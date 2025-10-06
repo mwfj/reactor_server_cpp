@@ -1,9 +1,5 @@
 #pragma once
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <string>
-#include<memory>
-#include<cstring>
+#include "common.h"
 
 class InetAddr{
 private:

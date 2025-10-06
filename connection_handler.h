@@ -1,14 +1,6 @@
 // connection_handler.h
 #pragma once
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/tcp.h>
-#include <fcntl.h>
-#include <string.h>
-#include <errno.h>
-#include <stdexcept>
-#include <unistd.h>
-
+#include "common.h"
 #include "inet_addr.h"
 
 class ConnectionHandler {
