@@ -10,12 +10,12 @@ class EpollHandler{
 public:
     EpollHandler();
     ~EpollHandler();
-    void UpdateChannel(Channel *);
+    void UpdateEvent(Channel *);
     std::vector<std::shared_ptr<Channel>> WaitForEvent(int);
 
     // Store channel ownership
-    void AddChannel(std::shared_ptr<Channel> ch);
-    void RemoveChannel(int fd);
+    void AddChannelToMap(std::shared_ptr<Channel> ch);
+    void RemoveChannelFromMap(int fd);
 private:
     static const int MaxEpollEvents = 1000; // Max events to process per epoll_wait call
     int epollfd_ = -1;

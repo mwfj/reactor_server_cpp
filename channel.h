@@ -24,7 +24,7 @@ public:
         event_ |= EPOLLIN;
         auto ep_shared = ep_.lock();
         if(ep_shared)
-            ep_shared->UpdateChannel(this);
+            ep_shared->UpdateEvent(this);
     }
 
     uint32_t Event() const {return event_;}

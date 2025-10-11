@@ -20,7 +20,7 @@ EpollHandler::~EpollHandler(){
  * function parameters can accept raw pointers extracted from smart pointers (using .get()). 
  * this follows C++ Core Guidelines: "Pass smart pointers only to express ownership transfer
  */
-void EpollHandler::UpdateChannel(Channel *ch){
+void EpollHandler::UpdateEvent(Channel *ch){
     epoll_event ev;
     ev.data.ptr = ch;
     ev.events = ch -> Event();
@@ -37,7 +37,7 @@ void EpollHandler::UpdateChannel(Channel *ch){
     }
 }
 
-void EpollHandler::AddChannel(std::shared_ptr<Channel> ch){
+void EpollHandler::AddChannelToMap(std::shared_ptr<Channel> ch){
     channel_map_[ch->fd()] = ch;
 }
 
@@ -80,7 +80,7 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
     return channels;
 }
 
-void EpollHandler::RemoveChannel(int fd){
+void EpollHandler::RemoveChannelFromMap(int fd){
     auto it = channel_map_.find(fd);
     if(it == channel_map_.end()){
         return;

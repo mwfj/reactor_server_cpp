@@ -61,10 +61,10 @@ void Channel::NewConnection(ConnectionHandler& handler){
         });
         // Enable ET mode for better performance
         clientCh->EnableETMode();
-        // This calls UpdateChannel which registers with epoll
+        // This calls UpdateEvent which registers with epoll
         clientCh->EnableReadMode();
 
-        ep_shared->AddChannel(clientCh);
+        ep_shared->AddChannelToMap(clientCh);
     }
 }
 
@@ -123,7 +123,7 @@ void Channel::CloseChannel(){
 
     auto ep_shared = ep_.lock();
     if(ep_shared && is_epoll_in_){
-        ep_shared->RemoveChannel(fd_);
+        ep_shared->RemoveChannelFromMap(fd_);
     }
 
     if(fd_ != -1){

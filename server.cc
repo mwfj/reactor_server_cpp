@@ -28,7 +28,7 @@ void NetworkServer::Start(){
     serv_ch_->EnableReadMode();
 
     // CRITICAL: Add server channel to EpollHandler's map so events are tracked
-    ep_->AddChannel(serv_ch_);
+    ep_->AddChannelToMap(serv_ch_);
 }
 
 void NetworkServer::Run(){
