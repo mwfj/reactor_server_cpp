@@ -2,11 +2,6 @@
 
 
 NetworkServer::NetworkServer(const std::string& _ip, int _port) : ip_addr_(_ip), port_(_port){}
-
-NetworkServer::~NetworkServer(){
-    // Smart pointers automatically clean up
-}
-
 void NetworkServer::set_running_state(bool status){
     is_running_ = status;
 }

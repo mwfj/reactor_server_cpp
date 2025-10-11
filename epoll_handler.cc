@@ -18,7 +18,7 @@ EpollHandler::~EpollHandler(){
  * we store the raw pointer here but maintain ownership with smart pointers in channel_map_.
  * 
  * function parameters can accept raw pointers extracted from smart pointers (using .get()). 
- * this follows C++ Core Guidelines: "Pass smart pointers only to express ownership transfe
+ * this follows C++ Core Guidelines: "Pass smart pointers only to express ownership transfer
  */
 void EpollHandler::UpdateChannel(Channel *ch){
     epoll_event ev;

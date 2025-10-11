@@ -19,7 +19,7 @@ private:
 public:
     NetworkServer() = delete;
     NetworkServer(const std::string& _ip, int _port);
-    ~NetworkServer();
+    ~NetworkServer() = default;  // Smart pointers automatically clean up
     void Start();
     void Stop();
     void Run();
