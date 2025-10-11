@@ -1,24 +1,9 @@
 #include "connection_handler.h"
 
 
-void ConnectionHandler::SetNonBlocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) {
-        throw std::runtime_error("Failed to get socket flags");
-    }
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        throw std::runtime_error("Failed to set non-blocking mode");
-    }
-}
-
-
-
-void ConnectionHandler::Close() {
-    if (fd_ != -1) {
-        ::close(fd_);
-        fd_ = -1;
-    }
-}
+ConnectionHandler::ConnectionHandler() : fd_(CreateSocket()) {}
+ConnectionHandler::ConnectionHandler(int fd) : fd_(fd) {}
+ConnectionHandler::~ConnectionHandler() { Close(); }
 
 bool ConnectionHandler::SetTcpNoDelay(bool _flag){
     int optVal = _flag ? 1 : 0;
@@ -47,7 +32,7 @@ int ConnectionHandler::CreateSocket() {
 }
 
 void ConnectionHandler::Bind(const InetAddr& _servAddr){
-    if(::bind(fd_, _servAddr.Addr(), sizeof(_servAddr)) < 0){
+    if(::bind(fd_, _servAddr.Addr(), sizeof(sockaddr_in)) < 0){
         Close();
         throw std::runtime_error("Error occurred when binding port ...");
     }
@@ -64,18 +49,30 @@ int ConnectionHandler::Accept(InetAddr& _clientAddr){
     socklen_t len = sizeof(acceptAddr);
     int clientfd = accept4(fd_, reinterpret_cast<sockaddr*>(&acceptAddr), &len, SOCK_NONBLOCK);
     if(clientfd == -1){
-        Close();
-        throw std::runtime_error("Error occurred when accepting port ...");
-        return -1;
-    }else{
-        _clientAddr.SetAddr(acceptAddr);
-        return clientfd;
+        // Don't close listening socket on accept error
+        if(errno == EAGAIN || errno == EWOULDBLOCK) {
+            // No connections available right now - not an error
+            return -1;
+        }
+        throw std::runtime_error("Error occurred when accepting connection");
+    }
+    _clientAddr.SetAddr(acceptAddr);
+    return clientfd;
+}
+
+void ConnectionHandler::Close() {
+    if (fd_ != -1) {
+        ::close(fd_);
+        fd_ = -1;
     }
 }
 
-void ConnectionHandler::Close(){
-    if(fd_ != -1)
-        ::close(fd_);
+void ConnectionHandler::SetNonBlocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) {
+        throw std::runtime_error("Failed to get socket flags");
+    }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        throw std::runtime_error("Failed to set non-blocking mode");
+    }
 }
-
-int ConnectionHandler::fd() const { return fd_; }

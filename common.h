@@ -1,5 +1,7 @@
 #pragma once
 
+// TODO: Supoort cross-platform(current support Linux only)
+
 // Platform detection
 #ifdef _WIN32
     // Windows
@@ -61,6 +63,7 @@
 #include <iostream>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 #define MAX_BUFFER_SIZE 1024
 #define MAX_REPLY_SIZE 50

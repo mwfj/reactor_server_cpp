@@ -9,20 +9,20 @@ private:
     void SetNonBlocking(int fd);
     
 public:
-    ConnectionHandler::ConnectionHandler() : fd_(CreateSocket()) {}
-    explicit ConnectionHandler::ConnectionHandler(int fd) : fd_(fd) {}
-    ConnectionHandler::~ConnectionHandler() { Close(); }
+    ConnectionHandler();
+    explicit ConnectionHandler(int);
+    ~ConnectionHandler();
     
     // Delete copy operations
     ConnectionHandler(const ConnectionHandler&) = delete;
     ConnectionHandler& operator=(const ConnectionHandler&) = delete;
     
     // Move operations
-    ConnectionHandler::ConnectionHandler(ConnectionHandler&& other) noexcept 
+    ConnectionHandler(ConnectionHandler&& other) noexcept
         : fd_(other.fd_) {
         other.fd_ = -1;
     }
-    ConnectionHandler& ConnectionHandler::operator=(ConnectionHandler&& other) noexcept {
+    ConnectionHandler& operator=(ConnectionHandler&& other) noexcept {
         if (this != &other) {
             Close();
             fd_ = other.fd_;
@@ -30,7 +30,7 @@ public:
         }
         return *this;
     }
-    
+
     int fd() const { return fd_; }
     bool SetTcpNoDelay(bool);
     bool SetReuseAddr(bool);

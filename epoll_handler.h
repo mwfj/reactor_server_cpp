@@ -1,26 +1,24 @@
 #pragma once
 #include "common.h"
-#include "channel.h"
+#include <memory>
+#include <map>
 
-// typedef struct {
-// #ifdef __linux__
-//     struct epoll_event ev;
-// #elif defined(__APPLE__) || defined(__FreeBSD__)
-//     struct kevent ev;
-// #elif defined(_WIN32)
-//     WSAEVENT ev;
-// #endif
-// } gen_epoll_evts;
+// Forward declaration to break circular dependency
+class Channel;
 
 class EpollHandler{
 public:
     EpollHandler();
     ~EpollHandler();
-    void UpdateChannel(std::unique_ptr<Channel>);
+    void UpdateChannel(Channel *);
+    std::vector<std::shared_ptr<Channel>> WaitForEvent(int);
+
+    // Store channel ownership
+    void AddChannel(std::shared_ptr<Channel> ch);
 private:
     static const int MaxEpollEvents = 1000; // Max events to process per epoll_wait call
     int epollfd_ = -1;
-    // gen_epoll_evts events[MaxEpollEvents];
-    epoll_event events[MaxEpollEvents];
-    std::vector<std::unique_ptr<Channel>> channels_;
+    epoll_event events_[MaxEpollEvents];
+    // Map from fd to channel for ownership management
+    std::map<int, std::shared_ptr<Channel>> channel_map_;
 };

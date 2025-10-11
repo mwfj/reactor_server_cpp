@@ -17,10 +17,10 @@ LDFLAGS = -lpthread
 TARGET = run
 
 # Source files
-SRCS = server.cc main.cc
+SRCS = server.cc main.cc connection_handler.cc channel.cc epoll_handler.cc
 
 # Header files (for dependency tracking)
-HEADERS = server.h client.h common.h
+HEADERS = server.h client.h common.h connection_handler.h channel.h epoll_handler.h inet_addr.h
 
 # Default target
 all: $(TARGET)
