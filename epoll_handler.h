@@ -15,6 +15,7 @@ public:
 
     // Store channel ownership
     void AddChannel(std::shared_ptr<Channel> ch);
+    void RemoveChannel(int fd);
 private:
     static const int MaxEpollEvents = 1000; // Max events to process per epoll_wait call
     int epollfd_ = -1;

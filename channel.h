@@ -11,14 +11,16 @@ class Channel{
 public:
     Channel() = delete;
     Channel(std::shared_ptr<EpollHandler> _ep, int _fd);
-    ~Channel() = default;
+    ~Channel();
 
     const int fd() const { return fd_; }
     // enable ET (Edge-Triggered) mode
     void EnableETMode(){
+        if(is_channel_closed_) return;
         event_ |= EPOLLET;
     }
     void EnableReadMode(){
+        if(is_channel_closed_) return;
         event_ |= EPOLLIN;
         auto ep_shared = ep_.lock();
         if(ep_shared)
@@ -43,6 +45,8 @@ public:
     void NewConnection(ConnectionHandler&);
     void OnMessage();
     void SetReadCallBackFn(std::function<void()>);
+    void CloseChannel();
+    bool is_channel_closed() const { return is_channel_closed_; }
 private:
     int fd_ = -1;
     /**
@@ -59,4 +63,5 @@ private:
     uint32_t devent_ = 0;
     // read callback
     std::function<void()> read_fn_;
+    bool is_channel_closed_ = false;
 };

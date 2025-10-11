@@ -2,91 +2,136 @@
 
 Channel::Channel(std::shared_ptr<EpollHandler> _ep, int _fd) : fd_(_fd), ep_(_ep){}
 
-
+Channel::~Channel() {
+    CloseChannel();
+}
 
 void Channel::HandleEvent() {
-    // check whether a stream socket peer has either closed the connection
-    // or shut down the writing half of the connection.
-    if(devent_ & EPOLLRDHUP){
-        close(fd_);
-        // Don't throw - this is normal client disconnect
+    if(is_channel_closed_) {
         return;
-    }else if(devent_ & (EPOLLIN | EPOLLPRI)){
-        // there has data in buffer
+    }
+
+    const uint32_t events = devent_;
+
+    if(events & EPOLLERR){
+        CloseChannel();
+        return;
+    }
+
+    if(events & (EPOLLIN | EPOLLPRI)){
         if(read_fn_) {
             read_fn_();
         }
-    }else if(devent_ & EPOLLOUT){
-        //  reserve for future feature
-    }else if(devent_ & EPOLLERR){
-        close(fd_);
-        return;
-    }else if(devent_ & EPOLLHUP){
-        close(fd_);
+        if(is_channel_closed_) {
+            return;
+        }
+    }
+
+    if(events & (EPOLLRDHUP | EPOLLHUP)){
+        CloseChannel();
         return;
     }
 }
 
 void Channel::NewConnection(ConnectionHandler& handler){
     InetAddr clientAddr;
-    int client_fd = handler.Accept(clientAddr);
 
-    if(client_fd < 0){
-        return;
-    }
+    while(true){
+        int client_fd = handler.Accept(clientAddr);
 
-    // Get shared_ptr from weak_ptr
-    auto ep_shared = ep_.lock();
-    if(!ep_shared){
-        close(client_fd);
-        return;
-    }
-
-    std::shared_ptr<Channel> clientCh(new Channel(ep_shared, client_fd));
-
-    // Set callback using shared_ptr to keep channel alive during callback
-    std::weak_ptr<Channel> weak_ch = clientCh;
-    clientCh->SetReadCallBackFn([weak_ch]() {
-        auto ch = weak_ch.lock();
-        if(ch) {
-            ch->OnMessage();
+        if(client_fd < 0){
+            break;
         }
-    });
 
-    // Enable ET mode for better performance
-    clientCh->EnableETMode();
-    clientCh->EnableReadMode();  // This calls UpdateChannel which registers with epoll
+        auto ep_shared = ep_.lock();
+        if(!ep_shared){
+            ::close(client_fd);
+            continue;
+        }
 
-    // Store the channel in EpollHandler for ownership management
-    ep_shared->AddChannel(clientCh);
+        std::shared_ptr<Channel> clientCh(new Channel(ep_shared, client_fd));
+
+        // Set callback using shared_ptr to keep channel alive during callback
+        std::weak_ptr<Channel> weak_ch = clientCh;
+        clientCh->SetReadCallBackFn([weak_ch]() {
+            auto ch = weak_ch.lock();
+            if(ch) {
+                ch->OnMessage();
+            }
+        });
+        // Enable ET mode for better performance
+        clientCh->EnableETMode();
+        // This calls UpdateChannel which registers with epoll
+        clientCh->EnableReadMode();
+
+        ep_shared->AddChannel(clientCh);
+    }
 }
 
 void Channel::OnMessage(){
+    if(is_channel_closed_) {
+        return;
+    }
+
     char buffer[MAX_BUFFER_SIZE];
     while(true){
         memset(buffer, 0, sizeof buffer);
-
         ssize_t nread = ::read(fd_, buffer, sizeof buffer);
 
         if(nread > 0){
-            // receive the data and echo it back
-            ::send(fd_, buffer, strlen(buffer), 0);
-
-        }else if(nread == -1 && errno == EINTR){
-            // interruptted by keyboard signal
-            continue;
-
-        }else if(nread == -1 && ((errno == EAGAIN) || (errno == EWOULDBLOCK))){
-            // finished read
-            break;
+            ssize_t total_written = 0;
+            while(total_written < nread){
+                ssize_t nwrite = ::send(fd_, buffer + total_written, static_cast<size_t>(nread - total_written), 0);
+                if(nwrite > 0){
+                    total_written += nwrite;
+                    continue;
+                }
+                if(nwrite == -1 && errno == EINTR){
+                    continue;
+                }
+                if(nwrite == -1 && ((errno == EAGAIN) || (errno == EWOULDBLOCK))){
+                    return;
+                }
+                CloseChannel();
+                return;
+            }
         }else if(nread == 0){
-            // client disconnect
-            close(fd_);
-            break;
+            CloseChannel();
+            return;
+        }else{
+            if(errno == EINTR){
+                continue;
+            }
+            if((errno == EAGAIN) || (errno == EWOULDBLOCK)){
+                break;
+            }
+            CloseChannel();
+            return;
         }
     }
 }
 
 void Channel::SetReadCallBackFn(std::function<void()> fn){
     read_fn_ = fn;
+}
+
+void Channel::CloseChannel(){
+    if(is_channel_closed_){
+        return;
+    }
+    is_channel_closed_ = true;
+
+    auto ep_shared = ep_.lock();
+    if(ep_shared && is_epoll_in_){
+        ep_shared->RemoveChannel(fd_);
+    }
+
+    if(fd_ != -1){
+        ::close(fd_);
+        fd_ = -1;
+    }
+
+    is_epoll_in_ = false;
+    event_ = 0;
+    devent_ = 0;
 }

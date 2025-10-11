@@ -46,9 +46,16 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
     // init event array
     memset(events_, 0, sizeof(events_));
 
-    int infds = epoll_wait(epollfd_, events_, MaxEpollEvents, timeout);
+    int infds = -1;
 
-    if(infds < 0){
+    while(true){
+        infds = epoll_wait(epollfd_, events_, MaxEpollEvents, timeout);
+        if(infds >= 0){
+            break;
+        }
+        if(errno == EINTR){
+            continue;
+        }
         std::cout << "epoll_wait() failed: " << strerror(errno) << std::endl;
         throw std::runtime_error("epoll_wait() failed");
     }
@@ -71,4 +78,21 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
     }
 
     return channels;
+}
+
+void EpollHandler::RemoveChannel(int fd){
+    auto it = channel_map_.find(fd);
+    if(it == channel_map_.end()){
+        return;
+    }
+
+    if(epollfd_ != -1){
+        if(::epoll_ctl(epollfd_, EPOLL_CTL_DEL, fd, nullptr) == -1){
+            if(errno != EBADF && errno != ENOENT){
+                std::cerr << "epoll_ctl DEL failed for fd " << fd << ": " << strerror(errno) << std::endl;
+            }
+        }
+    }
+
+    channel_map_.erase(it);
 }
