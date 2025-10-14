@@ -18,7 +18,7 @@ TARGET = run
 
 # Source files
 SRCS = server.cc main.cc socket_handler.cc channel.cc epoll_handler.cc \
-       dispatcher.cc acceptor.cc conncetion_handler.cc
+       dispatcher.cc acceptor.cc connection_handler.cc
 
 # Header files (for dependency tracking)
 HEADERS = server.h client.h common.h socket_handler.h channel.h epoll_handler.h \
