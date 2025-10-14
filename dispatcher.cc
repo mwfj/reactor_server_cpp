@@ -21,7 +21,7 @@ void Dispatcher::RunEventLoop(){
                 ch->HandleEvent();
             } catch (const std::exception& e) {
                 // Log error but continue serving other clients
-                std::cerr << "[Reactor Server] Error handling event: " << e.what() << std::endl;
+                std::cerr << "[Dispatcher] Error handling event: " << e.what() << std::endl;
             }
         }
     }

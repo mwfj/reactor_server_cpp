@@ -3,6 +3,7 @@
 
 EpollHandler::EpollHandler(){
     if((epollfd_ = ::epoll_create(1)) == -1){
+        std::cout << "[Epoll Handler] epoll_create failed: " << strerror(errno) << std::endl;
         throw std::runtime_error("Epoll created failed");
     }
 }
@@ -23,10 +24,12 @@ void EpollHandler::UpdateEvent(std::shared_ptr<Channel> ch){
 
     if(ch->is_epoll_in()){
         if(::epoll_ctl(epollfd_, EPOLL_CTL_MOD, ch->fd(), &ev) == -1){
+            std::cout << "[Epoll Handler] epoll_ctl MOD failed: " << strerror(errno) << std::endl;
             throw std::runtime_error("epoll_ctl MOD failed");
         }
     }else{
         if(::epoll_ctl(epollfd_, EPOLL_CTL_ADD, ch->fd(), &ev) == -1){
+            std::cout << "[Epoll Handler] epoll_ctl ADD failed: " << strerror(errno) << std::endl;
             throw std::runtime_error("epoll_ctl ADD failed");
         }
         ch->SetEpollIn();
@@ -46,13 +49,13 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
     infds = epoll_wait(epollfd_, events_, MaxEpollEvents, timeout);
 
     if(infds < 0){
-        std::cout << "epoll_wait() failed: " << strerror(errno) << std::endl;
+        std::cout << "[Epoll Handler] epoll_wait() failed: " << strerror(errno) << std::endl;
         throw std::runtime_error("epoll_wait() failed");
     }
 
     // interruptted by other signal
     if(errno == EINTR){
-        std::cout << "epoll_wait() failed, iterruptted by other signal: " << strerror(errno) << std::endl;
+        std::cout << "[Epoll Handler] epoll_wait() failed, iterruptted by other signal: " << strerror(errno) << std::endl;
         throw std::runtime_error("epoll_wait() iterruptted by other signal");
     }
     

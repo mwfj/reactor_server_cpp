@@ -25,6 +25,7 @@ bool SocketHandler::SetKeepAlive(bool _flag){
 int SocketHandler::CreateSocket() {
     int listenfd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listenfd == -1) {
+        std::cout << "[Socket Handler] Invalid socket..." << std::endl;
         throw std::runtime_error("Invalid socket...");
     }
     SetNonBlocking(listenfd);
@@ -34,6 +35,7 @@ int SocketHandler::CreateSocket() {
 void SocketHandler::Bind(const InetAddr& _servAddr){
     if(::bind(fd_, _servAddr.Addr(), sizeof(sockaddr_in)) < 0){
         Close();
+        std::cout << "[Socket Handler] Error occurred when binding port ..." << std::endl;
         throw std::runtime_error("Error occurred when binding port ...");
     }
 }
@@ -41,7 +43,7 @@ void SocketHandler::Bind(const InetAddr& _servAddr){
 void SocketHandler::Listen(int _maxLen){
     if(::listen(fd_, _maxLen) != 0){
         Close();
-        std::cout << "[Reactor Server] Error occurred when listening ..." << std::endl;
+        std::cout << "[Socket Handler] Error occurred when listening ..." << std::endl;
         throw std::runtime_error("Error occurred when listening ...");
     }
 }
@@ -55,7 +57,7 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
             // No connections available right now - not an error
             return -1;
         }
-        std::cout << "[Reactor Server] Error occurred when accepting connection" << std::endl;
+        std::cout << "[Socket Handler] Error occurred when accepting connection" << std::endl;
         throw std::runtime_error("Error occurred when accepting connection");
     }
     _clientAddr.SetAddr(acceptAddr);
@@ -72,11 +74,11 @@ void SocketHandler::Close() {
 void SocketHandler::SetNonBlocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1) {
-        std::cout << "[Reactor Server] Failed to get socket flags" << std::endl;
+        std::cout << "[Socket Handler] Failed to get socket flags" << std::endl;
         throw std::runtime_error("Failed to get socket flags");
     }
     if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        std::cout << "[Reactor Server] Failed to set non-blocking mode" << std::endl;
+        std::cout << "[Socket Handler] Failed to set non-blocking mode" << std::endl;
         throw std::runtime_error("Failed to set non-blocking mode");
     }
 }
