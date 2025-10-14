@@ -10,8 +10,9 @@
 
 class ReactorServer {
 private:
-    std::shared_ptr<Dispatcher> event_dispatcher_;  // Owner (shared with components for coordination)
-
+    // Owner (shared with components for coordination)
+    // TODO: One server can have multiple dispatcher for multi-threads design
+    std::shared_ptr<Dispatcher> event_dispatcher_; 
     std::map<int, std::shared_ptr<ConnectionHandler>> connections_;
     std::unique_ptr<Acceptor> acceptor_;  // Sole owner of Acceptor
 public:

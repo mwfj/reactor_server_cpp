@@ -68,7 +68,9 @@ private:
 
     bool is_channel_closed_ = false;
 
-    // read callback
+    // Read callback
+    // - Callback Acceptor::NewConnection if is the acceptor channel
+    // - Callback Channel::OnMessage if is the client channel
     std::function<void()> read_fn_;
     std::function<void()> close_fn_;
     std::function<void()> error_fn_;
