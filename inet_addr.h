@@ -18,7 +18,7 @@ public:
     const char *Ip() const {
         return inet_ntoa(addr_.sin_addr);
     }
-    uint16_t Port() const {
+    size_t Port() const {
         return ntohs(addr_.sin_port);
     }
     const sockaddr* Addr() const {

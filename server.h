@@ -16,7 +16,7 @@ private:
     std::unique_ptr<Acceptor> acceptor_;  // Sole owner of Acceptor
 public:
     ReactorServer() = delete;
-    ReactorServer(const std::string& _ip, const uint16_t _port);
+    ReactorServer(const std::string& _ip, const size_t _port);
     ~ReactorServer(); 
 
     void Start();

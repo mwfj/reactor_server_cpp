@@ -1,7 +1,7 @@
 #include "server.h"
 
 
-ReactorServer::ReactorServer(const std::string& _ip, const uint16_t _port)
+ReactorServer::ReactorServer(const std::string& _ip, const size_t _port)
     : event_dispatcher_(std::shared_ptr<Dispatcher>(new Dispatcher())),
       acceptor_(new Acceptor(event_dispatcher_, _ip, _port))
 {
@@ -34,14 +34,14 @@ void ReactorServer::NewConnction(std::unique_ptr<SocketHandler> cilent_sock){
 }
 
 void ReactorServer::CloseConnection(std::shared_ptr<ConnectionHandler> conn){
-    std::cout << "client fd: " << conn -> fd() << "disconnected." << std::endl;
+    std::cout << "[ReactorServer] client fd: " << conn -> fd() << " disconnected." << std::endl;
     connections_.erase(conn -> fd());
     // close this connection
     conn.reset();
 }
 
 void ReactorServer::ErrorConnection(std::shared_ptr<ConnectionHandler> conn){
-    std::cout << "client fd: " << conn -> fd() << "error occurred, disconnect." << std::endl;
+    std::cout << "[ReactorServer] client fd: " << conn -> fd() << "error occurred, disconnect." << std::endl;
     connections_.erase(conn -> fd());
     conn.reset();
 }

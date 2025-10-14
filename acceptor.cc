@@ -2,7 +2,7 @@
 #include "channel.h"
 
 // init server socket
-Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _ip, const uint16_t _port):
+Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _ip, const size_t _port):
     event_dispatcher_(_dispatcher),
     servsock_(new SocketHandler())
 {

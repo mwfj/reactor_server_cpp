@@ -34,13 +34,13 @@ public:
     void Connect(){
         if(connect(socketfd_, (struct sockaddr *)&servaddr_, sizeof servaddr_) < 0){
             if(!quiet_mode_){
-                std::cout << "Connection error, port: " << port_ << std::endl;
+                std::cout << "[Client] Connection error, port: " << port_ << std::endl;
             }
             Close();
             throw std::runtime_error("Connection Error");
         }else{
             if(!quiet_mode_){
-                std::cout << "Connection success, port: " << port_ << std::endl;
+                std::cout << "[Client] Connection success, port: " << port_ << std::endl;
             }
         }
     }
@@ -57,7 +57,7 @@ public:
             throw std::runtime_error("Receive failed");
         }
         if(!quiet_mode_){
-            std::cout << "Received: " << buf_ << std::endl;
+            std::cout << "[Client] Received: " << buf_ << std::endl;
         }
     }
 

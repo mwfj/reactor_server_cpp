@@ -14,7 +14,7 @@ private:
     std::function<void(std::unique_ptr<SocketHandler>)> new_conn_cb_;
 public:
     Acceptor() = delete;
-    Acceptor(std::shared_ptr<Dispatcher>, const std::string&, const uint16_t);
+    Acceptor(std::shared_ptr<Dispatcher>, const std::string&, const size_t);
     ~Acceptor() = default; // smart pointer will release the source
 
     void NewConnection(); // process the request from client
