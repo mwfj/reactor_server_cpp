@@ -64,6 +64,9 @@
 #include <chrono>
 #include <thread>
 #include <vector>
+#include <memory>
+#include <functional>
+#include <map>
 
 #define MAX_BUFFER_SIZE 1024
 #define MAX_REPLY_SIZE 50

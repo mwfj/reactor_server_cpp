@@ -1,56 +1,47 @@
 #include "server.h"
 
 
-NetworkServer::NetworkServer(const std::string& _ip, int _port) : ip_addr_(_ip), port_(_port){}
-void NetworkServer::set_running_state(bool status){
-    is_running_ = status;
+ReactorServer::ReactorServer(const std::string& _ip, const uint16_t _port)
+    : event_dispatcher_(std::shared_ptr<Dispatcher>(new Dispatcher())),
+      acceptor_(new Acceptor(event_dispatcher_, _ip, _port))
+{
+    acceptor_->SetNewConnCb(std::bind(&ReactorServer::NewConnction, this, std::placeholders::_1));
 }
 
-void NetworkServer::Start(){
-    listen_conn_.reset(new ConnectionHandler());
-    InetAddr addr(ip_addr_, port_);
-
-    listen_conn_->SetReuseAddr(true);
-    listen_conn_->SetTcpNoDelay(true);
-    listen_conn_->SetReusePort(true);
-    listen_conn_->SetKeepAlive(true);
-
-    listen_conn_->Bind(addr);
-    listen_conn_->Listen(MAX_CONNECTIONS);
-
-    ep_ = std::shared_ptr<EpollHandler>(new EpollHandler());
-    serv_ch_ = std::shared_ptr<Channel>(new Channel(ep_, listen_conn_->fd()));
-
-    // Register callback for accepting new connections
-    serv_ch_->SetReadCallBackFn(
-        std::bind(&Channel::NewConnection, serv_ch_.get(), std::ref(*listen_conn_))
-    );
-    serv_ch_->EnableReadMode();
-
-    // CRITICAL: Add server channel to EpollHandler's map so events are tracked
-    ep_->AddChannelToMap(serv_ch_);
+ReactorServer::~ReactorServer(){
+    connections_.clear();
 }
 
-void NetworkServer::Run(){
-    set_running_state(true);
-
-    while(is_running()){
-        // Use 1000ms timeout instead of blocking indefinitely
-        // This allows the server to check is_running() periodically
-        channels_ = ep_->WaitForEvent(1000);
-
-        // Process all active channels
-        for(auto& ch : channels_) {
-            try {
-                ch->HandleEvent();
-            } catch (const std::exception& e) {
-                // Log error but continue serving other clients
-                std::cerr << "[SERVER] Error handling event: " << e.what() << std::endl;
-            }
-        }
-    }
+// start event loop
+void ReactorServer::Start(){
+    event_dispatcher_->RunEventLoop();
 }
 
-void NetworkServer::Stop(){
-    set_running_state(false);
+// stop event loop
+void ReactorServer::Stop(){
+    event_dispatcher_->StopEventLoop();
+}
+
+void ReactorServer::NewConnction(std::unique_ptr<SocketHandler> cilent_sock){
+    std::shared_ptr<ConnectionHandler> conn = std::shared_ptr<ConnectionHandler>(new ConnectionHandler(event_dispatcher_, std::move(cilent_sock)));
+    conn ->SetCloseCb(std::bind(&ReactorServer::CloseConnection, this, std::placeholders::_1));
+    conn ->SetErrorCb(std::bind(&ReactorServer::ErrorConnection, this, std::placeholders::_1));
+
+    std::cout << "[Reactor Server] new connection(fd: " 
+        << conn -> fd() << ", ip: " << conn->ip_addr() << ", port: " << conn -> port() << ").\n"
+        << "ok" << std::endl;
+    connections_[conn -> fd()] = conn;
+}
+
+void ReactorServer::CloseConnection(std::shared_ptr<ConnectionHandler> conn){
+    std::cout << "client fd: " << conn -> fd() << "disconnected." << std::endl;
+    connections_.erase(conn -> fd());
+    // close this connection
+    conn.reset();
+}
+
+void ReactorServer::ErrorConnection(std::shared_ptr<ConnectionHandler> conn){
+    std::cout << "client fd: " << conn -> fd() << "error occurred, disconnect." << std::endl;
+    connections_.erase(conn -> fd());
+    conn.reset();
 }

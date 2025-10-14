@@ -1,27 +1,29 @@
 #pragma once
 #include "common.h"
-#include "connection_handler.h"
+#include "socket_handler.h"
 #include "inet_addr.h"
 #include "epoll_handler.h"
 #include "channel.h"
-#include <memory>
+#include "dispatcher.h"
+#include "connection_handler.h"
+#include "acceptor.h"
 
-class NetworkServer {
+class ReactorServer {
 private:
-    std::string ip_addr_;
-    int port_;
-    bool is_running_ = false;
-    std::unique_ptr<ConnectionHandler> listen_conn_;
-    std::shared_ptr<Channel> serv_ch_;  // Changed to shared_ptr so it can be added to EpollHandler map
-    std::vector<std::shared_ptr<Channel>> channels_;
-    std::shared_ptr<EpollHandler> ep_;  // Changed to shared_ptr so Channel can hold weak_ptr
-    void set_running_state(bool);
+    std::shared_ptr<Dispatcher> event_dispatcher_;  // Owner (shared with components for coordination)
+
+    std::map<int, std::shared_ptr<ConnectionHandler>> connections_;
+    std::unique_ptr<Acceptor> acceptor_;  // Sole owner of Acceptor
 public:
-    NetworkServer() = delete;
-    NetworkServer(const std::string& _ip, int _port);
-    ~NetworkServer() = default;  // Smart pointers automatically clean up
+    ReactorServer() = delete;
+    ReactorServer(const std::string& _ip, const uint16_t _port);
+    ~ReactorServer(); 
+
     void Start();
     void Stop();
-    void Run();
-    bool is_running() const {return is_running_;}
+
+    void NewConnction(std::unique_ptr<SocketHandler>);
+
+    void CloseConnection(std::shared_ptr<ConnectionHandler>);
+    void ErrorConnection(std::shared_ptr<ConnectionHandler>);
 };

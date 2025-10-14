@@ -1,6 +1,8 @@
 #include "channel.h"
 
-Channel::Channel(std::shared_ptr<EpollHandler> _ep, int _fd) : fd_(_fd), ep_(_ep){}
+// Channel::Channel(std::shared_ptr<EpollHandler> _ep, int _fd) : fd_(_fd), ep_(_ep){}
+Channel::Channel(std::shared_ptr<Dispatcher> _dispatcher, int _fd) 
+    : fd_(_fd), event_dispatcher_(_dispatcher){}
 
 Channel::~Channel() {
     CloseChannel();
@@ -33,7 +35,7 @@ void Channel::HandleEvent() {
     }
 }
 
-void Channel::NewConnection(ConnectionHandler& handler){
+void Channel::NewConnection(SocketHandler& handler){
     InetAddr clientAddr;
 
     while(true){
@@ -43,7 +45,7 @@ void Channel::NewConnection(ConnectionHandler& handler){
             break;
         }
 
-        auto ep_shared = ep_.lock();
+        auto ep_shared = event_dispatcher_.lock();
         if(!ep_shared){
             ::close(client_fd);
             continue;
@@ -62,9 +64,7 @@ void Channel::NewConnection(ConnectionHandler& handler){
         // Enable ET mode for better performance
         clientCh->EnableETMode();
         // This calls UpdateEvent which registers with epoll
-        clientCh->EnableReadMode();
-
-        ep_shared->AddChannelToMap(clientCh);
+        clientCh->EnableReadMode(clientCh);
     }
 }
 
@@ -115,15 +115,23 @@ void Channel::SetReadCallBackFn(std::function<void()> fn){
     read_fn_ = fn;
 }
 
+void Channel::SetCloseCallBackFn(std::function<void()> fn){
+    close_fn_ = fn;
+}
+
+void Channel::SetErrorCallBackFn(std::function<void()> fn){
+    error_fn_ = fn;
+}
+
 void Channel::CloseChannel(){
     if(is_channel_closed_){
         return;
     }
     is_channel_closed_ = true;
 
-    auto ep_shared = ep_.lock();
-    if(ep_shared && is_epoll_in_){
-        ep_shared->RemoveChannelFromMap(fd_);
+    // Call the close callback before actually closing
+    if(close_fn_){
+        close_fn_();
     }
 
     if(fd_ != -1){

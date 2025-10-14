@@ -1,45 +1,28 @@
-// connection_handler.h
 #pragma once
 #include "common.h"
-#include "inet_addr.h"
+#include "dispatcher.h"
+#include "socket_handler.h"
 
-class ConnectionHandler {
+class ConnectionHandler : public std::enable_shared_from_this<ConnectionHandler>
+{
 private:
-    int fd_;
-    void SetNonBlocking(int fd);
-    
-public:
-    ConnectionHandler();
-    explicit ConnectionHandler(int);
-    ~ConnectionHandler();
-    
-    // Delete copy operations
-    ConnectionHandler(const ConnectionHandler&) = delete;
-    ConnectionHandler& operator=(const ConnectionHandler&) = delete;
-    
-    // Move operations
-    ConnectionHandler(ConnectionHandler&& other) noexcept
-        : fd_(other.fd_) {
-        other.fd_ = -1;
-    }
-    ConnectionHandler& operator=(ConnectionHandler&& other) noexcept {
-        if (this != &other) {
-            Close();
-            fd_ = other.fd_;
-            other.fd_ = -1;
-        }
-        return *this;
-    }
+    std::shared_ptr<Dispatcher> event_dispatcher_;
+    std::unique_ptr<SocketHandler> sock_;  // Sole owner of client socket
+    std::shared_ptr<Channel> client_channel_;
 
-    int fd() const { return fd_; }
-    bool SetTcpNoDelay(bool);
-    bool SetReuseAddr(bool);
-    bool SetReusePort(bool);
-    bool SetKeepAlive(bool);
-    
-    int CreateSocket();
-    void Bind(const InetAddr& servAddr);
-    void Listen(int maxLen);
-    int Accept(InetAddr& clientAddr);
-    void Close();
+    std::function<void(std::shared_ptr<ConnectionHandler>)> close_callback_;
+    std::function<void(std::shared_ptr<ConnectionHandler>)> error_callback_;
+public:
+    ConnectionHandler() = delete;
+    ConnectionHandler(std::shared_ptr<Dispatcher>, std::unique_ptr<SocketHandler>);
+    ~ConnectionHandler() = default; // no need the release resource for smart pointer
+
+    int fd() const{ return sock_ -> fd(); }
+    std::string ip_addr() const { return sock_ -> ip_addr(); }
+    int port() const { return sock_ -> port(); }
+
+    void CallCloseCb();
+    void CallErroCb();
+    void SetCloseCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
+    void SetErrorCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
 };
