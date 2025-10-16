@@ -8,11 +8,11 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <threads.h>
 #include <utility>
 #include <vector>
 
-#include "threadpool.h"
-#include "threads.h"
+#include "lib/threadpool.h"
 
 namespace TESTCASE {
 
