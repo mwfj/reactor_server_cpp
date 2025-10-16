@@ -10,19 +10,26 @@
 
 # Compiler and flags
 CXX = g++
-CXXFLAGS = -std=c++11 -g -Wall
+CXXFLAGS = -std=c++11 -g -Wall -Ilib
 LDFLAGS = -lpthread
+
+# Directories
+SRC_DIR = src
+LIB_DIR = lib
 
 # Target executable
 TARGET = run
 
-# Source files
-SRCS = server.cc main.cc socket_handler.cc channel.cc epoll_handler.cc \
-       dispatcher.cc acceptor.cc connection_handler.cc
+# Source files (with src/ prefix)
+SRCS = $(SRC_DIR)/server.cc $(SRC_DIR)/main.cc $(SRC_DIR)/socket_handler.cc \
+       $(SRC_DIR)/channel.cc $(SRC_DIR)/epoll_handler.cc $(SRC_DIR)/dispatcher.cc \
+       $(SRC_DIR)/acceptor.cc $(SRC_DIR)/connection_handler.cc
 
-# Header files (for dependency tracking)
-HEADERS = server.h client.h common.h socket_handler.h channel.h epoll_handler.h \
-          inet_addr.h dispatcher.h acceptor.h connection_handler.h
+# Header files (with lib/ prefix for dependency tracking)
+HEADERS = $(LIB_DIR)/server.h $(LIB_DIR)/client.h $(LIB_DIR)/common.h \
+          $(LIB_DIR)/socket_handler.h $(LIB_DIR)/channel.h $(LIB_DIR)/epoll_handler.h \
+          $(LIB_DIR)/inet_addr.h $(LIB_DIR)/dispatcher.h $(LIB_DIR)/acceptor.h \
+          $(LIB_DIR)/connection_handler.h
 
 # Default target
 all: $(TARGET)
