@@ -7,10 +7,10 @@ SRC_DIR := src
 LIB_DIR := lib
 
 # Source files (with src/ prefix)
-SRCS := $(SRC_DIR)/main.cc $(SRC_DIR)/threadpool.cc $(SRC_DIR)/threadtask.cc
+SRCS := main.cc $(SRC_DIR)/threadpool.cc $(SRC_DIR)/threadtask.cc
 
 # Object files (placed in src/ directory)
-OBJS := $(SRC_DIR)/main.o $(SRC_DIR)/threadpool.o $(SRC_DIR)/threadtask.o
+OBJS := main.o $(SRC_DIR)/threadpool.o $(SRC_DIR)/threadtask.o
 
 # Header files (with lib/ prefix)
 HEADERS := $(LIB_DIR)/threadpool.h $(LIB_DIR)/threadtask.h
@@ -24,7 +24,7 @@ $(TARGET): $(OBJS)
 	$(CXX) $(OBJS) -o $@ $(LDLIBS)
 
 # Dependency rules with new paths
-$(SRC_DIR)/main.o: $(SRC_DIR)/main.cc $(LIB_DIR)/threadpool.h
+/main.o: main.cc $(LIB_DIR)/threadpool.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(SRC_DIR)/threadpool.o: $(SRC_DIR)/threadpool.cc $(LIB_DIR)/threadpool.h
