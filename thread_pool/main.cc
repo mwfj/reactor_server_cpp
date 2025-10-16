@@ -14,7 +14,7 @@
 
 #include "lib/threadpool.h"
 
-namespace TESTCASE {
+namespace THREADPOOL_TESTCASE {
 
 void PrintSection(const std::string& name) {
     std::cout << "\n==== " << name << " ====\n";
@@ -342,17 +342,17 @@ void TestHighConcurrency() {
     std::cout << "HighConcurrency passed" << std::endl;
 }
 
-}  // namespace TESTCASE
+}  // namespace THREADPOOL_TESTCASE
 
 int main() {
     try {
-        TESTCASE::TestBasicExecution();
-        TESTCASE::TestExceptionPropagation();
-        TESTCASE::TestStopCancelsPendingTasks();
-        TESTCASE::TestRestartability();
-        TESTCASE::TestStartValidation();
-        TESTCASE::TestCooperativeCancellation();
-        TESTCASE::TestHighConcurrency();
+        THREADPOOL_TESTCASE::TestBasicExecution();
+        THREADPOOL_TESTCASE::TestExceptionPropagation();
+        THREADPOOL_TESTCASE::TestStopCancelsPendingTasks();
+        THREADPOOL_TESTCASE::TestRestartability();
+        THREADPOOL_TESTCASE::TestStartValidation();
+        THREADPOOL_TESTCASE::TestCooperativeCancellation();
+        THREADPOOL_TESTCASE::TestHighConcurrency();
     } catch (const std::exception& e) {
         std::cerr << "Test failure: " << e.what() << std::endl;
         return 1;
