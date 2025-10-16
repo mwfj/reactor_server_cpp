@@ -21,7 +21,7 @@ LIB_DIR = lib
 TARGET = run
 
 # Source files (with src/ prefix)
-SRCS = $(SRC_DIR)/server.cc test.cc $(SRC_DIR)/socket_handler.cc \
+SRCS = $(SRC_DIR)/server.cc framework_test.cc $(SRC_DIR)/socket_handler.cc \
        $(SRC_DIR)/channel.cc $(SRC_DIR)/epoll_handler.cc $(SRC_DIR)/dispatcher.cc \
        $(SRC_DIR)/acceptor.cc $(SRC_DIR)/connection_handler.cc
 
