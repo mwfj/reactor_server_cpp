@@ -11,8 +11,8 @@ private:
     int fd_ = -1;
     /**
      * Non-owning reference to Epoll loop.
-     * Uses weak_ptr for type safety and to detect if EpollHandler is destroyed.
-     * The EpollHandler is owned by NetServer and Channel just needs to reference it. 
+     * Uses weak_ptr for type safety and to detect if Dispatcher is destroyed.
+     * The Dispatcher is owned by NetServer and Channel just needs to reference it. 
      */
     std::weak_ptr<Dispatcher> event_dispatcher_;
     // to mark whether the channel has been put in the epoll tree
@@ -33,7 +33,6 @@ private:
     std::function<void()>   error_fn_;
 public:
     Channel() = delete;
-    // Channel(std::shared_ptr<EpollHandler> _ep, int _fd);
     Channel(std::shared_ptr<Dispatcher> _ep, int _fd);
     ~Channel();
 

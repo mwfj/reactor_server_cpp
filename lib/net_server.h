@@ -31,12 +31,13 @@ public:
     void Start();
     void Stop();
 
-    void HandleNewConnction(std::unique_ptr<SocketHandler>);
-    void CloseConnection(std::shared_ptr<ConnectionHandler>);
-    void ErrorConnection(std::shared_ptr<ConnectionHandler>);
-    void OnMessage(std::shared_ptr<ConnectionHandler>, std::string&);
-    void SendComplete(std::shared_ptr<ConnectionHandler>);
+    void HandleNewConnection(std::unique_ptr<SocketHandler>);
+    void HandleCloseConnection(std::shared_ptr<ConnectionHandler>);
+    void HandleErrorConnection(std::shared_ptr<ConnectionHandler>);
+    void HandleSendComplete(std::shared_ptr<ConnectionHandler>);
 
+    void OnMessage(std::shared_ptr<ConnectionHandler>, std::string&);
+    
     void SetNewConnectionCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn);
     void SetCloseConnectionCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn);
     void SetErrorCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn);

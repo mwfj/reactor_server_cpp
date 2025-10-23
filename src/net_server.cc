@@ -5,7 +5,7 @@ NetServer::NetServer(const std::string& _ip, const size_t _port)
     : event_dispatcher_(std::shared_ptr<Dispatcher>(new Dispatcher())),
       acceptor_(new Acceptor(event_dispatcher_, _ip, _port))
 {
-    acceptor_->SetNewConnCb(std::bind(&NetServer::HandleNewConnction, this, std::placeholders::_1));
+    acceptor_->SetNewConnCb(std::bind(&NetServer::HandleNewConnection, this, std::placeholders::_1));
 }
 
 NetServer::~NetServer(){
@@ -22,24 +22,24 @@ void NetServer::Stop(){
     event_dispatcher_->StopEventLoop();
 }
 
-void NetServer::HandleNewConnction(std::unique_ptr<SocketHandler> cilent_sock){
+void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
     std::shared_ptr<ConnectionHandler> conn = std::shared_ptr<ConnectionHandler>(new ConnectionHandler(event_dispatcher_, std::move(cilent_sock)));
-    conn ->SetCloseCb(std::bind(&NetServer::CloseConnection, this, std::placeholders::_1));
-    conn ->SetErrorCb(std::bind(&NetServer::ErrorConnection, this, std::placeholders::_1));
+    conn -> SetCloseCb(std::bind(&NetServer::HandleCloseConnection, this, std::placeholders::_1));
+    conn -> SetErrorCb(std::bind(&NetServer::HandleErrorConnection, this, std::placeholders::_1));
     conn -> SetOnMessageCb(std::bind(&NetServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
-    conn -> SetCompletionCb(std::bind(&NetServer::SendComplete, this, std::placeholders::_1));
+    conn -> SetCompletionCb(std::bind(&NetServer::HandleSendComplete, this, std::placeholders::_1));
 
     connections_[conn -> fd()] = conn;
 
     std::cout << "[Reactor Server] new connection(fd: " 
-        << conn -> fd() << ", ip: " << conn->ip_addr() << ", port: " << conn -> port() << ").\n"
+        << conn -> fd() << ", ip: " << conn -> ip_addr() << ", port: " << conn -> port() << ").\n"
         << "ok" << std::endl;
 
     if(new_conn_callback_)
         new_conn_callback_(conn);
 }
 
-void NetServer::CloseConnection(std::shared_ptr<ConnectionHandler> conn){
+void NetServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn){
     if(close_conn_callback_)
         close_conn_callback_(conn);
 
@@ -49,7 +49,7 @@ void NetServer::CloseConnection(std::shared_ptr<ConnectionHandler> conn){
     conn.reset();
 }
 
-void NetServer::ErrorConnection(std::shared_ptr<ConnectionHandler> conn){
+void NetServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn){
     if(error_callback_)
         error_callback_(conn);
         
@@ -63,7 +63,7 @@ void NetServer::OnMessage(std::shared_ptr<ConnectionHandler> conn, std::string& 
         on_message_callback_(conn, message);
 }
 
-void NetServer::SendComplete(std::shared_ptr<ConnectionHandler> conn){
+void NetServer::HandleSendComplete(std::shared_ptr<ConnectionHandler> conn){
     if(send_complete_callback_)
         send_complete_callback_(conn);
 }

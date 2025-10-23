@@ -33,7 +33,7 @@ public:
     }
 
     int fd() const { return fd_; }
-    std::string ip_addr() const {return ip_addr_;}
+    const std::string& ip_addr() const {return ip_addr_;}
     int port() const {return port_;}
 
     bool SetTcpNoDelay(bool);

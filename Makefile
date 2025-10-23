@@ -20,16 +20,31 @@ LIB_DIR = lib
 # Target executable
 TARGET = run
 
-# Source files (with src/ prefix)
-SRCS = $(SRC_DIR)/net_server.cc framework_test.cc $(SRC_DIR)/socket_handler.cc \
-       $(SRC_DIR)/channel.cc $(SRC_DIR)/epoll_handler.cc $(SRC_DIR)/dispatcher.cc \
-       $(SRC_DIR)/acceptor.cc $(SRC_DIR)/connection_handler.cc
+# Source files (organized by component)
+# Core reactor components
+REACTOR_SRCS = $(SRC_DIR)/dispatcher.cc $(SRC_DIR)/epoll_handler.cc $(SRC_DIR)/channel.cc
 
-# Header files (with lib/ prefix for dependency tracking)
-HEADERS = $(LIB_DIR)/net_server.h $(LIB_DIR)/client.h $(LIB_DIR)/common.h \
-          $(LIB_DIR)/socket_handler.h $(LIB_DIR)/channel.h $(LIB_DIR)/epoll_handler.h \
-          $(LIB_DIR)/inet_addr.h $(LIB_DIR)/dispatcher.h $(LIB_DIR)/acceptor.h \
-          $(LIB_DIR)/connection_handler.h
+# Network components
+NETWORK_SRCS = $(SRC_DIR)/socket_handler.cc $(SRC_DIR)/acceptor.cc $(SRC_DIR)/connection_handler.cc
+
+# Server and buffer
+SERVER_SRCS = $(SRC_DIR)/net_server.cc $(SRC_DIR)/buffer.cc
+
+# Application code
+APP_SRCS = reactor_server.cc framework_test.cc
+
+# All sources combined
+SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(APP_SRCS)
+
+# Header files (organized by category)
+CORE_HEADERS = $(LIB_DIR)/common.h $(LIB_DIR)/inet_addr.h
+REACTOR_HEADERS = $(LIB_DIR)/dispatcher.h $(LIB_DIR)/epoll_handler.h $(LIB_DIR)/channel.h
+NETWORK_HEADERS = $(LIB_DIR)/socket_handler.h $(LIB_DIR)/acceptor.h $(LIB_DIR)/connection_handler.h
+SERVER_HEADERS = $(LIB_DIR)/net_server.h $(LIB_DIR)/buffer.h $(LIB_DIR)/reactor_server.h
+TEST_HEADERS = $(LIB_DIR)/client.h
+
+# All headers combined
+HEADERS = $(CORE_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(TEST_HEADERS)
 
 # Default target
 all: $(TARGET)

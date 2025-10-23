@@ -17,8 +17,9 @@ ConnectionHandler::ConnectionHandler(std::shared_ptr<Dispatcher> _dispatcher, st
 
 
 void ConnectionHandler::OnMessage(){
-    if(client_channel_ -> is_channel_closed())
+    if(client_channel_ -> is_channel_closed()){
         return;
+    }
 
     char buffer[MAX_BUFFER_SIZE];
     while(true){
@@ -26,20 +27,28 @@ void ConnectionHandler::OnMessage(){
         ssize_t nread = ::read(fd(), buffer, sizeof buffer);
 
         if(nread > 0){
-            ssize_t total_written = 0;
             input_bf_.Append(buffer, nread);
             if(errno == EINTR){ // Interruptted by signal
                 continue;
             }
         } else if(nread == 0){ // Client close the connection
-           CallCloseCb(); 
+           CallCloseCb();
            break;
         } else{ // The incoming data is finished reading
             if((errno == EAGAIN) || (errno == EWOULDBLOCK)){
                 break;
             }
             CallCloseCb();
+            break;
         }
+    }
+
+    // After reading all available data, call the application callback if data was received
+    if(input_bf_.Size() > 0 && on_message_callback_){
+        std::string message(input_bf_.Data(), input_bf_.Size());
+        on_message_callback_(shared_from_this(), message);
+        // Clear the input buffer after processing
+        input_bf_.Clear();
     }
 }
 
@@ -49,18 +58,27 @@ void ConnectionHandler::SendData(const char *data, size_t size){
 }
 
 void ConnectionHandler::SetOnMessageCb(std::function<void(std::shared_ptr<ConnectionHandler>, std::string&)> fn){
-    if(on_message_callback_)
-        on_message_callback_ = fn;
+    on_message_callback_ = fn;
 }
 
 void ConnectionHandler::SetCompletionCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn){
-    if(completion_callback_)
-        completion_callback_ = fn;
+    completion_callback_ = fn;
 }
 
 void ConnectionHandler::CallCloseCb(){
+    // IMPORTANT: Capture shared_ptr to self BEFORE closing channel
+    // CloseChannel() removes us from channel_map, so shared_from_this() would fail after that
+    std::shared_ptr<ConnectionHandler> self = shared_from_this();
+
+    // Close the channel to remove fd from epoll
+    // This ensures the fd is properly cleaned up before ConnectionHandler might be destroyed
+    if(client_channel_ && !client_channel_->is_channel_closed()){
+        client_channel_->CloseChannel();
+    }
+
+    // Now call the application callback with the captured shared_ptr
     if (close_callback_)
-        close_callback_(shared_from_this());
+        close_callback_(self);
 }
 
 void ConnectionHandler::CallErroCb(){
@@ -80,7 +98,8 @@ void ConnectionHandler::CallWriteCb(){
     // If there has no data waiting to write, then unregister writing event
     if(output_bf_.Size() == 0){
         client_channel_ -> DisableWriteMode();
-        completion_callback_(shared_from_this());
+        if(completion_callback_)
+            completion_callback_(shared_from_this());
     }
 }
 

@@ -24,7 +24,7 @@ public:
     ~ConnectionHandler() = default; // no need the release resource for smart pointer
 
     int fd() const{ return sock_ -> fd(); }
-    std::string ip_addr() const { return sock_ -> ip_addr(); }
+    const std::string& ip_addr() const { return sock_ -> ip_addr(); }
     int port() const { return sock_ -> port(); }
 
     void OnMessage();

@@ -38,15 +38,39 @@ void EpollHandler::UpdateEvent(std::shared_ptr<Channel> ch){
     }
 }
 
+/**
+ * Remove channel from epoll and channel map
+ * MUST be called before closing the fd to prevent fd reuse bugs
+ */
+void EpollHandler::RemoveChannel(std::shared_ptr<Channel> ch){
+    int fd = ch->fd();
+
+    // Remove from epoll if it was registered
+    if(ch->is_epoll_in()){
+        if(::epoll_ctl(epollfd_, EPOLL_CTL_DEL, fd, nullptr) == -1){
+            // ENOENT means it wasn't in epoll (already removed or never added)
+            // EBADF means fd is invalid (already closed)
+            // Both are ok - we just want to ensure it's not in epoll
+            if(errno != ENOENT && errno != EBADF){
+                std::cout << "[EpollHandler] epoll_ctl DEL warning for fd=" << fd
+                          << ": " << strerror(errno) << std::endl;
+            }
+        }
+    }
+
+    // Remove from channel map
+    auto it = channel_map_.find(fd);
+    if(it != channel_map_.end()){
+        channel_map_.erase(it);
+    }
+}
+
 std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
     std::vector<std::shared_ptr<Channel>> channels;
     // init event array
     memset(events_, 0, sizeof(events_));
 
-    int infds = -1;
-
-
-    infds = epoll_wait(epollfd_, events_, MaxEpollEvents, timeout);
+    int infds = epoll_wait(epollfd_, events_, MaxEpollEvents, timeout);
 
     if(infds < 0){
         std::cout << "[Epoll Handler] epoll_wait() failed: " << strerror(errno) << std::endl;
@@ -58,11 +82,14 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
         std::cout << "[Epoll Handler] epoll_wait() failed, iterruptted by other signal: " << strerror(errno) << std::endl;
         throw std::runtime_error("epoll_wait() iterruptted by other signal");
     }
-    
-    // timeout
+
+    // timeout or no events
     if(infds == 0){
-        return channels;
+        return channels;  // RVO will optimize this
     }
+
+    // Reserve space to avoid reallocations
+    channels.reserve(infds);
 
     for(int idx = 0; idx < infds; idx ++){
         Channel *ch_raw = (Channel*)events_[idx].data.ptr;
@@ -75,5 +102,5 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
         }
     }
 
-    return channels;
+    return channels;  // RVO/NRVO will optimize this (no copy!)
 }

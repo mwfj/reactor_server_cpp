@@ -34,3 +34,7 @@ void Dispatcher::StopEventLoop(){
 void Dispatcher::UpdateChannel(std::shared_ptr<Channel> ch){
     ep_->UpdateEvent(ch);
 }
+
+void Dispatcher::RemoveChannel(std::shared_ptr<Channel> ch){
+    ep_->RemoveChannel(ch);
+}

@@ -19,4 +19,5 @@ public:
     bool is_running() const {return is_running_;}
 
     void UpdateChannel(std::shared_ptr<Channel>);
+    void RemoveChannel(std::shared_ptr<Channel>);
 };

@@ -4,7 +4,12 @@ Channel::Channel(std::shared_ptr<Dispatcher> _dispatcher, int _fd)
     : fd_(_fd), event_dispatcher_(_dispatcher){}
 
 Channel::~Channel() {
-    close_fn_();
+    // Close the file descriptor if not already closed
+    // Don't call close callback during destruction to avoid use-after-free
+    if(!is_channel_closed_ && fd_ != -1){
+        ::close(fd_);
+        fd_ = -1;
+    }
 }
 
 void Channel::EnableETMode(){
@@ -111,6 +116,15 @@ void Channel::CloseChannel(){
     // Call the close callback before actually closing
     if(close_fn_){
         close_fn_();
+    }
+
+    // IMPORTANT: Remove fd from epoll BEFORE closing it
+    // This prevents epoll fd reuse bugs when the OS reuses the fd number
+    if(fd_ != -1 && is_epoll_in_){
+        std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
+        if(ep_shared){
+            ep_shared->RemoveChannel(shared_from_this());
+        }
     }
 
     if(fd_ != -1){
