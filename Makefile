@@ -99,7 +99,7 @@ help:
 	@echo "  make test      # Build and run tests"
 	@echo "  ./run          # Run tests directly (after building)"
 	@echo ""
-	@echo "For more information, see CLAUDE.md"
+	@echo "For more information, see README.md"
 
 # Phony targets
 .PHONY: all clean test help
