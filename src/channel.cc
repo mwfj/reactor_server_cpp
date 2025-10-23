@@ -1,11 +1,64 @@
 #include "channel.h"
 
-// Channel::Channel(std::shared_ptr<EpollHandler> _ep, int _fd) : fd_(_fd), ep_(_ep){}
 Channel::Channel(std::shared_ptr<Dispatcher> _dispatcher, int _fd) 
     : fd_(_fd), event_dispatcher_(_dispatcher){}
 
 Channel::~Channel() {
-    CloseChannel();
+    close_fn_();
+}
+
+void Channel::EnableETMode(){
+    if(is_channel_closed_) return;
+    event_ |= EPOLLET;
+}
+
+void Channel::DisableETMode(){
+    if(is_channel_closed_) return;
+    event_ &= ~EPOLLET;
+}
+
+bool Channel::isEnableETMode() const {
+    return (event_ & EPOLLET) == EPOLLET;
+}
+
+void Channel::EnableReadMode(){
+    if(is_channel_closed_) return;
+    event_ |= EPOLLIN;
+    std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
+    if(ep_shared)
+        ep_shared -> UpdateChannel(shared_from_this());
+}
+
+void Channel::DisableReadMode(){
+    if(is_channel_closed_) return;
+    event_ &= ~EPOLLIN;
+    std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
+    if(ep_shared)
+        ep_shared -> UpdateChannel(shared_from_this());
+}
+
+bool Channel::isEnableReadMode() const {
+    return (event_ & EPOLLIN) == EPOLLIN;
+}
+
+void Channel::EnableWriteMode(){
+    if(is_channel_closed_)  return ;
+    event_ |= EPOLLOUT;
+    std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
+    if(ep_shared)
+        ep_shared -> UpdateChannel(shared_from_this());
+}
+
+void Channel::DisableWriteMode(){
+    if(is_channel_closed_)  return ;
+    event_ &= ~EPOLLOUT;
+    std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
+    if(ep_shared)
+        ep_shared -> UpdateChannel(shared_from_this());
+}
+
+bool Channel::isEnableWriteMode() const{
+    return (event_ & EPOLLOUT) == EPOLLOUT;
 }
 
 void Channel::HandleEvent() {
@@ -15,104 +68,30 @@ void Channel::HandleEvent() {
 
     const uint32_t events = devent_;
 
-    if(events & EPOLLERR){
-        CloseChannel();
-        return;
-    }
-
-    if(events & (EPOLLIN | EPOLLPRI)){
-        if(read_fn_) {
-            read_fn_();
-        }
-        if(is_channel_closed_) {
-            return;
-        }
-    }
-
     if(events & (EPOLLRDHUP | EPOLLHUP)){
-        CloseChannel();
-        return;
+        if(close_fn_)
+            close_fn_();
+    }else if(events & (EPOLLIN | EPOLLPRI)){
+        // Call Acceptor::NewConnection if it is acceptor channel
+        // Call ConnectionHandler:NewConection if it is client channel
+        if(read_fn_)
+            read_fn_();
+    }else if(events & EPOLLOUT){
+        if(write_fn_)
+            write_fn_();
+    }else{
+        if(error_fn_)
+            error_fn_();
     }
 }
 
-void Channel::NewConnection(SocketHandler& handler){
-    InetAddr clientAddr;
-
-    while(true){
-        int client_fd = handler.Accept(clientAddr);
-
-        if(client_fd < 0){
-            break;
-        }
-
-        auto ep_shared = event_dispatcher_.lock();
-        if(!ep_shared){
-            ::close(client_fd);
-            continue;
-        }
-
-        std::shared_ptr<Channel> clientCh(new Channel(ep_shared, client_fd));
-
-        // Set callback using shared_ptr to keep channel alive during callback
-        std::weak_ptr<Channel> weak_ch = clientCh;
-        clientCh->SetReadCallBackFn([weak_ch]() {
-            auto ch = weak_ch.lock();
-            if(ch) {
-                ch->OnMessage();
-            }
-        });
-        // Enable ET mode for better performance
-        clientCh->EnableETMode();
-        // This calls UpdateEvent which registers with epoll
-        clientCh->EnableReadMode(clientCh);
-    }
-}
-
-void Channel::OnMessage(){
-    if(is_channel_closed_) {
-        return;
-    }
-
-    char buffer[MAX_BUFFER_SIZE];
-    while(true){
-        memset(buffer, 0, sizeof buffer);
-        ssize_t nread = ::read(fd_, buffer, sizeof buffer);
-
-        if(nread > 0){
-            ssize_t total_written = 0;
-            while(total_written < nread){
-                ssize_t nwrite = ::send(fd_, buffer + total_written, static_cast<size_t>(nread - total_written), 0);
-                if(nwrite > 0){
-                    total_written += nwrite;
-                    continue;
-                }
-                if(nwrite == -1 && errno == EINTR){
-                    continue;
-                }
-                if(nwrite == -1 && ((errno == EAGAIN) || (errno == EWOULDBLOCK))){
-                    return;
-                }
-                CloseChannel();
-                return;
-            }
-        }else if(nread == 0){
-            CloseChannel();
-            return;
-        }else{
-            if(errno == EINTR){
-                continue;
-            }
-            if((errno == EAGAIN) || (errno == EWOULDBLOCK)){
-                break;
-            }
-            CloseChannel();
-            return;
-        }
-    }
-}
 
 void Channel::SetReadCallBackFn(std::function<void()> fn){
     read_fn_ = fn;
+}
+
+void Channel::SetWriteCallBackFn(std::function<void()> fn){
+    write_fn_ = fn;
 }
 
 void Channel::SetCloseCallBackFn(std::function<void()> fn){

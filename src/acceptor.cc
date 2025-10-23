@@ -17,7 +17,7 @@ Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _
 
     acceptor_channel_ = std::shared_ptr<Channel>(new Channel(event_dispatcher_, servsock_ -> fd()));
     acceptor_channel_ -> SetReadCallBackFn(std::bind(&Acceptor::NewConnection, this));
-    acceptor_channel_ -> EnableReadMode(acceptor_channel_); // let epoll_wait monitorting reading event
+    acceptor_channel_ -> EnableReadMode(); // let epoll_wait monitorting reading event
 }
 
 void Acceptor::SetNewConnCb(std::function<void(std::unique_ptr<SocketHandler>)> fn){

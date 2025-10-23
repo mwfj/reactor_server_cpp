@@ -6,7 +6,31 @@
 #include "socket_handler.h"
 #include "dispatcher.h"
 
-class Channel{
+class Channel : public std::enable_shared_from_this<Channel> {
+private:
+    int fd_ = -1;
+    /**
+     * Non-owning reference to Epoll loop.
+     * Uses weak_ptr for type safety and to detect if EpollHandler is destroyed.
+     * The EpollHandler is owned by NetServer and Channel just needs to reference it. 
+     */
+    std::weak_ptr<Dispatcher> event_dispatcher_;
+    // to mark whether the channel has been put in the epoll tree
+    bool is_epoll_in_ = false;
+    // the event that fd_ need to monitoring
+    uint32_t event_ = 0;
+    // the event that already finished 
+    uint32_t devent_ = 0;
+
+    bool is_channel_closed_ = false;
+
+    // Read callback
+    // - Callback Acceptor::NewConnection if is the acceptor channel
+    // - Callback Channel::OnMessage if is the client channel
+    std::function<void()>   read_fn_;
+    std::function<void()>   write_fn_;
+    std::function<void()>   close_fn_;
+    std::function<void()>   error_fn_;
 public:
     Channel() = delete;
     // Channel(std::shared_ptr<EpollHandler> _ep, int _fd);
@@ -14,18 +38,18 @@ public:
     ~Channel();
 
     const int fd() const { return fd_; }
-    // enable ET (Edge-Triggered) mode
-    void EnableETMode(){
-        if(is_channel_closed_) return;
-        event_ |= EPOLLET;
-    }
-    void EnableReadMode(std::shared_ptr<Channel> self){
-        if(is_channel_closed_) return;
-        event_ |= EPOLLIN;
-        auto ep_shared = event_dispatcher_.lock();
-        if(ep_shared)
-            ep_shared -> UpdateChannel(self);
-    }
+    // Set ET (Edge-Triggered) mode
+    void EnableETMode();
+    void DisableETMode();
+    bool isEnableETMode() const;
+
+    void EnableReadMode();
+    void DisableReadMode();
+    bool isEnableReadMode() const;
+
+    void EnableWriteMode();
+    void DisableWriteMode();
+    bool isEnableWriteMode() const;
 
     uint32_t Event() const {return event_;}
     uint32_t dEvent() const {return devent_;}
@@ -42,36 +66,12 @@ public:
 
     void HandleEvent();
 
-    void NewConnection(SocketHandler&);
-    void OnMessage();
     void CloseChannel();
     bool is_channel_closed() const { return is_channel_closed_; }
 
 
     void SetReadCallBackFn(std::function<void()>);
+    void SetWriteCallBackFn(std::function<void()>);
     void SetCloseCallBackFn(std::function<void()>);
     void SetErrorCallBackFn(std::function<void()>);
-private:
-    int fd_ = -1;
-    /**
-     * Non-owning reference to Epoll loop.
-     * Uses weak_ptr for type safety and to detect if EpollHandler is destroyed.
-     * The EpollHandler is owned by ReactorServer and Channel just needs to reference it. 
-     */
-    std::weak_ptr<Dispatcher> event_dispatcher_;
-    // to mark whether the channel has been put in the epoll tree
-    bool is_epoll_in_ = false;
-    // the event that fd_ need to monitoring
-    uint32_t event_ = 0;
-    // the event that already finished 
-    uint32_t devent_ = 0;
-
-    bool is_channel_closed_ = false;
-
-    // Read callback
-    // - Callback Acceptor::NewConnection if is the acceptor channel
-    // - Callback Channel::OnMessage if is the client channel
-    std::function<void()> read_fn_;
-    std::function<void()> close_fn_;
-    std::function<void()> error_fn_;
 };
