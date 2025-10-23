@@ -1,12 +1,11 @@
-# make                  # Build the executable
-# make clean            # Remove build artifacts
-# make test             # Build and run all tests
-# make test-server      # Build and run server test
-# make test-client      # Build and run client test
-# make test-integrated  # Build and run integrated test
-# make test-edge        # Build and run edge-triggered mode test
-# make test-error       # Build and run error test
-# make test-performance # Build and run performance test (5000 clients)
+# Reactor Server C++ - Makefile
+# High-performance network server using the Reactor pattern with epoll
+#
+# Quick start:
+#   make        - Build the project
+#   make test   - Build and run all tests
+#   make clean  - Remove build artifacts
+#   make help   - Show detailed help
 
 # Compiler and flags
 CXX = g++
@@ -48,6 +47,8 @@ TEST_HEADERS = $(LIB_DIR)/client.h
 HEADERS = $(CORE_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(TEST_HEADERS)
 
 # Default target
+.DEFAULT_GOAL := all
+
 all: $(TARGET)
 
 # Build the executable
@@ -60,26 +61,45 @@ clean:
 
 # Run all tests
 test: $(TARGET)
+	@echo "Running test suite..."
 	./$(TARGET)
 
-# Run specific test modes
-test-server: $(TARGET)
-	./$(TARGET) server
-
-test-client: $(TARGET)
-	./$(TARGET) client
-
-test-integrated: $(TARGET)
-	./$(TARGET) integrated
-
-test-edge: $(TARGET)
-	./$(TARGET) edge
-
-test-error: $(TARGET)
-	./$(TARGET) error
-
-test-performance: $(TARGET)
-	./$(TARGET) performance
+# Display help information
+help:
+	@echo "Reactor Server C++ - Makefile Help"
+	@echo "===================================="
+	@echo ""
+	@echo "Available targets:"
+	@echo "  make [all]     - Build the project (default target)"
+	@echo "                   Compiles all source files and creates './run' executable"
+	@echo ""
+	@echo "  make test      - Build and run all tests"
+	@echo "                   Runs BasicTests (port 8888) and StressTests (port 8889)"
+	@echo ""
+	@echo "  make clean     - Remove build artifacts"
+	@echo "                   Deletes the './run' executable"
+	@echo ""
+	@echo "  make help      - Show this help message"
+	@echo ""
+	@echo "Build configuration:"
+	@echo "  Compiler:      $(CXX)"
+	@echo "  C++ Standard:  C++11"
+	@echo "  Flags:         $(CXXFLAGS)"
+	@echo "  Linker:        $(LDFLAGS)"
+	@echo ""
+	@echo "Project structure:"
+	@echo "  Headers:       include/*.h"
+	@echo "  Source:        server/*.cc"
+	@echo "  Tests:         test/*.cc test/*.h"
+	@echo "  Executable:    ./run"
+	@echo ""
+	@echo "Usage examples:"
+	@echo "  make           # Build the project"
+	@echo "  make clean     # Clean build artifacts"
+	@echo "  make test      # Build and run tests"
+	@echo "  ./run          # Run tests directly (after building)"
+	@echo ""
+	@echo "For more information, see CLAUDE.md"
 
 # Phony targets
-.PHONY: all clean test test-server test-client test-integrated test-edge test-error test-performance
+.PHONY: all clean test help
