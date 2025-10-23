@@ -16,6 +16,7 @@ LDFLAGS = -lpthread
 # Directories
 SRC_DIR = src
 LIB_DIR = lib
+TEST_DIR = test
 
 # Target executable
 TARGET = run
@@ -31,7 +32,7 @@ NETWORK_SRCS = $(SRC_DIR)/socket_handler.cc $(SRC_DIR)/acceptor.cc $(SRC_DIR)/co
 SERVER_SRCS = $(SRC_DIR)/net_server.cc $(SRC_DIR)/buffer.cc
 
 # Application code
-APP_SRCS = reactor_server.cc framework_test.cc
+APP_SRCS = reactor_server.cc ${TEST_DIR}/framework_test.cc
 
 # All sources combined
 SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(APP_SRCS)
