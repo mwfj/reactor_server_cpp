@@ -32,7 +32,7 @@ NETWORK_SRCS = $(SERVER_DIR)/socket_handler.cc $(SERVER_DIR)/acceptor.cc $(SERVE
 SERVER_SRCS = $(SERVER_DIR)/net_server.cc $(SERVER_DIR)/buffer.cc
 
 # Application code
-APP_SRCS = $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/framework_test.cc
+APP_SRCS = $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/run_test.cc
 
 # All sources combined
 SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(APP_SRCS)
