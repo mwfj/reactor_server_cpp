@@ -128,7 +128,7 @@ std::shared_ptr<ThreadTaskInterface> ThreadPool::GetTask() {
         return nullptr;
     }
 
-    std::shared_ptr<ThreadTaskInterface> task = tasks_.front();
+    std::shared_ptr<ThreadTaskInterface> task = std::move(tasks_.front());
     tasks_.pop_front();
     return task;
 }
