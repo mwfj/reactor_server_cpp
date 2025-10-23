@@ -1,4 +1,4 @@
-#include "server.h"
+#include "net_server.h"
 #include "client.h"
 #include <iostream>
 #include <thread>
@@ -57,11 +57,11 @@ namespace BasicTests {
     // RAII wrapper for server thread management
     class ServerRunner {
     private:
-        ReactorServer& server_;
+        NetServer& server_;
         std::thread server_thread_;
 
     public:
-        ServerRunner(ReactorServer& server) : server_(server) {
+        ServerRunner(NetServer& server) : server_(server) {
             server_thread_ = std::thread([this]() {
                 try {
                     std::cout << "[SERVER] Starting on " << TEST_IP << ":" << TEST_PORT << std::endl;
@@ -91,7 +91,7 @@ namespace BasicTests {
         std::cout << "\n[TEST] Single Client Connection..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
+            NetServer server(TEST_IP, TEST_PORT);
             ServerRunner runner(server);
 
             // Create and connect client
@@ -114,7 +114,7 @@ namespace BasicTests {
         std::cout << "\n[TEST] Echo Functionality..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
+            NetServer server(TEST_IP, TEST_PORT);
             ServerRunner runner(server);
 
             Client client(TEST_PORT, TEST_IP, "TestMessage");
@@ -143,7 +143,7 @@ namespace BasicTests {
         std::cout << "\n[TEST] Multiple Sequential Connections..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
+            NetServer server(TEST_IP, TEST_PORT);
             ServerRunner runner(server);
 
             const int NUM_CLIENTS = 5;
@@ -177,7 +177,7 @@ namespace BasicTests {
         std::cout << "\n[TEST] Concurrent Connections..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
+            NetServer server(TEST_IP, TEST_PORT);
             ServerRunner runner(server);
 
             const int NUM_CLIENTS = 10;
@@ -222,7 +222,7 @@ namespace BasicTests {
         std::cout << "\n[TEST] Large Message Transfer..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
+            NetServer server(TEST_IP, TEST_PORT);
             ServerRunner runner(server);
 
             // Create a large message (close to buffer size)
@@ -250,7 +250,7 @@ namespace BasicTests {
         std::cout << "\n[TEST] Quick Connection and Disconnect..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
+            NetServer server(TEST_IP, TEST_PORT);
             ServerRunner runner(server);
 
             for (int i = 0; i < 3; i++) {
@@ -304,11 +304,11 @@ namespace StressTests {
     // RAII wrapper for stress test server
     class StressServerRunner {
     private:
-        ReactorServer& server_;
+        NetServer& server_;
         std::thread server_thread_;
 
     public:
-        StressServerRunner(ReactorServer& server) : server_(server) {
+        StressServerRunner(NetServer& server) : server_(server) {
             server_thread_ = std::thread([this]() {
                 try {
                     std::cout << "[SERVER] Stress test server starting" << std::endl;
@@ -335,7 +335,7 @@ namespace StressTests {
         std::cout << "\n[STRESS TEST] High Load (100 concurrent clients)..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
+            NetServer server(TEST_IP, TEST_PORT);
             StressServerRunner runner(server);
 
             const int NUM_CLIENTS = 100;
