@@ -29,13 +29,20 @@ void NetServer::HandleNewConnction(std::unique_ptr<SocketHandler> cilent_sock){
     conn -> SetOnMessageCb(std::bind(&NetServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
     conn -> SetCompletionCb(std::bind(&NetServer::SendComplete, this, std::placeholders::_1));
 
+    connections_[conn -> fd()] = conn;
+
     std::cout << "[Reactor Server] new connection(fd: " 
         << conn -> fd() << ", ip: " << conn->ip_addr() << ", port: " << conn -> port() << ").\n"
         << "ok" << std::endl;
-    connections_[conn -> fd()] = conn;
+
+    if(new_conn_callback_)
+        new_conn_callback_(conn);
 }
 
 void NetServer::CloseConnection(std::shared_ptr<ConnectionHandler> conn){
+    if(close_conn_callback_)
+        close_conn_callback_(conn);
+
     std::cout << "[NetServer] client fd: " << conn -> fd() << " disconnected." << std::endl;
     connections_.erase(conn -> fd());
     // close this connection
@@ -43,6 +50,9 @@ void NetServer::CloseConnection(std::shared_ptr<ConnectionHandler> conn){
 }
 
 void NetServer::ErrorConnection(std::shared_ptr<ConnectionHandler> conn){
+    if(error_callback_)
+        error_callback_(conn);
+        
     std::cout << "[NetServer] client fd: " << conn -> fd() << "error occurred, disconnect." << std::endl;
     connections_.erase(conn -> fd());
     conn.reset();
