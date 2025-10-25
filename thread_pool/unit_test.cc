@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-#include "lib/threadpool.h"
+#include "include/threadpool.h"
 
 namespace THREADPOOL_TESTCASE {
 

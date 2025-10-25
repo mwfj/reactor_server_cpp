@@ -4,7 +4,7 @@ LDLIBS := -pthread
 
 # Directories
 SRC_DIR := src
-LIB_DIR := lib
+LIB_DIR := include
 
 # Source files (with src/ prefix)
 SRCS := unit_test.cc $(SRC_DIR)/threadpool.cc $(SRC_DIR)/threadtask.cc
@@ -12,7 +12,7 @@ SRCS := unit_test.cc $(SRC_DIR)/threadpool.cc $(SRC_DIR)/threadtask.cc
 # Object files (placed in src/ directory)
 OBJS := unit_test.o $(SRC_DIR)/threadpool.o $(SRC_DIR)/threadtask.o
 
-# Header files (with lib/ prefix)
+# Header files (with include/ prefix)
 HEADERS := $(LIB_DIR)/threadpool.h $(LIB_DIR)/threadtask.h
 
 # Target executable
