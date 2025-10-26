@@ -18,23 +18,44 @@ EpollHandler::~EpollHandler(){
  * but we maintain ownership with smart pointers in channel_map_.
  */
 void EpollHandler::UpdateEvent(std::shared_ptr<Channel> ch){
+    // Check if channel is closed - prevents TOCTOU race
+    // This must be checked here, not just in Enable*/Disable* methods
+    if (ch->is_channel_closed()) {
+        return;  // Silently ignore - channel is closing or closed
+    }
+
+    int fd = ch->fd();
+
+    // Double-check fd is valid before epoll operations
+    if (fd < 0) {
+        return;  // Invalid fd, nothing to do
+    }
+
     epoll_event ev;
     ev.data.ptr = ch.get(); // Store raw pointer for epoll
     ev.events = ch->Event();
 
     if(ch->is_epoll_in()){
-        if(::epoll_ctl(epollfd_, EPOLL_CTL_MOD, ch->fd(), &ev) == -1){
+        if(::epoll_ctl(epollfd_, EPOLL_CTL_MOD, fd, &ev) == -1){
+            // If fd is invalid or not in epoll, it might be closing - don't throw
+            if (errno == EBADF || errno == ENOENT) {
+                return;  // Gracefully handle race condition
+            }
             std::cout << "[Epoll Handler] epoll_ctl MOD failed: " << strerror(errno) << std::endl;
             throw std::runtime_error("epoll_ctl MOD failed");
         }
     }else{
-        if(::epoll_ctl(epollfd_, EPOLL_CTL_ADD, ch->fd(), &ev) == -1){
+        if(::epoll_ctl(epollfd_, EPOLL_CTL_ADD, fd, &ev) == -1){
+            // If fd is invalid or already in epoll, it might be a race - don't throw
+            if (errno == EBADF || errno == EEXIST) {
+                return;  // Gracefully handle race condition
+            }
             std::cout << "[Epoll Handler] epoll_ctl ADD failed: " << strerror(errno) << std::endl;
             throw std::runtime_error("epoll_ctl ADD failed");
         }
         ch->SetEpollIn();
         // Store in map to maintain ownership
-        channel_map_[ch->fd()] = ch;
+        channel_map_[fd] = ch;
     }
 }
 
