@@ -52,7 +52,7 @@ void TestBasicExecution() {
 
     ThreadPool pool;
     pool.Init();
-    pool.SetMaxThreadWorkerNum(4, false);
+    pool.SetThreadWorkerNum(4, false);
     pool.Start();
 
     constexpr int task_count = 5;
@@ -95,7 +95,7 @@ void TestExceptionPropagation() {
 
     ThreadPool pool;
     pool.Init();
-    pool.SetMaxThreadWorkerNum(2, false);
+    pool.SetThreadWorkerNum(2, false);
     pool.Start();
 
     auto ok_task = std::make_shared<TestTask>([]() {
@@ -138,7 +138,7 @@ void TestStopCancelsPendingTasks() {
 
     ThreadPool pool;
     pool.Init();
-    pool.SetMaxThreadWorkerNum(1, false);
+    pool.SetThreadWorkerNum(1, false);
     pool.Start();
 
     auto long_task = std::make_shared<TestTask>([]() {
@@ -183,7 +183,7 @@ void TestRestartability() {
 
     ThreadPool pool;
     pool.Init();
-    pool.SetMaxThreadWorkerNum(2, false);
+    pool.SetThreadWorkerNum(2, false);
 
     auto run_batch = [&](int batch_size, int expected_start) {
         pool.Start();
@@ -233,11 +233,11 @@ void TestStartValidation() {
     ThreadPool pool;
     pool.Init();
 
-    if (pool.GetMaxThreadWorkerNum() <= 0) {
+    if (pool.GetThreadWorkerNum() <= 0) {
         throw std::runtime_error("StartValidation: Init did not assign a positive worker count");
     }
 
-    pool.SetMaxThreadWorkerNum(0, false);
+    pool.SetThreadWorkerNum(0, false);
 
     bool caught_expected = false;
     try {
@@ -252,7 +252,7 @@ void TestStartValidation() {
         throw std::runtime_error("StartValidation: expected Start() to reject zero workers");
     }
 
-    pool.SetMaxThreadWorkerNum(1, false);
+    pool.SetThreadWorkerNum(1, false);
     pool.Start();
     pool.Stop();
 
@@ -264,7 +264,7 @@ void TestCooperativeCancellation() {
 
     ThreadPool pool;
     pool.Init();
-    pool.SetMaxThreadWorkerNum(1, false);
+    pool.SetThreadWorkerNum(1, false);
     pool.Start();
 
     bool running_reported_at_start = false;

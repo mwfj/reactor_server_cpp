@@ -2,28 +2,57 @@
 
 
 NetServer::NetServer(const std::string& _ip, const size_t _port)
-    : event_dispatcher_(std::shared_ptr<Dispatcher>(new Dispatcher())),
-      acceptor_(new Acceptor(event_dispatcher_, _ip, _port))
+    : conn_dispatcher_(std::make_shared<Dispatcher>()),
+      acceptor_(nullptr)
 {
+    // Initialize conn_dispatcher_ after shared_ptr is constructed (required for eventfd setup)
+    conn_dispatcher_->Init();
+
+    // Now create acceptor with initialized dispatcher
+    acceptor_ = std::unique_ptr<Acceptor>(new Acceptor(conn_dispatcher_, _ip, _port));
     acceptor_->SetNewConnCb(std::bind(&NetServer::HandleNewConnection, this, std::placeholders::_1));
+    sock_workers_.Init();
+    sock_workers_.Start();
 }
 
 NetServer::~NetServer(){
+    socket_dispatchers_.clear();
     connections_.clear();
 }
 
 // start event loop
 void NetServer::Start(){
-    event_dispatcher_->RunEventLoop();
+    socket_dispatchers_.reserve(sock_workers_.GetThreadWorkerNum());
+    for(int idx = 0; idx < sock_workers_.GetThreadWorkerNum(); idx ++){
+        std::shared_ptr<Dispatcher> task = std::make_shared<Dispatcher>(true);
+        // Initialize each socket dispatcher (required for eventfd setup)
+        task->Init();
+        socket_dispatchers_.emplace_back(task);
+
+        // Use lambda with COPY-BY-VALUE capture for thread safety
+        // Why copy? The lambda will execute in a different thread later.
+        // Capturing 'task' by value ensures the Dispatcher shared_ptr is safely
+        // shared across threads without dangling references.
+        std::shared_ptr<SocketWorker> work_task = std::shared_ptr<SocketWorker>(
+            new SocketWorker([task]() {
+                task->RunEventLoop();
+            }));
+        sock_workers_.AddTask(work_task);
+    }
+    conn_dispatcher_->RunEventLoop();
 }
 
 // stop event loop
 void NetServer::Stop(){
-    event_dispatcher_->StopEventLoop();
+    for(auto task : socket_dispatchers_)
+        task -> StopEventLoop();
+    conn_dispatcher_->StopEventLoop();
+    sock_workers_.Stop();
 }
 
 void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
-    std::shared_ptr<ConnectionHandler> conn = std::shared_ptr<ConnectionHandler>(new ConnectionHandler(event_dispatcher_, std::move(cilent_sock)));
+    int idx = cilent_sock -> fd() % sock_workers_.GetThreadWorkerNum();
+    std::shared_ptr<ConnectionHandler> conn = std::shared_ptr<ConnectionHandler>(new ConnectionHandler(socket_dispatchers_[idx], std::move(cilent_sock)));
     conn -> SetCloseCb(std::bind(&NetServer::HandleCloseConnection, this, std::placeholders::_1));
     conn -> SetErrorCb(std::bind(&NetServer::HandleErrorConnection, this, std::placeholders::_1));
     conn -> SetOnMessageCb(std::bind(&NetServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));

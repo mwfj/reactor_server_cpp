@@ -8,11 +8,35 @@
 #include "connection_handler.h"
 #include "acceptor.h"
 
+#include "threadtask.h"
+#include "threadpool.h"
+
+// For socket connection related task, use this type of worker
+// SocketWorker: Handles I/O event loops for client connections in thread pool
+class SocketWorker : public ThreadTaskInterface{
+public:
+    explicit SocketWorker(std::function<void()> _func) : func_(std::move(_func)){}
+protected:
+    int RunTask() override {
+        try{
+            func_();
+            return 0;  // Success
+        }catch (const std::exception& e){
+            std::cerr << "[NetServer] SocketWorker: Error handling event: " << e.what() << std::endl;
+            return -1;
+        }
+    }
+private:
+    std::function<void()> func_;
+};
+
 class NetServer {
 private:
     // Owner (shared with components for coordination)
-    // TODO: One server can have multiple dispatcher for multi-threads design
-    std::shared_ptr<Dispatcher> event_dispatcher_; 
+    // The main event loop for build socket and connection
+    std::shared_ptr<Dispatcher> conn_dispatcher_;
+    // Sub-events looks for
+    std::vector<std::shared_ptr<Dispatcher>> socket_dispatchers_;
     std::map<int, std::shared_ptr<ConnectionHandler>> connections_;
     std::unique_ptr<Acceptor> acceptor_;  // Sole owner of Acceptor
 
@@ -23,6 +47,8 @@ private:
 
     std::function<void(std::shared_ptr<ConnectionHandler>, std::string&)>  on_message_callback_ = nullptr;
     std::function<void(std::shared_ptr<ConnectionHandler>)>  send_complete_callback_ = nullptr;
+
+    ThreadPool sock_workers_;
 public:
     NetServer() = delete;
     NetServer(const std::string& _ip, const size_t _port);

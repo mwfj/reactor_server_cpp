@@ -63,10 +63,12 @@
 #include <iostream>
 #include <chrono>
 #include <thread>
+#include <mutex>
 #include <vector>
 #include <memory>
 #include <functional>
 #include <map>
+#include <atomic>
 
 #define MAX_BUFFER_SIZE 1024
 #define MAX_REPLY_SIZE 50

@@ -2,39 +2,39 @@
 #include <iostream>
 #include <stdexcept>
 
-inline void ThreadPool::SetMaxThreadWorkerNum(int nums, bool set_by_init){
-    Max_Thread_Nums = nums;
+inline void ThreadPool::SetThreadWorkerNum(int nums, bool set_by_init){
+    thread_nums = nums;
     if(!set_by_init)
         std::cout << "Set Max Worker Number to: " << nums << std::endl;
 }
 
-inline int ThreadPool::GetMaxThreadWorkerNum(){
-    return Max_Thread_Nums;
+inline int ThreadPool::GetThreadWorkerNum(){
+    return thread_nums;
 }
 
 void ThreadPool::Init(int worker_nums){
     std::lock_guard<std::mutex> lck(mtx_);
-    SetMaxThreadWorkerNum(worker_nums, true);
-    std::cout << "[" << std::this_thread::get_id() << "]: Thread Pool Init, worker number: " << GetMaxThreadWorkerNum() << std::endl;
+    SetThreadWorkerNum(worker_nums, true);
+    std::cout << "[" << std::this_thread::get_id() << "]: Thread Pool Init, worker number: " << GetThreadWorkerNum() << std::endl;
 }
 
 void ThreadPool::Init(){
     std::lock_guard<std::mutex> lck(mtx_);
     // init the number of thread worker same as the CPU core number
-    unsigned int suggested_workers = std::thread::hardware_concurrency();
+    unsigned int suggested_workers = std::thread::hardware_concurrency() >> 1;
     if(suggested_workers == 0) {
         std::cout << "Invalid core numbers, set to default number: "<< DEFAULT_THREAD_NUMS << "\n";
         suggested_workers = DEFAULT_THREAD_NUMS;
     }
-    SetMaxThreadWorkerNum(static_cast<int>(suggested_workers), true);
-    std::cout << "[" << std::this_thread::get_id() << "]: Thread Pool Init, worker number: " << GetMaxThreadWorkerNum() << std::endl;
+    SetThreadWorkerNum(static_cast<int>(suggested_workers), true);
+    std::cout << "[" << std::this_thread::get_id() << "]: Thread Pool Init, worker number: " << GetThreadWorkerNum() << std::endl;
 }
 
 
 void ThreadPool::Start(){
     std::lock_guard<std::mutex> lck(mtx_);
 
-    if(GetMaxThreadWorkerNum() <= 0) {
+    if(GetThreadWorkerNum() <= 0) {
         std::cerr << "Thread Pool Start failed: thread count <= 0" << std::endl;
         throw std::runtime_error("Thread Pool Start failed: thread count <= 0");
     }
@@ -45,9 +45,9 @@ void ThreadPool::Start(){
     }
 
     is_running_.store(true);
-    workers_.reserve(static_cast<std::size_t>(GetMaxThreadWorkerNum()));
+    workers_.reserve(static_cast<std::size_t>(GetThreadWorkerNum()));
 
-    for(int idx = 0; idx < GetMaxThreadWorkerNum(); idx ++){
+    for(int idx = 0; idx < GetThreadWorkerNum(); idx ++){
         workers_.emplace_back(&ThreadPool::Run, this);
     }
     std::cout << "[" << std::this_thread::get_id() << "]: ThreadPool Start" << std::endl;

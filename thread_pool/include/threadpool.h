@@ -20,7 +20,7 @@ private:
     std::mutex mtx_;
     std::condition_variable cv_;
 
-    int Max_Thread_Nums = 0;
+    int thread_nums = 0;
     const int DEFAULT_THREAD_NUMS = 6;
     std::atomic_int running_threads_{0};
     std::atomic_bool is_running_{false};
@@ -34,8 +34,8 @@ public:
     void Start();
     void Stop();
 
-    void SetMaxThreadWorkerNum(int, bool);
-    int GetMaxThreadWorkerNum();
+    void SetThreadWorkerNum(int, bool);
+    int GetThreadWorkerNum();
 
     bool is_running() const { return is_running_; }
     int running_threads() const { return running_threads_.load(); }

@@ -32,13 +32,19 @@ void ConnectionHandler::OnMessage(){
                 continue;
             }
         } else if(nread == 0){ // Client close the connection
-           CallCloseCb();
+           // Close the channel, which will trigger the close callback
+           if(client_channel_ && !client_channel_->is_channel_closed()){
+               client_channel_->CloseChannel();
+           }
            break;
         } else{ // The incoming data is finished reading
             if((errno == EAGAIN) || (errno == EWOULDBLOCK)){
                 break;
             }
-            CallCloseCb();
+            // Read error - close the channel, which will trigger the close callback
+            if(client_channel_ && !client_channel_->is_channel_closed()){
+                client_channel_->CloseChannel();
+            }
             break;
         }
     }
@@ -55,6 +61,16 @@ void ConnectionHandler::OnMessage(){
 void ConnectionHandler::SendData(const char *data, size_t size){
     output_bf_.AppendWithHead(data, size);
     client_channel_ -> EnableWriteMode();
+
+    if(event_dispatcher_ && !event_dispatcher_ -> is_sock_dispatcher())
+        event_dispatcher_ -> EnQueue(std::bind(&ConnectionHandler::DoSend, this, data, size));
+    else
+        DoSend(data, size);
+}
+
+void ConnectionHandler::DoSend(const char *data, size_t size){
+    output_bf_.AppendWithHead(data, size);
+    client_channel_ -> EnableWriteMode();
 }
 
 void ConnectionHandler::SetOnMessageCb(std::function<void(std::shared_ptr<ConnectionHandler>, std::string&)> fn){
@@ -66,17 +82,23 @@ void ConnectionHandler::SetCompletionCb(std::function<void(std::shared_ptr<Conne
 }
 
 void ConnectionHandler::CallCloseCb(){
-    // IMPORTANT: Capture shared_ptr to self BEFORE closing channel
-    // CloseChannel() removes us from channel_map, so shared_from_this() would fail after that
+    // Prevent duplicate close callbacks with atomic compare-exchange
+    bool expected = false;
+    if (!is_closing_.compare_exchange_strong(expected, true)) {
+        // Already closing, return immediately to prevent duplicate callbacks
+        return;
+    }
+
+    // IMPORTANT: Capture shared_ptr to self to keep this alive during callback
     std::shared_ptr<ConnectionHandler> self = shared_from_this();
 
-    // Close the channel to remove fd from epoll
-    // This ensures the fd is properly cleaned up before ConnectionHandler might be destroyed
+    // Close the channel to clean up fd and remove from epoll
+    // CloseChannel() will NOT call this callback again (no recursion)
     if(client_channel_ && !client_channel_->is_channel_closed()){
         client_channel_->CloseChannel();
     }
 
-    // Now call the application callback with the captured shared_ptr
+    // Call the application callback
     if (close_callback_)
         close_callback_(self);
 }
@@ -87,17 +109,19 @@ void ConnectionHandler::CallErroCb(){
 }
 
 void ConnectionHandler::CallWriteCb(){
-    if(!client_channel_ -> isEnableWriteMode())
-        throw std::runtime_error("Client Channel Not Enable the Write Mode");
+    // Check if channel is closed or write mode disabled (can happen during shutdown)
+    if(!client_channel_ || client_channel_->is_channel_closed() || !client_channel_->isEnableWriteMode()) {
+        return; // Silently ignore - channel is closing or already closed
+    }
 
     int write_sz = ::send(fd(), output_bf_.Data(), output_bf_.Size(), 0);
-    // Remove sents data
+    // Remove sent data
     if(write_sz > 0)
         output_bf_.Erase(0, write_sz);
 
-    // If there has no data waiting to write, then unregister writing event
+    // If there's no data waiting to write, then unregister writing event
     if(output_bf_.Size() == 0){
-        client_channel_ -> DisableWriteMode();
+        client_channel_->DisableWriteMode();
         if(completion_callback_)
             completion_callback_(shared_from_this());
     }

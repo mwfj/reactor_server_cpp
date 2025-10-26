@@ -18,6 +18,8 @@ private:
 
     Buffer input_bf_;
     Buffer output_bf_;
+
+    std::atomic<bool> is_closing_{false};
 public:
     ConnectionHandler() = delete;
     ConnectionHandler(std::shared_ptr<Dispatcher>, std::unique_ptr<SocketHandler>);
@@ -30,6 +32,7 @@ public:
     void OnMessage();
 
     void SendData(const char*, size_t);
+    void DoSend(const char*, size_t);
     
     void CallCloseCb();
     void CallErroCb();

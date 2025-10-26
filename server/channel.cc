@@ -73,18 +73,30 @@ void Channel::HandleEvent() {
 
     const uint32_t events = devent_;
 
+    // Handle close events with highest priority
+    // If connection is closing, don't process other events
     if(events & (EPOLLRDHUP | EPOLLHUP)){
         if(close_fn_)
             close_fn_();
-    }else if(events & (EPOLLIN | EPOLLPRI)){
+        return; // Don't process other events if closing
+    }
+
+    // Handle read events
+    if(events & (EPOLLIN | EPOLLPRI)){
         // Call Acceptor::NewConnection if it is acceptor channel
-        // Call ConnectionHandler:NewConection if it is client channel
+        // Call ConnectionHandler::OnMessage if it is client channel
         if(read_fn_)
             read_fn_();
-    }else if(events & EPOLLOUT){
+    }
+
+    // Handle write events
+    if(events & EPOLLOUT){
         if(write_fn_)
             write_fn_();
-    }else{
+    }
+
+    // Handle error events
+    if(events & EPOLLERR){
         if(error_fn_)
             error_fn_();
     }
@@ -108,15 +120,16 @@ void Channel::SetErrorCallBackFn(std::function<void()> fn){
 }
 
 void Channel::CloseChannel(){
-    if(is_channel_closed_){
+    // Use atomic compare-and-swap to prevent race conditions
+    // If already closed, return immediately
+    bool expected = false;
+    if (!is_channel_closed_.compare_exchange_strong(expected, true)) {
+        // Another thread already closed this channel
         return;
     }
-    is_channel_closed_ = true;
 
-    // Call the close callback before actually closing
-    if(close_fn_){
-        close_fn_();
-    }
+    // NOTE: Do NOT call close_fn_() here to avoid recursion
+    // The close callback should call CloseChannel(), not the other way around
 
     // IMPORTANT: Remove fd from epoll BEFORE closing it
     // This prevents epoll fd reuse bugs when the OS reuses the fd number

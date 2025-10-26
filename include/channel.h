@@ -19,10 +19,10 @@ private:
     bool is_epoll_in_ = false;
     // the event that fd_ need to monitoring
     uint32_t event_ = 0;
-    // the event that already finished 
+    // the event that already finished
     uint32_t devent_ = 0;
 
-    bool is_channel_closed_ = false;
+    std::atomic<bool> is_channel_closed_{false};
 
     // Read callback
     // - Callback Acceptor::NewConnection if is the acceptor channel
@@ -56,6 +56,7 @@ public:
     void SetEpollIn() {
         is_epoll_in_ = true;
     }
+    bool is_channel_closed() const { return is_channel_closed_.load(); }
     void SetEvent(uint32_t ev){
         event_ = ev;
     }
@@ -66,8 +67,6 @@ public:
     void HandleEvent();
 
     void CloseChannel();
-    bool is_channel_closed() const { return is_channel_closed_; }
-
 
     void SetReadCallBackFn(std::function<void()>);
     void SetWriteCallBackFn(std::function<void()>);
