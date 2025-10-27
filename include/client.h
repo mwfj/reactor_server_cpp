@@ -51,12 +51,22 @@ private:
         const char* ptr = static_cast<const char*>(buffer);
 
         while(total_sent < n) {
-            ssize_t sent = send(socketfd_, ptr + total_sent, n - total_sent, 0);
+            int send_flags = 0;
+#ifdef MSG_NOSIGNAL
+            send_flags += MSG_NOSIGNAL;
+#endif
+            ssize_t sent = send(socketfd_, ptr + total_sent, n - total_sent, send_flags);
             if(sent <= 0) {
-                if(errno == EINTR) {
-                    continue;  // Interrupted, try again
+                if(errno == EINTR || errno == ECONNRESET){
+                    // Peer closed connection - propagate failure to caller without raising SIGPIPE
+                    return false;
                 }
-                throw std::runtime_error("Send failed");
+                throw std::runtime_error(std::string("Send failed: ") + std::strerror(errno));
+
+                if(sent == 0){
+                    // Socket closed - treat as failure
+                    return false;
+                }
             }
             total_sent += sent;
         }
@@ -80,7 +90,11 @@ public:
         socketfd_ = socket(AF_INET, SOCK_STREAM, 0);
         if(socketfd_ == -1)
             throw std::runtime_error("Socket creation failed");
-
+#ifdef SO_NOSIGPIPE
+        // Prevent SIGPIPE on platforms that support SO_NOSIGPIPE (e.g., macOS)
+        int set = 1;
+        setsockopt(socketfd_, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set));
+#endif
         memset(&servaddr_, 0, sizeof servaddr_);
         servaddr_.sin_family = AF_INET;
         servaddr_.sin_addr.s_addr = addr_;
