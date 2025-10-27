@@ -74,9 +74,9 @@ namespace StressTests {
 
             std::cout << "[STRESS TEST] Completed 100 concurrent connections" << std::endl;
 
-            TestFramework::RecordTest("High Load Connections (100 clients)", true);
+            TestFramework::RecordTest("High Load Connections (100 clients)", true, "", TestFramework::TestCategory::STRESS);
         } catch (const std::exception& e) {
-            TestFramework::RecordTest("High Load Connections (100 clients)", false, e.what());
+            TestFramework::RecordTest("High Load Connections (100 clients)", false, e.what(), TestFramework::TestCategory::STRESS);
         }
     }
 

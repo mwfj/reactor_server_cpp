@@ -42,6 +42,8 @@ public:
 
     void UpdateChannel(std::shared_ptr<Channel>);
     void RemoveChannel(std::shared_ptr<Channel>);
+    void UpdateChannelInLoop(std::shared_ptr<Channel>);
+    void RemoveChannelInLoop(std::shared_ptr<Channel>);
 
     void WakeUp();
     void HandleEventId();

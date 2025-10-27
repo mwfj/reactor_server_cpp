@@ -46,7 +46,7 @@ REACTOR_HEADERS = $(LIB_DIR)/dispatcher.h $(LIB_DIR)/epoll_handler.h $(LIB_DIR)/
 NETWORK_HEADERS = $(LIB_DIR)/socket_handler.h $(LIB_DIR)/acceptor.h $(LIB_DIR)/connection_handler.h
 SERVER_HEADERS = $(LIB_DIR)/net_server.h $(LIB_DIR)/buffer.h $(LIB_DIR)/reactor_server.h
 THREAD_POOL_HEADERS = $(THREAD_POOL_DIR)/include/threadpool.h $(THREAD_POOL_DIR)/include/threadtask.h
-TEST_HEADERS = $(LIB_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h
+TEST_HEADERS = $(LIB_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h
 
 # All headers combined
 HEADERS = $(CORE_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(TEST_HEADERS)
@@ -62,12 +62,21 @@ $(TARGET): $(SRCS) $(HEADERS)
 
 # Clean build artifacts
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) run_race_test
 
 # Run all tests
 test: $(TARGET)
 	@echo "Running test suite..."
 	./$(TARGET)
+
+# Build standalone race condition test executable
+race_test: $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/test_race_condition.cc $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/test_race_condition.cc $(LDFLAGS) -o run_race_test
+
+# Run only race condition tests
+test_race: race_test
+	@echo "Running race condition tests..."
+	./run_race_test
 
 # Display help information
 help:
@@ -79,10 +88,15 @@ help:
 	@echo "                   Compiles all source files and creates './run' executable"
 	@echo ""
 	@echo "  make test      - Build and run all tests"
-	@echo "                   Runs BasicTests (port 8888) and StressTests (port 8889)"
+	@echo "                   Runs BasicTests (port 8888), StressTests (port 8889),"
+	@echo "                   and RaceConditionTests (port 9000)"
+	@echo ""
+	@echo "  make test_race - Build and run only race condition tests"
+	@echo "                   Creates './run_race_test' and runs 7 race condition tests"
+	@echo "                   Validates fixes from EVENTFD_RACE_CONDITION_FIXES.md"
 	@echo ""
 	@echo "  make clean     - Remove build artifacts"
-	@echo "                   Deletes the './run' executable"
+	@echo "                   Deletes './run' and './run_race_test' executables"
 	@echo ""
 	@echo "  make help      - Show this help message"
 	@echo ""
@@ -102,10 +116,11 @@ help:
 	@echo "Usage examples:"
 	@echo "  make           # Build the project"
 	@echo "  make clean     # Clean build artifacts"
-	@echo "  make test      # Build and run tests"
-	@echo "  ./run          # Run tests directly (after building)"
+	@echo "  make test      # Build and run all tests"
+	@echo "  make test_race # Run only race condition tests"
+	@echo "  ./run          # Run all tests directly (after building)"
 	@echo ""
-	@echo "For more information, see README.md"
+	@echo "For more information, see README.md and test/RACE_CONDITION_TESTS_README.md"
 
 # Phony targets
-.PHONY: all clean test help
+.PHONY: all clean test test_race race_test help

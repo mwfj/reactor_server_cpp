@@ -1,25 +1,14 @@
 #include "reactor_server.h"
 #include "client.h"
-#include "stress_test.h"
-#include "basic_test.h"
 #include "race_condition_test.h"
 #include "test_framework.h"
 #include <algorithm>
 
-
 int main() {
-    std::cout << "Reactor Network Server - Test Suite" << std::endl;
-    std::cout << "====================================\n" << std::endl;
+    std::cout << "Reactor Network Server - Race Condition Test Suite" << std::endl;
+    std::cout << "==================================================\n" << std::endl;
 
-    // Run basic functional tests
-    BasicTests::RunAllTests();
-
-    // Run stress tests (optional - comment out if needed)
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    StressTests::RunStressTests();
-
-    // Run race condition tests (validates EVENTFD_RACE_CONDITION_FIXES.md)
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Run race condition tests only
     RaceConditionTests::RunRaceConditionTests();
 
     // Print test summary

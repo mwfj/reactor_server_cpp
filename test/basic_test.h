@@ -59,9 +59,9 @@ namespace BasicTests {
 
             client.Close();
 
-            TestFramework::RecordTest("Single Client Connection", true);
+            TestFramework::RecordTest("Single Client Connection", true, "", TestFramework::TestCategory::BASIC);
         } catch (const std::exception& e) {
-            TestFramework::RecordTest("Single Client Connection", false, e.what());
+            TestFramework::RecordTest("Single Client Connection", false, e.what(), TestFramework::TestCategory::BASIC);
         }
     }
 
@@ -88,9 +88,9 @@ namespace BasicTests {
 
             client.Close();
 
-            TestFramework::RecordTest("Echo Functionality", true);
+            TestFramework::RecordTest("Echo Functionality", true, "", TestFramework::TestCategory::BASIC);
         } catch (const std::exception& e) {
-            TestFramework::RecordTest("Echo Functionality", false, e.what());
+            TestFramework::RecordTest("Echo Functionality", false, e.what(), TestFramework::TestCategory::BASIC);
         }
     }
 
@@ -120,9 +120,9 @@ namespace BasicTests {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
 
-            TestFramework::RecordTest("Multiple Sequential Connections", true);
+            TestFramework::RecordTest("Multiple Sequential Connections", true, "", TestFramework::TestCategory::BASIC);
         } catch (const std::exception& e) {
-            TestFramework::RecordTest("Multiple Sequential Connections", false, e.what());
+            TestFramework::RecordTest("Multiple Sequential Connections", false, e.what(), TestFramework::TestCategory::BASIC);
         }
     }
 
@@ -165,9 +165,9 @@ namespace BasicTests {
 
             std::cout << "[TEST] All " << NUM_CLIENTS << " concurrent clients completed" << std::endl;
 
-            TestFramework::RecordTest("Concurrent Connections", true);
+            TestFramework::RecordTest("Concurrent Connections", true, "", TestFramework::TestCategory::BASIC);
         } catch (const std::exception& e) {
-            TestFramework::RecordTest("Concurrent Connections", false, e.what());
+            TestFramework::RecordTest("Concurrent Connections", false, e.what(), TestFramework::TestCategory::BASIC);
         }
     }
 
@@ -193,9 +193,9 @@ namespace BasicTests {
 
             std::cout << "[TEST] Large message (" << large_msg.size() << " bytes) transferred" << std::endl;
 
-            TestFramework::RecordTest("Large Message Transfer", true);
+            TestFramework::RecordTest("Large Message Transfer", true, "", TestFramework::TestCategory::BASIC);
         } catch (const std::exception& e) {
-            TestFramework::RecordTest("Large Message Transfer", false, e.what());
+            TestFramework::RecordTest("Large Message Transfer", false, e.what(), TestFramework::TestCategory::BASIC);
         }
     }
 
@@ -218,9 +218,9 @@ namespace BasicTests {
 
             std::cout << "[TEST] Quick disconnect test completed" << std::endl;
 
-            TestFramework::RecordTest("Quick Connection and Disconnect", true);
+            TestFramework::RecordTest("Quick Connection and Disconnect", true, "", TestFramework::TestCategory::BASIC);
         } catch (const std::exception& e) {
-            TestFramework::RecordTest("Quick Connection and Disconnect", false, e.what());
+            TestFramework::RecordTest("Quick Connection and Disconnect", false, e.what(), TestFramework::TestCategory::BASIC);
         }
     }
 

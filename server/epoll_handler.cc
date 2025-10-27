@@ -54,8 +54,11 @@ void EpollHandler::UpdateEvent(std::shared_ptr<Channel> ch){
             throw std::runtime_error("epoll_ctl ADD failed");
         }
         ch->SetEpollIn();
-        // Store in map to maintain ownership
-        channel_map_[fd] = ch;
+        // Store in map to maintain ownership - must lock to prevent race with WaitForEvent
+        {
+            std::lock_guard<std::mutex> lock(channel_map_mutex_);
+            channel_map_[fd] = ch;
+        }
     }
 }
 
@@ -79,10 +82,13 @@ void EpollHandler::RemoveChannel(std::shared_ptr<Channel> ch){
         }
     }
 
-    // Remove from channel map
-    auto it = channel_map_.find(fd);
-    if(it != channel_map_.end()){
-        channel_map_.erase(it);
+    // Remove from channel map - must lock to prevent race with WaitForEvent
+    {
+        std::lock_guard<std::mutex> lock(channel_map_mutex_);
+        auto it = channel_map_.find(fd);
+        if(it != channel_map_.end()){
+            channel_map_.erase(it);
+        }
     }
 }
 
@@ -112,14 +118,26 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
     // Reserve space to avoid reallocations
     channels.reserve(infds);
 
-    for(int idx = 0; idx < infds; idx ++){
-        Channel *ch_raw = (Channel*)events_[idx].data.ptr;
-        ch_raw->SetDEvent(events_[idx].events);
-        // Look up the channel from our map instead of creating a new shared_ptr
-        int fd = ch_raw->fd();
-        auto it = channel_map_.find(fd);
-        if(it != channel_map_.end()) {
-            channels.push_back(it->second);
+    for(int idx = 0; idx < infds; idx++){
+        Channel *ch_raw = static_cast<Channel*>(events_[idx].data.ptr);
+
+        // CRITICAL: Lock and validate BEFORE dereferencing the raw pointer
+        // The channel may have been deleted between epoll_wait() returning and now
+        std::lock_guard<std::mutex> lock(channel_map_mutex_);
+
+        // Find the shared_ptr by searching for matching raw pointer
+        std::shared_ptr<Channel> ch;
+        for(auto& pair : channel_map_) {
+            if(pair.second && pair.second.get() == ch_raw) {
+                ch = pair.second;
+                break;
+            }
+        }
+
+        // Only dereference if we found a valid shared_ptr
+        if(ch) {
+            ch->SetDEvent(events_[idx].events);  // NOW SAFE - we hold a shared_ptr
+            channels.push_back(ch);
         }
     }
 

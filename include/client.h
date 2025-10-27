@@ -32,6 +32,10 @@ private:
                 if(errno == EINTR) {
                     continue;  // Interrupted, try again
                 }
+                if(errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Timeout expired (if SO_RCVTIMEO was set)
+                    throw std::runtime_error("Receive timeout");
+                }
                 throw std::runtime_error("Receive failed");
             }
             total_received += received;
@@ -81,6 +85,40 @@ public:
         servaddr_.sin_family = AF_INET;
         servaddr_.sin_addr.s_addr = addr_;
         servaddr_.sin_port = htons(port_);
+    }
+
+    /**
+     * Set socket receive timeout (prevents indefinite blocking in Receive())
+     * Should be called after Init() but before Connect()
+     */
+    void SetReceiveTimeout(int seconds, int microseconds = 0){
+        if(socketfd_ == -1)
+            throw std::runtime_error("Socket not initialized - call Init() first");
+
+        struct timeval timeout;
+        timeout.tv_sec = seconds;
+        timeout.tv_usec = microseconds;
+
+        if(setsockopt(socketfd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0){
+            throw std::runtime_error("Failed to set receive timeout");
+        }
+    }
+
+    /**
+     * Set socket send timeout (prevents indefinite blocking in Send())
+     * Should be called after Init() but before Connect()
+     */
+    void SetSendTimeout(int seconds, int microseconds = 0){
+        if(socketfd_ == -1)
+            throw std::runtime_error("Socket not initialized - call Init() first");
+
+        struct timeval timeout;
+        timeout.tv_sec = seconds;
+        timeout.tv_usec = microseconds;
+
+        if(setsockopt(socketfd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0){
+            throw std::runtime_error("Failed to set send timeout");
+        }
     }
 
     void Connect(){

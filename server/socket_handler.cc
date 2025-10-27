@@ -34,9 +34,11 @@ int SocketHandler::CreateSocket() {
 
 void SocketHandler::Bind(const InetAddr& _servAddr){
     if(::bind(fd_, _servAddr.Addr(), sizeof(sockaddr_in)) < 0){
+        int saved_errno = errno;  // Save errno before any other calls
         Close();
-        std::cout << "[Socket Handler] Error occurred when binding port ..." << std::endl;
-        throw std::runtime_error("Error occurred when binding port ...");
+        std::cout << "[Socket Handler] Error occurred when binding port: "
+                  << strerror(saved_errno) << " (errno=" << saved_errno << ")" << std::endl;
+        throw std::runtime_error(std::string("Error binding port: ") + strerror(saved_errno));
     }
 }
 

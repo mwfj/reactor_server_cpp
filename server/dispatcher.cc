@@ -56,6 +56,11 @@ void Dispatcher::RunEventLoop(){
 
         // Process all active channels
         for(auto& ch : channels) {
+            if (!ch) {
+                // Skip null/expired channel entry
+                std::cerr << "[Dispatcher] Skipping null Channel in channels list" << std::endl;
+                continue;
+            }
             try {
                 ch->HandleEvent();
             } catch (const std::exception& e) {
@@ -64,6 +69,7 @@ void Dispatcher::RunEventLoop(){
                 throw std::runtime_error("Event Dispatcher Error");
             }
         }
+
     }
 }
 
@@ -72,10 +78,39 @@ void Dispatcher::StopEventLoop(){
 }
 
 void Dispatcher::UpdateChannel(std::shared_ptr<Channel> ch){
-    ep_->UpdateEvent(ch);
+    // Don't call ep_->UpdateEvent() here - UpdateChannelInLoop will do it
+    if(!is_running() || is_dispatcher_thread()){
+        UpdateChannelInLoop(ch);
+        return;
+    }
+
+    std::weak_ptr<Dispatcher> self = shared_from_this();
+    EnQueue([self, ch]() {
+        if(auto dispatcher = self.lock()){
+            dispatcher->UpdateChannelInLoop(ch);
+        }
+    });
 }
 
 void Dispatcher::RemoveChannel(std::shared_ptr<Channel> ch){
+    if(!is_running() || is_dispatcher_thread()){
+        RemoveChannelInLoop(ch);
+        return;
+    }
+
+    std::weak_ptr<Dispatcher> self = shared_from_this();
+    EnQueue([self, ch]() {
+        if(auto dispatcher = self.lock()){
+            dispatcher->RemoveChannelInLoop(ch);
+        }
+    });
+}
+
+void Dispatcher::UpdateChannelInLoop(std::shared_ptr<Channel> ch){
+    ep_->UpdateEvent(ch);
+}
+
+void Dispatcher::RemoveChannelInLoop(std::shared_ptr<Channel> ch){
     ep_->RemoveChannel(ch);
 }
 
