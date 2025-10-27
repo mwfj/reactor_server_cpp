@@ -15,11 +15,12 @@ int main() {
     BasicTests::RunAllTests();
 
     // Run stress tests (optional - comment out if needed)
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Longer delay to ensure ports are released from TIME_WAIT
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     StressTests::RunStressTests();
 
     // Run race condition tests (validates EVENTFD_RACE_CONDITION_FIXES.md)
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     RaceConditionTests::RunRaceConditionTests();
 
     // Print test summary

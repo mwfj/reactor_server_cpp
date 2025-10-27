@@ -39,13 +39,13 @@ namespace StressTests {
     };
 
     void TestHighLoadConnections() {
-        std::cout << "\n[STRESS TEST] High Load (100 concurrent clients)..." << std::endl;
+        std::cout << "\n[STRESS TEST] High Load (1000 concurrent clients)..." << std::endl;
 
         try {
             ReactorServer server(TEST_IP, TEST_PORT);
             StressServerRunner runner(server);
 
-            const int NUM_CLIENTS = 100;
+            const int NUM_CLIENTS = 1000;
             std::vector<std::thread> client_threads;
 
             for (int i = 0; i < NUM_CLIENTS; i++) {
@@ -57,9 +57,12 @@ namespace StressTests {
                         Client client(TEST_PORT, TEST_IP, ss.str().c_str());
                         client.SetQuietMode(true);
                         client.Init();
+                        // Set 10-second timeout to prevent indefinite hangs
+                        client.SetReceiveTimeout(10, 0);
                         client.Connect();
                         client.Send();
-                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                        // Wait longer for server to process under high load
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
                         client.Receive();
                         client.Close();
                     } catch (const std::exception& e) {

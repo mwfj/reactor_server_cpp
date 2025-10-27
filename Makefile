@@ -62,7 +62,7 @@ $(TARGET): $(SRCS) $(HEADERS)
 
 # Clean build artifacts
 clean:
-	rm -f $(TARGET) run_race_test
+	rm -f $(TARGET) run_race_test run_stress_test
 
 # Run all tests
 test: $(TARGET)
@@ -77,6 +77,15 @@ race_test: $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(
 test_race: race_test
 	@echo "Running race condition tests..."
 	./run_race_test
+
+# Build standalone stress test executable
+stress_test: $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/test_stress_only.cc $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/test_stress_only.cc $(LDFLAGS) -o run_stress_test
+
+# Run only stress tests
+test_stress: stress_test
+	@echo "Running stress tests..."
+	./run_stress_test
 
 # Display help information
 help:
@@ -95,8 +104,12 @@ help:
 	@echo "                   Creates './run_race_test' and runs 7 race condition tests"
 	@echo "                   Validates fixes from EVENTFD_RACE_CONDITION_FIXES.md"
 	@echo ""
+	@echo "  make test_stress - Build and run only stress tests"
+	@echo "                   Creates './run_stress_test' and runs 100 concurrent clients"
+	@echo "                   Validates fixes from STRESS_TEST_BUG_FIXES.md"
+	@echo ""
 	@echo "  make clean     - Remove build artifacts"
-	@echo "                   Deletes './run' and './run_race_test' executables"
+	@echo "                   Deletes './run', './run_race_test', and './run_stress_test'"
 	@echo ""
 	@echo "  make help      - Show this help message"
 	@echo ""
@@ -114,13 +127,17 @@ help:
 	@echo "  Executable:    ./run"
 	@echo ""
 	@echo "Usage examples:"
-	@echo "  make           # Build the project"
-	@echo "  make clean     # Clean build artifacts"
-	@echo "  make test      # Build and run all tests"
-	@echo "  make test_race # Run only race condition tests"
-	@echo "  ./run          # Run all tests directly (after building)"
+	@echo "  make             # Build the project"
+	@echo "  make clean       # Clean build artifacts"
+	@echo "  make test        # Build and run all tests"
+	@echo "  make test_race   # Run only race condition tests"
+	@echo "  make test_stress # Run only stress tests (100 concurrent clients)"
+	@echo "  ./run            # Run all tests directly (after building)"
 	@echo ""
-	@echo "For more information, see README.md and test/RACE_CONDITION_TESTS_README.md"
+	@echo "For more information, see:"
+	@echo "  - STRESS_TEST_BUG_FIXES.md - Stress test bug analysis"
+	@echo "  - EVENTFD_RACE_CONDITION_FIXES.md - Race condition fixes"
+	@echo "  - test/RACE_CONDITION_TESTS_README.md - Race condition tests"
 
 # Phony targets
-.PHONY: all clean test test_race race_test help
+.PHONY: all clean test test_race race_test test_stress stress_test help

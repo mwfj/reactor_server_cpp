@@ -87,24 +87,50 @@ void ThreadPool::Run() {
                 break;
             continue;
         }
-        running_threads_ ++;
+
+        // RAII guard to ensure running_threads_ is always decremented
+        running_threads_++;
+        struct RunningGuard {
+            std::atomic<int>& counter;
+            RunningGuard(std::atomic<int>& c) : counter(c) {}
+            ~RunningGuard() { counter--; }
+        } guard(running_threads_);
+
         try{
-            int res = task -> RunTask();
-            task -> SetValue(res);
-        }catch(...) {
+            // Execute task
+            int res = task->RunTask();
+
+            // Set result - wrap in try-catch to prevent thread termination
+            try {
+                task->SetValue(res);
+            } catch(const std::exception& e) {
+                std::cerr << "[ThreadPool] SetValue() failed: " << e.what() << std::endl;
+            } catch(...) {
+                std::cerr << "[ThreadPool] SetValue() failed with unknown exception" << std::endl;
+            }
+        } catch(...) {
+            // Task execution failed - capture exception
             std::exception_ptr ex = std::current_exception();
             try{
                 if(ex) {
                     std::rethrow_exception(ex);
                 }
             } catch (const std::exception& e){
-                std::cerr << e.what() << std::endl;
+                std::cerr << "[ThreadPool] Task failed: " << e.what() << std::endl;
             } catch(...) {
-                std::cerr << "Unknown task exception make threadpool stop" << "\n";
+                std::cerr << "[ThreadPool] Task failed with unknown exception" << std::endl;
             }
-            task ->SetException(std::move(ex));
+
+            // Set exception - wrap in try-catch to prevent thread termination
+            try {
+                task->SetException(std::move(ex));
+            } catch(const std::exception& e) {
+                std::cerr << "[ThreadPool] SetException() failed: " << e.what() << std::endl;
+            } catch(...) {
+                std::cerr << "[ThreadPool] SetException() failed with unknown exception" << std::endl;
+            }
         }
-        running_threads_ --;
+        // running_threads_ automatically decremented by RunningGuard destructor
     }
     std::cout << "[" << std::this_thread::get_id() << "]: End Run" << std::endl;
 }

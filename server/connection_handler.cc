@@ -5,11 +5,38 @@ ConnectionHandler::ConnectionHandler(std::shared_ptr<Dispatcher> _dispatcher, st
     : event_dispatcher_(_dispatcher), sock_(std::move(_sock))
 {
     client_channel_ = std::shared_ptr<Channel>(new Channel(event_dispatcher_, sock_ -> fd()));
+    // Note: Cannot call shared_from_this() in constructor
+    // Callbacks registered in RegisterCallbacks() after shared_ptr is created
+}
 
-    client_channel_ -> SetReadCallBackFn(std::bind(&ConnectionHandler::OnMessage, this));
-    client_channel_ -> SetCloseCallBackFn(std::bind(&ConnectionHandler::CallCloseCb, this));
-    client_channel_ -> SetErrorCallBackFn(std::bind(&ConnectionHandler::CallErroCb, this));
-    client_channel_ -> SetWriteCallBackFn(std::bind(&ConnectionHandler::CallWriteCb, this));
+void ConnectionHandler::RegisterCallbacks(){
+    // Use weak_ptr to avoid keeping ConnectionHandler alive via callbacks
+    // This prevents use-after-free when server shuts down during callback execution
+    std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
+
+    client_channel_ -> SetReadCallBackFn([weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->OnMessage();
+        }
+    });
+
+    client_channel_ -> SetCloseCallBackFn([weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->CallCloseCb();
+        }
+    });
+
+    client_channel_ -> SetErrorCallBackFn([weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->CallErroCb();
+        }
+    });
+
+    client_channel_ -> SetWriteCallBackFn([weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->CallWriteCb();
+        }
+    });
 
     client_channel_ -> EnableETMode();
     client_channel_ -> EnableReadMode();
@@ -59,16 +86,23 @@ void ConnectionHandler::OnMessage(){
 }
 
 void ConnectionHandler::SendData(const char *data, size_t size){
-    output_bf_.AppendWithHead(data, size);
-    client_channel_ -> EnableWriteMode();
+    // Thread-safe: All buffer operations must happen in socket dispatcher thread
+    // Copy data immediately to avoid dangling pointer
+    std::string data_copy(data, size);
 
-    if(event_dispatcher_ && !event_dispatcher_ -> is_sock_dispatcher())
-        event_dispatcher_ -> EnQueue(std::bind(&ConnectionHandler::DoSend, this, data, size));
-    else
+    if(event_dispatcher_ && !event_dispatcher_ -> is_sock_dispatcher()) {
+        // Capture data_copy by value to preserve across thread boundary
+        event_dispatcher_ -> EnQueue([this, data_copy]() {
+            this->DoSend(data_copy.data(), data_copy.size());
+        });
+    } else {
+        // Already in socket dispatcher thread
         DoSend(data, size);
+    }
 }
 
 void ConnectionHandler::DoSend(const char *data, size_t size){
+    // All buffer operations happen in socket dispatcher thread (thread-safe)
     output_bf_.AppendWithHead(data, size);
     client_channel_ -> EnableWriteMode();
 }

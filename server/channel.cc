@@ -28,7 +28,9 @@ bool Channel::isEnableETMode() const {
 
 void Channel::EnableReadMode(){
     if(is_channel_closed_) return;
-    event_ |= EPOLLIN;
+    // IMPORTANT: EPOLLRDHUP must be explicitly requested to detect peer shutdown
+    // Without it, we won't get notified when client closes the connection
+    event_ |= (EPOLLIN | EPOLLRDHUP);
     std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
     if(ep_shared)
         ep_shared -> UpdateChannel(shared_from_this());

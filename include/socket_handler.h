@@ -12,6 +12,7 @@ private:
 public:
     SocketHandler();
     explicit SocketHandler(int);
+    SocketHandler(int fd, const std::string& ip, int port);
     ~SocketHandler();
     
     // Delete copy operations
@@ -20,14 +21,18 @@ public:
     
     // Move operations
     SocketHandler(SocketHandler&& other) noexcept
-        : fd_(other.fd_) {
+        : fd_(other.fd_), ip_addr_(std::move(other.ip_addr_)), port_(other.port_) {
         other.fd_ = -1;
+        other.port_ = 0;
     }
     SocketHandler& operator=(SocketHandler&& other) noexcept {
         if (this != &other) {
             Close();
             fd_ = other.fd_;
+            ip_addr_ = std::move(other.ip_addr_);
+            port_ = other.port_;
             other.fd_ = -1;
+            other.port_ = 0;
         }
         return *this;
     }

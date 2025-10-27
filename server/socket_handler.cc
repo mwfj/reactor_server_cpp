@@ -1,8 +1,9 @@
 #include "socket_handler.h"
 
 
-SocketHandler::SocketHandler() : fd_(CreateSocket()) {}
-SocketHandler::SocketHandler(int fd) : fd_(fd) {}
+SocketHandler::SocketHandler() : fd_(CreateSocket()), port_(0) {}
+SocketHandler::SocketHandler(int fd) : fd_(fd), port_(0) {}
+SocketHandler::SocketHandler(int fd, const std::string& ip, int port) : fd_(fd), ip_addr_(ip), port_(port) {}
 SocketHandler::~SocketHandler() { Close(); }
 
 bool SocketHandler::SetTcpNoDelay(bool _flag){

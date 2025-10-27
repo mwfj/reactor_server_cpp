@@ -27,6 +27,10 @@ void Acceptor::SetNewConnCb(std::function<void(std::unique_ptr<SocketHandler>)> 
 // processing new connection from client
 void Acceptor::NewConnection(){
     InetAddr client_addr;
-    std::unique_ptr<SocketHandler> client_sock(new SocketHandler(servsock_ -> Accept(client_addr)));
+    int client_fd = servsock_ -> Accept(client_addr);
+    if(client_fd == -1){
+        return; // No connection available (EAGAIN)
+    }
+    std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));
     new_conn_cb_(std::move(client_sock));
 }

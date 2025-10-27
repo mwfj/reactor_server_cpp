@@ -65,8 +65,8 @@ void Dispatcher::RunEventLoop(){
                 ch->HandleEvent();
             } catch (const std::exception& e) {
                 // Log error but continue serving other clients
+                // Don't re-throw - just log and continue processing other events
                 std::cerr << "[Dispatcher] Error handling event: " << e.what() << std::endl;
-                throw std::runtime_error("Event Dispatcher Error");
             }
         }
 

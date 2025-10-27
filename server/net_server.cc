@@ -53,14 +53,22 @@ void NetServer::Stop(){
 void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
     int idx = cilent_sock -> fd() % sock_workers_.GetThreadWorkerNum();
     std::shared_ptr<ConnectionHandler> conn = std::shared_ptr<ConnectionHandler>(new ConnectionHandler(socket_dispatchers_[idx], std::move(cilent_sock)));
+
+    // Two-phase initialization: register callbacks after shared_ptr is created
+    // This allows callbacks to safely capture weak_ptr instead of raw 'this'
+    conn -> RegisterCallbacks();
+
     conn -> SetCloseCb(std::bind(&NetServer::HandleCloseConnection, this, std::placeholders::_1));
     conn -> SetErrorCb(std::bind(&NetServer::HandleErrorConnection, this, std::placeholders::_1));
     conn -> SetOnMessageCb(std::bind(&NetServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
     conn -> SetCompletionCb(std::bind(&NetServer::HandleSendComplete, this, std::placeholders::_1));
 
-    connections_[conn -> fd()] = conn;
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        connections_[conn -> fd()] = conn;
+    }
 
-    std::cout << "[Reactor Server] new connection(fd: " 
+    std::cout << "[Reactor Server] new connection(fd: "
         << conn -> fd() << ", ip: " << conn -> ip_addr() << ", port: " << conn -> port() << ").\n"
         << "ok" << std::endl;
 
@@ -73,7 +81,10 @@ void NetServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn){
         close_conn_callback_(conn);
 
     std::cout << "[NetServer] client fd: " << conn -> fd() << " disconnected." << std::endl;
-    connections_.erase(conn -> fd());
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        connections_.erase(conn -> fd());
+    }
     // close this connection
     conn.reset();
 }
@@ -81,9 +92,12 @@ void NetServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn){
 void NetServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn){
     if(error_callback_)
         error_callback_(conn);
-        
+
     std::cout << "[NetServer] client fd: " << conn -> fd() << "error occurred, disconnect." << std::endl;
-    connections_.erase(conn -> fd());
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        connections_.erase(conn -> fd());
+    }
     conn.reset();
 }
 

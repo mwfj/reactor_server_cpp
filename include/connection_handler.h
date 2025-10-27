@@ -25,6 +25,9 @@ public:
     ConnectionHandler(std::shared_ptr<Dispatcher>, std::unique_ptr<SocketHandler>);
     ~ConnectionHandler() = default; // no need the release resource for smart pointer
 
+    // Two-phase initialization: must be called after object is wrapped in shared_ptr
+    void RegisterCallbacks();
+
     int fd() const{ return sock_ -> fd(); }
     const std::string& ip_addr() const { return sock_ -> ip_addr(); }
     int port() const { return sock_ -> port(); }
@@ -32,8 +35,8 @@ public:
     void OnMessage();
 
     void SendData(const char*, size_t);
-    void DoSend(const char*, size_t);
-    
+    void DoSend(const char*, size_t);  // Internal: appends to buffer and enables write (in socket thread)
+
     void CallCloseCb();
     void CallErroCb();
     void CallWriteCb();

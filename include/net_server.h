@@ -10,6 +10,7 @@
 
 #include "threadtask.h"
 #include "threadpool.h"
+#include <mutex>
 
 // For socket connection related task, use this type of worker
 // SocketWorker: Handles I/O event loops for client connections in thread pool
@@ -38,6 +39,7 @@ private:
     // Sub-events looks for
     std::vector<std::shared_ptr<Dispatcher>> socket_dispatchers_;
     std::map<int, std::shared_ptr<ConnectionHandler>> connections_;
+    std::mutex conn_mtx_;  // Protects connections_ map from concurrent access
     std::unique_ptr<Acceptor> acceptor_;  // Sole owner of Acceptor
 
     // Callbacks
