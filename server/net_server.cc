@@ -10,6 +10,7 @@ NetServer::NetServer(const std::string& _ip, const size_t _port)
 
     // Now create acceptor with initialized dispatcher
     acceptor_ = std::unique_ptr<Acceptor>(new Acceptor(conn_dispatcher_, _ip, _port));
+    // Should we replace std::bind with lambda here?
     acceptor_->SetNewConnCb(std::bind(&NetServer::HandleNewConnection, this, std::placeholders::_1));
     sock_workers_.Init();
     sock_workers_.Start();

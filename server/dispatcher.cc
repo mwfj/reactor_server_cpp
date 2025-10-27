@@ -30,7 +30,7 @@ void Dispatcher::Init() {
     // Create wake_channel_ for eventfd now that shared_from_this() is safe
     // Must use shared_ptr because Channel calls shared_from_this() in its methods
     wake_channel_ = std::make_shared<Channel>(shared_from_this(), eventfd_);
-    wake_channel_->SetReadCallBackFn(std::bind(&Dispatcher::HandleEventId, this));
+    wake_channel_->SetReadCallBackFn(std::bind(&Dispatcher::HandleEventId, this)); // Should we replace std::bind with lambda here?
     wake_channel_->EnableReadMode();
 }
 
