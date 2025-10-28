@@ -3,6 +3,7 @@
 #include "stress_test.h"
 #include "basic_test.h"
 #include "race_condition_test.h"
+#include "timeout_test.h"
 #include "test_framework.h"
 #include <algorithm>
 
@@ -21,6 +22,9 @@ void RunAllTest(){
     std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     RaceConditionTests::RunRaceConditionTests();
 
+    // Run timeout tests
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    TimeoutTests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;
 }
@@ -28,11 +32,12 @@ void RunAllTest(){
 void PrintUsage(const char* program_name) {
     std::cout << "Usage: " << program_name << " [OPTIONS]" << std::endl;
     std::cout << "\nOptions:" << std::endl;
-    std::cout << "  basic,  -b    Run basic functional tests only" << std::endl;
-    std::cout << "  stress, -s    Run stress tests only (100 concurrent clients)" << std::endl;
-    std::cout << "  race,   -r    Run race condition tests only" << std::endl;
-    std::cout << "  help,   -h    Show this help message" << std::endl;
-    std::cout << "\nNo arguments: Run all tests (basic + stress + race)" << std::endl;
+    std::cout << "  basic,   -b    Run basic functional tests only" << std::endl;
+    std::cout << "  stress,  -s    Run stress tests only (100 concurrent clients)" << std::endl;
+    std::cout << "  race,    -r    Run race condition tests only" << std::endl;
+    std::cout << "  timeout, -t    Run timeout/idle connection tests only" << std::endl;
+    std::cout << "  help,    -h    Show this help message" << std::endl;
+    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout)" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -51,6 +56,9 @@ int main(int argc, char* argv[]) {
         // Run race condition tests
         }else if(mode == "race" || mode == "-r"){
             RaceConditionTests::RunRaceConditionTests();
+        // Run timeout tests
+        }else if(mode == "timeout" || mode == "-t"){
+            TimeoutTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

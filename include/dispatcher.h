@@ -3,8 +3,9 @@
 #include "epoll_handler.h"
 #include <deque>
 
-// Forward declaration to break circular dependency
+// Forward declarations to break circular dependency
 class Channel;
+class ConnectionHandler;
 
 class Dispatcher : public std::enable_shared_from_this<Dispatcher> {
 private:
@@ -25,9 +26,23 @@ private:
     std::deque<std::function<void()>> task_que_;
 
     std::thread::id thread_id_;
+
+    // Connection Timer
+    int timer_fd_;
+    int end_t_; // the time that timer should triggered
+    std::chrono::seconds timeout_; // Timeout duration for connection handler
+
+    std::shared_ptr<Channel> timer_channel_;  // Must be shared_ptr because Channel uses shared_from_this()
+    std::function<void(std::shared_ptr<Dispatcher>)> timeout_trigger_callback_;
+
+    // Manage the connection in a dispatcher(Eventloop)
+    std::map<int, std::shared_ptr<ConnectionHandler>> connections_;
+ 
+    std::function<void(int)> timer_callback_;
+    std::mutex timer_mtx_;
 public:
     Dispatcher();
-    Dispatcher(bool);
+    Dispatcher(bool, int = 60, std::chrono::seconds = std::chrono::seconds(30));
     ~Dispatcher();
 
     // Must be called after construction to initialize wake_channel_
@@ -48,4 +63,9 @@ public:
     void WakeUp();
     void HandleEventId();
     void EnQueue(std::function<void()>);
+
+    void AddConnection(std::shared_ptr<ConnectionHandler>);
+    void SetTimerCB(std::function<void(int)>);
+    void SetTimeOutTriggerCB(std::function<void(std::shared_ptr<Dispatcher>)>);
+    void TimerHandler();
 };

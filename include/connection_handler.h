@@ -3,6 +3,7 @@
 #include "dispatcher.h"
 #include "socket_handler.h"
 #include "buffer.h"
+#include "timestamp.h"
 
 class ConnectionHandler : public std::enable_shared_from_this<ConnectionHandler>
 {
@@ -20,6 +21,8 @@ private:
     Buffer output_bf_;
 
     std::atomic<bool> is_closing_{false};
+
+    TimeStamp ts_; // Each connection own a timestamp to manage
 public:
     ConnectionHandler() = delete;
     ConnectionHandler(std::shared_ptr<Dispatcher>, std::unique_ptr<SocketHandler>);
@@ -45,4 +48,6 @@ public:
     void SetCompletionCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
     void SetCloseCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
     void SetErrorCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
+
+    bool IsTimeOut(std::chrono::seconds) const;
 };

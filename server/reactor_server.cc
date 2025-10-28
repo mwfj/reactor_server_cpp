@@ -2,8 +2,10 @@
 #include <iostream>
 
 
-ReactorServer::ReactorServer(const std::string& _ip, const size_t _port)
-    : net_server_(_ip, _port)
+ReactorServer::ReactorServer(const std::string& _ip, const size_t _port,
+                             int timer_interval,
+                             std::chrono::seconds connection_timeout)
+    : net_server_(_ip, _port, timer_interval, connection_timeout)
 {   
     // Should we replace std::bind with lambda here?
     net_server_.SetNewConnectionCb(std::bind(&ReactorServer::NewConnection, this, std::placeholders::_1));

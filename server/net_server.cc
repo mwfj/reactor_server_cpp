@@ -1,12 +1,17 @@
 #include "net_server.h"
 
 
-NetServer::NetServer(const std::string& _ip, const size_t _port)
+NetServer::NetServer(const std::string& _ip, const size_t _port,
+                     int timer_interval,
+                     std::chrono::seconds connection_timeout)
     : conn_dispatcher_(std::make_shared<Dispatcher>()),
-      acceptor_(nullptr)
+      acceptor_(nullptr),
+      timer_interval_(timer_interval),
+      connection_timeout_(connection_timeout)
 {
     // Initialize conn_dispatcher_ after shared_ptr is constructed (required for eventfd setup)
     conn_dispatcher_->Init();
+    conn_dispatcher_->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
 
     // Now create acceptor with initialized dispatcher
     acceptor_ = std::unique_ptr<Acceptor>(new Acceptor(conn_dispatcher_, _ip, _port));
@@ -25,10 +30,13 @@ NetServer::~NetServer(){
 void NetServer::Start(){
     socket_dispatchers_.reserve(sock_workers_.GetThreadWorkerNum());
     for(int idx = 0; idx < sock_workers_.GetThreadWorkerNum(); idx ++){
-        std::shared_ptr<Dispatcher> task = std::make_shared<Dispatcher>(true);
+        // Use configurable timer parameters
+        std::shared_ptr<Dispatcher> task = std::make_shared<Dispatcher>(true, timer_interval_, connection_timeout_);
         // Initialize each socket dispatcher (required for eventfd setup)
         task->Init();
         socket_dispatchers_.emplace_back(task);
+        task->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1)); 
+        task->SetTimerCB(std::bind(&NetServer::RemoveConnection, this, std::placeholders::_1));
 
         // Use lambda with COPY-BY-VALUE capture for thread safety
         // Why copy? The lambda will execute in a different thread later.
@@ -63,11 +71,7 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
     conn -> SetErrorCb(std::bind(&NetServer::HandleErrorConnection, this, std::placeholders::_1));
     conn -> SetOnMessageCb(std::bind(&NetServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
     conn -> SetCompletionCb(std::bind(&NetServer::HandleSendComplete, this, std::placeholders::_1));
-
-    {
-        std::lock_guard<std::mutex> lck(conn_mtx_);
-        connections_[conn -> fd()] = conn;
-    }
+    AddConnection(conn);
 
     std::cout << "[Reactor Server] new connection(fd: "
         << conn -> fd() << ", ip: " << conn -> ip_addr() << ", port: " << conn -> port() << ").\n"
@@ -82,10 +86,7 @@ void NetServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn){
         close_conn_callback_(conn);
 
     std::cout << "[NetServer] client fd: " << conn -> fd() << " disconnected." << std::endl;
-    {
-        std::lock_guard<std::mutex> lck(conn_mtx_);
-        connections_.erase(conn -> fd());
-    }
+    RemoveConnection(conn -> fd());
     // close this connection
     conn.reset();
 }
@@ -95,16 +96,23 @@ void NetServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn){
         error_callback_(conn);
 
     std::cout << "[NetServer] client fd: " << conn -> fd() << "error occurred, disconnect." << std::endl;
-    {
-        std::lock_guard<std::mutex> lck(conn_mtx_);
-        connections_.erase(conn -> fd());
-    }
+    RemoveConnection(conn -> fd());
     conn.reset();
 }
 
 void NetServer::OnMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message){
     if(on_message_callback_)
         on_message_callback_(conn, message);
+}
+
+void NetServer::AddConnection(std::shared_ptr<ConnectionHandler> conn){
+    std::lock_guard<std::mutex> lck(conn_mtx_);
+    connections_[conn -> fd()] = conn;
+}
+
+void NetServer::RemoveConnection(int fd){
+    std::lock_guard<std::mutex> lck(conn_mtx_);
+    connections_.erase(fd);
 }
 
 void NetServer::HandleSendComplete(std::shared_ptr<ConnectionHandler> conn){
@@ -135,4 +143,13 @@ void NetServer::SetOnMessageCb(std::function<void(std::shared_ptr<ConnectionHand
 void NetServer::SetSendCompletionCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn){
     if(fn)
         send_complete_callback_ = fn;
+}
+
+void NetServer::SetTimerCb(std::function<void(std::shared_ptr<Dispatcher>)> fn){
+    timer_callback = fn;
+}
+
+void NetServer::Timeout(std::shared_ptr<Dispatcher> sock_dispatcher){
+    if(timer_callback)
+        timer_callback(sock_dispatcher);
 }

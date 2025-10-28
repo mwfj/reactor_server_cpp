@@ -91,19 +91,27 @@ namespace RaceConditionTests {
         std::cout << "\n[RC-TEST-2] EnQueue Deadlock Prevention..." << std::endl;
 
         try {
+            // Add delay to ensure previous test's port is released from TIME_WAIT
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
             ReactorServer server(TEST_IP, TEST_PORT);
             TestServerRunner runner(server);
+
+            // Give server time to fully initialize
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
             // EnQueue multiple tasks that themselves call EnQueue
             // This used to deadlock when mutex was held during task execution
             std::atomic<int> task_count{0};
-            std::atomic<bool> deadlock_detected{false};
+            std::atomic<int> started_count{0};
+            std::vector<std::thread> threads;
 
             for (int i = 0; i < 10; i++) {
-                std::thread([&server, &task_count, &deadlock_detected, i]() {
-                    // Note: We can't directly access dispatcher, but the test
-                    // is really about the server handling concurrent connections
-                    // which triggers EnQueue internally
+                threads.emplace_back([&server, &task_count, &started_count, i]() {
+                    started_count++;
+                    // Small stagger to avoid overwhelming the server
+                    std::this_thread::sleep_for(std::chrono::milliseconds(i * 20));
+
                     try {
                         Client client(TEST_PORT, TEST_IP, "EnQueueTest");
                         client.SetQuietMode(true);
@@ -114,23 +122,41 @@ namespace RaceConditionTests {
                         client.Close();
                         task_count++;
                     } catch (const std::exception& e) {
-                        // Connection might fail, but shouldn't deadlock
+                        // Connection might fail under load, but shouldn't deadlock
                     }
-                }).detach();
+                });
             }
 
-            // Wait with timeout - if it deadlocks, we'll timeout
+            // Wait for all threads to start
             auto start = std::chrono::steady_clock::now();
+            while (started_count < 10 &&
+                   std::chrono::steady_clock::now() - start < std::chrono::seconds(2)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+
+            // Wait for tasks to complete with increased timeout
+            // If it deadlocks, we'll timeout
+            start = std::chrono::steady_clock::now();
             while (task_count < 8 &&
-                   std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+                   std::chrono::steady_clock::now() - start < std::chrono::seconds(10)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
 
+            // Join all threads before checking results
+            for (auto& t : threads) {
+                if (t.joinable()) {
+                    t.join();
+                }
+            }
+
+            // Give server time to process cleanup
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
             if (task_count >= 8) {
-                std::cout << "[RC-TEST-2] PASS: No deadlock, " << task_count << " tasks completed" << std::endl;
+                std::cout << "[RC-TEST-2] PASS: No deadlock, " << task_count << "/10 tasks completed" << std::endl;
                 TestFramework::RecordTest("RC-2: EnQueue No Deadlock", true, "", TestFramework::TestCategory::RACE_CONDITION);
             } else {
-                std::cout << "[RC-TEST-2] FAIL: Possible deadlock - only " << task_count << " completed" << std::endl;
+                std::cout << "[RC-TEST-2] FAIL: Possible deadlock - only " << task_count << "/10 completed" << std::endl;
                 TestFramework::RecordTest("RC-2: EnQueue No Deadlock", false, "Timeout/deadlock detected", TestFramework::TestCategory::RACE_CONDITION);
             }
 

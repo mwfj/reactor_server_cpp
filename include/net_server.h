@@ -49,11 +49,19 @@ private:
 
     std::function<void(std::shared_ptr<ConnectionHandler>, std::string&)>  on_message_callback_ = nullptr;
     std::function<void(std::shared_ptr<ConnectionHandler>)>  send_complete_callback_ = nullptr;
+    std::function<void(std::shared_ptr<Dispatcher>)> timer_callback = nullptr;
 
     ThreadPool sock_workers_;
+
+    // Timer configuration
+    int timer_interval_;  // How often to check for timeouts (seconds)
+    std::chrono::seconds connection_timeout_;  // Connection idle timeout duration
+
 public:
     NetServer() = delete;
-    NetServer(const std::string& _ip, const size_t _port);
+    NetServer(const std::string& _ip, const size_t _port,
+              int timer_interval = 60,
+              std::chrono::seconds connection_timeout = std::chrono::seconds(300));
     ~NetServer(); 
 
     void Start();
@@ -65,10 +73,14 @@ public:
     void HandleSendComplete(std::shared_ptr<ConnectionHandler>);
 
     void OnMessage(std::shared_ptr<ConnectionHandler>, std::string&);
+    void AddConnection(std::shared_ptr<ConnectionHandler>);
+    void RemoveConnection(int);
+    void Timeout(std::shared_ptr<Dispatcher>);
     
-    void SetNewConnectionCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn);
-    void SetCloseConnectionCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn);
-    void SetErrorCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn);
-    void SetOnMessageCb(std::function<void(std::shared_ptr<ConnectionHandler>, std::string&)> fn);
-    void SetSendCompletionCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn);
+    void SetNewConnectionCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
+    void SetCloseConnectionCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
+    void SetErrorCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
+    void SetOnMessageCb(std::function<void(std::shared_ptr<ConnectionHandler>, std::string&)>);
+    void SetSendCompletionCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
+    void SetTimerCb(std::function<void(std::shared_ptr<Dispatcher>)>);
 };

@@ -80,6 +80,8 @@ void ConnectionHandler::OnMessage(){
     if(input_bf_.Size() > 0 && on_message_callback_){
         std::string message(input_bf_.Data(), input_bf_.Size());
         on_message_callback_(shared_from_this(), message);
+        // Update timestamp
+        ts_ = TimeStamp::Now();
         // Clear the input buffer after processing
         input_bf_.Clear();
     }
@@ -167,4 +169,8 @@ void ConnectionHandler::SetCloseCb(std::function<void(std::shared_ptr<Connection
 
 void ConnectionHandler::SetErrorCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn){
     error_callback_ = fn;
+}
+
+bool ConnectionHandler::IsTimeOut(std::chrono::seconds duration) const {
+    return ts_.IsTimeOut(duration);
 }

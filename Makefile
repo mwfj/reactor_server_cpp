@@ -9,7 +9,7 @@
 
 # Compiler and flags
 CXX = g++
-CXXFLAGS = -std=c++11 -g -Wall -Iinclude -Ithread_pool/include
+CXXFLAGS = -std=c++11 -g -Wall -Iinclude -Ithread_pool/include -Iutil
 LDFLAGS = -lpthread
 
 # Directories
@@ -17,6 +17,7 @@ SERVER_DIR = server
 LIB_DIR = include
 TEST_DIR = test
 THREAD_POOL_DIR = thread_pool
+UTIL_DIR = util
 
 # Target executable
 TARGET = run
@@ -37,8 +38,11 @@ THREAD_POOL_SRCS = $(THREAD_POOL_DIR)/src/threadpool.cc $(THREAD_POOL_DIR)/src/t
 # Application code
 APP_SRCS = $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/run_test.cc
 
+# TimeStamp Code
+UTIL_SRCS = $(UTIL_DIR)/timestamp.cc
+
 # All sources combined
-SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(APP_SRCS)
+SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(APP_SRCS) $(UTIL_SRCS)
 
 # Header files (organized by category)
 CORE_HEADERS = $(LIB_DIR)/common.h $(LIB_DIR)/inet_addr.h
@@ -46,10 +50,11 @@ REACTOR_HEADERS = $(LIB_DIR)/dispatcher.h $(LIB_DIR)/epoll_handler.h $(LIB_DIR)/
 NETWORK_HEADERS = $(LIB_DIR)/socket_handler.h $(LIB_DIR)/acceptor.h $(LIB_DIR)/connection_handler.h
 SERVER_HEADERS = $(LIB_DIR)/net_server.h $(LIB_DIR)/buffer.h $(LIB_DIR)/reactor_server.h
 THREAD_POOL_HEADERS = $(THREAD_POOL_DIR)/include/threadpool.h $(THREAD_POOL_DIR)/include/threadtask.h
-TEST_HEADERS = $(LIB_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h
+UTIL_HEADERS = $(UTIL_DIR)/timestamp.h
+TEST_HEADERS = $(LIB_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h
 
 # All headers combined
-HEADERS = $(CORE_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(TEST_HEADERS)
+HEADERS = $(CORE_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(TEST_HEADERS)
 
 # Default target
 .DEFAULT_GOAL := all

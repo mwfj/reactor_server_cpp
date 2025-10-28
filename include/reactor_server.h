@@ -34,7 +34,9 @@ private:
     NetServer net_server_;
     ThreadPool task_workers_;
 public:
-    ReactorServer(const std::string&, const size_t);
+    ReactorServer(const std::string&, const size_t,
+                  int timer_interval = 60,
+                  std::chrono::seconds connection_timeout = std::chrono::seconds(300));
     ~ReactorServer() = default;
 
     void Start();

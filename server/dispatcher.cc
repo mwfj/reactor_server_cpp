@@ -1,11 +1,14 @@
 #include "dispatcher.h"
 #include "channel.h"
-#include <sys/eventfd.h>
+#include "connection_handler.h"
 
 Dispatcher::Dispatcher() :
     ep_(std::unique_ptr<EpollHandler>(new EpollHandler())),
     is_sock_dispatcher_(false),
-    eventfd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC))
+    eventfd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)),
+    timer_fd_(-1),
+    end_t_(0),
+    timeout_(std::chrono::seconds(0))
 {
     if (eventfd_ == -1) {
         throw std::runtime_error(std::string("eventfd creation failed: ") + strerror(errno));
@@ -14,10 +17,12 @@ Dispatcher::Dispatcher() :
     // Cannot use shared_from_this() in constructor
 }
 
-Dispatcher::Dispatcher(bool _is_sock):
+Dispatcher::Dispatcher(bool _is_sock,  int _end_t, std::chrono::seconds _timeout):
     ep_(std::unique_ptr<EpollHandler>(new EpollHandler())),
     is_sock_dispatcher_(_is_sock),
-    eventfd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC))
+    eventfd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)),
+    end_t_(_end_t),
+    timeout_(_timeout)
 {
     if (eventfd_ == -1) {
         throw std::runtime_error(std::string("eventfd creation failed: ") + strerror(errno));
@@ -32,6 +37,14 @@ void Dispatcher::Init() {
     wake_channel_ = std::make_shared<Channel>(shared_from_this(), eventfd_);
     wake_channel_->SetReadCallBackFn(std::bind(&Dispatcher::HandleEventId, this)); // Should we replace std::bind with lambda here?
     wake_channel_->EnableReadMode();
+
+    // Only initialize timer if this is a socket dispatcher with timeout configured
+    if (is_sock_dispatcher_ && timeout_.count() > 0) {
+        timer_fd_ = TimeStamp::GenTimerFd(timeout_, std::chrono::nanoseconds(0));
+        timer_channel_ = std::make_shared<Channel>(shared_from_this(), timer_fd_);
+        timer_channel_->SetReadCallBackFn(std::bind(&Dispatcher::TimerHandler, this));
+        timer_channel_->EnableReadMode();
+    }
 }
 
 Dispatcher::~Dispatcher() {
@@ -53,6 +66,16 @@ void Dispatcher::RunEventLoop(){
         // Use 1000ms timeout instead of blocking indefinitely
         // This allows the server to check is_running() periodically
         std::vector<std::shared_ptr<Channel>> channels = ep_->WaitForEvent(1000);
+
+        // If no events, just continue loop (don't shutdown!)
+        // The timeout is for periodic checking, not termination
+        if(channels.size() == 0){
+            // Optional: Call timeout callback if set (but don't stop the loop)
+            if(timeout_trigger_callback_){
+                timeout_trigger_callback_(shared_from_this());
+            }
+            continue;
+        }
 
         // Process all active channels
         for(auto& ch : channels) {
@@ -157,4 +180,53 @@ void Dispatcher::EnQueue(std::function<void()> fn){
         task_que_.push_back(fn);
     }
     WakeUp();
+}
+
+void Dispatcher::AddConnection(std::shared_ptr<ConnectionHandler> conn){
+    std::lock_guard<std::mutex> lck(timer_mtx_);
+    connections_[conn -> fd()] = conn;
+}
+
+void Dispatcher::SetTimerCB(std::function<void(int)> fn){
+    timer_callback_ = fn;
+}
+
+void Dispatcher::SetTimeOutTriggerCB(std::function<void(std::shared_ptr<Dispatcher>)> fn){
+    timeout_trigger_callback_ = fn;
+}
+
+void Dispatcher::TimerHandler(){
+    TimeStamp::ResetTimerFd(timer_fd_, end_t_);
+
+    if(is_sock_dispatcher()){
+        std::cout << "[Dispatcher - " << std::this_thread::get_id() << "]: reset timer" << std::endl;
+
+        // Collect all timed-out connection fds first to avoid iterator invalidation
+        std::vector<int> timeout_fds;
+
+        {
+            // Lock before iterating to prevent data races
+            std::lock_guard<std::mutex> lck(timer_mtx_);
+
+            // Check every connection to find whether it has timeout
+            for(auto& conn : connections_){
+                // fd -> connection handler shared_ptr
+                if(conn.second && conn.second->IsTimeOut(timeout_)){
+                    timeout_fds.push_back(conn.first);
+                }
+            }
+
+            // Remove timed-out connections from our map
+            for(int fd : timeout_fds){
+                connections_.erase(fd);
+            }
+        }
+
+        // Call callback for each timed-out connection to remove from NetServer
+        if(timer_callback_){
+            for(int fd : timeout_fds){
+                timer_callback_(fd);
+            }
+        }
+    }
 }
