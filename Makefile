@@ -62,30 +62,27 @@ $(TARGET): $(SRCS) $(HEADERS)
 
 # Clean build artifacts
 clean:
-	rm -f $(TARGET) run_race_test run_stress_test
+	rm -f $(TARGET)
 
 # Run all tests
 test: $(TARGET)
 	@echo "Running test suite..."
 	./$(TARGET)
 
-# Build standalone race condition test executable
-race_test: $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/test_race_condition.cc $(HEADERS)
-	$(CXX) $(CXXFLAGS) $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/test_race_condition.cc $(LDFLAGS) -o run_race_test
-
 # Run only race condition tests
-test_race: race_test
-	@echo "Running race condition tests..."
-	./run_race_test
-
-# Build standalone stress test executable
-stress_test: $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/test_stress_only.cc $(HEADERS)
-	$(CXX) $(CXXFLAGS) $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/test_stress_only.cc $(LDFLAGS) -o run_stress_test
+test_race: $(TARGET)
+	@echo "Running race condition tests only..."
+	./$(TARGET) race
 
 # Run only stress tests
-test_stress: stress_test
-	@echo "Running stress tests..."
-	./run_stress_test
+test_stress: $(TARGET)
+	@echo "Running stress tests only..."
+	./$(TARGET) stress
+
+# Run only basic tests
+test_basic: $(TARGET)
+	@echo "Running basic tests only..."
+	./$(TARGET) basic
 
 # Display help information
 help:
@@ -93,25 +90,28 @@ help:
 	@echo "===================================="
 	@echo ""
 	@echo "Available targets:"
-	@echo "  make [all]     - Build the project (default target)"
-	@echo "                   Compiles all source files and creates './run' executable"
+	@echo "  make [all]       - Build the project (default target)"
+	@echo "                     Compiles all source files and creates './run' executable"
 	@echo ""
-	@echo "  make test      - Build and run all tests"
-	@echo "                   Runs BasicTests (port 8888), StressTests (port 8889),"
-	@echo "                   and RaceConditionTests (port 9000)"
+	@echo "  make test        - Build and run all tests"
+	@echo "                     Runs BasicTests (port 8888), StressTests (port 8889),"
+	@echo "                     and RaceConditionTests (port 9000)"
 	@echo ""
-	@echo "  make test_race - Build and run only race condition tests"
-	@echo "                   Creates './run_race_test' and runs 7 race condition tests"
-	@echo "                   Validates fixes from EVENTFD_RACE_CONDITION_FIXES.md"
+	@echo "  make test_basic  - Build and run only basic tests"
+	@echo "                     Equivalent to './run basic'"
 	@echo ""
 	@echo "  make test_stress - Build and run only stress tests"
-	@echo "                   Creates './run_stress_test' and runs 100 concurrent clients"
-	@echo "                   Validates fixes from STRESS_TEST_BUG_FIXES.md"
+	@echo "                     Runs 100 concurrent clients (equivalent to './run stress')"
+	@echo "                     Validates fixes from STRESS_TEST_BUG_FIXES.md"
 	@echo ""
-	@echo "  make clean     - Remove build artifacts"
-	@echo "                   Deletes './run', './run_race_test', and './run_stress_test'"
+	@echo "  make test_race   - Build and run only race condition tests"
+	@echo "                     Runs 7 race condition tests (equivalent to './run race')"
+	@echo "                     Validates fixes from EVENTFD_RACE_CONDITION_FIXES.md"
 	@echo ""
-	@echo "  make help      - Show this help message"
+	@echo "  make clean       - Remove build artifacts"
+	@echo "                     Deletes './run' executable"
+	@echo ""
+	@echo "  make help        - Show this help message"
 	@echo ""
 	@echo "Build configuration:"
 	@echo "  Compiler:      $(CXX)"
@@ -127,12 +127,19 @@ help:
 	@echo "  Executable:    ./run"
 	@echo ""
 	@echo "Usage examples:"
-	@echo "  make             # Build the project"
-	@echo "  make clean       # Clean build artifacts"
-	@echo "  make test        # Build and run all tests"
-	@echo "  make test_race   # Run only race condition tests"
-	@echo "  make test_stress # Run only stress tests (100 concurrent clients)"
-	@echo "  ./run            # Run all tests directly (after building)"
+	@echo "  make              # Build the project"
+	@echo "  make clean        # Clean build artifacts"
+	@echo "  make test         # Build and run all tests"
+	@echo "  make test_basic   # Run only basic tests"
+	@echo "  make test_stress  # Run only stress tests (100 concurrent clients)"
+	@echo "  make test_race    # Run only race condition tests"
+	@echo ""
+	@echo "Direct executable usage (after building):"
+	@echo "  ./run             # Run all tests"
+	@echo "  ./run basic       # Run basic tests only (or: ./run -b)"
+	@echo "  ./run stress      # Run stress tests only (or: ./run -s)"
+	@echo "  ./run race        # Run race condition tests only (or: ./run -r)"
+	@echo "  ./run help        # Show help message (or: ./run -h)"
 	@echo ""
 	@echo "For more information, see:"
 	@echo "  - STRESS_TEST_BUG_FIXES.md - Stress test bug analysis"
@@ -140,4 +147,4 @@ help:
 	@echo "  - test/RACE_CONDITION_TESTS_README.md - Race condition tests"
 
 # Phony targets
-.PHONY: all clean test test_race race_test test_stress stress_test help
+.PHONY: all clean test test_basic test_stress test_race help
