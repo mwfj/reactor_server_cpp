@@ -53,9 +53,19 @@ void NetServer::Start(){
 
 // stop event loop
 void NetServer::Stop(){
+    // First: Close all active connections to ensure clean shutdown
+    // This prevents connections from holding references to dispatchers during shutdown
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        connections_.clear();  // This will trigger ConnectionHandler destructors
+    }
+
+    // Second: Stop all event loops (now with no active connections)
     for(auto task : socket_dispatchers_)
         task -> StopEventLoop();
     conn_dispatcher_->StopEventLoop();
+
+    // Third: Now safe to join worker threads
     sock_workers_.Stop();
 }
 

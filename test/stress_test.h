@@ -2,6 +2,7 @@
 #include "reactor_server.h"
 #include "client.h"
 #include "test_framework.h"
+#include "string.h"
 
 // Stress test namespace
 namespace StressTests {
@@ -39,13 +40,13 @@ namespace StressTests {
     };
 
     void TestHighLoadConnections() {
+        const int NUM_CLIENTS = 1000;
         std::cout << "\n[STRESS TEST] High Load (1000 concurrent clients)..." << std::endl;
 
         try {
             ReactorServer server(TEST_IP, TEST_PORT);
             StressServerRunner runner(server);
 
-            const int NUM_CLIENTS = 1000;
             std::vector<std::thread> client_threads;
 
             for (int i = 0; i < NUM_CLIENTS; i++) {
@@ -75,11 +76,11 @@ namespace StressTests {
                 t.join();
             }
 
-            std::cout << "[STRESS TEST] Completed 100 concurrent connections" << std::endl;
+            std::cout << "[STRESS TEST] Completed " << NUM_CLIENTS << " concurrent connections" << std::endl;
 
-            TestFramework::RecordTest("High Load Connections (100 clients)", true, "", TestFramework::TestCategory::STRESS);
+            TestFramework::RecordTest("High Load Connections (1000 clients)", true, "", TestFramework::TestCategory::STRESS);
         } catch (const std::exception& e) {
-            TestFramework::RecordTest("High Load Connections (100 clients)", false, e.what(), TestFramework::TestCategory::STRESS);
+            TestFramework::RecordTest("High Load Connections (1000 clients)", false, e.what(), TestFramework::TestCategory::STRESS);
         }
     }
 

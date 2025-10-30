@@ -98,6 +98,7 @@ void Dispatcher::RunEventLoop(){
 
 void Dispatcher::StopEventLoop(){
     set_running_state(false);
+    WakeUp();  // Wake up epoll_wait() immediately for fast shutdown
 }
 
 void Dispatcher::UpdateChannel(std::shared_ptr<Channel> ch){
