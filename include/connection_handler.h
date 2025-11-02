@@ -22,7 +22,7 @@ private:
 
     std::atomic<bool> is_closing_{false};
 
-    TimeStamp ts_; // Each connection own a timestamp to manage
+    TimeStamp ts_; // Each connection owns a timestamp to manage
 public:
     ConnectionHandler() = delete;
     ConnectionHandler(std::shared_ptr<Dispatcher>, std::unique_ptr<SocketHandler>);
