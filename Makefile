@@ -9,7 +9,7 @@
 
 # Compiler and flags
 CXX = g++
-CXXFLAGS = -std=c++11 -g -Wall -Iinclude -Ithread_pool/include -Iutil
+CXXFLAGS = -std=c++11 -g -Wall -Iinclude -Ithread_pool/include -Iutil -Itest
 LDFLAGS = -lpthread
 
 # Directories
@@ -51,7 +51,7 @@ NETWORK_HEADERS = $(LIB_DIR)/socket_handler.h $(LIB_DIR)/acceptor.h $(LIB_DIR)/c
 SERVER_HEADERS = $(LIB_DIR)/net_server.h $(LIB_DIR)/buffer.h $(LIB_DIR)/reactor_server.h
 THREAD_POOL_HEADERS = $(THREAD_POOL_DIR)/include/threadpool.h $(THREAD_POOL_DIR)/include/threadtask.h
 UTIL_HEADERS = $(UTIL_DIR)/timestamp.h
-TEST_HEADERS = $(LIB_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h
+TEST_HEADERS = $(TEST_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h
 
 # All headers combined
 HEADERS = $(CORE_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(TEST_HEADERS)
