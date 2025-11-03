@@ -9,7 +9,10 @@ class ConnectionHandler;
 
 class Dispatcher : public std::enable_shared_from_this<Dispatcher> {
 private:
-    bool is_running_ = false;
+    // CRITICAL: Must be atomic to prevent data race between StopEventLoop() and RunEventLoop()
+    // When Stop() sets is_running_ = false from one thread, the event loop thread MUST see
+    // this change immediately. Without atomic, CPU caching can cause the loop to never exit.
+    std::atomic<bool> is_running_{false};
     std::unique_ptr<EpollHandler> ep_;  // Sole owner of EpollHandler
     void set_running_state(bool);
 
@@ -51,7 +54,7 @@ public:
 
     void RunEventLoop();
     void StopEventLoop();
-    bool is_running() const {return is_running_;}
+    bool is_running() const {return is_running_.load(std::memory_order_acquire);}
     bool is_dispatcher_thread() const { return std::this_thread::get_id() == thread_id_; }
     bool is_sock_dispatcher() const { return is_sock_dispatcher_.load(); }
 

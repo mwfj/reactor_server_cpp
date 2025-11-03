@@ -2,6 +2,12 @@
 #include <iostream>
 #include <stdexcept>
 
+ThreadPool::~ThreadPool() {
+    // RAII: Ensure threads are properly stopped and joined during destruction
+    // This is safe because Stop() is idempotent - calling it multiple times is harmless
+    Stop();
+}
+
 inline void ThreadPool::SetThreadWorkerNum(int nums, bool set_by_init){
     thread_nums = nums;
     if(!set_by_init)
@@ -54,9 +60,25 @@ void ThreadPool::Start(){
 }
 
 void ThreadPool::Stop(){
-    is_running_.store(false);
+    // Make Stop() idempotent - safe to call multiple times
+    // Use compare_exchange to atomically check and set is_running_
+    bool expected = true;
+    if (!is_running_.compare_exchange_strong(expected, false)) {
+        // Already stopped (is_running_ was already false)
+        return;
+    }
+
+    // CRITICAL: Acquire mutex before notifying to prevent lost wakeup
+    // This ensures that any thread checking the predicate in GetTask()
+    // either sees is_running_==false OR receives the notification
+    {
+        std::lock_guard<std::mutex> lck(mtx_);
+        // Lock establishes happens-before relationship with cv_.wait()
+    }
+    // Signal all worker threads to exit (safe to call after releasing lock)
     cv_.notify_all();
 
+    // Wait for all worker threads to finish
     for(std::thread& th : workers_){
         if(th.joinable())
             th.join();

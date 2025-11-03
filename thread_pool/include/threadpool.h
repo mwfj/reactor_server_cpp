@@ -27,7 +27,20 @@ private:
     void Run();
 public:
     ThreadPool() = default;
-    ~ThreadPool() = default;
+
+    // Destructor automatically calls Stop() to ensure proper cleanup (RAII principle).
+    // This is safe because Stop() is idempotent (can be called multiple times):
+    //   - Uses atomic compare_exchange to ensure cleanup logic runs only once
+    //   - Checks thread::joinable() before calling join() to prevent double-join
+    //   - Returns early if already stopped, making it exception-safe
+    //
+    // Users can call Stop() explicitly for:
+    //   - Controlled shutdown timing (e.g., before destruction)
+    //   - Custom error handling during shutdown
+    //   - Graceful cleanup in specific code paths
+    //
+    // If Stop() is called explicitly, destructor's Stop() call becomes a no-op.
+    ~ThreadPool();
 
     void Init();
     void Init(int);

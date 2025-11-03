@@ -116,13 +116,15 @@ namespace RaceConditionTests {
                         Client client(TEST_PORT, TEST_IP, "EnQueueTest");
                         client.SetQuietMode(true);
                         client.Init();
+                        // Set receive timeout to prevent indefinite blocking if server doesn't respond
+                        client.SetReceiveTimeout(5);  // 5 second timeout
                         client.Connect();
                         client.Send();
                         client.Receive();
                         client.Close();
                         task_count++;
                     } catch (const std::exception& e) {
-                        // Connection might fail under load, but shouldn't deadlock
+                        // Connection might fail under load, timeout, but shouldn't deadlock
                     }
                 });
             }

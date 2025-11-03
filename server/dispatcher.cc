@@ -54,7 +54,7 @@ Dispatcher::~Dispatcher() {
 }
 
 void Dispatcher::set_running_state(bool status){
-    is_running_ = status;
+    is_running_.store(status, std::memory_order_release);
 }
 
 void Dispatcher::RunEventLoop(){
