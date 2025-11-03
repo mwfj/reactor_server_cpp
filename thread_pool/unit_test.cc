@@ -342,6 +342,133 @@ void TestHighConcurrency() {
     std::cout << "HighConcurrency passed" << std::endl;
 }
 
+void TestNoLostWakeupOnShutdown() {
+    PrintSection("NoLostWakeupOnShutdown");
+
+    // This test specifically validates the fix for the lost wakeup bug
+    // where worker threads could miss the Stop() notification and hang forever.
+    //
+    // The bug scenario:
+    // 1. Worker threads are waiting in cv_.wait() with no tasks
+    // 2. Stop() sets is_running_ = false and calls cv_.notify_all() WITHOUT holding mutex
+    // 3. Race condition: threads can miss the notification and sleep forever
+    // 4. Main thread hangs in join() waiting for threads that never wake up
+    //
+    // The fix: Stop() now acquires mutex before notify_all() to establish
+    // happens-before ordering, ensuring threads either see is_running_==false
+    // or receive the notification.
+
+    constexpr int num_iterations = 10;  // Multiple iterations to catch race conditions
+
+    for (int iter = 0; iter < num_iterations; ++iter) {
+        ThreadPool pool;
+        pool.Init();
+        pool.SetThreadWorkerNum(8, false);  // More threads = higher chance of race
+        pool.Start();
+
+        // Add a few quick tasks so threads start running
+        std::vector<std::shared_ptr<ThreadTaskInterface>> tasks;
+        for (int i = 0; i < 4; ++i) {
+            auto task = std::make_shared<TestTask>([i]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                return i;
+            });
+            tasks.push_back(task);
+            pool.AddTask(task);
+        }
+
+        // Wait for tasks to complete - now all threads are waiting in GetTask()
+        for (auto& task : tasks) {
+            task->GetValue();
+        }
+
+        // Small delay to ensure threads have entered cv_.wait()
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        // Stop() should complete quickly without hanging
+        // With the bug, this would hang forever waiting for threads
+        auto start = std::chrono::steady_clock::now();
+        pool.Stop();
+        auto elapsed = std::chrono::steady_clock::now() - start;
+
+        // Stop() should complete in well under 1 second
+        // If it takes longer, likely indicates a lost wakeup bug
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+        if (elapsed_ms > 1000) {
+            throw std::runtime_error("NoLostWakeupOnShutdown: Stop() took too long ("
+                                   + std::to_string(elapsed_ms) + "ms), possible hang");
+        }
+
+        if (pool.running_threads() != 0) {
+            throw std::runtime_error("NoLostWakeupOnShutdown: threads still running after Stop()");
+        }
+    }
+
+    std::cout << "NoLostWakeupOnShutdown passed (tested " << num_iterations << " iterations)" << std::endl;
+}
+
+void TestStopWithIdleThreads() {
+    PrintSection("StopWithIdleThreads");
+
+    // Edge case: Stop pool with threads that never received any tasks
+    // This ensures threads wake up correctly even if they've been waiting
+    // since pool startup.
+
+    ThreadPool pool;
+    pool.Init();
+    pool.SetThreadWorkerNum(10, false);
+    pool.Start();
+
+    // Don't add any tasks - all threads are immediately waiting
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // Stop should complete without hanging
+    auto start = std::chrono::steady_clock::now();
+    pool.Stop();
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    if (elapsed_ms > 1000) {
+        throw std::runtime_error("StopWithIdleThreads: Stop() took too long ("
+                               + std::to_string(elapsed_ms) + "ms), possible hang");
+    }
+
+    if (pool.running_threads() != 0) {
+        throw std::runtime_error("StopWithIdleThreads: threads still running after Stop()");
+    }
+
+    std::cout << "StopWithIdleThreads passed" << std::endl;
+}
+
+void TestRapidStartStop() {
+    PrintSection("RapidStartStop");
+
+    // Stress test: Rapid start/stop cycles to expose race conditions
+    // in the Stop() notification mechanism
+
+    constexpr int cycles = 20;
+
+    for (int i = 0; i < cycles; ++i) {
+        ThreadPool pool;
+        pool.Init();
+        pool.SetThreadWorkerNum(6, false);
+        pool.Start();
+
+        // Add one quick task
+        auto task = std::make_shared<TestTask>([]() { return 42; });
+        pool.AddTask(task);
+
+        // Don't wait for task - stop immediately
+        // This creates a race between task execution and shutdown
+        pool.Stop();
+
+        // Task may or may not complete depending on timing
+        // But Stop() should not hang
+    }
+
+    std::cout << "RapidStartStop passed (" << cycles << " cycles)" << std::endl;
+}
+
 }  // namespace THREADPOOL_TESTCASE
 
 int main() {
@@ -353,6 +480,11 @@ int main() {
         THREADPOOL_TESTCASE::TestStartValidation();
         THREADPOOL_TESTCASE::TestCooperativeCancellation();
         THREADPOOL_TESTCASE::TestHighConcurrency();
+
+        // Lost wakeup bug regression tests
+        THREADPOOL_TESTCASE::TestNoLostWakeupOnShutdown();
+        THREADPOOL_TESTCASE::TestStopWithIdleThreads();
+        THREADPOOL_TESTCASE::TestRapidStartStop();
     } catch (const std::exception& e) {
         std::cerr << "Test failure: " << e.what() << std::endl;
         return 1;
