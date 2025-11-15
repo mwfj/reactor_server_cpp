@@ -76,3 +76,4 @@
 #define MAX_REPLY_SIZE 50
 #define NUMBER_OF_CHILD_PROCESSES 25
 #define MAX_CONNECTIONS 10000  // Maximum concurrent connections (epoll scales beyond FD_SETSIZE)
+#define MAX_EVETN_NUMS 1000 // Max events to process per epoll_wait call

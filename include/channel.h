@@ -16,7 +16,7 @@ private:
      */
     std::weak_ptr<Dispatcher> event_dispatcher_;
     // to mark whether the channel has been put in the epoll tree
-    bool is_epoll_in_ = false;
+    bool is_read_event_ = false;
     // the event that fd_ need to monitoring
     uint32_t event_ = 0;
     // the event that already finished
@@ -52,9 +52,9 @@ public:
 
     uint32_t Event() const {return event_;}
     uint32_t dEvent() const {return devent_;}
-    bool is_epoll_in() const {return is_epoll_in_;}
-    void SetEpollIn() {
-        is_epoll_in_ = true;
+    bool is_read_event() const {return is_read_event_;}
+    void SetEventRead() {
+        is_read_event_ = true;
     }
     bool is_channel_closed() const { return is_channel_closed_.load(); }
     void SetEvent(uint32_t ev){
