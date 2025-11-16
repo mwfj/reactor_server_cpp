@@ -59,9 +59,6 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
 #elif defined(__APPLE__) || defined(__MACH__)
     // macOS: use regular accept and set non-blocking separately
     int clientfd = accept(fd_, reinterpret_cast<sockaddr*>(&acceptAddr), &len);
-    if(clientfd != -1) {
-        SetNonBlocking(clientfd);  // Set non-blocking after accept
-    }
 #endif
     if(clientfd == -1){
         // Don't close listening socket on accept error
@@ -84,6 +81,10 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
         std::cout << "[Socket Handler] Error occurred when accepting connection: " << strerror(errno) << std::endl;
         throw std::runtime_error(std::string("Error accepting connection: ") + strerror(errno));
     }
+#if defined(__APPLE__) || defined(__MACH__)
+    // Set non-blocking after successful accept on macOS
+    SetNonBlocking(clientfd);
+#endif
     _clientAddr.SetAddr(acceptAddr);
     return clientfd;
 }
