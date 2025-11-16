@@ -1,5 +1,5 @@
 #pragma once
-#ifdef defined(__linux__)
+#if defined(__linux__)
 
 #include "common.h"
 

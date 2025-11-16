@@ -77,3 +77,27 @@
 #define NUMBER_OF_CHILD_PROCESSES 25
 #define MAX_CONNECTIONS 10000  // Maximum concurrent connections (epoll scales beyond FD_SETSIZE)
 #define MAX_EVETN_NUMS 1000 // Max events to process per epoll_wait call
+
+// Platform-agnostic event constants
+// These map to the underlying platform's event system (epoll on Linux, kqueue on macOS)
+#if defined(__linux__)
+    // Linux: Use epoll constants directly
+    #define EVENT_READ      EPOLLIN
+    #define EVENT_WRITE     EPOLLOUT
+    #define EVENT_ET        EPOLLET      // Edge-triggered mode
+    #define EVENT_RDHUP     EPOLLRDHUP   // Peer closed connection
+    #define EVENT_HUP       EPOLLHUP     // Hangup
+    #define EVENT_ERR       EPOLLERR     // Error condition
+    #define EVENT_PRI       EPOLLPRI     // Priority data
+#elif defined(__APPLE__) || defined(__MACH__)
+    // macOS: Define kqueue-compatible constants
+    // Note: kqueue uses separate filters (EVFILT_READ/EVFILT_WRITE) not bitflags
+    // These are bit positions for our internal event_ field in Channel
+    #define EVENT_READ      0x001        // Read event
+    #define EVENT_WRITE     0x002        // Write event
+    #define EVENT_ET        0x004        // Edge-triggered (kqueue is always edge-triggered)
+    #define EVENT_RDHUP     0x008        // Read hang-up (EOF condition)
+    #define EVENT_HUP       0x010        // Hangup
+    #define EVENT_ERR       0x020        // Error condition
+    #define EVENT_PRI       0x040        // Priority data
+#endif

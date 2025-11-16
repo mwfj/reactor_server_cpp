@@ -53,15 +53,36 @@ void SocketHandler::Listen(int _maxLen){
 int SocketHandler::Accept(InetAddr& _clientAddr){
     sockaddr_in acceptAddr;
     socklen_t len = sizeof(acceptAddr);
+#if defined(__linux__)
+    // Linux: use accept4 with SOCK_NONBLOCK for atomic non-blocking accept
     int clientfd = accept4(fd_, reinterpret_cast<sockaddr*>(&acceptAddr), &len, SOCK_NONBLOCK);
+#elif defined(__APPLE__) || defined(__MACH__)
+    // macOS: use regular accept and set non-blocking separately
+    int clientfd = accept(fd_, reinterpret_cast<sockaddr*>(&acceptAddr), &len);
+    if(clientfd != -1) {
+        SetNonBlocking(clientfd);  // Set non-blocking after accept
+    }
+#endif
     if(clientfd == -1){
         // Don't close listening socket on accept error
         if(errno == EAGAIN || errno == EWOULDBLOCK) {
             // No connections available right now - not an error
             return -1;
         }
-        std::cout << "[Socket Handler] Error occurred when accepting connection" << std::endl;
-        throw std::runtime_error("Error occurred when accepting connection");
+        // On macOS under high load, we can get ECONNABORTED, EMFILE, ENFILE
+        // These should not crash the server - just log and return
+        if(errno == ECONNABORTED || errno == EMFILE || errno == ENFILE ||
+           errno == ENOBUFS || errno == ENOMEM) {
+            // Temporary resource exhaustion - log but don't crash
+            // ECONNABORTED: Connection aborted before accept completed
+            // EMFILE: Process file descriptor limit reached
+            // ENFILE: System file descriptor limit reached
+            // ENOBUFS/ENOMEM: Insufficient resources
+            std::cerr << "[Socket Handler] Accept failed (temporary): " << strerror(errno) << std::endl;
+            return -1;
+        }
+        std::cout << "[Socket Handler] Error occurred when accepting connection: " << strerror(errno) << std::endl;
+        throw std::runtime_error(std::string("Error accepting connection: ") + strerror(errno));
     }
     _clientAddr.SetAddr(acceptAddr);
     return clientfd;

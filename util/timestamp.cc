@@ -17,6 +17,7 @@ TimeStamp TimeStamp::Now(){
 }
 
 int TimeStamp::GenTimerFd(std::chrono::seconds sec, std::chrono::nanoseconds nsec) {
+#if defined(__linux__)
     int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     if (timer_fd == -1) {
         throw std::runtime_error("Failed to create timer fd");
@@ -33,14 +34,29 @@ int TimeStamp::GenTimerFd(std::chrono::seconds sec, std::chrono::nanoseconds nse
     }
 
     return timer_fd;
+#elif defined(__APPLE__) || defined(__MACH__)
+    // macOS: kqueue timers are managed differently
+    // For now, return -1 to indicate timer not supported on macOS
+    // TODO: Implement kqueue-based timer support
+    (void)sec;   // Suppress unused parameter warning
+    (void)nsec;  // Suppress unused parameter warning
+    return -1;
+#endif
 }
 
 void TimeStamp::ResetTimerFd(int& timer_fd, int duration){
+#if defined(__linux__)
     struct itimerspec timeout;
     memset(&timeout,0,sizeof(struct itimerspec));
     timeout.it_value.tv_sec = duration;
     timeout.it_value.tv_nsec = 0;
     timerfd_settime(timer_fd,0,&timeout,0);
+#elif defined(__APPLE__) || defined(__MACH__)
+    // macOS: kqueue timers handled differently
+    // For now, no-op
+    (void)timer_fd;  // Suppress unused parameter warning
+    (void)duration;  // Suppress unused parameter warning
+#endif
 }
 
 std::string TimeStamp::toString() const{

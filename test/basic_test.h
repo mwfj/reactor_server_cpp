@@ -147,9 +147,10 @@ namespace BasicTests {
                         Client client(TEST_PORT, TEST_IP, ss.str().c_str());
                         client.SetQuietMode(true);
                         client.Init();
+                        client.SetReceiveTimeout(5);  // 5 second timeout to prevent hanging
                         client.Connect();
                         client.Send();
-                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));  // Give server more time
                         client.Receive();
                         client.Close();
                     } catch (const std::exception& e) {

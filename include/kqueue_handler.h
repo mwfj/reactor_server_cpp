@@ -9,8 +9,8 @@ class Channel;
 // For macOS/BSD Kqueue
 class KqueueHandler{
 public:
-    KqueueHandler() = default;
-    ~KqueueHandler() = default;
+    KqueueHandler();
+    ~KqueueHandler();
     void UpdateEvent(std::shared_ptr<Channel>);
     void RemoveChannel(std::shared_ptr<Channel>);  // Remove channel from kqueue
     std::vector<std::shared_ptr<Channel>> WaitForEvent(int);

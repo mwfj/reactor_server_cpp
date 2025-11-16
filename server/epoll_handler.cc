@@ -1,4 +1,4 @@
-#ifdef defined(__linux__)
+#if defined(__linux__)
 
 #include "epoll_handler.h"
 #include "channel.h"

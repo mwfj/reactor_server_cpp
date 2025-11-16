@@ -4,88 +4,103 @@
 
 KqueueHandler::KqueueHandler(){
     if((kqueuefd_ = ::kqueue()) == -1){
-        std::cout << "[Epoll Handler] epoll_create failed: " << strerror(errno) << std::endl;
-        throw std::runtime_error("Epoll created failed");
+        std::cout << "[Kqueue Handler] kqueue() failed: " << strerror(errno) << std::endl;
+        throw std::runtime_error("kqueue() failed");
     }
 }
 
 KqueueHandler::~KqueueHandler(){
-    close(kqueuefd_);
+    if(kqueuefd_ != -1) {
+        close(kqueuefd_);
+    }
 }
 
 /**
- * Store channel in map and register with epoll.
- * Linux epoll API requires raw void* pointer in epoll_event,
- * but we maintain ownership with smart pointers in channel_map_.
+ * Store channel in map and register with kqueue.
+ * kqueue uses separate filters for read/write instead of bitflags.
  */
 void KqueueHandler::UpdateEvent(std::shared_ptr<Channel> ch){
     // Check if channel is closed - prevents TOCTOU race
-    // This must be checked here, not just in Enable*/Disable* methods
     if (ch->is_channel_closed()) {
         return;  // Silently ignore - channel is closing or closed
     }
 
     int fd = ch->fd();
 
-    // Double-check fd is valid before epoll operations
+    // Double-check fd is valid before kqueue operations
     if (fd < 0) {
         return;  // Invalid fd, nothing to do
     }
 
-    
-    uint32_t kevents = ch->Event();
+    uint32_t events = ch->Event();
 
     // kqueue requires separate kevents for read and write filters
-    struct kevent evSet[2];
+    // Use EV_ADD | EV_ONESHOT to get edge-triggered behavior
+    // EV_CLEAR would work too, but ONESHOT is closer to epoll ET semantics
+    struct kevent evSet[4];  // Max: add/delete read + add/delete write
     int numChanges = 0;
 
+    // Check if already registered
+    bool is_registered = ch->is_read_event();
 
-    if(ch->is_read_event()){
-        if(::epoll_ctl(kqueuefd_, EPOLL_CTL_MOD, fd, &ev) == -1){
-            // If fd is invalid or not in epoll, it might be closing - don't throw
+    // Handle read filter
+    if(events & EVENT_READ){
+        // Add or re-enable read filter
+        EV_SET(&evSet[numChanges++], fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, ch.get());
+    } else if(is_registered) {
+        // Remove read filter if it was previously registered
+        EV_SET(&evSet[numChanges++], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+    }
+
+    // Handle write filter
+    if(events & EVENT_WRITE){
+        // Add or re-enable write filter
+        EV_SET(&evSet[numChanges++], fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, ch.get());
+    } else if(is_registered) {
+        // Remove write filter if it was previously registered
+        EV_SET(&evSet[numChanges++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+    }
+
+    // Apply changes to kqueue
+    if(numChanges > 0){
+        if(::kevent(kqueuefd_, evSet, numChanges, nullptr, 0, nullptr) == -1){
+            // If fd is invalid or not in kqueue, it might be closing - don't throw
             if (errno == EBADF || errno == ENOENT) {
                 return;  // Gracefully handle race condition
             }
-            std::cout << "[Epoll Handler] epoll_ctl MOD failed: " << strerror(errno) << std::endl;
-            throw std::runtime_error("epoll_ctl MOD failed");
+            std::cout << "[Kqueue Handler] kevent failed (fd=" << fd << "): " << strerror(errno) << std::endl;
+            // Don't throw - just log and continue
+            return;
         }
-    }else{
-        if(::epoll_ctl(kqueuefd_, EPOLL_CTL_ADD, fd, &ev) == -1){
-            // If fd is invalid or already in epoll, it might be a race - don't throw
-            if (errno == EBADF || errno == EEXIST) {
-                return;  // Gracefully handle race condition
-            }
-            std::cout << "[Epoll Handler] epoll_ctl ADD failed: " << strerror(errno) << std::endl;
-            throw std::runtime_error("epoll_ctl ADD failed");
-        }
-        ch->SetEventRead();
+
         // Store in map to maintain ownership - must lock to prevent race with WaitForEvent
-        {
+        if(events != 0) {
             std::lock_guard<std::mutex> lock(channel_map_mutex_);
             channel_map_[fd] = ch;
+            ch->SetEventRead();  // Mark as registered
         }
     }
 }
 
 /**
- * Remove channel from epoll and channel map
+ * Remove channel from kqueue and channel map
  * MUST be called before closing the fd to prevent fd reuse bugs
  */
 void KqueueHandler::RemoveChannel(std::shared_ptr<Channel> ch){
     int fd = ch->fd();
 
-    // Remove from epoll if it was registered
+    // Remove from kqueue if it was registered
     if(ch->is_read_event()){
         struct kevent evSets[2];
-        // Delete both read and write flags
+        // Delete both read and write filters
         EV_SET(&evSets[0], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
         EV_SET(&evSets[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
         if(::kevent(kqueuefd_, evSets, 2, nullptr, 0, nullptr) == -1){
-            // ENOENT means it wasn't in epoll (already removed or never added)
+            // ENOENT means it wasn't in kqueue (already removed or never added)
             // EBADF means fd is invalid (already closed)
-            // Both are ok - we just want to ensure it's not in epoll
+            // Both are ok - we just want to ensure it's not in kqueue
             if(errno != ENOENT && errno != EBADF){
-                std::cout << "[KqueueHandler] epoll_ctl DEL warning for fd=" << fd
+                std::cout << "[KqueueHandler] kevent DEL warning for fd=" << fd
                           << ": " << strerror(errno) << std::endl;
             }
         }
@@ -106,7 +121,7 @@ std::vector<std::shared_ptr<Channel>> KqueueHandler::WaitForEvent(int timeout){
     // init event array
     memset(events_, 0, sizeof(events_));
 
-    // Convert timeout from millionseconds to timespec
+    // Convert timeout from milliseconds to timespec
     struct timespec ts;
     struct timespec *timeout_ptr = nullptr;
 
@@ -119,13 +134,13 @@ std::vector<std::shared_ptr<Channel>> KqueueHandler::WaitForEvent(int timeout){
     int nevents = kevent(kqueuefd_, nullptr, 0,  events_, MAX_EVETN_NUMS, timeout_ptr);
 
     if(nevents < 0){
-        // interruptted by other signal
+        // interrupted by other signal
         if(errno == EINTR){
-             std::cout << "[Epoll Handler] epoll_wait() failed, iterruptted by other signal: " << strerror(errno) << std::endl;
+             std::cout << "[Kqueue Handler] kevent() failed, interrupted by signal: " << strerror(errno) << std::endl;
              return {};
         }
-        std::cout << "[Epoll Handler] epoll_wait() failed: " << strerror(errno) << std::endl;
-        throw std::runtime_error("epoll_wait() failed");
+        std::cout << "[Kqueue Handler] kevent() failed: " << strerror(errno) << std::endl;
+        throw std::runtime_error("kevent() failed");
     }
 
     // timeout or no events
@@ -133,30 +148,65 @@ std::vector<std::shared_ptr<Channel>> KqueueHandler::WaitForEvent(int timeout){
         return channels;
     }
 
-    // Reserve space to avoid reallocations
-    channels.reserve(nevents);
+    // kqueue can return multiple events for the same fd (read + write)
+    // We need to consolidate them into a single Channel with combined events
+    std::map<int, std::pair<std::shared_ptr<Channel>, uint32_t>> fd_events;
 
-    for(int idx = 0; idx < nevents; idx++){
-        Channel *ch_raw = static_cast<Channel*>(events_[idx].udata);
-
-        // CRITICAL: Lock and validate BEFORE dereferencing the raw pointer
-        // The channel may have been deleted between epoll_wait() returning and now
+    // Lock once for the entire event processing
+    {
         std::lock_guard<std::mutex> lock(channel_map_mutex_);
 
-        // Find the shared_ptr by searching for matching raw pointer
-        std::shared_ptr<Channel> ch;
-        for(auto& pair : channel_map_) {
-            if(pair.second && pair.second.get() == ch_raw) {
-                ch = pair.second;
-                break;
+        for(int idx = 0; idx < nevents; idx++){
+            Channel *ch_raw = static_cast<Channel*>(events_[idx].udata);
+
+            // Find the shared_ptr by searching for matching raw pointer
+            std::shared_ptr<Channel> ch;
+            for(auto& pair : channel_map_) {
+                if(pair.second && pair.second.get() == ch_raw) {
+                    ch = pair.second;
+                    break;
+                }
+            }
+
+            // Only process if we found a valid shared_ptr
+            if(ch) {
+                int fd = ch->fd();
+
+                // Convert kqueue filter events to our platform-agnostic EVENT_ constants
+                uint32_t platform_events = 0;
+                if(events_[idx].filter == EVFILT_READ) {
+                    platform_events |= EVENT_READ;
+                    if(events_[idx].flags & EV_EOF) {
+                        platform_events |= EVENT_RDHUP;  // EOF on read = peer closed
+                    }
+                }
+                if(events_[idx].filter == EVFILT_WRITE) {
+                    platform_events |= EVENT_WRITE;
+                }
+                if(events_[idx].flags & EV_ERROR) {
+                    platform_events |= EVENT_ERR;
+                }
+
+                // Consolidate events for the same fd
+                auto it = fd_events.find(fd);
+                if(it != fd_events.end()) {
+                    // Merge events for same fd
+                    it->second.second |= platform_events;
+                } else {
+                    // First event for this fd
+                    fd_events[fd] = std::make_pair(ch, platform_events);
+                }
             }
         }
+    }  // Release lock
 
-        // Only dereference if we found a valid shared_ptr
-        if(ch) {
-            ch->SetDEvent(events_[idx].events);  // NOW SAFE - we hold a shared_ptr
-            channels.push_back(ch);
-        }
+    // Build final channel list with consolidated events
+    channels.reserve(fd_events.size());
+    for(auto& pair : fd_events) {
+        auto& ch = pair.second.first;
+        uint32_t events = pair.second.second;
+        ch->SetDEvent(events);
+        channels.push_back(ch);
     }
 
     return channels;  // RVO/NRVO will optimize this (no copy!)

@@ -1,6 +1,6 @@
 #pragma once
 #include "common.h"
-#include "epoll_handler.h"
+#include "event_handler.h"
 #include <deque>
 
 // Forward declarations to break circular dependency
@@ -13,7 +13,7 @@ private:
     // When Stop() sets is_running_ = false from one thread, the event loop thread MUST see
     // this change immediately. Without atomic, CPU caching can cause the loop to never exit.
     std::atomic<bool> is_running_{false};
-    std::unique_ptr<EpollHandler> ep_;  // Sole owner of EpollHandler
+    std::unique_ptr<EventHandler> ep_;  // Sole owner of EventHandler
     void set_running_state(bool);
 
     std::atomic_bool is_sock_dispatcher_;
@@ -25,7 +25,11 @@ private:
     // the I/O related job
     // Note: Must be shared_ptr because Channel uses shared_from_this()
     std::shared_ptr<Channel> wake_channel_;
-    int eventfd_;
+#if defined(__linux__)
+    int eventfd_;  // Linux uses eventfd for wakeup
+#elif defined(__APPLE__) || defined(__MACH__)
+    int wakeup_pipe_[2];  // macOS uses pipe for wakeup (pipe[0]=read, pipe[1]=write)
+#endif
     std::deque<std::function<void()>> task_que_;
 
     std::thread::id thread_id_;
