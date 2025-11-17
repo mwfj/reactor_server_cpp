@@ -39,6 +39,7 @@
     // macOS uses kqueue instead of epoll
     #include <sys/event.h>
     #include <sys/time.h>
+// NOT Support Windows Currently
 // #elif _WIN32
 //     // Windows
 //     #define WIN32_LEAN_AND_MEAN
@@ -47,11 +48,11 @@
 //     #include <windows.h>
 //     #pragma comment(lib, "ws2_32.lib")
     
-//     // Windows doesn't have these POSIX headers
-//     // #include <unistd.h>     // Use _close(), _read(), _write() instead
-//     // #include <signal.h>     // Use Windows equivalents
+    // Windows doesn't have these POSIX headers
+    // #include <unistd.h>     // Use _close(), _read(), _write() instead
+    // #include <signal.h>     // Use Windows equivalents
     
-//     // Map POSIX-like functions to Windows equivalents
+// Map POSIX-like functions to Windows equivalents
 //     #define close closesocket
 //     typedef int socklen_t;    
 #else
