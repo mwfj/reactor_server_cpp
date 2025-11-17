@@ -22,6 +22,7 @@ private:
 #endif
 public:
     EventHandler();
+    ~EventHandler() = default;
     void UpdateEvent(std::shared_ptr<Channel>);
     void RemoveChannel(std::shared_ptr<Channel>);  // Remove channel from epoll
     std::vector<std::shared_ptr<Channel>> WaitForEvent(int);
