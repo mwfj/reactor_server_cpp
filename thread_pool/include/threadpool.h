@@ -6,6 +6,8 @@
 #include <condition_variable>
 #include <atomic>
 #include <memory>
+#include <iostream>
+#include <stdexcept>
 #include "threadtask.h"
 
 class ThreadTaskInterface;

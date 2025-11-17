@@ -1,5 +1,4 @@
 #include "timestamp.h"
-#include <time.h>
 
 TimeStamp::TimeStamp() : time_(std::chrono::system_clock::now()) {}
 

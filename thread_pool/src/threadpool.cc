@@ -1,6 +1,4 @@
 #include "../include/threadpool.h"
-#include <iostream>
-#include <stdexcept>
 
 ThreadPool::~ThreadPool() {
     // RAII: Ensure threads are properly stopped and joined during destruction

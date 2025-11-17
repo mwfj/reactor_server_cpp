@@ -1,8 +1,7 @@
 #pragma once
 
 #include "common.h"
-#include <string>
-#include <chrono>
+#include <time.h>
 
 class TimeStamp{
 private:

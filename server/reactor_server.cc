@@ -1,5 +1,4 @@
 #include "reactor_server.h"
-#include <iostream>
 
 
 ReactorServer::ReactorServer(const std::string& _ip, const size_t _port,
