@@ -136,10 +136,12 @@ namespace BasicTests {
 
             const int NUM_CLIENTS = 10;
             std::vector<std::thread> client_threads;
+            std::atomic<int> success_count{0};
+            std::atomic<int> failure_count{0};
 
             // Launch multiple clients concurrently
             for (int i = 0; i < NUM_CLIENTS; i++) {
-                client_threads.emplace_back([i]() {
+                client_threads.emplace_back([i, &success_count, &failure_count]() {
                     try {
                         std::stringstream ss;
                         ss << "ConcurrentClient" << i;
@@ -149,12 +151,14 @@ namespace BasicTests {
                         client.Init();
                         client.SetReceiveTimeout(5);  // 5 second timeout to prevent hanging
                         client.Connect();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));  // Reduced from 100ms - acceptor now handles all connections
                         client.Send();
-                        std::this_thread::sleep_for(std::chrono::milliseconds(50));  // Give server more time
-                        client.Receive();
+                        client.Receive();  // Block until response arrives (5 second timeout)
                         client.Close();
+                        success_count++;  // Only increment if no exception thrown
                     } catch (const std::exception& e) {
                         std::cerr << "[TEST] Client " << i << " error: " << e.what() << std::endl;
+                        failure_count++;
                     }
                 });
             }
@@ -165,8 +169,15 @@ namespace BasicTests {
             }
 
             std::cout << "[TEST] All " << NUM_CLIENTS << " concurrent clients completed" << std::endl;
+            std::cout << "[TEST] Success: " << success_count << ", Failures: " << failure_count << std::endl;
 
-            TestFramework::RecordTest("Concurrent Connections", true, "", TestFramework::TestCategory::BASIC);
+            // FIX: Test now properly tracks success/failure instead of always passing
+            // Previously, exceptions were caught and logged but test always recorded as PASS
+            // Now, test only passes if ALL clients successfully connect, send, and receive
+            bool all_success = (success_count == NUM_CLIENTS && failure_count == 0);
+            std::string error_msg = all_success ? "" :
+                "Only " + std::to_string(success_count.load()) + "/" + std::to_string(NUM_CLIENTS) + " clients succeeded";
+            TestFramework::RecordTest("Concurrent Connections", all_success, error_msg, TestFramework::TestCategory::BASIC);
         } catch (const std::exception& e) {
             TestFramework::RecordTest("Concurrent Connections", false, e.what(), TestFramework::TestCategory::BASIC);
         }

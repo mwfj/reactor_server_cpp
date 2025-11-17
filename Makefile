@@ -106,7 +106,7 @@ help:
 	@echo "                     Equivalent to './run basic'"
 	@echo ""
 	@echo "  make test_stress - Build and run only stress tests"
-	@echo "                     Runs 100 concurrent clients (equivalent to './run stress')"
+	@echo "                     Runs 1000 concurrent clients (equivalent to './run stress' or './run -s')"
 	@echo "                     Validates fixes from STRESS_TEST_BUG_FIXES.md"
 	@echo ""
 	@echo "  make test_race   - Build and run only race condition tests"

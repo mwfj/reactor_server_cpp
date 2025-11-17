@@ -45,7 +45,7 @@ void ReactorServer::Error(std::shared_ptr<ConnectionHandler> conn){
 void ReactorServer::ProcessMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message){
     std::cout << "Thread Id: " << std::this_thread::get_id() << " Process Message: " << message << std::endl;
 
-    if(task_workers_.is_running() || (task_workers_.GetThreadWorkerNum() == 0)){
+    if(task_workers_.is_running() && (task_workers_.GetThreadWorkerNum() > 0)){
         // Use lambda with COPY-BY-VALUE capture for thread safety
         // Why copy 'message'?
         // 1. 'message' is a reference parameter owned by the caller (NetServer)

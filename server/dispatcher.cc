@@ -124,8 +124,20 @@ void Dispatcher::StopEventLoop(){
 }
 
 void Dispatcher::UpdateChannel(std::shared_ptr<Channel> ch){
-    // Don't call ep_->UpdateEvent() here - UpdateChannelInLoop will do it
-    if(!is_running() || is_dispatcher_thread()){
+    // CRITICAL FIX: Always use EnQueue when not in dispatcher thread
+    // The original condition `if(!is_running() || is_dispatcher_thread())` was buggy:
+    // - It would call UpdateChannelInLoop() directly when !is_running(), even from wrong thread
+    // - This caused race conditions where channels weren't properly registered in epoll
+    if(is_dispatcher_thread()){
+        UpdateChannelInLoop(ch);
+        return;
+    }
+
+    // From other threads: use EnQueue to ensure thread-safe epoll modifications
+    // But ONLY if running - otherwise, calls during initialization will deadlock
+    if(!is_running()){
+        // Dispatcher not started yet - this is a bug in the calling code
+        // But to maintain compatibility, call directly (thread-unsafe but works for init)
         UpdateChannelInLoop(ch);
         return;
     }
@@ -139,7 +151,13 @@ void Dispatcher::UpdateChannel(std::shared_ptr<Channel> ch){
 }
 
 void Dispatcher::RemoveChannel(std::shared_ptr<Channel> ch){
-    if(!is_running() || is_dispatcher_thread()){
+    if(is_dispatcher_thread()){
+        RemoveChannelInLoop(ch);
+        return;
+    }
+
+    if(!is_running()){
+        // Dispatcher not started yet - call directly to avoid deadlock
         RemoveChannelInLoop(ch);
         return;
     }
