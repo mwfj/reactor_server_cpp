@@ -1,39 +1,41 @@
 #pragma once
 
+// Common C++ headers (available on all platforms)
+#include <cstring>
+#include <string.h>
+#include <stdexcept>
+#include <iostream>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <vector>
+#include <memory>
+#include <functional>
+#include <map>
+#include <atomic>
+
 // Supoort cross-platform(current support Linux & MacOS)
+// Common system-level library
+#include <sys/socket.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <errno.h>
+#include <fcntl.h>
+
+#include <netinet/tcp.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 // Platform detection
 #if defined(__linux__)
     // Linux
-    #include <sys/socket.h>
-    #include <unistd.h>
-    #include <signal.h>
-    #include <sys/wait.h>
-    #include <sys/epoll.h>
-    #include <fcntl.h>
-    #include <netinet/tcp.h>
-    #include <errno.h>
-    #include <arpa/inet.h>
-    #include <netinet/in.h>
-    #include <sys/types.h>
+    #include <sys/epoll.h>      
     #include <sys/eventfd.h>
     #include <sys/timerfd.h> 
-    #include <string.h>
+
 #elif defined(__APPLE__) || defined(__MACH__)
-    // macOS
-    #include <sys/socket.h>
-    #include <unistd.h>
-    #include <signal.h>
-    #include <sys/wait.h>
-    #include <sys/event.h>
-    #include <fcntl.h>
-    #include <netinet/tcp.h>
-    #include <errno.h>
-    #include <arpa/inet.h>
-    #include <netinet/in.h>
-    #include <sys/types.h>
-    #include <string.h>
-    
     // macOS uses kqueue instead of epoll
     #include <sys/event.h>
     #include <sys/time.h>
@@ -55,19 +57,6 @@
 #else
     #error "Unsupported platform"
 #endif
-
-// Common headers (available on all platforms)
-#include <cstring>
-#include <stdexcept>
-#include <iostream>
-#include <chrono>
-#include <thread>
-#include <mutex>
-#include <vector>
-#include <memory>
-#include <functional>
-#include <map>
-#include <atomic>
 
 #define MAX_BUFFER_SIZE 1024
 #define MAX_REPLY_SIZE 50
