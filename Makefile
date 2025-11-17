@@ -67,7 +67,7 @@ $(TARGET): $(SRCS) $(HEADERS)
 
 # Clean build artifacts
 clean:
-	rm -f $(TARGET)
+	rm -rf $(TARGET)*
 
 # Run all tests
 test: $(TARGET)
