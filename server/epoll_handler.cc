@@ -1,3 +1,5 @@
+#if defined(__linux__)
+
 #include "epoll_handler.h"
 #include "channel.h"
 
@@ -35,7 +37,7 @@ void EpollHandler::UpdateEvent(std::shared_ptr<Channel> ch){
     ev.data.ptr = ch.get(); // Store raw pointer for epoll
     ev.events = ch->Event();
 
-    if(ch->is_epoll_in()){
+    if(ch->is_read_event()){
         if(::epoll_ctl(epollfd_, EPOLL_CTL_MOD, fd, &ev) == -1){
             // If fd is invalid or not in epoll, it might be closing - don't throw
             if (errno == EBADF || errno == ENOENT) {
@@ -53,7 +55,7 @@ void EpollHandler::UpdateEvent(std::shared_ptr<Channel> ch){
             std::cout << "[Epoll Handler] epoll_ctl ADD failed: " << strerror(errno) << std::endl;
             throw std::runtime_error("epoll_ctl ADD failed");
         }
-        ch->SetEpollIn();
+        ch->SetEventRead();
         // Store in map to maintain ownership - must lock to prevent race with WaitForEvent
         {
             std::lock_guard<std::mutex> lock(channel_map_mutex_);
@@ -70,7 +72,7 @@ void EpollHandler::RemoveChannel(std::shared_ptr<Channel> ch){
     int fd = ch->fd();
 
     // Remove from epoll if it was registered
-    if(ch->is_epoll_in()){
+    if(ch->is_read_event()){
         if(::epoll_ctl(epollfd_, EPOLL_CTL_DEL, fd, nullptr) == -1){
             // ENOENT means it wasn't in epoll (already removed or never added)
             // EBADF means fd is invalid (already closed)
@@ -97,7 +99,7 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
     // init event array
     memset(events_, 0, sizeof(events_));
 
-    int infds = epoll_wait(epollfd_, events_, MaxEpollEvents, timeout);
+    int infds = epoll_wait(epollfd_, events_, MAX_EVETN_NUMS, timeout);
 
     if(infds < 0){
         std::cout << "[Epoll Handler] epoll_wait() failed: " << strerror(errno) << std::endl;
@@ -143,3 +145,5 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
 
     return channels;  // RVO/NRVO will optimize this (no copy!)
 }
+
+#endif

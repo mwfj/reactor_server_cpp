@@ -24,7 +24,7 @@ TARGET = run
 
 # Source files (organized by component)
 # Core reactor components
-REACTOR_SRCS = $(SERVER_DIR)/dispatcher.cc $(SERVER_DIR)/epoll_handler.cc $(SERVER_DIR)/channel.cc
+REACTOR_SRCS = $(SERVER_DIR)/dispatcher.cc $(SERVER_DIR)/event_handler.cc $(SERVER_DIR)/epoll_handler.cc $(SERVER_DIR)/kqueue_handler.cc $(SERVER_DIR)/channel.cc
 
 # Network components
 NETWORK_SRCS = $(SERVER_DIR)/socket_handler.cc $(SERVER_DIR)/acceptor.cc $(SERVER_DIR)/connection_handler.cc
@@ -106,7 +106,7 @@ help:
 	@echo "                     Equivalent to './run basic'"
 	@echo ""
 	@echo "  make test_stress - Build and run only stress tests"
-	@echo "                     Runs 100 concurrent clients (equivalent to './run stress')"
+	@echo "                     Runs 1000 concurrent clients (equivalent to './run stress' or './run -s')"
 	@echo "                     Validates fixes from STRESS_TEST_BUG_FIXES.md"
 	@echo ""
 	@echo "  make test_race   - Build and run only race condition tests"

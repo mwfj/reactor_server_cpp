@@ -107,7 +107,7 @@ namespace RaceConditionTests {
             std::vector<std::thread> threads;
 
             for (int i = 0; i < 10; i++) {
-                threads.emplace_back([&server, &task_count, &started_count, i]() {
+                threads.emplace_back([&task_count, &started_count, i]() {
                     started_count++;
                     // Small stagger to avoid overwhelming the server
                     std::this_thread::sleep_for(std::chrono::milliseconds(i * 20));
@@ -183,7 +183,7 @@ namespace RaceConditionTests {
 
             std::vector<std::thread> threads;
             for (int i = 0; i < NUM_RAPID_CLIENTS; i++) {
-                threads.emplace_back([&successful_closes, i]() {
+                threads.emplace_back([&successful_closes]() {
                     try {
                         Client client(TEST_PORT, TEST_IP, "RapidClose");
                         client.SetQuietMode(true);
@@ -238,7 +238,7 @@ namespace RaceConditionTests {
 
             std::vector<std::thread> threads;
             for (int i = 0; i < NUM_CLIENTS; i++) {
-                threads.emplace_back([&successful_ops, i]() {
+                threads.emplace_back([&successful_ops]() {
                     try {
                         Client client(TEST_PORT, TEST_IP, "ConcurrentEvent");
                         client.SetQuietMode(true);
@@ -389,7 +389,7 @@ namespace RaceConditionTests {
 
             std::vector<std::thread> threads;
             for (int i = 0; i < NUM_CLIENTS; i++) {
-                threads.emplace_back([&completed, i]() {
+                threads.emplace_back([&completed]() {
                     try {
                         Client client(TEST_PORT, TEST_IP, "TOCTOUTest");
                         client.SetQuietMode(true);

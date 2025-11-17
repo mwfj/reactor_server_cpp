@@ -14,23 +14,23 @@ Channel::~Channel() {
 
 void Channel::EnableETMode(){
     if(is_channel_closed_) return;
-    event_ |= EPOLLET;
+    event_ |= EVENT_ET;
 }
 
 void Channel::DisableETMode(){
     if(is_channel_closed_) return;
-    event_ &= ~EPOLLET;
+    event_ &= ~EVENT_ET;
 }
 
 bool Channel::isEnableETMode() const {
-    return (event_ & EPOLLET) == EPOLLET;
+    return (event_ & EVENT_ET) == EVENT_ET;
 }
 
 void Channel::EnableReadMode(){
     if(is_channel_closed_) return;
-    // IMPORTANT: EPOLLRDHUP must be explicitly requested to detect peer shutdown
+    // IMPORTANT: EVENT_RDHUP must be explicitly requested to detect peer shutdown
     // Without it, we won't get notified when client closes the connection
-    event_ |= (EPOLLIN | EPOLLRDHUP);
+    event_ |= (EVENT_READ | EVENT_RDHUP);
     std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
     if(ep_shared)
         ep_shared -> UpdateChannel(shared_from_this());
@@ -38,19 +38,19 @@ void Channel::EnableReadMode(){
 
 void Channel::DisableReadMode(){
     if(is_channel_closed_) return;
-    event_ &= ~EPOLLIN;
+    event_ &= ~EVENT_READ;
     std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
     if(ep_shared)
         ep_shared -> UpdateChannel(shared_from_this());
 }
 
 bool Channel::isEnableReadMode() const {
-    return (event_ & EPOLLIN) == EPOLLIN;
+    return (event_ & EVENT_READ) == EVENT_READ;
 }
 
 void Channel::EnableWriteMode(){
     if(is_channel_closed_)  return ;
-    event_ |= EPOLLOUT;
+    event_ |= EVENT_WRITE;
     std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
     if(ep_shared)
         ep_shared -> UpdateChannel(shared_from_this());
@@ -58,14 +58,14 @@ void Channel::EnableWriteMode(){
 
 void Channel::DisableWriteMode(){
     if(is_channel_closed_)  return ;
-    event_ &= ~EPOLLOUT;
+    event_ &= ~EVENT_WRITE;
     std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
     if(ep_shared)
         ep_shared -> UpdateChannel(shared_from_this());
 }
 
 bool Channel::isEnableWriteMode() const{
-    return (event_ & EPOLLOUT) == EPOLLOUT;
+    return (event_ & EVENT_WRITE) == EVENT_WRITE;
 }
 
 void Channel::HandleEvent() {
@@ -77,14 +77,14 @@ void Channel::HandleEvent() {
 
     // Handle close events with highest priority
     // If connection is closing, don't process other events
-    if(events & (EPOLLRDHUP | EPOLLHUP)){
+    if(events & (EVENT_RDHUP | EVENT_HUP)){
         if(close_fn_)
             close_fn_();
         return; // Don't process other events if closing
     }
 
     // Handle read events
-    if(events & (EPOLLIN | EPOLLPRI)){
+    if(events & (EVENT_READ | EVENT_PRI)){
         // Call Acceptor::NewConnection if it is acceptor channel
         // Call ConnectionHandler::OnMessage if it is client channel
         if(read_fn_)
@@ -92,13 +92,13 @@ void Channel::HandleEvent() {
     }
 
     // Handle write events
-    if(events & EPOLLOUT){
+    if(events & EVENT_WRITE){
         if(write_fn_)
             write_fn_();
     }
 
     // Handle error events
-    if(events & EPOLLERR){
+    if(events & EVENT_ERR){
         if(error_fn_)
             error_fn_();
     }
@@ -135,7 +135,7 @@ void Channel::CloseChannel(){
 
     // IMPORTANT: Remove fd from epoll BEFORE closing it
     // This prevents epoll fd reuse bugs when the OS reuses the fd number
-    if(fd_ != -1 && is_epoll_in_){
+    if(fd_ != -1 && is_read_event_){
         std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
         if(ep_shared){
             ep_shared->RemoveChannel(shared_from_this());
@@ -147,7 +147,7 @@ void Channel::CloseChannel(){
         fd_ = -1;
     }
 
-    is_epoll_in_ = false;
+    is_read_event_ = false;
     event_ = 0;
     devent_ = 0;
 }
