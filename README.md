@@ -678,24 +678,24 @@ The server uses a layered callback system for separation of concerns:
        │                                                    error handling
 
 ```
-### Key Design Pattern
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 1. Weak Pointer Callbacks (Two-Phase Initialization)                        │
-│    - ConnectionHandler callbacks use weak_ptr<ConnectionHandler> capture    │
-│    - Prevents circular references: Handler → Channel → Callback → Handler   │
-│    - RegisterCallbacks() called after shared_ptr wrapping                   │
-│    - Callbacks check weak_ptr.lock() before invoking (safe destruction)     │
-│                                                                             │
-│ 2. Separation of Concerns                                                   │
-│    - Layer 1 (Channel): Low-level fd event dispatch                         │
-│    - Layer 2 (NetServer): Connection lifecycle management                   │
-│    - Layer 3 (Application): Business logic and protocol implementation      │
-│                                                                             │
-│ 3. Non-Blocking + Edge-Triggered                                            │
-│    - All callbacks must handle partial reads/writes (EAGAIN/EWOULDBLOCK)    │
-│    - Read loops continue until EAGAIN                                       │
-│    - Write buffers accumulate data until socket writable                    │
-└─────────────────────────────────────────────────────────────────────────────┘
+
+### Key Design Pattern in Callback
+
+1. Weak Pointer Callbacks (Two-Phase Initialization)                     
+   - ConnectionHandler callbacks use `weak_ptr<ConnectionHandler>` capture 
+   - Prevents circular references: Handler → Channel → Callback → Handler
+   - `RegisterCallbacks()` called after shared_ptr wrapping                
+   - Callbacks check `weak_ptr.lock()` before invoking (safe destruction)  
+                                                                
+2. Separation of Concerns                                                
+   - Layer 1 (Channel): Low-level fd event dispatch                      
+   - Layer 2 (NetServer): Connection lifecycle management                
+   - Layer 3 (Application): Business logic and protocol implementation   
+                                                                
+3. Non-Blocking + Edge-Triggered                                         
+   - All callbacks must handle partial reads/writes (EAGAIN/EWOULDBLOCK) 
+   - Read loops continue until EAGAIN                                    
+   - Write buffers accumulate data until socket writable                 
 
 ## Application Development
 
