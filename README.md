@@ -617,9 +617,9 @@ The server uses a layered callback system for separation of concerns:
        │                                                       ├─ Send buffered data
        │                                                       ├─ Erase sent bytes
        │                                                       └─ When buffer empty:
-       │                                                           │
-  ┌────┴────────────┐                                             │
-  │   NetServer     │◀────────────────────────────────────────────┘
+       │                                                                │
+  ┌────┴────────────┐                                                   │
+  │   NetServer     │◀──────────────────────────────────────────────────┘
   │                 │
   └─────────────────┘
        │
