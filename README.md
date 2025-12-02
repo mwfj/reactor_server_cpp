@@ -166,6 +166,338 @@ The codebase implements a modular Reactor pattern with clear separation of conce
    - `NetServer::HandleCloseConnection()` calls application callback, removes from map
    - ConnectionHandler shared_ptr reset, triggering cleanup
 
+### Data Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          REACTOR SERVER DATA FLOW                           │
+│                    (Component Interaction & Data Movement)                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+ STEP 1: SERVER INITIALIZATION
+═══════════════════════════════════════════════════════════════════════════════
+
+                            ┌───────────────────┐
+                            │   NetServer       │
+                            │   Constructor     │
+                            └─────────┬─────────┘
+                                      │
+                    ┌─────────────────┼─────────────────┐
+                    │                 │                 │
+                    ▼                 ▼                 ▼
+          ┌─────────────────┐  ┌────────────┐  ┌────────────────┐
+          │   Dispatcher    │  │  Acceptor  │  │  Application   │
+          │                 │  │            │  │  Callbacks     │
+          └────────┬────────┘  └─────┬──────┘  └────────────────┘
+                   │                 │
+                   │ creates         │ creates
+                   ▼                 ▼
+          ┌─────────────────┐  ┌────────────────┐
+          │  EventHandler   │  │ SocketHandler  │
+          │  (Epoll/Kqueue) │  │ (listen socket)│
+          └─────────────────┘  └─────┬──────────┘
+                   │                 │
+                   │                 │ creates
+                   │                 ▼
+                   │           ┌────────────────┐
+                   │           │  Channel       │
+                   │           │  (listen fd)   │
+                   │           └────────┬───────┘
+                   │                    │
+                   │◀───────────────────┘
+                   │  register with epoll/kqueue
+                   │  (EPOLLIN events)
+                   ▼
+          ┌─────────────────────────────┐
+          │  channel_map_[listen_fd]    │
+          │  stores shared_ptr<Channel> │
+          └─────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+ STEP 2: EVENT LOOP (Dispatcher::RunEventLoop)
+═══════════════════════════════════════════════════════════════════════════════
+
+    ┌──────────────────────────────────────────────────────────────┐
+    │                    MAIN EVENT LOOP                           │
+    │                                                              │
+    │   while (is_running_) {                                      │
+    │                                                              │
+    │     ┌───────────────────────────────────────────┐            │
+    │     │ EventHandler::WaitForEvent(1000ms)        │            │
+    │     │ ↓                                         │            │
+    │     │ epoll_wait()/kevent() - BLOCKS            │            │
+    │     └─────────────────┬─────────────────────────┘            │
+    │                       │                                      │
+    │                       ▼                                      │
+    │     ┌────────────────────────────────────────────┐           │
+    │     │ Returns: vector<shared_ptr<Channel>>       │           │
+    │     │          (active channels with events)     │           │
+    │     └─────────────────┬──────────────────────────┘           │
+    │                       │                                      │
+    │                       ▼                                      │
+    │     ┌────────────────────────────────────────────┐           │
+    │     │ For each active channel:                   │           │
+    │     │   channel->HandleEvent()                   │           │
+    │     │     ↓                                      │           │
+    │     │   Dispatches to registered callbacks       │           │
+    │     └────────────────────────────────────────────┘           │
+    │   }                                                          │
+    └──────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+ STEP 3: NEW CONNECTION ACCEPTANCE
+═══════════════════════════════════════════════════════════════════════════════
+
+    Client connects
+         │
+         ▼
+    [TCP SYN/ACK Handshake]
+         │
+         ▼
+    ┌──────────────────────┐
+    │ EPOLLIN on listen_fd │
+    └──────────┬───────────┘
+               │
+               ▼
+    ┌────────────────────────────┐
+    │ Acceptor::NewConnection()  │
+    │   accept4(SOCK_NONBLOCK)   │
+    └──────────┬─────────────────┘
+               │
+               ├─ Creates: SocketHandler (client_fd)
+               │
+               ▼
+    ┌─────────────────────────────────────┐
+    │ NetServer::HandleNewConnection()    │
+    └──────────┬──────────────────────────┘
+               │
+               ├─ Creates: ConnectionHandler
+               │              │
+               │              ├─ Creates: Channel (client_fd)
+               │              ├─ Creates: input_bf_, output_bf_
+               │              └─ RegisterCallbacks() [weak_ptr]
+               │
+               ├─ Stores in: connections_[client_fd]
+               │
+               ▼
+    ┌─────────────────────────────────────┐
+    │ Channel registered with Dispatcher  │
+    │ Mode: EPOLLIN | EPOLLET             │
+    └─────────────────────────────────────┘
+               │
+               ▼
+    ┌─────────────────────────────────────┐
+    │ Application: new_conn_callback_     │
+    └─────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+ STEP 4: CLIENT DATA READ (Client → Server)
+═══════════════════════════════════════════════════════════════════════════════
+
+    Client sends data
+         │
+         ▼
+    ┌──────────────────────┐
+    │ EPOLLIN on client_fd │
+    └──────────┬───────────┘
+               │
+               ▼
+    ┌──────────────────────────┐
+    │ Channel::HandleEvent()   │
+    │   (EPOLLIN detected)     │
+    └──────────┬───────────────┘
+               │
+               ▼
+    ┌───────────────────────────────────────┐
+    │ ConnectionHandler::OnMessage()        │
+    │                                       │
+    │   while (true) {                      │
+    │     n = read(fd, buf, MAX_BUFFER)     │
+    │     if (n > 0)                        │
+    │       input_bf_.Append(buf, n)        │◀─── Edge-triggered:
+    │     else if (errno == EAGAIN)         │     Read until EAGAIN
+    │       break                           │
+    │   }                                   │
+    └───────────────┬───────────────────────┘
+                    │
+                    ▼
+    ┌─────────────────────────────────────────┐
+    │ NetServer::OnMessage()                  │
+    │   Extracts data from input_bf_          │
+    └───────────────┬─────────────────────────┘
+                    │
+                    ▼
+    ┌─────────────────────────────────────────┐
+    │ Application: on_message_callback_       │
+    │   - Parse protocol                      │
+    │   - Process business logic              │
+    │   - Generate response                   │
+    │   - Call conn->SendData()               │
+    └─────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+ STEP 5: SERVER DATA WRITE (Server → Client)
+═══════════════════════════════════════════════════════════════════════════════
+
+    Application calls conn->SendData(data, len)
+         │
+         ▼
+    ┌────────────────────────────────────────┐
+    │ ConnectionHandler::SendData()          │
+    │   output_bf_.AppendWithHead(data, len) │ ◀── 4-byte length header
+    │   channel_->EnableWriting()            │     prepended
+    │   channel_->EnableETMode()             │
+    └─────────────┬──────────────────────────┘
+                  │
+                  ├─ Modifies epoll: EPOLLIN | EPOLLOUT | EPOLLET
+                  │
+                  ▼
+    ┌──────────────────────────┐
+    │ EPOLLOUT on client_fd    │ ◀── Socket writable
+    └──────────┬─────────────────┘
+               │
+               ▼
+    ┌──────────────────────────┐
+    │ Channel::HandleEvent()   │
+    │   (EPOLLOUT detected)    │
+    └──────────┬───────────────┘
+               │
+               ▼
+    ┌────────────────────────────────────────┐
+    │ ConnectionHandler::CallWriteCb()       │
+    │                                        │
+    │   while (output_bf_.Size() > 0) {      │
+    │     n = write(fd, output_bf_.Data())   │
+    │     if (n > 0)                         │
+    │       output_bf_.Erase(n)              │◀─── Edge-triggered:
+    │     else if (errno == EAGAIN)          │     Write until EAGAIN
+    │       break                            │
+    │   }                                    │
+    │                                        │
+    │   if (output_bf_.Size() == 0) {        │
+    │     channel_->DisableWriting()         │
+    │     completion_callback_()             │
+    │   }                                    │
+    └────────────────┬───────────────────────┘
+                     │
+                     ▼
+    ┌──────────────────────────────────────────┐
+    │ NetServer::HandleSendComplete()          │
+    └────────────────┬─────────────────────────┘
+                     │
+                     ▼
+    ┌──────────────────────────────────────────┐
+    │ Application: send_complete_callback_     │
+    └──────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+ STEP 6: CONNECTION CLOSE
+═══════════════════════════════════════════════════════════════════════════════
+
+    Client closes connection / read() returns 0 / EPOLLRDHUP
+         │
+         ▼
+    ┌──────────────────────────────────┐
+    │ Channel::HandleEvent()           │
+    │   (EPOLLRDHUP | EPOLLHUP)        │
+    └──────────┬───────────────────────┘
+               │
+               ▼
+    ┌──────────────────────────────────┐
+    │ ConnectionHandler::CallCloseCb() │
+    └──────────┬───────────────────────┘
+               │
+               ▼
+    ┌─────────────────────────────────────────┐
+    │ NetServer::HandleCloseConnection()      │
+    │   - Remove from connections_[fd]        │
+    │   - Call close_conn_callback_           │
+    └─────────────┬───────────────────────────┘
+                  │
+                  ▼
+    ┌─────────────────────────────────────────┐
+    │ Application: close_conn_callback_       │
+    └─────────────┬───────────────────────────┘
+                  │
+                  ▼
+    ┌─────────────────────────────────────────┐
+    │ ConnectionHandler destroyed             │
+    │   (shared_ptr refcount → 0)             │
+    └─────────────┬───────────────────────────┘
+                  │
+                  ▼
+    ┌─────────────────────────────────────────┐
+    │ Channel::CloseChannel()                 │
+    │   1. dispatcher->RemoveChannel(fd)      │
+    │      → epoll_ctl(EPOLL_CTL_DEL)         │
+    │   2. close(fd)                          │
+    └─────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+                           MEMORY MANAGEMENT
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Ownership Model (C++11 Smart Pointers)                                      │
+│                                                                             │
+│  NetServer                                                                  │
+│    ├─ unique_ptr<Dispatcher>          (sole ownership)                      │
+│    │    └─ unique_ptr<EventHandler>   (sole ownership)                      │
+│    │                                                                        │
+│    ├─ unique_ptr<Acceptor>             (sole ownership)                     │
+│    │    └─ unique_ptr<SocketHandler>   (listen socket)                      │
+│    │                                                                        │
+│    └─ map<fd, shared_ptr<ConnectionHandler>>  (shared ownership)            │
+│              │                                                              │
+│              ├─ unique_ptr<SocketHandler>     (client socket)               │
+│              ├─ shared_ptr<Channel>           (shared with EventHandler)    │
+│              │    └─ weak_ptr<Dispatcher>     (avoids circular ref)         │
+│              ├─ Buffer input_bf_                                            │
+│              └─ Buffer output_bf_                                           │
+│                                                                             │
+│  EventHandler (EpollHandler/KqueueHandler)                                  │
+│    └─ map<fd, shared_ptr<Channel>>    (shared with ConnectionHandler)       │
+│                                                                             │
+│  Callbacks use weak_ptr<ConnectionHandler>:                                 │
+│    - Prevents circular reference: Handler → Channel → Callback → Handler    │
+│    - Safe destruction: callbacks check weak_ptr.lock() before invoking      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+                        CROSS-THREAD COMMUNICATION
+═══════════════════════════════════════════════════════════════════════════════
+
+  Other Thread                    I/O Thread (Dispatcher Event Loop)
+       │                                     │
+       │ EnQueue(task)                       │
+       ├──────────────────────────────┐      │
+       │                              │      │
+       │  ┌───────────────────────┐   │      │
+       │  │ Lock task_que_ mutex  │   │      │
+       │  │ task_que_.push(task)  │   │      │
+       │  │ Unlock mutex          │   │      │
+       │  └───────────────────────┘   │      │
+       │                              │      │
+       │ WakeUp()                     │      │
+       │  write(wake_fd_, "1")  ──────┼──────▶ EPOLLIN on wake_fd_
+       │                              │      │
+       │                              │      ▼
+       │                              │  HandleEventId()
+       │                              │      │
+       │                              │      ├─ read(wake_fd_)
+       │                              │      │
+       │                              │      ├─ Lock mutex
+       │                              │      ├─ Copy task_que_ → local_tasks
+       │                              │      ├─ Clear task_que_
+       │                              │      ├─ Unlock mutex
+       │                              │      │
+       │                              │      └─ Execute local_tasks
+       │                              │            (outside mutex)
+       │                              │
+       ▼                              ▼
+```
+
 ## Cross-Platform Support
 
 **[include/common.h](include/common.h)** provides platform detection and common constants:
@@ -213,8 +545,8 @@ The server uses a layered callback system for separation of concerns:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         CALLBACK ARCHITECTURE                                │
-│                    (3-Layer Callback Chain Pattern)                          │
+│                         CALLBACK ARCHITECTURE                               │
+│                    (3-Layer Callback Chain Pattern)                         │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -270,14 +602,14 @@ The server uses a layered callback system for separation of concerns:
   │ Connection   │───────▶│   Channel   │───────▶│  ConnectionHandler │
   │  Handler     │        │             │        │                    │
   └──────────────┘        └─────────────┘        └────────────────────┘
-       │                       │                         │
-       │ SendData()            │                         │
-       ├─ Append to            │                         │
-       │  output_bf_           │                         │
-       ├─ Enable EPOLLOUT     │                         │
-       │                      │                         │
-       │                      │ EPOLLOUT                │
-       │                      ▼                         │
+       │                       │                        │
+       │ SendData()            │                        │
+       ├─ Append to            │                        │
+       │  output_bf_           │                        │
+       ├─ Enable EPOLLOUT      │                        │
+       │                       │                        │
+       │                       │ EPOLLOUT               │
+       │                       ▼                        │
        │                 HandleEvent()                  │
        │                      │                         │
        │                      └─────────────────────────▶ CallWriteCb()
@@ -317,7 +649,7 @@ The server uses a layered callback system for separation of concerns:
        │                      │                         │
        │                      │                         └──▶ close_conn_callback_
        │                      │                                   │
-       │                      └─ CloseChannel()                  ▼
+       │                      └─ CloseChannel()                   ▼
        │                         │                          Application
        │                         ├─ RemoveChannel()        cleanup
        │                         └─ close(fd)
@@ -330,7 +662,7 @@ The server uses a layered callback system for separation of concerns:
   │   Channel   │───────▶│ Connection   │───────▶│  NetServer         │
   │             │        │  Handler     │        │                    │
   └─────────────┘        └──────────────┘        └────────────────────┘
-       │                      │                        │
+       │                      │                         │
        │ EPOLLERR             │                         │
        │                      │                         │
        ▼                      ▼                         ▼
@@ -345,10 +677,8 @@ The server uses a layered callback system for separation of concerns:
        │                                                    Application
        │                                                    error handling
 
-═══════════════════════════════════════════════════════════════════════════════
-                              KEY DESIGN PATTERNS
-═══════════════════════════════════════════════════════════════════════════════
-
+```
+### Key Design Pattern
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ 1. Weak Pointer Callbacks (Two-Phase Initialization)                        │
 │    - ConnectionHandler callbacks use weak_ptr<ConnectionHandler> capture    │
@@ -366,7 +696,6 @@ The server uses a layered callback system for separation of concerns:
 │    - Read loops continue until EAGAIN                                       │
 │    - Write buffers accumulate data until socket writable                    │
 └─────────────────────────────────────────────────────────────────────────────┘
-```
 
 ## Application Development
 
