@@ -93,8 +93,8 @@ void Dispatcher::RunEventLoop(){
         // The timeout is for periodic checking, not termination
         if(channels.size() == 0){
             // Optional: Call timeout callback if set (but don't stop the loop)
-            if(timeout_trigger_callback_){
-                timeout_trigger_callback_(shared_from_this());
+            if(callbacks_.timeout_trigger_callback){
+                callbacks_.timeout_trigger_callback(shared_from_this());
             }
             continue;
         }
@@ -244,12 +244,12 @@ void Dispatcher::AddConnection(std::shared_ptr<ConnectionHandler> conn){
     connections_[conn -> fd()] = conn;
 }
 
-void Dispatcher::SetTimerCB(std::function<void(int)> fn){
-    timer_callback_ = fn;
+void Dispatcher::SetTimerCB(CALLBACKS_NAMESPACE::DispatcherTimerCallback fn){
+    callbacks_.timer_callback = std::move(fn);
 }
 
-void Dispatcher::SetTimeOutTriggerCB(std::function<void(std::shared_ptr<Dispatcher>)> fn){
-    timeout_trigger_callback_ = fn;
+void Dispatcher::SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCallback fn){
+    callbacks_.timeout_trigger_callback = std::move(fn);
 }
 
 void Dispatcher::TimerHandler(){
@@ -280,9 +280,9 @@ void Dispatcher::TimerHandler(){
         }
 
         // Call callback for each timed-out connection to remove from NetServer
-        if(timer_callback_){
+        if(callbacks_.timer_callback){
             for(int fd : timeout_fds){
-                timer_callback_(fd);
+                callbacks_.timer_callback(fd);
             }
         }
     }

@@ -11,7 +11,7 @@
 // Tests all issues documented in EVENTFD_RACE_CONDITION_FIXES.md
 namespace RaceConditionTests {
     const char* TEST_IP = "127.0.0.1";
-    const int TEST_PORT = 9000;
+    const int TEST_PORT = 10000;
 
     // RAII wrapper for test server
     class TestServerRunner {

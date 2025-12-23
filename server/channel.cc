@@ -78,8 +78,9 @@ void Channel::HandleEvent() {
     // Handle close events with highest priority
     // If connection is closing, don't process other events
     if(events & (EVENT_RDHUP | EVENT_HUP)){
-        if(close_fn_)
-            close_fn_();
+        if(callbacks_.close_callback)
+            callbacks_.close_callback();
+        CloseChannel();
         return; // Don't process other events if closing
     }
 
@@ -87,38 +88,37 @@ void Channel::HandleEvent() {
     if(events & (EVENT_READ | EVENT_PRI)){
         // Call Acceptor::NewConnection if it is acceptor channel
         // Call ConnectionHandler::OnMessage if it is client channel
-        if(read_fn_)
-            read_fn_();
+        if(callbacks_.read_callback)
+            callbacks_.read_callback();
     }
 
     // Handle write events
     if(events & EVENT_WRITE){
-        if(write_fn_)
-            write_fn_();
+        if(callbacks_.write_callback)
+            callbacks_.write_callback();
     }
 
     // Handle error events
     if(events & EVENT_ERR){
-        if(error_fn_)
-            error_fn_();
+        if(callbacks_.error_callback)
+            callbacks_.error_callback();
     }
 }
 
-
-void Channel::SetReadCallBackFn(std::function<void()> fn){
-    read_fn_ = fn;
+void Channel::SetReadCallBackFn(CALLBACKS_NAMESPACE::ChannelReadCallback fn){
+    callbacks_.read_callback = std::move(fn);
 }
 
-void Channel::SetWriteCallBackFn(std::function<void()> fn){
-    write_fn_ = fn;
+void Channel::SetWriteCallBackFn(CALLBACKS_NAMESPACE::ChannelWriteCallback fn){
+    callbacks_.write_callback = std::move(fn);
 }
 
-void Channel::SetCloseCallBackFn(std::function<void()> fn){
-    close_fn_ = fn;
+void Channel::SetCloseCallBackFn(CALLBACKS_NAMESPACE::ChannelCloseCallback fn){
+    callbacks_.close_callback = std::move(fn);
 }
 
-void Channel::SetErrorCallBackFn(std::function<void()> fn){
-    error_fn_ = fn;
+void Channel::SetErrorCallBackFn(CALLBACKS_NAMESPACE::ChannelErrorCallback fn){
+    callbacks_.error_callback = std::move(fn);
 }
 
 void Channel::CloseChannel(){

@@ -87,13 +87,13 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
         << conn -> fd() << ", ip: " << conn -> ip_addr() << ", port: " << conn -> port() << ").\n"
         << "ok" << std::endl;
 
-    if(new_conn_callback_)
-        new_conn_callback_(conn);
+    if(callbacks_.new_conn_callback)
+        callbacks_.new_conn_callback(conn);
 }
 
 void NetServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn){
-    if(close_conn_callback_)
-        close_conn_callback_(conn);
+    if(callbacks_.close_conn_callback)
+        callbacks_.close_conn_callback(conn);
 
     std::cout << "[NetServer] client fd: " << conn -> fd() << " disconnected." << std::endl;
     RemoveConnection(conn -> fd());
@@ -102,8 +102,8 @@ void NetServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn){
 }
 
 void NetServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn){
-    if(error_callback_)
-        error_callback_(conn);
+    if(callbacks_.error_callback)
+        callbacks_.error_callback(conn);
 
     std::cout << "[NetServer] client fd: " << conn -> fd() << "error occurred, disconnect." << std::endl;
     RemoveConnection(conn -> fd());
@@ -111,8 +111,8 @@ void NetServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn){
 }
 
 void NetServer::OnMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message){
-    if(on_message_callback_)
-        on_message_callback_(conn, message);
+    if(callbacks_.on_message_callback)
+        callbacks_.on_message_callback(conn, message);
 }
 
 void NetServer::AddConnection(std::shared_ptr<ConnectionHandler> conn){
@@ -126,40 +126,41 @@ void NetServer::RemoveConnection(int fd){
 }
 
 void NetServer::HandleSendComplete(std::shared_ptr<ConnectionHandler> conn){
-    if(send_complete_callback_)
-        send_complete_callback_(conn);
-}
-
-void NetServer::SetNewConnectionCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn){
-    if(fn)
-        new_conn_callback_ = fn;
-}
-
-void NetServer::SetCloseConnectionCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn){
-    if(fn)
-        close_conn_callback_ = fn;
-}
-
-void NetServer::SetErrorCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn){
-    if(fn)
-        error_callback_ = fn;
-}
-
-void NetServer::SetOnMessageCb(std::function<void(std::shared_ptr<ConnectionHandler>, std::string&)> fn){
-    if(fn)
-        on_message_callback_ = fn;
-}
-
-void NetServer::SetSendCompletionCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn){
-    if(fn)
-        send_complete_callback_ = fn;
-}
-
-void NetServer::SetTimerCb(std::function<void(std::shared_ptr<Dispatcher>)> fn){
-    timer_callback = fn;
+    if(callbacks_.send_complete_callback)
+        callbacks_.send_complete_callback(conn);
 }
 
 void NetServer::Timeout(std::shared_ptr<Dispatcher> sock_dispatcher){
-    if(timer_callback)
-        timer_callback(sock_dispatcher);
+    if(callbacks_.timer_callback)
+        callbacks_.timer_callback(sock_dispatcher);
+}
+
+void NetServer::SetNewConnectionCb(CALLBACKS_NAMESPACE::NetSrvConnCallback fn){
+    if(fn)
+        callbacks_.new_conn_callback = std::move(fn);
+}
+
+void NetServer::SetCloseConnectionCb(CALLBACKS_NAMESPACE::NetSrvCloseConnCallback fn){
+    if(fn)
+        callbacks_.close_conn_callback = std::move(fn);
+}
+
+void NetServer::SetErrorCb(CALLBACKS_NAMESPACE::NetSrvErrorCallback fn){
+    if(fn)
+        callbacks_.error_callback = std::move(fn);
+}
+
+void NetServer::SetOnMessageCb(CALLBACKS_NAMESPACE::NetSrvOnMsgCallback fn){
+    if(fn)
+        callbacks_.on_message_callback = std::move(fn);
+}
+
+void NetServer::SetSendCompletionCb(CALLBACKS_NAMESPACE::NetSrvSendCompleteCallback fn){
+    if(fn)
+        callbacks_.send_complete_callback = std::move(fn);
+}
+
+void NetServer::SetTimerCb(CALLBACKS_NAMESPACE::NetSrvTimerCallback fn){
+    if(fn)
+        callbacks_.timer_callback = std::move(fn);
 }
