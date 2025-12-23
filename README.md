@@ -94,6 +94,7 @@ The codebase implements a modular Reactor pattern with clear separation of conce
 - `SendData()`: Appends data to output buffer with size header and enables write mode
 - `CallWriteCb()`: Sends buffered data, disables write mode when complete
 - Callback setters: `SetOnMessageCb()`, `SetCompletionCb()`, `SetCloseCb()`, `SetErrorCb()`
+- Uses callback types from [include/callbacks.h](include/callbacks.h) (`CALLBACKS_NAMESPACE` namespace)
 
 **SocketHandler** ([include/socket_handler.h](include/socket_handler.h), [server/socket_handler.cc](server/socket_handler.cc))
 - RAII wrapper for socket file descriptors with move semantics (no copy allowed)
@@ -126,6 +127,13 @@ The codebase implements a modular Reactor pattern with clear separation of conce
 - Sets up all NetServer callbacks in constructor using `std::bind`
 - Virtual methods for application logic: `NewConnection()`, `CloseConnection()`, `Error()`, `ProcessMessage()`, `SendComplete()`
 - Example implementation shows echo protocol with message prefix: `"[Server Reply]: "`
+
+**Callbacks** ([include/callbacks.h](include/callbacks.h))
+- Centralized callback type definitions in `CALLBACKS_NAMESPACE` namespace
+- Organizes callbacks by component: ConnectionHandler, Channel, NetServer, Dispatcher
+- Provides structured callback groups: `ConnCallbacks`, `ChannelCallbacks`, `NetSrvCallbacks`, `DispatcherCallbacks`
+- Improves type safety and code organization
+- All callback types use `std::function` for flexibility
 
 ### Data Flow
 
@@ -519,7 +527,7 @@ The codebase implements a modular Reactor pattern with clear separation of conce
 
 ## Callback Architecture
 
-The server uses a layered callback system for separation of concerns:
+The server uses a layered callback system for separation of concerns. All callback types are centralized in [include/callbacks.h](include/callbacks.h) under the `CALLBACKS_NAMESPACE` namespace for improved type safety and organization.
 
 **Layer 1: Channel-level callbacks** (internal, set by ConnectionHandler)
 - Read callback → `ConnectionHandler::OnMessage()`
@@ -692,10 +700,42 @@ The server uses a layered callback system for separation of concerns:
    - Layer 2 (NetServer): Connection lifecycle management                
    - Layer 3 (Application): Business logic and protocol implementation   
                                                                 
-3. Non-Blocking + Edge-Triggered                                         
-   - All callbacks must handle partial reads/writes (EAGAIN/EWOULDBLOCK) 
-   - Read loops continue until EAGAIN                                    
-   - Write buffers accumulate data until socket writable                 
+3. Non-Blocking + Edge-Triggered
+   - All callbacks must handle partial reads/writes (EAGAIN/EWOULDBLOCK)
+   - Read loops continue until EAGAIN
+   - Write buffers accumulate data until socket writable
+
+### Callback Type Definitions
+
+The [include/callbacks.h](include/callbacks.h) file provides organized callback types for each component:
+
+**ConnectionHandler Callbacks**:
+- `ConnOnMsgCallback` - Message received from client
+- `ConnCompleteCallback` - Send operation completed
+- `ConnCloseCallback` - Connection closed
+- `ConnErrorCallback` - Error occurred on connection
+- `ConnCallbacks` struct groups all ConnectionHandler callbacks
+
+**NetServer Callbacks**:
+- `NetSrvConnCallback` - New connection established
+- `NetSrvCloseConnCallback` - Connection closed notification
+- `NetSrvErrorCallback` - Connection error notification
+- `NetSrvOnMsgCallback` - Process incoming messages
+- `NetSrvSendCompleteCallback` - Send completion notification
+- `NetSrvTimerCallback` - Timer event notification
+- `NetSrvCallbacks` struct groups all NetServer callbacks
+
+**Dispatcher Callbacks**:
+- `DispatcherTOTriggerCallback` - Timeout trigger callback
+- `DispatcherTimerCallback` - Timer handler callback
+- `DispatcherCallbacks` struct groups all Dispatcher callbacks
+
+**Channel Callbacks**:
+- `ChannelReadCallback` - Read event occurred
+- `ChannelWriteCallback` - Write ready
+- `ChannelCloseCallback` - Channel closed
+- `ChannelErrorCallback` - Channel error
+- `ChannelCallbacks` struct groups all Channel callbacks                 
 
 ## Application Development
 
