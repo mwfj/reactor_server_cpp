@@ -5,6 +5,7 @@
 #include "epoll_handler.h"
 #include "socket_handler.h"
 #include "dispatcher.h"
+#include "callbacks.h"
 
 class Channel : public std::enable_shared_from_this<Channel> {
 private:
@@ -24,13 +25,7 @@ private:
 
     std::atomic<bool> is_channel_closed_{false};
 
-    // Read callback
-    // - Callback Acceptor::NewConnection if is the acceptor channel
-    // - Callback Channel::OnMessage if is the client channel
-    std::function<void()>   read_fn_;
-    std::function<void()>   write_fn_;
-    std::function<void()>   close_fn_;
-    std::function<void()>   error_fn_;
+    CALLBACKS_NAMESPACE::ChannelCallbacks callbacks_;
 public:
     Channel() = delete;
     Channel(std::shared_ptr<Dispatcher> _ep, int _fd);
@@ -68,8 +63,8 @@ public:
 
     void CloseChannel();
 
-    void SetReadCallBackFn(std::function<void()>);
-    void SetWriteCallBackFn(std::function<void()>);
-    void SetCloseCallBackFn(std::function<void()>);
-    void SetErrorCallBackFn(std::function<void()>);
+    void SetReadCallBackFn(CALLBACKS_NAMESPACE::ChannelReadCallback);
+    void SetWriteCallBackFn(CALLBACKS_NAMESPACE::ChannelWriteCallback);
+    void SetCloseCallBackFn(CALLBACKS_NAMESPACE::ChannelCloseCallback);
+    void SetErrorCallBackFn(CALLBACKS_NAMESPACE::ChannelErrorCallback);
 };

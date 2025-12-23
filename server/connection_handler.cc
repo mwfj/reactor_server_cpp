@@ -77,9 +77,9 @@ void ConnectionHandler::OnMessage(){
     }
 
     // After reading all available data, call the application callback if data was received
-    if(input_bf_.Size() > 0 && on_message_callback_){
+    if(input_bf_.Size() > 0 && callbacks_.on_message_callback){
         std::string message(input_bf_.Data(), input_bf_.Size());
-        on_message_callback_(shared_from_this(), message);
+        callbacks_.on_message_callback(shared_from_this(), message);
         // Update timestamp
         ts_ = TimeStamp::Now();
         // Clear the input buffer after processing
@@ -109,14 +109,6 @@ void ConnectionHandler::DoSend(const char *data, size_t size){
     client_channel_ -> EnableWriteMode();
 }
 
-void ConnectionHandler::SetOnMessageCb(std::function<void(std::shared_ptr<ConnectionHandler>, std::string&)> fn){
-    on_message_callback_ = fn;
-}
-
-void ConnectionHandler::SetCompletionCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn){
-    completion_callback_ = fn;
-}
-
 void ConnectionHandler::CallCloseCb(){
     // Prevent duplicate close callbacks with atomic compare-exchange
     bool expected = false;
@@ -135,13 +127,13 @@ void ConnectionHandler::CallCloseCb(){
     }
 
     // Call the application callback
-    if (close_callback_)
-        close_callback_(self);
+    if (callbacks_.close_callback)
+        callbacks_.close_callback(self);
 }
 
 void ConnectionHandler::CallErroCb(){
-    if (error_callback_)
-        error_callback_(shared_from_this());
+    if (callbacks_.error_callback)
+        callbacks_.error_callback(shared_from_this());
 }
 
 void ConnectionHandler::CallWriteCb(){
@@ -158,17 +150,25 @@ void ConnectionHandler::CallWriteCb(){
     // If there's no data waiting to write, then unregister writing event
     if(output_bf_.Size() == 0){
         client_channel_->DisableWriteMode();
-        if(completion_callback_)
-            completion_callback_(shared_from_this());
+        if(callbacks_.complete_callback)
+            callbacks_.complete_callback(shared_from_this());
     }
 }
 
-void ConnectionHandler::SetCloseCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn){
-    close_callback_ = fn;
+void ConnectionHandler::SetOnMessageCb(CALLBACKS_NAMESPACE::ConnOnMsgCallback fn){
+    callbacks_.on_message_callback = std::move(fn);
 }
 
-void ConnectionHandler::SetErrorCb(std::function<void(std::shared_ptr<ConnectionHandler>)> fn){
-    error_callback_ = fn;
+void ConnectionHandler::SetCompletionCb(CALLBACKS_NAMESPACE::ConnCompleteCallback fn){
+    callbacks_.complete_callback = std::move(fn);
+}
+
+void ConnectionHandler::SetCloseCb(CALLBACKS_NAMESPACE::ConnCloseCallback fn){
+    callbacks_.close_callback = std::move(fn);
+}
+
+void ConnectionHandler::SetErrorCb(CALLBACKS_NAMESPACE::ConnErrorCallback fn){
+    callbacks_.error_callback = std::move(fn);
 }
 
 bool ConnectionHandler::IsTimeOut(std::chrono::seconds duration) const {

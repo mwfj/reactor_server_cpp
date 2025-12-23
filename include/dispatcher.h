@@ -2,6 +2,7 @@
 #include "common.h"
 #include "event_handler.h"
 #include <deque>
+#include "callbacks.h"
 
 // Forward declarations to break circular dependency
 class Channel;
@@ -40,12 +41,13 @@ private:
     std::chrono::seconds timeout_; // Timeout duration for connection handler
 
     std::shared_ptr<Channel> timer_channel_;  // Must be shared_ptr because Channel uses shared_from_this()
-    std::function<void(std::shared_ptr<Dispatcher>)> timeout_trigger_callback_;
+    
+    // Timer callback
+    CALLBACKS_NAMESPACE::DispatcherCallbacks callbacks_;
 
     // Manage the connection in a dispatcher(Eventloop)
     std::map<int, std::shared_ptr<ConnectionHandler>> connections_;
  
-    std::function<void(int)> timer_callback_;
     std::mutex timer_mtx_;
 public:
     Dispatcher();
@@ -70,9 +72,9 @@ public:
     void WakeUp();
     void HandleEventId();
     void EnQueue(std::function<void()>);
-
     void AddConnection(std::shared_ptr<ConnectionHandler>);
-    void SetTimerCB(std::function<void(int)>);
-    void SetTimeOutTriggerCB(std::function<void(std::shared_ptr<Dispatcher>)>);
+
+    void SetTimerCB(CALLBACKS_NAMESPACE::DispatcherTimerCallback);
+    void SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCallback);
     void TimerHandler();
 };

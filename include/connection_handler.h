@@ -4,6 +4,7 @@
 #include "socket_handler.h"
 #include "buffer.h"
 #include "timestamp.h"
+#include "callbacks.h"
 
 class ConnectionHandler : public std::enable_shared_from_this<ConnectionHandler>
 {
@@ -12,10 +13,7 @@ private:
     std::unique_ptr<SocketHandler> sock_;  // Sole owner of client socket
     std::shared_ptr<Channel> client_channel_;
 
-    std::function<void(std::shared_ptr<ConnectionHandler>, std::string&)> on_message_callback_;
-    std::function<void(std::shared_ptr<ConnectionHandler>)> completion_callback_;
-    std::function<void(std::shared_ptr<ConnectionHandler>)> close_callback_;
-    std::function<void(std::shared_ptr<ConnectionHandler>)> error_callback_;
+    CALLBACKS_NAMESPACE::ConnCallbacks callbacks_;
 
     Buffer input_bf_;
     Buffer output_bf_;
@@ -44,10 +42,10 @@ public:
     void CallErroCb();
     void CallWriteCb();
 
-    void SetOnMessageCb(std::function<void(std::shared_ptr<ConnectionHandler>, std::string&)>);
-    void SetCompletionCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
-    void SetCloseCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
-    void SetErrorCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
+    void SetOnMessageCb(CALLBACKS_NAMESPACE::ConnOnMsgCallback);
+    void SetCompletionCb(CALLBACKS_NAMESPACE::ConnCompleteCallback);
+    void SetCloseCb(CALLBACKS_NAMESPACE::ConnCloseCallback);
+    void SetErrorCb(CALLBACKS_NAMESPACE::ConnErrorCallback);
 
     bool IsTimeOut(std::chrono::seconds) const;
 };

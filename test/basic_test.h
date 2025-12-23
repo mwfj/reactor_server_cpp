@@ -8,7 +8,7 @@
 // Test namespace for basic functionality tests
 namespace BasicTests {
     const char* TEST_IP = "127.0.0.1";
-    const int TEST_PORT = 8888;
+    const int TEST_PORT = 9888;
 
     // RAII wrapper for server thread management
     class ServerRunner {

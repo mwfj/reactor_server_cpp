@@ -7,7 +7,7 @@
 // Stress test namespace
 namespace StressTests {
     const char* TEST_IP = "127.0.0.1";
-    const int TEST_PORT = 8889;
+    const int TEST_PORT = 9889;
 
     // RAII wrapper for stress test server
     class StressServerRunner {

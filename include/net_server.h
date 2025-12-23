@@ -7,6 +7,7 @@
 #include "dispatcher.h"
 #include "connection_handler.h"
 #include "acceptor.h"
+#include "callbacks.h"
 
 #include "threadtask.h"
 #include "threadpool.h"
@@ -42,14 +43,7 @@ private:
     std::mutex conn_mtx_;  // Protects connections_ map from concurrent access
     std::unique_ptr<Acceptor> acceptor_;  // Sole owner of Acceptor
 
-    // Callbacks
-    std::function<void(std::shared_ptr<ConnectionHandler>)>  new_conn_callback_ = nullptr;
-    std::function<void(std::shared_ptr<ConnectionHandler>)>  close_conn_callback_ = nullptr;
-    std::function<void(std::shared_ptr<ConnectionHandler>)>  error_callback_ = nullptr;
-
-    std::function<void(std::shared_ptr<ConnectionHandler>, std::string&)>  on_message_callback_ = nullptr;
-    std::function<void(std::shared_ptr<ConnectionHandler>)>  send_complete_callback_ = nullptr;
-    std::function<void(std::shared_ptr<Dispatcher>)> timer_callback = nullptr;
+    CALLBACKS_NAMESPACE::NetSrvCallbacks callbacks_;
 
     ThreadPool sock_workers_;
 
@@ -77,10 +71,10 @@ public:
     void RemoveConnection(int);
     void Timeout(std::shared_ptr<Dispatcher>);
     
-    void SetNewConnectionCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
-    void SetCloseConnectionCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
-    void SetErrorCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
-    void SetOnMessageCb(std::function<void(std::shared_ptr<ConnectionHandler>, std::string&)>);
-    void SetSendCompletionCb(std::function<void(std::shared_ptr<ConnectionHandler>)>);
-    void SetTimerCb(std::function<void(std::shared_ptr<Dispatcher>)>);
+    void SetNewConnectionCb(CALLBACKS_NAMESPACE::NetSrvConnCallback);
+    void SetCloseConnectionCb(CALLBACKS_NAMESPACE::NetSrvCloseConnCallback);
+    void SetErrorCb(CALLBACKS_NAMESPACE::NetSrvErrorCallback);
+    void SetOnMessageCb(CALLBACKS_NAMESPACE::NetSrvOnMsgCallback);
+    void SetSendCompletionCb(CALLBACKS_NAMESPACE::NetSrvSendCompleteCallback);
+    void SetTimerCb(CALLBACKS_NAMESPACE::NetSrvTimerCallback);
 };
