@@ -2,7 +2,7 @@
 
 This is a C++11 implementation of a high-performance network server using the Reactor pattern with epoll-based/kqueue-based I/O multiplexing. The server is designed to handle thousands of concurrent connections efficiently using edge-triggered epoll mode.
 
-This server now support MacOS and Linux
+This server now support MacOS and Linux.
 
 ## Build Commands
 
