@@ -13,6 +13,8 @@
 #include "threadpool.h"
 #include <mutex>
 
+class TlsContext;
+
 // For socket connection related task, use this type of worker
 // SocketWorker: Handles I/O event loops for client connections in thread pool
 class SocketWorker : public ThreadTaskInterface{
@@ -51,6 +53,8 @@ private:
     int timer_interval_;  // How often to check for timeouts (seconds)
     std::chrono::seconds connection_timeout_;  // Connection idle timeout duration
 
+    TlsContext* tls_ctx_ = nullptr;  // Non-owning, owned by HttpServer
+
 public:
     NetServer() = delete;
     NetServer(const std::string& _ip, const size_t _port,
@@ -77,4 +81,6 @@ public:
     void SetOnMessageCb(CALLBACKS_NAMESPACE::NetSrvOnMsgCallback);
     void SetSendCompletionCb(CALLBACKS_NAMESPACE::NetSrvSendCompleteCallback);
     void SetTimerCb(CALLBACKS_NAMESPACE::NetSrvTimerCallback);
+
+    void SetTlsContext(TlsContext* ctx) { tls_ctx_ = ctx; }
 };

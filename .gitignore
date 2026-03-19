@@ -1,0 +1,7 @@
+# AI Agent
+.claude/
+AGENT.md
+CLAUDE.md
+
+*.o
+run

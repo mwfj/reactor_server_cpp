@@ -1,4 +1,6 @@
 #include "net_server.h"
+#include "tls/tls_context.h"
+#include "tls/tls_connection.h"
 
 
 NetServer::NetServer(const std::string& _ip, const size_t _port,
@@ -72,6 +74,19 @@ void NetServer::Stop(){
 void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
     int idx = cilent_sock -> fd() % sock_workers_.GetThreadWorkerNum();
     std::shared_ptr<ConnectionHandler> conn = std::shared_ptr<ConnectionHandler>(new ConnectionHandler(socket_dispatchers_[idx], std::move(cilent_sock)));
+
+    // Inject TLS BEFORE RegisterCallbacks to avoid race:
+    // RegisterCallbacks() enables epoll read, so data could arrive immediately.
+    // OnMessage() must know about TLS before the first read event.
+    if (tls_ctx_) {
+        try {
+            auto tls = std::make_unique<TlsConnection>(*tls_ctx_, conn->fd());
+            conn->SetTlsConnection(std::move(tls));
+        } catch (const std::exception& e) {
+            std::cerr << "[NetServer] TLS setup failed for fd " << conn->fd() << ": " << e.what() << std::endl;
+            return;  // Don't add connection if TLS setup fails
+        }
+    }
 
     // Two-phase initialization: register callbacks after shared_ptr is created
     // This allows callbacks to safely capture weak_ptr instead of raw 'this'

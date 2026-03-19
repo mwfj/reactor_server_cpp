@@ -4,6 +4,10 @@
 #include "basic_test.h"
 #include "race_condition_test.h"
 #include "timeout_test.h"
+#include "config_test.h"
+#include "http_test.h"
+#include "websocket_test.h"
+#include "tls_test.h"
 #include "test_framework.h"
 #include <algorithm>
 
@@ -26,6 +30,22 @@ void RunAllTest(){
     std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     TimeoutTests::RunAllTests();
 
+    // Run config tests
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    ConfigTests::RunAllTests();
+
+    // Run HTTP tests
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    HttpTests::RunAllTests();
+
+    // Run WebSocket tests
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    WebSocketTests::RunAllTests();
+
+    // Run TLS tests
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    TlsTests::RunAllTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -36,8 +56,12 @@ void PrintUsage(const char* program_name) {
     std::cout << "  stress,  -s    Run stress tests only (100 concurrent clients)" << std::endl;
     std::cout << "  race,    -r    Run race condition tests only" << std::endl;
     std::cout << "  timeout, -t    Run timeout/idle connection tests only" << std::endl;
+    std::cout << "  config,  -c    Run configuration tests only" << std::endl;
+    std::cout << "  http,    -H    Run HTTP layer tests only" << std::endl;
+    std::cout << "  ws,      -w    Run WebSocket layer tests only" << std::endl;
+    std::cout << "  tls,     -T    Run TLS/SSL tests only" << std::endl;
     std::cout << "  help,    -h    Show this help message" << std::endl;
-    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout)" << std::endl;
+    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls)" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -59,6 +83,18 @@ int main(int argc, char* argv[]) {
         // Run timeout tests
         }else if(mode == "timeout" || mode == "-t"){
             TimeoutTests::RunAllTests();
+        // Run config tests
+        }else if(mode == "config" || mode == "-c"){
+            ConfigTests::RunAllTests();
+        // Run HTTP tests
+        }else if(mode == "http" || mode == "-H"){
+            HttpTests::RunAllTests();
+        // Run WebSocket tests
+        }else if(mode == "ws" || mode == "-w"){
+            WebSocketTests::RunAllTests();
+        // Run TLS tests
+        }else if(mode == "tls" || mode == "-T"){
+            TlsTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

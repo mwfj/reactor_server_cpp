@@ -1,0 +1,146 @@
+#include "http/http_server.h"
+#include "ws/websocket_frame.h"
+#include "log/logger.h"
+
+HttpServer::HttpServer(const std::string& ip, int port)
+    : net_server_(ip, static_cast<size_t>(port))
+{
+    net_server_.SetNewConnectionCb(
+        [this](std::shared_ptr<ConnectionHandler> conn) { HandleNewConnection(conn); });
+    net_server_.SetCloseConnectionCb(
+        [this](std::shared_ptr<ConnectionHandler> conn) { HandleCloseConnection(conn); });
+    net_server_.SetErrorCb(
+        [this](std::shared_ptr<ConnectionHandler> conn) { HandleErrorConnection(conn); });
+    net_server_.SetOnMessageCb(
+        [this](std::shared_ptr<ConnectionHandler> conn, std::string& msg) { HandleMessage(conn, msg); });
+}
+
+HttpServer::HttpServer(const ServerConfig& config)
+    : HttpServer(config.bind_host, config.bind_port)
+{
+    if (config.tls.enabled) {
+        tls_ctx_ = std::make_unique<TlsContext>(config.tls.cert_file, config.tls.key_file);
+        net_server_.SetTlsContext(tls_ctx_.get());
+    }
+}
+
+HttpServer::~HttpServer() {
+    Stop();
+}
+
+// Route registration delegates
+void HttpServer::Get(const std::string& path, HttpRouter::Handler handler)    { router_.Get(path, std::move(handler)); }
+void HttpServer::Post(const std::string& path, HttpRouter::Handler handler)   { router_.Post(path, std::move(handler)); }
+void HttpServer::Put(const std::string& path, HttpRouter::Handler handler)    { router_.Put(path, std::move(handler)); }
+void HttpServer::Delete(const std::string& path, HttpRouter::Handler handler) { router_.Delete(path, std::move(handler)); }
+void HttpServer::Route(const std::string& method, const std::string& path, HttpRouter::Handler handler) { router_.Route(method, path, std::move(handler)); }
+void HttpServer::WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler) { router_.WebSocket(path, std::move(handler)); }
+void HttpServer::Use(HttpRouter::Middleware middleware) { router_.Use(std::move(middleware)); }
+
+void HttpServer::Start() {
+    logging::Get()->info("HttpServer starting");
+    net_server_.Start();
+}
+
+void HttpServer::Stop() {
+    logging::Get()->info("HttpServer stopping");
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        // Send WebSocket Close frames (1001 Going Away) to all upgraded connections
+        for (auto& pair : http_connections_) {
+            auto& http_conn = pair.second;
+            if (http_conn && http_conn->IsUpgraded() && http_conn->GetWebSocket()) {
+                auto* ws = http_conn->GetWebSocket();
+                if (ws->IsOpen()) {
+                    ws->SendClose(1001, "Going Away");
+                }
+            }
+        }
+        http_connections_.clear();
+    }
+    net_server_.Stop();
+}
+
+void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn) {
+    // Set request handler: dispatch through router
+    http_conn->SetRequestHandler(
+        [this](std::shared_ptr<HttpConnectionHandler> self,
+               const HttpRequest& request,
+               HttpResponse& response) {
+            if (!router_.Dispatch(request, response)) {
+                response = HttpResponse::NotFound();
+            }
+        }
+    );
+
+    // Set WebSocket upgrade handler (returns true if route exists, false to reject)
+    // Called twice: first to check route existence (before 101), then to wire callbacks (after ws_conn_ created)
+    http_conn->SetUpgradeHandler(
+        [this](std::shared_ptr<HttpConnectionHandler> self,
+               const HttpRequest& request,
+               std::shared_ptr<ConnectionHandler> conn) -> bool {
+            if (!router_.HasWebSocketRoute(request.path)) {
+                return false;  // No route — reject upgrade
+            }
+            // Wire WS callbacks if WebSocket connection exists (second call)
+            auto ws_handler = router_.GetWebSocketHandler(request.path);
+            if (ws_handler && self->GetWebSocket()) {
+                ws_handler(*self->GetWebSocket());
+            }
+            return true;
+        }
+    );
+}
+
+void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
+    auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
+    SetupHandlers(http_conn);
+
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        http_connections_[conn->fd()] = http_conn;
+    }
+
+    logging::Get()->debug("New HTTP connection fd={} from {}:{}",
+                          conn->fd(), conn->ip_addr(), conn->port());
+}
+
+void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) {
+    logging::Get()->debug("HTTP connection closed fd={}", conn->fd());
+    std::lock_guard<std::mutex> lck(conn_mtx_);
+    // Guard against fd reuse race: only remove if the stored HttpConnectionHandler
+    // wraps the same ConnectionHandler that is being closed. Otherwise, a new
+    // connection may have already claimed this fd.
+    auto it = http_connections_.find(conn->fd());
+    if (it != http_connections_.end() && it->second->GetConnection() == conn) {
+        http_connections_.erase(it);
+    }
+}
+
+void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) {
+    logging::Get()->error("HTTP connection error fd={}", conn->fd());
+    std::lock_guard<std::mutex> lck(conn_mtx_);
+    auto it = http_connections_.find(conn->fd());
+    if (it != http_connections_.end() && it->second->GetConnection() == conn) {
+        http_connections_.erase(it);
+    }
+}
+
+void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message) {
+    std::shared_ptr<HttpConnectionHandler> http_conn;
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        auto it = http_connections_.find(conn->fd());
+        if (it == http_connections_.end()) {
+            // Race condition: data arrived before HandleNewConnection created
+            // the HttpConnectionHandler. Create it now (lazy initialization).
+            http_conn = std::make_shared<HttpConnectionHandler>(conn);
+            SetupHandlers(http_conn);
+            http_connections_[conn->fd()] = http_conn;
+        } else {
+            http_conn = it->second;
+        }
+    }
+
+    http_conn->OnRawData(conn, message);
+}

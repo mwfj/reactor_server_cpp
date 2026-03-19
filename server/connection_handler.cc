@@ -1,5 +1,6 @@
 #include "connection_handler.h"
 #include "channel.h"
+#include "tls/tls_connection.h"
 
 ConnectionHandler::ConnectionHandler(std::shared_ptr<Dispatcher> _dispatcher, std::unique_ptr<SocketHandler> _sock)
     : event_dispatcher_(_dispatcher), sock_(std::move(_sock))
@@ -48,23 +49,62 @@ void ConnectionHandler::OnMessage(){
         return;
     }
 
+    // TLS handshake phase
+    if (tls_state_ == TlsState::HANDSHAKE) {
+        int result = tls_->DoHandshake();
+        if (result == 0) {
+            tls_state_ = TlsState::READY;
+            // Handshake complete, fall through to read any buffered data
+        } else if (result == 1) {
+            // Want read — already enabled
+            return;
+        } else if (result == 2) {
+            // Want write
+            client_channel_->EnableWriteMode();
+            return;
+        } else {
+            // Handshake failed
+            if(client_channel_ && !client_channel_->is_channel_closed()){
+                client_channel_->CloseChannel();
+            }
+            return;
+        }
+    }
+
     char buffer[MAX_BUFFER_SIZE];
     while(true){
         memset(buffer, 0, sizeof buffer);
-        ssize_t nread = ::read(fd(), buffer, sizeof buffer);
+        ssize_t nread;
+
+        if (tls_state_ == TlsState::READY) {
+            nread = tls_->Read(buffer, sizeof buffer);
+            if (nread == 0) {
+                // Would block (WANT_READ/WANT_WRITE)
+                break;
+            }
+        } else {
+            nread = ::read(fd(), buffer, sizeof buffer);
+        }
 
         if(nread > 0){
             input_bf_.Append(buffer, nread);
             if(errno == EINTR){ // Interruptted by signal
                 continue;
             }
-        } else if(nread == 0){ // Client close the connection
-           // Close the channel, which will trigger the close callback
+        } else if(nread == 0 && tls_state_ != TlsState::READY){
+            // Client close (raw TCP only; TLS nread==0 means would_block above)
            if(client_channel_ && !client_channel_->is_channel_closed()){
                client_channel_->CloseChannel();
            }
            break;
-        } else{ // The incoming data is finished reading
+        } else if (nread < 0) {
+            if (tls_state_ == TlsState::READY) {
+                // TLS read error — close
+                if(client_channel_ && !client_channel_->is_channel_closed()){
+                    client_channel_->CloseChannel();
+                }
+                break;
+            }
             if((errno == EAGAIN) || (errno == EWOULDBLOCK)){
                 break;
             }
@@ -73,6 +113,8 @@ void ConnectionHandler::OnMessage(){
                 client_channel_->CloseChannel();
             }
             break;
+        } else {
+            break;  // nread == 0 for TLS means would_block, already handled
         }
     }
 
@@ -109,6 +151,58 @@ void ConnectionHandler::DoSend(const char *data, size_t size){
     client_channel_ -> EnableWriteMode();
 }
 
+void ConnectionHandler::SendRaw(const char *data, size_t size){
+    // Thread-safe: same pattern as SendData()
+    std::string data_copy(data, size);
+
+    if(event_dispatcher_ && !event_dispatcher_ -> is_sock_dispatcher()) {
+        event_dispatcher_ -> EnQueue([this, data_copy]() {
+            this->DoSendRaw(data_copy.data(), data_copy.size());
+        });
+    } else {
+        DoSendRaw(data, size);
+    }
+}
+
+void ConnectionHandler::DoSendRaw(const char *data, size_t size){
+    // Same as DoSend but uses Append() instead of AppendWithHead()
+    // No 4-byte length prefix -- HTTP uses its own framing
+    if (is_closing_) return;
+
+    // If output buffer is empty, try sending directly first.
+    // This avoids the edge-triggered EPOLLOUT issue where a freshly writable
+    // socket won't generate a new event when EPOLLOUT is first registered.
+    if (output_bf_.Size() == 0) {
+        ssize_t written;
+        if (tls_state_ == TlsState::READY) {
+            written = tls_->Write(data, size);
+            if (written == 0) {
+                // Would block -- fall through to buffering
+                written = -1;
+                errno = EAGAIN;
+            }
+        } else {
+            written = ::send(fd(), data, size, MSG_NOSIGNAL);
+        }
+        if (written > 0) {
+            if (static_cast<size_t>(written) == size) {
+                // All data sent immediately, no need to buffer
+                return;
+            }
+            // Partial write -- buffer the remainder
+            data += written;
+            size -= written;
+        } else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            // Send error
+            return;
+        }
+        // written == 0 or EAGAIN -- fall through to buffering
+    }
+
+    output_bf_.Append(data, size);
+    client_channel_ -> EnableWriteMode();
+}
+
 void ConnectionHandler::CallCloseCb(){
     // Prevent duplicate close callbacks with atomic compare-exchange
     bool expected = false;
@@ -142,7 +236,40 @@ void ConnectionHandler::CallWriteCb(){
         return; // Silently ignore - channel is closing or already closed
     }
 
-    int write_sz = ::send(fd(), output_bf_.Data(), output_bf_.Size(), 0);
+    // TLS handshake WANT_WRITE handling
+    if (tls_state_ == TlsState::HANDSHAKE) {
+        int result = tls_->DoHandshake();
+        if (result == 0) {
+            tls_state_ = TlsState::READY;
+            // Fall through to normal write logic to flush any pending output buffer
+        } else if (result == 1) {
+            client_channel_->DisableWriteMode();
+            // Want read — read mode already enabled
+            return;
+        } else if (result == 2) {
+            // Want write again, will get another EPOLLOUT
+            return;
+        } else {
+            // Handshake error
+            return;
+        }
+    }
+
+    int write_sz;
+    if (tls_state_ == TlsState::READY) {
+        write_sz = tls_->Write(output_bf_.Data(), output_bf_.Size());
+        if (write_sz == 0) return;  // Would block, try again later
+        if (write_sz < 0) {
+            // TLS write error
+            if(client_channel_ && !client_channel_->is_channel_closed()){
+                client_channel_->CloseChannel();
+            }
+            return;
+        }
+    } else {
+        write_sz = ::send(fd(), output_bf_.Data(), output_bf_.Size(), 0);
+    }
+
     // Remove sent data
     if(write_sz > 0)
         output_bf_.Erase(0, write_sz);
@@ -169,6 +296,11 @@ void ConnectionHandler::SetCloseCb(CALLBACKS_NAMESPACE::ConnCloseCallback fn){
 
 void ConnectionHandler::SetErrorCb(CALLBACKS_NAMESPACE::ConnErrorCallback fn){
     callbacks_.error_callback = std::move(fn);
+}
+
+void ConnectionHandler::SetTlsConnection(std::unique_ptr<TlsConnection> tls) {
+    tls_ = std::move(tls);
+    tls_state_ = TlsState::HANDSHAKE;
 }
 
 bool ConnectionHandler::IsTimeOut(std::chrono::seconds duration) const {

@@ -6,6 +6,11 @@
 #include "timestamp.h"
 #include "callbacks.h"
 
+#include <memory>
+
+// Forward declaration (no need to include full TLS headers)
+class TlsConnection;
+
 class ConnectionHandler : public std::enable_shared_from_this<ConnectionHandler>
 {
 private:
@@ -21,6 +26,11 @@ private:
     std::atomic<bool> is_closing_{false};
 
     TimeStamp ts_; // Each connection owns a timestamp to manage
+
+    // TLS support
+    enum class TlsState { NONE, HANDSHAKE, READY };
+    TlsState tls_state_ = TlsState::NONE;
+    std::unique_ptr<TlsConnection> tls_;
 public:
     ConnectionHandler() = delete;
     ConnectionHandler(std::shared_ptr<Dispatcher>, std::unique_ptr<SocketHandler>);
@@ -38,6 +48,9 @@ public:
     void SendData(const char*, size_t);
     void DoSend(const char*, size_t);  // Internal: appends to buffer and enables write (in socket thread)
 
+    void SendRaw(const char*, size_t);
+    void DoSendRaw(const char*, size_t);  // Internal: appends without length header (in socket thread)
+
     void CallCloseCb();
     void CallErroCb();
     void CallWriteCb();
@@ -46,6 +59,8 @@ public:
     void SetCompletionCb(CALLBACKS_NAMESPACE::ConnCompleteCallback);
     void SetCloseCb(CALLBACKS_NAMESPACE::ConnCloseCallback);
     void SetErrorCb(CALLBACKS_NAMESPACE::ConnErrorCallback);
+
+    void SetTlsConnection(std::unique_ptr<TlsConnection> tls);
 
     bool IsTimeOut(std::chrono::seconds) const;
 };
