@@ -49,12 +49,18 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
     size_t remaining = data.size();
 
     // Slowloris protection: track when the current incomplete request started.
-    // If we receive data but the request hasn't completed within the timeout, kill it.
+    // Two enforcement mechanisms:
+    // 1. On data arrival: check elapsed time here (catches slow-trickle attacks)
+    // 2. Timer scan: ConnectionHandler::IsTimeOut checks the deadline even when
+    //    no data arrives (catches clients that send one partial request then go silent)
     if (request_timeout_sec_ > 0) {
         if (!request_in_progress_) {
             // First bytes of a new request — start the clock
             request_in_progress_ = true;
             request_start_ = std::chrono::steady_clock::now();
+            // Set deadline on the connection so the timer scanner can enforce it
+            // even if the client stops sending entirely
+            conn_->SetDeadline(request_start_ + std::chrono::seconds(request_timeout_sec_));
         } else {
             // Request still in progress — check elapsed time
             auto elapsed = std::chrono::steady_clock::now() - request_start_;
@@ -134,6 +140,7 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
 
                 // Request completed (as upgrade) — reset timeout tracking
                 request_in_progress_ = false;
+                conn_->ClearDeadline();
 
                 // Route confirmed — send 101 Switching Protocols
                 SendResponse(WebSocketHandshake::Accept(req));
@@ -175,6 +182,7 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
 
             // Request completed — reset timeout tracking for next request
             request_in_progress_ = false;
+            conn_->ClearDeadline();
 
             // Advance past consumed bytes
             buf += consumed;

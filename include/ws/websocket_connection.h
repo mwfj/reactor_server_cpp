@@ -47,6 +47,7 @@ private:
     std::shared_ptr<ConnectionHandler> conn_;
     WebSocketParser parser_;
     bool is_open_ = true;
+    bool close_sent_ = false;  // We sent a close frame, waiting for peer's reply
 
     MessageHandler message_handler_;
     CloseHandler close_handler_;

@@ -45,10 +45,18 @@ bool WebSocketHandshake::Validate(const HttpRequest& request, std::string& error
         return false;
     }
 
-    // 6. Sec-WebSocket-Key present
-    if (!request.HasHeader("sec-websocket-key")) {
-        error_message = "Missing Sec-WebSocket-Key header";
-        return false;
+    // 6. Sec-WebSocket-Key present and valid (base64-encoded 16 bytes → 24 chars with padding)
+    {
+        std::string key = request.GetHeader("sec-websocket-key");
+        if (key.empty()) {
+            error_message = "Missing Sec-WebSocket-Key header";
+            return false;
+        }
+        // RFC 6455 §4.2.1: key must be base64 of 16 bytes = exactly 24 characters
+        if (key.size() != 24 || key[22] != '=' || key[23] != '=') {
+            error_message = "Invalid Sec-WebSocket-Key: must be base64 of 16 bytes";
+            return false;
+        }
     }
 
     // 7. Sec-WebSocket-Version is "13"

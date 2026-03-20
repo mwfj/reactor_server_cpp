@@ -66,12 +66,12 @@ void WebSocketConnection::SendBinary(const std::string& data) {
 }
 
 void WebSocketConnection::SendClose(uint16_t code, const std::string& reason) {
+    if (close_sent_) return;  // Already sent a close frame
     SendFrame(WebSocketFrame::CloseFrame(code, reason));
-    is_open_ = false;
-    // Transport close is handled by the connection lifecycle — HttpConnectionHandler
-    // or the peer's response will trigger channel close. We don't call CloseAfterWrite()
-    // here because SendClose can be called during shutdown when the dispatcher may
-    // not be running to process the queued close.
+    close_sent_ = true;
+    // Keep is_open_ true so OnRawData can still receive the peer's close reply.
+    // The connection will be closed when we receive the peer's close frame in
+    // ProcessFrame, or by the idle timeout if the peer never responds.
 }
 
 void WebSocketConnection::SendPing(const std::string& payload) {
@@ -106,6 +106,11 @@ void WebSocketConnection::OnRawData(const std::string& data) {
 }
 
 void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
+    // If we've sent a close frame, only accept the peer's Close reply — discard data/continuation
+    if (close_sent_ && frame.opcode != WebSocketOpcode::Close) {
+        return;  // Discard non-close frames during close handshake
+    }
+
     switch (frame.opcode) {
         case WebSocketOpcode::Text:
         case WebSocketOpcode::Binary: {
@@ -224,11 +229,13 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 code = 1002;
                 reason = "Invalid close code";
             }
-            // Echo close frame back (close handshake)
-            if (is_open_) {
+            // Echo close frame back if we haven't sent one yet (peer-initiated close).
+            // If close_sent_ is already true, this is the peer's reply to our close.
+            if (!close_sent_) {
                 SendClose(code, reason);
             }
-            // Close the TCP transport after the close handshake completes.
+            is_open_ = false;
+            // Close the TCP transport — handshake is complete (both sides sent close).
             // This runs on the reactor thread (via OnRawData callback chain),
             // so CloseAfterWrite is safe to call inline.
             if (conn_) {

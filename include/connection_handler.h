@@ -27,6 +27,8 @@ private:
     std::atomic<bool> close_after_write_{false};
 
     TimeStamp ts_; // Each connection owns a timestamp to manage
+    bool has_deadline_ = false;
+    std::chrono::steady_clock::time_point deadline_;
 
     // TLS support
     enum class TlsState { NONE, HANDSHAKE, READY };
@@ -63,6 +65,10 @@ public:
     void SetErrorCb(CALLBACKS_NAMESPACE::ConnErrorCallback);
 
     void SetTlsConnection(std::unique_ptr<TlsConnection> tls);
+
+    // Deadline: if set, IsTimeOut returns true when deadline is exceeded
+    void SetDeadline(std::chrono::steady_clock::time_point deadline);
+    void ClearDeadline();
 
     bool IsTimeOut(std::chrono::seconds) const;
 };

@@ -63,10 +63,8 @@ void ConnectionHandler::OnMessage(){
             client_channel_->EnableWriteMode();
             return;
         } else {
-            // Handshake failed
-            if(client_channel_ && !client_channel_->is_channel_closed()){
-                client_channel_->CloseChannel();
-            }
+            // Handshake failed — use CallCloseCb for proper cleanup
+            CallCloseCb();
             return;
         }
     }
@@ -84,10 +82,10 @@ void ConnectionHandler::OnMessage(){
             }
             if (nread == -2) {
                 // Peer closed TLS connection cleanly (close_notify)
-                if(client_channel_ && !client_channel_->is_channel_closed()){
-                    client_channel_->CloseChannel();
-                }
-                break;
+                // Use CallCloseCb (not CloseChannel) so NetServer/HttpServer
+                // connection maps are properly cleaned up
+                CallCloseCb();
+                return;  // Connection is closed, don't process any buffered data
             }
         } else {
             nread = ::read(fd(), buffer, sizeof buffer);
@@ -106,11 +104,9 @@ void ConnectionHandler::OnMessage(){
            break;
         } else if (nread < 0) {
             if (tls_state_ == TlsState::READY) {
-                // TLS read error — close
-                if(client_channel_ && !client_channel_->is_channel_closed()){
-                    client_channel_->CloseChannel();
-                }
-                break;
+                // TLS read error — use CallCloseCb for proper cleanup
+                CallCloseCb();
+                return;
             }
             if((errno == EAGAIN) || (errno == EWOULDBLOCK)){
                 break;
@@ -339,6 +335,19 @@ void ConnectionHandler::SetTlsConnection(std::unique_ptr<TlsConnection> tls) {
     tls_state_ = TlsState::HANDSHAKE;
 }
 
+void ConnectionHandler::SetDeadline(std::chrono::steady_clock::time_point deadline) {
+    has_deadline_ = true;
+    deadline_ = deadline;
+}
+
+void ConnectionHandler::ClearDeadline() {
+    has_deadline_ = false;
+}
+
 bool ConnectionHandler::IsTimeOut(std::chrono::seconds duration) const {
+    // Check request deadline first (Slowloris protection)
+    if (has_deadline_ && std::chrono::steady_clock::now() > deadline_) {
+        return true;
+    }
     return ts_.IsTimeOut(duration);
 }

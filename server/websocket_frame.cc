@@ -50,9 +50,14 @@ WebSocketFrame WebSocketFrame::CloseFrame(uint16_t code, const std::string& reas
     WebSocketFrame f;
     f.opcode = WebSocketOpcode::Close;
     // Close frame payload: 2-byte status code + optional reason
+    // RFC 6455 §5.5: control frame payload max 125 bytes (2 for code + up to 123 for reason)
     f.payload += static_cast<char>((code >> 8) & 0xFF);
     f.payload += static_cast<char>(code & 0xFF);
-    f.payload += reason;
+    if (reason.size() > 123) {
+        f.payload += reason.substr(0, 123);
+    } else {
+        f.payload += reason;
+    }
     f.payload_length = f.payload.size();
     return f;
 }
@@ -60,15 +65,17 @@ WebSocketFrame WebSocketFrame::CloseFrame(uint16_t code, const std::string& reas
 WebSocketFrame WebSocketFrame::PingFrame(const std::string& payload) {
     WebSocketFrame f;
     f.opcode = WebSocketOpcode::Ping;
-    f.payload = payload;
-    f.payload_length = payload.size();
+    // RFC 6455 §5.5: control frame payload max 125 bytes
+    f.payload = payload.size() > 125 ? payload.substr(0, 125) : payload;
+    f.payload_length = f.payload.size();
     return f;
 }
 
 WebSocketFrame WebSocketFrame::PongFrame(const std::string& payload) {
     WebSocketFrame f;
     f.opcode = WebSocketOpcode::Pong;
-    f.payload = payload;
-    f.payload_length = payload.size();
+    // RFC 6455 §5.5: control frame payload max 125 bytes
+    f.payload = payload.size() > 125 ? payload.substr(0, 125) : payload;
+    f.payload_length = f.payload.size();
     return f;
 }
