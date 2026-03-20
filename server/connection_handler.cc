@@ -253,6 +253,11 @@ void ConnectionHandler::CallCloseCb(){
     // IMPORTANT: Capture shared_ptr to self to keep this alive during callback
     std::shared_ptr<ConnectionHandler> self = shared_from_this();
 
+    // Send TLS close_notify before closing the fd (if TLS is active)
+    if (tls_state_ == TlsState::READY && tls_) {
+        tls_->Shutdown();
+    }
+
     // Close the channel to clean up fd and remove from epoll
     // CloseChannel() will NOT call this callback again (no recursion)
     if(client_channel_ && !client_channel_->is_channel_closed()){

@@ -1,5 +1,26 @@
 #include "ws/websocket_connection.h"
 
+// RFC 3629 UTF-8 validation
+static bool IsValidUtf8(const std::string& data) {
+    size_t i = 0;
+    while (i < data.size()) {
+        uint8_t c = static_cast<uint8_t>(data[i]);
+        size_t len;
+        if (c <= 0x7F) { len = 1; }
+        else if ((c & 0xE0) == 0xC0) { len = 2; if (c < 0xC2) return false; }
+        else if ((c & 0xF0) == 0xE0) { len = 3; }
+        else if ((c & 0xF8) == 0xF0) { len = 4; if (c > 0xF4) return false; }
+        else { return false; }
+
+        if (i + len > data.size()) return false;
+        for (size_t j = 1; j < len; j++) {
+            if ((static_cast<uint8_t>(data[i + j]) & 0xC0) != 0x80) return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
 WebSocketConnection::WebSocketConnection(std::shared_ptr<ConnectionHandler> conn)
     : conn_(std::move(conn)) {}
 
@@ -133,6 +154,12 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 if (frame.payload.size() > 2) {
                     reason = frame.payload.substr(2);
                 }
+            }
+            // RFC 6455 §7.1.6: close reason must be valid UTF-8
+            if (!reason.empty() && !IsValidUtf8(reason)) {
+                if (error_handler_) error_handler_(*this, "Close reason is not valid UTF-8");
+                SendClose(1007, "Invalid UTF-8 in close reason");
+                return;
             }
             // Validate close code per RFC 6455 Section 7.4 + IANA registry.
             // Valid ranges: 1000-1003, 1007-1014 (IANA registered), 3000-4999 (private use).

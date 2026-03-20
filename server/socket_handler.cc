@@ -142,6 +142,9 @@ void SocketHandler::SetNonBlocking(int fd) {
     // macOS: suppress SIGPIPE per-socket since MSG_NOSIGNAL is not available
 #ifdef SO_NOSIGPIPE
     int set = 1;
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set));
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set)) < 0) {
+        std::cerr << "[Socket Handler] Failed to set SO_NOSIGPIPE: "
+                  << strerror(errno) << std::endl;
+    }
 #endif
 }
