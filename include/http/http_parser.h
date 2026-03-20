@@ -25,12 +25,19 @@ public:
     // Reset parser state for next request (keep-alive)
     void Reset();
 
+    // Set size limits (enforced during parsing callbacks)
+    void SetMaxBodySize(size_t max) { max_body_size_ = max; }
+    void SetMaxHeaderSize(size_t max) { max_header_size_ = max; }
+
     // Error state
     bool HasError() const { return has_error_; }
     std::string GetError() const { return error_message_; }
 
     // Public fields accessed by llhttp callbacks (defined in .cc file)
     HttpRequest request_;
+    size_t max_body_size_ = 0;    // 0 = unlimited
+    size_t max_header_size_ = 0;  // 0 = unlimited
+    size_t header_bytes_ = 0;     // accumulated header bytes
     bool has_error_ = false;
     std::string error_message_;
     std::string current_header_field_;

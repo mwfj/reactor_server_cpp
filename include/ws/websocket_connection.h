@@ -34,6 +34,9 @@ public:
     int fd() const;
     bool IsOpen() const { return is_open_; }
 
+    // Access parser (for setting max payload size)
+    WebSocketParser& GetParser() { return parser_; }
+
     // Feed raw data from the reactor
     void OnRawData(const std::string& data);
 

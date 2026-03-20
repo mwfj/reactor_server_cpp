@@ -7,13 +7,31 @@ void HttpConnectionHandler::SetRequestHandler(RequestHandler handler) {
     request_handler_ = std::move(handler);
 }
 
+void HttpConnectionHandler::SetRouteChecker(RouteChecker checker) {
+    route_checker_ = std::move(checker);
+}
+
 void HttpConnectionHandler::SetUpgradeHandler(UpgradeHandler handler) {
     upgrade_handler_ = std::move(handler);
+}
+
+void HttpConnectionHandler::SetMaxBodySize(size_t max) {
+    max_body_size_ = max;
+    parser_.SetMaxBodySize(max);
+}
+
+void HttpConnectionHandler::SetMaxHeaderSize(size_t max) {
+    max_header_size_ = max;
+    parser_.SetMaxHeaderSize(max);
 }
 
 void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
     std::string wire = response.Serialize();
     conn_->SendRaw(wire.data(), wire.size());
+}
+
+void HttpConnectionHandler::CloseConnection() {
+    conn_->CallCloseCb();
 }
 
 void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data) {
@@ -31,12 +49,20 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
         size_t consumed = parser_.Parse(buf, remaining);
 
         if (parser_.HasError()) {
-            // Send 400 Bad Request with Connection: close.
-            // Don't just reset the parser — the stream is in an unknown state,
-            // so the only safe action is to close the connection.
-            HttpResponse err_resp = HttpResponse::BadRequest(parser_.GetError());
+            // Determine appropriate error response based on parser error
+            std::string err_msg = parser_.GetError();
+            HttpResponse err_resp;
+            if (err_msg.find("Body size exceeds") != std::string::npos) {
+                err_resp = HttpResponse::PayloadTooLarge();
+            } else if (err_msg.find("Header size exceeds") != std::string::npos) {
+                err_resp = HttpResponse::HeaderTooLarge();
+            } else {
+                err_resp = HttpResponse::BadRequest(err_msg);
+            }
             err_resp.Header("Connection", "close");
             SendResponse(err_resp);
+            // Actually close the connection — the stream is in an unknown state
+            CloseConnection();
             return;
         }
 
@@ -46,27 +72,20 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
         if (parser_.GetRequest().complete) {
             const HttpRequest& req = parser_.GetRequest();
 
-            // Enforce body size limit
-            if (max_body_size_ > 0 && req.body.size() > max_body_size_) {
-                HttpResponse err_resp = HttpResponse::PayloadTooLarge();
-                err_resp.Header("Connection", "close");
-                SendResponse(err_resp);
-                return;
-            }
-
             // Check for WebSocket upgrade
-            if (req.upgrade && upgrade_handler_) {
+            if (req.upgrade && route_checker_) {
                 // Validate WebSocket handshake per RFC 6455
                 std::string ws_error;
                 if (!WebSocketHandshake::Validate(req, ws_error)) {
-                    SendResponse(WebSocketHandshake::Reject(400, ws_error));
+                    HttpResponse reject = WebSocketHandshake::Reject(400, ws_error);
+                    reject.Header("Connection", "close");
+                    SendResponse(reject);
+                    CloseConnection();
                     return;
                 }
 
                 // Check route existence BEFORE sending 101
-                // upgrade_handler_ returns true if a WS route exists for this path
-                auto self = shared_from_this();
-                if (!upgrade_handler_(self, req, conn_)) {
+                if (!route_checker_(req.path)) {
                     SendResponse(HttpResponse::NotFound());
                     return;
                 }
@@ -74,13 +93,17 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 // Route confirmed — send 101 Switching Protocols
                 SendResponse(WebSocketHandshake::Accept(req));
 
-                // Create WebSocket connection and wire up callbacks
+                // Create WebSocket connection
                 ws_conn_ = std::make_unique<WebSocketConnection>(conn_);
+                if (max_ws_message_size_ > 0) {
+                    ws_conn_->GetParser().SetMaxPayloadSize(max_ws_message_size_);
+                }
                 upgraded_ = true;
 
-                // Invoke handler again to wire WS callbacks (ws_conn_ now exists).
-                // The handler is idempotent: first call checks route, second call wires callbacks.
-                upgrade_handler_(self, req, conn_);
+                // Wire WS callbacks (called exactly once, ws_conn_ guaranteed to exist)
+                if (upgrade_handler_) {
+                    upgrade_handler_(shared_from_this(), req);
+                }
 
                 // Forward any trailing bytes after the HTTP headers as WebSocket data
                 buf += consumed;

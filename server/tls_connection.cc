@@ -16,8 +16,10 @@ TlsConnection::TlsConnection(TlsContext& ctx, int fd) {
 
 TlsConnection::~TlsConnection() {
     if (ssl_) {
-        // Send close_notify to peer before freeing
-        SSL_shutdown(ssl_);
+        // Note: SSL_shutdown() is NOT called here because by the time
+        // TlsConnection is destroyed, Channel::CloseChannel() has already
+        // closed the fd. Use the explicit Shutdown() method before socket
+        // close if a clean close_notify is needed.
         SSL_free(ssl_);
     }
 }

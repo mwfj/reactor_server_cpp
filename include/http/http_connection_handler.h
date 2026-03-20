@@ -22,12 +22,16 @@ public:
     )>;
     void SetRequestHandler(RequestHandler handler);
 
-    // Handler for WebSocket upgrade requests.
-    // Returns true if upgrade should proceed (route exists), false to reject.
-    using UpgradeHandler = std::function<bool(
+    // Check if a WebSocket route exists for the given path.
+    // Returns true if upgrade should proceed, false to reject.
+    using RouteChecker = std::function<bool(const std::string& path)>;
+    void SetRouteChecker(RouteChecker checker);
+
+    // Handler called ONCE after WebSocket upgrade is complete and ws_conn_ exists.
+    // Wires application-level OnMessage/OnClose callbacks on the WebSocketConnection.
+    using UpgradeHandler = std::function<void(
         std::shared_ptr<HttpConnectionHandler> self,
-        const HttpRequest& request,
-        std::shared_ptr<ConnectionHandler> conn
+        const HttpRequest& request
     )>;
     void SetUpgradeHandler(UpgradeHandler handler);
 
@@ -44,8 +48,9 @@ public:
     std::shared_ptr<ConnectionHandler> GetConnection() const { return conn_; }
 
     // Set request size limits (from ServerConfig)
-    void SetMaxBodySize(size_t max) { max_body_size_ = max; }
-    void SetMaxHeaderSize(size_t max) { max_header_size_ = max; }
+    void SetMaxBodySize(size_t max);
+    void SetMaxHeaderSize(size_t max);
+    void SetMaxWsMessageSize(size_t max) { max_ws_message_size_ = max; }
 
     // Called when raw data arrives (set as NetServer's on_message callback)
     void OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data);
@@ -53,9 +58,14 @@ public:
 private:
     size_t max_body_size_ = 0;    // 0 = unlimited
     size_t max_header_size_ = 0;  // 0 = unlimited
+    size_t max_ws_message_size_ = 0; // 0 = unlimited
+
+    // Close the underlying connection (send response then close)
+    void CloseConnection();
     std::shared_ptr<ConnectionHandler> conn_;
     HttpParser parser_;
     RequestHandler request_handler_;
+    RouteChecker route_checker_;
     UpgradeHandler upgrade_handler_;
     bool upgraded_ = false;
     std::unique_ptr<WebSocketConnection> ws_conn_;

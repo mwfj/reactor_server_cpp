@@ -13,6 +13,7 @@ static int on_message_begin(llhttp_t* parser) {
     self->current_header_field_.clear();
     self->current_header_value_.clear();
     self->parsing_header_value_ = false;
+    self->header_bytes_ = 0;
     return 0;
 }
 
@@ -24,6 +25,14 @@ static int on_url(llhttp_t* parser, const char* at, size_t length) {
 
 static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<HttpParser*>(parser->data);
+
+    // Enforce header size limit
+    self->header_bytes_ += length;
+    if (self->max_header_size_ > 0 && self->header_bytes_ > self->max_header_size_) {
+        self->has_error_ = true;
+        self->error_message_ = "Header size exceeds maximum";
+        return HPE_USER;  // Tell llhttp to stop parsing
+    }
 
     // If we were reading a value, flush the previous header
     if (self->parsing_header_value_) {
@@ -41,6 +50,15 @@ static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
 
 static int on_header_value(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<HttpParser*>(parser->data);
+
+    // Enforce header size limit
+    self->header_bytes_ += length;
+    if (self->max_header_size_ > 0 && self->header_bytes_ > self->max_header_size_) {
+        self->has_error_ = true;
+        self->error_message_ = "Header size exceeds maximum";
+        return HPE_USER;
+    }
+
     self->current_header_value_.append(at, length);
     self->parsing_header_value_ = true;
     return 0;
@@ -89,6 +107,15 @@ static int on_headers_complete(llhttp_t* parser) {
 
 static int on_body(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<HttpParser*>(parser->data);
+
+    // Enforce body size limit DURING parsing, not after
+    if (self->max_body_size_ > 0 &&
+        (self->request_.body.size() + length) > self->max_body_size_) {
+        self->has_error_ = true;
+        self->error_message_ = "Body size exceeds maximum";
+        return HPE_USER;
+    }
+
     self->request_.body.append(at, length);
     return 0;
 }
@@ -153,6 +180,7 @@ void HttpParser::Reset() {
     current_header_field_.clear();
     current_header_value_.clear();
     parsing_header_value_ = false;
+    header_bytes_ = 0;
     llhttp_init(&impl_->parser, HTTP_REQUEST, &impl_->settings);
     impl_->parser.data = this;
 }

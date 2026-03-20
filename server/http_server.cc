@@ -24,6 +24,12 @@ HttpServer::HttpServer(const ServerConfig& config)
 
     if (config.tls.enabled) {
         tls_ctx_ = std::make_unique<TlsContext>(config.tls.cert_file, config.tls.key_file);
+        // Apply configured minimum TLS version
+        if (config.tls.min_version == "1.3") {
+            tls_ctx_->SetMinProtocolVersion(TLS1_3_VERSION);
+        } else {
+            // Default: TLS 1.2 (already set in TlsContext constructor)
+        }
         net_server_.SetTlsContext(tls_ctx_.get());
     }
 }
@@ -69,6 +75,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     // Apply request size limits
     http_conn->SetMaxBodySize(max_body_size_);
     http_conn->SetMaxHeaderSize(max_header_size_);
+    http_conn->SetMaxWsMessageSize(max_ws_message_size_);
 
     // Set request handler: dispatch through router
     http_conn->SetRequestHandler(
@@ -81,21 +88,21 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
         }
     );
 
-    // Set WebSocket upgrade handler (returns true if route exists, false to reject)
-    // Called twice: first to check route existence (before 101), then to wire callbacks (after ws_conn_ created)
+    // Route checker: determines if a WebSocket route exists (called before 101)
+    http_conn->SetRouteChecker(
+        [this](const std::string& path) -> bool {
+            return router_.HasWebSocketRoute(path);
+        }
+    );
+
+    // Upgrade handler: wires WS callbacks (called exactly once, after ws_conn_ created)
     http_conn->SetUpgradeHandler(
         [this](std::shared_ptr<HttpConnectionHandler> self,
-               const HttpRequest& request,
-               std::shared_ptr<ConnectionHandler> conn) -> bool {
-            if (!router_.HasWebSocketRoute(request.path)) {
-                return false;  // No route — reject upgrade
-            }
-            // Wire WS callbacks if WebSocket connection exists (second call)
+               const HttpRequest& request) {
             auto ws_handler = router_.GetWebSocketHandler(request.path);
             if (ws_handler && self->GetWebSocket()) {
                 ws_handler(*self->GetWebSocket());
             }
-            return true;
         }
     );
 }
