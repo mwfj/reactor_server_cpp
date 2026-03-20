@@ -94,6 +94,13 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
 
             if (frame.fin) {
                 // Complete single-frame message
+                // RFC 6455 §5.6: text frames must contain valid UTF-8
+                if (frame.opcode == WebSocketOpcode::Text && !IsValidUtf8(frame.payload)) {
+                    if (error_handler_) error_handler_(*this, "Invalid UTF-8 in text message");
+                    SendClose(1007, "Invalid UTF-8");
+                    if (conn_) conn_->CloseAfterWrite();
+                    return;
+                }
                 if (message_handler_) {
                     message_handler_(*this, frame.payload,
                                      frame.opcode == WebSocketOpcode::Binary);
@@ -134,6 +141,15 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             }
             fragment_buffer_ += frame.payload;
             if (frame.fin) {
+                // RFC 6455 §5.6: validate reassembled text messages
+                if (fragment_opcode_ == WebSocketOpcode::Text && !IsValidUtf8(fragment_buffer_)) {
+                    if (error_handler_) error_handler_(*this, "Invalid UTF-8 in text message");
+                    SendClose(1007, "Invalid UTF-8");
+                    if (conn_) conn_->CloseAfterWrite();
+                    in_fragment_ = false;
+                    fragment_buffer_.clear();
+                    return;
+                }
                 if (message_handler_) {
                     message_handler_(*this, fragment_buffer_,
                                      fragment_opcode_ == WebSocketOpcode::Binary);

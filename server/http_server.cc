@@ -31,6 +31,7 @@ HttpServer::HttpServer(const ServerConfig& config)
     max_body_size_ = config.max_body_size;
     max_header_size_ = config.max_header_size;
     max_ws_message_size_ = config.max_ws_message_size;
+    net_server_.SetMaxConnections(config.max_connections);
 
     if (config.tls.enabled) {
         tls_ctx_ = std::make_unique<TlsContext>(config.tls.cert_file, config.tls.key_file);

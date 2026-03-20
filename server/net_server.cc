@@ -76,6 +76,16 @@ void NetServer::Stop(){
 }
 
 void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
+    // Enforce max_connections limit
+    if (max_connections_ > 0) {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        if (static_cast<int>(connections_.size()) >= max_connections_) {
+            std::cerr << "[NetServer] Max connections (" << max_connections_
+                      << ") reached, rejecting fd " << cilent_sock->fd() << std::endl;
+            return;  // SocketHandler destructor closes the fd
+        }
+    }
+
     int idx = cilent_sock -> fd() % sock_workers_.GetThreadWorkerNum();
     std::shared_ptr<ConnectionHandler> conn = std::shared_ptr<ConnectionHandler>(new ConnectionHandler(socket_dispatchers_[idx], std::move(cilent_sock)));
 

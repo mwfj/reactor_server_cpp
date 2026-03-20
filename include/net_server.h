@@ -54,6 +54,7 @@ private:
     std::chrono::seconds connection_timeout_;  // Connection idle timeout duration
 
     TlsContext* tls_ctx_ = nullptr;  // Non-owning, owned by HttpServer
+    int max_connections_ = 0;         // 0 = unlimited
 
 public:
     NetServer() = delete;
@@ -84,4 +85,5 @@ public:
     void SetTimerCb(CALLBACKS_NAMESPACE::NetSrvTimerCallback);
 
     void SetTlsContext(TlsContext* ctx) { tls_ctx_ = ctx; }
+    void SetMaxConnections(int max) { max_connections_ = max; }
 };

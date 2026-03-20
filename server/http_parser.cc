@@ -23,6 +23,18 @@ static int on_message_begin(llhttp_t* parser) {
 
 static int on_url(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<HttpParser*>(parser->data);
+
+    // Charge URL bytes against header size limit (prevents oversized request targets)
+    if (self->max_header_size_ > 0 &&
+        (self->header_bytes_ >= self->max_header_size_ ||
+         length > self->max_header_size_ - self->header_bytes_)) {
+        self->has_error_ = true;
+        self->error_message_ = "Header size exceeds maximum";
+        self->error_type_ = HttpParser::ParseError::HEADER_TOO_LARGE;
+        return HPE_USER;
+    }
+    self->header_bytes_ += length;
+
     self->request_.url.append(at, length);
     return 0;
 }
