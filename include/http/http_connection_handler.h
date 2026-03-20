@@ -27,6 +27,11 @@ public:
     using RouteChecker = std::function<bool(const std::string& path)>;
     void SetRouteChecker(RouteChecker checker);
 
+    // Run middleware chain before WebSocket upgrade.
+    // Returns true if all middleware passed, false if any short-circuited (response is set).
+    using MiddlewareRunner = std::function<bool(const HttpRequest& request, HttpResponse& response)>;
+    void SetMiddlewareRunner(MiddlewareRunner runner);
+
     // Handler called ONCE after WebSocket upgrade is complete and ws_conn_ exists.
     // Wires application-level OnMessage/OnClose callbacks on the WebSocketConnection.
     using UpgradeHandler = std::function<void(
@@ -66,6 +71,7 @@ private:
     HttpParser parser_;
     RequestHandler request_handler_;
     RouteChecker route_checker_;
+    MiddlewareRunner middleware_runner_;
     UpgradeHandler upgrade_handler_;
     bool upgraded_ = false;
     std::unique_ptr<WebSocketConnection> ws_conn_;

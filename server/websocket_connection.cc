@@ -144,6 +144,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             if (!valid_code && frame.payload.size() >= 2) {
                 // Invalid code on wire — protocol error, close with 1002
                 code = 1002;
+                reason = "Invalid close code";
             }
             // Echo close frame back (close handshake)
             if (is_open_) {

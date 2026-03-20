@@ -137,12 +137,13 @@ void ConnectionHandler::OnMessage(){
 }
 
 void ConnectionHandler::SendData(const char *data, size_t size){
-    // Thread-safe: All buffer operations must happen in socket dispatcher thread
-    // Copy data immediately to avoid dangling pointer
+    // Thread-safe: All buffer operations must happen in socket dispatcher thread.
+    // is_sock_dispatcher() checks if this dispatcher is a socket worker — if not (conn_dispatcher),
+    // we must EnQueue. Normal callback paths (OnMessage → handler → SendData) always run on the
+    // owning dispatcher thread so the inline path is safe.
     std::string data_copy(data, size);
 
     if(event_dispatcher_ && !event_dispatcher_ -> is_sock_dispatcher()) {
-        // Capture weak_ptr to avoid preventing ConnectionHandler destruction
         std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
         event_dispatcher_ -> EnQueue([weak_self, data_copy]() {
             if (auto self = weak_self.lock()) {
@@ -150,7 +151,6 @@ void ConnectionHandler::SendData(const char *data, size_t size){
             }
         });
     } else {
-        // Already in socket dispatcher thread
         DoSend(data, size);
     }
 }
@@ -195,7 +195,7 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
                 errno = EAGAIN;
             }
         } else {
-            written = ::send(fd(), data, size, MSG_NOSIGNAL);
+            written = ::send(fd(), data, size, SEND_FLAGS);
         }
         if (written > 0) {
             if (static_cast<size_t>(written) == size) {
@@ -221,7 +221,7 @@ void ConnectionHandler::CloseAfterWrite(){
 
     // Must run on the reactor thread — CloseChannel/epoll_ctl need to be called
     // from the same thread that owns the fd to avoid fd-reuse races.
-    if (event_dispatcher_ && !event_dispatcher_->is_sock_dispatcher()) {
+    if (event_dispatcher_ && !event_dispatcher_->is_dispatcher_thread()) {
         std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
         event_dispatcher_->EnQueue([weak_self]() {
             if (auto self = weak_self.lock()) {
@@ -313,7 +313,7 @@ void ConnectionHandler::CallWriteCb(){
             return;
         }
     } else {
-        write_sz = ::send(fd(), output_bf_.Data(), output_bf_.Size(), MSG_NOSIGNAL);
+        write_sz = ::send(fd(), output_bf_.Data(), output_bf_.Size(), SEND_FLAGS);
     }
 
     // Remove sent data

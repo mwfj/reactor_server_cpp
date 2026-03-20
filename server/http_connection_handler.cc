@@ -11,6 +11,10 @@ void HttpConnectionHandler::SetRouteChecker(RouteChecker checker) {
     route_checker_ = std::move(checker);
 }
 
+void HttpConnectionHandler::SetMiddlewareRunner(MiddlewareRunner runner) {
+    middleware_runner_ = std::move(runner);
+}
+
 void HttpConnectionHandler::SetUpgradeHandler(UpgradeHandler handler) {
     upgrade_handler_ = std::move(handler);
 }
@@ -77,6 +81,18 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
 
             // Check for WebSocket upgrade
             if (req.upgrade && route_checker_) {
+                // Run middleware before upgrade (auth, CORS, rate limiting, etc.)
+                if (middleware_runner_) {
+                    HttpResponse mw_response;
+                    if (!middleware_runner_(req, mw_response)) {
+                        // Middleware rejected the request
+                        mw_response.Header("Connection", "close");
+                        SendResponse(mw_response);
+                        CloseConnection();
+                        return;
+                    }
+                }
+
                 // Validate WebSocket handshake per RFC 6455
                 std::string ws_error;
                 if (!WebSocketHandshake::Validate(req, ws_error)) {

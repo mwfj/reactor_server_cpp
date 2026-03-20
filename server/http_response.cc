@@ -51,9 +51,11 @@ std::string HttpResponse::Serialize() const {
 
     // Headers
     auto hdrs = headers_;
-    // Add Content-Length if not already set (even for empty body, except 1xx/204/304)
+    // Add Content-Length if not already set.
+    // Excluded: 1xx informational, 101 Switching Protocols, 204 No Content, 304 Not Modified
     if (hdrs.find("Content-Length") == hdrs.end() &&
-        status_code_ >= 200 && status_code_ != 204 && status_code_ != 304) {
+        status_code_ >= 200 && status_code_ != 204 && status_code_ != 304 &&
+        status_code_ != 101) {
         hdrs["Content-Length"] = std::to_string(body_.size());
     }
     for (const auto& kv : hdrs) {

@@ -85,7 +85,7 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
         if (log.contains("file") && log["file"].is_string()) {
             config.log.file = log["file"].get<std::string>();
         }
-        if (log.contains("max_file_size") && log["max_file_size"].is_number_integer()) {
+        if (log.contains("max_file_size") && log["max_file_size"].is_number_unsigned()) {
             config.log.max_file_size = log["max_file_size"].get<size_t>();
         }
         if (log.contains("max_files") && log["max_files"].is_number_integer()) {

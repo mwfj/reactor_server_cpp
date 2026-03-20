@@ -55,6 +55,15 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     return false;  // No route found -- caller sends 404
 }
 
+bool HttpRouter::RunMiddleware(const HttpRequest& request, HttpResponse& response) {
+    for (const auto& mw : middlewares_) {
+        if (!mw(request, response)) {
+            return false;  // Middleware short-circuited
+        }
+    }
+    return true;  // All middleware passed
+}
+
 bool HttpRouter::HasWebSocketRoute(const std::string& path) const {
     for (const auto& ws : ws_routes_) {
         if (ws.path == path) return true;

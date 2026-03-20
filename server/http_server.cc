@@ -103,6 +103,13 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
         }
     );
 
+    // Middleware runner for WebSocket upgrades (auth, CORS, rate limiting)
+    http_conn->SetMiddlewareRunner(
+        [this](const HttpRequest& request, HttpResponse& response) -> bool {
+            return router_.RunMiddleware(request, response);
+        }
+    );
+
     // Route checker: determines if a WebSocket route exists (called before 101)
     http_conn->SetRouteChecker(
         [this](const std::string& path) -> bool {

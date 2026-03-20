@@ -46,6 +46,10 @@ public:
     // Returns true if route found, false if no match (caller should send 404).
     bool Dispatch(const HttpRequest& request, HttpResponse& response);
 
+    // Run middleware chain only (for WebSocket upgrades that need auth/CORS/etc.)
+    // Returns true if all middleware passed, false if any short-circuited.
+    bool RunMiddleware(const HttpRequest& request, HttpResponse& response);
+
     // WebSocket route lookup
     bool HasWebSocketRoute(const std::string& path) const;
     WsUpgradeHandler GetWebSocketHandler(const std::string& path) const;

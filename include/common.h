@@ -59,6 +59,14 @@
     #error "Unsupported platform"
 #endif
 
+// Platform-safe send flags to suppress SIGPIPE
+#if defined(__linux__)
+    #define SEND_FLAGS MSG_NOSIGNAL
+#else
+    // macOS uses SO_NOSIGPIPE per-socket (set in SocketHandler)
+    #define SEND_FLAGS 0
+#endif
+
 #define MAX_BUFFER_SIZE 1024
 #define MAX_REPLY_SIZE 50
 #define NUMBER_OF_CHILD_PROCESSES 25
