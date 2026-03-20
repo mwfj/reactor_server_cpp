@@ -119,6 +119,12 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
         }
 
         case WebSocketOpcode::Close: {
+            // RFC 6455 §7.1.5: close body must be 0 bytes or >= 2 bytes
+            if (frame.payload.size() == 1) {
+                if (error_handler_) error_handler_(*this, "Invalid close frame: 1-byte payload");
+                SendClose(1002, "Protocol error");
+                return;
+            }
             uint16_t code = 1000;
             std::string reason;
             if (frame.payload.size() >= 2) {

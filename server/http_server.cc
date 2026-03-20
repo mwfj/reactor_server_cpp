@@ -1,6 +1,7 @@
 #include "http/http_server.h"
 #include "ws/websocket_frame.h"
 #include "log/logger.h"
+#include <algorithm>
 
 void HttpServer::WireNetServerCallbacks() {
     net_server_.SetNewConnectionCb(
@@ -21,7 +22,7 @@ HttpServer::HttpServer(const std::string& ip, int port)
 
 HttpServer::HttpServer(const ServerConfig& config)
     : net_server_(config.bind_host, static_cast<size_t>(config.bind_port),
-                  config.idle_timeout_sec,
+                  std::max(config.idle_timeout_sec / 6, 10),  // scan interval: fraction of timeout
                   std::chrono::seconds(config.idle_timeout_sec))
 {
     WireNetServerCallbacks();
@@ -61,7 +62,9 @@ void HttpServer::Stop() {
     logging::Get()->info("HttpServer stopping");
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        // Send WebSocket Close frames (1001 Going Away) to all upgraded connections
+        // Send WebSocket Close frames (1001 Going Away) to all upgraded connections.
+        // These are queued via SendRaw → EnQueue and will be flushed by the reactor
+        // dispatchers before NetServer::Stop() joins the worker threads.
         for (auto& pair : http_connections_) {
             auto& http_conn = pair.second;
             if (http_conn && http_conn->IsUpgraded() && http_conn->GetWebSocket()) {
@@ -71,9 +74,16 @@ void HttpServer::Stop() {
                 }
             }
         }
-        http_connections_.clear();
+        // Don't clear http_connections_ here — let NetServer::Stop() drain the
+        // event loops first so queued close frames are actually flushed.
+        // Connections will be destroyed when NetServer::Stop() clears its own map.
     }
     net_server_.Stop();
+    // Now safe to clear — NetServer has already stopped and destroyed connections
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        http_connections_.clear();
+    }
 }
 
 void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn) {

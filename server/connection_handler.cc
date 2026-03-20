@@ -218,12 +218,27 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
 
 void ConnectionHandler::CloseAfterWrite(){
     close_after_write_.store(true, std::memory_order_release);
-    // If buffer is already empty (SendRaw fast path flushed everything),
-    // close immediately — in ET mode, EPOLLOUT won't fire on an already-writable socket.
-    if (output_bf_.Size() == 0) {
-        CallCloseCb();
+
+    // Must run on the reactor thread — CloseChannel/epoll_ctl need to be called
+    // from the same thread that owns the fd to avoid fd-reuse races.
+    if (event_dispatcher_ && !event_dispatcher_->is_sock_dispatcher()) {
+        std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
+        event_dispatcher_->EnQueue([weak_self]() {
+            if (auto self = weak_self.lock()) {
+                if (self->output_bf_.Size() == 0) {
+                    self->CallCloseCb();
+                } else {
+                    self->client_channel_->EnableWriteMode();
+                }
+            }
+        });
     } else {
-        client_channel_ -> EnableWriteMode();
+        // Already on reactor thread
+        if (output_bf_.Size() == 0) {
+            CallCloseCb();
+        } else {
+            client_channel_->EnableWriteMode();
+        }
     }
 }
 
@@ -298,7 +313,7 @@ void ConnectionHandler::CallWriteCb(){
             return;
         }
     } else {
-        write_sz = ::send(fd(), output_bf_.Data(), output_bf_.Size(), 0);
+        write_sz = ::send(fd(), output_bf_.Data(), output_bf_.Size(), MSG_NOSIGNAL);
     }
 
     // Remove sent data

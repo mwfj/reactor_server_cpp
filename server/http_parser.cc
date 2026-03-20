@@ -14,6 +14,9 @@ static int on_message_begin(llhttp_t* parser) {
     self->current_header_value_.clear();
     self->parsing_header_value_ = false;
     self->header_bytes_ = 0;
+    // Reset all error state defensively (for pipelining without external Reset())
+    self->has_error_ = false;
+    self->error_message_.clear();
     self->error_type_ = HttpParser::ParseError::NONE;
     return 0;
 }
@@ -27,14 +30,16 @@ static int on_url(llhttp_t* parser, const char* at, size_t length) {
 static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<HttpParser*>(parser->data);
 
-    // Enforce header size limit
-    self->header_bytes_ += length;
-    if (self->max_header_size_ > 0 && self->header_bytes_ > self->max_header_size_) {
+    // Enforce header size limit (guard against unsigned overflow before adding)
+    if (self->max_header_size_ > 0 &&
+        (self->header_bytes_ >= self->max_header_size_ ||
+         length > self->max_header_size_ - self->header_bytes_)) {
         self->has_error_ = true;
         self->error_message_ = "Header size exceeds maximum";
         self->error_type_ = HttpParser::ParseError::HEADER_TOO_LARGE;
-        return HPE_USER;  // Tell llhttp to stop parsing
+        return HPE_USER;
     }
+    self->header_bytes_ += length;
 
     // If we were reading a value, flush the previous header
     if (self->parsing_header_value_) {
@@ -53,14 +58,16 @@ static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
 static int on_header_value(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<HttpParser*>(parser->data);
 
-    // Enforce header size limit
-    self->header_bytes_ += length;
-    if (self->max_header_size_ > 0 && self->header_bytes_ > self->max_header_size_) {
+    // Enforce header size limit (guard against unsigned overflow before adding)
+    if (self->max_header_size_ > 0 &&
+        (self->header_bytes_ >= self->max_header_size_ ||
+         length > self->max_header_size_ - self->header_bytes_)) {
         self->has_error_ = true;
         self->error_message_ = "Header size exceeds maximum";
         self->error_type_ = HttpParser::ParseError::HEADER_TOO_LARGE;
         return HPE_USER;
     }
+    self->header_bytes_ += length;
 
     self->current_header_value_.append(at, length);
     self->parsing_header_value_ = true;
