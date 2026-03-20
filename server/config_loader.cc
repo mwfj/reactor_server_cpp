@@ -166,6 +166,18 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             " (must be >= 1)");
     }
 
+    if (config.idle_timeout_sec < 1) {
+        throw std::invalid_argument(
+            "Invalid idle_timeout_sec: " + std::to_string(config.idle_timeout_sec) +
+            " (must be >= 1)");
+    }
+
+    if (config.request_timeout_sec < 1) {
+        throw std::invalid_argument(
+            "Invalid request_timeout_sec: " + std::to_string(config.request_timeout_sec) +
+            " (must be >= 1)");
+    }
+
     if (config.tls.enabled) {
         if (config.tls.cert_file.empty()) {
             throw std::invalid_argument(

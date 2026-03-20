@@ -259,6 +259,13 @@ void Dispatcher::SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCal
 }
 
 void Dispatcher::TimerHandler(){
+    // Drain the timerfd expiration count before re-arming.
+    // On Linux, timerfd stays readable until read(); without draining,
+    // epoll_wait returns the timer channel continuously in a tight loop.
+#if defined(__linux__)
+    uint64_t expirations;
+    ::read(timer_fd_, &expirations, sizeof(expirations));
+#endif
     TimeStamp::ResetTimerFd(timer_fd_, end_t_);
 
     if(is_sock_dispatcher()){

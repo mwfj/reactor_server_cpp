@@ -294,6 +294,11 @@ void ConnectionHandler::CallWriteCb(){
         }
     } else {
         write_sz = ::send(fd(), output_bf_.Data(), output_bf_.Size(), SEND_FLAGS);
+        if (write_sz < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            // Send failed (EPIPE, ECONNRESET, etc.) — close the connection
+            CallCloseCb();
+            return;
+        }
     }
 
     // Remove sent data
