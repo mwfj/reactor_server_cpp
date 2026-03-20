@@ -42,16 +42,18 @@ static int on_url(llhttp_t* parser, const char* at, size_t length) {
 static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<HttpParser*>(parser->data);
 
-    // Enforce header size limit (guard against unsigned overflow before adding)
+    // Enforce header size limit (guard against unsigned overflow before adding).
+    // Add 4 bytes per header for delimiters (": " + "\r\n") not exposed by llhttp callbacks.
+    size_t charge = length + 4;
     if (self->max_header_size_ > 0 &&
         (self->header_bytes_ >= self->max_header_size_ ||
-         length > self->max_header_size_ - self->header_bytes_)) {
+         charge > self->max_header_size_ - self->header_bytes_)) {
         self->has_error_ = true;
         self->error_message_ = "Header size exceeds maximum";
         self->error_type_ = HttpParser::ParseError::HEADER_TOO_LARGE;
         return HPE_USER;
     }
-    self->header_bytes_ += length;
+    self->header_bytes_ += charge;
 
     // If we were reading a value, flush the previous header
     if (self->parsing_header_value_) {

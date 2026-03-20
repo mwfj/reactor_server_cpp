@@ -32,7 +32,7 @@ public:
 
     // Connection info
     int fd() const;
-    bool IsOpen() const { return is_open_; }
+    bool IsOpen() const { return is_open_ && !close_sent_; }
 
     // Access parser (for setting max payload size)
     WebSocketParser& GetParser() { return parser_; }

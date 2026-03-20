@@ -58,10 +58,12 @@ void WebSocketConnection::OnPing(PingHandler handler) { ping_handler_ = std::mov
 void WebSocketConnection::OnError(ErrorHandler handler) { error_handler_ = std::move(handler); }
 
 void WebSocketConnection::SendText(const std::string& message) {
+    if (close_sent_ || !is_open_) return;  // No data frames after close
     SendFrame(WebSocketFrame::TextFrame(message));
 }
 
 void WebSocketConnection::SendBinary(const std::string& data) {
+    if (close_sent_ || !is_open_) return;  // No data frames after close
     SendFrame(WebSocketFrame::BinaryFrame(data));
 }
 

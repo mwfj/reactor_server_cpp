@@ -235,15 +235,20 @@ void ConnectionHandler::CallCloseCb(){
     // acceptable for server-side shutdown. For clean TLS shutdown, call Shutdown() explicitly
     // before triggering close.
 
-    // Close the channel to clean up fd and remove from epoll
-    // CloseChannel() will NOT call this callback again (no recursion)
+    // Close the channel to clean up fd and remove from epoll.
+    // CloseChannel() calls ::close(fd) and sets Channel::fd_ = -1.
     if(client_channel_ && !client_channel_->is_channel_closed()){
         client_channel_->CloseChannel();
     }
 
-    // Call the application callback
+    // Call the application callback (needs fd() to still work for map lookups)
     if (callbacks_.close_callback)
         callbacks_.close_callback(self);
+
+    // AFTER the callback: release fd from SocketHandler to prevent double-close.
+    // CloseChannel already closed the fd, but SocketHandler still has the old fd number.
+    // Under connection churn the kernel can reuse the fd before SocketHandler destructs.
+    if (sock_) sock_->ReleaseFd();
 }
 
 void ConnectionHandler::CallErroCb(){

@@ -190,6 +190,14 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
 
             // Reset parser for next request (keep-alive / pipelining)
             parser_.Reset();
+
+            // If there are remaining bytes (pipelined request), arm a new deadline
+            // immediately so partial pipelined requests are also protected
+            if (remaining > 0 && request_timeout_sec_ > 0) {
+                request_in_progress_ = true;
+                request_start_ = std::chrono::steady_clock::now();
+                conn_->SetDeadline(request_start_ + std::chrono::seconds(request_timeout_sec_));
+            }
         } else {
             // Incomplete request -- need more data
             break;
