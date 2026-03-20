@@ -98,6 +98,12 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
 
             case State::ReadExtendedLen64: {
                 if (buf_remaining() < 8) goto done;
+                // RFC 6455 §5.2: most significant bit must be 0
+                if (static_cast<uint8_t>(buffer_[offset]) & 0x80) {
+                    has_error_ = true;
+                    error_message_ = "64-bit payload length has MSB set";
+                    goto done;
+                }
                 uint64_t len64 = 0;
                 for (int i = 0; i < 8; i++) {
                     len64 = (len64 << 8) | static_cast<uint8_t>(buffer_[offset + i]);

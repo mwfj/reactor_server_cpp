@@ -57,4 +57,5 @@ private:
     size_t max_body_size_ = 1048576;       // 1 MB
     size_t max_header_size_ = 8192;        // 8 KB
     size_t max_ws_message_size_ = 16777216; // 16 MB
+    int request_timeout_sec_ = 30;         // Slowloris protection
 };

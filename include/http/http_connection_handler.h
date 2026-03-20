@@ -9,6 +9,7 @@
 
 #include <memory>
 #include <functional>
+#include <chrono>
 
 class HttpConnectionHandler : public std::enable_shared_from_this<HttpConnectionHandler> {
 public:
@@ -57,6 +58,9 @@ public:
     void SetMaxHeaderSize(size_t max);
     void SetMaxWsMessageSize(size_t max) { max_ws_message_size_ = max; }
 
+    // Set request timeout (Slowloris protection)
+    void SetRequestTimeout(int seconds) { request_timeout_sec_ = seconds; }
+
     // Called when raw data arrives (set as NetServer's on_message callback)
     void OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data);
 
@@ -64,6 +68,11 @@ private:
     size_t max_body_size_ = 0;    // 0 = unlimited
     size_t max_header_size_ = 0;  // 0 = unlimited
     size_t max_ws_message_size_ = 0; // 0 = unlimited
+    int request_timeout_sec_ = 0; // 0 = disabled
+
+    // Slowloris protection: tracks when the current incomplete request started
+    bool request_in_progress_ = false;
+    std::chrono::steady_clock::time_point request_start_;
 
     // Close the underlying connection (send response then close)
     void CloseConnection();

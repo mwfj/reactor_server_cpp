@@ -116,6 +116,10 @@ HttpResponse HttpResponse::HeaderTooLarge() {
     return HttpResponse().Status(431).Text("Request Header Fields Too Large");
 }
 
+HttpResponse HttpResponse::RequestTimeout() {
+    return HttpResponse().Status(408).Text("Request Timeout");
+}
+
 std::string HttpResponse::DefaultReason(int code) {
     switch (code) {
         case 200: return "OK";

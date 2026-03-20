@@ -48,6 +48,26 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
     const char* buf = data.data();
     size_t remaining = data.size();
 
+    // Slowloris protection: track when the current incomplete request started.
+    // If we receive data but the request hasn't completed within the timeout, kill it.
+    if (request_timeout_sec_ > 0) {
+        if (!request_in_progress_) {
+            // First bytes of a new request — start the clock
+            request_in_progress_ = true;
+            request_start_ = std::chrono::steady_clock::now();
+        } else {
+            // Request still in progress — check elapsed time
+            auto elapsed = std::chrono::steady_clock::now() - request_start_;
+            if (elapsed > std::chrono::seconds(request_timeout_sec_)) {
+                HttpResponse timeout_resp = HttpResponse::RequestTimeout();
+                timeout_resp.Header("Connection", "close");
+                SendResponse(timeout_resp);
+                CloseConnection();
+                return;
+            }
+        }
+    }
+
     // Loop to handle pipelining: a single data buffer may contain multiple HTTP requests
     while (remaining > 0) {
         size_t consumed = parser_.Parse(buf, remaining);
@@ -112,6 +132,9 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                     return;
                 }
 
+                // Request completed (as upgrade) — reset timeout tracking
+                request_in_progress_ = false;
+
                 // Route confirmed — send 101 Switching Protocols
                 SendResponse(WebSocketHandshake::Accept(req));
 
@@ -149,6 +172,9 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                     return;
                 }
             }
+
+            // Request completed — reset timeout tracking for next request
+            request_in_progress_ = false;
 
             // Advance past consumed bytes
             buf += consumed;

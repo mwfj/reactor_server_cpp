@@ -22,7 +22,7 @@ HttpServer::HttpServer(const std::string& ip, int port)
 
 HttpServer::HttpServer(const ServerConfig& config)
     : net_server_(config.bind_host, static_cast<size_t>(config.bind_port),
-                  std::max(config.idle_timeout_sec / 6, 10),  // scan interval: fraction of timeout
+                  std::max(config.idle_timeout_sec / 6, 1),  // scan interval: 1/6 of timeout, min 1s
                   std::chrono::seconds(config.idle_timeout_sec),
                   config.worker_threads)
 {
@@ -31,6 +31,7 @@ HttpServer::HttpServer(const ServerConfig& config)
     max_body_size_ = config.max_body_size;
     max_header_size_ = config.max_header_size;
     max_ws_message_size_ = config.max_ws_message_size;
+    request_timeout_sec_ = config.request_timeout_sec;
     net_server_.SetMaxConnections(config.max_connections);
 
     if (config.tls.enabled) {
@@ -79,6 +80,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetMaxBodySize(max_body_size_);
     http_conn->SetMaxHeaderSize(max_header_size_);
     http_conn->SetMaxWsMessageSize(max_ws_message_size_);
+    http_conn->SetRequestTimeout(request_timeout_sec_);
 
     // Set request handler: dispatch through router
     http_conn->SetRequestHandler(

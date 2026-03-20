@@ -33,6 +33,7 @@ public:
     static HttpResponse ServiceUnavailable();
     static HttpResponse PayloadTooLarge();
     static HttpResponse HeaderTooLarge();
+    static HttpResponse RequestTimeout();
 
     // Accessors
     int GetStatusCode() const { return status_code_; }
