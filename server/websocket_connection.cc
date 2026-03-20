@@ -19,6 +19,10 @@ void WebSocketConnection::SendBinary(const std::string& data) {
 void WebSocketConnection::SendClose(uint16_t code, const std::string& reason) {
     SendFrame(WebSocketFrame::CloseFrame(code, reason));
     is_open_ = false;
+    // Close the transport after the close frame is flushed
+    if (conn_) {
+        conn_->CloseAfterWrite();
+    }
 }
 
 void WebSocketConnection::SendPing(const std::string& payload) {
@@ -94,7 +98,8 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 return;
             }
             if (max_message_size_ > 0 &&
-                (fragment_buffer_.size() + frame.payload.size()) > max_message_size_) {
+                (fragment_buffer_.size() >= max_message_size_ ||
+                 frame.payload.size() > max_message_size_ - fragment_buffer_.size())) {
                 if (error_handler_) error_handler_(*this, "Message exceeds maximum size");
                 SendClose(1009, "Message too big");
                 in_fragment_ = false;
@@ -123,12 +128,16 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                     reason = frame.payload.substr(2);
                 }
             }
-            // Validate close code per RFC 6455 Section 7.4
+            // Validate close code per RFC 6455 Section 7.4 + IANA registry.
+            // Valid ranges: 1000-1003, 1007-1014 (IANA registered), 3000-4999 (private use).
+            // Codes 1004-1006, 1015 are reserved and must not appear on the wire.
+            // Unknown codes in valid ranges are echoed as-is per RFC 6455 §7.4.
             bool valid_code = (code >= 1000 && code <= 1003) ||
-                              (code >= 1007 && code <= 1011) ||
+                              (code >= 1007 && code <= 1014) ||
                               (code >= 3000 && code <= 4999);
-            if (!valid_code && code != 0) {
-                code = 1002;  // Protocol error -- replace invalid code
+            if (!valid_code && frame.payload.size() >= 2) {
+                // Invalid code on wire — protocol error, close with 1002
+                code = 1002;
             }
             // Echo close frame back (close handshake)
             if (is_open_) {

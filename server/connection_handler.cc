@@ -217,8 +217,14 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
 }
 
 void ConnectionHandler::CloseAfterWrite(){
-    close_after_write_ = true;
-    client_channel_ -> EnableWriteMode();
+    close_after_write_.store(true, std::memory_order_release);
+    // If buffer is already empty (SendRaw fast path flushed everything),
+    // close immediately — in ET mode, EPOLLOUT won't fire on an already-writable socket.
+    if (output_bf_.Size() == 0) {
+        CallCloseCb();
+    } else {
+        client_channel_ -> EnableWriteMode();
+    }
 }
 
 void ConnectionHandler::CallCloseCb(){
@@ -244,6 +250,10 @@ void ConnectionHandler::CallCloseCb(){
 }
 
 void ConnectionHandler::CallErroCb(){
+    // Guard against double-close: if already closing, error callback could trigger
+    // another close attempt causing undefined behavior
+    if (is_closing_) return;
+
     if (callbacks_.error_callback)
         callbacks_.error_callback(shared_from_this());
 }
@@ -298,7 +308,7 @@ void ConnectionHandler::CallWriteCb(){
     // If there's no data waiting to write, then unregister writing event
     if(output_bf_.Size() == 0){
         client_channel_->DisableWriteMode();
-        if (close_after_write_) {
+        if (close_after_write_.load(std::memory_order_acquire)) {
             CallCloseCb();
             return;
         }

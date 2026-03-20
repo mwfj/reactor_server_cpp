@@ -14,6 +14,7 @@ static int on_message_begin(llhttp_t* parser) {
     self->current_header_value_.clear();
     self->parsing_header_value_ = false;
     self->header_bytes_ = 0;
+    self->error_type_ = HttpParser::ParseError::NONE;
     return 0;
 }
 
@@ -110,9 +111,11 @@ static int on_headers_complete(llhttp_t* parser) {
 static int on_body(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<HttpParser*>(parser->data);
 
-    // Enforce body size limit DURING parsing, not after
+    // Enforce body size limit DURING parsing, not after.
+    // Guard against unsigned underflow: check body.size() >= max first.
     if (self->max_body_size_ > 0 &&
-        length > self->max_body_size_ - self->request_.body.size()) {
+        (self->request_.body.size() >= self->max_body_size_ ||
+         length > self->max_body_size_ - self->request_.body.size())) {
         self->has_error_ = true;
         self->error_message_ = "Body size exceeds maximum";
         self->error_type_ = HttpParser::ParseError::BODY_TOO_LARGE;

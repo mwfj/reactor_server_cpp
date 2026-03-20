@@ -2,9 +2,7 @@
 #include "ws/websocket_frame.h"
 #include "log/logger.h"
 
-HttpServer::HttpServer(const std::string& ip, int port)
-    : net_server_(ip, static_cast<size_t>(port))
-{
+void HttpServer::WireNetServerCallbacks() {
     net_server_.SetNewConnectionCb(
         [this](std::shared_ptr<ConnectionHandler> conn) { HandleNewConnection(conn); });
     net_server_.SetCloseConnectionCb(
@@ -15,19 +13,18 @@ HttpServer::HttpServer(const std::string& ip, int port)
         [this](std::shared_ptr<ConnectionHandler> conn, std::string& msg) { HandleMessage(conn, msg); });
 }
 
+HttpServer::HttpServer(const std::string& ip, int port)
+    : net_server_(ip, static_cast<size_t>(port))
+{
+    WireNetServerCallbacks();
+}
+
 HttpServer::HttpServer(const ServerConfig& config)
     : net_server_(config.bind_host, static_cast<size_t>(config.bind_port),
                   config.idle_timeout_sec,
                   std::chrono::seconds(config.idle_timeout_sec))
 {
-    net_server_.SetNewConnectionCb(
-        [this](std::shared_ptr<ConnectionHandler> conn) { HandleNewConnection(conn); });
-    net_server_.SetCloseConnectionCb(
-        [this](std::shared_ptr<ConnectionHandler> conn) { HandleCloseConnection(conn); });
-    net_server_.SetErrorCb(
-        [this](std::shared_ptr<ConnectionHandler> conn) { HandleErrorConnection(conn); });
-    net_server_.SetOnMessageCb(
-        [this](std::shared_ptr<ConnectionHandler> conn, std::string& msg) { HandleMessage(conn, msg); });
+    WireNetServerCallbacks();
 
     max_body_size_ = config.max_body_size;
     max_header_size_ = config.max_header_size;
@@ -165,6 +162,9 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             http_conn = it->second;
         }
     }
+
+    // Guard against fd-reuse: verify the handler still wraps the same connection
+    if (http_conn->GetConnection() != conn) return;
 
     http_conn->OnRawData(conn, message);
 }

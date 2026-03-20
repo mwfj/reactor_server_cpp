@@ -47,11 +47,14 @@ private:
 
     // Helper: set up request + upgrade handlers on an HttpConnectionHandler
     void SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn);
+    // Helper: wire NetServer callbacks to this HttpServer
+    void WireNetServerCallbacks();
 
     std::unique_ptr<TlsContext> tls_ctx_;
 
-    // Request limits (from ServerConfig, or defaults)
-    size_t max_body_size_ = 0;
-    size_t max_header_size_ = 0;
-    size_t max_ws_message_size_ = 0;
+    // Request limits — defaults match ServerConfig defaults.
+    // The ip/port constructor uses these; the config constructor overwrites them.
+    size_t max_body_size_ = 1048576;       // 1 MB
+    size_t max_header_size_ = 8192;        // 8 KB
+    size_t max_ws_message_size_ = 16777216; // 16 MB
 };
