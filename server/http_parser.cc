@@ -43,8 +43,11 @@ static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<HttpParser*>(parser->data);
 
     // Enforce header size limit (guard against unsigned overflow before adding).
-    // Add 4 bytes per header for delimiters (": " + "\r\n") not exposed by llhttp callbacks.
-    size_t charge = length + 4;
+    // Charge +4 for delimiters (": " + "\r\n") only when starting a NEW header
+    // (transition from value→field). llhttp may call on_header_field multiple times
+    // for the same header when fragmented across TCP segments.
+    size_t overhead = self->parsing_header_value_ ? 4 : 0;
+    size_t charge = length + overhead;
     if (self->max_header_size_ > 0 &&
         (self->header_bytes_ >= self->max_header_size_ ||
          charge > self->max_header_size_ - self->header_bytes_)) {

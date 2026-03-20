@@ -14,6 +14,7 @@ private:
     // When Stop() sets is_running_ = false from one thread, the event loop thread MUST see
     // this change immediately. Without atomic, CPU caching can cause the loop to never exit.
     std::atomic<bool> is_running_{false};
+    std::atomic<bool> was_stopped_{false};  // Set on StopEventLoop, never cleared
     std::unique_ptr<EventHandler> ep_;  // Sole owner of EventHandler
     void set_running_state(bool);
 

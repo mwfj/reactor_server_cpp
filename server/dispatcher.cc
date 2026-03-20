@@ -119,6 +119,7 @@ void Dispatcher::RunEventLoop(){
 }
 
 void Dispatcher::StopEventLoop(){
+    was_stopped_.store(true, std::memory_order_release);
     set_running_state(false);
     WakeUp();  // Wake up epoll_wait() immediately for fast shutdown
 }
@@ -232,7 +233,8 @@ void Dispatcher::HandleEventId(){
 }
 
 void Dispatcher::EnQueue(std::function<void()> fn){
-    if (!is_running()) return;  // Dispatcher stopped, discard
+    // Only discard tasks after explicit stop — allow during startup (before RunEventLoop)
+    if (was_stopped_.load(std::memory_order_acquire)) return;
     {
         std::lock_guard<std::mutex> lck(mtx_);
         task_que_.push_back(fn);

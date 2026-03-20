@@ -280,10 +280,8 @@ void ConnectionHandler::CallWriteCb(){
             // Want write again, will get another EPOLLOUT
             return;
         } else {
-            // Handshake error — close the channel (same as read-path error handling)
-            if(client_channel_ && !client_channel_->is_channel_closed()){
-                client_channel_->CloseChannel();
-            }
+            // Handshake error — use CallCloseCb for proper cleanup
+            CallCloseCb();
             return;
         }
     }
