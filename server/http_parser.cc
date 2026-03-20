@@ -110,7 +110,7 @@ struct HttpParser::Impl {
     llhttp_settings_t settings;
 };
 
-HttpParser::HttpParser() : impl_(new Impl) {
+HttpParser::HttpParser() : impl_(std::make_unique<Impl>()) {
     std::memset(&impl_->settings, 0, sizeof(impl_->settings));
 
     impl_->settings.on_message_begin    = on_message_begin;
@@ -125,9 +125,7 @@ HttpParser::HttpParser() : impl_(new Impl) {
     impl_->parser.data = this;  // Store pointer to HttpParser for callbacks
 }
 
-HttpParser::~HttpParser() {
-    delete impl_;
-}
+HttpParser::~HttpParser() = default;
 
 size_t HttpParser::Parse(const char* data, size_t len) {
     llhttp_errno_t err = llhttp_execute(&impl_->parser, data, len);

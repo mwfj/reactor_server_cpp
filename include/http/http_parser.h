@@ -3,6 +3,7 @@
 #include "http/http_request.h"
 #include <string>
 #include <cstddef>
+#include <memory>
 
 class HttpParser {
 public:
@@ -39,5 +40,5 @@ public:
 private:
     // llhttp internals (pimpl -- llhttp.h only included in .cc)
     struct Impl;
-    Impl* impl_;
+    std::unique_ptr<Impl> impl_;
 };

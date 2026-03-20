@@ -38,8 +38,17 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                     return total_consumed;
                 }
 
+                // RFC 6455 §5.2: reject reserved opcodes (0x3-0x7 data, 0xB-0xF control)
+                uint8_t op = static_cast<uint8_t>(current_.opcode);
+                bool is_valid_opcode = (op <= 0x2) || (op >= 0x8 && op <= 0xA);
+                if (!is_valid_opcode) {
+                    has_error_ = true;
+                    error_message_ = "Reserved opcode";
+                    return total_consumed;
+                }
+
                 // Validate: control frames must not be fragmented and <= 125 bytes
-                if (static_cast<uint8_t>(current_.opcode) >= 0x8) {
+                if (op >= 0x8) {
                     if (!current_.fin) {
                         has_error_ = true;
                         error_message_ = "Fragmented control frame";
@@ -54,6 +63,11 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
 
                 if (len7 <= 125) {
                     current_.payload_length = len7;
+                    if (max_payload_size_ > 0 && current_.payload_length > max_payload_size_) {
+                        has_error_ = true;
+                        error_message_ = "Frame payload exceeds maximum size";
+                        return total_consumed;
+                    }
                     state_ = current_.masked ? State::ReadMaskingKey : State::ReadPayload;
                 } else if (len7 == 126) {
                     state_ = State::ReadExtendedLen16;
@@ -70,6 +84,11 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                 current_.payload_length = len16;
                 buffer_.erase(0, 2);
                 total_consumed += 2;
+                if (max_payload_size_ > 0 && current_.payload_length > max_payload_size_) {
+                    has_error_ = true;
+                    error_message_ = "Frame payload exceeds maximum size";
+                    return total_consumed;
+                }
                 state_ = current_.masked ? State::ReadMaskingKey : State::ReadPayload;
                 break;
             }
@@ -83,6 +102,11 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                 current_.payload_length = len64;
                 buffer_.erase(0, 8);
                 total_consumed += 8;
+                if (max_payload_size_ > 0 && current_.payload_length > max_payload_size_) {
+                    has_error_ = true;
+                    error_message_ = "Frame payload exceeds maximum size";
+                    return total_consumed;
+                }
                 state_ = current_.masked ? State::ReadMaskingKey : State::ReadPayload;
                 break;
             }
@@ -100,10 +124,7 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
             case State::ReadPayload: {
                 size_t remaining = current_.payload_length - payload_read_;
                 if (remaining == 0) {
-                    // Unmask if needed
-                    if (current_.masked) {
-                        Unmask(current_.payload, current_.masking_key);
-                    }
+                    // Zero-length payload (e.g., empty ping/pong) — no unmasking needed
                     completed_.push_back(std::move(current_));
                     state_ = State::ReadHeader;
                     payload_read_ = 0;
@@ -119,6 +140,7 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                 payload_read_ += available;
 
                 if (payload_read_ == current_.payload_length) {
+                    // Unmask once, only at completion
                     if (current_.masked) {
                         Unmask(current_.payload, current_.masking_key);
                     }

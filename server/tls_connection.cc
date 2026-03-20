@@ -6,12 +6,18 @@ TlsConnection::TlsConnection(TlsContext& ctx, int fd) {
     if (!ssl_) {
         throw std::runtime_error("Failed to create SSL object");
     }
-    SSL_set_fd(ssl_, fd);
+    if (SSL_set_fd(ssl_, fd) != 1) {
+        SSL_free(ssl_);
+        ssl_ = nullptr;
+        throw std::runtime_error("Failed to set SSL file descriptor");
+    }
     SSL_set_accept_state(ssl_);  // Server-side
 }
 
 TlsConnection::~TlsConnection() {
     if (ssl_) {
+        // Send close_notify to peer before freeing
+        SSL_shutdown(ssl_);
         SSL_free(ssl_);
     }
 }
@@ -39,7 +45,10 @@ int TlsConnection::Read(char* buf, size_t len) {
     if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
         return 0;  // Would block
     }
-    return -1;  // Error or closed
+    if (err == SSL_ERROR_ZERO_RETURN) {
+        return -2;  // Peer closed TLS connection cleanly (close_notify received)
+    }
+    return -1;  // Error
 }
 
 int TlsConnection::Write(const char* buf, size_t len) {

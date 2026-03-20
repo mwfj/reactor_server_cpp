@@ -18,6 +18,10 @@ HttpServer::HttpServer(const std::string& ip, int port)
 HttpServer::HttpServer(const ServerConfig& config)
     : HttpServer(config.bind_host, config.bind_port)
 {
+    max_body_size_ = config.max_body_size;
+    max_header_size_ = config.max_header_size;
+    max_ws_message_size_ = config.max_ws_message_size;
+
     if (config.tls.enabled) {
         tls_ctx_ = std::make_unique<TlsContext>(config.tls.cert_file, config.tls.key_file);
         net_server_.SetTlsContext(tls_ctx_.get());
@@ -62,6 +66,10 @@ void HttpServer::Stop() {
 }
 
 void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn) {
+    // Apply request size limits
+    http_conn->SetMaxBodySize(max_body_size_);
+    http_conn->SetMaxHeaderSize(max_header_size_);
+
     // Set request handler: dispatch through router
     http_conn->SetRequestHandler(
         [this](std::shared_ptr<HttpConnectionHandler> self,

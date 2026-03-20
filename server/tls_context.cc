@@ -42,5 +42,7 @@ void TlsContext::SetMinProtocolVersion(int version) {
 }
 
 void TlsContext::SetCipherList(const std::string& ciphers) {
-    SSL_CTX_set_cipher_list(ctx_, ciphers.c_str());
+    if (SSL_CTX_set_cipher_list(ctx_, ciphers.c_str()) != 1) {
+        throw std::runtime_error("Failed to set cipher list: " + ciphers);
+    }
 }

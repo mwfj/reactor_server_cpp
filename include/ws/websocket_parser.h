@@ -9,6 +9,9 @@ class WebSocketParser {
 public:
     WebSocketParser();
 
+    // Set maximum allowed payload size (0 = unlimited)
+    void SetMaxPayloadSize(size_t max_size) { max_payload_size_ = max_size; }
+
     // Feed raw bytes. Returns number of bytes consumed.
     size_t Parse(const char* data, size_t len);
 
@@ -36,6 +39,7 @@ private:
     std::deque<WebSocketFrame> completed_;
     std::string buffer_;
     size_t payload_read_ = 0;
+    size_t max_payload_size_ = 0;  // 0 = unlimited
     bool has_error_ = false;
     std::string error_message_;
 

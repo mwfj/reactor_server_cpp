@@ -43,10 +43,16 @@ public:
     // Access underlying connection
     std::shared_ptr<ConnectionHandler> GetConnection() const { return conn_; }
 
+    // Set request size limits (from ServerConfig)
+    void SetMaxBodySize(size_t max) { max_body_size_ = max; }
+    void SetMaxHeaderSize(size_t max) { max_header_size_ = max; }
+
     // Called when raw data arrives (set as NetServer's on_message callback)
     void OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data);
 
 private:
+    size_t max_body_size_ = 0;    // 0 = unlimited
+    size_t max_header_size_ = 0;  // 0 = unlimited
     std::shared_ptr<ConnectionHandler> conn_;
     HttpParser parser_;
     RequestHandler request_handler_;

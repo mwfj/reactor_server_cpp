@@ -5,6 +5,7 @@
 #include <sstream>
 #include <cstdlib>
 #include <stdexcept>
+#include <algorithm>
 
 using json = nlohmann::json;
 
@@ -95,6 +96,16 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
     return config;
 }
 
+// Helper: parse env var as int, throw descriptive error on invalid input
+static int EnvToInt(const char* val, const char* env_name) {
+    try {
+        return std::stoi(val);
+    } catch (const std::exception&) {
+        throw std::runtime_error(
+            std::string("Invalid integer for ") + env_name + ": " + val);
+    }
+}
+
 void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     const char* val = nullptr;
 
@@ -102,11 +113,12 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     if (val) config.bind_host = val;
 
     val = std::getenv("REACTOR_BIND_PORT");
-    if (val) config.bind_port = std::stoi(val);
+    if (val) config.bind_port = EnvToInt(val, "REACTOR_BIND_PORT");
 
     val = std::getenv("REACTOR_TLS_ENABLED");
     if (val) {
         std::string s(val);
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
         config.tls.enabled = (s == "1" || s == "true" || s == "yes");
     }
 
@@ -123,16 +135,16 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     if (val) config.log.file = val;
 
     val = std::getenv("REACTOR_MAX_CONNECTIONS");
-    if (val) config.max_connections = std::stoi(val);
+    if (val) config.max_connections = EnvToInt(val, "REACTOR_MAX_CONNECTIONS");
 
     val = std::getenv("REACTOR_IDLE_TIMEOUT");
-    if (val) config.idle_timeout_sec = std::stoi(val);
+    if (val) config.idle_timeout_sec = EnvToInt(val, "REACTOR_IDLE_TIMEOUT");
 
     val = std::getenv("REACTOR_WORKER_THREADS");
-    if (val) config.worker_threads = std::stoi(val);
+    if (val) config.worker_threads = EnvToInt(val, "REACTOR_WORKER_THREADS");
 
     val = std::getenv("REACTOR_REQUEST_TIMEOUT");
-    if (val) config.request_timeout_sec = std::stoi(val);
+    if (val) config.request_timeout_sec = EnvToInt(val, "REACTOR_REQUEST_TIMEOUT");
 }
 
 void ConfigLoader::Validate(const ServerConfig& config) {

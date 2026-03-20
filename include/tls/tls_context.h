@@ -9,9 +9,11 @@ public:
     TlsContext(const std::string& cert_file, const std::string& key_file);
     ~TlsContext();
 
-    // Non-copyable
+    // Non-copyable and non-movable (SSL_CTX* ownership must not be transferred)
     TlsContext(const TlsContext&) = delete;
     TlsContext& operator=(const TlsContext&) = delete;
+    TlsContext(TlsContext&&) = delete;
+    TlsContext& operator=(TlsContext&&) = delete;
 
     SSL_CTX* GetCtx() const { return ctx_; }
 

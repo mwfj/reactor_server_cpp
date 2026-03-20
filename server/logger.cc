@@ -1,16 +1,20 @@
 #include "log/logger.h"
 
 #include <vector>
+#include <mutex>
 
 namespace logging {
 
 static std::shared_ptr<spdlog::logger> g_logger;
+static std::mutex g_logger_mtx;
 
 void Init(const std::string& name,
           spdlog::level::level_enum level,
           const std::string& log_file,
           size_t max_size,
           int max_files) {
+    std::lock_guard<std::mutex> lock(g_logger_mtx);
+
     std::vector<spdlog::sink_ptr> sinks;
 
     // Console sink with color support
@@ -36,6 +40,7 @@ void Init(const std::string& name,
 }
 
 std::shared_ptr<spdlog::logger> Get() {
+    std::lock_guard<std::mutex> lock(g_logger_mtx);
     if (g_logger) {
         return g_logger;
     }
@@ -43,6 +48,7 @@ std::shared_ptr<spdlog::logger> Get() {
 }
 
 void Shutdown() {
+    std::lock_guard<std::mutex> lock(g_logger_mtx);
     if (g_logger) {
         g_logger->flush();
     }

@@ -82,15 +82,22 @@ void ConnectionHandler::OnMessage(){
                 // Would block (WANT_READ/WANT_WRITE)
                 break;
             }
+            if (nread == -2) {
+                // Peer closed TLS connection cleanly (close_notify)
+                if(client_channel_ && !client_channel_->is_channel_closed()){
+                    client_channel_->CloseChannel();
+                }
+                break;
+            }
         } else {
             nread = ::read(fd(), buffer, sizeof buffer);
         }
 
         if(nread > 0){
             input_bf_.Append(buffer, nread);
-            if(errno == EINTR){ // Interruptted by signal
-                continue;
-            }
+        } else if(nread < 0 && errno == EINTR){
+            // Interrupted by signal — retry
+            continue;
         } else if(nread == 0 && tls_state_ != TlsState::READY){
             // Client close (raw TCP only; TLS nread==0 means would_block above)
            if(client_channel_ && !client_channel_->is_channel_closed()){
@@ -250,7 +257,10 @@ void ConnectionHandler::CallWriteCb(){
             // Want write again, will get another EPOLLOUT
             return;
         } else {
-            // Handshake error
+            // Handshake error — close the channel (same as read-path error handling)
+            if(client_channel_ && !client_channel_->is_channel_closed()){
+                client_channel_->CloseChannel();
+            }
             return;
         }
     }

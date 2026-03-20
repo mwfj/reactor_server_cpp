@@ -9,9 +9,11 @@ public:
     TlsConnection(TlsContext& ctx, int fd);
     ~TlsConnection();
 
-    // Non-copyable
+    // Non-copyable and non-movable (SSL* ownership must not be transferred)
     TlsConnection(const TlsConnection&) = delete;
     TlsConnection& operator=(const TlsConnection&) = delete;
+    TlsConnection(TlsConnection&&) = delete;
+    TlsConnection& operator=(TlsConnection&&) = delete;
 
     // Returns: 0=complete, 1=want_read, 2=want_write, -1=error
     int DoHandshake();

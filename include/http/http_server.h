@@ -49,4 +49,9 @@ private:
     void SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn);
 
     std::unique_ptr<TlsContext> tls_ctx_;
+
+    // Request limits (from ServerConfig, or defaults)
+    size_t max_body_size_ = 0;
+    size_t max_header_size_ = 0;
+    size_t max_ws_message_size_ = 0;
 };
