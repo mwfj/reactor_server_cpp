@@ -47,6 +47,7 @@ public:
     std::string current_header_field_;
     std::string current_header_value_;
     bool parsing_header_value_ = false;
+    bool in_header_field_ = false;  // true while accumulating same header field across fragments
 
 private:
     // llhttp internals (pimpl -- llhttp.h only included in .cc)

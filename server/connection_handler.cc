@@ -97,11 +97,10 @@ void ConnectionHandler::OnMessage(){
             // Interrupted by signal — retry
             continue;
         } else if(nread == 0 && tls_state_ != TlsState::READY){
-            // Client close (raw TCP only; TLS nread==0 means would_block above)
-           if(client_channel_ && !client_channel_->is_channel_closed()){
-               client_channel_->CloseChannel();
-           }
-           break;
+            // Client close (raw TCP only; TLS nread==0 means would_block above).
+            // Use CallCloseCb for proper server map cleanup.
+            CallCloseCb();
+            return;
         } else if (nread < 0) {
             if (tls_state_ == TlsState::READY) {
                 // TLS read error — use CallCloseCb for proper cleanup
@@ -111,11 +110,9 @@ void ConnectionHandler::OnMessage(){
             if((errno == EAGAIN) || (errno == EWOULDBLOCK)){
                 break;
             }
-            // Read error - close the channel, which will trigger the close callback
-            if(client_channel_ && !client_channel_->is_channel_closed()){
-                client_channel_->CloseChannel();
-            }
-            break;
+            // Read error — use CallCloseCb for proper server map cleanup
+            CallCloseCb();
+            return;
         } else {
             break;  // nread == 0 for TLS means would_block, already handled
         }
@@ -291,10 +288,8 @@ void ConnectionHandler::CallWriteCb(){
         write_sz = tls_->Write(output_bf_.Data(), output_bf_.Size());
         if (write_sz == 0) return;  // Would block, try again later
         if (write_sz < 0) {
-            // TLS write error
-            if(client_channel_ && !client_channel_->is_channel_closed()){
-                client_channel_->CloseChannel();
-            }
+            // TLS write error — use CallCloseCb for proper cleanup
+            CallCloseCb();
             return;
         }
     } else {

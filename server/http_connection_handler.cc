@@ -174,7 +174,11 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 request_handler_(shared_from_this(), req, response);
                 SendResponse(response);
 
-                if (!req.keep_alive) {
+                // Close if request is non-keep-alive OR response sets Connection: close
+                const auto& resp_headers = response.GetHeaders();
+                auto conn_hdr = resp_headers.find("Connection");
+                bool resp_close = (conn_hdr != resp_headers.end() && conn_hdr->second == "close");
+                if (!req.keep_alive || resp_close) {
                     CloseConnection();
                     return;
                 }

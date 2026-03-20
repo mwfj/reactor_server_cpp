@@ -270,10 +270,12 @@ void Dispatcher::TimerHandler(){
         std::vector<int> timeout_fds;
 
         // Check every connection to find whether it has timeout
+        // Collect shared_ptrs so we can close them after map cleanup
+        std::vector<std::shared_ptr<ConnectionHandler>> timed_out_conns;
         for(auto& conn : connections_){
-            // fd -> connection handler shared_ptr
             if(conn.second && conn.second->IsTimeOut(timeout_)){
                 timeout_fds.push_back(conn.first);
+                timed_out_conns.push_back(conn.second);
             }
         }
 
@@ -282,7 +284,12 @@ void Dispatcher::TimerHandler(){
             connections_.erase(fd);
         }
 
-        // Call callback for each timed-out connection to remove from NetServer
+        // Close timed-out connections via CallCloseCb (closes fd + cleans up server maps)
+        for(auto& conn : timed_out_conns){
+            conn->CallCloseCb();
+        }
+
+        // Also notify NetServer's timer callback for any additional cleanup
         if(callbacks_.timer_callback){
             for(int fd : timeout_fds){
                 callbacks_.timer_callback(fd);

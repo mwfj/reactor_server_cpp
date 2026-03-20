@@ -13,6 +13,7 @@ static int on_message_begin(llhttp_t* parser) {
     self->current_header_field_.clear();
     self->current_header_value_.clear();
     self->parsing_header_value_ = false;
+    self->in_header_field_ = false;
     self->header_bytes_ = 0;
     // Reset all error state defensively (for pipelining without external Reset())
     self->has_error_ = false;
@@ -43,10 +44,12 @@ static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<HttpParser*>(parser->data);
 
     // Enforce header size limit (guard against unsigned overflow before adding).
-    // Charge +4 for delimiters (": " + "\r\n") only when starting a NEW header
-    // (transition from value→field). llhttp may call on_header_field multiple times
-    // for the same header when fragmented across TCP segments.
-    size_t overhead = self->parsing_header_value_ ? 4 : 0;
+    // Charge +4 for delimiters (": " + "\r\n") when starting a NEW header.
+    // A new header starts when we're NOT already in a header field (in_header_field_ is false).
+    // llhttp may call on_header_field multiple times for the same header when fragmented
+    // across TCP segments — don't charge overhead for continuations.
+    size_t overhead = self->in_header_field_ ? 0 : 4;
+    self->in_header_field_ = true;  // Mark that we're accumulating this header field
     size_t charge = length + overhead;
     if (self->max_header_size_ > 0 &&
         (self->header_bytes_ >= self->max_header_size_ ||
@@ -88,6 +91,7 @@ static int on_header_value(llhttp_t* parser, const char* at, size_t length) {
 
     self->current_header_value_.append(at, length);
     self->parsing_header_value_ = true;
+    self->in_header_field_ = false;  // No longer in field — next on_header_field is a new header
     return 0;
 }
 
@@ -216,6 +220,7 @@ void HttpParser::Reset() {
     current_header_field_.clear();
     current_header_value_.clear();
     parsing_header_value_ = false;
+    in_header_field_ = false;
     header_bytes_ = 0;
     llhttp_init(&impl_->parser, HTTP_REQUEST, &impl_->settings);
     impl_->parser.data = this;
