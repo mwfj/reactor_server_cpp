@@ -63,7 +63,7 @@
 #if defined(__linux__)
     #define SEND_FLAGS MSG_NOSIGNAL
 #else
-    // macOS uses SO_NOSIGPIPE per-socket (set in SocketHandler)
+    // macOS: SO_NOSIGPIPE is set per-socket in SocketHandler::SetNonBlocking()
     #define SEND_FLAGS 0
 #endif
 

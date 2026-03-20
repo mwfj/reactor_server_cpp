@@ -23,7 +23,8 @@ HttpServer::HttpServer(const std::string& ip, int port)
 HttpServer::HttpServer(const ServerConfig& config)
     : net_server_(config.bind_host, static_cast<size_t>(config.bind_port),
                   std::max(config.idle_timeout_sec / 6, 10),  // scan interval: fraction of timeout
-                  std::chrono::seconds(config.idle_timeout_sec))
+                  std::chrono::seconds(config.idle_timeout_sec),
+                  config.worker_threads)
 {
     WireNetServerCallbacks();
 

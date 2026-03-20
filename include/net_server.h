@@ -59,7 +59,8 @@ public:
     NetServer() = delete;
     NetServer(const std::string& _ip, const size_t _port,
               int timer_interval = 60,
-              std::chrono::seconds connection_timeout = std::chrono::seconds(300));
+              std::chrono::seconds connection_timeout = std::chrono::seconds(300),
+              int worker_threads = 0);  // 0 = use hardware_concurrency default
     ~NetServer(); 
 
     void Start();

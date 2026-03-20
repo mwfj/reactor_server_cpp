@@ -5,7 +5,8 @@
 
 NetServer::NetServer(const std::string& _ip, const size_t _port,
                      int timer_interval,
-                     std::chrono::seconds connection_timeout)
+                     std::chrono::seconds connection_timeout,
+                     int worker_threads)
     : conn_dispatcher_(std::make_shared<Dispatcher>()),
       acceptor_(nullptr),
       timer_interval_(timer_interval),
@@ -17,9 +18,12 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
 
     // Now create acceptor with initialized dispatcher
     acceptor_ = std::unique_ptr<Acceptor>(new Acceptor(conn_dispatcher_, _ip, _port));
-    // Should we replace std::bind with lambda here?
     acceptor_->SetNewConnCb(std::bind(&NetServer::HandleNewConnection, this, std::placeholders::_1));
-    sock_workers_.Init();
+    if (worker_threads > 0) {
+        sock_workers_.Init(worker_threads);
+    } else {
+        sock_workers_.Init();
+    }
     sock_workers_.Start();
 }
 
@@ -88,15 +92,19 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
         }
     }
 
-    // Two-phase initialization: register callbacks after shared_ptr is created
-    // This allows callbacks to safely capture weak_ptr instead of raw 'this'
-    conn -> RegisterCallbacks();
-
+    // Set application callbacks BEFORE RegisterCallbacks().
+    // RegisterCallbacks() enables epoll read, so data/close events can arrive immediately.
+    // If callbacks are null when the first event fires, data is silently dropped or
+    // close events are not properly tracked.
     conn -> SetCloseCb(std::bind(&NetServer::HandleCloseConnection, this, std::placeholders::_1));
     conn -> SetErrorCb(std::bind(&NetServer::HandleErrorConnection, this, std::placeholders::_1));
     conn -> SetOnMessageCb(std::bind(&NetServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
     conn -> SetCompletionCb(std::bind(&NetServer::HandleSendComplete, this, std::placeholders::_1));
     AddConnection(conn);
+
+    // Two-phase initialization: register channel callbacks and enable epoll AFTER
+    // application callbacks are set and connection is tracked.
+    conn -> RegisterCallbacks();
 
     std::cout << "[Reactor Server] new connection(fd: "
         << conn -> fd() << ", ip: " << conn -> ip_addr() << ", port: " << conn -> port() << ").\n"

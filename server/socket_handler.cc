@@ -138,4 +138,10 @@ void SocketHandler::SetNonBlocking(int fd) {
                   << strerror(errno) << " (errno=" << errno << ")" << std::endl;
         throw std::runtime_error(std::string("Failed to set non-blocking mode: ") + strerror(errno));
     }
+
+    // macOS: suppress SIGPIPE per-socket since MSG_NOSIGNAL is not available
+#ifdef SO_NOSIGPIPE
+    int set = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set));
+#endif
 }
