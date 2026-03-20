@@ -82,7 +82,7 @@ void Dispatcher::set_running_state(bool status){
 void Dispatcher::RunEventLoop(){
     set_running_state(true);
 
-    thread_id_ = std::this_thread::get_id();
+    thread_id_.store(std::this_thread::get_id(), std::memory_order_release);
 
     while(is_running()){
         // Use 1000ms timeout instead of blocking indefinitely
@@ -232,6 +232,7 @@ void Dispatcher::HandleEventId(){
 }
 
 void Dispatcher::EnQueue(std::function<void()> fn){
+    if (!is_running()) return;  // Dispatcher stopped, discard
     {
         std::lock_guard<std::mutex> lck(mtx_);
         task_que_.push_back(fn);
@@ -240,8 +241,11 @@ void Dispatcher::EnQueue(std::function<void()> fn){
 }
 
 void Dispatcher::AddConnection(std::shared_ptr<ConnectionHandler> conn){
-    std::lock_guard<std::mutex> lck(timer_mtx_);
     connections_[conn -> fd()] = conn;
+}
+
+void Dispatcher::RemoveTimerConnection(int fd) {
+    connections_.erase(fd);
 }
 
 void Dispatcher::SetTimerCB(CALLBACKS_NAMESPACE::DispatcherTimerCallback fn){
@@ -259,24 +263,21 @@ void Dispatcher::TimerHandler(){
         std::cout << "[Dispatcher - " << std::this_thread::get_id() << "]: reset timer" << std::endl;
 
         // Collect all timed-out connection fds first to avoid iterator invalidation
+        // No mutex needed: AddConnection/RemoveTimerConnection/TimerHandler all run
+        // on this dispatcher's event-loop thread via EnQueue.
         std::vector<int> timeout_fds;
 
-        {
-            // Lock before iterating to prevent data races
-            std::lock_guard<std::mutex> lck(timer_mtx_);
-
-            // Check every connection to find whether it has timeout
-            for(auto& conn : connections_){
-                // fd -> connection handler shared_ptr
-                if(conn.second && conn.second->IsTimeOut(timeout_)){
-                    timeout_fds.push_back(conn.first);
-                }
+        // Check every connection to find whether it has timeout
+        for(auto& conn : connections_){
+            // fd -> connection handler shared_ptr
+            if(conn.second && conn.second->IsTimeOut(timeout_)){
+                timeout_fds.push_back(conn.first);
             }
+        }
 
-            // Remove timed-out connections from our map
-            for(int fd : timeout_fds){
-                connections_.erase(fd);
-            }
+        // Remove timed-out connections from our map
+        for(int fd : timeout_fds){
+            connections_.erase(fd);
         }
 
         // Call callback for each timed-out connection to remove from NetServer

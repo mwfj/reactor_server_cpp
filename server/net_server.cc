@@ -92,15 +92,32 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
         }
     }
 
-    // Two-phase initialization: register callbacks after shared_ptr is created
-    // This allows callbacks to safely capture weak_ptr instead of raw 'this'
-    conn -> RegisterCallbacks();
-
+    // Set application callbacks BEFORE RegisterCallbacks().
+    // RegisterCallbacks() queues epoll registration via EnQueue, so in practice
+    // the socket dispatcher processes it after these are set. But ordering them
+    // first eliminates any theoretical race window.
     conn -> SetCloseCb(std::bind(&NetServer::HandleCloseConnection, this, std::placeholders::_1));
     conn -> SetErrorCb(std::bind(&NetServer::HandleErrorConnection, this, std::placeholders::_1));
     conn -> SetOnMessageCb(std::bind(&NetServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
     conn -> SetCompletionCb(std::bind(&NetServer::HandleSendComplete, this, std::placeholders::_1));
     AddConnection(conn);
+
+    // Two-phase initialization: register channel callbacks and enable epoll.
+    // Uses weak_ptr captures so callbacks are safe if ConnectionHandler is destroyed.
+    conn -> RegisterCallbacks();
+
+    // Register with socket dispatcher's timer for idle timeout scanning.
+    // Must go through EnQueue so AddConnection runs on the dispatcher thread,
+    // avoiding lock inversion between timer_mtx_ and conn_mtx_.
+    {
+        std::weak_ptr<ConnectionHandler> weak_conn = conn;
+        auto dispatcher = socket_dispatchers_[idx];
+        dispatcher->EnQueue([weak_conn, dispatcher]() {
+            if (auto c = weak_conn.lock()) {
+                dispatcher->AddConnection(c);
+            }
+        });
+    }
 
     std::cout << "[Reactor Server] new connection(fd: "
         << conn -> fd() << ", ip: " << conn -> ip_addr() << ", port: " << conn -> port() << ").\n"
@@ -115,6 +132,15 @@ void NetServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn){
         callbacks_.close_conn_callback(conn);
 
     std::cout << "[NetServer] client fd: " << conn -> fd() << " disconnected." << std::endl;
+
+    // Remove from dispatcher's timer map
+    int idx = conn->fd() % sock_workers_.GetThreadWorkerNum();
+    int close_fd = conn->fd();
+    auto dispatcher = socket_dispatchers_[idx];
+    dispatcher->EnQueue([close_fd, dispatcher]() {
+        dispatcher->RemoveTimerConnection(close_fd);
+    });
+
     RemoveConnection(conn -> fd());
     // close this connection
     conn.reset();
@@ -125,6 +151,15 @@ void NetServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn){
         callbacks_.error_callback(conn);
 
     std::cout << "[NetServer] client fd: " << conn -> fd() << "error occurred, disconnect." << std::endl;
+
+    // Remove from dispatcher's timer map
+    int idx = conn->fd() % sock_workers_.GetThreadWorkerNum();
+    int close_fd = conn->fd();
+    auto dispatcher = socket_dispatchers_[idx];
+    dispatcher->EnQueue([close_fd, dispatcher]() {
+        dispatcher->RemoveTimerConnection(close_fd);
+    });
+
     RemoveConnection(conn -> fd());
     conn.reset();
 }

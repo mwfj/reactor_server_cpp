@@ -33,7 +33,7 @@ private:
 #endif
     std::deque<std::function<void()>> task_que_;
 
-    std::thread::id thread_id_;
+    std::atomic<std::thread::id> thread_id_{};
 
     // Connection Timer
     int timer_fd_;
@@ -47,8 +47,6 @@ private:
 
     // Manage the connection in a dispatcher(Eventloop)
     std::map<int, std::shared_ptr<ConnectionHandler>> connections_;
- 
-    std::mutex timer_mtx_;
 public:
     Dispatcher();
     Dispatcher(bool, int = 60, std::chrono::seconds = std::chrono::seconds(30));
@@ -61,7 +59,12 @@ public:
     void RunEventLoop();
     void StopEventLoop();
     bool is_running() const {return is_running_.load(std::memory_order_acquire);}
-    bool is_dispatcher_thread() const { return std::this_thread::get_id() == thread_id_; }
+    bool is_on_loop_thread() const {
+        std::thread::id tid = thread_id_.load(std::memory_order_acquire);
+        if (tid == std::thread::id{}) return false;  // not yet running -> assume off-thread
+        return std::this_thread::get_id() == tid;
+    }
+    bool is_dispatcher_thread() const { return is_on_loop_thread(); }
     bool is_sock_dispatcher() const { return is_sock_dispatcher_.load(); }
 
     void UpdateChannel(std::shared_ptr<Channel>);
@@ -73,6 +76,7 @@ public:
     void HandleEventId();
     void EnQueue(std::function<void()>);
     void AddConnection(std::shared_ptr<ConnectionHandler>);
+    void RemoveTimerConnection(int fd);
 
     void SetTimerCB(CALLBACKS_NAMESPACE::DispatcherTimerCallback);
     void SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCallback);

@@ -68,6 +68,7 @@ void WebSocketConnection::OnRawData(const std::string& data) {
             error_handler_(*this, parser_.GetError());
         }
         SendClose(1002, "Protocol error");
+        if (conn_) conn_->CloseAfterWrite();
         return;
     }
 
@@ -87,6 +88,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                     error_handler_(*this, "New data frame received during fragmented message");
                 }
                 SendClose(1002, "Protocol error: interleaved data frames");
+                if (conn_) conn_->CloseAfterWrite();
                 return;
             }
 
@@ -101,6 +103,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 if (max_message_size_ > 0 && frame.payload.size() > max_message_size_) {
                     if (error_handler_) error_handler_(*this, "Message exceeds maximum size");
                     SendClose(1009, "Message too big");
+                    if (conn_) conn_->CloseAfterWrite();
                     in_fragment_ = false;
                     fragment_buffer_.clear();
                     return;
@@ -116,6 +119,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             if (!in_fragment_) {
                 if (error_handler_) error_handler_(*this, "Unexpected continuation frame");
                 SendClose(1002, "Protocol error: unexpected continuation");
+                if (conn_) conn_->CloseAfterWrite();
                 return;
             }
             if (max_message_size_ > 0 &&
@@ -123,6 +127,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                  frame.payload.size() > max_message_size_ - fragment_buffer_.size())) {
                 if (error_handler_) error_handler_(*this, "Message exceeds maximum size");
                 SendClose(1009, "Message too big");
+                if (conn_) conn_->CloseAfterWrite();
                 in_fragment_ = false;
                 fragment_buffer_.clear();
                 return;
@@ -144,6 +149,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             if (frame.payload.size() == 1) {
                 if (error_handler_) error_handler_(*this, "Invalid close frame: 1-byte payload");
                 SendClose(1002, "Protocol error");
+                if (conn_) conn_->CloseAfterWrite();
                 return;
             }
             uint16_t code = 1000;
@@ -159,6 +165,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             if (!reason.empty() && !IsValidUtf8(reason)) {
                 if (error_handler_) error_handler_(*this, "Close reason is not valid UTF-8");
                 SendClose(1007, "Invalid UTF-8 in close reason");
+                if (conn_) conn_->CloseAfterWrite();
                 return;
             }
             // Validate close code per RFC 6455 Section 7.4 + IANA registry.
@@ -176,6 +183,12 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             // Echo close frame back (close handshake)
             if (is_open_) {
                 SendClose(code, reason);
+            }
+            // Close the TCP transport after the close handshake completes.
+            // This runs on the reactor thread (via OnRawData callback chain),
+            // so CloseAfterWrite is safe to call inline.
+            if (conn_) {
+                conn_->CloseAfterWrite();
             }
             if (close_handler_) {
                 close_handler_(*this, code, reason);

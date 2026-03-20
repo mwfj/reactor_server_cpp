@@ -137,22 +137,19 @@ void ConnectionHandler::OnMessage(){
 }
 
 void ConnectionHandler::SendData(const char *data, size_t size){
-    // Thread-safe: All buffer operations must happen in socket dispatcher thread.
-    // Note: is_sock_dispatcher() checks dispatcher type, not calling thread identity.
-    // For cross-thread sends (e.g., HttpServer::Stop()), use CloseAfterWrite() which
-    // has proper is_dispatcher_thread() gating. Normal callback paths (OnMessage →
-    // handler → SendData) always run on the owning dispatcher thread.
-    std::string data_copy(data, size);
-
-    if(event_dispatcher_ && !event_dispatcher_ -> is_sock_dispatcher()) {
+    // Thread-safety: if we are already on the dispatcher's event-loop thread,
+    // we can call DoSend inline. Otherwise we must EnQueue so that buffer
+    // mutations happen on the correct thread (avoids racing with the reactor).
+    if(event_dispatcher_ && event_dispatcher_->is_on_loop_thread()) {
+        DoSend(data, size);
+    } else {
+        std::string data_copy(data, size);
         std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
         event_dispatcher_ -> EnQueue([weak_self, data_copy]() {
             if (auto self = weak_self.lock()) {
                 self->DoSend(data_copy.data(), data_copy.size());
             }
         });
-    } else {
-        DoSend(data, size);
     }
 }
 
@@ -163,18 +160,18 @@ void ConnectionHandler::DoSend(const char *data, size_t size){
 }
 
 void ConnectionHandler::SendRaw(const char *data, size_t size){
-    // Thread-safe: same pattern as SendData()
-    std::string data_copy(data, size);
-
-    if(event_dispatcher_ && !event_dispatcher_ -> is_sock_dispatcher()) {
+    // Thread-safety: same pattern as SendData() — inline on loop thread,
+    // EnQueue otherwise.
+    if(event_dispatcher_ && event_dispatcher_->is_on_loop_thread()) {
+        DoSendRaw(data, size);
+    } else {
+        std::string data_copy(data, size);
         std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
         event_dispatcher_ -> EnQueue([weak_self, data_copy]() {
             if (auto self = weak_self.lock()) {
                 self->DoSendRaw(data_copy.data(), data_copy.size());
             }
         });
-    } else {
-        DoSendRaw(data, size);
     }
 }
 
