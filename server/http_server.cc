@@ -61,26 +61,12 @@ void HttpServer::Start() {
 
 void HttpServer::Stop() {
     logging::Get()->info("HttpServer stopping");
-    {
-        std::lock_guard<std::mutex> lck(conn_mtx_);
-        // Send WebSocket Close frames (1001 Going Away) to all upgraded connections.
-        // These are queued via SendRaw → EnQueue and will be flushed by the reactor
-        // dispatchers before NetServer::Stop() joins the worker threads.
-        for (auto& pair : http_connections_) {
-            auto& http_conn = pair.second;
-            if (http_conn && http_conn->IsUpgraded() && http_conn->GetWebSocket()) {
-                auto* ws = http_conn->GetWebSocket();
-                if (ws->IsOpen()) {
-                    ws->SendClose(1001, "Going Away");
-                }
-            }
-        }
-        // Don't clear http_connections_ here — let NetServer::Stop() drain the
-        // event loops first so queued close frames are actually flushed.
-        // Connections will be destroyed when NetServer::Stop() clears its own map.
-    }
+    // Note: WebSocket graceful close (1001 Going Away) is not sent during Stop()
+    // because NetServer::Stop() clears connections before the reactor can flush
+    // queued close frames. Clients will see TCP RST on server shutdown.
+    // For graceful shutdown, applications should close WebSocket connections
+    // explicitly before calling Stop().
     net_server_.Stop();
-    // Now safe to clear — NetServer has already stopped and destroyed connections
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         http_connections_.clear();

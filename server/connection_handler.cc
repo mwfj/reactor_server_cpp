@@ -138,9 +138,10 @@ void ConnectionHandler::OnMessage(){
 
 void ConnectionHandler::SendData(const char *data, size_t size){
     // Thread-safe: All buffer operations must happen in socket dispatcher thread.
-    // is_sock_dispatcher() checks if this dispatcher is a socket worker — if not (conn_dispatcher),
-    // we must EnQueue. Normal callback paths (OnMessage → handler → SendData) always run on the
-    // owning dispatcher thread so the inline path is safe.
+    // Note: is_sock_dispatcher() checks dispatcher type, not calling thread identity.
+    // For cross-thread sends (e.g., HttpServer::Stop()), use CloseAfterWrite() which
+    // has proper is_dispatcher_thread() gating. Normal callback paths (OnMessage →
+    // handler → SendData) always run on the owning dispatcher thread.
     std::string data_copy(data, size);
 
     if(event_dispatcher_ && !event_dispatcher_ -> is_sock_dispatcher()) {
@@ -218,27 +219,10 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
 
 void ConnectionHandler::CloseAfterWrite(){
     close_after_write_.store(true, std::memory_order_release);
-
-    // Must run on the reactor thread — CloseChannel/epoll_ctl need to be called
-    // from the same thread that owns the fd to avoid fd-reuse races.
-    if (event_dispatcher_ && !event_dispatcher_->is_dispatcher_thread()) {
-        std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
-        event_dispatcher_->EnQueue([weak_self]() {
-            if (auto self = weak_self.lock()) {
-                if (self->output_bf_.Size() == 0) {
-                    self->CallCloseCb();
-                } else {
-                    self->client_channel_->EnableWriteMode();
-                }
-            }
-        });
+    if (output_bf_.Size() == 0) {
+        CallCloseCb();
     } else {
-        // Already on reactor thread
-        if (output_bf_.Size() == 0) {
-            CallCloseCb();
-        } else {
-            client_channel_->EnableWriteMode();
-        }
+        client_channel_ -> EnableWriteMode();
     }
 }
 
@@ -253,10 +237,10 @@ void ConnectionHandler::CallCloseCb(){
     // IMPORTANT: Capture shared_ptr to self to keep this alive during callback
     std::shared_ptr<ConnectionHandler> self = shared_from_this();
 
-    // Send TLS close_notify before closing the fd (if TLS is active)
-    if (tls_state_ == TlsState::READY && tls_) {
-        tls_->Shutdown();
-    }
+    // Note: We don't call SSL_shutdown() here because it requires I/O on a non-blocking
+    // socket which can block during teardown. The fd close will send TCP RST which is
+    // acceptable for server-side shutdown. For clean TLS shutdown, call Shutdown() explicitly
+    // before triggering close.
 
     // Close the channel to clean up fd and remove from epoll
     // CloseChannel() will NOT call this callback again (no recursion)

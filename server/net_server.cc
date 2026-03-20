@@ -63,7 +63,7 @@ void NetServer::Stop(){
     // This prevents connections from holding references to dispatchers during shutdown
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        connections_.clear();  // This will trigger ConnectionHandler destructors
+        connections_.clear();
     }
 
     // Second: Stop all event loops (now with no active connections)
@@ -92,19 +92,15 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
         }
     }
 
-    // Set application callbacks BEFORE RegisterCallbacks().
-    // RegisterCallbacks() enables epoll read, so data/close events can arrive immediately.
-    // If callbacks are null when the first event fires, data is silently dropped or
-    // close events are not properly tracked.
+    // Two-phase initialization: register callbacks after shared_ptr is created
+    // This allows callbacks to safely capture weak_ptr instead of raw 'this'
+    conn -> RegisterCallbacks();
+
     conn -> SetCloseCb(std::bind(&NetServer::HandleCloseConnection, this, std::placeholders::_1));
     conn -> SetErrorCb(std::bind(&NetServer::HandleErrorConnection, this, std::placeholders::_1));
     conn -> SetOnMessageCb(std::bind(&NetServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
     conn -> SetCompletionCb(std::bind(&NetServer::HandleSendComplete, this, std::placeholders::_1));
     AddConnection(conn);
-
-    // Two-phase initialization: register channel callbacks and enable epoll AFTER
-    // application callbacks are set and connection is tracked.
-    conn -> RegisterCallbacks();
 
     std::cout << "[Reactor Server] new connection(fd: "
         << conn -> fd() << ", ip: " << conn -> ip_addr() << ", port: " << conn -> port() << ").\n"

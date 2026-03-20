@@ -40,10 +40,10 @@ void WebSocketConnection::SendBinary(const std::string& data) {
 void WebSocketConnection::SendClose(uint16_t code, const std::string& reason) {
     SendFrame(WebSocketFrame::CloseFrame(code, reason));
     is_open_ = false;
-    // Close the transport after the close frame is flushed
-    if (conn_) {
-        conn_->CloseAfterWrite();
-    }
+    // Transport close is handled by the connection lifecycle — HttpConnectionHandler
+    // or the peer's response will trigger channel close. We don't call CloseAfterWrite()
+    // here because SendClose can be called during shutdown when the dispatcher may
+    // not be running to process the queued close.
 }
 
 void WebSocketConnection::SendPing(const std::string& payload) {

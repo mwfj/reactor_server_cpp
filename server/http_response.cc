@@ -66,8 +66,11 @@ std::string HttpResponse::Serialize() const {
     // Blank line
     oss << "\r\n";
 
-    // Body
-    if (!body_.empty()) {
+    // Body — suppress for status codes that must not have a body (101, 204, 205, 304)
+    bool suppress_body = (status_code_ == 101 || status_code_ == 204 ||
+                          status_code_ == 205 || status_code_ == 304 ||
+                          status_code_ < 200);
+    if (!body_.empty() && !suppress_body) {
         oss << body_;
     }
 
