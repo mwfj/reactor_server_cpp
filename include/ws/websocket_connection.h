@@ -37,6 +37,9 @@ public:
     // Access parser (for setting max payload size)
     WebSocketParser& GetParser() { return parser_; }
 
+    // Set maximum reassembled message size (0 = unlimited)
+    void SetMaxMessageSize(size_t max) { max_message_size_ = max; }
+
     // Feed raw data from the reactor
     void OnRawData(const std::string& data);
 
@@ -54,6 +57,7 @@ private:
     std::string fragment_buffer_;
     WebSocketOpcode fragment_opcode_ = WebSocketOpcode::Text;
     bool in_fragment_ = false;
+    size_t max_message_size_ = 0;  // 0 = unlimited
 
     void ProcessFrame(const WebSocketFrame& frame);
     void SendFrame(const WebSocketFrame& frame);

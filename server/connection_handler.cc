@@ -142,9 +142,12 @@ void ConnectionHandler::SendData(const char *data, size_t size){
     std::string data_copy(data, size);
 
     if(event_dispatcher_ && !event_dispatcher_ -> is_sock_dispatcher()) {
-        // Capture data_copy by value to preserve across thread boundary
-        event_dispatcher_ -> EnQueue([this, data_copy]() {
-            this->DoSend(data_copy.data(), data_copy.size());
+        // Capture weak_ptr to avoid preventing ConnectionHandler destruction
+        std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
+        event_dispatcher_ -> EnQueue([weak_self, data_copy]() {
+            if (auto self = weak_self.lock()) {
+                self->DoSend(data_copy.data(), data_copy.size());
+            }
         });
     } else {
         // Already in socket dispatcher thread
@@ -163,8 +166,11 @@ void ConnectionHandler::SendRaw(const char *data, size_t size){
     std::string data_copy(data, size);
 
     if(event_dispatcher_ && !event_dispatcher_ -> is_sock_dispatcher()) {
-        event_dispatcher_ -> EnQueue([this, data_copy]() {
-            this->DoSendRaw(data_copy.data(), data_copy.size());
+        std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
+        event_dispatcher_ -> EnQueue([weak_self, data_copy]() {
+            if (auto self = weak_self.lock()) {
+                self->DoSendRaw(data_copy.data(), data_copy.size());
+            }
         });
     } else {
         DoSendRaw(data, size);
@@ -207,6 +213,11 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
     }
 
     output_bf_.Append(data, size);
+    client_channel_ -> EnableWriteMode();
+}
+
+void ConnectionHandler::CloseAfterWrite(){
+    close_after_write_ = true;
     client_channel_ -> EnableWriteMode();
 }
 
@@ -287,6 +298,10 @@ void ConnectionHandler::CallWriteCb(){
     // If there's no data waiting to write, then unregister writing event
     if(output_bf_.Size() == 0){
         client_channel_->DisableWriteMode();
+        if (close_after_write_) {
+            CallCloseCb();
+            return;
+        }
         if(callbacks_.complete_callback)
             callbacks_.complete_callback(shared_from_this());
     }

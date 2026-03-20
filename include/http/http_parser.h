@@ -7,6 +7,8 @@
 
 class HttpParser {
 public:
+    enum class ParseError { NONE, BODY_TOO_LARGE, HEADER_TOO_LARGE, PARSE_ERROR };
+
     HttpParser();
     ~HttpParser();
 
@@ -32,6 +34,7 @@ public:
     // Error state
     bool HasError() const { return has_error_; }
     std::string GetError() const { return error_message_; }
+    ParseError GetErrorType() const { return error_type_; }
 
     // Public fields accessed by llhttp callbacks (defined in .cc file)
     HttpRequest request_;
@@ -40,6 +43,7 @@ public:
     size_t header_bytes_ = 0;     // accumulated header bytes
     bool has_error_ = false;
     std::string error_message_;
+    ParseError error_type_ = ParseError::NONE;
     std::string current_header_field_;
     std::string current_header_value_;
     bool parsing_header_value_ = false;

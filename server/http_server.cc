@@ -16,19 +16,27 @@ HttpServer::HttpServer(const std::string& ip, int port)
 }
 
 HttpServer::HttpServer(const ServerConfig& config)
-    : HttpServer(config.bind_host, config.bind_port)
+    : net_server_(config.bind_host, static_cast<size_t>(config.bind_port),
+                  config.idle_timeout_sec,
+                  std::chrono::seconds(config.idle_timeout_sec))
 {
+    net_server_.SetNewConnectionCb(
+        [this](std::shared_ptr<ConnectionHandler> conn) { HandleNewConnection(conn); });
+    net_server_.SetCloseConnectionCb(
+        [this](std::shared_ptr<ConnectionHandler> conn) { HandleCloseConnection(conn); });
+    net_server_.SetErrorCb(
+        [this](std::shared_ptr<ConnectionHandler> conn) { HandleErrorConnection(conn); });
+    net_server_.SetOnMessageCb(
+        [this](std::shared_ptr<ConnectionHandler> conn, std::string& msg) { HandleMessage(conn, msg); });
+
     max_body_size_ = config.max_body_size;
     max_header_size_ = config.max_header_size;
     max_ws_message_size_ = config.max_ws_message_size;
 
     if (config.tls.enabled) {
         tls_ctx_ = std::make_unique<TlsContext>(config.tls.cert_file, config.tls.key_file);
-        // Apply configured minimum TLS version
         if (config.tls.min_version == "1.3") {
             tls_ctx_->SetMinProtocolVersion(TLS1_3_VERSION);
-        } else {
-            // Default: TLS 1.2 (already set in TlsContext constructor)
         }
         net_server_.SetTlsContext(tls_ctx_.get());
     }
@@ -108,14 +116,15 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
 }
 
 void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
+    std::lock_guard<std::mutex> lck(conn_mtx_);
+    auto it = http_connections_.find(conn->fd());
+    if (it != http_connections_.end() && it->second->GetConnection() == conn) {
+        // Already created by HandleMessage lazy-init -- don't overwrite
+        return;
+    }
     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
     SetupHandlers(http_conn);
-
-    {
-        std::lock_guard<std::mutex> lck(conn_mtx_);
-        http_connections_[conn->fd()] = http_conn;
-    }
-
+    http_connections_[conn->fd()] = http_conn;
     logging::Get()->debug("New HTTP connection fd={} from {}:{}",
                           conn->fd(), conn->ip_addr(), conn->port());
 }

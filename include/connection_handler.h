@@ -24,6 +24,7 @@ private:
     Buffer output_bf_;
 
     std::atomic<bool> is_closing_{false};
+    bool close_after_write_ = false;
 
     TimeStamp ts_; // Each connection owns a timestamp to manage
 
@@ -52,6 +53,7 @@ public:
     void DoSendRaw(const char*, size_t);  // Internal: appends without length header (in socket thread)
 
     void CallCloseCb();
+    void CloseAfterWrite();
     void CallErroCb();
     void CallWriteCb();
 

@@ -6,14 +6,17 @@ WebSocketParser::WebSocketParser() {}
 size_t WebSocketParser::Parse(const char* data, size_t len) {
     buffer_.append(data, len);
     size_t total_consumed = 0;
+    size_t offset = 0;  // track position within buffer_ to avoid O(N^2) erase
 
-    while (!buffer_.empty() && !has_error_) {
+    auto buf_remaining = [&]() -> size_t { return buffer_.size() - offset; };
+
+    while (buf_remaining() > 0 && !has_error_) {
         switch (state_) {
             case State::ReadHeader: {
-                if (buffer_.size() < 2) return total_consumed;
+                if (buf_remaining() < 2) goto done;
 
-                uint8_t byte1 = static_cast<uint8_t>(buffer_[0]);
-                uint8_t byte2 = static_cast<uint8_t>(buffer_[1]);
+                uint8_t byte1 = static_cast<uint8_t>(buffer_[offset]);
+                uint8_t byte2 = static_cast<uint8_t>(buffer_[offset + 1]);
 
                 current_ = WebSocketFrame{};
                 current_.fin = (byte1 & 0x80) != 0;
@@ -21,21 +24,21 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                 current_.masked = (byte2 & 0x80) != 0;
 
                 uint8_t len7 = byte2 & 0x7F;
-                buffer_.erase(0, 2);
+                offset += 2;
                 total_consumed += 2;
 
                 // RFC 6455 §5.2: RSV bits must be 0 unless extension negotiated
                 if ((byte1 & 0x70) != 0) {
                     has_error_ = true;
                     error_message_ = "RSV bits set without extension negotiation";
-                    return total_consumed;
+                    goto done;
                 }
 
                 // RFC 6455 §5.1: server MUST close on unmasked client frames
                 if (!current_.masked) {
                     has_error_ = true;
                     error_message_ = "Client frame not masked";
-                    return total_consumed;
+                    goto done;
                 }
 
                 // RFC 6455 §5.2: reject reserved opcodes (0x3-0x7 data, 0xB-0xF control)
@@ -44,7 +47,7 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                 if (!is_valid_opcode) {
                     has_error_ = true;
                     error_message_ = "Reserved opcode";
-                    return total_consumed;
+                    goto done;
                 }
 
                 // Validate: control frames must not be fragmented and <= 125 bytes
@@ -52,12 +55,12 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                     if (!current_.fin) {
                         has_error_ = true;
                         error_message_ = "Fragmented control frame";
-                        return total_consumed;
+                        goto done;
                     }
                     if (len7 > 125) {
                         has_error_ = true;
                         error_message_ = "Control frame payload > 125 bytes";
-                        return total_consumed;
+                        goto done;
                     }
                 }
 
@@ -66,7 +69,7 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                     if (max_payload_size_ > 0 && current_.payload_length > max_payload_size_) {
                         has_error_ = true;
                         error_message_ = "Frame payload exceeds maximum size";
-                        return total_consumed;
+                        goto done;
                     }
                     state_ = current_.masked ? State::ReadMaskingKey : State::ReadPayload;
                 } else if (len7 == 126) {
@@ -78,43 +81,43 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
             }
 
             case State::ReadExtendedLen16: {
-                if (buffer_.size() < 2) return total_consumed;
-                uint16_t len16 = (static_cast<uint8_t>(buffer_[0]) << 8) |
-                                  static_cast<uint8_t>(buffer_[1]);
+                if (buf_remaining() < 2) goto done;
+                uint16_t len16 = (static_cast<uint8_t>(buffer_[offset]) << 8) |
+                                  static_cast<uint8_t>(buffer_[offset + 1]);
                 current_.payload_length = len16;
-                buffer_.erase(0, 2);
+                offset += 2;
                 total_consumed += 2;
                 if (max_payload_size_ > 0 && current_.payload_length > max_payload_size_) {
                     has_error_ = true;
                     error_message_ = "Frame payload exceeds maximum size";
-                    return total_consumed;
+                    goto done;
                 }
                 state_ = current_.masked ? State::ReadMaskingKey : State::ReadPayload;
                 break;
             }
 
             case State::ReadExtendedLen64: {
-                if (buffer_.size() < 8) return total_consumed;
+                if (buf_remaining() < 8) goto done;
                 uint64_t len64 = 0;
                 for (int i = 0; i < 8; i++) {
-                    len64 = (len64 << 8) | static_cast<uint8_t>(buffer_[i]);
+                    len64 = (len64 << 8) | static_cast<uint8_t>(buffer_[offset + i]);
                 }
                 current_.payload_length = len64;
-                buffer_.erase(0, 8);
+                offset += 8;
                 total_consumed += 8;
                 if (max_payload_size_ > 0 && current_.payload_length > max_payload_size_) {
                     has_error_ = true;
                     error_message_ = "Frame payload exceeds maximum size";
-                    return total_consumed;
+                    goto done;
                 }
                 state_ = current_.masked ? State::ReadMaskingKey : State::ReadPayload;
                 break;
             }
 
             case State::ReadMaskingKey: {
-                if (buffer_.size() < 4) return total_consumed;
-                std::memcpy(current_.masking_key, buffer_.data(), 4);
-                buffer_.erase(0, 4);
+                if (buf_remaining() < 4) goto done;
+                std::memcpy(current_.masking_key, buffer_.data() + offset, 4);
+                offset += 4;
                 total_consumed += 4;
                 state_ = State::ReadPayload;
                 payload_read_ = 0;
@@ -131,11 +134,11 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                     break;
                 }
 
-                size_t available = std::min(remaining, buffer_.size());
-                if (available == 0) return total_consumed;
+                size_t available = std::min(remaining, buf_remaining());
+                if (available == 0) goto done;
 
-                current_.payload.append(buffer_.data(), available);
-                buffer_.erase(0, available);
+                current_.payload.append(buffer_.data() + offset, available);
+                offset += available;
                 total_consumed += available;
                 payload_read_ += available;
 
@@ -151,6 +154,12 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                 break;
             }
         }
+    }
+
+done:
+    // Single erase of all consumed bytes — O(N) total instead of O(N^2)
+    if (offset > 0) {
+        buffer_.erase(0, offset);
     }
 
     return total_consumed;

@@ -31,6 +31,7 @@ static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
     if (self->max_header_size_ > 0 && self->header_bytes_ > self->max_header_size_) {
         self->has_error_ = true;
         self->error_message_ = "Header size exceeds maximum";
+        self->error_type_ = HttpParser::ParseError::HEADER_TOO_LARGE;
         return HPE_USER;  // Tell llhttp to stop parsing
     }
 
@@ -56,6 +57,7 @@ static int on_header_value(llhttp_t* parser, const char* at, size_t length) {
     if (self->max_header_size_ > 0 && self->header_bytes_ > self->max_header_size_) {
         self->has_error_ = true;
         self->error_message_ = "Header size exceeds maximum";
+        self->error_type_ = HttpParser::ParseError::HEADER_TOO_LARGE;
         return HPE_USER;
     }
 
@@ -110,9 +112,10 @@ static int on_body(llhttp_t* parser, const char* at, size_t length) {
 
     // Enforce body size limit DURING parsing, not after
     if (self->max_body_size_ > 0 &&
-        (self->request_.body.size() + length) > self->max_body_size_) {
+        length > self->max_body_size_ - self->request_.body.size()) {
         self->has_error_ = true;
         self->error_message_ = "Body size exceeds maximum";
+        self->error_type_ = HttpParser::ParseError::BODY_TOO_LARGE;
         return HPE_USER;
     }
 
@@ -159,8 +162,13 @@ size_t HttpParser::Parse(const char* data, size_t len) {
 
     if (err != HPE_OK && err != HPE_PAUSED) {
         has_error_ = true;
-        error_message_ = std::string(llhttp_errno_name(err)) + ": " +
-                         std::string(llhttp_get_error_reason(&impl_->parser));
+        if (error_type_ == ParseError::NONE) {
+            error_type_ = ParseError::PARSE_ERROR;
+        }
+        if (error_message_.empty()) {
+            error_message_ = std::string(llhttp_errno_name(err)) + ": " +
+                             std::string(llhttp_get_error_reason(&impl_->parser));
+        }
         return 0;
     }
 
@@ -177,6 +185,7 @@ void HttpParser::Reset() {
     request_.Reset();
     has_error_ = false;
     error_message_.clear();
+    error_type_ = ParseError::NONE;
     current_header_field_.clear();
     current_header_value_.clear();
     parsing_header_value_ = false;

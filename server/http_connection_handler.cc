@@ -31,7 +31,7 @@ void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
 }
 
 void HttpConnectionHandler::CloseConnection() {
-    conn_->CallCloseCb();
+    conn_->CloseAfterWrite();
 }
 
 void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data) {
@@ -49,15 +49,18 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
         size_t consumed = parser_.Parse(buf, remaining);
 
         if (parser_.HasError()) {
-            // Determine appropriate error response based on parser error
-            std::string err_msg = parser_.GetError();
+            // Determine appropriate error response based on parser error type
             HttpResponse err_resp;
-            if (err_msg.find("Body size exceeds") != std::string::npos) {
-                err_resp = HttpResponse::PayloadTooLarge();
-            } else if (err_msg.find("Header size exceeds") != std::string::npos) {
-                err_resp = HttpResponse::HeaderTooLarge();
-            } else {
-                err_resp = HttpResponse::BadRequest(err_msg);
+            switch (parser_.GetErrorType()) {
+                case HttpParser::ParseError::BODY_TOO_LARGE:
+                    err_resp = HttpResponse::PayloadTooLarge();
+                    break;
+                case HttpParser::ParseError::HEADER_TOO_LARGE:
+                    err_resp = HttpResponse::HeaderTooLarge();
+                    break;
+                default:
+                    err_resp = HttpResponse::BadRequest(parser_.GetError());
+                    break;
             }
             err_resp.Header("Connection", "close");
             SendResponse(err_resp);
@@ -86,7 +89,10 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
 
                 // Check route existence BEFORE sending 101
                 if (!route_checker_(req.path)) {
-                    SendResponse(HttpResponse::NotFound());
+                    auto not_found = HttpResponse::NotFound();
+                    not_found.Header("Connection", "close");
+                    SendResponse(not_found);
+                    CloseConnection();
                     return;
                 }
 
@@ -97,6 +103,7 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 ws_conn_ = std::make_unique<WebSocketConnection>(conn_);
                 if (max_ws_message_size_ > 0) {
                     ws_conn_->GetParser().SetMaxPayloadSize(max_ws_message_size_);
+                    ws_conn_->SetMaxMessageSize(max_ws_message_size_);
                 }
                 upgraded_ = true;
 
@@ -120,6 +127,11 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 HttpResponse response;
                 request_handler_(shared_from_this(), req, response);
                 SendResponse(response);
+
+                if (!req.keep_alive) {
+                    CloseConnection();
+                    return;
+                }
             }
 
             // Advance past consumed bytes

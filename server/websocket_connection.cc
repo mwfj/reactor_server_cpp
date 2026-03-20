@@ -73,6 +73,13 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 }
             } else {
                 // First fragment
+                if (max_message_size_ > 0 && frame.payload.size() > max_message_size_) {
+                    if (error_handler_) error_handler_(*this, "Message exceeds maximum size");
+                    SendClose(1009, "Message too big");
+                    in_fragment_ = false;
+                    fragment_buffer_.clear();
+                    return;
+                }
                 in_fragment_ = true;
                 fragment_opcode_ = frame.opcode;
                 fragment_buffer_ = frame.payload;
@@ -84,6 +91,14 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             if (!in_fragment_) {
                 if (error_handler_) error_handler_(*this, "Unexpected continuation frame");
                 SendClose(1002, "Protocol error: unexpected continuation");
+                return;
+            }
+            if (max_message_size_ > 0 &&
+                (fragment_buffer_.size() + frame.payload.size()) > max_message_size_) {
+                if (error_handler_) error_handler_(*this, "Message exceeds maximum size");
+                SendClose(1009, "Message too big");
+                in_fragment_ = false;
+                fragment_buffer_.clear();
                 return;
             }
             fragment_buffer_ += frame.payload;
@@ -107,6 +122,13 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 if (frame.payload.size() > 2) {
                     reason = frame.payload.substr(2);
                 }
+            }
+            // Validate close code per RFC 6455 Section 7.4
+            bool valid_code = (code >= 1000 && code <= 1003) ||
+                              (code >= 1007 && code <= 1011) ||
+                              (code >= 3000 && code <= 4999);
+            if (!valid_code && code != 0) {
+                code = 1002;  // Protocol error -- replace invalid code
             }
             // Echo close frame back (close handshake)
             if (is_open_) {
