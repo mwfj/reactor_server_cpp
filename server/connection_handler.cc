@@ -152,14 +152,12 @@ void ConnectionHandler::OnMessage(){
             // Data already buffered — flush it
             client_channel_->EnableWriteMode();
         } else {
-            // No data buffered. Set a short deadline so the connection closes
-            // promptly if no async handler sends a response. This covers:
-            //   - Fire-and-forget handlers that intentionally send no reply
-            //   - idle_timeout_sec == 0 configurations where idle timeout is disabled
-            // Async handlers that call SendData/SendRaw will arm EnableWriteMode,
-            // and CallWriteCb will close after flushing via the close_after_write_ flag.
+            // No data buffered. Set a short deadline (2s) so the connection closes
+            // promptly. This is enough time for async handlers (e.g., task_workers_)
+            // to enqueue a response, while not holding dead connections from
+            // health checks or fire-and-forget clients for too long.
             if (!has_deadline_) {
-                SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(30));
+                SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(2));
             }
         }
     }
@@ -327,16 +325,25 @@ void ConnectionHandler::CallCloseCb(){
 }
 
 void ConnectionHandler::CallErroCb(){
-    // Guard against double-close: if already closing, error callback could trigger
-    // another close attempt causing undefined behavior
-    if (is_closing_) return;
+    // Guard against double-close
+    bool expected = false;
+    if (!is_closing_.compare_exchange_strong(expected, true)) {
+        return;
+    }
 
+    std::shared_ptr<ConnectionHandler> self = shared_from_this();
+
+    // Notify error handler (NOT close handler — avoid duplicate callbacks)
     if (callbacks_.error_callback)
-        callbacks_.error_callback(shared_from_this());
+        callbacks_.error_callback(self);
 
-    // Close the connection after error notification.
-    // Without this, the fd stays registered in epoll and leaks.
-    CallCloseCb();
+    // Close the channel and release fd — same cleanup as CallCloseCb
+    // but without firing the close callback (which would be a second notification)
+    if(client_channel_ && !client_channel_->is_channel_closed()){
+        client_channel_->CloseChannel();
+    }
+
+    if (sock_) sock_->ReleaseFd();
 }
 
 void ConnectionHandler::CallWriteCb(){
