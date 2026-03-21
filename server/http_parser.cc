@@ -61,11 +61,17 @@ static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
     }
     self->header_bytes_ += charge;
 
-    // If we were reading a value, flush the previous header
+    // If we were reading a value, flush the previous header.
+    // RFC 7230 §3.2.2: combine repeated headers with ", " separator.
     if (self->parsing_header_value_) {
         std::string key = self->current_header_field_;
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-        self->request_.headers[key] = self->current_header_value_;
+        auto it = self->request_.headers.find(key);
+        if (it != self->request_.headers.end()) {
+            it->second += ", " + self->current_header_value_;
+        } else {
+            self->request_.headers[key] = self->current_header_value_;
+        }
         self->current_header_field_.clear();
         self->current_header_value_.clear();
     }
@@ -98,11 +104,16 @@ static int on_header_value(llhttp_t* parser, const char* at, size_t length) {
 static int on_headers_complete(llhttp_t* parser) {
     auto* self = static_cast<HttpParser*>(parser->data);
 
-    // Flush last header
+    // Flush last header (combine repeated headers per RFC 7230 §3.2.2)
     if (!self->current_header_field_.empty()) {
         std::string key = self->current_header_field_;
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-        self->request_.headers[key] = self->current_header_value_;
+        auto it = self->request_.headers.find(key);
+        if (it != self->request_.headers.end()) {
+            it->second += ", " + self->current_header_value_;
+        } else {
+            self->request_.headers[key] = self->current_header_value_;
+        }
         self->current_header_field_.clear();
         self->current_header_value_.clear();
     }

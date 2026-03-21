@@ -15,7 +15,9 @@ void HttpServer::WireNetServerCallbacks() {
 }
 
 HttpServer::HttpServer(const std::string& ip, int port)
-    : net_server_(ip, static_cast<size_t>(port))
+    : net_server_(ip, static_cast<size_t>(port),
+                  std::max(request_timeout_sec_ / 3, 1),  // scan interval matches default request timeout
+                  std::chrono::seconds(300))               // default idle timeout
 {
     WireNetServerCallbacks();
 }
