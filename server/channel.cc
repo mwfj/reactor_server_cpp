@@ -96,15 +96,17 @@ void Channel::HandleEvent() {
     }
 
     // Handle close events AFTER read AND write.
-    // Close the connection unless it was already closed by the read/write callbacks.
-    // The read callback (OnMessage) handles EOF by arming close_after_write.
-    // The write callback (CallWriteCb) closes via close_after_write after flushing.
-    // If neither callback closed the channel, we must close it here.
+    // Invoke the close callback (ConnectionHandler::CallCloseCb), which either:
+    //   1. Closes inline (calls CloseChannel internally), OR
+    //   2. Defers if close_after_write_ with buffered data (response still flushing)
+    // Do NOT call CloseChannel here — CallCloseCb handles it when appropriate.
     if(events & (EVENT_RDHUP | EVENT_HUP)){
         if (!is_channel_closed()) {
-            if(callbacks_.close_callback)
+            if(callbacks_.close_callback) {
                 callbacks_.close_callback();
-            CloseChannel();
+            } else {
+                CloseChannel();  // Fallback if no close callback wired
+            }
         }
         return;
     }

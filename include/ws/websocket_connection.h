@@ -43,6 +43,10 @@ public:
     // Feed raw data from the reactor
     void OnRawData(const std::string& data);
 
+    // Called when the transport (TCP/TLS) disconnects without a WebSocket Close frame.
+    // Fires the close handler so applications can clean up session state.
+    void NotifyTransportClose();
+
 private:
     std::shared_ptr<ConnectionHandler> conn_;
     WebSocketParser parser_;

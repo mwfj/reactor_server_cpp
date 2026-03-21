@@ -88,6 +88,15 @@ int WebSocketConnection::fd() const {
     return conn_->fd();
 }
 
+void WebSocketConnection::NotifyTransportClose() {
+    if (!is_open_) return;
+    is_open_ = false;
+    // Fire close handler with code 1006 (Abnormal Closure — no Close frame received)
+    if (close_handler_) {
+        close_handler_(*this, 1006, "Transport closed");
+    }
+}
+
 void WebSocketConnection::OnRawData(const std::string& data) {
     if (!is_open_) return;
 

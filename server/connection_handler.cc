@@ -71,10 +71,12 @@ void ConnectionHandler::OnMessage(){
 
     // If a previous SSL_write returned WANT_READ, the next readable event
     // must retry that write instead of doing a new SSL_read.
+    // After the retry, fall through to the normal read loop to drain any
+    // readable bytes that arrived — ET mode won't fire another EPOLLIN.
     if (tls_write_wants_read_) {
         tls_write_wants_read_ = false;
         CallWriteCb();  // Retry the pending write
-        return;
+        // Fall through to read loop below (don't return)
     }
 
     bool peer_closed = false;  // Track if we saw EOF, close after dispatching buffered data
@@ -405,11 +407,12 @@ void ConnectionHandler::CallWriteCb(){
 
     // If a previous SSL_read returned WANT_WRITE, the next writable event
     // must retry that read instead of doing a normal write.
+    // After the retry, fall through to the normal write path to flush any
+    // pending output — ET mode won't fire another EPOLLOUT for already-writable.
     if (tls_read_wants_write_) {
         tls_read_wants_write_ = false;
-        client_channel_->DisableWriteMode();
         OnMessage();  // Retry the pending read
-        return;
+        // Fall through to write path below (don't return)
     }
 
     // TLS handshake WANT_WRITE handling

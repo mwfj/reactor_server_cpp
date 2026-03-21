@@ -172,11 +172,13 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
 void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->debug("HTTP connection closed fd={}", conn->fd());
     std::lock_guard<std::mutex> lck(conn_mtx_);
-    // Guard against fd reuse race: only remove if the stored HttpConnectionHandler
-    // wraps the same ConnectionHandler that is being closed. Otherwise, a new
-    // connection may have already claimed this fd.
     auto it = http_connections_.find(conn->fd());
     if (it != http_connections_.end() && it->second->GetConnection() == conn) {
+        // Notify WebSocket close handler for transport-level disconnects
+        auto* ws = it->second->GetWebSocket();
+        if (ws && ws->IsOpen()) {
+            ws->NotifyTransportClose();
+        }
         http_connections_.erase(it);
     }
 }
@@ -186,6 +188,10 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
     std::lock_guard<std::mutex> lck(conn_mtx_);
     auto it = http_connections_.find(conn->fd());
     if (it != http_connections_.end() && it->second->GetConnection() == conn) {
+        auto* ws = it->second->GetWebSocket();
+        if (ws && ws->IsOpen()) {
+            ws->NotifyTransportClose();
+        }
         http_connections_.erase(it);
     }
 }
