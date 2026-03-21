@@ -77,6 +77,7 @@ void ConnectionHandler::OnMessage(){
         return;
     }
 
+    bool peer_closed = false;  // Track if we saw EOF, close after dispatching buffered data
     char buffer[MAX_BUFFER_SIZE];
     while(true){
         memset(buffer, 0, sizeof buffer);
@@ -112,10 +113,10 @@ void ConnectionHandler::OnMessage(){
             // Interrupted by signal — retry
             continue;
         } else if(nread == 0 && tls_state_ != TlsState::READY){
-            // Client close (raw TCP only; TLS nread==0 means would_block above).
-            // Use CallCloseCb for proper server map cleanup.
-            CallCloseCb();
-            return;
+            // Client close (raw TCP). Break out of the read loop to dispatch any
+            // buffered data first, then close after processing.
+            peer_closed = true;
+            break;
         } else if (nread < 0) {
             if (tls_state_ == TlsState::READY) {
                 // TLS read error — use CallCloseCb for proper cleanup
@@ -141,6 +142,11 @@ void ConnectionHandler::OnMessage(){
         ts_ = TimeStamp::Now();
         // Clear the input buffer after processing
         input_bf_.Clear();
+    }
+
+    // If peer sent EOF, close now that buffered data has been dispatched
+    if (peer_closed) {
+        CallCloseCb();
     }
 }
 
@@ -212,7 +218,8 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
             data += written;
             size -= written;
         } else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            // Send error
+            // Send error — close the connection (same as buffered write path)
+            CallCloseCb();
             return;
         }
         // written == 0 or EAGAIN -- fall through to buffering

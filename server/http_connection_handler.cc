@@ -207,11 +207,19 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             parser_.Reset();
 
             // If there are remaining bytes (pipelined request), arm a new deadline
-            // immediately so partial pipelined requests are also protected
+            // AND re-install the 408 callback so timer-driven timeout sends proper response
             if (remaining > 0 && request_timeout_sec_ > 0) {
                 request_in_progress_ = true;
                 request_start_ = std::chrono::steady_clock::now();
                 conn_->SetDeadline(request_start_ + std::chrono::seconds(request_timeout_sec_));
+                std::weak_ptr<HttpConnectionHandler> weak_self = shared_from_this();
+                conn_->SetDeadlineTimeoutCb([weak_self]() {
+                    if (auto self = weak_self.lock()) {
+                        HttpResponse timeout_resp = HttpResponse::RequestTimeout();
+                        timeout_resp.Header("Connection", "close");
+                        self->SendResponse(timeout_resp);
+                    }
+                });
             }
         } else {
             // Incomplete request -- need more data

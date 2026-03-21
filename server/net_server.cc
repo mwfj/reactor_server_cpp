@@ -59,8 +59,10 @@ void NetServer::Start(){
 
 // stop event loop
 void NetServer::Stop(){
-    // First: Close the listening socket so no new connections are accepted
-    // and the port is released for immediate reuse
+    // First: Stop the connection dispatcher so no more accept events fire,
+    // then destroy the acceptor. Stopping the dispatcher first ensures no
+    // pending accept callback can run after the Acceptor object is freed.
+    conn_dispatcher_->StopEventLoop();
     acceptor_.reset();
 
     // Second: Release dispatcher-held connection references via EnQueue
@@ -71,22 +73,27 @@ void NetServer::Stop(){
         });
     }
 
-    // Third: Close all active connections — actually close the channels/fds,
-    // not just drop shared_ptrs (EpollHandler::channel_map_ would keep channels alive)
+    // Third: Close all active connections — collect under lock, close after releasing.
+    // CallCloseCb triggers HandleCloseConnection which takes conn_mtx_, so we must
+    // NOT hold the lock while calling it to avoid deadlock.
+    std::vector<std::shared_ptr<ConnectionHandler>> conns_to_close;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         for (auto& pair : connections_) {
             if (pair.second) {
-                pair.second->CallCloseCb();
+                conns_to_close.push_back(pair.second);
             }
         }
         connections_.clear();
     }
+    for (auto& conn : conns_to_close) {
+        conn->CallCloseCb();
+    }
+    conns_to_close.clear();
 
-    // Fourth: Stop all event loops (now with no active connections)
+    // Fourth: Stop socket dispatcher event loops (conn_dispatcher already stopped above)
     for(auto task : socket_dispatchers_)
         task -> StopEventLoop();
-    conn_dispatcher_->StopEventLoop();
 
     // Fifth: Now safe to join worker threads
     sock_workers_.Stop();
