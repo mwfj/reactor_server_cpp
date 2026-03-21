@@ -93,17 +93,25 @@ void WebSocketConnection::OnRawData(const std::string& data) {
 
     parser_.Parse(data.data(), data.size());
 
-    if (parser_.HasError()) {
+    // Drain any valid frames that were parsed BEFORE the error.
+    // The parser may have pushed complete frames before encountering a malformed one.
+    while (parser_.HasFrame() && is_open_) {
+        ProcessFrame(parser_.NextFrame());
+    }
+
+    if (parser_.HasError() && is_open_) {
         if (error_handler_) {
             error_handler_(*this, parser_.GetError());
         }
-        SendClose(1002, "Protocol error");
+        // Use the correct close code based on the error type
+        std::string err_msg = parser_.GetError();
+        uint16_t close_code = 1002;  // Default: protocol error
+        if (err_msg.find("exceeds maximum size") != std::string::npos) {
+            close_code = 1009;  // Message Too Big
+        }
+        SendClose(close_code, err_msg.substr(0, 123));
         if (conn_) conn_->CloseAfterWrite();
         return;
-    }
-
-    while (parser_.HasFrame() && is_open_) {
-        ProcessFrame(parser_.NextFrame());
     }
 }
 

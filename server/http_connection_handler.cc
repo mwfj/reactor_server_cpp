@@ -117,8 +117,10 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             // Check for WebSocket upgrade
             if (req.upgrade && route_checker_) {
                 // Run middleware before upgrade (auth, CORS, rate limiting, etc.)
+                // Hoist mw_response so successful middleware headers can be merged
+                // into the 101 response (e.g., Set-Cookie, auth tokens).
+                HttpResponse mw_response;
                 if (middleware_runner_) {
-                    HttpResponse mw_response;
                     if (!middleware_runner_(req, mw_response)) {
                         // Middleware rejected the request
                         mw_response.Header("Connection", "close");
@@ -152,8 +154,13 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 conn_->ClearDeadline();
                 conn_->SetDeadlineTimeoutCb(nullptr);
 
-                // Route confirmed — send 101 Switching Protocols
-                SendResponse(WebSocketHandshake::Accept(req));
+                // Route confirmed — send 101 Switching Protocols.
+                // Merge any headers set by middleware (e.g., Set-Cookie, auth tokens).
+                HttpResponse upgrade_resp = WebSocketHandshake::Accept(req);
+                for (const auto& hdr : mw_response.GetHeaders()) {
+                    upgrade_resp.Header(hdr.first, hdr.second);
+                }
+                SendResponse(upgrade_resp);
 
                 // If the send failed (client disconnected), don't proceed with upgrade.
                 // SendRaw may have triggered CallCloseCb via EPIPE/ECONNRESET.

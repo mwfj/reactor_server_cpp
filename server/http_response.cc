@@ -1,5 +1,6 @@
 #include "http/http_response.h"
 #include <sstream>
+#include <algorithm>
 
 HttpResponse::HttpResponse() : status_code_(200), status_reason_("OK") {}
 
@@ -51,10 +52,19 @@ std::string HttpResponse::Serialize() const {
 
     // Headers
     auto hdrs = headers_;
-    // Add Content-Length if not already set.
+    // Add Content-Length if not already set (case-insensitive check).
     // Excluded per RFC 7230/7231: 1xx, 101 (Switching Protocols), 204 (No Content),
     // 205 (Reset Content), 304 (Not Modified)
-    if (hdrs.find("Content-Length") == hdrs.end() &&
+    bool has_content_length = false;
+    for (const auto& kv : hdrs) {
+        std::string key = kv.first;
+        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+        if (key == "content-length") {
+            has_content_length = true;
+            break;
+        }
+    }
+    if (!has_content_length &&
         status_code_ >= 200 && status_code_ != 204 && status_code_ != 205 &&
         status_code_ != 304 && status_code_ != 101) {
         hdrs["Content-Length"] = std::to_string(body_.size());
