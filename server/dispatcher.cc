@@ -65,7 +65,10 @@ void Dispatcher::Init() {
     // deadline scanning (has_deadline_ per-connection). Always create when
     // end_t_ > 0 (scan interval configured), even if idle timeout is disabled.
     if (is_sock_dispatcher_ && end_t_ > 0) {
-        timer_fd_ = TimeStamp::GenTimerFd(timeout_, std::chrono::nanoseconds(0));
+        // Use end_t_ (scan interval) for the initial timer fire, not timeout_ (idle timeout).
+        // TimerHandler re-arms with end_t_ on each fire. Using timeout_ here would delay
+        // the first scan to 300s, missing 30s request deadlines.
+        timer_fd_ = TimeStamp::GenTimerFd(std::chrono::seconds(end_t_), std::chrono::nanoseconds(0));
         // Guard against platforms where GenTimerFd returns -1 (e.g., macOS)
         if (timer_fd_ >= 0) {
             timer_channel_ = std::make_shared<Channel>(shared_from_this(), timer_fd_);

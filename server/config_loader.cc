@@ -154,16 +154,18 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             " (must be 1-65535)");
     }
 
-    if (config.max_connections < 1) {
+    // 0 = unlimited (sentinel), negative = invalid
+    if (config.max_connections < 0) {
         throw std::invalid_argument(
             "Invalid max_connections: " + std::to_string(config.max_connections) +
-            " (must be >= 1)");
+            " (must be >= 0, 0 = unlimited)");
     }
 
-    if (config.worker_threads < 1) {
+    // 0 = auto-detect (hardware_concurrency), negative = invalid
+    if (config.worker_threads < 0) {
         throw std::invalid_argument(
             "Invalid worker_threads: " + std::to_string(config.worker_threads) +
-            " (must be >= 1)");
+            " (must be >= 0, 0 = auto)");
     }
 
     // 0 = disabled (sentinel), negative = invalid

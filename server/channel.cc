@@ -86,23 +86,26 @@ void Channel::HandleEvent() {
             callbacks_.read_callback();
     }
 
-    // Handle close events AFTER read.
+    // Handle write events BEFORE close events.
+    // When RDHUP arrives with EPOLLOUT (client half-closed but socket is writable),
+    // the server may have a buffered response (queued via CloseAfterWrite) that must
+    // flush before the fd is closed.
+    if(events & EVENT_WRITE){
+        if(callbacks_.write_callback)
+            callbacks_.write_callback();
+    }
+
+    // Handle close events AFTER read AND write.
     // If READ was also set, OnMessage already handled EOF (dispatched buffered data
-    // and called CloseAfterWrite to defer close until the response flushes).
-    // Only act on RDHUP/HUP if there was NO concurrent read event.
-    if((events & (EVENT_RDHUP | EVENT_HUP)) && !(events & EVENT_READ)){
+    // and armed close_after_write). If WRITE was also set, CallWriteCb flushed and
+    // may have closed via close_after_write. Only act if channel is still open.
+    if(events & (EVENT_RDHUP | EVENT_HUP)){
         if (!is_channel_closed()) {
             if(callbacks_.close_callback)
                 callbacks_.close_callback();
             CloseChannel();
         }
         return;
-    }
-
-    // Handle write events
-    if(events & EVENT_WRITE){
-        if(callbacks_.write_callback)
-            callbacks_.write_callback();
     }
 
     // Handle error events
