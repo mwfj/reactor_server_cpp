@@ -38,11 +38,13 @@ public:
     }
 
     int fd() const { return fd_; }
-    // Release ownership of the fd without closing it (used when Channel takes over)
-    void ReleaseFd() { fd_ = -1; }
     const std::string& ip_addr() const {return ip_addr_;}
     int port() const {return port_;}
+    
 
+    // Release ownership of the fd without closing it (used when Channel takes over)
+    void ReleaseFd() { fd_ = -1; }
+    
     bool SetTcpNoDelay(bool);
     bool SetReuseAddr(bool);
     bool SetReusePort(bool);

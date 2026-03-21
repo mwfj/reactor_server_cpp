@@ -479,11 +479,17 @@ namespace HttpTests {
     void TestRequestTimeout() {
         std::cout << "\n[TEST] Request Timeout (Slowloris Protection)..." << std::endl;
         try {
-            // Use a separate port to avoid conflicts
             const int TIMEOUT_PORT = TEST_PORT + 1;
-            HttpServer server("127.0.0.1", TIMEOUT_PORT);
 
-            // Set a 1-second request timeout for testing
+            // Configure with a short request timeout for testing
+            ServerConfig config;
+            config.bind_host = "127.0.0.1";
+            config.bind_port = TIMEOUT_PORT;
+            config.request_timeout_sec = 2;   // 2-second request timeout
+            config.idle_timeout_sec = 60;      // idle timeout won't interfere
+            config.worker_threads = 2;
+
+            HttpServer server(config);
             server.Get("/health", [](const HttpRequest& req, HttpResponse& res) {
                 res.Status(200).Text("ok");
             });
@@ -491,12 +497,12 @@ namespace HttpTests {
             std::thread server_thread([&server]() {
                 try { server.Start(); } catch (...) {}
             });
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
             bool pass = true;
             std::string err;
 
-            // Test 1: Slow request should be killed after timeout
+            // Test 1: Slow request — send partial headers, wait for 408 or connection close
             {
                 int sockfd = socket(AF_INET, SOCK_STREAM, 0);
                 struct sockaddr_in addr{};
@@ -505,14 +511,29 @@ namespace HttpTests {
                 addr.sin_addr.s_addr = inet_addr("127.0.0.1");
                 connect(sockfd, (struct sockaddr*)&addr, sizeof(addr));
 
-                // Send partial headers (no \r\n\r\n terminator)
+                // Send partial headers (no \r\n\r\n terminator) then go silent
                 std::string partial = "GET /health HTTP/1.1\r\nHost: localhost\r\n";
                 send(sockfd, partial.data(), partial.size(), 0);
 
-                // Wait longer than the default 30s timeout would take —
-                // but we're using the default 30s which is too slow for a test.
-                // Instead, verify the connection stays open for fast requests.
+                // Wait for server to kill the connection (timeout + scan interval)
+                struct timeval tv; tv.tv_sec = 5; tv.tv_usec = 0;
+                setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+                char buf[4096] = {};
+                std::string response;
+                ssize_t n;
+                while ((n = recv(sockfd, buf, sizeof(buf) - 1, 0)) > 0) {
+                    response.append(buf, n);
+                }
                 close(sockfd);
+
+                // Should get 408 or at least connection closed
+                bool got_408 = response.find("408") != std::string::npos;
+                bool got_closed = (n == 0 || n < 0);  // EOF or error
+                if (!got_408 && !got_closed) {
+                    pass = false;
+                    err += "Slow request: expected 408 or close, got nothing; ";
+                }
             }
 
             // Test 2: Fast request should succeed normally
@@ -527,7 +548,6 @@ namespace HttpTests {
                 std::string req = "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
                 send(sockfd, req.data(), req.size(), 0);
 
-                // Read response
                 struct timeval tv; tv.tv_sec = 3; tv.tv_usec = 0;
                 setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 

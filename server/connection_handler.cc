@@ -344,6 +344,16 @@ void ConnectionHandler::SetTlsConnection(std::unique_ptr<TlsConnection> tls) {
     tls_state_ = TlsState::HANDSHAKE;
 }
 
+void ConnectionHandler::SetDeadlineTimeoutCb(DeadlineTimeoutCb cb) {
+    deadline_timeout_cb_ = std::move(cb);
+}
+
+void ConnectionHandler::CallDeadlineTimeoutCb() {
+    if (deadline_timeout_cb_) {
+        deadline_timeout_cb_();
+    }
+}
+
 void ConnectionHandler::SetDeadline(std::chrono::steady_clock::time_point deadline) {
     has_deadline_ = true;
     deadline_ = deadline;
@@ -358,5 +368,7 @@ bool ConnectionHandler::IsTimeOut(std::chrono::seconds duration) const {
     if (has_deadline_ && std::chrono::steady_clock::now() > deadline_) {
         return true;
     }
+    // duration == 0 means idle timeout is disabled
+    if (duration.count() == 0) return false;
     return ts_.IsTimeOut(duration);
 }

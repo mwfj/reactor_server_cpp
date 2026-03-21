@@ -61,6 +61,15 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             // Set deadline on the connection so the timer scanner can enforce it
             // even if the client stops sending entirely
             conn_->SetDeadline(request_start_ + std::chrono::seconds(request_timeout_sec_));
+            // Set callback so timer-driven timeout sends 408 before close
+            std::weak_ptr<HttpConnectionHandler> weak_self = shared_from_this();
+            conn_->SetDeadlineTimeoutCb([weak_self]() {
+                if (auto self = weak_self.lock()) {
+                    HttpResponse timeout_resp = HttpResponse::RequestTimeout();
+                    timeout_resp.Header("Connection", "close");
+                    self->SendResponse(timeout_resp);
+                }
+            });
         } else {
             // Request still in progress — check elapsed time
             auto elapsed = std::chrono::steady_clock::now() - request_start_;
@@ -141,6 +150,7 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 // Request completed (as upgrade) — reset timeout tracking
                 request_in_progress_ = false;
                 conn_->ClearDeadline();
+                conn_->SetDeadlineTimeoutCb(nullptr);
 
                 // Route confirmed — send 101 Switching Protocols
                 SendResponse(WebSocketHandshake::Accept(req));
@@ -187,6 +197,7 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             // Request completed — reset timeout tracking for next request
             request_in_progress_ = false;
             conn_->ClearDeadline();
+            conn_->SetDeadlineTimeoutCb(nullptr);
 
             // Advance past consumed bytes
             buf += consumed;

@@ -29,6 +29,7 @@ private:
     TimeStamp ts_; // Each connection owns a timestamp to manage
     bool has_deadline_ = false;
     std::chrono::steady_clock::time_point deadline_;
+    std::function<void()> deadline_timeout_cb_;
 
     // TLS support
     enum class TlsState { NONE, HANDSHAKE, READY };
@@ -69,6 +70,12 @@ public:
     // Deadline: if set, IsTimeOut returns true when deadline is exceeded
     void SetDeadline(std::chrono::steady_clock::time_point deadline);
     void ClearDeadline();
+
+    // Pre-close callback for deadline timeouts — allows upper layers (HttpConnectionHandler)
+    // to send a 408 response before the connection is closed by the timer.
+    using DeadlineTimeoutCb = std::function<void()>;
+    void SetDeadlineTimeoutCb(DeadlineTimeoutCb cb);
+    void CallDeadlineTimeoutCb();
 
     bool IsTimeOut(std::chrono::seconds) const;
 };

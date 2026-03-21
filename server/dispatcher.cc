@@ -291,8 +291,11 @@ void Dispatcher::TimerHandler(){
             connections_.erase(fd);
         }
 
-        // Close timed-out connections via CallCloseCb (closes fd + cleans up server maps)
+        // Close timed-out connections.
+        // Call deadline timeout callback first (allows HTTP layer to send 408),
+        // then CallCloseCb to close the transport.
         for(auto& conn : timed_out_conns){
+            conn->CallDeadlineTimeoutCb();
             conn->CallCloseCb();
         }
 

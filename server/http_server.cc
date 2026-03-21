@@ -35,7 +35,9 @@ HttpServer::HttpServer(const ServerConfig& config)
                       if (req_interval == 0) return idle_interval;
                       return std::min(idle_interval, req_interval);
                   }(),
-                  std::chrono::seconds(config.idle_timeout_sec > 0 ? config.idle_timeout_sec : 86400),
+                  // Pass idle_timeout_sec directly — 0 means disabled.
+                  // ConnectionHandler::IsTimeOut handles duration==0 by skipping idle check.
+                  std::chrono::seconds(config.idle_timeout_sec),
                   config.worker_threads)
 {
     WireNetServerCallbacks();
