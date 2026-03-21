@@ -210,7 +210,20 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             if (request_handler_) {
                 HttpResponse response;
                 request_handler_(shared_from_this(), req, response);
-                SendResponse(response);
+
+                // RFC 7231 §4.3.2: HEAD responses MUST NOT include a body.
+                // Send headers only (Content-Length is preserved for client to know size).
+                if (req.method == "HEAD") {
+                    // Serialize headers only — strip body
+                    HttpResponse head_resp;
+                    head_resp.Status(response.GetStatusCode());
+                    for (const auto& hdr : response.GetHeaders()) {
+                        head_resp.Header(hdr.first, hdr.second);
+                    }
+                    SendResponse(head_resp);
+                } else {
+                    SendResponse(response);
+                }
 
                 // If SendResponse triggered a connection close (e.g., EPIPE),
                 // stop processing pipelined requests.

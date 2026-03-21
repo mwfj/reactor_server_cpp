@@ -211,6 +211,22 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 if (conn_) conn_->CloseAfterWrite();
                 return;
             }
+            // If payload is empty, echo an empty close frame (no code/reason)
+            if (frame.payload.empty()) {
+                if (!close_sent_) {
+                    // Send empty close frame to match
+                    WebSocketFrame empty_close;
+                    empty_close.opcode = WebSocketOpcode::Close;
+                    empty_close.fin = true;
+                    SendFrame(empty_close);
+                    close_sent_ = true;
+                }
+                is_open_ = false;
+                if (conn_) conn_->CloseAfterWrite();
+                if (close_handler_) close_handler_(*this, 1005, "");  // 1005 = no status received
+                break;
+            }
+
             uint16_t code = 1000;
             std::string reason;
             if (frame.payload.size() >= 2) {

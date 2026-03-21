@@ -1,7 +1,8 @@
 #pragma once
 
 #include <string>
-#include <map>
+#include <vector>
+#include <utility>
 
 class HttpResponse {
 public:
@@ -38,12 +39,12 @@ public:
     // Accessors
     int GetStatusCode() const { return status_code_; }
     const std::string& GetBody() const { return body_; }
-    const std::map<std::string, std::string>& GetHeaders() const { return headers_; }
+    const std::vector<std::pair<std::string, std::string>>& GetHeaders() const { return headers_; }
 
 private:
     int status_code_;
     std::string status_reason_;
-    std::map<std::string, std::string> headers_;
+    std::vector<std::pair<std::string, std::string>> headers_;
     std::string body_;
 
     static std::string DefaultReason(int code);

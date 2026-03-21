@@ -17,7 +17,7 @@ HttpResponse& HttpResponse::Status(int code, const std::string& reason) {
 }
 
 HttpResponse& HttpResponse::Header(const std::string& key, const std::string& value) {
-    headers_[key] = value;
+    headers_.emplace_back(key, value);
     return *this;
 }
 
@@ -28,7 +28,7 @@ HttpResponse& HttpResponse::Body(const std::string& content) {
 
 HttpResponse& HttpResponse::Body(const std::string& content, const std::string& content_type) {
     body_ = content;
-    headers_["Content-Type"] = content_type;
+    Header("Content-Type", content_type);
     return *this;
 }
 
@@ -67,7 +67,7 @@ std::string HttpResponse::Serialize() const {
     if (!has_content_length &&
         status_code_ >= 200 && status_code_ != 204 && status_code_ != 205 &&
         status_code_ != 304 && status_code_ != 101) {
-        hdrs["Content-Length"] = std::to_string(body_.size());
+        hdrs.emplace_back("Content-Length", std::to_string(body_.size()));
     }
     for (const auto& kv : hdrs) {
         oss << kv.first << ": " << kv.second << "\r\n";
