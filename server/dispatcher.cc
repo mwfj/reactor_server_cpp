@@ -246,6 +246,10 @@ void Dispatcher::AddConnection(std::shared_ptr<ConnectionHandler> conn){
     connections_[conn -> fd()] = conn;
 }
 
+void Dispatcher::ClearConnections(){
+    connections_.clear();
+}
+
 void Dispatcher::RemoveTimerConnection(int fd) {
     connections_.erase(fd);
 }
@@ -293,10 +297,11 @@ void Dispatcher::TimerHandler(){
 
         // Close timed-out connections.
         // Call deadline timeout callback first (allows HTTP layer to send 408),
-        // then CallCloseCb to close the transport.
+        // then use CloseAfterWrite so the 408 response flushes before close.
+        // For connections without a deadline callback, close immediately.
         for(auto& conn : timed_out_conns){
             conn->CallDeadlineTimeoutCb();
-            conn->CallCloseCb();
+            conn->CloseAfterWrite();
         }
 
         // Also notify NetServer's timer callback for any additional cleanup

@@ -63,18 +63,32 @@ void NetServer::Stop(){
     // and the port is released for immediate reuse
     acceptor_.reset();
 
-    // Second: Close all active connections to ensure clean shutdown
+    // Second: Release dispatcher-held connection references via EnQueue
+    // (ClearConnections must run on the dispatcher thread to avoid racing TimerHandler)
+    for (auto& disp : socket_dispatchers_) {
+        disp->EnQueue([d = disp]() {
+            d->ClearConnections();
+        });
+    }
+
+    // Third: Close all active connections — actually close the channels/fds,
+    // not just drop shared_ptrs (EpollHandler::channel_map_ would keep channels alive)
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
+        for (auto& pair : connections_) {
+            if (pair.second) {
+                pair.second->CallCloseCb();
+            }
+        }
         connections_.clear();
     }
 
-    // Third: Stop all event loops (now with no active connections)
+    // Fourth: Stop all event loops (now with no active connections)
     for(auto task : socket_dispatchers_)
         task -> StopEventLoop();
     conn_dispatcher_->StopEventLoop();
 
-    // Fourth: Now safe to join worker threads
+    // Fifth: Now safe to join worker threads
     sock_workers_.Stop();
 }
 

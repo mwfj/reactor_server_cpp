@@ -78,6 +78,7 @@ public:
     void EnQueue(std::function<void()>);
     void AddConnection(std::shared_ptr<ConnectionHandler>);
     void RemoveTimerConnection(int fd);
+    void ClearConnections();
 
     void SetTimerCB(CALLBACKS_NAMESPACE::DispatcherTimerCallback);
     void SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCallback);

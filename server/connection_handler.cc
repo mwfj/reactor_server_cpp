@@ -69,6 +69,14 @@ void ConnectionHandler::OnMessage(){
         }
     }
 
+    // If a previous SSL_write returned WANT_READ, the next readable event
+    // must retry that write instead of doing a new SSL_read.
+    if (tls_write_wants_read_) {
+        tls_write_wants_read_ = false;
+        CallWriteCb();  // Retry the pending write
+        return;
+    }
+
     char buffer[MAX_BUFFER_SIZE];
     while(true){
         memset(buffer, 0, sizeof buffer);
@@ -77,7 +85,14 @@ void ConnectionHandler::OnMessage(){
         if (tls_state_ == TlsState::READY) {
             nread = tls_->Read(buffer, sizeof buffer);
             if (nread == 0) {
-                // Would block (WANT_READ/WANT_WRITE)
+                // WANT_READ — wait for more data (already in read mode)
+                break;
+            }
+            if (nread == -3) {
+                // WANT_WRITE — SSL needs write readiness to complete this read
+                // (renegotiation/key update). Set flag so CallWriteCb retries the read.
+                tls_read_wants_write_ = true;
+                client_channel_->EnableWriteMode();
                 break;
             }
             if (nread == -2) {
@@ -255,12 +270,25 @@ void ConnectionHandler::CallErroCb(){
 
     if (callbacks_.error_callback)
         callbacks_.error_callback(shared_from_this());
+
+    // Close the connection after error notification.
+    // Without this, the fd stays registered in epoll and leaks.
+    CallCloseCb();
 }
 
 void ConnectionHandler::CallWriteCb(){
     // Check if channel is closed or write mode disabled (can happen during shutdown)
     if(!client_channel_ || client_channel_->is_channel_closed() || !client_channel_->isEnableWriteMode()) {
         return; // Silently ignore - channel is closing or already closed
+    }
+
+    // If a previous SSL_read returned WANT_WRITE, the next writable event
+    // must retry that read instead of doing a normal write.
+    if (tls_read_wants_write_) {
+        tls_read_wants_write_ = false;
+        client_channel_->DisableWriteMode();
+        OnMessage();  // Retry the pending read
+        return;
     }
 
     // TLS handshake WANT_WRITE handling
@@ -292,7 +320,14 @@ void ConnectionHandler::CallWriteCb(){
     int write_sz;
     if (tls_state_ == TlsState::READY) {
         write_sz = tls_->Write(output_bf_.Data(), output_bf_.Size());
-        if (write_sz == 0) return;  // Would block, try again later
+        if (write_sz == 0) return;  // WANT_WRITE — try again on next EPOLLOUT
+        if (write_sz == -3) {
+            // WANT_READ — SSL needs read readiness to complete this write
+            // (renegotiation/key update). Set flag so OnMessage retries the write.
+            tls_write_wants_read_ = true;
+            client_channel_->EnableReadMode();
+            return;
+        }
         if (write_sz < 0) {
             // TLS write error — use CallCloseCb for proper cleanup
             CallCloseCb();

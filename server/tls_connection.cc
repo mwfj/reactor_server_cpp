@@ -39,28 +39,26 @@ int TlsConnection::DoHandshake() {
     }
 }
 
+// Returns: >0 bytes read, 0=want_read, -3=want_write, -2=peer close, -1=error
 int TlsConnection::Read(char* buf, size_t len) {
     int ret = SSL_read(ssl_, buf, static_cast<int>(len));
     if (ret > 0) return ret;
 
     int err = SSL_get_error(ssl_, ret);
-    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-        return 0;  // Would block
-    }
-    if (err == SSL_ERROR_ZERO_RETURN) {
-        return -2;  // Peer closed TLS connection cleanly (close_notify received)
-    }
+    if (err == SSL_ERROR_WANT_READ) return 0;    // Need more read data
+    if (err == SSL_ERROR_WANT_WRITE) return -3;   // Need write readiness (renegotiation)
+    if (err == SSL_ERROR_ZERO_RETURN) return -2;   // Peer closed cleanly
     return -1;  // Error
 }
 
+// Returns: >0 bytes written, 0=want_write, -3=want_read, -1=error
 int TlsConnection::Write(const char* buf, size_t len) {
     int ret = SSL_write(ssl_, buf, static_cast<int>(len));
     if (ret > 0) return ret;
 
     int err = SSL_get_error(ssl_, ret);
-    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-        return 0;  // Would block
-    }
+    if (err == SSL_ERROR_WANT_WRITE) return 0;    // Need write readiness
+    if (err == SSL_ERROR_WANT_READ) return -3;     // Need read readiness (renegotiation)
     return -1;  // Error
 }
 

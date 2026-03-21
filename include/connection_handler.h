@@ -35,6 +35,11 @@ private:
     enum class TlsState { NONE, HANDSHAKE, READY };
     TlsState tls_state_ = TlsState::NONE;
     std::unique_ptr<TlsConnection> tls_;
+    // TLS renegotiation/key-update retry flags:
+    // When SSL_read returns WANT_WRITE, we must retry the read on the next writable event.
+    // When SSL_write returns WANT_READ, we must retry the write on the next readable event.
+    bool tls_read_wants_write_ = false;
+    bool tls_write_wants_read_ = false;
 public:
     ConnectionHandler() = delete;
     ConnectionHandler(std::shared_ptr<Dispatcher>, std::unique_ptr<SocketHandler>);
