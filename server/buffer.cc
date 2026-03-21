@@ -5,8 +5,10 @@ void Buffer::Append(const char *data, size_t size){
 }
 
 void Buffer::AppendWithHead(const char *data, size_t size){
-    // Add header to store the length of the current string
-    buf_.append(reinterpret_cast<const char*>(&size), 4);
+    // Add 4-byte length header in network byte order (big-endian)
+    uint32_t len = static_cast<uint32_t>(size);
+    uint32_t net_len = htonl(len);
+    buf_.append(reinterpret_cast<const char*>(&net_len), 4);
     buf_.append(data, size);
 }
 

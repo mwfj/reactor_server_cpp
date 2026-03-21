@@ -142,7 +142,11 @@ void Dispatcher::RunEventLoop(){
             TimerHandler();
         }
 
-    }
+    } // end of while(is_running())
+
+    // Final drain: process any tasks enqueued during shutdown
+    // (e.g., CallCloseCb enqueued from NetServer::Stop on a different thread)
+    HandleEventId();
 }
 
 void Dispatcher::StopEventLoop(){

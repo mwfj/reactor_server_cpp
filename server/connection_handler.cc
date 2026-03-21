@@ -304,10 +304,34 @@ void ConnectionHandler::CallCloseCb(){
     // IMPORTANT: Capture shared_ptr to self to keep this alive during callback
     std::shared_ptr<ConnectionHandler> self = shared_from_this();
 
-    // Note: We don't call SSL_shutdown() here because it requires I/O on a non-blocking
-    // socket which can block during teardown. The fd close will send TCP RST which is
-    // acceptable for server-side shutdown. For clean TLS shutdown, call Shutdown() explicitly
-    // before triggering close.
+    // If off the dispatcher thread and the dispatcher is still running,
+    // enqueue the close so EPOLL_CTL_DEL and ::close(fd) happen atomically
+    // on the loop thread (prevents fd-reuse races).
+    if (event_dispatcher_ && !event_dispatcher_->is_on_loop_thread()
+        && !event_dispatcher_->was_stopped()) {
+        event_dispatcher_->EnQueue([self]() {
+            // Best-effort TLS close_notify (phase 1 only -- don't wait for peer reply)
+            if (self->tls_state_ == TlsState::READY && self->tls_) {
+                self->tls_->Shutdown();
+                self->tls_state_ = TlsState::NONE;
+            }
+            if (self->client_channel_ && !self->client_channel_->is_channel_closed()) {
+                self->client_channel_->CloseChannel();
+            }
+            if (self->callbacks_.close_callback)
+                self->callbacks_.close_callback(self);
+            if (self->sock_) self->sock_->ReleaseFd();
+        });
+        return;
+    }
+
+    // On-thread or dispatcher stopped: execute inline
+
+    // Best-effort TLS close_notify (phase 1 only -- don't wait for peer reply)
+    if (tls_state_ == TlsState::READY && tls_) {
+        tls_->Shutdown();
+        tls_state_ = TlsState::NONE;
+    }
 
     // Close the channel to clean up fd and remove from epoll.
     // CloseChannel() calls ::close(fd) and sets Channel::fd_ = -1.
@@ -334,11 +358,40 @@ void ConnectionHandler::CallErroCb(){
 
     std::shared_ptr<ConnectionHandler> self = shared_from_this();
 
-    // Notify error handler (NOT close handler — avoid duplicate callbacks)
+    // If off the dispatcher thread and the dispatcher is still running,
+    // enqueue the error handling so EPOLL_CTL_DEL and ::close(fd) happen
+    // atomically on the loop thread (prevents fd-reuse races).
+    if (event_dispatcher_ && !event_dispatcher_->is_on_loop_thread()
+        && !event_dispatcher_->was_stopped()) {
+        event_dispatcher_->EnQueue([self]() {
+            if (self->callbacks_.error_callback)
+                self->callbacks_.error_callback(self);
+            // Best-effort TLS close_notify (phase 1 only)
+            if (self->tls_state_ == TlsState::READY && self->tls_) {
+                self->tls_->Shutdown();
+                self->tls_state_ = TlsState::NONE;
+            }
+            if (self->client_channel_ && !self->client_channel_->is_channel_closed()) {
+                self->client_channel_->CloseChannel();
+            }
+            if (self->sock_) self->sock_->ReleaseFd();
+        });
+        return;
+    }
+
+    // On-thread or dispatcher stopped: execute inline
+
+    // Notify error handler (NOT close handler -- avoid duplicate callbacks)
     if (callbacks_.error_callback)
         callbacks_.error_callback(self);
 
-    // Close the channel and release fd — same cleanup as CallCloseCb
+    // Best-effort TLS close_notify (phase 1 only)
+    if (tls_state_ == TlsState::READY && tls_) {
+        tls_->Shutdown();
+        tls_state_ = TlsState::NONE;
+    }
+
+    // Close the channel and release fd -- same cleanup as CallCloseCb
     // but without firing the close callback (which would be a second notification)
     if(client_channel_ && !client_channel_->is_channel_closed()){
         client_channel_->CloseChannel();

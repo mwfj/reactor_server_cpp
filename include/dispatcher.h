@@ -60,6 +60,7 @@ public:
     void RunEventLoop();
     void StopEventLoop();
     bool is_running() const {return is_running_.load(std::memory_order_acquire);}
+    bool was_stopped() const { return was_stopped_.load(std::memory_order_acquire); }
     bool is_on_loop_thread() const {
         std::thread::id tid = thread_id_.load(std::memory_order_acquire);
         if (tid == std::thread::id{}) return false;  // not yet running -> assume off-thread
