@@ -60,8 +60,11 @@ void Dispatcher::Init() {
     wake_channel_->SetReadCallBackFn(std::bind(&Dispatcher::HandleEventId, this));
     wake_channel_->EnableReadMode();
 
-    // Only initialize timer if this is a socket dispatcher with timeout configured
-    if (is_sock_dispatcher_ && timeout_.count() > 0) {
+    // Initialize timer for socket dispatchers.
+    // Timer is needed for both idle timeout (timeout_.count() > 0) and request
+    // deadline scanning (has_deadline_ per-connection). Always create when
+    // end_t_ > 0 (scan interval configured), even if idle timeout is disabled.
+    if (is_sock_dispatcher_ && end_t_ > 0) {
         timer_fd_ = TimeStamp::GenTimerFd(timeout_, std::chrono::nanoseconds(0));
         // Guard against platforms where GenTimerFd returns -1 (e.g., macOS)
         if (timer_fd_ >= 0) {
@@ -101,7 +104,7 @@ void Dispatcher::RunEventLoop(){
             }
             // Fallback timer for platforms without timerfd (macOS):
             // Must also run here so idle connections are caught even with no traffic.
-            if (is_sock_dispatcher_ && timer_fd_ < 0 && timeout_.count() > 0) {
+            if (is_sock_dispatcher_ && timer_fd_ < 0 && end_t_ > 0) {
                 TimerHandler();
             }
             continue;
@@ -126,7 +129,7 @@ void Dispatcher::RunEventLoop(){
         // Fallback timer for platforms without timerfd (macOS):
         // Run TimerHandler after processing events so it works even under load.
         // WaitForEvent has a 1s timeout, so this runs approximately once per second.
-        if (is_sock_dispatcher_ && timer_fd_ < 0 && timeout_.count() > 0) {
+        if (is_sock_dispatcher_ && timer_fd_ < 0 && end_t_ > 0) {
             TimerHandler();
         }
 

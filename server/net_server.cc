@@ -59,11 +59,11 @@ void NetServer::Start(){
 
 // stop event loop
 void NetServer::Stop(){
-    // First: Stop the connection dispatcher so no more accept events fire,
-    // then destroy the acceptor. Stopping the dispatcher first ensures no
-    // pending accept callback can run after the Acceptor object is freed.
+    // First: Stop the connection dispatcher so no more accept events fire.
+    // Don't destroy acceptor_ here — the loop thread may still be executing
+    // a callback from the last WaitForEvent batch. The acceptor will be
+    // destroyed in ~NetServer after all threads have exited.
     conn_dispatcher_->StopEventLoop();
-    acceptor_.reset();
 
     // Second: Release dispatcher-held connection references via EnQueue
     // (ClearConnections must run on the dispatcher thread to avoid racing TimerHandler)

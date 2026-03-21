@@ -144,11 +144,18 @@ void ConnectionHandler::OnMessage(){
         input_bf_.Clear();
     }
 
-    // If peer sent EOF, use CloseAfterWrite so any queued response can flush
-    // before the connection is closed. If no data is buffered, CloseAfterWrite
-    // closes immediately.
+    // If peer sent EOF, defer the close. Don't call CloseAfterWrite immediately
+    // because async handlers (e.g., ReactorServer::ProcessMessage via task_workers_)
+    // may not have enqueued their response yet. Instead, just arm the flag —
+    // CallWriteCb will close after the response buffer drains.
+    // If no response is ever sent, the idle timeout will clean up.
     if (peer_closed) {
-        CloseAfterWrite();
+        close_after_write_.store(true, std::memory_order_release);
+        // If there IS already data buffered (synchronous response), enable write mode
+        // to trigger flush + close.
+        if (output_bf_.Size() > 0) {
+            client_channel_->EnableWriteMode();
+        }
     }
 }
 
