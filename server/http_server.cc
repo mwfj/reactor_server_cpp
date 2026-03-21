@@ -171,28 +171,40 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
 
 void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->debug("HTTP connection closed fd={}", conn->fd());
-    std::lock_guard<std::mutex> lck(conn_mtx_);
-    auto it = http_connections_.find(conn->fd());
-    if (it != http_connections_.end() && it->second->GetConnection() == conn) {
-        // Notify WebSocket close handler for transport-level disconnects
-        auto* ws = it->second->GetWebSocket();
+    std::shared_ptr<HttpConnectionHandler> http_conn;
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        auto it = http_connections_.find(conn->fd());
+        if (it != http_connections_.end() && it->second->GetConnection() == conn) {
+            http_conn = it->second;
+            http_connections_.erase(it);
+        }
+    }
+    // Notify WS close handler OUTSIDE the lock to prevent deadlock
+    if (http_conn) {
+        auto* ws = http_conn->GetWebSocket();
         if (ws && ws->IsOpen()) {
             ws->NotifyTransportClose();
         }
-        http_connections_.erase(it);
     }
 }
 
 void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->error("HTTP connection error fd={}", conn->fd());
-    std::lock_guard<std::mutex> lck(conn_mtx_);
-    auto it = http_connections_.find(conn->fd());
-    if (it != http_connections_.end() && it->second->GetConnection() == conn) {
-        auto* ws = it->second->GetWebSocket();
+    std::shared_ptr<HttpConnectionHandler> http_conn;
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        auto it = http_connections_.find(conn->fd());
+        if (it != http_connections_.end() && it->second->GetConnection() == conn) {
+            http_conn = it->second;
+            http_connections_.erase(it);
+        }
+    }
+    if (http_conn) {
+        auto* ws = http_conn->GetWebSocket();
         if (ws && ws->IsOpen()) {
             ws->NotifyTransportClose();
         }
-        http_connections_.erase(it);
     }
 }
 
@@ -213,8 +225,13 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
     }
 
     // Guard against fd-reuse: if the handler wraps a stale connection,
-    // replace it with a fresh one so the first request isn't dropped.
+    // notify the old WS handler and replace with a fresh one.
     if (http_conn->GetConnection() != conn) {
+        // Notify old WebSocket close handler before discarding
+        auto* old_ws = http_conn->GetWebSocket();
+        if (old_ws && old_ws->IsOpen()) {
+            old_ws->NotifyTransportClose();
+        }
         http_conn = std::make_shared<HttpConnectionHandler>(conn);
         SetupHandlers(http_conn);
         std::lock_guard<std::mutex> lck(conn_mtx_);

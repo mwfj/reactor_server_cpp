@@ -206,6 +206,11 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             throw std::invalid_argument(
                 "TLS is enabled but key_file is empty");
         }
+        if (config.tls.min_version != "1.2" && config.tls.min_version != "1.3") {
+            throw std::invalid_argument(
+                "Invalid tls.min_version: '" + config.tls.min_version +
+                "' (must be '1.2' or '1.3')");
+        }
     }
 }
 
