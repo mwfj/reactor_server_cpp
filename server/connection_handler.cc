@@ -144,18 +144,12 @@ void ConnectionHandler::OnMessage(){
         input_bf_.Clear();
     }
 
-    // If peer sent EOF, close the connection after flushing any pending response.
+    // If peer sent EOF, arm close_after_write. CallWriteCb or RDHUP handler
+    // will close the connection after any pending response flushes.
+    // Don't close immediately — async handlers may enqueue a response later.
     if (peer_closed) {
         close_after_write_.store(true, std::memory_order_release);
-        if (output_bf_.Size() > 0) {
-            // Data buffered — flush it, then close via close_after_write in CallWriteCb
-            client_channel_->EnableWriteMode();
-        } else {
-            // No data buffered. Close immediately — the application callback already
-            // ran and chose not to respond. For async handlers that enqueue later,
-            // DoSend/DoSendRaw will detect is_closing_ and skip.
-            CallCloseCb();
-        }
+        client_channel_->EnableWriteMode();
     }
 }
 
@@ -206,6 +200,7 @@ void ConnectionHandler::DoSend(const char *data, size_t size){
         if (tls_state_ != TlsState::HANDSHAKE) {
             if (written > 0) {
                 output_bf_.Erase(0, written);
+                ts_ = TimeStamp::Now();  // Refresh idle timeout on successful write
                 if (output_bf_.Size() == 0) {
                     return;  // All sent, no need for EPOLLOUT
                 }
@@ -261,6 +256,7 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
             written = ::send(fd(), data, size, SEND_FLAGS);
         }
         if (written > 0) {
+            ts_ = TimeStamp::Now();  // Refresh idle timeout on successful write
             if (static_cast<size_t>(written) == size) {
                 // All data sent immediately, no need to buffer
                 return;
@@ -290,10 +286,15 @@ void ConnectionHandler::CloseAfterWrite(){
 }
 
 void ConnectionHandler::CallCloseCb(){
+    // If close_after_write is armed and there's still data to flush,
+    // defer — CallWriteCb will close after the buffer drains.
+    if (close_after_write_.load(std::memory_order_acquire) && output_bf_.Size() > 0) {
+        return;
+    }
+
     // Prevent duplicate close callbacks with atomic compare-exchange
     bool expected = false;
     if (!is_closing_.compare_exchange_strong(expected, true)) {
-        // Already closing, return immediately to prevent duplicate callbacks
         return;
     }
 

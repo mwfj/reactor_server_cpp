@@ -28,6 +28,7 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
 }
 
 NetServer::~NetServer(){
+    Stop();
     socket_dispatchers_.clear();
     connections_.clear();
 }
