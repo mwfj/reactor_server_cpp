@@ -66,8 +66,14 @@ HttpServer::HttpServer(const ServerConfig& config)
 
     if (config.tls.enabled) {
         tls_ctx_ = std::make_unique<TlsContext>(config.tls.cert_file, config.tls.key_file);
-        if (config.tls.min_version == "1.3") {
+        if (config.tls.min_version == "1.2") {
+            // Default — already set in TlsContext constructor
+        } else if (config.tls.min_version == "1.3") {
             tls_ctx_->SetMinProtocolVersion(TLS1_3_VERSION);
+        } else {
+            throw std::runtime_error(
+                "Unsupported tls.min_version: '" + config.tls.min_version +
+                "' (must be '1.2' or '1.3')");
         }
         net_server_.SetTlsContext(tls_ctx_.get());
     }
@@ -200,8 +206,14 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         }
     }
 
-    // Guard against fd-reuse: verify the handler still wraps the same connection
-    if (http_conn->GetConnection() != conn) return;
+    // Guard against fd-reuse: if the handler wraps a stale connection,
+    // replace it with a fresh one so the first request isn't dropped.
+    if (http_conn->GetConnection() != conn) {
+        http_conn = std::make_shared<HttpConnectionHandler>(conn);
+        SetupHandlers(http_conn);
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        http_connections_[conn->fd()] = http_conn;
+    }
 
     http_conn->OnRawData(conn, message);
 }

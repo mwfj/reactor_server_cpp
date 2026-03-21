@@ -35,6 +35,11 @@ void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
 }
 
 void HttpConnectionHandler::CloseConnection() {
+    // Always clear deadline/timeout state before closing to prevent
+    // stale timer callbacks from firing during the close flush.
+    request_in_progress_ = false;
+    conn_->ClearDeadline();
+    conn_->SetDeadlineTimeoutCb(nullptr);
     conn_->CloseAfterWrite();
 }
 
@@ -206,6 +211,12 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 HttpResponse response;
                 request_handler_(shared_from_this(), req, response);
                 SendResponse(response);
+
+                // If SendResponse triggered a connection close (e.g., EPIPE),
+                // stop processing pipelined requests.
+                if (conn_->IsClosing()) {
+                    return;
+                }
 
                 // Close if request is non-keep-alive OR response sets Connection: close.
                 // Check case-insensitively for both the header name and value.
