@@ -15,7 +15,7 @@ private:
 public:
     Acceptor() = delete;
     Acceptor(std::shared_ptr<Dispatcher>, const std::string&, const size_t);
-    ~Acceptor() = default; // smart pointer will release the source
+    ~Acceptor();
 
     void NewConnection(); // process the request from client
 

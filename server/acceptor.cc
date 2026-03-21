@@ -20,6 +20,17 @@ Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _
     acceptor_channel_ -> EnableReadMode(); // let epoll_wait monitorting reading event
 }
 
+Acceptor::~Acceptor() {
+    // Close the channel first (removes from epoll + closes fd),
+    // then release fd from SocketHandler to prevent double-close.
+    if (acceptor_channel_ && !acceptor_channel_->is_channel_closed()) {
+        acceptor_channel_->CloseChannel();
+    }
+    if (servsock_) {
+        servsock_->ReleaseFd();
+    }
+}
+
 void Acceptor::SetNewConnCb(std::function<void(std::unique_ptr<SocketHandler>)> fn){
     new_conn_cb_ = fn;
 }

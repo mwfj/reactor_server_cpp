@@ -183,8 +183,8 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
     // Notify WS close handler OUTSIDE the lock to prevent deadlock
     if (http_conn) {
         auto* ws = http_conn->GetWebSocket();
-        if (ws && ws->IsOpen()) {
-            ws->NotifyTransportClose();
+        if (ws) {
+            ws->NotifyTransportClose();  // Checks is_open_ internally
         }
     }
 }
@@ -202,8 +202,8 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
     }
     if (http_conn) {
         auto* ws = http_conn->GetWebSocket();
-        if (ws && ws->IsOpen()) {
-            ws->NotifyTransportClose();
+        if (ws) {
+            ws->NotifyTransportClose();  // Checks is_open_ internally
         }
     }
 }
@@ -229,7 +229,7 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
     if (http_conn->GetConnection() != conn) {
         // Notify old WebSocket close handler before discarding
         auto* old_ws = http_conn->GetWebSocket();
-        if (old_ws && old_ws->IsOpen()) {
+        if (old_ws) {
             old_ws->NotifyTransportClose();
         }
         http_conn = std::make_shared<HttpConnectionHandler>(conn);

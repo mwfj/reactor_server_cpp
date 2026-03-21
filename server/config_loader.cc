@@ -115,10 +115,20 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
 // Helper: parse env var as int, throw descriptive error on invalid input
 static int EnvToInt(const char* val, const char* env_name) {
     try {
-        return std::stoi(val);
-    } catch (const std::exception&) {
+        size_t pos = 0;
+        int result = std::stoi(val, &pos);
+        // Reject trailing non-numeric characters (e.g., "8080junk")
+        if (pos != std::strlen(val)) {
+            throw std::runtime_error(
+                std::string("Invalid integer for ") + env_name + ": " + val);
+        }
+        return result;
+    } catch (const std::invalid_argument&) {
         throw std::runtime_error(
             std::string("Invalid integer for ") + env_name + ": " + val);
+    } catch (const std::out_of_range&) {
+        throw std::runtime_error(
+            std::string("Integer out of range for ") + env_name + ": " + val);
     }
 }
 
