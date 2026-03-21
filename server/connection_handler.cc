@@ -191,7 +191,40 @@ void ConnectionHandler::SendData(const char *data, size_t size){
 
 void ConnectionHandler::DoSend(const char *data, size_t size){
     // All buffer operations happen in socket dispatcher thread (thread-safe)
+    if (is_closing_) return;
+
+    // Prepend the 4-byte length header, then attempt direct send.
+    // This avoids the edge-triggered EPOLLOUT issue where a freshly writable
+    // socket won't generate a new event when EPOLLOUT is first registered.
     output_bf_.AppendWithHead(data, size);
+
+    if (output_bf_.Size() > 0) {
+        ssize_t written;
+        if (tls_state_ == TlsState::READY) {
+            written = tls_->Write(output_bf_.Data(), output_bf_.Size());
+            if (written == 0) {
+                written = -1;
+                errno = EAGAIN;
+            } else if (written == -3) {
+                tls_write_wants_read_ = true;
+                client_channel_->EnableReadMode();
+                written = -1;
+                errno = EAGAIN;
+            }
+        } else {
+            written = ::send(fd(), output_bf_.Data(), output_bf_.Size(), SEND_FLAGS);
+        }
+        if (written > 0) {
+            output_bf_.Erase(0, written);
+            if (output_bf_.Size() == 0) {
+                return;  // All sent, no need for EPOLLOUT
+            }
+        } else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            CallCloseCb();
+            return;
+        }
+    }
+
     client_channel_ -> EnableWriteMode();
 }
 

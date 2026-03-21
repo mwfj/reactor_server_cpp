@@ -155,9 +155,19 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 conn_->SetDeadlineTimeoutCb(nullptr);
 
                 // Route confirmed — send 101 Switching Protocols.
-                // Merge any headers set by middleware (e.g., Set-Cookie, auth tokens).
+                // Merge safe middleware headers (e.g., Set-Cookie, auth tokens).
+                // Skip headers that are mandatory parts of the 101 handshake response
+                // to avoid corruption.
                 HttpResponse upgrade_resp = WebSocketHandshake::Accept(req);
                 for (const auto& hdr : mw_response.GetHeaders()) {
+                    std::string key = hdr.first;
+                    std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+                    // Skip 101 mandatory headers and framing headers
+                    if (key == "connection" || key == "upgrade" ||
+                        key == "sec-websocket-accept" || key == "content-length" ||
+                        key == "transfer-encoding") {
+                        continue;
+                    }
                     upgrade_resp.Header(hdr.first, hdr.second);
                 }
                 SendResponse(upgrade_resp);
