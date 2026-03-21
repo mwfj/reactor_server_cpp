@@ -1,4 +1,5 @@
 #include "http/http_server.h"
+#include "config/config_loader.h"
 #include "ws/websocket_frame.h"
 #include "log/logger.h"
 #include <algorithm>
@@ -22,8 +23,14 @@ HttpServer::HttpServer(const std::string& ip, int port)
     WireNetServerCallbacks();
 }
 
+// Validate config before construction — throws on invalid values
+static const ServerConfig& ValidateConfig(const ServerConfig& config) {
+    ConfigLoader::Validate(config);
+    return config;
+}
+
 HttpServer::HttpServer(const ServerConfig& config)
-    : net_server_(config.bind_host, static_cast<size_t>(config.bind_port),
+    : net_server_(ValidateConfig(config).bind_host, static_cast<size_t>(config.bind_port),
                   // Timer scan interval: must be frequent enough to enforce BOTH timeouts.
                   // Use the smaller of (idle/6) and (request/3), with 1s floor.
                   // If either timeout is 0 (disabled), use the other for the calculation.

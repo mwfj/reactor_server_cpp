@@ -379,9 +379,19 @@ namespace HttpTests {
                 ssize_t n = recv(sockfd, buf, sizeof(buf) - 1, 0);
                 if (n > 0) {
                     response.append(buf, n);
-                    // Check if we have a complete HTTP response
-                    if (response.find("\r\n\r\n") != std::string::npos) {
-                        break;  // Got headers, good enough
+                    // Check if we have a complete response (headers + body)
+                    auto hdr_end = response.find("\r\n\r\n");
+                    if (hdr_end != std::string::npos) {
+                        // Parse Content-Length to know when body is complete
+                        size_t body_start = hdr_end + 4;
+                        size_t content_length = 0;
+                        auto cl_pos = response.find("Content-Length: ");
+                        if (cl_pos != std::string::npos && cl_pos < hdr_end) {
+                            content_length = std::stoul(response.substr(cl_pos + 16));
+                        }
+                        if (response.size() >= body_start + content_length) {
+                            break;  // Got full response
+                        }
                     }
                 } else {
                     break;  // Connection closed or error
@@ -527,12 +537,15 @@ namespace HttpTests {
                 }
                 close(sockfd);
 
-                // Should get 408 or at least connection closed
+                // Should get 408 or server-initiated close (EOF, n==0).
+                // n < 0 with EAGAIN/EWOULDBLOCK is a client-side timeout — doesn't count.
                 bool got_408 = response.find("408") != std::string::npos;
-                bool got_closed = (n == 0 || n < 0);  // EOF or error
-                if (!got_408 && !got_closed) {
+                bool got_server_close = (n == 0);  // EOF = server closed
+                if (!got_408 && !got_server_close) {
                     pass = false;
-                    err += "Slow request: expected 408 or close, got nothing; ";
+                    err += "Slow request: expected 408 or server close (EOF), got ";
+                    if (n < 0) err += "client timeout (not server action); ";
+                    else err += "unexpected data; ";
                 }
             }
 
