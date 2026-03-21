@@ -86,10 +86,11 @@ void Channel::HandleEvent() {
             callbacks_.read_callback();
     }
 
-    // Handle close events AFTER read (data has been consumed above).
-    // OnMessage handles read==0 (EOF) by dispatching buffered data then closing,
-    // so RDHUP/HUP only needs to act if OnMessage didn't already close.
-    if(events & (EVENT_RDHUP | EVENT_HUP)){
+    // Handle close events AFTER read.
+    // If READ was also set, OnMessage already handled EOF (dispatched buffered data
+    // and called CloseAfterWrite to defer close until the response flushes).
+    // Only act on RDHUP/HUP if there was NO concurrent read event.
+    if((events & (EVENT_RDHUP | EVENT_HUP)) && !(events & EVENT_READ)){
         if (!is_channel_closed()) {
             if(callbacks_.close_callback)
                 callbacks_.close_callback();

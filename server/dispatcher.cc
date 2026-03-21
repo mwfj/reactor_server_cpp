@@ -99,6 +99,11 @@ void Dispatcher::RunEventLoop(){
             if(callbacks_.timeout_trigger_callback){
                 callbacks_.timeout_trigger_callback(shared_from_this());
             }
+            // Fallback timer for platforms without timerfd (macOS):
+            // Must also run here so idle connections are caught even with no traffic.
+            if (is_sock_dispatcher_ && timer_fd_ < 0 && timeout_.count() > 0) {
+                TimerHandler();
+            }
             continue;
         }
 
