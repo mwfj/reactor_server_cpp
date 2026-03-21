@@ -127,7 +127,10 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 HttpResponse mw_response;
                 if (middleware_runner_) {
                     if (!middleware_runner_(req, mw_response)) {
-                        // Middleware rejected the request
+                        // Middleware rejected — default to 403 if no status was set
+                        if (mw_response.GetStatusCode() == 200 && mw_response.GetBody().empty()) {
+                            mw_response = HttpResponse::Forbidden();
+                        }
                         mw_response.Header("Connection", "close");
                         SendResponse(mw_response);
                         CloseConnection();
@@ -209,7 +212,15 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             // Normal HTTP request -- dispatch to handler
             if (request_handler_) {
                 HttpResponse response;
-                request_handler_(shared_from_this(), req, response);
+                try {
+                    request_handler_(shared_from_this(), req, response);
+                } catch (const std::exception& e) {
+                    response = HttpResponse::InternalError(e.what());
+                    response.Header("Connection", "close");
+                    SendResponse(response);
+                    CloseConnection();
+                    return;
+                }
 
                 // RFC 7231 §4.3.2: HEAD responses MUST NOT include a body,
                 // but MUST include the same headers as the GET response (including

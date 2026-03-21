@@ -32,7 +32,11 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     // Run middleware chain first
     for (const auto& mw : middlewares_) {
         if (!mw(request, response)) {
-            return true;  // Middleware short-circuited, response is set
+            // If middleware returned false but didn't set a status, default to 403
+            if (response.GetStatusCode() == 200 && response.GetBody().empty()) {
+                response = HttpResponse::Forbidden();
+            }
+            return true;
         }
     }
 

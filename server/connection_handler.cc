@@ -202,17 +202,21 @@ void ConnectionHandler::DoSend(const char *data, size_t size){
                 written = -1;
                 errno = EAGAIN;
             }
-        } else {
+        } else if (tls_state_ == TlsState::NONE) {
+            // No TLS — raw send
             written = ::send(fd(), output_bf_.Data(), output_bf_.Size(), SEND_FLAGS);
         }
-        if (written > 0) {
-            output_bf_.Erase(0, written);
-            if (output_bf_.Size() == 0) {
-                return;  // All sent, no need for EPOLLOUT
+        // tls_state_ == HANDSHAKE: skip direct send, data stays buffered
+        if (tls_state_ != TlsState::HANDSHAKE) {
+            if (written > 0) {
+                output_bf_.Erase(0, written);
+                if (output_bf_.Size() == 0) {
+                    return;  // All sent, no need for EPOLLOUT
+                }
+            } else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                CallCloseCb();
+                return;
             }
-        } else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            CallCloseCb();
-            return;
         }
     }
 
@@ -243,24 +247,21 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
     // If output buffer is empty, try sending directly first.
     // This avoids the edge-triggered EPOLLOUT issue where a freshly writable
     // socket won't generate a new event when EPOLLOUT is first registered.
-    if (output_bf_.Size() == 0) {
+    if (output_bf_.Size() == 0 && tls_state_ != TlsState::HANDSHAKE) {
         ssize_t written;
         if (tls_state_ == TlsState::READY) {
             written = tls_->Write(data, size);
             if (written == 0) {
-                // WANT_WRITE — fall through to buffering
                 written = -1;
                 errno = EAGAIN;
             } else if (written == -3) {
-                // WANT_READ — SSL needs read readiness (renegotiation/key update)
-                // Buffer the data and set retry flag so OnMessage retries the write
                 tls_write_wants_read_ = true;
                 client_channel_->EnableReadMode();
-                // Fall through to buffer the data
                 written = -1;
                 errno = EAGAIN;
             }
         } else {
+            // No TLS — raw send
             written = ::send(fd(), data, size, SEND_FLAGS);
         }
         if (written > 0) {
@@ -388,7 +389,10 @@ void ConnectionHandler::CallWriteCb(){
     }
 
     int write_sz;
-    if (tls_state_ == TlsState::READY) {
+    if (tls_state_ == TlsState::HANDSHAKE) {
+        // Don't write during handshake — data stays buffered until READY
+        return;
+    } else if (tls_state_ == TlsState::READY) {
         write_sz = tls_->Write(output_bf_.Data(), output_bf_.Size());
         if (write_sz == 0) return;  // WANT_WRITE — try again on next EPOLLOUT
         if (write_sz == -3) {

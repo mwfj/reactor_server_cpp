@@ -102,14 +102,12 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
     int infds = epoll_wait(epollfd_, events_, MAX_EVETN_NUMS, timeout);
 
     if(infds < 0){
+        if (errno == EINTR) {
+            // Interrupted by signal — not an error, just return empty
+            return channels;
+        }
         std::cout << "[Epoll Handler] epoll_wait() failed: " << strerror(errno) << std::endl;
         throw std::runtime_error("epoll_wait() failed");
-    }
-
-    // interruptted by other signal
-    if(errno == EINTR){
-        std::cout << "[Epoll Handler] epoll_wait() failed, iterruptted by other signal: " << strerror(errno) << std::endl;
-        throw std::runtime_error("epoll_wait() iterruptted by other signal");
     }
 
     // timeout or no events
