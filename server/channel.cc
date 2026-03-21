@@ -96,11 +96,13 @@ void Channel::HandleEvent() {
     }
 
     // Handle close events AFTER read AND write.
-    // If READ was also set, OnMessage already handled EOF (dispatched buffered data
-    // and armed close_after_write). If WRITE was also set, CallWriteCb flushed and
-    // may have closed via close_after_write. Only act if channel is still open.
+    // Only close if no other handler already dealt with it:
+    //   - READ set: OnMessage handled EOF, armed close_after_write for deferred close
+    //   - WRITE set: CallWriteCb flushed response, may have closed via close_after_write
+    // For RDHUP/HUP-only (no READ, no WRITE), close immediately.
     if(events & (EVENT_RDHUP | EVENT_HUP)){
-        if (!is_channel_closed()) {
+        bool handled_by_io = (events & EVENT_READ) || (events & EVENT_WRITE);
+        if (!handled_by_io && !is_channel_closed()) {
             if(callbacks_.close_callback)
                 callbacks_.close_callback();
             CloseChannel();
