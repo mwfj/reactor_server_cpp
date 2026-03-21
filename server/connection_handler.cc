@@ -283,6 +283,12 @@ void ConnectionHandler::CallWriteCb(){
         }
     }
 
+    // Nothing to write — can happen after TLS handshake completes with no queued data
+    if (output_bf_.Size() == 0) {
+        client_channel_->DisableWriteMode();
+        return;
+    }
+
     int write_sz;
     if (tls_state_ == TlsState::READY) {
         write_sz = tls_->Write(output_bf_.Data(), output_bf_.Size());

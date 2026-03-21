@@ -141,39 +141,58 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
 }
 
 void NetServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn){
+    // Capture fd BEFORE any cleanup that might invalidate it (CallCloseCb → ReleaseFd)
+    // Note: HandleCloseConnection is called FROM CallCloseCb, so fd() should still be
+    // valid at this point (ReleaseFd runs after the callback). But under fd-reuse the
+    // number could belong to a new connection, so we verify identity.
+    int close_fd = conn->fd();
+
     if(callbacks_.close_conn_callback)
         callbacks_.close_conn_callback(conn);
 
-    std::cout << "[NetServer] client fd: " << conn -> fd() << " disconnected." << std::endl;
+    std::cout << "[NetServer] client fd: " << close_fd << " disconnected." << std::endl;
 
-    // Remove from dispatcher's timer map
-    int idx = conn->fd() % sock_workers_.GetThreadWorkerNum();
-    int close_fd = conn->fd();
+    // Remove from dispatcher's timer map using captured fd
+    int idx = close_fd % sock_workers_.GetThreadWorkerNum();
     auto dispatcher = socket_dispatchers_[idx];
     dispatcher->EnQueue([close_fd, dispatcher]() {
         dispatcher->RemoveTimerConnection(close_fd);
     });
 
-    RemoveConnection(conn -> fd());
-    // close this connection
+    // Remove from connections_ map with identity check to avoid removing a reused fd
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        auto it = connections_.find(close_fd);
+        if (it != connections_.end() && it->second == conn) {
+            connections_.erase(it);
+        }
+    }
     conn.reset();
 }
 
 void NetServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn){
+    int close_fd = conn->fd();
+
     if(callbacks_.error_callback)
         callbacks_.error_callback(conn);
 
-    std::cout << "[NetServer] client fd: " << conn -> fd() << "error occurred, disconnect." << std::endl;
+    std::cout << "[NetServer] client fd: " << close_fd << " error occurred, disconnect." << std::endl;
 
-    // Remove from dispatcher's timer map
-    int idx = conn->fd() % sock_workers_.GetThreadWorkerNum();
-    int close_fd = conn->fd();
+    // Remove from dispatcher's timer map using captured fd
+    int idx = close_fd % sock_workers_.GetThreadWorkerNum();
     auto dispatcher = socket_dispatchers_[idx];
     dispatcher->EnQueue([close_fd, dispatcher]() {
         dispatcher->RemoveTimerConnection(close_fd);
     });
 
-    RemoveConnection(conn -> fd());
+    // Remove from connections_ map with identity check
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        auto it = connections_.find(close_fd);
+        if (it != connections_.end() && it->second == conn) {
+            connections_.erase(it);
+        }
+    }
     conn.reset();
 }
 

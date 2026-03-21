@@ -22,8 +22,20 @@ HttpServer::HttpServer(const std::string& ip, int port)
 
 HttpServer::HttpServer(const ServerConfig& config)
     : net_server_(config.bind_host, static_cast<size_t>(config.bind_port),
-                  std::max(config.idle_timeout_sec / 6, 1),  // scan interval: 1/6 of timeout, min 1s
-                  std::chrono::seconds(config.idle_timeout_sec),
+                  // Timer scan interval: must be frequent enough to enforce BOTH timeouts.
+                  // Use the smaller of (idle/6) and (request/3), with 1s floor.
+                  // If either timeout is 0 (disabled), use the other for the calculation.
+                  [&]() -> int {
+                      int idle_interval = config.idle_timeout_sec > 0
+                          ? std::max(config.idle_timeout_sec / 6, 1) : 0;
+                      int req_interval = config.request_timeout_sec > 0
+                          ? std::max(config.request_timeout_sec / 3, 1) : 0;
+                      if (idle_interval == 0 && req_interval == 0) return 60;  // both disabled
+                      if (idle_interval == 0) return req_interval;
+                      if (req_interval == 0) return idle_interval;
+                      return std::min(idle_interval, req_interval);
+                  }(),
+                  std::chrono::seconds(config.idle_timeout_sec > 0 ? config.idle_timeout_sec : 86400),
                   config.worker_threads)
 {
     WireNetServerCallbacks();
