@@ -46,14 +46,26 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
     if (j.contains("worker_threads") && j["worker_threads"].is_number_integer()) {
         config.worker_threads = j["worker_threads"].get<int>();
     }
-    if (j.contains("max_header_size") && j["max_header_size"].is_number_unsigned()) {
-        config.max_header_size = j["max_header_size"].get<size_t>();
+    if (j.contains("max_header_size")) {
+        if (j["max_header_size"].is_number_unsigned()) {
+            config.max_header_size = j["max_header_size"].get<size_t>();
+        } else if (j["max_header_size"].is_number_integer()) {
+            throw std::runtime_error("max_header_size must be non-negative");
+        }
     }
-    if (j.contains("max_body_size") && j["max_body_size"].is_number_unsigned()) {
-        config.max_body_size = j["max_body_size"].get<size_t>();
+    if (j.contains("max_body_size")) {
+        if (j["max_body_size"].is_number_unsigned()) {
+            config.max_body_size = j["max_body_size"].get<size_t>();
+        } else if (j["max_body_size"].is_number_integer()) {
+            throw std::runtime_error("max_body_size must be non-negative");
+        }
     }
-    if (j.contains("max_ws_message_size") && j["max_ws_message_size"].is_number_unsigned()) {
-        config.max_ws_message_size = j["max_ws_message_size"].get<size_t>();
+    if (j.contains("max_ws_message_size")) {
+        if (j["max_ws_message_size"].is_number_unsigned()) {
+            config.max_ws_message_size = j["max_ws_message_size"].get<size_t>();
+        } else if (j["max_ws_message_size"].is_number_integer()) {
+            throw std::runtime_error("max_ws_message_size must be non-negative");
+        }
     }
     if (j.contains("request_timeout_sec") && j["request_timeout_sec"].is_number_integer()) {
         config.request_timeout_sec = j["request_timeout_sec"].get<int>();
@@ -85,8 +97,12 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
         if (log.contains("file") && log["file"].is_string()) {
             config.log.file = log["file"].get<std::string>();
         }
-        if (log.contains("max_file_size") && log["max_file_size"].is_number_unsigned()) {
-            config.log.max_file_size = log["max_file_size"].get<size_t>();
+        if (log.contains("max_file_size")) {
+            if (log["max_file_size"].is_number_unsigned()) {
+                config.log.max_file_size = log["max_file_size"].get<size_t>();
+            } else if (log["max_file_size"].is_number_integer()) {
+                throw std::runtime_error("log.max_file_size must be non-negative");
+            }
         }
         if (log.contains("max_files") && log["max_files"].is_number_integer()) {
             config.log.max_files = log["max_files"].get<int>();

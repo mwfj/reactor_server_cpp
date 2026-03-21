@@ -144,21 +144,17 @@ void ConnectionHandler::OnMessage(){
         input_bf_.Clear();
     }
 
-    // If peer sent EOF, arm close_after_write so the connection closes after
-    // any response is flushed. Async handlers may enqueue a response later.
+    // If peer sent EOF, close the connection after flushing any pending response.
     if (peer_closed) {
         close_after_write_.store(true, std::memory_order_release);
         if (output_bf_.Size() > 0) {
-            // Data already buffered — flush it
+            // Data buffered — flush it, then close via close_after_write in CallWriteCb
             client_channel_->EnableWriteMode();
         } else {
-            // No data buffered. Set a short deadline (2s) so the connection closes
-            // promptly. This is enough time for async handlers (e.g., task_workers_)
-            // to enqueue a response, while not holding dead connections from
-            // health checks or fire-and-forget clients for too long.
-            if (!has_deadline_) {
-                SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(2));
-            }
+            // No data buffered. Close immediately — the application callback already
+            // ran and chose not to respond. For async handlers that enqueue later,
+            // DoSend/DoSendRaw will detect is_closing_ and skip.
+            CallCloseCb();
         }
     }
 }
@@ -181,10 +177,10 @@ void ConnectionHandler::SendData(const char *data, size_t size){
 }
 
 void ConnectionHandler::DoSend(const char *data, size_t size){
-    // All buffer operations happen in socket dispatcher thread (thread-safe)
     if (is_closing_) return;
 
     // Prepend the 4-byte length header, then attempt direct send.
+
     // This avoids the edge-triggered EPOLLOUT issue where a freshly writable
     // socket won't generate a new event when EPOLLOUT is first registered.
     output_bf_.AppendWithHead(data, size);
@@ -469,9 +465,11 @@ void ConnectionHandler::CallWriteCb(){
         }
     }
 
-    // Remove sent data
-    if(write_sz > 0)
+    // Remove sent data and refresh idle timestamp
+    if(write_sz > 0) {
         output_bf_.Erase(0, write_sz);
+        ts_ = TimeStamp::Now();  // Refresh idle timeout on successful write
+    }
 
     // If there's no data waiting to write, then unregister writing event
     if(output_bf_.Size() == 0){
