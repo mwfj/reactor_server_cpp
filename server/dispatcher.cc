@@ -123,9 +123,12 @@ void Dispatcher::RunEventLoop(){
             try {
                 ch->HandleEvent();
             } catch (const std::exception& e) {
-                // Log error but continue serving other clients
-                // Don't re-throw - just log and continue processing other events
+                // Log error and close the affected channel to avoid corrupted state.
+                // The connection's input buffer may have stale data from before the exception.
                 std::cerr << "[Dispatcher] Error handling event: " << e.what() << std::endl;
+                if (!ch->is_channel_closed()) {
+                    ch->CloseChannel();
+                }
             }
         }
 
@@ -273,6 +276,13 @@ void Dispatcher::ClearConnections(){
 
 void Dispatcher::RemoveTimerConnection(int fd) {
     connections_.erase(fd);
+}
+
+void Dispatcher::RemoveTimerConnectionIfMatch(int fd, std::shared_ptr<ConnectionHandler> conn) {
+    auto it = connections_.find(fd);
+    if (it != connections_.end() && (!conn || it->second == conn)) {
+        connections_.erase(it);
+    }
 }
 
 void Dispatcher::SetTimerCB(CALLBACKS_NAMESPACE::DispatcherTimerCallback fn){

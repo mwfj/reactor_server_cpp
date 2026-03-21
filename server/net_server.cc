@@ -176,11 +176,12 @@ void NetServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn){
 
     std::cout << "[NetServer] client fd: " << close_fd << " disconnected." << std::endl;
 
-    // Remove from dispatcher's timer map using captured fd
+    // Remove from dispatcher's timer map with identity check to avoid fd-reuse race
     int idx = close_fd % sock_workers_.GetThreadWorkerNum();
     auto dispatcher = socket_dispatchers_[idx];
-    dispatcher->EnQueue([close_fd, dispatcher]() {
-        dispatcher->RemoveTimerConnection(close_fd);
+    std::weak_ptr<ConnectionHandler> weak_conn = conn;
+    dispatcher->EnQueue([close_fd, weak_conn, dispatcher]() {
+        dispatcher->RemoveTimerConnectionIfMatch(close_fd, weak_conn.lock());
     });
 
     // Remove from connections_ map with identity check to avoid removing a reused fd
@@ -202,11 +203,12 @@ void NetServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn){
 
     std::cout << "[NetServer] client fd: " << close_fd << " error occurred, disconnect." << std::endl;
 
-    // Remove from dispatcher's timer map using captured fd
+    // Remove from dispatcher's timer map with identity check to avoid fd-reuse race
     int idx = close_fd % sock_workers_.GetThreadWorkerNum();
     auto dispatcher = socket_dispatchers_[idx];
-    dispatcher->EnQueue([close_fd, dispatcher]() {
-        dispatcher->RemoveTimerConnection(close_fd);
+    std::weak_ptr<ConnectionHandler> weak_conn = conn;
+    dispatcher->EnQueue([close_fd, weak_conn, dispatcher]() {
+        dispatcher->RemoveTimerConnectionIfMatch(close_fd, weak_conn.lock());
     });
 
     // Remove from connections_ map with identity check

@@ -144,30 +144,16 @@ void ConnectionHandler::OnMessage(){
         input_bf_.Clear();
     }
 
-    // If peer sent EOF, defer the close to allow responses to flush.
+    // If peer sent EOF, arm close_after_write so the connection closes after
+    // any response is flushed. Don't close immediately — async handlers (e.g.,
+    // ReactorServer::ProcessMessage via task_workers_) may enqueue a response later.
+    // The connection will be cleaned up by:
+    //   1. CallWriteCb (after response data flushes via close_after_write_ flag)
+    //   2. Idle timeout (if no response is ever sent)
     if (peer_closed) {
         close_after_write_.store(true, std::memory_order_release);
         if (output_bf_.Size() > 0) {
-            // Data already buffered (synchronous response) — enable write mode to flush
             client_channel_->EnableWriteMode();
-        } else {
-            // No data buffered yet. Enqueue a deferred close check — this runs after
-            // any async handler's EnQueued SendData, since EnQueue is FIFO.
-            // If the handler sent data, CallWriteCb will flush + close.
-            // If no data was sent, close the connection.
-            std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
-            event_dispatcher_->EnQueue([weak_self]() {
-                if (auto self = weak_self.lock()) {
-                    if (self->close_after_write_.load(std::memory_order_acquire)
-                        && !self->is_closing_.load(std::memory_order_acquire)) {
-                        if (self->output_bf_.Size() > 0) {
-                            self->client_channel_->EnableWriteMode();
-                        } else {
-                            self->CallCloseCb();
-                        }
-                    }
-                }
-            });
         }
     }
 }
