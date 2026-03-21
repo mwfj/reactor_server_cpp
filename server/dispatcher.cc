@@ -99,11 +99,6 @@ void Dispatcher::RunEventLoop(){
             if(callbacks_.timeout_trigger_callback){
                 callbacks_.timeout_trigger_callback(shared_from_this());
             }
-            // Fallback timer for platforms without timerfd (macOS):
-            // Run TimerHandler periodically based on the event loop timeout
-            if (is_sock_dispatcher_ && timer_fd_ < 0 && timeout_.count() > 0) {
-                TimerHandler();
-            }
             continue;
         }
 
@@ -121,6 +116,13 @@ void Dispatcher::RunEventLoop(){
                 // Don't re-throw - just log and continue processing other events
                 std::cerr << "[Dispatcher] Error handling event: " << e.what() << std::endl;
             }
+        }
+
+        // Fallback timer for platforms without timerfd (macOS):
+        // Run TimerHandler after processing events so it works even under load.
+        // WaitForEvent has a 1s timeout, so this runs approximately once per second.
+        if (is_sock_dispatcher_ && timer_fd_ < 0 && timeout_.count() > 0) {
+            TimerHandler();
         }
 
     }

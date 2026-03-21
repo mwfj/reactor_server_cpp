@@ -122,7 +122,10 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
             conn->SetTlsConnection(std::move(tls));
         } catch (const std::exception& e) {
             std::cerr << "[NetServer] TLS setup failed for fd " << conn->fd() << ": " << e.what() << std::endl;
-            return;  // Don't add connection if TLS setup fails
+            // Close properly to avoid double-close: both Channel and SocketHandler
+            // hold the same fd. CallCloseCb closes the channel fd and releases from SocketHandler.
+            conn->CallCloseCb();
+            return;
         }
     }
 

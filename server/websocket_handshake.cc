@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <sstream>
 
 static const char* WS_MAGIC = "258EAFA5-E914-47DA-95CA-5AB611DC65B6";
 
@@ -29,20 +30,39 @@ bool WebSocketHandshake::Validate(const HttpRequest& request, std::string& error
         return false;
     }
 
-    // 4. Upgrade header contains "websocket"
+    // 4. Upgrade header must be exactly "websocket" (case-insensitive)
+    // RFC 6455 §4.2.1: the value is a single token, not a comma-separated list
     std::string upgrade = request.GetHeader("upgrade");
     std::transform(upgrade.begin(), upgrade.end(), upgrade.begin(), ::tolower);
-    if (upgrade.find("websocket") == std::string::npos) {
+    // Trim whitespace
+    while (!upgrade.empty() && upgrade.front() == ' ') upgrade.erase(upgrade.begin());
+    while (!upgrade.empty() && upgrade.back() == ' ') upgrade.pop_back();
+    if (upgrade != "websocket") {
         error_message = "Missing or invalid Upgrade header";
         return false;
     }
 
-    // 5. Connection header contains "Upgrade"
+    // 5. Connection header must contain "upgrade" as a token (not substring).
+    // Connection can be a comma-separated list like "keep-alive, Upgrade"
     std::string connection = request.GetHeader("connection");
     std::transform(connection.begin(), connection.end(), connection.begin(), ::tolower);
-    if (connection.find("upgrade") == std::string::npos) {
-        error_message = "Missing or invalid Connection header";
-        return false;
+    {
+        bool found_upgrade = false;
+        std::string token;
+        std::istringstream ss(connection);
+        while (std::getline(ss, token, ',')) {
+            // Trim whitespace from token
+            while (!token.empty() && token.front() == ' ') token.erase(token.begin());
+            while (!token.empty() && token.back() == ' ') token.pop_back();
+            if (token == "upgrade") {
+                found_upgrade = true;
+                break;
+            }
+        }
+        if (!found_upgrade) {
+            error_message = "Missing or invalid Connection header";
+            return false;
+        }
     }
 
     // 6. Sec-WebSocket-Key present and valid (base64-encoded 16 bytes → 24 chars with padding)
