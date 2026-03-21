@@ -63,6 +63,10 @@ public:
 
     void CloseChannel();
 
+    // Invoke the close callback to trigger full connection teardown
+    // (used by exception handler to route through CallCloseCb)
+    void InvokeCloseCallback();
+
     void SetReadCallBackFn(CALLBACKS_NAMESPACE::ChannelReadCallback);
     void SetWriteCallBackFn(CALLBACKS_NAMESPACE::ChannelWriteCallback);
     void SetCloseCallBackFn(CALLBACKS_NAMESPACE::ChannelCloseCallback);

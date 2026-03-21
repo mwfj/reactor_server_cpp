@@ -123,11 +123,14 @@ void Dispatcher::RunEventLoop(){
             try {
                 ch->HandleEvent();
             } catch (const std::exception& e) {
-                // Log error and close the affected channel to avoid corrupted state.
-                // The connection's input buffer may have stale data from before the exception.
+                // Log error and tear down via the close callback so server maps
+                // (connections_, http_connections_) are properly cleaned up.
+                // Just calling CloseChannel() would leave stale entries.
                 std::cerr << "[Dispatcher] Error handling event: " << e.what() << std::endl;
                 if (!ch->is_channel_closed()) {
-                    ch->CloseChannel();
+                    // Invoke the close callback (wired to ConnectionHandler::CallCloseCb
+                    // which handles channel close + server map cleanup + fd release)
+                    ch->InvokeCloseCallback();
                 }
             }
         }
@@ -279,8 +282,9 @@ void Dispatcher::RemoveTimerConnection(int fd) {
 }
 
 void Dispatcher::RemoveTimerConnectionIfMatch(int fd, std::shared_ptr<ConnectionHandler> conn) {
+    if (!conn) return;  // Original connection already destroyed — can't verify identity
     auto it = connections_.find(fd);
-    if (it != connections_.end() && (!conn || it->second == conn)) {
+    if (it != connections_.end() && it->second == conn) {
         connections_.erase(it);
     }
 }

@@ -117,6 +117,12 @@ void Channel::HandleEvent() {
     }
 }
 
+void Channel::InvokeCloseCallback() {
+    if (callbacks_.close_callback) {
+        callbacks_.close_callback();
+    }
+}
+
 void Channel::SetReadCallBackFn(CALLBACKS_NAMESPACE::ChannelReadCallback fn){
     callbacks_.read_callback = std::move(fn);
 }

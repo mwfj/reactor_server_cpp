@@ -145,15 +145,22 @@ void ConnectionHandler::OnMessage(){
     }
 
     // If peer sent EOF, arm close_after_write so the connection closes after
-    // any response is flushed. Don't close immediately — async handlers (e.g.,
-    // ReactorServer::ProcessMessage via task_workers_) may enqueue a response later.
-    // The connection will be cleaned up by:
-    //   1. CallWriteCb (after response data flushes via close_after_write_ flag)
-    //   2. Idle timeout (if no response is ever sent)
+    // any response is flushed. Async handlers may enqueue a response later.
     if (peer_closed) {
         close_after_write_.store(true, std::memory_order_release);
         if (output_bf_.Size() > 0) {
+            // Data already buffered — flush it
             client_channel_->EnableWriteMode();
+        } else {
+            // No data buffered. Set a short deadline so the connection closes
+            // promptly if no async handler sends a response. This covers:
+            //   - Fire-and-forget handlers that intentionally send no reply
+            //   - idle_timeout_sec == 0 configurations where idle timeout is disabled
+            // Async handlers that call SendData/SendRaw will arm EnableWriteMode,
+            // and CallWriteCb will close after flushing via the close_after_write_ flag.
+            if (!has_deadline_) {
+                SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(30));
+            }
         }
     }
 }
