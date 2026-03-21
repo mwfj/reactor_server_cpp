@@ -65,9 +65,15 @@ std::string HttpResponse::Serialize() const {
         }
     }
     if (!has_content_length &&
-        status_code_ >= 200 && status_code_ != 204 && status_code_ != 205 &&
+        status_code_ >= 200 && status_code_ != 204 &&
         status_code_ != 304 && status_code_ != 101) {
-        hdrs.emplace_back("Content-Length", std::to_string(body_.size()));
+        // 205 Reset Content: must have Content-Length: 0 for keep-alive framing
+        // All other eligible statuses: Content-Length = body size
+        if (status_code_ == 205) {
+            hdrs.emplace_back("Content-Length", "0");
+        } else {
+            hdrs.emplace_back("Content-Length", std::to_string(body_.size()));
+        }
     }
     for (const auto& kv : hdrs) {
         oss << kv.first << ": " << kv.second << "\r\n";

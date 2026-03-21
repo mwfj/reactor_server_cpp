@@ -211,16 +211,19 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 HttpResponse response;
                 request_handler_(shared_from_this(), req, response);
 
-                // RFC 7231 §4.3.2: HEAD responses MUST NOT include a body.
-                // Send headers only (Content-Length is preserved for client to know size).
+                // RFC 7231 §4.3.2: HEAD responses MUST NOT include a body,
+                // but MUST include the same headers as the GET response (including
+                // Content-Length reflecting the GET body size).
                 if (req.method == "HEAD") {
-                    // Serialize headers only — strip body
-                    HttpResponse head_resp;
-                    head_resp.Status(response.GetStatusCode());
-                    for (const auto& hdr : response.GetHeaders()) {
-                        head_resp.Header(hdr.first, hdr.second);
+                    // Serialize the full response to get auto-computed Content-Length,
+                    // then strip the body from the wire output.
+                    std::string wire = response.Serialize();
+                    // Find the end of headers (blank line)
+                    auto header_end = wire.find("\r\n\r\n");
+                    if (header_end != std::string::npos) {
+                        wire = wire.substr(0, header_end + 4);  // Include the blank line
                     }
-                    SendResponse(head_resp);
+                    conn_->SendRaw(wire.data(), wire.size());
                 } else {
                     SendResponse(response);
                 }

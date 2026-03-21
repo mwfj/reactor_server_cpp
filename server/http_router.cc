@@ -37,8 +37,11 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     }
 
     // Find matching route (exact path + method match)
+    // HEAD requests also match GET handlers (RFC 7231 §4.3.2)
     for (const auto& route : routes_) {
-        if (route.path == request.path && route.method == request.method) {
+        if (route.path == request.path &&
+            (route.method == request.method ||
+             (request.method == "HEAD" && route.method == "GET"))) {
             route.handler(request, response);
             return true;
         }
