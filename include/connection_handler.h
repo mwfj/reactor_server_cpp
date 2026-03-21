@@ -48,7 +48,8 @@ public:
     // Two-phase initialization: must be called after object is wrapped in shared_ptr
     void RegisterCallbacks();
 
-    int fd() const{ return sock_ -> fd(); }
+    int fd() const{ return sock_ ? sock_ -> fd() : -1; }
+    bool IsClosing() const { return is_closing_.load(std::memory_order_acquire); }
     const std::string& ip_addr() const { return sock_ -> ip_addr(); }
     int port() const { return sock_ -> port(); }
 

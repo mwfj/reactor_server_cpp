@@ -319,17 +319,12 @@ void Dispatcher::TimerHandler(){
         // Close timed-out connections.
         // Call deadline timeout callback first (allows HTTP layer to send 408),
         // then use CloseAfterWrite so the 408 response flushes before close.
-        // For connections without a deadline callback, close immediately.
+        // CloseAfterWrite → CallCloseCb → HandleCloseConnection handles
+        // identity-checked removal from NetServer::connections_.
+        // No separate timer callback needed (bare-fd removal is unsafe under fd reuse).
         for(auto& conn : timed_out_conns){
             conn->CallDeadlineTimeoutCb();
             conn->CloseAfterWrite();
-        }
-
-        // Also notify NetServer's timer callback for any additional cleanup
-        if(callbacks_.timer_callback){
-            for(int fd : timeout_fds){
-                callbacks_.timer_callback(fd);
-            }
         }
     }
 }

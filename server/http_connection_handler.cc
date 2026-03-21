@@ -155,6 +155,12 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 // Route confirmed — send 101 Switching Protocols
                 SendResponse(WebSocketHandshake::Accept(req));
 
+                // If the send failed (client disconnected), don't proceed with upgrade.
+                // SendRaw may have triggered CallCloseCb via EPIPE/ECONNRESET.
+                if (conn_->IsClosing()) {
+                    return;
+                }
+
                 // Create WebSocket connection
                 ws_conn_ = std::make_unique<WebSocketConnection>(conn_);
                 if (max_ws_message_size_ > 0) {
