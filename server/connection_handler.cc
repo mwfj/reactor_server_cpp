@@ -202,7 +202,15 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
         if (tls_state_ == TlsState::READY) {
             written = tls_->Write(data, size);
             if (written == 0) {
-                // Would block -- fall through to buffering
+                // WANT_WRITE — fall through to buffering
+                written = -1;
+                errno = EAGAIN;
+            } else if (written == -3) {
+                // WANT_READ — SSL needs read readiness (renegotiation/key update)
+                // Buffer the data and set retry flag so OnMessage retries the write
+                tls_write_wants_read_ = true;
+                client_channel_->EnableReadMode();
+                // Fall through to buffer the data
                 written = -1;
                 errno = EAGAIN;
             }

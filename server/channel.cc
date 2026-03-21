@@ -75,21 +75,27 @@ void Channel::HandleEvent() {
 
     const uint32_t events = devent_;
 
-    // Handle close events with highest priority
-    // If connection is closing, don't process other events
-    if(events & (EVENT_RDHUP | EVENT_HUP)){
-        if(callbacks_.close_callback)
-            callbacks_.close_callback();
-        CloseChannel();
-        return; // Don't process other events if closing
-    }
-
-    // Handle read events
+    // Handle read events BEFORE close events.
+    // When RDHUP arrives with EVENT_READ (client sends final bytes then closes),
+    // we must read the pending data first. ConnectionHandler::OnMessage() handles
+    // EOF (read==0) by dispatching buffered data then closing.
     if(events & (EVENT_READ | EVENT_PRI)){
         // Call Acceptor::NewConnection if it is acceptor channel
         // Call ConnectionHandler::OnMessage if it is client channel
         if(callbacks_.read_callback)
             callbacks_.read_callback();
+    }
+
+    // Handle close events AFTER read (data has been consumed above).
+    // OnMessage handles read==0 (EOF) by dispatching buffered data then closing,
+    // so RDHUP/HUP only needs to act if OnMessage didn't already close.
+    if(events & (EVENT_RDHUP | EVENT_HUP)){
+        if (!is_channel_closed()) {
+            if(callbacks_.close_callback)
+                callbacks_.close_callback();
+            CloseChannel();
+        }
+        return;
     }
 
     // Handle write events

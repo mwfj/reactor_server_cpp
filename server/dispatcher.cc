@@ -63,9 +63,12 @@ void Dispatcher::Init() {
     // Only initialize timer if this is a socket dispatcher with timeout configured
     if (is_sock_dispatcher_ && timeout_.count() > 0) {
         timer_fd_ = TimeStamp::GenTimerFd(timeout_, std::chrono::nanoseconds(0));
-        timer_channel_ = std::make_shared<Channel>(shared_from_this(), timer_fd_);
-        timer_channel_->SetReadCallBackFn(std::bind(&Dispatcher::TimerHandler, this));
-        timer_channel_->EnableReadMode();
+        // Guard against platforms where GenTimerFd returns -1 (e.g., macOS)
+        if (timer_fd_ >= 0) {
+            timer_channel_ = std::make_shared<Channel>(shared_from_this(), timer_fd_);
+            timer_channel_->SetReadCallBackFn(std::bind(&Dispatcher::TimerHandler, this));
+            timer_channel_->EnableReadMode();
+        }
     }
 }
 

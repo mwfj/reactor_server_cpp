@@ -66,15 +66,32 @@ WebSocketFrame WebSocketFrame::CloseFrame(uint16_t code, const std::string& reas
     f.payload += static_cast<char>(code & 0xFF);
 
     // Truncate reason to fit 123-byte limit, respecting UTF-8 boundaries.
-    // Walk backward from the limit to find a valid UTF-8 boundary.
+    // If byte at the cut point is a continuation byte (10xxxxxx), back up to
+    // the lead byte to avoid splitting a multi-byte codepoint.
     std::string trimmed_reason = reason;
     if (trimmed_reason.size() > 123) {
-        size_t max_len = 123;
-        // Back up past any continuation bytes (10xxxxxx) at the cut point
-        while (max_len > 0 && (static_cast<uint8_t>(trimmed_reason[max_len]) & 0xC0) == 0x80) {
-            --max_len;
+        size_t cut = 123;
+        // Back up if we'd split a multi-byte character
+        while (cut > 0 && (static_cast<uint8_t>(trimmed_reason[cut]) & 0xC0) == 0x80) {
+            --cut;
         }
-        trimmed_reason = trimmed_reason.substr(0, max_len);
+        // 'cut' now points to a lead byte — exclude it if it starts a multi-byte
+        // sequence that extends past byte 122
+        if (cut > 0) {
+            uint8_t lead = static_cast<uint8_t>(trimmed_reason[cut]);
+            size_t codepoint_len = 1;
+            if ((lead & 0xE0) == 0xC0) codepoint_len = 2;
+            else if ((lead & 0xF0) == 0xE0) codepoint_len = 3;
+            else if ((lead & 0xF8) == 0xF0) codepoint_len = 4;
+            if (cut + codepoint_len > 123) {
+                // This codepoint would be incomplete — exclude it
+                trimmed_reason = trimmed_reason.substr(0, cut);
+            } else {
+                trimmed_reason = trimmed_reason.substr(0, cut + codepoint_len);
+            }
+        } else {
+            trimmed_reason.clear();
+        }
     }
     f.payload += trimmed_reason;
 
