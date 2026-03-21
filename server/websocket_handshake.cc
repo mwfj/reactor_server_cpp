@@ -53,9 +53,20 @@ bool WebSocketHandshake::Validate(const HttpRequest& request, std::string& error
             return false;
         }
         // RFC 6455 §4.2.1: key must be base64 of 16 bytes = exactly 24 characters
+        // with valid base64 alphabet (A-Z, a-z, 0-9, +, /) and == padding
         if (key.size() != 24 || key[22] != '=' || key[23] != '=') {
             error_message = "Invalid Sec-WebSocket-Key: must be base64 of 16 bytes";
             return false;
+        }
+        // Validate first 22 characters are base64 alphabet
+        for (int i = 0; i < 22; i++) {
+            char c = key[i];
+            bool valid = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                         (c >= '0' && c <= '9') || c == '+' || c == '/';
+            if (!valid) {
+                error_message = "Invalid Sec-WebSocket-Key: contains non-base64 characters";
+                return false;
+            }
         }
     }
 

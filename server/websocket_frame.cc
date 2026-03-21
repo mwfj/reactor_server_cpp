@@ -49,15 +49,35 @@ WebSocketFrame WebSocketFrame::BinaryFrame(const std::string& data) {
 WebSocketFrame WebSocketFrame::CloseFrame(uint16_t code, const std::string& reason) {
     WebSocketFrame f;
     f.opcode = WebSocketOpcode::Close;
+
+    // RFC 6455 §7.4: only specific codes may appear on the wire.
+    // Valid: 1000-1003, 1007-1014 (IANA), 3000-4999 (private use).
+    // Invalid: 1004-1006, 1015, 1016-2999, >4999 — replace with 1000.
+    bool valid_code = (code >= 1000 && code <= 1003) ||
+                      (code >= 1007 && code <= 1014) ||
+                      (code >= 3000 && code <= 4999);
+    if (!valid_code) {
+        code = 1000;
+    }
+
     // Close frame payload: 2-byte status code + optional reason
     // RFC 6455 §5.5: control frame payload max 125 bytes (2 for code + up to 123 for reason)
     f.payload += static_cast<char>((code >> 8) & 0xFF);
     f.payload += static_cast<char>(code & 0xFF);
-    if (reason.size() > 123) {
-        f.payload += reason.substr(0, 123);
-    } else {
-        f.payload += reason;
+
+    // Truncate reason to fit 123-byte limit, respecting UTF-8 boundaries.
+    // Walk backward from the limit to find a valid UTF-8 boundary.
+    std::string trimmed_reason = reason;
+    if (trimmed_reason.size() > 123) {
+        size_t max_len = 123;
+        // Back up past any continuation bytes (10xxxxxx) at the cut point
+        while (max_len > 0 && (static_cast<uint8_t>(trimmed_reason[max_len]) & 0xC0) == 0x80) {
+            --max_len;
+        }
+        trimmed_reason = trimmed_reason.substr(0, max_len);
     }
+    f.payload += trimmed_reason;
+
     f.payload_length = f.payload.size();
     return f;
 }
