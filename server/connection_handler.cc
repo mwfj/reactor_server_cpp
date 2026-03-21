@@ -97,11 +97,11 @@ void ConnectionHandler::OnMessage(){
                 break;
             }
             if (nread == -2) {
-                // Peer closed TLS connection cleanly (close_notify)
-                // Use CallCloseCb (not CloseChannel) so NetServer/HttpServer
-                // connection maps are properly cleaned up
-                CallCloseCb();
-                return;  // Connection is closed, don't process any buffered data
+                // Peer closed TLS connection cleanly (close_notify).
+                // Break out of the read loop — dispatch any buffered data first,
+                // then the peer_closed flag will trigger CloseAfterWrite.
+                peer_closed = true;
+                break;
             }
         } else {
             nread = ::read(fd(), buffer, sizeof buffer);
@@ -144,9 +144,11 @@ void ConnectionHandler::OnMessage(){
         input_bf_.Clear();
     }
 
-    // If peer sent EOF, close now that buffered data has been dispatched
+    // If peer sent EOF, use CloseAfterWrite so any queued response can flush
+    // before the connection is closed. If no data is buffered, CloseAfterWrite
+    // closes immediately.
     if (peer_closed) {
-        CallCloseCb();
+        CloseAfterWrite();
     }
 }
 

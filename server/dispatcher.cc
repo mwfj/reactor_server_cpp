@@ -95,9 +95,14 @@ void Dispatcher::RunEventLoop(){
         // If no events, just continue loop (don't shutdown!)
         // The timeout is for periodic checking, not termination
         if(channels.size() == 0){
-            // Optional: Call timeout callback if set (but don't stop the loop)
+            // Call timeout callback if set
             if(callbacks_.timeout_trigger_callback){
                 callbacks_.timeout_trigger_callback(shared_from_this());
+            }
+            // Fallback timer for platforms without timerfd (macOS):
+            // Run TimerHandler periodically based on the event loop timeout
+            if (is_sock_dispatcher_ && timer_fd_ < 0 && timeout_.count() > 0) {
+                TimerHandler();
             }
             continue;
         }
