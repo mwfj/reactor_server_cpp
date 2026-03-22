@@ -11,6 +11,13 @@ private:
     std::unique_ptr<SocketHandler> servsock_;  // Sole owner of listening socket
     std::shared_ptr<Channel> acceptor_channel_;
 
+    // Reserved fd for the "idle fd trick" — when accept() fails with EMFILE
+    // (per-process fd limit), close this fd to make room for one accept,
+    // immediately close the accepted fd, then re-open the reserved fd.
+    // This drains the pending connection from the listen queue, preventing
+    // ET mode starvation where the server permanently stops accepting.
+    int idle_fd_ = -1;
+
     std::function<void(std::unique_ptr<SocketHandler>)> new_conn_cb_;
 public:
     Acceptor() = delete;

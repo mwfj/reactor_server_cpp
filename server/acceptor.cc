@@ -1,6 +1,8 @@
 #include "acceptor.h"
 #include "channel.h"
 
+#include <fcntl.h>
+
 // init server socket
 Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _ip, const size_t _port):
     event_dispatcher_(_dispatcher),
@@ -14,6 +16,9 @@ Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _
 
     servsock_->Bind(addr);
     servsock_->Listen(MAX_CONNECTIONS);
+
+    // Reserve one fd for the idle fd trick (EMFILE recovery).
+    idle_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
 
     acceptor_channel_ = std::shared_ptr<Channel>(new Channel(event_dispatcher_, servsock_ -> fd()));
     acceptor_channel_ -> SetReadCallBackFn(std::bind(&Acceptor::NewConnection, this));
@@ -29,6 +34,10 @@ Acceptor::~Acceptor() {
     if (servsock_) {
         servsock_->ReleaseFd();
     }
+    if (idle_fd_ >= 0) {
+        ::close(idle_fd_);
+        idle_fd_ = -1;
+    }
 }
 
 void Acceptor::CloseListenSocket() {
@@ -38,6 +47,10 @@ void Acceptor::CloseListenSocket() {
     if (servsock_) {
         servsock_->ReleaseFd();
     }
+    if (idle_fd_ >= 0) {
+        ::close(idle_fd_);
+        idle_fd_ = -1;
+    }
 }
 
 void Acceptor::SetNewConnCb(std::function<void(std::unique_ptr<SocketHandler>)> fn){
@@ -46,20 +59,10 @@ void Acceptor::SetNewConnCb(std::function<void(std::unique_ptr<SocketHandler>)> 
 
 // processing new connection from client
 void Acceptor::NewConnection(){
-    // CRITICAL FIX: Accept ALL pending connections in a loop
-    // When multiple clients connect simultaneously, they queue in the listen socket's backlog.
-    // Edge-triggered epoll only notifies ONCE, so we must drain the entire queue.
-    // Without this loop, only the first connection is accepted, and the rest timeout.
-    //
-    // Why this bug occurred:
-    // - 10 concurrent clients connect nearly simultaneously
-    // - All get queued in the listen socket
-    // - epoll triggers EPOLLIN once (edge-triggered)
-    // - Old code accepted only 1 connection and returned
-    // - Remaining 9 connections stayed in queue, never processed
-    // - Those clients timeout waiting for server response
-    //
-    // The fix: Loop until Accept() returns -1 (EAGAIN/EWOULDBLOCK)
+    // Accept ALL pending connections in a loop.
+    // Edge-triggered epoll only notifies ONCE, so we must drain the entire
+    // queue to EAGAIN. Returning before EAGAIN means no future EPOLLIN edge
+    // fires even after resources recover — permanent accept starvation.
     while(true){
         InetAddr client_addr;
         int client_fd = servsock_ -> Accept(client_addr);
@@ -72,8 +75,27 @@ void Acceptor::NewConnection(){
             continue;
         }
         if(client_fd == -3){
-            // Resource exhaustion — return to event loop, retry later
-            return;
+            // Resource exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM).
+            // Use the "idle fd trick": close a reserved fd to make room for
+            // one accept, immediately close the accepted connection (we can't
+            // serve it), then re-open the reserved fd. This drains one pending
+            // connection from the listen queue, preventing ET mode starvation
+            // where the server permanently stops accepting after a transient
+            // fd exhaustion event.
+            if (idle_fd_ >= 0) {
+                ::close(idle_fd_);
+                idle_fd_ = -1;
+            }
+            // Try to drain one connection with the freed fd slot
+            InetAddr discard_addr;
+            int discard_fd = servsock_->Accept(discard_addr);
+            if (discard_fd >= 0) {
+                ::close(discard_fd);  // Can't serve it — just drain the queue
+            }
+            // Re-reserve the fd for next time
+            idle_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+            // Continue loop to drain more or reach EAGAIN
+            continue;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));
         new_conn_cb_(std::move(client_sock));
