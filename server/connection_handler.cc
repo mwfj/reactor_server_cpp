@@ -140,7 +140,17 @@ void ConnectionHandler::OnMessage(){
         }
     }
 
+    // If peer sent EOF, arm close_after_write_ BEFORE the callback so that
+    // synchronous sends (DoSendRaw fast-path) see the flag and ForceClose
+    // immediately after flushing, without waiting for a post-callback check.
+    // This avoids the ordering issue where close_after_write_ is set AFTER
+    // the fast-path already checked it and returned.
+    if (peer_closed) {
+        close_after_write_.store(true, std::memory_order_release);
+    }
+
     // After reading all available data, call the application callback if data was received
+    bool callback_ran = false;
     if(input_bf_.Size() > 0 && callbacks_.on_message_callback){
         std::string message(input_bf_.Data(), input_bf_.Size());
         callbacks_.on_message_callback(shared_from_this(), message);
@@ -148,14 +158,31 @@ void ConnectionHandler::OnMessage(){
         ts_ = TimeStamp::Now();
         // Clear the input buffer after processing
         input_bf_.Clear();
+        callback_ran = true;
     }
 
-    // If peer sent EOF, close after any pending response is flushed.
-    // If the handler already sent a synchronous response (flushed via fast-path),
-    // the buffer is empty and CloseAfterWrite will ForceClose immediately.
-    // If data is still buffered, it will be drained by CallWriteCb first.
-    if (peer_closed) {
-        CloseAfterWrite();
+    // If peer sent EOF and connection isn't already closing (the sync fast-path
+    // in DoSendRaw/DoSend may have already ForceClose'd), handle the close.
+    if (peer_closed && !is_closing_.load(std::memory_order_acquire)) {
+        if (output_bf_.Size() > 0) {
+            // Data still being flushed — enable write mode to drain it.
+            // CallWriteCb will ForceClose when the buffer empties.
+            client_channel_->EnableWriteMode();
+        } else if (callback_ran) {
+            // Callback ran but buffer is empty and connection not closed.
+            // Possible cases:
+            // - Sync handler sent response, fast-path ForceClose'd → is_closing_ true
+            //   (caught above, won't reach here)
+            // - Async handler will send response later via SendData/SendRaw →
+            //   the fast-path there will see close_after_write_ and ForceClose.
+            //   Set a deadline in case the async handler never responds.
+            if (!has_deadline_) {
+                SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+            }
+        } else {
+            // No callback ran (EOF without data) — nothing to wait for.
+            ForceClose();
+        }
     }
 }
 
@@ -584,11 +611,31 @@ void ConnectionHandler::CallDeadlineTimeoutCb() {
 }
 
 void ConnectionHandler::SetDeadline(std::chrono::steady_clock::time_point deadline) {
-    has_deadline_ = true;
-    deadline_ = deadline;
+    if (event_dispatcher_ && event_dispatcher_->is_on_loop_thread()) {
+        // On the dispatcher thread — direct write (no race with IsTimeOut/TimerHandler).
+        has_deadline_ = true;
+        deadline_ = deadline;
+    } else {
+        // Off-thread (e.g., acceptor thread in HandleNewConnection).
+        // Route through EnQueue so has_deadline_/deadline_ are only written from the
+        // dispatcher thread, avoiding a data race with IsTimeOut on the timer thread.
+        // Only set if no deadline already armed — OnRawData may have already set a
+        // stricter per-request deadline before this queued task executes.
+        std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
+        event_dispatcher_->EnQueue([weak_self, deadline]() {
+            if (auto self = weak_self.lock()) {
+                if (!self->has_deadline_) {
+                    self->has_deadline_ = true;
+                    self->deadline_ = deadline;
+                }
+            }
+        });
+    }
 }
 
 void ConnectionHandler::ClearDeadline() {
+    // ClearDeadline is only called from OnRawData/CloseConnection (on dispatcher thread),
+    // so no off-thread routing is needed.
     has_deadline_ = false;
 }
 

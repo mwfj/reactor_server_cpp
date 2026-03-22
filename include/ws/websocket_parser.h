@@ -25,6 +25,13 @@ public:
     bool HasError() const { return has_error_; }
     std::string GetError() const { return error_message_; }
 
+    // Reset parser after an error so it can receive the peer's Close reply.
+    // Clears the error flag, discards any corrupt buffered data, and resets
+    // the state machine to ReadHeader. Must be called after sending Close
+    // in response to a parser error, otherwise Parse() is permanently stuck
+    // (the while loop checks !has_error_).
+    void ResetAfterError();
+
 private:
     enum class State {
         ReadHeader,

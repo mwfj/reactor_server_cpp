@@ -129,9 +129,11 @@ void WebSocketConnection::OnRawData(const std::string& data) {
             close_code = 1009;  // Message Too Big
         }
         SendClose(close_code, err_msg.substr(0, 123));
-        // No CloseAfterWrite here — SendClose arms a deadline for the close
-        // handshake. The peer's close reply (if any) is handled by ProcessFrame.
-        // If the peer doesn't reply, the deadline forces close via the timer.
+        // Reset the parser so it can receive the peer's Close reply.
+        // Without this, has_error_ stays latched and Parse() won't process
+        // any bytes, so the Close reply is silently dropped and the app
+        // gets 1006 (abnormal) instead of a clean close.
+        parser_.ResetAfterError();
         return;
     }
 }

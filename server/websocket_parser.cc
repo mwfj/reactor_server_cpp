@@ -183,6 +183,15 @@ done:
     return total_consumed;
 }
 
+void WebSocketParser::ResetAfterError() {
+    has_error_ = false;
+    error_message_.clear();
+    state_ = State::ReadHeader;
+    buffer_.clear();
+    current_ = WebSocketFrame{};
+    payload_read_ = 0;
+}
+
 WebSocketFrame WebSocketParser::NextFrame() {
     WebSocketFrame frame = std::move(completed_.front());
     completed_.pop_front();
