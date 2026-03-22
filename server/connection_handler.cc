@@ -195,11 +195,14 @@ void ConnectionHandler::DoSend(const char *data, size_t size){
     if (output_bf_.Size() > 0) {
         ssize_t written;
         if (tls_state_ == TlsState::READY) {
-            written = tls_->Write(output_bf_.Data(), output_bf_.Size());
+            size_t try_len = output_bf_.Size();
+            written = tls_->Write(output_bf_.Data(), try_len);
             if (written == 0) {
+                tls_pending_write_size_ = try_len;
                 written = -1;
                 errno = EAGAIN;
             } else if (written == -3) {
+                tls_pending_write_size_ = try_len;
                 tls_write_wants_read_ = true;
                 client_channel_->EnableReadMode();
                 written = -1;
@@ -264,9 +267,12 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
         if (tls_state_ == TlsState::READY) {
             written = tls_->Write(data, size);
             if (written == 0) {
+                // WANT_WRITE — data will be buffered below, record size for retry
+                tls_pending_write_size_ = size;
                 written = -1;
                 errno = EAGAIN;
             } else if (written == -3) {
+                tls_pending_write_size_ = size;
                 tls_write_wants_read_ = true;
                 client_channel_->EnableReadMode();
                 written = -1;
@@ -301,10 +307,17 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
 
 void ConnectionHandler::CloseAfterWrite(){
     close_after_write_.store(true, std::memory_order_release);
-    if (output_bf_.Size() == 0) {
-        ForceClose();
-    } else {
+    if (output_bf_.Size() > 0) {
+        // Data buffered — flush it, then close via CallWriteCb
         client_channel_ -> EnableWriteMode();
+    } else {
+        // No data buffered. Set a short deadline so the timer scan closes
+        // the connection if no async handler sends data. This avoids ET stalls
+        // (EnableWriteMode on already-writable socket) while giving async
+        // handlers (e.g., ReactorServer task workers) time to enqueue a response.
+        if (!has_deadline_) {
+            SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+        }
     }
 }
 
