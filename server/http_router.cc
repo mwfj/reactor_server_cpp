@@ -41,14 +41,21 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
         }
     }
 
-    // Find matching route (exact path + method match)
-    // HEAD requests also match GET handlers (RFC 7231 §4.3.2)
+    // Find matching route — exact method match first
     for (const auto& route : routes_) {
-        if (route.path == request.path &&
-            (route.method == request.method ||
-             (request.method == "HEAD" && route.method == "GET"))) {
+        if (route.path == request.path && route.method == request.method) {
             route.handler(request, response);
             return true;
+        }
+    }
+
+    // HEAD fallback: if no explicit HEAD handler, try GET (RFC 7231 §4.3.2)
+    if (request.method == "HEAD") {
+        for (const auto& route : routes_) {
+            if (route.path == request.path && route.method == "GET") {
+                route.handler(request, response);
+                return true;
+            }
         }
     }
 

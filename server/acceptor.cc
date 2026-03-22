@@ -55,8 +55,12 @@ void Acceptor::NewConnection(){
         InetAddr client_addr;
         int client_fd = servsock_ -> Accept(client_addr);
         if(client_fd == -1){
-            // No more connections available (EAGAIN in non-blocking mode)
+            // Queue drained (EAGAIN) — exit loop
             return;
+        }
+        if(client_fd == -2){
+            // Transient error (ECONNABORTED/EMFILE/etc.) — skip but keep draining
+            continue;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));
         new_conn_cb_(std::move(client_sock));

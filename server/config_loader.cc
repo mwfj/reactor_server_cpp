@@ -113,6 +113,10 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
     }
 
     // Log section
+    if (j.contains("log")) {
+        if (!j["log"].is_object())
+            throw std::runtime_error("log must be an object");
+    }
     if (j.contains("log") && j["log"].is_object()) {
         auto& log = j["log"];
         if (log.contains("level")) {

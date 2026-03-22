@@ -63,20 +63,14 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
     if(clientfd == -1){
         // Don't close listening socket on accept error
         if(errno == EAGAIN || errno == EWOULDBLOCK) {
-            // No connections available right now - not an error
+            // Queue drained — no more pending connections
             return -1;
         }
-        // On macOS under high load, we can get ECONNABORTED, EMFILE, ENFILE
-        // These should not crash the server - just log and return
+        // Transient errors: don't crash, but signal caller to keep draining
         if(errno == ECONNABORTED || errno == EMFILE || errno == ENFILE ||
            errno == ENOBUFS || errno == ENOMEM) {
-            // Temporary resource exhaustion - log but don't crash
-            // ECONNABORTED: Connection aborted before accept completed
-            // EMFILE: Process file descriptor limit reached
-            // ENFILE: System file descriptor limit reached
-            // ENOBUFS/ENOMEM: Insufficient resources
             std::cerr << "[Socket Handler] Accept failed (temporary): " << strerror(errno) << std::endl;
-            return -1;
+            return -2;  // Transient — more connections may be queued
         }
         std::cout << "[Socket Handler] Error occurred when accepting connection: " << strerror(errno) << std::endl;
         throw std::runtime_error(std::string("Error accepting connection: ") + strerror(errno));
