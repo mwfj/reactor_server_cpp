@@ -121,6 +121,7 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
 
             // Check for WebSocket upgrade
             if (req.upgrade && route_checker_) {
+                try {
                 // Run middleware before upgrade (auth, CORS, rate limiting, etc.)
                 // Hoist mw_response so successful middleware headers can be merged
                 // into the 101 response (e.g., Set-Cookie, auth tokens).
@@ -207,6 +208,21 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                     ws_conn_->OnRawData(trailing);
                 }
                 return;
+
+                } catch (const std::exception& e) {
+                    // Exception in middleware/upgrade handler — send appropriate error
+                    if (!upgraded_) {
+                        // Pre-101: send HTTP 500
+                        HttpResponse err = HttpResponse::InternalError(e.what());
+                        err.Header("Connection", "close");
+                        SendResponse(err);
+                    } else if (ws_conn_) {
+                        // Post-101: send WS close 1011 (Internal Error)
+                        ws_conn_->SendClose(1011, "Internal error");
+                    }
+                    CloseConnection();
+                    return;
+                }
             }
 
             // Normal HTTP request -- dispatch to handler

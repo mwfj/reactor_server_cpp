@@ -163,15 +163,29 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
 }
 
 void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
-    std::lock_guard<std::mutex> lck(conn_mtx_);
-    auto it = http_connections_.find(conn->fd());
-    if (it != http_connections_.end() && it->second->GetConnection() == conn) {
-        // Already created by HandleMessage lazy-init -- don't overwrite
-        return;
+    std::shared_ptr<HttpConnectionHandler> old_handler;
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        auto it = http_connections_.find(conn->fd());
+        if (it != http_connections_.end()) {
+            if (it->second->GetConnection() == conn) {
+                // Already created by HandleMessage lazy-init — don't overwrite
+                return;
+            }
+            // FD reused — save old handler for WS notification outside the lock
+            old_handler = it->second;
+        }
+        auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
+        SetupHandlers(http_conn);
+        http_connections_[conn->fd()] = http_conn;
     }
-    auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
-    SetupHandlers(http_conn);
-    http_connections_[conn->fd()] = http_conn;
+    // Notify old WS handler outside the lock to prevent deadlock
+    if (old_handler) {
+        auto* ws = old_handler->GetWebSocket();
+        if (ws) {
+            ws->NotifyTransportClose();
+        }
+    }
     logging::Get()->debug("New HTTP connection fd={} from {}:{}",
                           conn->fd(), conn->ip_addr(), conn->port());
 }
