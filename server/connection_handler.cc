@@ -150,12 +150,12 @@ void ConnectionHandler::OnMessage(){
         input_bf_.Clear();
     }
 
-    // If peer sent EOF, arm close_after_write. CallWriteCb or RDHUP handler
-    // will close the connection after any pending response flushes.
-    // Don't close immediately — async handlers may enqueue a response later.
+    // If peer sent EOF, defer close until any pending response is flushed.
+    // CloseAfterWrite handles both cases:
+    //   - Buffer has data → EnableWriteMode → CallWriteCb flushes then closes
+    //   - Buffer empty → ForceClose immediately (avoids ET stall)
     if (peer_closed) {
-        close_after_write_.store(true, std::memory_order_release);
-        client_channel_->EnableWriteMode();
+        CloseAfterWrite();
     }
 }
 

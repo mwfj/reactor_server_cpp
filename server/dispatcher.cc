@@ -150,9 +150,22 @@ void Dispatcher::RunEventLoop(){
 
     } // end of while(is_running())
 
-    // Final drain: process any tasks enqueued during shutdown
-    // (e.g., CallCloseCb enqueued from NetServer::Stop on a different thread)
-    HandleEventId();
+    // Final drain: process all tasks enqueued during shutdown.
+    // Loop because a task may EnQueue more work (e.g., close callback
+    // triggers timer removal which enqueues to this dispatcher).
+    // Note: EnQueue guards against was_stopped_, but tasks enqueued BEFORE
+    // was_stopped_ was set may themselves enqueue more work.
+    for (int drain_rounds = 0; drain_rounds < 10; ++drain_rounds) {
+        std::deque<std::function<void()>> tasks;
+        {
+            std::lock_guard<std::mutex> lck(mtx_);
+            if (task_que_.empty()) break;
+            tasks.swap(task_que_);
+        }
+        for (auto& fn : tasks) {
+            try { fn(); } catch (...) {}
+        }
+    }
 }
 
 void Dispatcher::StopEventLoop(){
