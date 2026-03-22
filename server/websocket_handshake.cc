@@ -34,9 +34,9 @@ bool WebSocketHandshake::Validate(const HttpRequest& request, std::string& error
     // RFC 6455 §4.2.1: the value is a single token, not a comma-separated list
     std::string upgrade = request.GetHeader("upgrade");
     std::transform(upgrade.begin(), upgrade.end(), upgrade.begin(), ::tolower);
-    // Trim whitespace
-    while (!upgrade.empty() && upgrade.front() == ' ') upgrade.erase(upgrade.begin());
-    while (!upgrade.empty() && upgrade.back() == ' ') upgrade.pop_back();
+    // Trim OWS (optional whitespace: SP and HTAB per RFC 7230 §3.2.3)
+    while (!upgrade.empty() && (upgrade.front() == ' ' || upgrade.front() == '\t')) upgrade.erase(upgrade.begin());
+    while (!upgrade.empty() && (upgrade.back() == ' ' || upgrade.back() == '\t')) upgrade.pop_back();
     if (upgrade != "websocket") {
         error_message = "Missing or invalid Upgrade header";
         return false;
@@ -51,9 +51,9 @@ bool WebSocketHandshake::Validate(const HttpRequest& request, std::string& error
         std::string token;
         std::istringstream ss(connection);
         while (std::getline(ss, token, ',')) {
-            // Trim whitespace from token
-            while (!token.empty() && token.front() == ' ') token.erase(token.begin());
-            while (!token.empty() && token.back() == ' ') token.pop_back();
+            // Trim OWS (SP and HTAB per RFC 7230 §3.2.3)
+            while (!token.empty() && (token.front() == ' ' || token.front() == '\t')) token.erase(token.begin());
+            while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) token.pop_back();
             if (token == "upgrade") {
                 found_upgrade = true;
                 break;

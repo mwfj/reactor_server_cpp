@@ -32,9 +32,10 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     // Run middleware chain first
     for (const auto& mw : middlewares_) {
         if (!mw(request, response)) {
-            // If middleware returned false but didn't set a status, default to 403
+            // If middleware returned false but didn't set a status, default to 403.
+            // Preserve any headers the middleware already added (e.g., WWW-Authenticate).
             if (response.GetStatusCode() == 200 && response.GetBody().empty()) {
-                response = HttpResponse::Forbidden();
+                response.Status(403).Text("Forbidden");
             }
             return true;
         }

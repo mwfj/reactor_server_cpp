@@ -453,9 +453,12 @@ void ConnectionHandler::CallWriteCb(){
         }
     }
 
-    // Nothing to write — can happen after TLS handshake completes with no queued data
+    // Nothing to write
     if (output_bf_.Size() == 0) {
         client_channel_->DisableWriteMode();
+        if (close_after_write_.load(std::memory_order_acquire)) {
+            ForceClose();
+        }
         return;
     }
 
