@@ -151,11 +151,21 @@ void ConnectionHandler::OnMessage(){
     }
 
     // If peer sent EOF, defer close until any pending response is flushed.
-    // CloseAfterWrite handles both cases:
-    //   - Buffer has data → EnableWriteMode → CallWriteCb flushes then closes
-    //   - Buffer empty → ForceClose immediately (avoids ET stall)
     if (peer_closed) {
-        CloseAfterWrite();
+        // Set deadline for async handler grace period BEFORE CloseAfterWrite,
+        // because CloseAfterWrite will ForceClose if buffer is empty.
+        // Async handlers have until this deadline to enqueue a response.
+        if (!has_deadline_) {
+            SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+        }
+        // Arm flag — DoSend/DoSendRaw fast-path will check it and close after sending.
+        // If buffer is empty and no async handler enqueues, ForceClose runs now.
+        // But the deadline prevents ForceClose from running if we want to wait.
+        close_after_write_.store(true, std::memory_order_release);
+        if (output_bf_.Size() > 0) {
+            client_channel_->EnableWriteMode();
+        }
+        // Don't ForceClose here — let async handlers and deadline handle it
     }
 }
 
@@ -315,16 +325,12 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
 void ConnectionHandler::CloseAfterWrite(){
     close_after_write_.store(true, std::memory_order_release);
     if (output_bf_.Size() > 0) {
-        // Data buffered — flush it, then close via CallWriteCb
         client_channel_ -> EnableWriteMode();
     } else {
-        // No data buffered. Set a short deadline so the timer scan closes
-        // the connection if no async handler sends data. This avoids ET stalls
-        // (EnableWriteMode on already-writable socket) while giving async
-        // handlers (e.g., ReactorServer task workers) time to enqueue a response.
-        if (!has_deadline_) {
-            SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(5));
-        }
+        // Nothing to flush — close immediately.
+        // Callers that need async handler support (EOF path) should set a
+        // deadline before calling CloseAfterWrite.
+        ForceClose();
     }
 }
 

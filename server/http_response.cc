@@ -12,12 +12,22 @@ HttpResponse& HttpResponse::Status(int code) {
 
 HttpResponse& HttpResponse::Status(int code, const std::string& reason) {
     status_code_ = code;
+    // Sanitize reason to prevent response splitting
     status_reason_ = reason;
+    status_reason_.erase(std::remove(status_reason_.begin(), status_reason_.end(), '\r'), status_reason_.end());
+    status_reason_.erase(std::remove(status_reason_.begin(), status_reason_.end(), '\n'), status_reason_.end());
     return *this;
 }
 
 HttpResponse& HttpResponse::Header(const std::string& key, const std::string& value) {
-    headers_.emplace_back(key, value);
+    // Sanitize: strip \r and \n to prevent HTTP response splitting
+    std::string safe_key = key;
+    std::string safe_value = value;
+    safe_key.erase(std::remove(safe_key.begin(), safe_key.end(), '\r'), safe_key.end());
+    safe_key.erase(std::remove(safe_key.begin(), safe_key.end(), '\n'), safe_key.end());
+    safe_value.erase(std::remove(safe_value.begin(), safe_value.end(), '\r'), safe_value.end());
+    safe_value.erase(std::remove(safe_value.begin(), safe_value.end(), '\n'), safe_value.end());
+    headers_.emplace_back(std::move(safe_key), std::move(safe_value));
     return *this;
 }
 
