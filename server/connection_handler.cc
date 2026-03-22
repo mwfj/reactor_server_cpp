@@ -528,9 +528,8 @@ void ConnectionHandler::ClearDeadline() {
 }
 
 bool ConnectionHandler::IsTimeOut(std::chrono::seconds duration) const {
-    // Already closing — don't re-trigger
-    if (is_closing_.load(std::memory_order_acquire) ||
-        close_after_write_.load(std::memory_order_acquire)) {
+    // Fully closed — don't re-trigger
+    if (is_closing_.load(std::memory_order_acquire)) {
         return false;
     }
     // Check request deadline first (Slowloris protection)

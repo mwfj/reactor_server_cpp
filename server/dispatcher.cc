@@ -336,14 +336,16 @@ void Dispatcher::TimerHandler(){
         }
 
         // Close timed-out connections.
-        // Call deadline timeout callback first (allows HTTP layer to send 408),
-        // then use CloseAfterWrite so the 408 response flushes before close.
-        // Don't remove from connections_ yet — keep scanning until the close completes.
-        // CallCloseCb (via CloseAfterWrite) → HandleCloseConnection will enqueue
-        // RemoveTimerConnectionIfMatch to clean up after the fd is actually closed.
         for(auto& conn : timed_out_conns){
-            conn->CallDeadlineTimeoutCb();
-            conn->CloseAfterWrite();
+            if (conn->IsClosing() || conn->IsCloseDeferred()) {
+                // Already closing (previous timeout triggered CloseAfterWrite but flush stalled).
+                // Force close now — the buffered response will never drain.
+                conn->CallCloseCb();
+            } else {
+                // First timeout: send 408 (if deadline callback set), then deferred close.
+                conn->CallDeadlineTimeoutCb();
+                conn->CloseAfterWrite();
+            }
         }
     }
 }

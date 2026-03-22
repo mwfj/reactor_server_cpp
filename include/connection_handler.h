@@ -50,6 +50,7 @@ public:
 
     int fd() const{ return sock_ ? sock_ -> fd() : -1; }
     bool IsClosing() const { return is_closing_.load(std::memory_order_acquire); }
+    bool IsCloseDeferred() const { return close_after_write_.load(std::memory_order_acquire); }
     const std::string& ip_addr() const { return sock_ -> ip_addr(); }
     int port() const { return sock_ -> port(); }
 

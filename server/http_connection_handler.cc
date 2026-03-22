@@ -64,7 +64,15 @@ void HttpConnectionHandler::CloseConnection() {
 void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data) {
     // If upgraded to WebSocket, forward raw bytes to WebSocketConnection
     if (upgraded_ && ws_conn_) {
-        ws_conn_->OnRawData(data);
+        try {
+            ws_conn_->OnRawData(data);
+        } catch (const std::exception& e) {
+            // App handler threw — send WS close 1011 instead of bare transport close
+            if (ws_conn_->IsOpen()) {
+                ws_conn_->SendClose(1011, "Internal error");
+            }
+            CloseConnection();
+        }
         return;
     }
 
