@@ -62,24 +62,35 @@ static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
     self->header_bytes_ += charge;
 
     // If we were reading a value, flush the previous header.
-    // RFC 7230 §3.2.2: combine repeated headers with ", " separator.
     if (self->parsing_header_value_) {
-        std::string key = self->current_header_field_;
-        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-        auto it = self->request_.headers.find(key);
-        if (it != self->request_.headers.end()) {
-            // RFC 7230 §5.4: reject duplicate Host headers (400 Bad Request).
-            // Host is not a comma-separated list, and duplicates enable
-            // host/origin ambiguity attacks (request smuggling).
-            if (key == "host") {
-                self->has_error_ = true;
-                self->error_message_ = "Duplicate Host header";
-                self->error_type_ = HttpParser::ParseError::PARSE_ERROR;
-                return HPE_USER;
-            }
-            it->second += ", " + self->current_header_value_;
+        // If headers_complete is true, we're in the trailer section —
+        // discard all trailer fields (RFC 7230 §4.1.2 forbids security-
+        // critical trailers like Authorization, and merging trailers into
+        // request_.headers would let them masquerade as original headers).
+        if (self->request_.headers_complete) {
+            self->current_header_field_.clear();
+            self->current_header_value_.clear();
         } else {
-            self->request_.headers[key] = self->current_header_value_;
+            std::string key = self->current_header_field_;
+            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+            auto it = self->request_.headers.find(key);
+            if (it != self->request_.headers.end()) {
+                // Reject duplicates of non-list headers — comma-folding these
+                // creates synthetic values never on the wire (RFC 7230 §3.2.2
+                // only permits folding for list-valued fields).
+                if (key == "host" || key == "authorization" ||
+                    key == "content-type" || key == "content-length" ||
+                    key == "content-range" || key == "content-disposition") {
+                    self->has_error_ = true;
+                    self->error_message_ = "Duplicate " + key + " header";
+                    self->error_type_ = HttpParser::ParseError::PARSE_ERROR;
+                    return HPE_USER;
+                }
+                // List-valued headers: comma-fold per RFC 7230 §3.2.2
+                it->second += ", " + self->current_header_value_;
+            } else {
+                self->request_.headers[key] = self->current_header_value_;
+            }
         }
         self->current_header_field_.clear();
         self->current_header_value_.clear();
@@ -113,16 +124,18 @@ static int on_header_value(llhttp_t* parser, const char* at, size_t length) {
 static int on_headers_complete(llhttp_t* parser) {
     auto* self = static_cast<HttpParser*>(parser->data);
 
-    // Flush last header (combine repeated headers per RFC 7230 §3.2.2)
+    // Flush last header
     if (!self->current_header_field_.empty()) {
         std::string key = self->current_header_field_;
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
         auto it = self->request_.headers.find(key);
         if (it != self->request_.headers.end()) {
-            // RFC 7230 §5.4: reject duplicate Host headers
-            if (key == "host") {
+            // Reject duplicates of non-list headers
+            if (key == "host" || key == "authorization" ||
+                key == "content-type" || key == "content-length" ||
+                key == "content-range" || key == "content-disposition") {
                 self->has_error_ = true;
-                self->error_message_ = "Duplicate Host header";
+                self->error_message_ = "Duplicate " + key + " header";
                 self->error_type_ = HttpParser::ParseError::PARSE_ERROR;
                 return HPE_USER;
             }
@@ -190,21 +203,11 @@ static int on_body(llhttp_t* parser, const char* at, size_t length) {
 static int on_message_complete(llhttp_t* parser) {
     auto* self = static_cast<HttpParser*>(parser->data);
 
-    // Flush any remaining trailer header field (the last trailer has no
-    // subsequent on_header_field call to trigger flushing).
-    // Without this, the last trailer is silently dropped.
+    // Discard any remaining trailer header field — trailers are not merged
+    // into request_.headers (see on_header_field's trailer guard above).
+    // RFC 7230 §4.1.2 forbids security-critical fields in trailers, and
+    // merging them would let them masquerade as original request headers.
     if (self->parsing_header_value_ && !self->current_header_field_.empty()) {
-        std::string key = self->current_header_field_;
-        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-        auto it = self->request_.headers.find(key);
-        if (it != self->request_.headers.end()) {
-            // Don't allow trailers to overwrite Host (RFC 7230 §4.1.2)
-            if (key != "host") {
-                it->second += ", " + self->current_header_value_;
-            }
-        } else {
-            self->request_.headers[key] = self->current_header_value_;
-        }
         self->current_header_field_.clear();
         self->current_header_value_.clear();
     }
