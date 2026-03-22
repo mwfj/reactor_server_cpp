@@ -80,8 +80,14 @@ void Dispatcher::Init() {
 
 Dispatcher::~Dispatcher() {
     // Let smart pointers handle cleanup automatically
-    // wake_channel_ destructor will close the eventfd
-    // No need to explicitly remove from epoll - ep_ is being destroyed anyway
+    // wake_channel_ destructor will close the eventfd / wakeup_pipe_[0]
+#if defined(__APPLE__) || defined(__MACH__)
+    // Close the write end of the wakeup pipe (not owned by wake_channel_)
+    if (wakeup_pipe_[1] >= 0) {
+        ::close(wakeup_pipe_[1]);
+        wakeup_pipe_[1] = -1;
+    }
+#endif
 }
 
 void Dispatcher::set_running_state(bool status){
@@ -329,17 +335,12 @@ void Dispatcher::TimerHandler(){
             }
         }
 
-        // Remove timed-out connections from our map
-        for(int fd : timeout_fds){
-            connections_.erase(fd);
-        }
-
         // Close timed-out connections.
         // Call deadline timeout callback first (allows HTTP layer to send 408),
         // then use CloseAfterWrite so the 408 response flushes before close.
-        // CloseAfterWrite → CallCloseCb → HandleCloseConnection handles
-        // identity-checked removal from NetServer::connections_.
-        // No separate timer callback needed (bare-fd removal is unsafe under fd reuse).
+        // Don't remove from connections_ yet — keep scanning until the close completes.
+        // CallCloseCb (via CloseAfterWrite) → HandleCloseConnection will enqueue
+        // RemoveTimerConnectionIfMatch to clean up after the fd is actually closed.
         for(auto& conn : timed_out_conns){
             conn->CallDeadlineTimeoutCb();
             conn->CloseAfterWrite();

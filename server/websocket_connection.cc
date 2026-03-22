@@ -132,9 +132,13 @@ void WebSocketConnection::OnRawData(const std::string& data) {
 }
 
 void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
-    // If we've sent a close frame, only accept the peer's Close reply — discard data/continuation
-    if (close_sent_ && frame.opcode != WebSocketOpcode::Close) {
-        return;  // Discard non-close frames during close handshake
+    // If we've sent a close frame, only accept Close replies and Ping/Pong control frames.
+    // RFC 6455 §5.5.2: endpoint MUST respond to Ping until Close is received.
+    // Discard data/continuation frames during the close handshake.
+    if (close_sent_ && frame.opcode != WebSocketOpcode::Close
+        && frame.opcode != WebSocketOpcode::Ping
+        && frame.opcode != WebSocketOpcode::Pong) {
+        return;
     }
 
     switch (frame.opcode) {

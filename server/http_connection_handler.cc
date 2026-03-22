@@ -29,6 +29,24 @@ void HttpConnectionHandler::SetMaxHeaderSize(size_t max) {
     parser_.SetMaxHeaderSize(max);
 }
 
+void HttpConnectionHandler::SetRequestTimeout(int seconds) {
+    request_timeout_sec_ = seconds;
+    // Arm deadline immediately so connect-and-wait (zero-byte Slowloris) is caught
+    if (request_timeout_sec_ > 0) {
+        request_in_progress_ = true;
+        request_start_ = std::chrono::steady_clock::now();
+        conn_->SetDeadline(request_start_ + std::chrono::seconds(request_timeout_sec_));
+        std::weak_ptr<HttpConnectionHandler> weak_self = shared_from_this();
+        conn_->SetDeadlineTimeoutCb([weak_self]() {
+            if (auto self = weak_self.lock()) {
+                HttpResponse timeout_resp = HttpResponse::RequestTimeout();
+                timeout_resp.Header("Connection", "close");
+                self->SendResponse(timeout_resp);
+            }
+        });
+    }
+}
+
 void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
     std::string wire = response.Serialize();
     conn_->SendRaw(wire.data(), wire.size());

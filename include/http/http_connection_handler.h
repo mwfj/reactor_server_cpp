@@ -58,8 +58,9 @@ public:
     void SetMaxHeaderSize(size_t max);
     void SetMaxWsMessageSize(size_t max) { max_ws_message_size_ = max; }
 
-    // Set request timeout (Slowloris protection)
-    void SetRequestTimeout(int seconds) { request_timeout_sec_ = seconds; }
+    // Set request timeout (Slowloris protection).
+    // Arms a deadline immediately so connect-and-wait attacks are caught.
+    void SetRequestTimeout(int seconds);
 
     // Called when raw data arrives (set as NetServer's on_message callback)
     void OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data);
