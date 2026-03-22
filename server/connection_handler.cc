@@ -179,6 +179,13 @@ void ConnectionHandler::SendData(const char *data, size_t size){
 void ConnectionHandler::DoSend(const char *data, size_t size){
     if (is_closing_) return;
 
+    // If a TLS write retry is pending, just buffer — don't try to write.
+    // OpenSSL requires retrying with the same buffer after WANT_READ/WANT_WRITE.
+    if (tls_write_wants_read_ || tls_read_wants_write_) {
+        output_bf_.AppendWithHead(data, size);
+        return;
+    }
+
     // Prepend the 4-byte length header, then attempt direct send.
 
     // This avoids the edge-triggered EPOLLOUT issue where a freshly writable
@@ -240,9 +247,14 @@ void ConnectionHandler::SendRaw(const char *data, size_t size){
 }
 
 void ConnectionHandler::DoSendRaw(const char *data, size_t size){
-    // Same as DoSend but uses Append() instead of AppendWithHead()
-    // No 4-byte length prefix -- HTTP uses its own framing
     if (is_closing_) return;
+
+    // If a TLS write retry is pending, just buffer — don't try to write.
+    if (tls_write_wants_read_ || tls_read_wants_write_) {
+        output_bf_.Append(data, size);
+        client_channel_->EnableWriteMode();
+        return;
+    }
 
     // If output buffer is empty, try sending directly first.
     // This avoids the edge-triggered EPOLLOUT issue where a freshly writable
@@ -443,6 +455,9 @@ void ConnectionHandler::CallWriteCb(){
         int result = tls_->DoHandshake();
         if (result == 0) {
             tls_state_ = TlsState::READY;
+            // Handshake complete — OpenSSL may have buffered application data.
+            // Try reading it before proceeding to writes.
+            OnMessage();
             // Fall through to normal write logic to flush any pending output buffer
         } else if (result == 1) {
             client_channel_->DisableWriteMode();
@@ -472,11 +487,15 @@ void ConnectionHandler::CallWriteCb(){
         // Don't write during handshake — data stays buffered until READY
         return;
     } else if (tls_state_ == TlsState::READY) {
-        write_sz = tls_->Write(output_bf_.Data(), output_bf_.Size());
-        if (write_sz == 0) return;  // WANT_WRITE — try again on next EPOLLOUT
+        // Use pending size for retry, or full buffer for new write
+        size_t write_len = tls_pending_write_size_ > 0 ? tls_pending_write_size_ : output_bf_.Size();
+        write_sz = tls_->Write(output_bf_.Data(), write_len);
+        if (write_sz == 0) {
+            tls_pending_write_size_ = write_len;  // Track for retry
+            return;  // WANT_WRITE — try again on next EPOLLOUT
+        }
         if (write_sz == -3) {
-            // WANT_READ — SSL needs read readiness to complete this write
-            // (renegotiation/key update). Set flag so OnMessage retries the write.
+            tls_pending_write_size_ = write_len;  // Track for retry
             tls_write_wants_read_ = true;
             client_channel_->EnableReadMode();
             return;
@@ -498,7 +517,8 @@ void ConnectionHandler::CallWriteCb(){
     // Remove sent data and refresh idle timestamp
     if(write_sz > 0) {
         output_bf_.Erase(0, write_sz);
-        ts_ = TimeStamp::Now();  // Refresh idle timeout on successful write
+        ts_ = TimeStamp::Now();
+        tls_pending_write_size_ = 0;  // Clear pending — write succeeded
     }
 
     // If there's no data waiting to write, then unregister writing event

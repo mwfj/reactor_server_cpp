@@ -63,6 +63,12 @@ void NetServer::Stop(){
     // First: Stop the connection dispatcher so no more accept events fire.
     conn_dispatcher_->StopEventLoop();
 
+    // Note: acceptor_ is NOT destroyed here — the conn_dispatcher thread
+    // may still be processing the last event batch (accept callback uses
+    // raw pointers into acceptor). The acceptor is destroyed in ~NetServer
+    // after the server thread is joined by the caller.
+    // The port is released when ~NetServer runs.
+
     // Second: Release dispatcher-held connection references via EnQueue
     // (ClearConnections must run on the dispatcher thread to avoid racing TimerHandler)
     for (auto& disp : socket_dispatchers_) {
