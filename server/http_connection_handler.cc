@@ -53,11 +53,11 @@ void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
 }
 
 void HttpConnectionHandler::CloseConnection() {
-    // Don't clear the deadline here — if the deferred close stalls (client stops
-    // reading), the timer scan needs the deadline to force-close the connection.
-    // The deadline is cleared normally after a completed request (keep-alive reset).
+    // Clear deadline — the request is complete, response is being flushed.
+    // Stalled flushes are handled by the idle timeout, not the request deadline.
     request_in_progress_ = false;
-    conn_->SetDeadlineTimeoutCb(nullptr);  // Don't re-send 408 on force-close
+    conn_->ClearDeadline();
+    conn_->SetDeadlineTimeoutCb(nullptr);
     conn_->CloseAfterWrite();
 }
 
@@ -144,6 +144,15 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
 
         if (parser_.GetRequest().complete) {
             const HttpRequest& req = parser_.GetRequest();
+
+            // RFC 7230 §5.4: HTTP/1.1 requests MUST include Host header
+            if (req.http_major >= 1 && req.http_minor >= 1 && !req.HasHeader("host")) {
+                HttpResponse bad_req = HttpResponse::BadRequest("Missing Host header");
+                bad_req.Header("Connection", "close");
+                SendResponse(bad_req);
+                CloseConnection();
+                return;
+            }
 
             // Check for WebSocket upgrade
             if (req.upgrade && route_checker_) {
