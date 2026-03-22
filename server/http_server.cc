@@ -186,6 +186,17 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
             ws->NotifyTransportClose();
         }
     }
+    // Arm a connection-level deadline covering the TLS handshake + first HTTP request.
+    // Without this, a client can slow-drip the TLS handshake indefinitely, bypassing
+    // the request timeout (which only activates after parsed HTTP bytes in OnRawData).
+    // When OnRawData fires after handshake completion, it overwrites this with the
+    // per-request deadline. No DeadlineTimeoutCb is needed — can't send HTTP 408
+    // during a TLS handshake, so the timer just closes the connection.
+    if (request_timeout_sec_ > 0) {
+        conn->SetDeadline(std::chrono::steady_clock::now() +
+                          std::chrono::seconds(request_timeout_sec_));
+    }
+
     logging::Get()->debug("New HTTP connection fd={} from {}:{}",
                           conn->fd(), conn->ip_addr(), conn->port());
 }

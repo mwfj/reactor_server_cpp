@@ -74,8 +74,14 @@ void WebSocketConnection::SendClose(uint16_t code, const std::string& reason) {
     sent_close_code_ = code;
     sent_close_reason_ = reason;
     // Keep is_open_ true so OnRawData can still receive the peer's close reply.
-    // The connection will be closed when we receive the peer's close frame in
-    // ProcessFrame, or by the idle timeout if the peer never responds.
+    // Arm a deadline for the close handshake — if the peer doesn't send a Close
+    // reply within this window, the timer scanner will force-close the connection.
+    // This replaces the old pattern of calling CloseAfterWrite() immediately after
+    // SendClose(), which would ForceClose if the frame flushed via fast-path,
+    // preventing clients from ever seeing the close code.
+    if (conn_) {
+        conn_->SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    }
 }
 
 void WebSocketConnection::SendPing(const std::string& payload) {
@@ -112,7 +118,7 @@ void WebSocketConnection::OnRawData(const std::string& data) {
         ProcessFrame(parser_.NextFrame());
     }
 
-    if (parser_.HasError() && is_open_) {
+    if (parser_.HasError() && is_open_ && !close_sent_) {
         if (error_handler_) {
             error_handler_(*this, parser_.GetError());
         }
@@ -123,7 +129,9 @@ void WebSocketConnection::OnRawData(const std::string& data) {
             close_code = 1009;  // Message Too Big
         }
         SendClose(close_code, err_msg.substr(0, 123));
-        if (conn_) conn_->CloseAfterWrite();
+        // No CloseAfterWrite here — SendClose arms a deadline for the close
+        // handshake. The peer's close reply (if any) is handled by ProcessFrame.
+        // If the peer doesn't reply, the deadline forces close via the timer.
         return;
     }
 }
@@ -148,7 +156,6 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                     error_handler_(*this, "New data frame received during fragmented message");
                 }
                 SendClose(1002, "Protocol error: interleaved data frames");
-                if (conn_) conn_->CloseAfterWrite();
                 return;
             }
 
@@ -158,7 +165,6 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 if (frame.opcode == WebSocketOpcode::Text && !IsValidUtf8(frame.payload)) {
                     if (error_handler_) error_handler_(*this, "Invalid UTF-8 in text message");
                     SendClose(1007, "Invalid UTF-8");
-                    if (conn_) conn_->CloseAfterWrite();
                     return;
                 }
                 if (message_handler_) {
@@ -170,7 +176,6 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 if (max_message_size_ > 0 && frame.payload.size() > max_message_size_) {
                     if (error_handler_) error_handler_(*this, "Message exceeds maximum size");
                     SendClose(1009, "Message too big");
-                    if (conn_) conn_->CloseAfterWrite();
                     in_fragment_ = false;
                     fragment_buffer_.clear();
                     return;
@@ -186,7 +191,6 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             if (!in_fragment_) {
                 if (error_handler_) error_handler_(*this, "Unexpected continuation frame");
                 SendClose(1002, "Protocol error: unexpected continuation");
-                if (conn_) conn_->CloseAfterWrite();
                 return;
             }
             if (max_message_size_ > 0 &&
@@ -194,7 +198,6 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                  frame.payload.size() > max_message_size_ - fragment_buffer_.size())) {
                 if (error_handler_) error_handler_(*this, "Message exceeds maximum size");
                 SendClose(1009, "Message too big");
-                if (conn_) conn_->CloseAfterWrite();
                 in_fragment_ = false;
                 fragment_buffer_.clear();
                 return;
@@ -205,7 +208,6 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 if (fragment_opcode_ == WebSocketOpcode::Text && !IsValidUtf8(fragment_buffer_)) {
                     if (error_handler_) error_handler_(*this, "Invalid UTF-8 in text message");
                     SendClose(1007, "Invalid UTF-8");
-                    if (conn_) conn_->CloseAfterWrite();
                     in_fragment_ = false;
                     fragment_buffer_.clear();
                     return;
@@ -225,7 +227,6 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             if (frame.payload.size() == 1) {
                 if (error_handler_) error_handler_(*this, "Invalid close frame: 1-byte payload");
                 SendClose(1002, "Protocol error");
-                if (conn_) conn_->CloseAfterWrite();
                 return;
             }
             // If payload is empty, echo an empty close frame (no code/reason)
@@ -257,7 +258,6 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             if (!reason.empty() && !IsValidUtf8(reason)) {
                 if (error_handler_) error_handler_(*this, "Close reason is not valid UTF-8");
                 SendClose(1007, "Invalid UTF-8 in close reason");
-                if (conn_) conn_->CloseAfterWrite();
                 return;
             }
             // Validate close code per RFC 6455 Section 7.4 + IANA registry.
