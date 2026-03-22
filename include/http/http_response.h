@@ -35,6 +35,7 @@ public:
     static HttpResponse PayloadTooLarge();
     static HttpResponse HeaderTooLarge();
     static HttpResponse RequestTimeout();
+    static HttpResponse HttpVersionNotSupported();
 
     // Accessors
     int GetStatusCode() const { return status_code_; }

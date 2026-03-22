@@ -169,10 +169,14 @@ static int on_message_complete(llhttp_t* parser) {
     auto* self = static_cast<HttpParser*>(parser->data);
     self->request_.complete = true;
 
-    // Pause the parser so we can process this request
-    // before parsing the next one (pipelining support)
-    llhttp_pause(parser);
-    return 0;
+    // Return HPE_PAUSED so llhttp_execute() stops immediately and returns
+    // HPE_PAUSED. This prevents the parser from advancing into the next
+    // pipelined request and calling on_message_begin (which would reset
+    // request_ before the caller can process it).
+    // Note: llhttp_pause() + return 0 does NOT work — the parser continues
+    // processing bytes after the callback returns 0 before the pause flag
+    // takes effect, corrupting pipelined request data.
+    return HPE_PAUSED;
 }
 
 // --- HttpParser::Impl (pimpl) ---

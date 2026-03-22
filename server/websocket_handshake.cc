@@ -30,16 +30,28 @@ bool WebSocketHandshake::Validate(const HttpRequest& request, std::string& error
         return false;
     }
 
-    // 4. Upgrade header must be exactly "websocket" (case-insensitive)
-    // RFC 6455 §4.2.1: the value is a single token, not a comma-separated list
+    // 4. Upgrade header must contain the "websocket" token (case-insensitive).
+    // RFC 7230 §6.7: Upgrade is a comma-separated list of protocols.
+    // Valid examples: "websocket", "WebSocket", "websocket, foo"
     std::string upgrade = request.GetHeader("upgrade");
     std::transform(upgrade.begin(), upgrade.end(), upgrade.begin(), ::tolower);
-    // Trim OWS (optional whitespace: SP and HTAB per RFC 7230 §3.2.3)
-    while (!upgrade.empty() && (upgrade.front() == ' ' || upgrade.front() == '\t')) upgrade.erase(upgrade.begin());
-    while (!upgrade.empty() && (upgrade.back() == ' ' || upgrade.back() == '\t')) upgrade.pop_back();
-    if (upgrade != "websocket") {
-        error_message = "Missing or invalid Upgrade header";
-        return false;
+    {
+        bool found_websocket = false;
+        std::string token;
+        std::istringstream uss(upgrade);
+        while (std::getline(uss, token, ',')) {
+            // Trim OWS (SP and HTAB per RFC 7230 §3.2.3)
+            while (!token.empty() && (token.front() == ' ' || token.front() == '\t')) token.erase(token.begin());
+            while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) token.pop_back();
+            if (token == "websocket") {
+                found_websocket = true;
+                break;
+            }
+        }
+        if (!found_websocket) {
+            error_message = "Missing or invalid Upgrade header";
+            return false;
+        }
     }
 
     // 5. Connection header must contain "upgrade" as a token (not substring).

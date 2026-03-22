@@ -146,6 +146,10 @@ HttpResponse HttpResponse::RequestTimeout() {
     return HttpResponse().Status(408).Text("Request Timeout");
 }
 
+HttpResponse HttpResponse::HttpVersionNotSupported() {
+    return HttpResponse().Status(505).Text("HTTP Version Not Supported");
+}
+
 std::string HttpResponse::DefaultReason(int code) {
     switch (code) {
         case 200: return "OK";
@@ -167,6 +171,7 @@ std::string HttpResponse::DefaultReason(int code) {
         case 501: return "Not Implemented";
         case 502: return "Bad Gateway";
         case 503: return "Service Unavailable";
+        case 505: return "HTTP Version Not Supported";
         default:  return "Unknown";
     }
 }

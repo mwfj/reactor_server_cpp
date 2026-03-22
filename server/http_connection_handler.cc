@@ -132,8 +132,19 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
         if (parser_.GetRequest().complete) {
             const HttpRequest& req = parser_.GetRequest();
 
+            // Reject unsupported HTTP versions — only HTTP/1.0 and HTTP/1.1 supported.
+            // llhttp will parse any major.minor (e.g. HTTP/2.0, HTTP/0.9), but this
+            // server only speaks HTTP/1.x, so dispatch would produce wrong responses.
+            if (req.http_major != 1 || (req.http_minor != 0 && req.http_minor != 1)) {
+                HttpResponse ver_resp = HttpResponse::HttpVersionNotSupported();
+                ver_resp.Header("Connection", "close");
+                SendResponse(ver_resp);
+                CloseConnection();
+                return;
+            }
+
             // RFC 7230 §5.4: HTTP/1.1 requests MUST include Host header
-            if (req.http_major >= 1 && req.http_minor >= 1 && !req.HasHeader("host")) {
+            if (req.http_minor >= 1 && !req.HasHeader("host")) {
                 HttpResponse bad_req = HttpResponse::BadRequest("Missing Host header");
                 bad_req.Header("Connection", "close");
                 SendResponse(bad_req);
