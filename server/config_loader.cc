@@ -241,6 +241,21 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             " (must be >= 0, 0 = disabled)");
     }
 
+    // Validate log rotation settings when file logging is configured.
+    // spdlog::rotating_file_sink_mt throws on max_size == 0, and negative
+    // max_files converts to a huge size_t causing resource exhaustion.
+    if (!config.log.file.empty()) {
+        if (config.log.max_file_size == 0) {
+            throw std::invalid_argument(
+                "Invalid log.max_file_size: 0 (must be > 0 when log.file is set)");
+        }
+        if (config.log.max_files < 1) {
+            throw std::invalid_argument(
+                "Invalid log.max_files: " + std::to_string(config.log.max_files) +
+                " (must be >= 1 when log.file is set)");
+        }
+    }
+
     if (config.tls.enabled) {
         if (config.tls.cert_file.empty()) {
             throw std::invalid_argument(

@@ -30,6 +30,11 @@ private:
     bool has_deadline_ = false;
     std::chrono::steady_clock::time_point deadline_;
     std::function<void()> deadline_timeout_cb_;
+    // Monotonic counter incremented on every on-thread deadline write/clear.
+    // Off-thread SetDeadline captures the generation at queue time and only
+    // applies the deadline if the generation hasn't changed, preventing stale
+    // queued deadlines from being resurrected after ClearDeadline.
+    unsigned deadline_generation_ = 0;
 
     // TLS support
     enum class TlsState { NONE, HANDSHAKE, READY };

@@ -54,11 +54,14 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
         try {
             ws_conn_->OnRawData(data);
         } catch (const std::exception& e) {
-            // App handler threw — send WS close 1011 instead of bare transport close
+            // App handler threw — send WS close 1011 instead of bare transport close.
+            // Don't call CloseConnection afterward: SendClose arms a 5s deadline
+            // for the close handshake. CloseConnection would overwrite that deadline
+            // and tear down the transport before the peer can send their Close reply.
             if (ws_conn_->IsOpen()) {
                 ws_conn_->SendClose(1011, "Internal error");
             }
-            CloseConnection();
+            // If !IsOpen(), a close is already in progress (close_sent_ or !is_open_).
         }
         return;
     }
@@ -255,15 +258,18 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 } catch (const std::exception& e) {
                     // Exception in middleware/upgrade handler — send appropriate error
                     if (!upgraded_) {
-                        // Pre-101: send HTTP 500
+                        // Pre-101: send HTTP 500, close via HTTP path
                         HttpResponse err = HttpResponse::InternalError(e.what());
                         err.Header("Connection", "close");
                         SendResponse(err);
+                        CloseConnection();
                     } else if (ws_conn_) {
-                        // Post-101: send WS close 1011 (Internal Error)
+                        // Post-101: send WS close 1011 (Internal Error).
+                        // Don't call CloseConnection — SendClose arms a 5s deadline
+                        // for the close handshake. The peer's Close reply (or deadline
+                        // expiry) handles transport cleanup.
                         ws_conn_->SendClose(1011, "Internal error");
                     }
-                    CloseConnection();
                     return;
                 }
             }

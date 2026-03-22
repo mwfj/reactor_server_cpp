@@ -615,18 +615,22 @@ void ConnectionHandler::SetDeadline(std::chrono::steady_clock::time_point deadli
         // On the dispatcher thread — direct write (no race with IsTimeOut/TimerHandler).
         has_deadline_ = true;
         deadline_ = deadline;
+        ++deadline_generation_;
     } else {
         // Off-thread (e.g., acceptor thread in HandleNewConnection).
         // Route through EnQueue so has_deadline_/deadline_ are only written from the
         // dispatcher thread, avoiding a data race with IsTimeOut on the timer thread.
-        // Only set if no deadline already armed — OnRawData may have already set a
-        // stricter per-request deadline before this queued task executes.
+        // Capture the current generation — only apply if no on-thread deadline
+        // activity (set or clear) has occurred since queuing. This prevents a
+        // stale accept-time deadline from being resurrected after ClearDeadline.
+        unsigned gen = deadline_generation_;
         std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
-        event_dispatcher_->EnQueue([weak_self, deadline]() {
+        event_dispatcher_->EnQueue([weak_self, deadline, gen]() {
             if (auto self = weak_self.lock()) {
-                if (!self->has_deadline_) {
+                if (self->deadline_generation_ == gen) {
                     self->has_deadline_ = true;
                     self->deadline_ = deadline;
+                    ++self->deadline_generation_;
                 }
             }
         });
@@ -637,6 +641,7 @@ void ConnectionHandler::ClearDeadline() {
     // ClearDeadline is only called from OnRawData/CloseConnection (on dispatcher thread),
     // so no off-thread routing is needed.
     has_deadline_ = false;
+    ++deadline_generation_;
 }
 
 bool ConnectionHandler::IsTimeOut(std::chrono::seconds duration) const {
