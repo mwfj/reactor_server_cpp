@@ -68,6 +68,15 @@ static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
         auto it = self->request_.headers.find(key);
         if (it != self->request_.headers.end()) {
+            // RFC 7230 §5.4: reject duplicate Host headers (400 Bad Request).
+            // Host is not a comma-separated list, and duplicates enable
+            // host/origin ambiguity attacks (request smuggling).
+            if (key == "host") {
+                self->has_error_ = true;
+                self->error_message_ = "Duplicate Host header";
+                self->error_type_ = HttpParser::ParseError::PARSE_ERROR;
+                return HPE_USER;
+            }
             it->second += ", " + self->current_header_value_;
         } else {
             self->request_.headers[key] = self->current_header_value_;
@@ -110,6 +119,13 @@ static int on_headers_complete(llhttp_t* parser) {
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
         auto it = self->request_.headers.find(key);
         if (it != self->request_.headers.end()) {
+            // RFC 7230 §5.4: reject duplicate Host headers
+            if (key == "host") {
+                self->has_error_ = true;
+                self->error_message_ = "Duplicate Host header";
+                self->error_type_ = HttpParser::ParseError::PARSE_ERROR;
+                return HPE_USER;
+            }
             it->second += ", " + self->current_header_value_;
         } else {
             self->request_.headers[key] = self->current_header_value_;

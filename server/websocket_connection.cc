@@ -234,6 +234,9 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 // instead of waiting 5s for a reply that won't come.
                 is_open_ = false;
                 if (conn_) conn_->CloseAfterWrite();
+                // Notify the app — is_open_ is already false so NotifyTransportClose
+                // will skip, making this the only close notification the app gets.
+                if (close_handler_) close_handler_(*this, 1002, "Protocol error");
                 return;
             }
             // If payload is empty, echo an empty close frame (no code/reason)
@@ -269,6 +272,9 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 // Close transport immediately instead of waiting 5s.
                 is_open_ = false;
                 if (conn_) conn_->CloseAfterWrite();
+                // Notify the app — is_open_ is already false so NotifyTransportClose
+                // will skip, making this the only close notification the app gets.
+                if (close_handler_) close_handler_(*this, 1007, "Invalid UTF-8 in close reason");
                 return;
             }
             // Validate close code per RFC 6455 Section 7.4 + IANA registry.
