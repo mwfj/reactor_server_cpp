@@ -1,4 +1,5 @@
 #include "http/http_connection_handler.h"
+#include "log/logger.h"
 
 HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn)
     : conn_(std::move(conn)) {}
@@ -59,10 +60,11 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
         try {
             ws_conn_->OnRawData(data);
         } catch (const std::exception& e) {
-            // App handler threw — send WS close 1011 instead of bare transport close.
+            // App handler threw — log server-side, send WS close 1011.
             // Don't call CloseConnection afterward: SendClose arms a 5s deadline
             // for the close handshake. CloseConnection would overwrite that deadline
             // and tear down the transport before the peer can send their Close reply.
+            logging::Get()->error("Exception in WS handler: {}", e.what());
             if (ws_conn_->IsOpen()) {
                 ws_conn_->SendClose(1011, "Internal error");
             }
@@ -112,6 +114,15 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
     // Loop to handle pipelining: a single data buffer may contain multiple HTTP requests
     while (remaining > 0) {
         size_t consumed = parser_.Parse(buf, remaining);
+
+        // Update HTTP version as early as headers are available — needed for
+        // error responses (413, 431, 400) that fire before request completion.
+        // Only for valid versions (1.0/1.1); unsupported versions keep the default.
+        if (parser_.GetRequest().headers_complete &&
+            parser_.GetRequest().http_major == 1 &&
+            (parser_.GetRequest().http_minor == 0 || parser_.GetRequest().http_minor == 1)) {
+            current_http_minor_ = parser_.GetRequest().http_minor;
+        }
 
         if (parser_.HasError()) {
             // Determine appropriate error response based on parser error type
@@ -265,10 +276,12 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 return;
 
                 } catch (const std::exception& e) {
-                    // Exception in middleware/upgrade handler — send appropriate error
+                    // Exception in middleware/upgrade handler — log server-side,
+                    // send generic 500 to client (never leak e.what() over the wire).
+                    logging::Get()->error("Exception in upgrade handler: {}", e.what());
                     if (!upgraded_) {
                         // Pre-101: send HTTP 500, close via HTTP path
-                        HttpResponse err = HttpResponse::InternalError(e.what());
+                        HttpResponse err = HttpResponse::InternalError();
                         err.Header("Connection", "close");
                         SendResponse(err);
                         CloseConnection();
@@ -289,7 +302,10 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 try {
                     request_handler_(shared_from_this(), req, response);
                 } catch (const std::exception& e) {
-                    response = HttpResponse::InternalError(e.what());
+                    // Log the exception server-side; never send e.what() to the
+                    // client — it can contain stack traces, file paths, DB strings.
+                    logging::Get()->error("Exception in request handler: {}", e.what());
+                    response = HttpResponse::InternalError();
                     response.Header("Connection", "close");
                     SendResponse(response);
                     CloseConnection();
@@ -298,6 +314,9 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
 
                 // Determine if response sets Connection: close (needed for
                 // keep-alive logic AND the close decision after sending).
+                // Scan ALL Connection headers — duplicates/conflicting values
+                // must not cause the server's close decision to disagree with
+                // on-wire semantics (e.g. Connection: keep-alive + Connection: close).
                 bool resp_close = false;
                 for (const auto& hdr : response.GetHeaders()) {
                     std::string key = hdr.first;
@@ -308,7 +327,6 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                         if (val == "close") {
                             resp_close = true;
                         }
-                        break;
                     }
                 }
 
