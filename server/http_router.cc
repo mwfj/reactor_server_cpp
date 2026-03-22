@@ -53,11 +53,18 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     }
 
     // Check if path exists with different method (405 vs 404)
+    // Collect allowed methods for the Allow header (RFC 7231 §6.5.5)
+    std::string allowed;
     for (const auto& route : routes_) {
         if (route.path == request.path) {
-            response = HttpResponse::MethodNotAllowed();
-            return true;
+            if (!allowed.empty()) allowed += ", ";
+            allowed += route.method;
         }
+    }
+    if (!allowed.empty()) {
+        response = HttpResponse::MethodNotAllowed();
+        response.Header("Allow", allowed);
+        return true;
     }
 
     return false;  // No route found -- caller sends 404

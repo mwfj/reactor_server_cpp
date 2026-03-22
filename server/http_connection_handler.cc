@@ -169,7 +169,16 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 // Validate WebSocket handshake per RFC 6455
                 std::string ws_error;
                 if (!WebSocketHandshake::Validate(req, ws_error)) {
-                    HttpResponse reject = WebSocketHandshake::Reject(400, ws_error);
+                    int reject_code = 400;
+                    // RFC 6455 §4.4: wrong version → 426 + Sec-WebSocket-Version
+                    if (ws_error.find("version") != std::string::npos ||
+                        ws_error.find("Version") != std::string::npos) {
+                        reject_code = 426;
+                    }
+                    HttpResponse reject = WebSocketHandshake::Reject(reject_code, ws_error);
+                    if (reject_code == 426) {
+                        reject.Header("Sec-WebSocket-Version", "13");
+                    }
                     reject.Header("Connection", "close");
                     SendResponse(reject);
                     CloseConnection();

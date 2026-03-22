@@ -9,7 +9,7 @@ ReactorServer::ReactorServer(const std::string& _ip, const size_t _port,
     // Should we replace std::bind with lambda here?
     net_server_.SetNewConnectionCb(std::bind(&ReactorServer::NewConnection, this, std::placeholders::_1));
     net_server_.SetCloseConnectionCb(std::bind(&ReactorServer::CloseConnecition, this, std::placeholders::_1));
-    net_server_.SetErrorCb(std::bind(&ReactorServer::CloseConnecition, this, std::placeholders::_1));
+    net_server_.SetErrorCb(std::bind(&ReactorServer::Error, this, std::placeholders::_1));
     net_server_.SetOnMessageCb(std::bind(&ReactorServer::ProcessMessage, this, std::placeholders::_1, std::placeholders::_2));
     net_server_.SetSendCompletionCb(std::bind(&ReactorServer::SendComplete, this, std::placeholders::_1));
 }

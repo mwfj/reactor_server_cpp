@@ -60,12 +60,8 @@ void NetServer::Start(){
 
 // stop event loop
 void NetServer::Stop(){
-    // First: Stop the connection dispatcher so no more accept events fire,
-    // then destroy the acceptor to release the listening port immediately.
-    // StopEventLoop sets is_running_=false; RunEventLoop exits on next check.
-    // Acceptor::~Acceptor closes the channel (atomic guard) and releases the fd.
+    // First: Stop the connection dispatcher so no more accept events fire.
     conn_dispatcher_->StopEventLoop();
-    acceptor_.reset();
 
     // Second: Release dispatcher-held connection references via EnQueue
     // (ClearConnections must run on the dispatcher thread to avoid racing TimerHandler)
@@ -99,6 +95,10 @@ void NetServer::Stop(){
 
     // Fifth: Now safe to join worker threads
     sock_workers_.Stop();
+
+    // Sixth: Destroy the acceptor now that the conn_dispatcher thread has exited.
+    // (RunEventLoop returned to caller; no more accept callbacks can fire.)
+    acceptor_.reset();
 }
 
 void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){

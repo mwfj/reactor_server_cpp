@@ -93,14 +93,11 @@ int WebSocketConnection::fd() const {
 void WebSocketConnection::NotifyTransportClose() {
     if (!is_open_) return;
     is_open_ = false;
+    // Always report 1006 (Abnormal Closure) for transport-level disconnects.
+    // Even if we sent a Close frame, the peer never completed the handshake
+    // (no Close reply received), so RFC 6455 classifies this as abnormal.
     if (close_handler_) {
-        if (close_sent_ && sent_close_code_ != 0) {
-            // Server initiated the close — report the actual code we sent
-            close_handler_(*this, sent_close_code_, sent_close_reason_);
-        } else {
-            // Unexpected transport disconnect — 1006 (Abnormal Closure)
-            close_handler_(*this, 1006, "Transport closed");
-        }
+        close_handler_(*this, 1006, "Transport closed");
     }
 }
 
