@@ -16,6 +16,7 @@ struct HttpRequest {
     bool keep_alive = true;
     bool upgrade = false;         // Connection: Upgrade (for WebSocket)
     size_t content_length = 0;
+    bool headers_complete = false; // True when headers are parsed (body may still be pending)
     bool complete = false;        // True when full request has been parsed
 
     // Case-insensitive header lookup
@@ -45,6 +46,7 @@ struct HttpRequest {
         keep_alive = true;
         upgrade = false;
         content_length = 0;
+        headers_complete = false;
         complete = false;
     }
 };

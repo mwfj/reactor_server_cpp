@@ -79,6 +79,10 @@ private:
     // Defaults to 1.1; updated when a complete request is parsed.
     int current_http_minor_ = 1;
 
+    // Tracks whether we've sent 100 Continue for the current request.
+    // Reset when the parser is reset for the next pipelined request.
+    bool sent_100_continue_ = false;
+
     // Close the underlying connection (send response then close)
     void CloseConnection();
     std::shared_ptr<ConnectionHandler> conn_;

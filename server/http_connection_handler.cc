@@ -296,6 +296,30 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                     return;
                 }
 
+                // Determine if response sets Connection: close (needed for
+                // keep-alive logic AND the close decision after sending).
+                bool resp_close = false;
+                for (const auto& hdr : response.GetHeaders()) {
+                    std::string key = hdr.first;
+                    std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+                    if (key == "connection") {
+                        std::string val = hdr.second;
+                        std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+                        if (val == "close") {
+                            resp_close = true;
+                        }
+                        break;
+                    }
+                }
+
+                // HTTP/1.0 persistence requires explicit Connection: keep-alive
+                // in the response. Without it, a compliant 1.0 client treats the
+                // response as close-delimited and closes its end, while the server
+                // keeps waiting — stranding the connection until idle timeout.
+                if (req.http_minor == 0 && req.keep_alive && !resp_close) {
+                    response.Header("Connection", "keep-alive");
+                }
+
                 // RFC 7231 §4.3.2: HEAD responses MUST NOT include a body,
                 // but MUST include the same headers as the GET response (including
                 // Content-Length reflecting the GET body size).
@@ -320,21 +344,6 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                     return;
                 }
 
-                // Close if request is non-keep-alive OR response sets Connection: close.
-                // Check case-insensitively for both the header name and value.
-                bool resp_close = false;
-                for (const auto& hdr : response.GetHeaders()) {
-                    std::string key = hdr.first;
-                    std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-                    if (key == "connection") {
-                        std::string val = hdr.second;
-                        std::transform(val.begin(), val.end(), val.begin(), ::tolower);
-                        if (val == "close") {
-                            resp_close = true;
-                        }
-                        break;
-                    }
-                }
                 if (!req.keep_alive || resp_close) {
                     CloseConnection();
                     return;
@@ -350,8 +359,9 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             buf += consumed;
             remaining -= consumed;
 
-            // Reset parser for next request (keep-alive / pipelining)
+            // Reset parser and per-request state for next request (keep-alive / pipelining)
             parser_.Reset();
+            sent_100_continue_ = false;
 
             // If there are remaining bytes (pipelined request), arm a new deadline
             // AND re-install the 408 callback so timer-driven timeout sends proper response
@@ -369,7 +379,37 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 });
             }
         } else {
-            // Incomplete request -- need more data
+            // Incomplete request -- need more data.
+            // RFC 7231 §5.1.1: If headers are complete and the client sent
+            // Expect: 100-continue, send 100 Continue so the client sends
+            // the body. Without this, the client waits for 100 while the
+            // server waits for the body — deadlock until 408 timeout.
+            if (!sent_100_continue_ &&
+                parser_.GetRequest().headers_complete &&
+                parser_.GetRequest().HasHeader("expect")) {
+                std::string expect = parser_.GetRequest().GetHeader("expect");
+                std::transform(expect.begin(), expect.end(), expect.begin(), ::tolower);
+                // Trim OWS (SP/HTAB per RFC 7230 §3.2.3)
+                while (!expect.empty() && (expect.front() == ' ' || expect.front() == '\t'))
+                    expect.erase(expect.begin());
+                while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
+                    expect.pop_back();
+                if (expect == "100-continue") {
+                    // Early rejection: check body size before sending 100
+                    if (max_body_size_ > 0 &&
+                        parser_.GetRequest().content_length > max_body_size_) {
+                        HttpResponse err = HttpResponse::PayloadTooLarge();
+                        err.Header("Connection", "close");
+                        SendResponse(err);
+                        CloseConnection();
+                        return;
+                    }
+                    HttpResponse cont;
+                    cont.Status(100, "Continue");
+                    SendResponse(cont);
+                    sent_100_continue_ = true;
+                }
+            }
             break;
         }
     }

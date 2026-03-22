@@ -144,6 +144,7 @@ static int on_headers_complete(llhttp_t* parser) {
     // Content-Length
     self->request_.content_length = parser->content_length;
 
+    self->request_.headers_complete = true;
     return 0;
 }
 
