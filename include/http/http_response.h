@@ -11,6 +11,7 @@ public:
     // Builder methods (return *this for chaining)
     HttpResponse& Status(int code);
     HttpResponse& Status(int code, const std::string& reason);
+    HttpResponse& Version(int major, int minor);
     HttpResponse& Header(const std::string& key, const std::string& value);
     HttpResponse& Body(const std::string& content);
     HttpResponse& Body(const std::string& content, const std::string& content_type);
@@ -45,6 +46,8 @@ public:
 private:
     int status_code_;
     std::string status_reason_;
+    int http_major_ = 1;
+    int http_minor_ = 1;
     std::vector<std::pair<std::string, std::string>> headers_;
     std::string body_;
 

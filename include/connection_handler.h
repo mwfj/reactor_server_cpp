@@ -34,7 +34,9 @@ private:
     // Off-thread SetDeadline captures the generation at queue time and only
     // applies the deadline if the generation hasn't changed, preventing stale
     // queued deadlines from being resurrected after ClearDeadline.
-    unsigned deadline_generation_ = 0;
+    // Atomic because the off-thread path reads it (to capture a snapshot)
+    // while the on-thread path writes it — plain unsigned would be UB.
+    std::atomic<unsigned> deadline_generation_{0};
 
     // TLS support
     enum class TlsState { NONE, HANDSHAKE, READY };

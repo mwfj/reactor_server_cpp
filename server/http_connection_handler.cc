@@ -37,7 +37,12 @@ void HttpConnectionHandler::SetRequestTimeout(int seconds) {
 }
 
 void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
-    std::string wire = response.Serialize();
+    // Stamp the response with the current request's HTTP version so the
+    // status line matches (e.g. HTTP/1.0 for 1.0 clients, HTTP/1.1 for 1.1).
+    // For pre-parse errors, current_http_minor_ is 1 (default = HTTP/1.1).
+    HttpResponse versioned = response;
+    versioned.Version(1, current_http_minor_);
+    std::string wire = versioned.Serialize();
     conn_->SendRaw(wire.data(), wire.size());
 }
 
@@ -145,6 +150,10 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 CloseConnection();
                 return;
             }
+
+            // Track the request's HTTP version so SendResponse echoes it correctly
+            // (e.g. HTTP/1.0 for 1.0 clients). Must be set after the version check.
+            current_http_minor_ = req.http_minor;
 
             // RFC 7230 §5.4: HTTP/1.1 requests MUST include Host header
             if (req.http_minor >= 1 && !req.HasHeader("host")) {
@@ -293,6 +302,7 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 if (req.method == "HEAD") {
                     // Serialize the full response to get auto-computed Content-Length,
                     // then strip the body from the wire output.
+                    response.Version(1, current_http_minor_);
                     std::string wire = response.Serialize();
                     // Find the end of headers (blank line)
                     auto header_end = wire.find("\r\n\r\n");

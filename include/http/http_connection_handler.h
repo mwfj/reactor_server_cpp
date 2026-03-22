@@ -75,6 +75,10 @@ private:
     bool request_in_progress_ = false;
     std::chrono::steady_clock::time_point request_start_;
 
+    // HTTP version of the current request (for echoing in responses).
+    // Defaults to 1.1; updated when a complete request is parsed.
+    int current_http_minor_ = 1;
+
     // Close the underlying connection (send response then close)
     void CloseConnection();
     std::shared_ptr<ConnectionHandler> conn_;

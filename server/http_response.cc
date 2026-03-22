@@ -19,6 +19,12 @@ HttpResponse& HttpResponse::Status(int code, const std::string& reason) {
     return *this;
 }
 
+HttpResponse& HttpResponse::Version(int major, int minor) {
+    http_major_ = major;
+    http_minor_ = minor;
+    return *this;
+}
+
 HttpResponse& HttpResponse::Header(const std::string& key, const std::string& value) {
     // Sanitize: strip \r and \n to prevent HTTP response splitting
     std::string safe_key = key;
@@ -57,8 +63,9 @@ HttpResponse& HttpResponse::Html(const std::string& html_body) {
 std::string HttpResponse::Serialize() const {
     std::ostringstream oss;
 
-    // Status line
-    oss << "HTTP/1.1 " << status_code_ << " " << status_reason_ << "\r\n";
+    // Status line — echo the request's HTTP version (default 1.1)
+    oss << "HTTP/" << http_major_ << "." << http_minor_ << " "
+        << status_code_ << " " << status_reason_ << "\r\n";
 
     // Headers
     auto hdrs = headers_;
@@ -66,15 +73,21 @@ std::string HttpResponse::Serialize() const {
     // Excluded per RFC 7230/7231: 1xx, 101 (Switching Protocols), 204 (No Content),
     // 205 (Reset Content), 304 (Not Modified)
     bool has_content_length = false;
-    bool has_transfer_encoding = false;
     for (const auto& kv : hdrs) {
         std::string key = kv.first;
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
         if (key == "content-length") has_content_length = true;
-        if (key == "transfer-encoding") has_transfer_encoding = true;
     }
-    // Don't add Content-Length when Transfer-Encoding is set (RFC 7230 §3.3.2)
-    if (!has_content_length && !has_transfer_encoding &&
+    // Strip Transfer-Encoding headers — this server does not implement chunked
+    // encoding, so emitting Transfer-Encoding: chunked with an un-chunked body
+    // produces malformed HTTP. Use Content-Length framing exclusively.
+    hdrs.erase(std::remove_if(hdrs.begin(), hdrs.end(),
+        [](const std::pair<std::string, std::string>& kv) {
+            std::string key = kv.first;
+            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+            return key == "transfer-encoding";
+        }), hdrs.end());
+    if (!has_content_length &&
         status_code_ >= 200 && status_code_ != 204 &&
         status_code_ != 304 && status_code_ != 101) {
         // 205 Reset Content: must have Content-Length: 0 for keep-alive framing
