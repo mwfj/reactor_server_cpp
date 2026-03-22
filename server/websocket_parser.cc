@@ -84,6 +84,12 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                 if (buf_remaining() < 2) goto done;
                 uint16_t len16 = (static_cast<uint8_t>(buffer_[offset]) << 8) |
                                   static_cast<uint8_t>(buffer_[offset + 1]);
+                // RFC 6455 §5.2: 16-bit length must be > 125 (minimal encoding)
+                if (len16 <= 125) {
+                    has_error_ = true;
+                    error_message_ = "Non-minimal 16-bit payload length encoding";
+                    goto done;
+                }
                 current_.payload_length = len16;
                 offset += 2;
                 total_consumed += 2;
@@ -107,6 +113,12 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                 uint64_t len64 = 0;
                 for (int i = 0; i < 8; i++) {
                     len64 = (len64 << 8) | static_cast<uint8_t>(buffer_[offset + i]);
+                }
+                // RFC 6455 §5.2: 64-bit length must be > 65535 (minimal encoding)
+                if (len64 <= 65535) {
+                    has_error_ = true;
+                    error_message_ = "Non-minimal 64-bit payload length encoding";
+                    goto done;
                 }
                 current_.payload_length = len64;
                 offset += 8;
