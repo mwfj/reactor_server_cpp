@@ -31,19 +31,29 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
     ServerConfig config;
 
     // Top-level fields
-    if (j.contains("bind_host") && j["bind_host"].is_string()) {
+    if (j.contains("bind_host")) {
+        if (!j["bind_host"].is_string())
+            throw std::runtime_error("bind_host must be a string");
         config.bind_host = j["bind_host"].get<std::string>();
     }
-    if (j.contains("bind_port") && j["bind_port"].is_number_integer()) {
+    if (j.contains("bind_port")) {
+        if (!j["bind_port"].is_number_integer())
+            throw std::runtime_error("bind_port must be an integer");
         config.bind_port = j["bind_port"].get<int>();
     }
-    if (j.contains("max_connections") && j["max_connections"].is_number_integer()) {
+    if (j.contains("max_connections")) {
+        if (!j["max_connections"].is_number_integer())
+            throw std::runtime_error("max_connections must be an integer");
         config.max_connections = j["max_connections"].get<int>();
     }
-    if (j.contains("idle_timeout_sec") && j["idle_timeout_sec"].is_number_integer()) {
+    if (j.contains("idle_timeout_sec")) {
+        if (!j["idle_timeout_sec"].is_number_integer())
+            throw std::runtime_error("idle_timeout_sec must be an integer");
         config.idle_timeout_sec = j["idle_timeout_sec"].get<int>();
     }
-    if (j.contains("worker_threads") && j["worker_threads"].is_number_integer()) {
+    if (j.contains("worker_threads")) {
+        if (!j["worker_threads"].is_number_integer())
+            throw std::runtime_error("worker_threads must be an integer");
         config.worker_threads = j["worker_threads"].get<int>();
     }
     if (j.contains("max_header_size")) {
@@ -67,23 +77,33 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
             throw std::runtime_error("max_ws_message_size must be non-negative");
         }
     }
-    if (j.contains("request_timeout_sec") && j["request_timeout_sec"].is_number_integer()) {
+    if (j.contains("request_timeout_sec")) {
+        if (!j["request_timeout_sec"].is_number_integer())
+            throw std::runtime_error("request_timeout_sec must be an integer");
         config.request_timeout_sec = j["request_timeout_sec"].get<int>();
     }
 
     // TLS section
     if (j.contains("tls") && j["tls"].is_object()) {
         auto& tls = j["tls"];
-        if (tls.contains("enabled") && tls["enabled"].is_boolean()) {
+        if (tls.contains("enabled")) {
+            if (!tls["enabled"].is_boolean())
+                throw std::runtime_error("tls.enabled must be a boolean");
             config.tls.enabled = tls["enabled"].get<bool>();
         }
-        if (tls.contains("cert_file") && tls["cert_file"].is_string()) {
+        if (tls.contains("cert_file")) {
+            if (!tls["cert_file"].is_string())
+                throw std::runtime_error("tls.cert_file must be a string");
             config.tls.cert_file = tls["cert_file"].get<std::string>();
         }
-        if (tls.contains("key_file") && tls["key_file"].is_string()) {
+        if (tls.contains("key_file")) {
+            if (!tls["key_file"].is_string())
+                throw std::runtime_error("tls.key_file must be a string");
             config.tls.key_file = tls["key_file"].get<std::string>();
         }
-        if (tls.contains("min_version") && tls["min_version"].is_string()) {
+        if (tls.contains("min_version")) {
+            if (!tls["min_version"].is_string())
+                throw std::runtime_error("tls.min_version must be a string");
             config.tls.min_version = tls["min_version"].get<std::string>();
         }
     }
@@ -91,10 +111,14 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
     // Log section
     if (j.contains("log") && j["log"].is_object()) {
         auto& log = j["log"];
-        if (log.contains("level") && log["level"].is_string()) {
+        if (log.contains("level")) {
+            if (!log["level"].is_string())
+                throw std::runtime_error("log.level must be a string");
             config.log.level = log["level"].get<std::string>();
         }
-        if (log.contains("file") && log["file"].is_string()) {
+        if (log.contains("file")) {
+            if (!log["file"].is_string())
+                throw std::runtime_error("log.file must be a string");
             config.log.file = log["file"].get<std::string>();
         }
         if (log.contains("max_file_size")) {
@@ -104,7 +128,9 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 throw std::runtime_error("log.max_file_size must be non-negative");
             }
         }
-        if (log.contains("max_files") && log["max_files"].is_number_integer()) {
+        if (log.contains("max_files")) {
+            if (!log["max_files"].is_number_integer())
+                throw std::runtime_error("log.max_files must be an integer");
             config.log.max_files = log["max_files"].get<int>();
         }
     }

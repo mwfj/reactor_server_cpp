@@ -56,15 +56,15 @@ std::string HttpResponse::Serialize() const {
     // Excluded per RFC 7230/7231: 1xx, 101 (Switching Protocols), 204 (No Content),
     // 205 (Reset Content), 304 (Not Modified)
     bool has_content_length = false;
+    bool has_transfer_encoding = false;
     for (const auto& kv : hdrs) {
         std::string key = kv.first;
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-        if (key == "content-length") {
-            has_content_length = true;
-            break;
-        }
+        if (key == "content-length") has_content_length = true;
+        if (key == "transfer-encoding") has_transfer_encoding = true;
     }
-    if (!has_content_length &&
+    // Don't add Content-Length when Transfer-Encoding is set (RFC 7230 §3.3.2)
+    if (!has_content_length && !has_transfer_encoding &&
         status_code_ >= 200 && status_code_ != 204 &&
         status_code_ != 304 && status_code_ != 101) {
         // 205 Reset Content: must have Content-Length: 0 for keep-alive framing

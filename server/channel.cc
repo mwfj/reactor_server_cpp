@@ -101,13 +101,21 @@ void Channel::HandleEvent() {
     //   2. Defers if close_after_write_ with buffered data (response still flushing)
     // Do NOT call CloseChannel here — CallCloseCb handles it when appropriate.
     if(events & (EVENT_RDHUP | EVENT_HUP)){
+        // Only close if:
+        // - Channel isn't already closed (by read/write callbacks), AND
+        // - No close callback is wired (fallback), OR
+        // - The close callback doesn't defer (CallCloseCb returns early if
+        //   close_after_write_ is set with buffered data)
         if (!is_channel_closed()) {
             if(callbacks_.close_callback) {
                 callbacks_.close_callback();
             } else {
-                CloseChannel();  // Fallback if no close callback wired
+                CloseChannel();
             }
         }
+        // Note: if CallCloseCb deferred (close_after_write_ + buffer), the channel
+        // stays open. CallWriteCb will close after the buffer drains. For async
+        // handlers, DoSend will enable write mode when data arrives.
         return;
     }
 

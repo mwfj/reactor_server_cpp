@@ -76,7 +76,11 @@ void ConnectionHandler::OnMessage(){
     if (tls_write_wants_read_) {
         tls_write_wants_read_ = false;
         CallWriteCb();  // Retry the pending write
-        // Fall through to read loop below (don't return)
+        // If SSL still needs read readiness, keep read mode (already enabled)
+        if (tls_write_wants_read_) {
+            return;
+        }
+        // Otherwise fall through to read loop
     }
 
     bool peer_closed = false;  // Track if we saw EOF, close after dispatching buffered data
@@ -281,7 +285,7 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
 void ConnectionHandler::CloseAfterWrite(){
     close_after_write_.store(true, std::memory_order_release);
     if (output_bf_.Size() == 0) {
-        CallCloseCb();
+        ForceClose();  // Nothing to flush — close immediately
     } else {
         client_channel_ -> EnableWriteMode();
     }
@@ -295,9 +299,11 @@ void ConnectionHandler::ForceClose(){
 }
 
 void ConnectionHandler::CallCloseCb(){
-    // If close_after_write is armed and there's still data to flush,
-    // defer — CallWriteCb will close after the buffer drains.
-    if (close_after_write_.load(std::memory_order_acquire) && output_bf_.Size() > 0) {
+    // If close_after_write is armed, defer to the write path.
+    // CallWriteCb will close after the buffer drains. For async handlers,
+    // DoSend will enable write mode when data arrives. If nothing ever
+    // arrives, the idle/deadline timeout will force-close via ForceClose().
+    if (close_after_write_.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -419,7 +425,12 @@ void ConnectionHandler::CallWriteCb(){
     if (tls_read_wants_write_) {
         tls_read_wants_write_ = false;
         OnMessage();  // Retry the pending read
-        // Fall through to write path below (don't return)
+        // If SSL still needs write readiness (flag re-armed by OnMessage),
+        // keep write mode enabled — don't fall through to disable it.
+        if (tls_read_wants_write_) {
+            return;  // Will get another EPOLLOUT
+        }
+        // Otherwise fall through to write path
     }
 
     // TLS handshake WANT_WRITE handling
@@ -486,7 +497,7 @@ void ConnectionHandler::CallWriteCb(){
     if(output_bf_.Size() == 0){
         client_channel_->DisableWriteMode();
         if (close_after_write_.load(std::memory_order_acquire)) {
-            CallCloseCb();
+            ForceClose();  // Buffer drained — close now
             return;
         }
         if(callbacks_.complete_callback)
