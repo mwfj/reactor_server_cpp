@@ -1,5 +1,6 @@
 #include "http/http_connection_handler.h"
 #include "log/logger.h"
+#include <sstream>
 
 HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn)
     : conn_(std::move(conn)) {}
@@ -314,9 +315,9 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
 
                 // Determine if response sets Connection: close (needed for
                 // keep-alive logic AND the close decision after sending).
-                // Scan ALL Connection headers — duplicates/conflicting values
-                // must not cause the server's close decision to disagree with
-                // on-wire semantics (e.g. Connection: keep-alive + Connection: close).
+                // Scan ALL Connection headers and parse each as a comma-separated
+                // token list (RFC 7230 §6.1). Values like "keep-alive, close" or
+                // "upgrade, close" must be recognized, not just exact "close".
                 bool resp_close = false;
                 for (const auto& hdr : response.GetHeaders()) {
                     std::string key = hdr.first;
@@ -324,8 +325,16 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                     if (key == "connection") {
                         std::string val = hdr.second;
                         std::transform(val.begin(), val.end(), val.begin(), ::tolower);
-                        if (val == "close") {
-                            resp_close = true;
+                        std::istringstream ss(val);
+                        std::string token;
+                        while (std::getline(ss, token, ',')) {
+                            while (!token.empty() && (token.front() == ' ' || token.front() == '\t'))
+                                token.erase(token.begin());
+                            while (!token.empty() && (token.back() == ' ' || token.back() == '\t'))
+                                token.pop_back();
+                            if (token == "close") {
+                                resp_close = true;
+                            }
                         }
                     }
                 }

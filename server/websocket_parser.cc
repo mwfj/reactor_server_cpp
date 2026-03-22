@@ -180,7 +180,13 @@ done:
         buffer_.erase(0, offset);
     }
 
-    return total_consumed;
+    // Return `len` — the parser always consumes all input into its internal
+    // buffer. The previous return of `total_consumed` counted bytes processed
+    // from the internal buffer (which includes previously buffered data),
+    // not from the current data,len chunk. That broke the API contract:
+    // e.g., feeding an 8-byte frame as 1+7 bytes would return 0 then 8,
+    // even though the second chunk was only 7 bytes.
+    return len;
 }
 
 void WebSocketParser::ResetAfterError() {

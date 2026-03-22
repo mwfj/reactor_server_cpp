@@ -575,6 +575,14 @@ void ConnectionHandler::CallWriteCb(){
         output_bf_.Erase(0, write_sz);
         ts_ = TimeStamp::Now();
         tls_pending_write_size_ = 0;  // Clear pending — write succeeded
+        // Refresh close-after-write deadline — the connection is actively draining.
+        // Without this, a large/slow-but-healthy response can be force-closed
+        // mid-transfer by the fixed 30s deadline from CloseConnection().
+        // Only refresh when close_after_write_ is set (close-drain deadline),
+        // NOT for request deadlines (Slowloris protection) which should be absolute.
+        if (has_deadline_ && close_after_write_.load(std::memory_order_acquire)) {
+            deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        }
     }
 
     // If there's no data waiting to write, then unregister writing event
