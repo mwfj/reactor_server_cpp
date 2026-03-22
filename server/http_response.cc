@@ -151,6 +151,7 @@ std::string HttpResponse::DefaultReason(int code) {
         case 405: return "Method Not Allowed";
         case 408: return "Request Timeout";
         case 413: return "Payload Too Large";
+        case 426: return "Upgrade Required";
         case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
         case 501: return "Not Implemented";

@@ -59,8 +59,10 @@ void Acceptor::NewConnection(){
             return;
         }
         if(client_fd == -2){
-            // Transient error (ECONNABORTED/EMFILE/etc.) — skip but keep draining
-            continue;
+            // Resource exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM) or ECONNABORTED.
+            // Return to event loop instead of busy-spinning — the next
+            // accept event will retry when resources are available.
+            return;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));
         new_conn_cb_(std::move(client_sock));

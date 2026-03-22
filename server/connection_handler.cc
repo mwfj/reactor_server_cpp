@@ -206,9 +206,12 @@ void ConnectionHandler::DoSend(const char *data, size_t size){
         if (tls_state_ != TlsState::HANDSHAKE) {
             if (written > 0) {
                 output_bf_.Erase(0, written);
-                ts_ = TimeStamp::Now();  // Refresh idle timeout on successful write
+                ts_ = TimeStamp::Now();
                 if (output_bf_.Size() == 0) {
-                    return;  // All sent, no need for EPOLLOUT
+                    // All sent — fire completion callback
+                    if (callbacks_.complete_callback)
+                        callbacks_.complete_callback(shared_from_this());
+                    return;
                 }
             } else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                 CallCloseCb();
@@ -262,9 +265,11 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
             written = ::send(fd(), data, size, SEND_FLAGS);
         }
         if (written > 0) {
-            ts_ = TimeStamp::Now();  // Refresh idle timeout on successful write
+            ts_ = TimeStamp::Now();
             if (static_cast<size_t>(written) == size) {
-                // All data sent immediately, no need to buffer
+                // All sent — fire completion callback
+                if (callbacks_.complete_callback)
+                    callbacks_.complete_callback(shared_from_this());
                 return;
             }
             // Partial write -- buffer the remainder
@@ -285,7 +290,7 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
 void ConnectionHandler::CloseAfterWrite(){
     close_after_write_.store(true, std::memory_order_release);
     if (output_bf_.Size() == 0) {
-        ForceClose();  // Nothing to flush — close immediately
+        ForceClose();
     } else {
         client_channel_ -> EnableWriteMode();
     }
