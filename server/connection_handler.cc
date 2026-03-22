@@ -232,8 +232,11 @@ void ConnectionHandler::DoSend(const char *data, size_t size){
                 tls_pending_write_size_ = try_len;
                 tls_write_wants_read_ = true;
                 client_channel_->EnableReadMode();
-                written = -1;
-                errno = EAGAIN;
+                // Don't enable write mode — wait for read readiness first.
+                // OnMessage() will retry the write when read data arrives.
+                // Without this, EPOLLOUT fires continuously (socket is writable)
+                // and we busy-loop retrying SSL_write that keeps returning WANT_READ.
+                return;
             }
         } else if (tls_state_ == TlsState::NONE) {
             // No TLS — raw send
@@ -306,8 +309,10 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
                 tls_pending_write_size_ = size;
                 tls_write_wants_read_ = true;
                 client_channel_->EnableReadMode();
-                written = -1;
-                errno = EAGAIN;
+                // Buffer the data and stop watching write readiness.
+                // OnMessage() will retry the write when read data arrives.
+                output_bf_.Append(data, size);
+                return;
             }
         } else {
             // No TLS — raw send
@@ -544,6 +549,11 @@ void ConnectionHandler::CallWriteCb(){
             tls_pending_write_size_ = write_len;  // Track for retry
             tls_write_wants_read_ = true;
             client_channel_->EnableReadMode();
+            // Stop watching write readiness — the TLS layer needs read data
+            // from the peer before it can complete this write. OnMessage()
+            // will retry when read data arrives. Without disabling write,
+            // EPOLLOUT fires continuously and we busy-loop.
+            client_channel_->DisableWriteMode();
             return;
         }
         if (write_sz < 0) {
@@ -576,6 +586,12 @@ void ConnectionHandler::CallWriteCb(){
         }
         if(callbacks_.complete_callback)
             callbacks_.complete_callback(shared_from_this());
+    } else {
+        // Still data to send — ensure write mode is enabled.
+        // This is essential after the WANT_READ recovery path (OnMessage → CallWriteCb)
+        // where write mode was disabled while waiting for read readiness.
+        // For the normal EPOLLOUT path, write mode is already enabled, so this is a no-op.
+        client_channel_->EnableWriteMode();
     }
 }
 

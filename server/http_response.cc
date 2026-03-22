@@ -69,32 +69,48 @@ std::string HttpResponse::Serialize() const {
 
     // Headers
     auto hdrs = headers_;
-    // Add Content-Length if not already set (case-insensitive check).
-    // Excluded per RFC 7230/7231: 1xx, 101 (Switching Protocols), 204 (No Content),
-    // 205 (Reset Content), 304 (Not Modified)
-    bool has_content_length = false;
-    for (const auto& kv : hdrs) {
-        std::string key = kv.first;
-        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-        if (key == "content-length") has_content_length = true;
-    }
+
+    // Determine if this status code must not have a body (RFC 7230/7231).
+    // For these statuses, any caller-set Content-Length is invalid and must
+    // be stripped/normalized to prevent keep-alive framing desync.
+    bool bodyless_status = (status_code_ < 200 || status_code_ == 101 ||
+                            status_code_ == 204 || status_code_ == 304);
+
     // Strip Transfer-Encoding headers — this server does not implement chunked
     // encoding, so emitting Transfer-Encoding: chunked with an un-chunked body
     // produces malformed HTTP. Use Content-Length framing exclusively.
+    // Also strip Content-Length for bodyless statuses (1xx, 101, 204, 304)
+    // to prevent framing desync on keep-alive connections.
     hdrs.erase(std::remove_if(hdrs.begin(), hdrs.end(),
-        [](const std::pair<std::string, std::string>& kv) {
+        [bodyless_status](const std::pair<std::string, std::string>& kv) {
             std::string key = kv.first;
             std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-            return key == "transfer-encoding";
+            if (key == "transfer-encoding") return true;
+            if (key == "content-length" && bodyless_status) return true;
+            return false;
         }), hdrs.end());
-    if (!has_content_length &&
-        status_code_ >= 200 && status_code_ != 204 &&
-        status_code_ != 304 && status_code_ != 101) {
-        // 205 Reset Content: must have Content-Length: 0 for keep-alive framing
-        // All other eligible statuses: Content-Length = body size
-        if (status_code_ == 205) {
-            hdrs.emplace_back("Content-Length", "0");
-        } else {
+
+    // Add Content-Length if not already set.
+    // Excluded: 1xx, 101, 204, 304 (bodyless — just stripped above).
+    // 205 Reset Content: force Content-Length: 0 for keep-alive framing
+    // regardless of what the caller set.
+    if (status_code_ == 205) {
+        // Strip any caller-set Content-Length first, then force 0
+        hdrs.erase(std::remove_if(hdrs.begin(), hdrs.end(),
+            [](const std::pair<std::string, std::string>& kv) {
+                std::string key = kv.first;
+                std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+                return key == "content-length";
+            }), hdrs.end());
+        hdrs.emplace_back("Content-Length", "0");
+    } else if (!bodyless_status) {
+        bool has_content_length = false;
+        for (const auto& kv : hdrs) {
+            std::string key = kv.first;
+            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+            if (key == "content-length") { has_content_length = true; break; }
+        }
+        if (!has_content_length) {
             hdrs.emplace_back("Content-Length", std::to_string(body_.size()));
         }
     }
