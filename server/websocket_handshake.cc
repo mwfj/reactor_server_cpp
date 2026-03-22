@@ -68,6 +68,9 @@ bool WebSocketHandshake::Validate(const HttpRequest& request, std::string& error
     // 6. Sec-WebSocket-Key present and valid (base64-encoded 16 bytes → 24 chars with padding)
     {
         std::string key = request.GetHeader("sec-websocket-key");
+        // Trim OWS (SP/HTAB) per RFC 7230 §3.2.3
+        while (!key.empty() && (key.front() == ' ' || key.front() == '\t')) key.erase(key.begin());
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
         if (key.empty()) {
             error_message = "Missing Sec-WebSocket-Key header";
             return false;
@@ -91,16 +94,25 @@ bool WebSocketHandshake::Validate(const HttpRequest& request, std::string& error
     }
 
     // 7. Sec-WebSocket-Version is "13"
-    if (request.GetHeader("sec-websocket-version") != "13") {
-        error_message = "Unsupported WebSocket version (expected 13)";
-        return false;
+    {
+        std::string version = request.GetHeader("sec-websocket-version");
+        while (!version.empty() && (version.front() == ' ' || version.front() == '\t')) version.erase(version.begin());
+        while (!version.empty() && (version.back() == ' ' || version.back() == '\t')) version.pop_back();
+        if (version != "13") {
+            error_message = "Unsupported WebSocket version (expected 13)";
+            return false;
+        }
     }
 
     return true;
 }
 
 HttpResponse WebSocketHandshake::Accept(const HttpRequest& request) {
-    std::string accept_key = ComputeAcceptKey(request.GetHeader("sec-websocket-key"));
+    std::string key = request.GetHeader("sec-websocket-key");
+    // Trim OWS before hashing
+    while (!key.empty() && (key.front() == ' ' || key.front() == '\t')) key.erase(key.begin());
+    while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+    std::string accept_key = ComputeAcceptKey(key);
 
     HttpResponse response;
     response.Status(101, "Switching Protocols")

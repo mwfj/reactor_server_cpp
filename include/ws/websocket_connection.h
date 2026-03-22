@@ -50,8 +50,8 @@ public:
 private:
     std::shared_ptr<ConnectionHandler> conn_;
     WebSocketParser parser_;
-    bool is_open_ = true;
-    bool close_sent_ = false;  // We sent a close frame, waiting for peer's reply
+    std::atomic<bool> is_open_{true};
+    std::atomic<bool> close_sent_{false};  // We sent a close frame, waiting for peer's reply
     uint16_t sent_close_code_ = 0;     // Close code we sent (for NotifyTransportClose)
     std::string sent_close_reason_;    // Close reason we sent
 
