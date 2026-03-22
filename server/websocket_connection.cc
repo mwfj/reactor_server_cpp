@@ -1,53 +1,5 @@
 #include "ws/websocket_connection.h"
-
-// RFC 3629 UTF-8 validation
-// RFC 3629 UTF-8 validation with full codepoint range checks:
-// - Rejects overlong encodings (e.g., 0xC0 0x80 for U+0000)
-// - Rejects surrogates U+D800-U+DFFF
-// - Rejects codepoints > U+10FFFF
-static bool IsValidUtf8(const std::string& data) {
-    size_t i = 0;
-    while (i < data.size()) {
-        uint8_t c = static_cast<uint8_t>(data[i]);
-        uint32_t codepoint;
-        size_t len;
-
-        if (c <= 0x7F) {
-            i++; continue;
-        } else if ((c & 0xE0) == 0xC0) {
-            len = 2;
-            if (c < 0xC2) return false;  // overlong
-            codepoint = c & 0x1F;
-        } else if ((c & 0xF0) == 0xE0) {
-            len = 3;
-            codepoint = c & 0x0F;
-        } else if ((c & 0xF8) == 0xF0) {
-            len = 4;
-            codepoint = c & 0x07;
-        } else {
-            return false;  // invalid lead byte
-        }
-
-        if (i + len > data.size()) return false;
-
-        for (size_t j = 1; j < len; j++) {
-            uint8_t cb = static_cast<uint8_t>(data[i + j]);
-            if ((cb & 0xC0) != 0x80) return false;
-            codepoint = (codepoint << 6) | (cb & 0x3F);
-        }
-
-        // Reject surrogates (U+D800-U+DFFF) and codepoints > U+10FFFF
-        if (codepoint >= 0xD800 && codepoint <= 0xDFFF) return false;
-        if (codepoint > 0x10FFFF) return false;
-
-        // Reject overlong encodings
-        if (len == 3 && codepoint < 0x0800) return false;
-        if (len == 4 && codepoint < 0x10000) return false;
-
-        i += len;
-    }
-    return true;
-}
+#include "ws/utf8_validate.h"
 
 WebSocketConnection::WebSocketConnection(std::shared_ptr<ConnectionHandler> conn)
     : conn_(std::move(conn)) {}
@@ -59,6 +11,13 @@ void WebSocketConnection::OnError(ErrorHandler handler) { error_handler_ = std::
 
 void WebSocketConnection::SendText(const std::string& message) {
     if (close_sent_ || !is_open_) return;  // No data frames after close
+    // RFC 6455 §5.6: text frames must contain valid UTF-8.
+    // Validate outbound text to prevent emitting protocol-invalid frames
+    // that would cause compliant clients to close with 1007.
+    if (!IsValidUtf8(message)) {
+        if (error_handler_) error_handler_(*this, "Outbound text message is not valid UTF-8");
+        return;
+    }
     SendFrame(WebSocketFrame::TextFrame(message));
 }
 

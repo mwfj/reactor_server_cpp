@@ -161,6 +161,11 @@ static int on_headers_complete(llhttp_t* parser) {
     self->request_.content_length = parser->content_length;
 
     self->request_.headers_complete = true;
+    // Reset parsing state so trailer fields (which reuse on_header_field/value
+    // callbacks) don't incorrectly flush the cleared header fields as an empty
+    // key-value pair into the headers map.
+    self->parsing_header_value_ = false;
+    self->in_header_field_ = false;
     return 0;
 }
 
@@ -184,6 +189,26 @@ static int on_body(llhttp_t* parser, const char* at, size_t length) {
 
 static int on_message_complete(llhttp_t* parser) {
     auto* self = static_cast<HttpParser*>(parser->data);
+
+    // Flush any remaining trailer header field (the last trailer has no
+    // subsequent on_header_field call to trigger flushing).
+    // Without this, the last trailer is silently dropped.
+    if (self->parsing_header_value_ && !self->current_header_field_.empty()) {
+        std::string key = self->current_header_field_;
+        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+        auto it = self->request_.headers.find(key);
+        if (it != self->request_.headers.end()) {
+            // Don't allow trailers to overwrite Host (RFC 7230 §4.1.2)
+            if (key != "host") {
+                it->second += ", " + self->current_header_value_;
+            }
+        } else {
+            self->request_.headers[key] = self->current_header_value_;
+        }
+        self->current_header_field_.clear();
+        self->current_header_value_.clear();
+    }
+
     self->request_.complete = true;
 
     // Return HPE_PAUSED so llhttp_execute() stops immediately and returns

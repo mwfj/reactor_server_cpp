@@ -1,4 +1,5 @@
 #include "ws/websocket_frame.h"
+#include "ws/utf8_validate.h"
 
 std::string WebSocketFrame::Serialize() const {
     std::string result;
@@ -92,6 +93,11 @@ WebSocketFrame WebSocketFrame::CloseFrame(uint16_t code, const std::string& reas
         } else {
             trimmed_reason.clear();
         }
+    }
+    // RFC 6455 §7.4.1: close reason must be valid UTF-8.
+    // Validate after truncation to prevent emitting protocol-invalid frames.
+    if (!trimmed_reason.empty() && !IsValidUtf8(trimmed_reason)) {
+        trimmed_reason.clear();  // Drop invalid reason, keep the close code
     }
     f.payload += trimmed_reason;
 

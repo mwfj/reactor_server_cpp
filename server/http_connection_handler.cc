@@ -407,45 +407,65 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             }
         } else {
             // Incomplete request -- need more data.
-            // RFC 7231 §5.1.1: If headers are complete and the client sent
-            // Expect: 100-continue, send 100 Continue so the client sends
-            // the body. Without this, the client waits for 100 while the
-            // server waits for the body — deadlock until 408 timeout.
-            if (!sent_100_continue_ &&
-                parser_.GetRequest().headers_complete &&
-                parser_.GetRequest().HasHeader("expect")) {
-                std::string expect = parser_.GetRequest().GetHeader("expect");
-                std::transform(expect.begin(), expect.end(), expect.begin(), ::tolower);
-                // Trim OWS (SP/HTAB per RFC 7230 §3.2.3)
-                while (!expect.empty() && (expect.front() == ' ' || expect.front() == '\t'))
-                    expect.erase(expect.begin());
-                while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
-                    expect.pop_back();
-                if (expect == "100-continue") {
-                    // Early rejection: check body size before sending 100
-                    if (max_body_size_ > 0 &&
-                        parser_.GetRequest().content_length > max_body_size_) {
-                        HttpResponse err = HttpResponse::PayloadTooLarge();
+            // Perform early validation once headers are complete to avoid
+            // holding connection slots for requests that can never succeed.
+            if (!sent_100_continue_ && parser_.GetRequest().headers_complete) {
+                const auto& partial = parser_.GetRequest();
+
+                // Early reject: unsupported HTTP version
+                if (partial.http_major != 1 ||
+                    (partial.http_minor != 0 && partial.http_minor != 1)) {
+                    HttpResponse ver_resp = HttpResponse::HttpVersionNotSupported();
+                    ver_resp.Header("Connection", "close");
+                    SendResponse(ver_resp);
+                    CloseConnection();
+                    return;
+                }
+
+                // Early reject: HTTP/1.1 missing Host
+                if (partial.http_minor >= 1 && !partial.HasHeader("host")) {
+                    HttpResponse bad_req = HttpResponse::BadRequest("Missing Host header");
+                    bad_req.Header("Connection", "close");
+                    SendResponse(bad_req);
+                    CloseConnection();
+                    return;
+                }
+
+                // Early reject: Content-Length exceeds body size limit.
+                // Without this, a client can send headers with a huge Content-Length
+                // and no body, occupying a connection slot until request timeout.
+                if (max_body_size_ > 0 &&
+                    partial.content_length > max_body_size_) {
+                    HttpResponse err = HttpResponse::PayloadTooLarge();
+                    err.Header("Connection", "close");
+                    SendResponse(err);
+                    CloseConnection();
+                    return;
+                }
+
+                // RFC 7231 §5.1.1: handle Expect header
+                if (partial.HasHeader("expect")) {
+                    std::string expect = partial.GetHeader("expect");
+                    std::transform(expect.begin(), expect.end(), expect.begin(), ::tolower);
+                    // Trim OWS (SP/HTAB per RFC 7230 §3.2.3)
+                    while (!expect.empty() && (expect.front() == ' ' || expect.front() == '\t'))
+                        expect.erase(expect.begin());
+                    while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
+                        expect.pop_back();
+                    if (expect == "100-continue") {
+                        HttpResponse cont;
+                        cont.Status(100, "Continue");
+                        SendResponse(cont);
+                        sent_100_continue_ = true;
+                    } else {
+                        // Unrecognized Expect value — RFC 7231 §5.1.1: 417
+                        HttpResponse err;
+                        err.Status(417, "Expectation Failed");
                         err.Header("Connection", "close");
                         SendResponse(err);
                         CloseConnection();
                         return;
                     }
-                    HttpResponse cont;
-                    cont.Status(100, "Continue");
-                    SendResponse(cont);
-                    sent_100_continue_ = true;
-                } else {
-                    // Unrecognized Expect value (e.g., "foo", "100-continue, bar").
-                    // RFC 7231 §5.1.1: respond with 417 Expectation Failed.
-                    // Without this, the client waits for 100/417 while the server
-                    // waits for the body — deadlock until request timeout.
-                    HttpResponse err;
-                    err.Status(417, "Expectation Failed");
-                    err.Header("Connection", "close");
-                    SendResponse(err);
-                    CloseConnection();
-                    return;
                 }
             }
             break;
