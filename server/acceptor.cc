@@ -31,6 +31,15 @@ Acceptor::~Acceptor() {
     }
 }
 
+void Acceptor::CloseListenSocket() {
+    if (acceptor_channel_ && !acceptor_channel_->is_channel_closed()) {
+        acceptor_channel_->CloseChannel();
+    }
+    if (servsock_) {
+        servsock_->ReleaseFd();
+    }
+}
+
 void Acceptor::SetNewConnCb(std::function<void(std::unique_ptr<SocketHandler>)> fn){
     new_conn_cb_ = fn;
 }

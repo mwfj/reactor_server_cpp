@@ -426,6 +426,17 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                     cont.Status(100, "Continue");
                     SendResponse(cont);
                     sent_100_continue_ = true;
+                } else {
+                    // Unrecognized Expect value (e.g., "foo", "100-continue, bar").
+                    // RFC 7231 §5.1.1: respond with 417 Expectation Failed.
+                    // Without this, the client waits for 100/417 while the server
+                    // waits for the body — deadlock until request timeout.
+                    HttpResponse err;
+                    err.Status(417, "Expectation Failed");
+                    err.Header("Connection", "close");
+                    SendResponse(err);
+                    CloseConnection();
+                    return;
                 }
             }
             break;

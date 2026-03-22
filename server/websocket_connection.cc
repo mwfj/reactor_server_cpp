@@ -229,6 +229,11 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             if (frame.payload.size() == 1) {
                 if (error_handler_) error_handler_(*this, "Invalid close frame: 1-byte payload");
                 SendClose(1002, "Protocol error");
+                // The peer already sent their Close frame — the handshake is
+                // complete once we send ours. Close the transport immediately
+                // instead of waiting 5s for a reply that won't come.
+                is_open_ = false;
+                if (conn_) conn_->CloseAfterWrite();
                 return;
             }
             // If payload is empty, echo an empty close frame (no code/reason)
@@ -260,6 +265,10 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             if (!reason.empty() && !IsValidUtf8(reason)) {
                 if (error_handler_) error_handler_(*this, "Close reason is not valid UTF-8");
                 SendClose(1007, "Invalid UTF-8 in close reason");
+                // The peer already sent their Close frame — handshake complete.
+                // Close transport immediately instead of waiting 5s.
+                is_open_ = false;
+                if (conn_) conn_->CloseAfterWrite();
                 return;
             }
             // Validate close code per RFC 6455 Section 7.4 + IANA registry.

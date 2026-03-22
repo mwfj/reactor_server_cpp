@@ -19,5 +19,10 @@ public:
 
     void NewConnection(); // process the request from client
 
+    // Close the listening socket and remove from epoll, releasing the port
+    // immediately. Safe to call from the conn_dispatcher thread (sequentially
+    // with accept callbacks). After this, ~Acceptor is a no-op.
+    void CloseListenSocket();
+
     void SetNewConnCb(std::function<void(std::unique_ptr<SocketHandler>)>);
 };
