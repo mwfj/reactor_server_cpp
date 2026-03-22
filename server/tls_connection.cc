@@ -12,6 +12,10 @@ TlsConnection::TlsConnection(TlsContext& ctx, int fd) {
         throw std::runtime_error("Failed to set SSL file descriptor");
     }
     SSL_set_accept_state(ssl_);  // Server-side
+
+    // Allow retrying SSL_write with a different buffer address.
+    // Our output_bf_ can reallocate between the original write and the retry.
+    SSL_set_mode(ssl_, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_ENABLE_PARTIAL_WRITE);
 }
 
 TlsConnection::~TlsConnection() {

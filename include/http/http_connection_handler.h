@@ -59,7 +59,7 @@ public:
     void SetMaxWsMessageSize(size_t max) { max_ws_message_size_ = max; }
 
     // Set request timeout (Slowloris protection).
-    // Arms a deadline immediately so connect-and-wait attacks are caught.
+    // Deadline is armed on first OnRawData call (after TLS handshake completes for TLS connections).
     void SetRequestTimeout(int seconds);
 
     // Called when raw data arrives (set as NetServer's on_message callback)

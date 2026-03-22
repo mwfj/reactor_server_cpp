@@ -31,20 +31,9 @@ void HttpConnectionHandler::SetMaxHeaderSize(size_t max) {
 
 void HttpConnectionHandler::SetRequestTimeout(int seconds) {
     request_timeout_sec_ = seconds;
-    // Arm deadline immediately so connect-and-wait (zero-byte Slowloris) is caught
-    if (request_timeout_sec_ > 0) {
-        request_in_progress_ = true;
-        request_start_ = std::chrono::steady_clock::now();
-        conn_->SetDeadline(request_start_ + std::chrono::seconds(request_timeout_sec_));
-        std::weak_ptr<HttpConnectionHandler> weak_self = shared_from_this();
-        conn_->SetDeadlineTimeoutCb([weak_self]() {
-            if (auto self = weak_self.lock()) {
-                HttpResponse timeout_resp = HttpResponse::RequestTimeout();
-                timeout_resp.Header("Connection", "close");
-                self->SendResponse(timeout_resp);
-            }
-        });
-    }
+    // Don't arm deadline here — for TLS connections, the handshake hasn't
+    // completed yet. The deadline is armed on the first OnRawData call
+    // (which only fires after TLS handshake completes).
 }
 
 void HttpConnectionHandler::SendResponse(const HttpResponse& response) {

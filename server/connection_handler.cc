@@ -217,10 +217,14 @@ void ConnectionHandler::DoSend(const char *data, size_t size){
             if (written > 0) {
                 output_bf_.Erase(0, written);
                 ts_ = TimeStamp::Now();
+                tls_pending_write_size_ = 0;
                 if (output_bf_.Size() == 0) {
-                    // All sent — fire completion callback
                     if (callbacks_.complete_callback)
                         callbacks_.complete_callback(shared_from_this());
+                    // Check close_after_write — connection may need to close
+                    if (close_after_write_.load(std::memory_order_acquire)) {
+                        ForceClose();
+                    }
                     return;
                 }
             } else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -284,10 +288,13 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
         }
         if (written > 0) {
             ts_ = TimeStamp::Now();
+            tls_pending_write_size_ = 0;
             if (static_cast<size_t>(written) == size) {
-                // All sent — fire completion callback
                 if (callbacks_.complete_callback)
                     callbacks_.complete_callback(shared_from_this());
+                if (close_after_write_.load(std::memory_order_acquire)) {
+                    ForceClose();
+                }
                 return;
             }
             // Partial write -- buffer the remainder
