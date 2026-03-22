@@ -53,11 +53,11 @@ void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
 }
 
 void HttpConnectionHandler::CloseConnection() {
-    // Always clear deadline/timeout state before closing to prevent
-    // stale timer callbacks from firing during the close flush.
+    // Don't clear the deadline here — if the deferred close stalls (client stops
+    // reading), the timer scan needs the deadline to force-close the connection.
+    // The deadline is cleared normally after a completed request (keep-alive reset).
     request_in_progress_ = false;
-    conn_->ClearDeadline();
-    conn_->SetDeadlineTimeoutCb(nullptr);
+    conn_->SetDeadlineTimeoutCb(nullptr);  // Don't re-send 408 on force-close
     conn_->CloseAfterWrite();
 }
 

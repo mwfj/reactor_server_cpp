@@ -63,6 +63,7 @@ public:
     void DoSendRaw(const char*, size_t);  // Internal: appends without length header (in socket thread)
 
     void CallCloseCb();
+    void ForceClose();  // Bypass close_after_write defer — for stalled flush recovery
     void CloseAfterWrite();
     void CallErroCb();
     void CallWriteCb();

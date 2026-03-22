@@ -287,6 +287,13 @@ void ConnectionHandler::CloseAfterWrite(){
     }
 }
 
+void ConnectionHandler::ForceClose(){
+    // Skip the close_after_write defer — used when a deferred close stalls
+    // and the timer needs to reclaim the connection.
+    close_after_write_.store(false, std::memory_order_release);
+    CallCloseCb();
+}
+
 void ConnectionHandler::CallCloseCb(){
     // If close_after_write is armed and there's still data to flush,
     // defer — CallWriteCb will close after the buffer drains.

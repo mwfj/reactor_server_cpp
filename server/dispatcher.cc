@@ -340,7 +340,7 @@ void Dispatcher::TimerHandler(){
             if (conn->IsClosing() || conn->IsCloseDeferred()) {
                 // Already closing (previous timeout triggered CloseAfterWrite but flush stalled).
                 // Force close now — the buffered response will never drain.
-                conn->CallCloseCb();
+                conn->ForceClose();
             } else {
                 // First timeout: send 408 (if deadline callback set), then deferred close.
                 conn->CallDeadlineTimeoutCb();
