@@ -482,15 +482,15 @@ void ConnectionHandler::CallWriteCb(){
             return;
         }
         if (write_sz < 0) {
-            // TLS write error — use CallCloseCb for proper cleanup
-            CallCloseCb();
+            // TLS write error — ForceClose bypasses close_after_write defer
+            ForceClose();
             return;
         }
     } else {
         write_sz = ::send(fd(), output_bf_.Data(), output_bf_.Size(), SEND_FLAGS);
         if (write_sz < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            // Send failed (EPIPE, ECONNRESET, etc.) — close the connection
-            CallCloseCb();
+            // Send failed (EPIPE, ECONNRESET, etc.) — ForceClose bypasses defer
+            ForceClose();
             return;
         }
     }

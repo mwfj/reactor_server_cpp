@@ -96,9 +96,10 @@ void NetServer::Stop(){
     // Fifth: Now safe to join worker threads
     sock_workers_.Stop();
 
-    // Sixth: Destroy the acceptor now that the conn_dispatcher thread has exited.
-    // (RunEventLoop returned to caller; no more accept callbacks can fire.)
-    acceptor_.reset();
+    // Note: acceptor_ is NOT destroyed here — the conn_dispatcher thread
+    // (which runs RunEventLoop on the server thread) may still be exiting.
+    // The acceptor is destroyed in ~NetServer, which runs after the caller
+    // joins the server thread.
 }
 
 void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){

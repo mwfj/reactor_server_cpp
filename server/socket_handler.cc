@@ -66,11 +66,14 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
             // Queue drained — no more pending connections
             return -1;
         }
-        // Transient errors: don't crash, but signal caller to keep draining
-        if(errno == ECONNABORTED || errno == EMFILE || errno == ENFILE ||
-           errno == ENOBUFS || errno == ENOMEM) {
-            std::cerr << "[Socket Handler] Accept failed (temporary): " << strerror(errno) << std::endl;
-            return -2;  // Transient — more connections may be queued
+        // ECONNABORTED: one connection failed, but more may be queued — keep draining
+        if(errno == ECONNABORTED) {
+            return -2;  // Continue accept loop
+        }
+        // Resource exhaustion: stop draining, return to event loop
+        if(errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+            std::cerr << "[Socket Handler] Accept failed (resource exhaustion): " << strerror(errno) << std::endl;
+            return -3;  // Return to event loop — retry when resources available
         }
         std::cout << "[Socket Handler] Error occurred when accepting connection: " << strerror(errno) << std::endl;
         throw std::runtime_error(std::string("Error accepting connection: ") + strerror(errno));

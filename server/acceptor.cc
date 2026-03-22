@@ -59,9 +59,11 @@ void Acceptor::NewConnection(){
             return;
         }
         if(client_fd == -2){
-            // Resource exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM) or ECONNABORTED.
-            // Return to event loop instead of busy-spinning — the next
-            // accept event will retry when resources are available.
+            // ECONNABORTED — one connection failed, keep draining queue
+            continue;
+        }
+        if(client_fd == -3){
+            // Resource exhaustion — return to event loop, retry later
             return;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));
