@@ -53,11 +53,11 @@ void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
 }
 
 void HttpConnectionHandler::CloseConnection() {
-    // Clear deadline — the request is complete, response is being flushed.
-    // Stalled flushes are handled by the idle timeout, not the request deadline.
     request_in_progress_ = false;
-    conn_->ClearDeadline();
     conn_->SetDeadlineTimeoutCb(nullptr);
+    // Set a flush deadline so stalled responses don't hang forever.
+    // This covers idle_timeout_sec == 0 where no idle timeout exists.
+    conn_->SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(30));
     conn_->CloseAfterWrite();
 }
 

@@ -442,10 +442,10 @@ void ConnectionHandler::CallWriteCb(){
     if (tls_read_wants_write_) {
         tls_read_wants_write_ = false;
         OnMessage();  // Retry the pending read
-        // If SSL still needs write readiness (flag re-armed by OnMessage),
-        // keep write mode enabled — don't fall through to disable it.
-        if (tls_read_wants_write_) {
-            return;  // Will get another EPOLLOUT
+        // OnMessage may have closed the channel or re-armed a TLS flag
+        if (tls_read_wants_write_ || is_closing_ ||
+            (client_channel_ && client_channel_->is_channel_closed())) {
+            return;
         }
         // Otherwise fall through to write path
     }
@@ -456,8 +456,11 @@ void ConnectionHandler::CallWriteCb(){
         if (result == 0) {
             tls_state_ = TlsState::READY;
             // Handshake complete — OpenSSL may have buffered application data.
-            // Try reading it before proceeding to writes.
             OnMessage();
+            // OnMessage may have closed the channel
+            if (is_closing_ || (client_channel_ && client_channel_->is_channel_closed())) {
+                return;
+            }
             // Fall through to normal write logic to flush any pending output buffer
         } else if (result == 1) {
             client_channel_->DisableWriteMode();
