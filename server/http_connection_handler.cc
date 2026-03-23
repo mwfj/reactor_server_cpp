@@ -273,7 +273,10 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                     // masking keys (4 bytes), and fragmentation overhead. Without
                     // enough headroom, a valid max-sized fragmented message gets
                     // truncated before the WS parser sees it.
-                    conn_->SetMaxInputSize(2 * max_ws_message_size_);
+                    // Guard against overflow: if 2x wraps, disable cap (0).
+                    size_t ws_cap = (max_ws_message_size_ <= SIZE_MAX / 2)
+                        ? 2 * max_ws_message_size_ : 0;
+                    conn_->SetMaxInputSize(ws_cap);
                 } else {
                     // Unlimited WS messages — remove the input cap entirely
                     conn_->SetMaxInputSize(0);

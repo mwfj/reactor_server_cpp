@@ -94,20 +94,18 @@ HttpServer::HttpServer(const ServerConfig& config)
 }
 
 size_t HttpServer::ComputeInputCap() const {
-    // Compute HTTP-only cap: 2x multiplier for wire overhead (chunked framing, etc.).
-    // Do NOT include max_ws_message_size_ here — that would lift the initial cap
-    // to ~32 MiB for ALL connections (including plain HTTP), enabling a memory-DoS
-    // where oversized HTTP POSTs allocate 32x beyond the configured body limit
-    // before the parser rejects them. The WS upgrade path raises the cap when
-    // it actually occurs (see HttpConnectionHandler::OnRawData WS upgrade section).
+    // Only cap when BOTH limits are finite — if either is 0 (unlimited),
+    // the input cap must also be unlimited. Setting a cap based on only
+    // one finite limit (e.g., 2 * max_header_size_ when body is unlimited)
+    // would truncate valid unlimited bodies at ~header-sized cap.
+    // 2x multiplier accounts for wire overhead (chunked framing, etc.).
     if (max_header_size_ > 0 && max_body_size_ > 0) {
-        return 2 * (max_header_size_ + max_body_size_);
-    } else if (max_header_size_ > 0) {
-        return 2 * max_header_size_;
-    } else if (max_body_size_ > 0) {
-        return 2 * max_body_size_;
+        size_t sum = max_header_size_ + max_body_size_;
+        // Guard against overflow: if the sum or 2x wraps, disable cap.
+        if (sum < max_header_size_ || sum > SIZE_MAX / 2) return 0;
+        return 2 * sum;
     }
-    return 0;  // Both unlimited — no cap
+    return 0;
 }
 
 HttpServer::~HttpServer() {
