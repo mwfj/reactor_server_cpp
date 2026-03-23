@@ -201,14 +201,16 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
 
 void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
     std::shared_ptr<HttpConnectionHandler> old_handler;
+    bool already_initialized = false;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         auto it = http_connections_.find(conn->fd());
         if (it != http_connections_.end()) {
             if (it->second->GetConnection() == conn) {
                 // Already created by HandleMessage lazy-init — don't overwrite.
-                // Fall through to per-connection setup below (SetMaxInputSize,
-                // SetDeadline) which the lazy-init path doesn't do.
+                // The handler is already processing data, so skip deadline arming
+                // below to avoid overwriting real request/keep-alive state.
+                already_initialized = true;
             } else {
                 // FD reused — save old handler for WS notification outside the lock
                 old_handler = it->second;
@@ -234,16 +236,18 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
             }
         }
     }
-    // Note: max_input_size_ is already set by NetServer before RegisterCallbacks,
-    // so the input buffer cap is in place before any data can arrive.
 
     // Arm a connection-level deadline covering the TLS handshake + first HTTP request.
     // Without this, a client can slow-drip the TLS handshake indefinitely, bypassing
     // the request timeout (which only activates after parsed HTTP bytes in OnRawData).
     // When OnRawData fires after handshake completion, it overwrites this with the
-    // per-request deadline. No DeadlineTimeoutCb is needed — can't send HTTP 408
-    // during a TLS handshake, so the timer just closes the connection.
-    if (request_timeout_sec_ > 0) {
+    // per-request deadline.
+    //
+    // Skip if HandleMessage already lazy-created the handler: the handler has already
+    // started processing data, so re-arming the "first request" deadline would overwrite
+    // the real state and could close a healthy keep-alive connection after
+    // request_timeout_sec instead of the configured idle timeout.
+    if (request_timeout_sec_ > 0 && !already_initialized) {
         conn->SetDeadline(std::chrono::steady_clock::now() +
                           std::chrono::seconds(request_timeout_sec_));
     }

@@ -20,7 +20,10 @@ bool WebSocketHandshake::Validate(const HttpRequest& request, std::string& error
 
     // 2. Must not have a request body — RFC 6455 opening handshake is a GET.
     // A body would be consumed by the HTTP parser and lost (never becomes WS data).
-    if (request.content_length > 0 || !request.body.empty()) {
+    // Also reject Transfer-Encoding (e.g. chunked with empty terminator) since it
+    // indicates a body-bearing request even when the decoded body is empty.
+    if (request.content_length > 0 || !request.body.empty() ||
+        request.HasHeader("transfer-encoding")) {
         error_message = "WebSocket upgrade must not have a request body";
         return false;
     }
