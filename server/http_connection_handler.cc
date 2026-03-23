@@ -247,10 +247,17 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 for (const auto& hdr : mw_response.GetHeaders()) {
                     std::string key = hdr.first;
                     std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-                    // Skip 101 mandatory headers and framing headers
+                    // Skip 101 mandatory headers, framing headers, and WS
+                    // negotiation headers. This server doesn't implement WS
+                    // extensions or subprotocol negotiation, so allowing
+                    // middleware to inject Sec-WebSocket-Extensions (e.g.,
+                    // permessage-deflate) would cause clients to send RSV1
+                    // frames that the parser rejects as protocol errors.
                     if (key == "connection" || key == "upgrade" ||
                         key == "sec-websocket-accept" || key == "content-length" ||
-                        key == "transfer-encoding") {
+                        key == "transfer-encoding" ||
+                        key == "sec-websocket-extensions" ||
+                        key == "sec-websocket-protocol") {
                         continue;
                     }
                     upgrade_resp.Header(hdr.first, hdr.second);
@@ -268,19 +275,15 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 if (max_ws_message_size_ > 0) {
                     ws_conn_->GetParser().SetMaxPayloadSize(max_ws_message_size_);
                     ws_conn_->SetMaxMessageSize(max_ws_message_size_);
-                    // Lift the input buffer cap to accommodate WS messages.
-                    // 2x multiplier accounts for per-frame headers (2-14 bytes),
-                    // masking keys (4 bytes), and fragmentation overhead. Without
-                    // enough headroom, a valid max-sized fragmented message gets
-                    // truncated before the WS parser sees it.
-                    // Guard against overflow: if 2x wraps, disable cap (0).
-                    size_t ws_cap = (max_ws_message_size_ <= SIZE_MAX / 2)
-                        ? 2 * max_ws_message_size_ : 0;
-                    conn_->SetMaxInputSize(ws_cap);
-                } else {
-                    // Unlimited WS messages — remove the input cap entirely
-                    conn_->SetMaxInputSize(0);
                 }
+                // Remove the pre-read input cap for WebSocket connections.
+                // The WS parser enforces its own limits (max_payload_size per
+                // frame, max_message_size for reassembled messages). The input
+                // cap's discard mechanism is incompatible with WS: discarding
+                // bytes from a binary-framed stream permanently desynchronizes
+                // the parser. No fixed multiplier can cover worst-case WS
+                // fragmentation (1-byte payloads have 7x wire overhead).
+                conn_->SetMaxInputSize(0);
                 upgraded_ = true;
 
                 // Wire WS callbacks (called exactly once, ws_conn_ guaranteed to exist)
