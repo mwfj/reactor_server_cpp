@@ -259,6 +259,14 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 if (max_ws_message_size_ > 0) {
                     ws_conn_->GetParser().SetMaxPayloadSize(max_ws_message_size_);
                     ws_conn_->SetMaxMessageSize(max_ws_message_size_);
+                    // Lift the input buffer cap to accommodate WS messages,
+                    // which can be larger than HTTP bodies. Without this,
+                    // valid WS messages between max_body_size and max_ws_message_size
+                    // get discarded in the read loop before the WS parser sees them.
+                    conn_->SetMaxInputSize(max_ws_message_size_);
+                } else {
+                    // Unlimited WS messages — remove the input cap entirely
+                    conn_->SetMaxInputSize(0);
                 }
                 upgraded_ = true;
 

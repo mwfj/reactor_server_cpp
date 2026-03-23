@@ -297,7 +297,17 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
     if (is_closing_) return;
 
     // If a TLS write retry is pending, just buffer — don't try to write.
-    if (tls_write_wants_read_ || tls_read_wants_write_) {
+    if (tls_write_wants_read_) {
+        // SSL_write needs read readiness — just buffer without enabling write.
+        // OnMessage will retry the write when read data arrives. Enabling
+        // write mode here would undo the busy-loop prevention (EPOLLOUT fires
+        // continuously on a writable socket while TLS is waiting for read).
+        output_bf_.Append(data, size);
+        return;
+    }
+    if (tls_read_wants_write_) {
+        // SSL_read needs write readiness — buffer and ensure write mode is on
+        // so CallWriteCb can retry the read.
         output_bf_.Append(data, size);
         client_channel_->EnableWriteMode();
         return;

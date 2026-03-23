@@ -169,15 +169,21 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         auto it = http_connections_.find(conn->fd());
         if (it != http_connections_.end()) {
             if (it->second->GetConnection() == conn) {
-                // Already created by HandleMessage lazy-init — don't overwrite
-                return;
+                // Already created by HandleMessage lazy-init — don't overwrite.
+                // Fall through to per-connection setup below (SetMaxInputSize,
+                // SetDeadline) which the lazy-init path doesn't do.
+            } else {
+                // FD reused — save old handler for WS notification outside the lock
+                old_handler = it->second;
+                auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
+                SetupHandlers(http_conn);
+                http_connections_[conn->fd()] = http_conn;
             }
-            // FD reused — save old handler for WS notification outside the lock
-            old_handler = it->second;
+        } else {
+            auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
+            SetupHandlers(http_conn);
+            http_connections_[conn->fd()] = http_conn;
         }
-        auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
-        SetupHandlers(http_conn);
-        http_connections_[conn->fd()] = http_conn;
     }
     // Notify old WS handler outside the lock to prevent deadlock
     if (old_handler) {
@@ -259,6 +265,10 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             http_conn = std::make_shared<HttpConnectionHandler>(conn);
             SetupHandlers(http_conn);
             http_connections_[conn->fd()] = http_conn;
+            // Per-connection setup that HandleNewConnection normally does.
+            if (max_header_size_ > 0 || max_body_size_ > 0) {
+                conn->SetMaxInputSize(max_header_size_ + max_body_size_);
+            }
         } else {
             http_conn = it->second;
         }
@@ -276,6 +286,10 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         SetupHandlers(http_conn);
         std::lock_guard<std::mutex> lck(conn_mtx_);
         http_connections_[conn->fd()] = http_conn;
+        // Per-connection setup
+        if (max_header_size_ > 0 || max_body_size_ > 0) {
+            conn->SetMaxInputSize(max_header_size_ + max_body_size_);
+        }
     }
 
     http_conn->OnRawData(conn, message);
