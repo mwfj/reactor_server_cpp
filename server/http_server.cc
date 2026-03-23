@@ -21,6 +21,9 @@ HttpServer::HttpServer(const std::string& ip, int port)
                   std::chrono::seconds(300))   // default idle timeout
 {
     WireNetServerCallbacks();
+    // Apply the same pre-read input cap as the config constructor.
+    // Uses member defaults (max_header_size_=8KB, max_body_size_=1MB, max_ws_message_size_=16MB).
+    net_server_.SetMaxInputSize(ComputeInputCap());
 }
 
 // Validate config before construction — throws on invalid values
@@ -71,19 +74,9 @@ HttpServer::HttpServer(const ServerConfig& config)
     request_timeout_sec_ = config.request_timeout_sec;
     net_server_.SetMaxConnections(config.max_connections);
 
-    // Compute and set input buffer cap on NetServer so it's applied BEFORE
-    // epoll registration (eliminates the race where data arrives before
-    // HttpServer::HandleNewConnection sets the cap).
-    // When both limits are finite: cap at 2 * (headers + body).
-    // When only one is finite: use 2x that limit as a safety floor.
-    // When both are zero (unlimited): no cap.
-    if (max_header_size_ > 0 && max_body_size_ > 0) {
-        net_server_.SetMaxInputSize(2 * (max_header_size_ + max_body_size_));
-    } else if (max_header_size_ > 0) {
-        net_server_.SetMaxInputSize(2 * max_header_size_);
-    } else if (max_body_size_ > 0) {
-        net_server_.SetMaxInputSize(2 * max_body_size_);
-    }
+    // Set input buffer cap on NetServer — applied BEFORE epoll registration
+    // to eliminate the race where data arrives before the cap is set.
+    net_server_.SetMaxInputSize(ComputeInputCap());
 
     if (config.tls.enabled) {
         tls_ctx_ = std::make_unique<TlsContext>(config.tls.cert_file, config.tls.key_file);
@@ -98,6 +91,24 @@ HttpServer::HttpServer(const ServerConfig& config)
         }
         net_server_.SetTlsContext(tls_ctx_.get());
     }
+}
+
+size_t HttpServer::ComputeInputCap() const {
+    // Compute HTTP cap: 2x multiplier for wire overhead (chunked framing, etc.)
+    size_t http_cap = 0;
+    if (max_header_size_ > 0 && max_body_size_ > 0) {
+        http_cap = 2 * (max_header_size_ + max_body_size_);
+    } else if (max_header_size_ > 0) {
+        http_cap = 2 * max_header_size_;
+    } else if (max_body_size_ > 0) {
+        http_cap = 2 * max_body_size_;
+    }
+    // Compute WS cap: 2x for per-frame headers/masking/fragmentation overhead.
+    // The initial read may contain the HTTP upgrade + the first WS frame in one
+    // TCP segment. If the WS cap is larger than the HTTP cap, use it to avoid
+    // discarding valid WS data before the upgrade code raises the limit.
+    size_t ws_cap = max_ws_message_size_ > 0 ? 2 * max_ws_message_size_ : 0;
+    return std::max(http_cap, ws_cap);
 }
 
 HttpServer::~HttpServer() {

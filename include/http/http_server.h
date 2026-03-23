@@ -49,6 +49,8 @@ private:
     void SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn);
     // Helper: wire NetServer callbacks to this HttpServer
     void WireNetServerCallbacks();
+    // Compute the pre-read input buffer cap from configured limits.
+    size_t ComputeInputCap() const;
 
     std::unique_ptr<TlsContext> tls_ctx_;
 

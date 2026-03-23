@@ -2,6 +2,7 @@
 #include "tls/tls_context.h"
 #include "tls/tls_connection.h"
 
+#include <csignal>
 
 NetServer::NetServer(const std::string& _ip, const size_t _port,
                      int timer_interval,
@@ -12,6 +13,11 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
       timer_interval_(timer_interval),
       connection_timeout_(connection_timeout)
 {
+    // Suppress SIGPIPE process-wide. Raw TCP sends are protected via
+    // MSG_NOSIGNAL (SEND_FLAGS), but OpenSSL's SSL_write/SSL_shutdown use
+    // the underlying socket's write() which bypasses MSG_NOSIGNAL. Without
+    // this, a single peer reset on a TLS connection kills the entire process.
+    signal(SIGPIPE, SIG_IGN);
     // Initialize conn_dispatcher_ after shared_ptr is constructed (required for eventfd setup)
     conn_dispatcher_->Init();
     conn_dispatcher_->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
