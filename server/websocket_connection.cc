@@ -32,15 +32,15 @@ void WebSocketConnection::SendClose(uint16_t code, const std::string& reason) {
     close_sent_ = true;
     sent_close_code_ = code;
     sent_close_reason_ = reason;
-    // Arm a deadline and CloseAfterWrite to drain the output buffer (which may
-    // contain queued app data before the Close frame) then close the transport.
-    // The deadline is refreshed by successful writes in CallWriteCb's
-    // close_after_write path, so it won't fire prematurely while the buffer
-    // is actively draining. The 5s countdown starts when writes stop
-    // (backlog drained, Close frame sent, waiting for peer or stalled).
+    // Keep is_open_ true so OnRawData can receive the peer's Close reply.
+    // Arm a deadline — if the peer doesn't reply within this window, the
+    // timer scanner will force-close. Do NOT call CloseAfterWrite here:
+    // that would ForceClose as soon as the Close frame drains, before the
+    // peer has a chance to send their Close reply (resulting in 1006).
+    // The Close frame drains naturally via the write path. close_sent_
+    // prevents new data frames (SendText/SendBinary check it).
     if (conn_) {
         conn_->SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(5));
-        conn_->CloseAfterWrite();
     }
 }
 

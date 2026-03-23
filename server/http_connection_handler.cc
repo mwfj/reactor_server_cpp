@@ -56,12 +56,14 @@ void HttpConnectionHandler::CloseConnection() {
 }
 
 void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data) {
-    // If the connection is draining a response (close_after_write set),
+    // For HTTP connections draining a response (close_after_write set),
     // don't process new data. The parser wasn't Reset after the last
     // HPE_PAUSED return when CloseConnection was called — feeding new
     // bytes to a paused parser causes llhttp_get_error_pos() to reference
     // old data, producing underflow/bogus consumed counts.
-    if (conn->IsCloseDeferred()) {
+    // WebSocket connections must NOT be blocked here — the peer's Close
+    // reply must reach ProcessFrame for a clean close handshake.
+    if (conn->IsCloseDeferred() && !upgraded_) {
         return;
     }
 
