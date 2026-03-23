@@ -138,14 +138,22 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
         }
     }
 
-    // Set application callbacks BEFORE RegisterCallbacks().
-    // RegisterCallbacks() queues epoll registration via EnQueue, so in practice
-    // the socket dispatcher processes it after these are set. But ordering them
-    // first eliminates any theoretical race window.
+    // Set application callbacks and per-connection limits BEFORE RegisterCallbacks().
+    // RegisterCallbacks() enables epoll (EPOLL_CTL_ADD), after which data can arrive
+    // on the socket dispatcher thread. All connection state must be configured before
+    // this point — the epoll_ctl syscall provides the memory barrier ensuring writes
+    // here are visible to reads on the socket dispatcher thread.
     conn -> SetCloseCb(std::bind(&NetServer::HandleCloseConnection, this, std::placeholders::_1));
     conn -> SetErrorCb(std::bind(&NetServer::HandleErrorConnection, this, std::placeholders::_1));
     conn -> SetOnMessageCb(std::bind(&NetServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
     conn -> SetCompletionCb(std::bind(&NetServer::HandleSendComplete, this, std::placeholders::_1));
+
+    // Set input buffer cap BEFORE epoll registration to eliminate the race where
+    // the first read arrives uncapped before HttpServer::HandleNewConnection runs.
+    if (max_input_size_ > 0) {
+        conn->SetMaxInputSize(max_input_size_);
+    }
+
     AddConnection(conn);
 
     // Two-phase initialization: register channel callbacks and enable epoll.

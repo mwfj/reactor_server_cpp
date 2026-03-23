@@ -71,6 +71,20 @@ HttpServer::HttpServer(const ServerConfig& config)
     request_timeout_sec_ = config.request_timeout_sec;
     net_server_.SetMaxConnections(config.max_connections);
 
+    // Compute and set input buffer cap on NetServer so it's applied BEFORE
+    // epoll registration (eliminates the race where data arrives before
+    // HttpServer::HandleNewConnection sets the cap).
+    // When both limits are finite: cap at 2 * (headers + body).
+    // When only one is finite: use 2x that limit as a safety floor.
+    // When both are zero (unlimited): no cap.
+    if (max_header_size_ > 0 && max_body_size_ > 0) {
+        net_server_.SetMaxInputSize(2 * (max_header_size_ + max_body_size_));
+    } else if (max_header_size_ > 0) {
+        net_server_.SetMaxInputSize(2 * max_header_size_);
+    } else if (max_body_size_ > 0) {
+        net_server_.SetMaxInputSize(2 * max_body_size_);
+    }
+
     if (config.tls.enabled) {
         tls_ctx_ = std::make_unique<TlsContext>(config.tls.cert_file, config.tls.key_file);
         if (config.tls.min_version == "1.2") {
@@ -192,15 +206,8 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
             ws->NotifyTransportClose();
         }
     }
-    // Cap the input buffer to prevent allocating far beyond configured limits
-    // before the parser has a chance to reject (413/431).
-    // Only cap when BOTH limits are non-zero — if either is 0 (unlimited),
-    // don't cap (preserves "0 = unlimited" semantics).
-    // 2x multiplier accounts for wire-level overhead (chunked encoding framing,
-    // pipelined requests, etc.) that makes raw bytes exceed decoded payload size.
-    if (max_header_size_ > 0 && max_body_size_ > 0) {
-        conn->SetMaxInputSize(2 * (max_header_size_ + max_body_size_));
-    }
+    // Note: max_input_size_ is already set by NetServer before RegisterCallbacks,
+    // so the input buffer cap is in place before any data can arrive.
 
     // Arm a connection-level deadline covering the TLS handshake + first HTTP request.
     // Without this, a client can slow-drip the TLS handshake indefinitely, bypassing
@@ -267,10 +274,7 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             http_conn = std::make_shared<HttpConnectionHandler>(conn);
             SetupHandlers(http_conn);
             http_connections_[conn->fd()] = http_conn;
-            // Per-connection setup that HandleNewConnection normally does.
-            if (max_header_size_ > 0 && max_body_size_ > 0) {
-                conn->SetMaxInputSize(2 * (max_header_size_ + max_body_size_));
-            }
+            // Note: max_input_size_ already set by NetServer before RegisterCallbacks.
         } else {
             http_conn = it->second;
         }
@@ -288,10 +292,7 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         SetupHandlers(http_conn);
         std::lock_guard<std::mutex> lck(conn_mtx_);
         http_connections_[conn->fd()] = http_conn;
-        // Per-connection setup
-        if (max_header_size_ > 0 && max_body_size_ > 0) {
-            conn->SetMaxInputSize(2 * (max_header_size_ + max_body_size_));
-        }
+        // Note: max_input_size_ already set by NetServer before RegisterCallbacks.
     }
 
     http_conn->OnRawData(conn, message);

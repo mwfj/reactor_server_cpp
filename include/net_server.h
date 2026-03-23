@@ -55,6 +55,7 @@ private:
 
     TlsContext* tls_ctx_ = nullptr;  // Non-owning, owned by HttpServer
     int max_connections_ = 0;         // 0 = unlimited
+    size_t max_input_size_ = 0;       // 0 = unlimited, set before RegisterCallbacks
 
 public:
     NetServer() = delete;
@@ -86,4 +87,5 @@ public:
 
     void SetTlsContext(TlsContext* ctx) { tls_ctx_ = ctx; }
     void SetMaxConnections(int max) { max_connections_ = max; }
+    void SetMaxInputSize(size_t max) { max_input_size_ = max; }
 };
