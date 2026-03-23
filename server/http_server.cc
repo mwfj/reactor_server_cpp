@@ -21,8 +21,8 @@ HttpServer::HttpServer(const std::string& ip, int port)
                   std::chrono::seconds(300))   // default idle timeout
 {
     WireNetServerCallbacks();
-    // Apply the same pre-read input cap as the config constructor.
-    // Uses member defaults (max_header_size_=8KB, max_body_size_=1MB, max_ws_message_size_=16MB).
+    // Apply the same defaults as the config constructor — must match ServerConfig defaults.
+    net_server_.SetMaxConnections(ServerConfig{}.max_connections);
     net_server_.SetMaxInputSize(ComputeInputCap());
 }
 

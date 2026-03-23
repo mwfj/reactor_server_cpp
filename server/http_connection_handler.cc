@@ -275,6 +275,12 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                     return;
                 }
 
+                // Mark as upgraded IMMEDIATELY after 101 is sent, before any
+                // code that could throw. This ensures the catch block correctly
+                // identifies post-101 exceptions and sends WS close 1011
+                // instead of raw HTTP 500 on an already-upgraded connection.
+                upgraded_ = true;
+
                 // Create WebSocket connection
                 ws_conn_ = std::make_unique<WebSocketConnection>(conn_);
                 if (max_ws_message_size_ > 0) {
@@ -289,7 +295,6 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 // the parser. No fixed multiplier can cover worst-case WS
                 // fragmentation (1-byte payloads have 7x wire overhead).
                 conn_->SetMaxInputSize(0);
-                upgraded_ = true;
 
                 // Wire WS callbacks (called exactly once, ws_conn_ guaranteed to exist)
                 if (upgrade_handler_) {
