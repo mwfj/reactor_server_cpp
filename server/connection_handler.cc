@@ -84,7 +84,7 @@ void ConnectionHandler::OnMessage(){
     }
 
     bool peer_closed = false;  // Track if we saw EOF, close after dispatching buffered data
-    bool input_capped = false; // True when input_bf_ hit max_input_size_
+    bool stopped_for_cap = false; // True when we stopped reading due to input cap
     char buffer[MAX_BUFFER_SIZE];
     while(true){
         memset(buffer, 0, sizeof buffer);
@@ -115,16 +115,17 @@ void ConnectionHandler::OnMessage(){
         }
 
         if(nread > 0){
-            // Enforce input buffer cap — prevents allocating far beyond configured
-            // limits (max_body_size, max_header_size) before the parser rejects.
-            // Still drain to EAGAIN (required for ET mode) but discard excess bytes.
-            if (!input_capped) {
-                input_bf_.Append(buffer, nread);
-                if (max_input_size_ > 0 && input_bf_.Size() > max_input_size_) {
-                    input_capped = true;
-                }
+            input_bf_.Append(buffer, nread);
+            // Enforce input buffer cap — stop reading when the cap is hit.
+            // Data stays in the kernel buffer (not discarded). After the
+            // callback processes what we have, another read is scheduled
+            // via EnQueue. This bounds per-cycle allocation without losing
+            // data, and works correctly with chunked encoding and WS framing
+            // regardless of wire overhead.
+            if (max_input_size_ > 0 && input_bf_.Size() >= max_input_size_) {
+                stopped_for_cap = true;
+                break;
             }
-            // If capped, keep reading but don't append (drain for ET mode)
         } else if(nread < 0 && errno == EINTR){
             // Interrupted by signal — retry
             continue;
@@ -193,6 +194,24 @@ void ConnectionHandler::OnMessage(){
             // No callback ran (EOF without data) — nothing to wait for.
             ForceClose();
         }
+    }
+
+    // If we stopped reading due to the input cap (not EAGAIN/EOF), there's
+    // more data in the kernel buffer (raw TCP) or OpenSSL's internal buffer
+    // (TLS). Schedule another OnMessage on the next event loop iteration to
+    // continue processing. This is non-recursive (EnQueue) and works for
+    // both raw TCP and TLS without needing EPOLL_CTL_MOD re-arm.
+    if (stopped_for_cap &&
+        !is_closing_.load(std::memory_order_acquire) &&
+        !close_after_write_.load(std::memory_order_acquire)) {
+        std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
+        event_dispatcher_->EnQueue([weak_self]() {
+            if (auto self = weak_self.lock()) {
+                if (!self->is_closing_.load(std::memory_order_acquire)) {
+                    self->OnMessage();
+                }
+            }
+        });
     }
 }
 

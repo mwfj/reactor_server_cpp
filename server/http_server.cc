@@ -94,18 +94,19 @@ HttpServer::HttpServer(const ServerConfig& config)
 }
 
 size_t HttpServer::ComputeInputCap() const {
-    // Only cap when BOTH limits are finite — if either is 0 (unlimited),
-    // the input cap must also be unlimited. Setting a cap based on only
-    // one finite limit (e.g., N * max_header_size_ when body is unlimited)
-    // would truncate valid unlimited bodies at a header-sized cap.
-    // 4x multiplier covers chunked Transfer-Encoding wire overhead:
-    // 2-byte chunks have 3.5x overhead, so 4x handles all practical chunk
-    // sizes. (1-byte chunks are 6x but pathological and never seen in practice.)
+    // Cap per-cycle input buffer allocation. When the cap is hit, the read
+    // loop stops (data stays in kernel buffer) and schedules another read
+    // after the parser processes what it has. No data is discarded.
+    // No multiplier needed — the parser processes data incrementally across
+    // cycles. Wire overhead (chunked framing etc.) is handled naturally.
     if (max_header_size_ > 0 && max_body_size_ > 0) {
         size_t sum = max_header_size_ + max_body_size_;
-        // Guard against overflow: if the sum or 4x wraps, disable cap.
-        if (sum < max_header_size_ || sum > SIZE_MAX / 4) return 0;
-        return 4 * sum;
+        if (sum < max_header_size_) return 0;  // overflow guard
+        return sum;
+    } else if (max_header_size_ > 0) {
+        return max_header_size_;
+    } else if (max_body_size_ > 0) {
+        return max_body_size_;
     }
     return 0;
 }
