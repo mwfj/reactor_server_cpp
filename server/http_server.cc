@@ -186,6 +186,14 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
             ws->NotifyTransportClose();
         }
     }
+    // Cap the input buffer to prevent allocating far beyond configured limits
+    // before the parser has a chance to reject (413/431). The cap is the sum of
+    // max_header_size + max_body_size (the most a valid request can contain).
+    // If both are 0 (unlimited), no cap is set (backward compat).
+    if (max_header_size_ > 0 || max_body_size_ > 0) {
+        conn->SetMaxInputSize(max_header_size_ + max_body_size_);
+    }
+
     // Arm a connection-level deadline covering the TLS handshake + first HTTP request.
     // Without this, a client can slow-drip the TLS handshake indefinitely, bypassing
     // the request timeout (which only activates after parsed HTTP bytes in OnRawData).

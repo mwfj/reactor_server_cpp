@@ -99,10 +99,15 @@ void Acceptor::NewConnection(){
         }
         if(client_fd == -4){
             // Memory/buffer pressure (ENOBUFS/ENOMEM).
-            // The idle fd trick doesn't help here — closing fds frees fd slots,
-            // not memory. Continuing the loop would spin indefinitely.
-            // Return to the event loop; new incoming connections will produce
-            // a fresh EPOLLIN edge so accept resumes when resources recover.
+            // The idle fd trick doesn't help — closing fds frees fd slots, not memory.
+            // Can't drain the queue (accept keeps failing), can't spin (starvation).
+            // Re-arm the channel via EPOLL_CTL_MOD — on Linux this re-triggers the
+            // edge if the fd is still ready, so the next epoll_wait cycle retries.
+            // Without this, the listen socket stays readable but ET mode never
+            // delivers another edge (no transition occurred).
+            if (acceptor_channel_ && !acceptor_channel_->is_channel_closed()) {
+                acceptor_channel_->EnableReadMode();
+            }
             return;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));

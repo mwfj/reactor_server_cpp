@@ -407,6 +407,13 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             }
         } else {
             // Incomplete request -- need more data.
+            // If the peer already closed (close_after_write_ set), no more bytes
+            // will arrive — the request can never complete. Close immediately
+            // instead of leaking the connection slot until timeout.
+            if (conn_->IsCloseDeferred()) {
+                conn_->ForceClose();
+                return;
+            }
             // Perform early validation once headers are complete to avoid
             // holding connection slots for requests that can never succeed.
             if (!sent_100_continue_ && parser_.GetRequest().headers_complete) {

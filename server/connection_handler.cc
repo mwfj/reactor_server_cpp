@@ -84,6 +84,7 @@ void ConnectionHandler::OnMessage(){
     }
 
     bool peer_closed = false;  // Track if we saw EOF, close after dispatching buffered data
+    bool input_capped = false; // True when input_bf_ hit max_input_size_
     char buffer[MAX_BUFFER_SIZE];
     while(true){
         memset(buffer, 0, sizeof buffer);
@@ -114,7 +115,16 @@ void ConnectionHandler::OnMessage(){
         }
 
         if(nread > 0){
-            input_bf_.Append(buffer, nread);
+            // Enforce input buffer cap — prevents allocating far beyond configured
+            // limits (max_body_size, max_header_size) before the parser rejects.
+            // Still drain to EAGAIN (required for ET mode) but discard excess bytes.
+            if (!input_capped) {
+                input_bf_.Append(buffer, nread);
+                if (max_input_size_ > 0 && input_bf_.Size() > max_input_size_) {
+                    input_capped = true;
+                }
+            }
+            // If capped, keep reading but don't append (drain for ET mode)
         } else if(nread < 0 && errno == EINTR){
             // Interrupted by signal — retry
             continue;

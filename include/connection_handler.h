@@ -46,6 +46,13 @@ private:
     bool tls_read_wants_write_ = false;
     bool tls_write_wants_read_ = false;
     size_t tls_pending_write_size_ = 0;  // Size of pending SSL_write for retry
+
+    // Cap on input buffer accumulation during the ET read loop.
+    // Prevents allocating far beyond configured limits (max_body_size, etc.)
+    // before the parser has a chance to reject. The read loop still drains
+    // to EAGAIN (required for ET mode) but discards bytes past this limit.
+    // 0 = unlimited (default, for backward compatibility with ReactorServer).
+    size_t max_input_size_ = 0;
 public:
     ConnectionHandler() = delete;
     ConnectionHandler(std::shared_ptr<Dispatcher>, std::unique_ptr<SocketHandler>);
@@ -80,6 +87,7 @@ public:
     void SetErrorCb(CALLBACKS_NAMESPACE::ConnErrorCallback);
 
     void SetTlsConnection(std::unique_ptr<TlsConnection> tls);
+    void SetMaxInputSize(size_t max) { max_input_size_ = max; }
 
     // Deadline: if set, IsTimeOut returns true when deadline is exceeded
     void SetDeadline(std::chrono::steady_clock::time_point deadline);
