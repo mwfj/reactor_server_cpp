@@ -70,10 +70,15 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
         if(errno == ECONNABORTED) {
             return -2;  // Continue accept loop
         }
-        // Resource exhaustion: stop draining, return to event loop
-        if(errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
-            std::cerr << "[Socket Handler] Accept failed (resource exhaustion): " << strerror(errno) << std::endl;
-            return -3;  // Return to event loop — retry when resources available
+        // FD exhaustion: the idle fd trick can recover by freeing one slot
+        if(errno == EMFILE || errno == ENFILE) {
+            std::cerr << "[Socket Handler] Accept failed (fd exhaustion): " << strerror(errno) << std::endl;
+            return -3;  // Recoverable via idle fd trick
+        }
+        // Memory/buffer pressure: closing fds doesn't help, must back off
+        if(errno == ENOBUFS || errno == ENOMEM) {
+            std::cerr << "[Socket Handler] Accept failed (memory pressure): " << strerror(errno) << std::endl;
+            return -4;  // Not recoverable via idle fd trick — return to event loop
         }
         std::cout << "[Socket Handler] Error occurred when accepting connection: " << strerror(errno) << std::endl;
         throw std::runtime_error(std::string("Error accepting connection: ") + strerror(errno));

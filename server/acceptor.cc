@@ -75,7 +75,7 @@ void Acceptor::NewConnection(){
             continue;
         }
         if(client_fd == -3){
-            // Resource exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM).
+            // FD exhaustion (EMFILE/ENFILE).
             // Use the "idle fd trick": close a reserved fd to make room for
             // one accept, immediately close the accepted connection (we can't
             // serve it), then re-open the reserved fd. This drains one pending
@@ -96,6 +96,14 @@ void Acceptor::NewConnection(){
             idle_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
             // Continue loop to drain more or reach EAGAIN
             continue;
+        }
+        if(client_fd == -4){
+            // Memory/buffer pressure (ENOBUFS/ENOMEM).
+            // The idle fd trick doesn't help here — closing fds frees fd slots,
+            // not memory. Continuing the loop would spin indefinitely.
+            // Return to the event loop; new incoming connections will produce
+            // a fresh EPOLLIN edge so accept resumes when resources recover.
+            return;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));
         new_conn_cb_(std::move(client_sock));

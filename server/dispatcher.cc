@@ -357,6 +357,12 @@ void Dispatcher::TimerHandler(){
             } else {
                 // First timeout: send 408 (if deadline callback set), then deferred close.
                 conn->CallDeadlineTimeoutCb();
+                // Re-arm deadline to give the response time to flush (30s drain window).
+                // Without this, the expired request deadline causes the next timer scan
+                // to see IsCloseDeferred() and ForceClose before the 408 has drained.
+                // The write path refreshes this deadline on each successful write,
+                // so actively-draining connections won't be killed.
+                conn->SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(30));
                 conn->CloseAfterWrite();
             }
         }
