@@ -94,21 +94,20 @@ HttpServer::HttpServer(const ServerConfig& config)
 }
 
 size_t HttpServer::ComputeInputCap() const {
-    // Compute HTTP cap: 2x multiplier for wire overhead (chunked framing, etc.)
-    size_t http_cap = 0;
+    // Compute HTTP-only cap: 2x multiplier for wire overhead (chunked framing, etc.).
+    // Do NOT include max_ws_message_size_ here — that would lift the initial cap
+    // to ~32 MiB for ALL connections (including plain HTTP), enabling a memory-DoS
+    // where oversized HTTP POSTs allocate 32x beyond the configured body limit
+    // before the parser rejects them. The WS upgrade path raises the cap when
+    // it actually occurs (see HttpConnectionHandler::OnRawData WS upgrade section).
     if (max_header_size_ > 0 && max_body_size_ > 0) {
-        http_cap = 2 * (max_header_size_ + max_body_size_);
+        return 2 * (max_header_size_ + max_body_size_);
     } else if (max_header_size_ > 0) {
-        http_cap = 2 * max_header_size_;
+        return 2 * max_header_size_;
     } else if (max_body_size_ > 0) {
-        http_cap = 2 * max_body_size_;
+        return 2 * max_body_size_;
     }
-    // Compute WS cap: 2x for per-frame headers/masking/fragmentation overhead.
-    // The initial read may contain the HTTP upgrade + the first WS frame in one
-    // TCP segment. If the WS cap is larger than the HTTP cap, use it to avoid
-    // discarding valid WS data before the upgrade code raises the limit.
-    size_t ws_cap = max_ws_message_size_ > 0 ? 2 * max_ws_message_size_ : 0;
-    return std::max(http_cap, ws_cap);
+    return 0;  // Both unlimited — no cap
 }
 
 HttpServer::~HttpServer() {
