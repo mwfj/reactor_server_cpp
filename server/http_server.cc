@@ -193,11 +193,13 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         }
     }
     // Cap the input buffer to prevent allocating far beyond configured limits
-    // before the parser has a chance to reject (413/431). The cap is the sum of
-    // max_header_size + max_body_size (the most a valid request can contain).
-    // If both are 0 (unlimited), no cap is set (backward compat).
-    if (max_header_size_ > 0 || max_body_size_ > 0) {
-        conn->SetMaxInputSize(max_header_size_ + max_body_size_);
+    // before the parser has a chance to reject (413/431).
+    // Only cap when BOTH limits are non-zero — if either is 0 (unlimited),
+    // don't cap (preserves "0 = unlimited" semantics).
+    // 2x multiplier accounts for wire-level overhead (chunked encoding framing,
+    // pipelined requests, etc.) that makes raw bytes exceed decoded payload size.
+    if (max_header_size_ > 0 && max_body_size_ > 0) {
+        conn->SetMaxInputSize(2 * (max_header_size_ + max_body_size_));
     }
 
     // Arm a connection-level deadline covering the TLS handshake + first HTTP request.
@@ -266,8 +268,8 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             SetupHandlers(http_conn);
             http_connections_[conn->fd()] = http_conn;
             // Per-connection setup that HandleNewConnection normally does.
-            if (max_header_size_ > 0 || max_body_size_ > 0) {
-                conn->SetMaxInputSize(max_header_size_ + max_body_size_);
+            if (max_header_size_ > 0 && max_body_size_ > 0) {
+                conn->SetMaxInputSize(2 * (max_header_size_ + max_body_size_));
             }
         } else {
             http_conn = it->second;
@@ -287,8 +289,8 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         std::lock_guard<std::mutex> lck(conn_mtx_);
         http_connections_[conn->fd()] = http_conn;
         // Per-connection setup
-        if (max_header_size_ > 0 || max_body_size_ > 0) {
-            conn->SetMaxInputSize(max_header_size_ + max_body_size_);
+        if (max_header_size_ > 0 && max_body_size_ > 0) {
+            conn->SetMaxInputSize(2 * (max_header_size_ + max_body_size_));
         }
     }
 
