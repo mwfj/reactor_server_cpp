@@ -166,7 +166,9 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                const HttpRequest& request,
                HttpResponse& response) {
             if (!router_.Dispatch(request, response)) {
-                response = HttpResponse::NotFound();
+                // Set 404 on the existing response to preserve any headers
+                // that middleware already added (CORS, request-id, etc.)
+                response.Status(404).Text("Not Found");
             }
         }
     );

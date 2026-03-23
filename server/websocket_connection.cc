@@ -238,9 +238,9 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 return;
             }
             // Validate close code per RFC 6455 Section 7.4 + IANA registry.
-            // Valid ranges: 1000-1003, 1007-1014 (IANA registered), 3000-4999 (private use).
+            // Valid ranges: 1000-1003, 1007-1009 (both), 1010 (client-only),
+            //   1011-1014 (server), 3000-4999 (private use).
             // Codes 1004-1006, 1015 are reserved and must not appear on the wire.
-            // Unknown codes in valid ranges are echoed as-is per RFC 6455 §7.4.
             bool valid_code = (code >= 1000 && code <= 1003) ||
                               (code >= 1007 && code <= 1014) ||
                               (code >= 3000 && code <= 4999);
@@ -252,7 +252,11 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             // Echo close frame back if we haven't sent one yet (peer-initiated close).
             // If close_sent_ is already true, this is the peer's reply to our close.
             if (!close_sent_) {
-                SendClose(code, reason);
+                // 1010 ("Missing Extension") is client-only per RFC 6455 §7.4.1.
+                // Valid to receive from a client, but the server must not echo it.
+                // Acknowledge with 1000 (Normal Closure) instead.
+                uint16_t echo_code = (code == 1010) ? 1000 : code;
+                SendClose(echo_code, reason);
             }
             is_open_ = false;
             // Close the TCP transport — handshake is complete (both sides sent close).
