@@ -76,8 +76,11 @@ void ConnectionHandler::OnMessage(){
     if (tls_write_wants_read_) {
         tls_write_wants_read_ = false;
         CallWriteCb();  // Retry the pending write
-        // If SSL still needs read readiness, keep read mode (already enabled)
-        if (tls_write_wants_read_) {
+        // CallWriteCb may have closed the connection (ForceClose on write error
+        // or after draining a close_after_write response). Check before falling
+        // through to the read loop — reading from a closed fd is UB.
+        if (tls_write_wants_read_ || is_closing_ ||
+            (client_channel_ && client_channel_->is_channel_closed())) {
             return;
         }
         // Otherwise fall through to read loop

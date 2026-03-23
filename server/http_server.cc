@@ -15,15 +15,21 @@ void HttpServer::WireNetServerCallbacks() {
         [this](std::shared_ptr<ConnectionHandler> conn, std::string& msg) { HandleMessage(conn, msg); });
 }
 
-HttpServer::HttpServer(const std::string& ip, int port)
-    : net_server_(ip, static_cast<size_t>(port),
-                  10,                          // scan interval: 30s default timeout / 3
-                  std::chrono::seconds(300))   // default idle timeout
-{
+// Validate port before member construction — must run in the initializer
+// list, before net_server_ tries to bind/listen on the (possibly invalid) port.
+static size_t ValidatePort(int port) {
     if (port < 1 || port > 65535) {
         throw std::invalid_argument(
             "Invalid port: " + std::to_string(port) + " (must be 1-65535)");
     }
+    return static_cast<size_t>(port);
+}
+
+HttpServer::HttpServer(const std::string& ip, int port)
+    : net_server_(ip, ValidatePort(port),
+                  10,                          // scan interval: 30s default timeout / 3
+                  std::chrono::seconds(300))   // default idle timeout
+{
     WireNetServerCallbacks();
     // Apply the same defaults as the config constructor — must match ServerConfig defaults.
     net_server_.SetMaxConnections(ServerConfig{}.max_connections);
