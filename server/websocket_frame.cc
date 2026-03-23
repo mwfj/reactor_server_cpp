@@ -52,10 +52,12 @@ WebSocketFrame WebSocketFrame::CloseFrame(uint16_t code, const std::string& reas
     f.opcode = WebSocketOpcode::Close;
 
     // RFC 6455 §7.4: only specific codes may appear on the wire.
-    // Valid: 1000-1003, 1007-1014 (IANA), 3000-4999 (private use).
-    // Invalid: 1004-1006, 1015, 1016-2999, >4999 — replace with 1000.
+    // Valid for server: 1000-1003, 1007-1009, 1011-1014 (IANA), 3000-4999 (private use).
+    // 1010 is client-only ("Missing Extension" — RFC 6455 §7.4.1).
+    // Invalid: 1004-1006, 1010, 1015, 1016-2999, >4999 — replace with 1000.
     bool valid_code = (code >= 1000 && code <= 1003) ||
-                      (code >= 1007 && code <= 1014) ||
+                      (code >= 1007 && code <= 1009) ||
+                      (code >= 1011 && code <= 1014) ||
                       (code >= 3000 && code <= 4999);
     if (!valid_code) {
         code = 1000;

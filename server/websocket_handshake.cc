@@ -18,19 +18,26 @@ bool WebSocketHandshake::Validate(const HttpRequest& request, std::string& error
         return false;
     }
 
-    // 2. HTTP version >= 1.1
+    // 2. Must not have a request body — RFC 6455 opening handshake is a GET.
+    // A body would be consumed by the HTTP parser and lost (never becomes WS data).
+    if (request.content_length > 0 || !request.body.empty()) {
+        error_message = "WebSocket upgrade must not have a request body";
+        return false;
+    }
+
+    // 3. HTTP version >= 1.1
     if (request.http_major < 1 || (request.http_major == 1 && request.http_minor < 1)) {
         error_message = "WebSocket upgrade requires HTTP/1.1 or higher";
         return false;
     }
 
-    // 3. Host header present
+    // 4. Host header present
     if (!request.HasHeader("host")) {
         error_message = "Missing Host header";
         return false;
     }
 
-    // 4. Upgrade header must contain the "websocket" token (case-insensitive).
+    // 5. Upgrade header must contain the "websocket" token (case-insensitive).
     // RFC 7230 §6.7: Upgrade is a comma-separated list of protocols.
     // Valid examples: "websocket", "WebSocket", "websocket, foo"
     std::string upgrade = request.GetHeader("upgrade");
@@ -54,7 +61,7 @@ bool WebSocketHandshake::Validate(const HttpRequest& request, std::string& error
         }
     }
 
-    // 5. Connection header must contain "upgrade" as a token (not substring).
+    // 6. Connection header must contain "upgrade" as a token (not substring).
     // Connection can be a comma-separated list like "keep-alive, Upgrade"
     std::string connection = request.GetHeader("connection");
     std::transform(connection.begin(), connection.end(), connection.begin(), ::tolower);

@@ -187,6 +187,26 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 return;
             }
 
+            // RFC 7231 §5.1.1: reject unsupported Expect values.
+            // For complete requests, 100-continue is a no-op (body already arrived).
+            // Any other value must be rejected with 417.
+            if (req.HasHeader("expect")) {
+                std::string expect = req.GetHeader("expect");
+                std::transform(expect.begin(), expect.end(), expect.begin(), ::tolower);
+                while (!expect.empty() && (expect.front() == ' ' || expect.front() == '\t'))
+                    expect.erase(expect.begin());
+                while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
+                    expect.pop_back();
+                if (expect != "100-continue") {
+                    HttpResponse err;
+                    err.Status(417, "Expectation Failed");
+                    err.Header("Connection", "close");
+                    SendResponse(err);
+                    CloseConnection();
+                    return;
+                }
+            }
+
             // Check for WebSocket upgrade
             if (req.upgrade && route_checker_) {
                 try {
