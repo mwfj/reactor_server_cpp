@@ -41,6 +41,10 @@ void ReactorServer::Error(std::shared_ptr<ConnectionHandler> conn){
     // Can add some extra features related code below
 }
 
+// NOTE: This legacy TCP echo server treats each callback invocation as one
+// logical message. This is stream-unsafe: TCP fragmentation/coalescing can
+// split or merge application messages across callbacks. For proper message
+// framing, use HttpServer (HTTP framing) or WebSocket (frame-based protocol).
 void ReactorServer::ProcessMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message){
     std::cout << "Thread Id: " << std::this_thread::get_id() << " Process Message: " << message << std::endl;
 

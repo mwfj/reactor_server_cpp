@@ -86,8 +86,14 @@ static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
                     self->error_type_ = HttpParser::ParseError::PARSE_ERROR;
                     return HPE_USER;
                 }
-                // List-valued headers: comma-fold per RFC 7230 §3.2.2
-                it->second += ", " + self->current_header_value_;
+                // Cookie uses "; " separator per RFC 6265 §5.4, not ", ".
+                // Proxies/clients can split cookies into multiple headers.
+                if (key == "cookie") {
+                    it->second += "; " + self->current_header_value_;
+                } else {
+                    // List-valued headers: comma-fold per RFC 7230 §3.2.2
+                    it->second += ", " + self->current_header_value_;
+                }
             } else {
                 self->request_.headers[key] = self->current_header_value_;
             }
@@ -139,7 +145,12 @@ static int on_headers_complete(llhttp_t* parser) {
                 self->error_type_ = HttpParser::ParseError::PARSE_ERROR;
                 return HPE_USER;
             }
-            it->second += ", " + self->current_header_value_;
+            // Cookie uses "; " separator per RFC 6265 §5.4, not ", ".
+            if (key == "cookie") {
+                it->second += "; " + self->current_header_value_;
+            } else {
+                it->second += ", " + self->current_header_value_;
+            }
         } else {
             self->request_.headers[key] = self->current_header_value_;
         }

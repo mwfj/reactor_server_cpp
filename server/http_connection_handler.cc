@@ -194,9 +194,14 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 HttpResponse mw_response;
                 if (middleware_runner_) {
                     if (!middleware_runner_(req, mw_response)) {
-                        // Middleware rejected — default to 403 if no status was set.
-                        // Preserve middleware-added headers (e.g., WWW-Authenticate).
-                        if (mw_response.GetStatusCode() == 200 && mw_response.GetBody().empty()) {
+                        // Middleware rejected — default to 403 if nothing was set.
+                        // Only apply when the response is completely untouched
+                        // (default status + no body + no headers). This allows
+                        // middleware to intentionally short-circuit with 200 OK
+                        // plus custom headers (e.g., CORS preflight, Set-Cookie).
+                        if (mw_response.GetStatusCode() == 200 &&
+                            mw_response.GetBody().empty() &&
+                            mw_response.GetHeaders().empty()) {
                             mw_response.Status(403).Text("Forbidden");
                         }
                         mw_response.Header("Connection", "close");

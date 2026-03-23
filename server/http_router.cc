@@ -32,9 +32,12 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     // Run middleware chain first
     for (const auto& mw : middlewares_) {
         if (!mw(request, response)) {
-            // If middleware returned false but didn't set a status, default to 403.
-            // Preserve any headers the middleware already added (e.g., WWW-Authenticate).
-            if (response.GetStatusCode() == 200 && response.GetBody().empty()) {
+            // If middleware returned false without setting anything, default to 403.
+            // Only when the response is completely untouched (default status +
+            // no body + no headers). Allows intentional 200 OK + headers.
+            if (response.GetStatusCode() == 200 &&
+                response.GetBody().empty() &&
+                response.GetHeaders().empty()) {
                 response.Status(403).Text("Forbidden");
             }
             return true;
