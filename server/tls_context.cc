@@ -10,7 +10,10 @@ TlsContext::TlsContext(const std::string& cert_file, const std::string& key_file
     }
 
     // Set minimum TLS 1.2
-    SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION);
+    if (!SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION)) {
+        SSL_CTX_free(ctx_);
+        throw std::runtime_error("Failed to set minimum TLS version to 1.2");
+    }
 
     // Load certificate
     if (SSL_CTX_use_certificate_file(ctx_, cert_file.c_str(), SSL_FILETYPE_PEM) <= 0) {
@@ -38,7 +41,9 @@ TlsContext::~TlsContext() {
 }
 
 void TlsContext::SetMinProtocolVersion(int version) {
-    SSL_CTX_set_min_proto_version(ctx_, version);
+    if (!SSL_CTX_set_min_proto_version(ctx_, version)) {
+        throw std::runtime_error("Failed to set minimum TLS protocol version");
+    }
 }
 
 void TlsContext::SetCipherList(const std::string& ciphers) {

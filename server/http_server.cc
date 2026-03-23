@@ -141,11 +141,21 @@ void HttpServer::Start() {
 
 void HttpServer::Stop() {
     logging::Get()->info("HttpServer stopping");
-    // Note: WebSocket graceful close (1001 Going Away) is not sent during Stop()
-    // because NetServer::Stop() clears connections before the reactor can flush
-    // queued close frames. Clients will see TCP RST on server shutdown.
-    // For graceful shutdown, applications should close WebSocket connections
-    // explicitly before calling Stop().
+
+    // Send WebSocket 1001 Going Away close frames before tearing down transport.
+    // SendClose → SendFrame → SendRaw → EnQueue(DoSendRaw) on each dispatcher,
+    // which is processed before NetServer::Stop() stops the event loops.
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        for (auto& pair : http_connections_) {
+            auto* ws = pair.second->GetWebSocket();
+            if (ws && ws->IsOpen()) {
+                try { ws->SendClose(1001, "Going Away"); }
+                catch (...) {}
+            }
+        }
+    }
+
     net_server_.Stop();
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);

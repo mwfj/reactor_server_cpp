@@ -96,9 +96,9 @@ void NetServer::Stop(){
         });
     }
 
-    // Third: Close all active connections — collect under lock, close after releasing.
-    // CallCloseCb triggers HandleCloseConnection which takes conn_mtx_, so we must
-    // NOT hold the lock while calling it to avoid deadlock.
+    // Third: Gracefully close all active connections — CloseAfterWrite lets pending
+    // output (including WS close frames) drain via the still-running event loops.
+    // Connections with empty output buffers close immediately (ForceClose path).
     std::vector<std::shared_ptr<ConnectionHandler>> conns_to_close;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
@@ -110,7 +110,7 @@ void NetServer::Stop(){
         connections_.clear();
     }
     for (auto& conn : conns_to_close) {
-        conn->CallCloseCb();
+        conn->CloseAfterWrite();
     }
     conns_to_close.clear();
 

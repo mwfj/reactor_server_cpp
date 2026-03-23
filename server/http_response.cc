@@ -33,6 +33,22 @@ HttpResponse& HttpResponse::Header(const std::string& key, const std::string& va
     safe_key.erase(std::remove(safe_key.begin(), safe_key.end(), '\n'), safe_key.end());
     safe_value.erase(std::remove(safe_value.begin(), safe_value.end(), '\r'), safe_value.end());
     safe_value.erase(std::remove(safe_value.begin(), safe_value.end(), '\n'), safe_value.end());
+
+    // Set-semantics: replace existing header with the same name (case-insensitive)
+    // to prevent conflicting duplicates (e.g., duplicate Content-Type from
+    // middleware + 404 fallback, or multiple Connection headers).
+    std::string lower_key = safe_key;
+    std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(), ::tolower);
+    for (auto& hdr : headers_) {
+        std::string existing_lower = hdr.first;
+        std::transform(existing_lower.begin(), existing_lower.end(), existing_lower.begin(), ::tolower);
+        if (existing_lower == lower_key) {
+            hdr.first = std::move(safe_key);
+            hdr.second = std::move(safe_value);
+            return *this;
+        }
+    }
+
     headers_.emplace_back(std::move(safe_key), std::move(safe_value));
     return *this;
 }
