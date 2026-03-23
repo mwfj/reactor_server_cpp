@@ -1,18 +1,11 @@
 #include "timestamp.h"
 
-TimeStamp::TimeStamp() : time_(std::chrono::system_clock::now()) {}
-
-TimeStamp::TimeStamp(std::chrono::system_clock::time_point tp) : time_(tp) {}
-
-TimeStamp::TimeStamp(int seconds_since_epoch)
-    : time_(std::chrono::system_clock::from_time_t(static_cast<time_t>(seconds_since_epoch))) {}
-
-std::chrono::system_clock::time_point TimeStamp::GetCurrentTS() {
-    return std::chrono::system_clock::now();
-}
+TimeStamp::TimeStamp() : time_(std::chrono::steady_clock::now()) {}
 
 TimeStamp TimeStamp::Now(){
-    return TimeStamp(std::chrono::system_clock::now());
+    TimeStamp ts;
+    ts.time_ = std::chrono::steady_clock::now();
+    return ts;
 }
 
 int TimeStamp::GenTimerFd(std::chrono::seconds sec, std::chrono::nanoseconds nsec) {
@@ -58,27 +51,11 @@ void TimeStamp::ResetTimerFd(int& timer_fd, int duration){
 #endif
 }
 
-std::string TimeStamp::toString() const{
-    char buf[32] = {0};
-    tm local_tm;
-    time_t time = std::chrono::system_clock::to_time_t(time_);
-    localtime_r(&time, &local_tm);
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &local_tm);
-    return std::string(buf);
-}
-
-int64_t TimeStamp::toInt() const{
-    auto duration = time_.time_since_epoch();
-    auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration);
-    return seconds.count();
-}
-
-std::chrono::system_clock::time_point TimeStamp::GetTime() const {
-    return time_;
-}
-
 bool TimeStamp::IsTimeOut(std::chrono::seconds duration) const {
-    auto now = TimeStamp::Now().GetTime();
+    auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - time_);
-    return elapsed > duration;
+    // Use >= so the timeout fires as soon as the elapsed time reaches the
+    // duration. With > and truncating duration_cast, a 300s timeout would
+    // require 301s elapsed (truncation of 300.9s → 300s, 300 > 300 is false).
+    return elapsed >= duration;
 }
