@@ -386,6 +386,15 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                     response.Header("Connection", "keep-alive");
                 }
 
+                // If the server will close after this response (client sent
+                // Connection: close, or HTTP/1.0 without keep-alive), the response
+                // must include Connection: close so the wire semantics match.
+                // Without this, an HTTP/1.1 response implies persistence but the
+                // server tears the socket down immediately after sending.
+                if (!req.keep_alive && !resp_close) {
+                    response.Header("Connection", "close");
+                }
+
                 // RFC 7231 §4.3.2: HEAD responses MUST NOT include a body,
                 // but MUST include the same headers as the GET response (including
                 // Content-Length reflecting the GET body size).

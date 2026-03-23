@@ -63,6 +63,12 @@ void Acceptor::NewConnection(){
     // Edge-triggered epoll only notifies ONCE, so we must drain the entire
     // queue to EAGAIN. Returning before EAGAIN means no future EPOLLIN edge
     // fires even after resources recover — permanent accept starvation.
+    // Guard: if the channel was closed by CloseListenSocket (shutdown),
+    // don't accept. This prevents accepting new connections after Stop()
+    // has started, even if the accept event and the close task are in the
+    // same epoll batch and the accept fires first.
+    if (!acceptor_channel_ || acceptor_channel_->is_channel_closed()) return;
+
     while(true){
         InetAddr client_addr;
         int client_fd = servsock_ -> Accept(client_addr);
