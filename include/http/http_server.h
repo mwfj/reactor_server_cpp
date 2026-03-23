@@ -30,7 +30,10 @@ public:
     void WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler);
     void Use(HttpRouter::Middleware middleware);
 
-    // Server lifecycle
+    // Server lifecycle.
+    // NOTE: Start/Stop is one-shot — after Stop(), the internal dispatchers
+    // and thread pool are permanently stopped and cannot be restarted.
+    // To restart, destroy and reconstruct the HttpServer.
     void Start();  // Blocks in event loop
     void Stop();
 

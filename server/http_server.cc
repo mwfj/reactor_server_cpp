@@ -20,6 +20,10 @@ HttpServer::HttpServer(const std::string& ip, int port)
                   10,                          // scan interval: 30s default timeout / 3
                   std::chrono::seconds(300))   // default idle timeout
 {
+    if (port < 1 || port > 65535) {
+        throw std::invalid_argument(
+            "Invalid port: " + std::to_string(port) + " (must be 1-65535)");
+    }
     WireNetServerCallbacks();
     // Apply the same defaults as the config constructor — must match ServerConfig defaults.
     net_server_.SetMaxConnections(ServerConfig{}.max_connections);
@@ -210,11 +214,16 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
             http_connections_[conn->fd()] = http_conn;
         }
     }
-    // Notify old WS handler outside the lock to prevent deadlock
+    // Notify old WS handler outside the lock to prevent deadlock.
+    // Catch exceptions from user close handlers to prevent breaking
+    // core cleanup (ReleaseFd, timer removal, connection map erasure).
     if (old_handler) {
         auto* ws = old_handler->GetWebSocket();
         if (ws) {
-            ws->NotifyTransportClose();
+            try { ws->NotifyTransportClose(); }
+            catch (const std::exception& e) {
+                logging::Get()->error("Exception in WS close handler: {}", e.what());
+            }
         }
     }
     // Note: max_input_size_ is already set by NetServer before RegisterCallbacks,
@@ -246,11 +255,15 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
             http_connections_.erase(it);
         }
     }
-    // Notify WS close handler OUTSIDE the lock to prevent deadlock
+    // Notify WS close handler OUTSIDE the lock to prevent deadlock.
+    // Catch exceptions to prevent breaking core cleanup (ReleaseFd, etc.).
     if (http_conn) {
         auto* ws = http_conn->GetWebSocket();
         if (ws) {
-            ws->NotifyTransportClose();  // Checks is_open_ internally
+            try { ws->NotifyTransportClose(); }
+            catch (const std::exception& e) {
+                logging::Get()->error("Exception in WS close handler: {}", e.what());
+            }
         }
     }
 }
@@ -269,7 +282,10 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
     if (http_conn) {
         auto* ws = http_conn->GetWebSocket();
         if (ws) {
-            ws->NotifyTransportClose();  // Checks is_open_ internally
+            try { ws->NotifyTransportClose(); }
+            catch (const std::exception& e) {
+                logging::Get()->error("Exception in WS close handler: {}", e.what());
+            }
         }
     }
 }
@@ -297,7 +313,10 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         // Notify old WebSocket close handler before discarding
         auto* old_ws = http_conn->GetWebSocket();
         if (old_ws) {
-            old_ws->NotifyTransportClose();
+            try { old_ws->NotifyTransportClose(); }
+            catch (const std::exception& e) {
+                logging::Get()->error("Exception in WS close handler: {}", e.what());
+            }
         }
         http_conn = std::make_shared<HttpConnectionHandler>(conn);
         SetupHandlers(http_conn);

@@ -3,6 +3,7 @@
 
 #include <fstream>
 #include <sstream>
+#include <arpa/inet.h>
 #include <cstdlib>
 #include <stdexcept>
 #include <algorithm>
@@ -208,6 +209,18 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
 }
 
 void ConfigLoader::Validate(const ServerConfig& config) {
+    // Validate bind_host is a numeric IPv4 address (inet_addr is used
+    // internally — hostnames like "localhost" and IPv6 literals won't bind).
+    if (config.bind_host.empty()) {
+        throw std::invalid_argument("bind_host must not be empty");
+    }
+    if (inet_addr(config.bind_host.c_str()) == INADDR_NONE &&
+        config.bind_host != "255.255.255.255") {
+        throw std::invalid_argument(
+            "Invalid bind_host: '" + config.bind_host +
+            "' (must be a numeric IPv4 address, e.g. '0.0.0.0' or '127.0.0.1')");
+    }
+
     if (config.bind_port < 1 || config.bind_port > 65535) {
         throw std::invalid_argument(
             "Invalid bind_port: " + std::to_string(config.bind_port) +
