@@ -321,11 +321,14 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                         SendResponse(err);
                         CloseConnection();
                     } else if (ws_conn_) {
-                        // Post-101: send WS close 1011 (Internal Error).
-                        // Don't call CloseConnection — SendClose arms a 5s deadline
-                        // for the close handshake. The peer's Close reply (or deadline
-                        // expiry) handles transport cleanup.
+                        // Post-101 with WS connection: send close 1011.
+                        // SendClose now includes CloseAfterWrite for proper drain.
                         ws_conn_->SendClose(1011, "Internal error");
+                    } else {
+                        // Post-101 but ws_conn_ is null — make_unique threw (OOM).
+                        // Connection is in a bad state (101 sent, no WS handler).
+                        // Force close the transport immediately.
+                        conn_->ForceClose();
                     }
                     return;
                 }
