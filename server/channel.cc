@@ -38,7 +38,11 @@ void Channel::EnableReadMode(){
 
 void Channel::DisableReadMode(){
     if(is_channel_closed_) return;
-    event_ &= ~EVENT_READ;
+    // Clear both EVENT_READ and EVENT_RDHUP (set together by EnableReadMode).
+    // On kqueue, UpdateEvent() treats events != 0 as "still registered".
+    // Without clearing RDHUP, the channel stays in channel_map_ with
+    // is_read_event_ true even after both filters are deleted.
+    event_ &= ~(EVENT_READ | EVENT_RDHUP);
     std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
     if(ep_shared)
         ep_shared -> UpdateChannel(shared_from_this());

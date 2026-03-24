@@ -167,8 +167,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 return;
             }
             if (max_message_size_ > 0 &&
-                (fragment_buffer_.size() >= max_message_size_ ||
-                 frame.payload.size() > max_message_size_ - fragment_buffer_.size())) {
+                fragment_buffer_.size() + frame.payload.size() > max_message_size_) {
                 if (error_callback_) error_callback_(*this, "Message exceeds maximum size");
                 SendClose(1009, "Message too big");
                 in_fragment_ = false;
