@@ -37,15 +37,20 @@ HttpResponse& HttpResponse::Header(const std::string& key, const std::string& va
     // Set-semantics: replace existing header with the same name (case-insensitive)
     // to prevent conflicting duplicates (e.g., duplicate Content-Type from
     // middleware + 404 fallback, or multiple Connection headers).
+    // Exception: headers that are legally repeated and cannot be folded into a
+    // single comma-separated value (RFC 6265 §4.1, RFC 7235 §4.1).
     std::string lower_key = safe_key;
     std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(), ::tolower);
-    for (auto& hdr : headers_) {
-        std::string existing_lower = hdr.first;
-        std::transform(existing_lower.begin(), existing_lower.end(), existing_lower.begin(), ::tolower);
-        if (existing_lower == lower_key) {
-            hdr.first = std::move(safe_key);
-            hdr.second = std::move(safe_value);
-            return *this;
+    bool repeatable = (lower_key == "set-cookie" || lower_key == "www-authenticate");
+    if (!repeatable) {
+        for (auto& hdr : headers_) {
+            std::string existing_lower = hdr.first;
+            std::transform(existing_lower.begin(), existing_lower.end(), existing_lower.begin(), ::tolower);
+            if (existing_lower == lower_key) {
+                hdr.first = std::move(safe_key);
+                hdr.second = std::move(safe_value);
+                return *this;
+            }
         }
     }
 

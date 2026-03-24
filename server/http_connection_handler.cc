@@ -309,14 +309,14 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                     ws_conn_->GetParser().SetMaxPayloadSize(max_ws_message_size_);
                     ws_conn_->SetMaxMessageSize(max_ws_message_size_);
                 }
-                // Remove the pre-read input cap for WebSocket connections.
-                // The WS parser enforces its own limits (max_payload_size per
-                // frame, max_message_size for reassembled messages). The input
-                // cap's discard mechanism is incompatible with WS: discarding
-                // bytes from a binary-framed stream permanently desynchronizes
-                // the parser. No fixed multiplier can cover worst-case WS
-                // fragmentation (1-byte payloads have 7x wire overhead).
-                conn_->SetMaxInputSize(0);
+                // Switch input cap to the WS message size limit. The read loop
+                // stops at the cap (data stays in kernel buffer, nothing is
+                // discarded) and requeues, so no parser desync. This bounds
+                // per-cycle memory allocation against a fast peer while the
+                // WS parser enforces frame/message limits independently.
+                if (max_ws_message_size_ > 0) {
+                    conn_->SetMaxInputSize(max_ws_message_size_);
+                }
 
                 // Wire WS callbacks (called exactly once, ws_conn_ guaranteed to exist)
                 if (upgrade_handler_) {
@@ -528,6 +528,17 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                     while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
                         expect.pop_back();
                     if (expect == "100-continue") {
+                        // Don't send 100 Continue for WebSocket upgrade requests —
+                        // WebSocketHandshake::Validate() rejects body-bearing
+                        // upgrades, so acknowledging the body is contradictory.
+                        if (partial.upgrade) {
+                            HttpResponse bad_req = HttpResponse::BadRequest(
+                                "WebSocket upgrade must not have a request body");
+                            bad_req.Header("Connection", "close");
+                            SendResponse(bad_req);
+                            CloseConnection();
+                            return;
+                        }
                         HttpResponse cont;
                         cont.Status(100, "Continue");
                         SendResponse(cont);
