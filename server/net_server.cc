@@ -117,7 +117,11 @@ void NetServer::Stop(){
             conn->CloseAfterWrite();
         }
     }
-    conns_to_close.clear();
+    // Do NOT clear conns_to_close here. The shared_ptrs must keep
+    // ConnectionHandlers alive until the deferred CloseAfterWrite lambdas
+    // (which capture weak_ptr) have executed. Without this, ClearConnections
+    // + clear() can drop the last strong ref before the drain/close lambda
+    // runs, causing weak_ptr::lock() to fail and skipping graceful close.
 
     // Fourth: Wait for each dispatcher to process enqueued CloseAfterWrite tasks.
     // Without this barrier, StopEventLoop would exit the event loop before
@@ -147,6 +151,10 @@ void NetServer::Stop(){
 
     // Sixth: Now safe to join worker threads
     sock_workers_.Stop();
+
+    // Seventh: Release shutdown connection references. All deferred work has
+    // completed — the event loops are stopped and workers are joined.
+    conns_to_close.clear();
 }
 
 void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
@@ -199,7 +207,18 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
 
     // Two-phase initialization: register channel callbacks and enable epoll.
     // Uses weak_ptr captures so callbacks are safe if ConnectionHandler is destroyed.
-    conn -> RegisterCallbacks();
+    // If epoll_ctl fails (ENOMEM/ENOSPC), clean up the half-initialized connection
+    // to prevent leaking a connection slot and fd.
+    try {
+        conn -> RegisterCallbacks();
+    } catch (const std::exception& e) {
+        std::cerr << "[NetServer] epoll registration failed for fd " << conn->fd()
+                  << ": " << e.what() << std::endl;
+        // CallCloseCb handles: close channel, fire close callback (removes from
+        // connections_ map), release fd from SocketHandler (prevents double-close).
+        conn->CallCloseCb();
+        return;
+    }
 
     // Register with socket dispatcher's timer for idle timeout scanning.
     // Must go through EnQueue so AddConnection runs on the dispatcher thread,
