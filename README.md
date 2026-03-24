@@ -128,7 +128,7 @@ Layer 1: ConnectionHandler, Channel,        (reactor core)
          Dispatcher, EventHandler
 ```
 
-See [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the full design, data flow diagrams, and memory management model.
+See [docs/architecture.md](docs/architecture.md) for the full design, data flow diagrams, and memory management model.
 
 ## Project Structure
 
@@ -144,10 +144,14 @@ reactor_server_cpp/
 ├── thread_pool/          # Standalone thread pool (separate build)
 ├── third_party/          # llhttp (HTTP parser), nlohmann/json, spdlog
 ├── util/                 # Utilities (timestamp)
-├── doc/                  # Documentation
-│   ├── ARCHITECTURE.md   #   Core design and data flow
-│   ├── CALLBACK_ARCHITECTURE.md  #   Callback layer design
-│   └── TESTING.md        #   Test suites and running tests
+├── docs/                 # Documentation
+│   ├── architecture.md          #   Core design and data flow
+│   ├── callback_architecture.md #   Callback layer design
+│   ├── testing.md               #   Test suites and running tests
+│   ├── http.md                  #   HTTP/1.1 layer
+│   ├── websocket.md             #   WebSocket (RFC 6455)
+│   ├── tls.md                   #   TLS/SSL support
+│   └── configuration.md        #   Config and logging
 └── Makefile
 ```
 
@@ -168,9 +172,13 @@ cd thread_pool && make && ./run
 
 | Document | Description |
 |----------|-------------|
-| [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) | Reactor pattern, layered design, data flow, memory management, cross-platform support |
-| [doc/CALLBACK_ARCHITECTURE.md](doc/CALLBACK_ARCHITECTURE.md) | 3-layer callback chain, type definitions, weak_ptr design pattern |
-| [doc/TESTING.md](doc/TESTING.md) | Test suites, running tests, port configuration |
+| [docs/architecture.md](docs/architecture.md) | Reactor pattern, layered design, data flow, memory management, cross-platform support |
+| [docs/callback_architecture.md](docs/callback_architecture.md) | 3-layer callback chain, type definitions, weak_ptr design pattern |
+| [docs/testing.md](docs/testing.md) | Test suites, running tests, port configuration |
+| [docs/http.md](docs/http.md) | HTTP/1.1 layer — routing, middleware, request/response API |
+| [docs/websocket.md](docs/websocket.md) | WebSocket — upgrade flow, frames, message API, RFC 6455 compliance |
+| [docs/tls.md](docs/tls.md) | TLS/SSL — configuration, state machine, OpenSSL integration |
+| [docs/configuration.md](docs/configuration.md) | JSON config, environment variables, structured logging |
 
 ## Platform Support
 
