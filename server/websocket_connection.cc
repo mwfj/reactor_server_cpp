@@ -78,21 +78,23 @@ void WebSocketConnection::OnRawData(const std::string& data) {
         ProcessFrame(parser_.NextFrame());
     }
 
-    if (parser_.HasError() && is_open_ && !close_sent_) {
-        if (error_callback_) {
-            error_callback_(*this, parser_.GetError());
+    if (parser_.HasError() && is_open_) {
+        if (!close_sent_) {
+            if (error_callback_) {
+                error_callback_(*this, parser_.GetError());
+            }
+            // Use the correct close code based on the error type
+            std::string err_msg = parser_.GetError();
+            uint16_t close_code = 1002;  // Default: protocol error
+            if (err_msg.find("exceeds maximum size") != std::string::npos) {
+                close_code = 1009;  // Message Too Big
+            }
+            SendClose(close_code, err_msg.substr(0, 123));
         }
-        // Use the correct close code based on the error type
-        std::string err_msg = parser_.GetError();
-        uint16_t close_code = 1002;  // Default: protocol error
-        if (err_msg.find("exceeds maximum size") != std::string::npos) {
-            close_code = 1009;  // Message Too Big
-        }
-        SendClose(close_code, err_msg.substr(0, 123));
-        // Reset the parser so it can receive the peer's Close reply.
-        // Without this, has_error_ stays latched and Parse() won't process
-        // any bytes, so the Close reply is silently dropped and the app
-        // gets 1006 (abnormal) instead of a clean close.
+        // Reset the parser to prevent unbounded buffer growth.
+        // Parse() appends to buffer_ before checking has_error_, so without
+        // a reset, every subsequent call accumulates data in memory until
+        // the transport times out. Also allows receiving the peer's Close reply.
         parser_.ResetAfterError();
         return;
     }

@@ -207,8 +207,11 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 }
             }
 
-            // Check for WebSocket upgrade
-            if (req.upgrade && route_check_callback_) {
+            // Check for WebSocket upgrade.
+            // Guard on method == GET: llhttp sets upgrade=1 for CONNECT too,
+            // but RFC 6455 §4.1 requires GET. Without this, Route("CONNECT", ...)
+            // is unreachable — CONNECT enters the WS path and fails validation.
+            if (req.upgrade && req.method == "GET" && route_check_callback_) {
                 try {
                 // Run middleware before upgrade (auth, CORS, rate limiting, etc.)
                 // Hoist mw_response so successful middleware headers can be merged

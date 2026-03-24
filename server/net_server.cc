@@ -3,6 +3,7 @@
 #include "tls/tls_connection.h"
 
 #include <csignal>
+#include <future>
 
 NetServer::NetServer(const std::string& _ip, const size_t _port,
                      int timer_interval,
@@ -118,11 +119,27 @@ void NetServer::Stop(){
     }
     conns_to_close.clear();
 
-    // Fourth: Stop socket dispatcher event loops (conn_dispatcher already stopped above)
+    // Fourth: Wait for each dispatcher to process enqueued CloseAfterWrite tasks.
+    // Without this barrier, StopEventLoop would exit the event loop before
+    // EnableWriteMode (from CloseAfterWrite) triggers a write event, truncating
+    // buffered output (WS close frames, in-flight HTTP responses) under backpressure.
+    // The barrier ensures write mode is registered; StopEventLoop's WakeUp then
+    // triggers one final WaitForEvent that includes the write-ready channels.
+    for (auto& disp : socket_dispatchers_) {
+        if (disp->was_stopped()) continue;
+        auto barrier = std::make_shared<std::promise<void>>();
+        auto future = barrier->get_future();
+        disp->EnQueue([barrier]() { barrier->set_value(); });
+        future.wait();
+    }
+
+    // Fifth: Stop socket dispatcher event loops (conn_dispatcher already stopped above).
+    // StopEventLoop's WakeUp triggers one final loop iteration that processes any
+    // write-ready channels (from EnableWriteMode set above), draining buffered output.
     for(auto task : socket_dispatchers_)
         task -> StopEventLoop();
 
-    // Fifth: Now safe to join worker threads
+    // Sixth: Now safe to join worker threads
     sock_workers_.Stop();
 }
 
