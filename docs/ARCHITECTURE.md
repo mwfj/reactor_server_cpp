@@ -6,13 +6,13 @@ The server uses the [Reactor pattern](https://en.wikipedia.org/wiki/Reactor_patt
 
 ```
                     ┌──────────────────────────────────┐
-                    │     Dispatcher (Event Loop)       │
+                    │     Dispatcher (Event Loop)      │
                     │                                  │
-                    │  while (is_running_) {            │
-                    │    channels = WaitForEvent()      │
-                    │    for ch : channels              │
-                    │      ch->HandleEvent()            │
-                    │  }                                │
+                    │  while (is_running_) {           │
+                    │    channels = WaitForEvent()     │
+                    │    for ch : channels             │
+                    │      ch->HandleEvent()           │
+                    │  }                               │
                     └───────────────┬──────────────────┘
                                     │
               ┌─────────────────────┼─────────────────────┐
