@@ -54,6 +54,9 @@ private:
     void WireNetServerCallbacks();
     // Compute the pre-read input buffer cap from configured limits.
     size_t ComputeInputCap() const;
+    // Safe WS transport-close notification: null-check, exception-safe, log errors.
+    // Must be called OUTSIDE conn_mtx_ to prevent deadlock.
+    void SafeNotifyWsClose(const std::shared_ptr<HttpConnectionHandler>& http_conn);
 
     std::shared_ptr<TlsContext> tls_ctx_;  // Shared with NetServer for safe lifetime
 

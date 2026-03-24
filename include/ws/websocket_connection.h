@@ -1,5 +1,6 @@
 #pragma once
 
+#include "http/http_callbacks.h"
 #include "ws/websocket_parser.h"
 #include "ws/websocket_frame.h"
 #include "connection_handler.h"
@@ -10,11 +11,11 @@ class WebSocketConnection {
 public:
     explicit WebSocketConnection(std::shared_ptr<ConnectionHandler> conn);
 
-    // Message-level callbacks
-    using MessageCallback = std::function<void(WebSocketConnection& ws, const std::string& message, bool is_binary)>;
-    using CloseCallback = std::function<void(WebSocketConnection& ws, uint16_t code, const std::string& reason)>;
-    using PingCallback = std::function<void(WebSocketConnection& ws, const std::string& payload)>;
-    using ErrorCallback = std::function<void(WebSocketConnection& ws, const std::string& error)>;
+    // Public type aliases for backward compatibility
+    using MessageCallback = HTTP_CALLBACKS_NAMESPACE::WsMessageCallback;
+    using CloseCallback   = HTTP_CALLBACKS_NAMESPACE::WsCloseCallback;
+    using PingCallback    = HTTP_CALLBACKS_NAMESPACE::WsPingCallback;
+    using ErrorCallback   = HTTP_CALLBACKS_NAMESPACE::WsErrorCallback;
 
     void OnMessage(MessageCallback callback);
     void OnClose(CloseCallback callback);
@@ -58,10 +59,7 @@ private:
     uint16_t sent_close_code_ = 0;     // Close code we sent (for NotifyTransportClose)
     std::string sent_close_reason_;    // Close reason we sent
 
-    MessageCallback message_callback_;
-    CloseCallback close_callback_;
-    PingCallback ping_callback_;
-    ErrorCallback error_callback_;
+    HTTP_CALLBACKS_NAMESPACE::WsCallbacks callbacks_;
 
     // Fragmentation reassembly
     std::string fragment_buffer_;

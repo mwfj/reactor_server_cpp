@@ -1,5 +1,6 @@
 #pragma once
 
+#include "http/http_callbacks.h"
 #include "http/http_parser.h"
 #include "http/http_request.h"
 #include "http/http_response.h"
@@ -13,30 +14,15 @@ class HttpConnectionHandler : public std::enable_shared_from_this<HttpConnection
 public:
     explicit HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn);
 
-    // Handler for complete HTTP requests
-    using RequestCallback = std::function<void(
-        std::shared_ptr<HttpConnectionHandler> self,
-        const HttpRequest& request,
-        HttpResponse& response
-    )>;
+    // Public type aliases for backward compatibility with SetupHandlers() callers
+    using RequestCallback    = HTTP_CALLBACKS_NAMESPACE::HttpConnRequestCallback;
+    using RouteCheckCallback = HTTP_CALLBACKS_NAMESPACE::HttpConnRouteCheckCallback;
+    using MiddlewareCallback = HTTP_CALLBACKS_NAMESPACE::HttpConnMiddlewareCallback;
+    using UpgradeCallback    = HTTP_CALLBACKS_NAMESPACE::HttpConnUpgradeCallback;
+
     void SetRequestCallback(RequestCallback callback);
-
-    // Check if a WebSocket route exists for the given path.
-    // Returns true if upgrade should proceed, false to reject.
-    using RouteCheckCallback = std::function<bool(const std::string& path)>;
     void SetRouteCheckCallback(RouteCheckCallback callback);
-
-    // Run middleware chain before WebSocket upgrade.
-    // Returns true if all middleware passed, false if any short-circuited (response is set).
-    using MiddlewareCallback = std::function<bool(const HttpRequest& request, HttpResponse& response)>;
     void SetMiddlewareCallback(MiddlewareCallback callback);
-
-    // Handler called ONCE after WebSocket upgrade is complete and ws_conn_ exists.
-    // Wires application-level OnMessage/OnClose callbacks on the WebSocketConnection.
-    using UpgradeCallback = std::function<void(
-        std::shared_ptr<HttpConnectionHandler> self,
-        const HttpRequest& request
-    )>;
     void SetUpgradeCallback(UpgradeCallback callback);
 
     // Send an HTTP response
@@ -83,12 +69,16 @@ private:
 
     // Close the underlying connection (send response then close)
     void CloseConnection();
+
+    // Internal phases of OnRawData -- split for readability
+    void HandleUpgradedData(const std::string& data);
+    void HandleParseError();
+    // Returns true to continue pipelining loop, false to stop processing
+    bool HandleCompleteRequest(const char*& buf, size_t& remaining, size_t consumed);
+    void HandleIncompleteRequest();
     std::shared_ptr<ConnectionHandler> conn_;
     HttpParser parser_;
-    RequestCallback request_callback_;
-    RouteCheckCallback route_check_callback_;
-    MiddlewareCallback middleware_callback_;
-    UpgradeCallback upgrade_callback_;
+    HTTP_CALLBACKS_NAMESPACE::HttpConnCallbacks callbacks_;
     bool upgraded_ = false;
     std::unique_ptr<WebSocketConnection> ws_conn_;
 };
