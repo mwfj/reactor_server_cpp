@@ -50,8 +50,11 @@ private:
     WebSocketParser parser_;
     std::atomic<bool> is_open_{true};
     std::atomic<bool> close_sent_{false};  // We sent a close frame, waiting for peer's reply
-    std::mutex send_mtx_;  // Serializes SendText/SendBinary/SendClose to prevent
-                           // data frames after Close (RFC 6455 §5.5.1)
+    std::recursive_mutex send_mtx_;  // Serializes SendText/SendBinary/SendClose to prevent
+                                     // data frames after Close (RFC 6455 §5.5.1).
+                                     // Recursive: SendFrame can synchronously fail → CallCloseCb
+                                     // → NotifyTransportClose → user close callback → re-entrant
+                                     // send (which is a no-op due to is_open_ guard).
     uint16_t sent_close_code_ = 0;     // Close code we sent (for NotifyTransportClose)
     std::string sent_close_reason_;    // Close reason we sent
 

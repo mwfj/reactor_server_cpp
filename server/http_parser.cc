@@ -167,16 +167,25 @@ static int on_headers_complete(llhttp_t* parser) {
 
     // Parse URL into path and query.
     // Handle absolute-form request-targets (RFC 7230 §5.3.2):
-    // "GET http://example.com/foo?x=1 HTTP/1.1" → path = "/foo"
+    // "GET http://example.com/foo?x=1 HTTP/1.1" → path="/foo", query="x=1"
+    // "GET http://example.com?x=1 HTTP/1.1"     → path="/",    query="x=1"
+    // "GET http://example.com HTTP/1.1"          → path="/"
     std::string target = self->request_.url;
     if (target.compare(0, 7, "http://") == 0 ||
         target.compare(0, 8, "https://") == 0) {
-        // Skip scheme + authority: find the first '/' after "://"
         auto scheme_end = target.find("://");
-        auto path_pos = target.find('/', scheme_end + 3);
-        target = (path_pos != std::string::npos)
-                 ? target.substr(path_pos)
-                 : "/";
+        auto authority_start = scheme_end + 3;
+        auto path_pos = target.find('/', authority_start);
+        if (path_pos != std::string::npos) {
+            target = target.substr(path_pos);
+        } else {
+            // No path slash — check for query directly after authority
+            // (e.g., "http://example.com?x=1" → "/?x=1")
+            auto query_pos = target.find('?', authority_start);
+            target = (query_pos != std::string::npos)
+                     ? "/" + target.substr(query_pos)
+                     : "/";
+        }
     }
     auto qpos = target.find('?');
     if (qpos != std::string::npos) {

@@ -10,7 +10,7 @@ void WebSocketConnection::OnPing(PingCallback callback) { ping_callback_ = std::
 void WebSocketConnection::OnError(ErrorCallback callback) { error_callback_ = std::move(callback); }
 
 void WebSocketConnection::SendText(const std::string& message) {
-    std::lock_guard<std::mutex> lck(send_mtx_);
+    std::lock_guard<std::recursive_mutex> lck(send_mtx_);
     if (close_sent_ || !is_open_) return;  // No data frames after close
     // RFC 6455 §5.6: text frames must contain valid UTF-8.
     // Validate outbound text to prevent emitting protocol-invalid frames
@@ -23,13 +23,13 @@ void WebSocketConnection::SendText(const std::string& message) {
 }
 
 void WebSocketConnection::SendBinary(const std::string& data) {
-    std::lock_guard<std::mutex> lck(send_mtx_);
+    std::lock_guard<std::recursive_mutex> lck(send_mtx_);
     if (close_sent_ || !is_open_) return;  // No data frames after close
     SendFrame(WebSocketFrame::BinaryFrame(data));
 }
 
 void WebSocketConnection::SendClose(uint16_t code, const std::string& reason) {
-    std::lock_guard<std::mutex> lck(send_mtx_);
+    std::lock_guard<std::recursive_mutex> lck(send_mtx_);
     if (close_sent_) return;  // Already sent a close frame
     SendFrame(WebSocketFrame::CloseFrame(code, reason));
     close_sent_ = true;
