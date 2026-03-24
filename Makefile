@@ -10,9 +10,24 @@
 # Compiler and flags
 CXX = g++
 CC = gcc
-CXXFLAGS = -std=c++17 -g -Wall -Iinclude -Ithread_pool/include -Iutil -Itest -Ithird_party
+
+# Platform-specific OpenSSL configuration
+# - Linux: OpenSSL headers/libs are in system paths, no extra flags needed
+# - macOS (ARM/Intel): Homebrew installs OpenSSL outside system paths
+UNAME_S := $(shell uname -s)
+OPENSSL_CFLAGS =
+OPENSSL_LDFLAGS =
+ifeq ($(UNAME_S),Darwin)
+    OPENSSL_PREFIX := $(shell brew --prefix openssl@3 2>/dev/null)
+    ifneq ($(OPENSSL_PREFIX),)
+        OPENSSL_CFLAGS := -I$(OPENSSL_PREFIX)/include
+        OPENSSL_LDFLAGS := -L$(OPENSSL_PREFIX)/lib
+    endif
+endif
+
+CXXFLAGS = -std=c++17 -g -Wall -Iinclude -Ithread_pool/include -Iutil -Itest -Ithird_party $(OPENSSL_CFLAGS)
 CFLAGS = -g -Wall -Ithird_party/llhttp
-LDFLAGS = -lpthread -lssl -lcrypto
+LDFLAGS = $(OPENSSL_LDFLAGS) -lpthread -lssl -lcrypto
 
 # Directories
 SERVER_DIR = server
