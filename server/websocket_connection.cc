@@ -4,10 +4,10 @@
 WebSocketConnection::WebSocketConnection(std::shared_ptr<ConnectionHandler> conn)
     : conn_(std::move(conn)) {}
 
-void WebSocketConnection::OnMessage(MessageHandler handler) { message_handler_ = std::move(handler); }
-void WebSocketConnection::OnClose(CloseHandler handler) { close_handler_ = std::move(handler); }
-void WebSocketConnection::OnPing(PingHandler handler) { ping_handler_ = std::move(handler); }
-void WebSocketConnection::OnError(ErrorHandler handler) { error_handler_ = std::move(handler); }
+void WebSocketConnection::OnMessage(MessageCallback callback) { message_callback_ = std::move(callback); }
+void WebSocketConnection::OnClose(CloseCallback callback) { close_callback_ = std::move(callback); }
+void WebSocketConnection::OnPing(PingCallback callback) { ping_callback_ = std::move(callback); }
+void WebSocketConnection::OnError(ErrorCallback callback) { error_callback_ = std::move(callback); }
 
 void WebSocketConnection::SendText(const std::string& message) {
     if (close_sent_ || !is_open_) return;  // No data frames after close
@@ -15,7 +15,7 @@ void WebSocketConnection::SendText(const std::string& message) {
     // Validate outbound text to prevent emitting protocol-invalid frames
     // that would cause compliant clients to close with 1007.
     if (!IsValidUtf8(message)) {
-        if (error_handler_) error_handler_(*this, "Outbound text message is not valid UTF-8");
+        if (error_callback_) error_callback_(*this, "Outbound text message is not valid UTF-8");
         return;
     }
     SendFrame(WebSocketFrame::TextFrame(message));
@@ -62,8 +62,8 @@ void WebSocketConnection::NotifyTransportClose() {
     // Always report 1006 (Abnormal Closure) for transport-level disconnects.
     // Even if we sent a Close frame, the peer never completed the handshake
     // (no Close reply received), so RFC 6455 classifies this as abnormal.
-    if (close_handler_) {
-        close_handler_(*this, 1006, "Transport closed");
+    if (close_callback_) {
+        close_callback_(*this, 1006, "Transport closed");
     }
 }
 
@@ -79,8 +79,8 @@ void WebSocketConnection::OnRawData(const std::string& data) {
     }
 
     if (parser_.HasError() && is_open_ && !close_sent_) {
-        if (error_handler_) {
-            error_handler_(*this, parser_.GetError());
+        if (error_callback_) {
+            error_callback_(*this, parser_.GetError());
         }
         // Use the correct close code based on the error type
         std::string err_msg = parser_.GetError();
@@ -109,13 +109,16 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
     }
 
     switch (frame.opcode) {
+        // Text and Binary share the same processing logic: both are data frames
+        // subject to the same fragmentation, reassembly, and delivery rules.
+        // The only difference is the is_binary flag passed to the message callback.
         case WebSocketOpcode::Text:
         case WebSocketOpcode::Binary: {
             // IMPORTANT: Receiving a new Text/Binary frame while in_fragment_ is true
             // is a protocol error per RFC 6455 -- send Close(1002) and return
             if (in_fragment_) {
-                if (error_handler_) {
-                    error_handler_(*this, "New data frame received during fragmented message");
+                if (error_callback_) {
+                    error_callback_(*this, "New data frame received during fragmented message");
                 }
                 SendClose(1002, "Protocol error: interleaved data frames");
                 return;
@@ -125,18 +128,18 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 // Complete single-frame message
                 // RFC 6455 §5.6: text frames must contain valid UTF-8
                 if (frame.opcode == WebSocketOpcode::Text && !IsValidUtf8(frame.payload)) {
-                    if (error_handler_) error_handler_(*this, "Invalid UTF-8 in text message");
+                    if (error_callback_) error_callback_(*this, "Invalid UTF-8 in text message");
                     SendClose(1007, "Invalid UTF-8");
                     return;
                 }
-                if (message_handler_) {
-                    message_handler_(*this, frame.payload,
+                if (message_callback_) {
+                    message_callback_(*this, frame.payload,
                                      frame.opcode == WebSocketOpcode::Binary);
                 }
             } else {
                 // First fragment
                 if (max_message_size_ > 0 && frame.payload.size() > max_message_size_) {
-                    if (error_handler_) error_handler_(*this, "Message exceeds maximum size");
+                    if (error_callback_) error_callback_(*this, "Message exceeds maximum size");
                     SendClose(1009, "Message too big");
                     in_fragment_ = false;
                     fragment_buffer_.clear();
@@ -151,14 +154,14 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
 
         case WebSocketOpcode::Continuation: {
             if (!in_fragment_) {
-                if (error_handler_) error_handler_(*this, "Unexpected continuation frame");
+                if (error_callback_) error_callback_(*this, "Unexpected continuation frame");
                 SendClose(1002, "Protocol error: unexpected continuation");
                 return;
             }
             if (max_message_size_ > 0 &&
                 (fragment_buffer_.size() >= max_message_size_ ||
                  frame.payload.size() > max_message_size_ - fragment_buffer_.size())) {
-                if (error_handler_) error_handler_(*this, "Message exceeds maximum size");
+                if (error_callback_) error_callback_(*this, "Message exceeds maximum size");
                 SendClose(1009, "Message too big");
                 in_fragment_ = false;
                 fragment_buffer_.clear();
@@ -168,14 +171,14 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             if (frame.fin) {
                 // RFC 6455 §5.6: validate reassembled text messages
                 if (fragment_opcode_ == WebSocketOpcode::Text && !IsValidUtf8(fragment_buffer_)) {
-                    if (error_handler_) error_handler_(*this, "Invalid UTF-8 in text message");
+                    if (error_callback_) error_callback_(*this, "Invalid UTF-8 in text message");
                     SendClose(1007, "Invalid UTF-8");
                     in_fragment_ = false;
                     fragment_buffer_.clear();
                     return;
                 }
-                if (message_handler_) {
-                    message_handler_(*this, fragment_buffer_,
+                if (message_callback_) {
+                    message_callback_(*this, fragment_buffer_,
                                      fragment_opcode_ == WebSocketOpcode::Binary);
                 }
                 in_fragment_ = false;
@@ -187,7 +190,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
         case WebSocketOpcode::Close: {
             // RFC 6455 §7.1.5: close body must be 0 bytes or >= 2 bytes
             if (frame.payload.size() == 1) {
-                if (error_handler_) error_handler_(*this, "Invalid close frame: 1-byte payload");
+                if (error_callback_) error_callback_(*this, "Invalid close frame: 1-byte payload");
                 // Set is_open_ = false BEFORE SendClose so that if the send
                 // fails synchronously (→ CallCloseCb → NotifyTransportClose),
                 // the transport-close path sees is_open_ == false and skips,
@@ -198,7 +201,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 // complete once we send ours. Close the transport immediately
                 // instead of waiting 5s for a reply that won't come.
                 if (conn_) conn_->CloseAfterWrite();
-                if (close_handler_) close_handler_(*this, 1002, "Protocol error");
+                if (close_callback_) close_callback_(*this, 1002, "Protocol error");
                 return;
             }
             // If payload is empty, echo an empty close frame (no code/reason)
@@ -213,7 +216,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                     close_sent_ = true;
                 }
                 if (conn_) conn_->CloseAfterWrite();
-                if (close_handler_) close_handler_(*this, 1005, "");  // 1005 = no status received
+                if (close_callback_) close_callback_(*this, 1005, "");  // 1005 = no status received
                 break;
             }
 
@@ -228,23 +231,16 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             }
             // RFC 6455 §7.1.6: close reason must be valid UTF-8
             if (!reason.empty() && !IsValidUtf8(reason)) {
-                if (error_handler_) error_handler_(*this, "Close reason is not valid UTF-8");
+                if (error_callback_) error_callback_(*this, "Close reason is not valid UTF-8");
                 is_open_ = false;
                 SendClose(1007, "Invalid UTF-8 in close reason");
                 // The peer already sent their Close frame — handshake complete.
                 // Close transport immediately instead of waiting 5s.
                 if (conn_) conn_->CloseAfterWrite();
-                if (close_handler_) close_handler_(*this, 1007, "Invalid UTF-8 in close reason");
+                if (close_callback_) close_callback_(*this, 1007, "Invalid UTF-8 in close reason");
                 return;
             }
-            // Validate close code per RFC 6455 Section 7.4 + IANA registry.
-            // Valid ranges: 1000-1003, 1007-1009 (both), 1010 (client-only),
-            //   1011-1014 (server), 3000-4999 (private use).
-            // Codes 1004-1006, 1015 are reserved and must not appear on the wire.
-            bool valid_code = (code >= 1000 && code <= 1003) ||
-                              (code >= 1007 && code <= 1014) ||
-                              (code >= 3000 && code <= 4999);
-            if (!valid_code && frame.payload.size() >= 2) {
+            if (!WebSocketFrame::IsValidCloseCode(code) && frame.payload.size() >= 2) {
                 // Invalid code on wire — protocol error, close with 1002
                 code = 1002;
                 reason = "Invalid close code";
@@ -268,8 +264,8 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             if (conn_) {
                 conn_->CloseAfterWrite();
             }
-            if (close_handler_) {
-                close_handler_(*this, code, reason);
+            if (close_callback_) {
+                close_callback_(*this, code, reason);
             }
             break;
         }
@@ -277,8 +273,8 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
         case WebSocketOpcode::Ping: {
             // Auto-respond with pong
             SendPong(frame.payload);
-            if (ping_handler_) {
-                ping_handler_(*this, frame.payload);
+            if (ping_callback_) {
+                ping_callback_(*this, frame.payload);
             }
             break;
         }
@@ -289,8 +285,8 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
         }
 
         default: {
-            if (error_handler_) {
-                error_handler_(*this, "Unknown opcode");
+            if (error_callback_) {
+                error_callback_(*this, "Unknown opcode");
             }
             break;
         }

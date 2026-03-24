@@ -26,18 +26,7 @@ Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _
 }
 
 Acceptor::~Acceptor() {
-    // Close the channel first (removes from epoll + closes fd),
-    // then release fd from SocketHandler to prevent double-close.
-    if (acceptor_channel_ && !acceptor_channel_->is_channel_closed()) {
-        acceptor_channel_->CloseChannel();
-    }
-    if (servsock_) {
-        servsock_->ReleaseFd();
-    }
-    if (idle_fd_ >= 0) {
-        ::close(idle_fd_);
-        idle_fd_ = -1;
-    }
+    CloseListenSocket();
 }
 
 void Acceptor::CloseListenSocket() {
@@ -72,15 +61,13 @@ void Acceptor::NewConnection(){
     while(true){
         InetAddr client_addr;
         int client_fd = servsock_ -> Accept(client_addr);
-        if(client_fd == -1){
-            // Queue drained (EAGAIN) — exit loop
+        if(client_fd == SocketHandler::ACCEPT_QUEUE_DRAINED){
             return;
         }
-        if(client_fd == -2){
-            // ECONNABORTED — one connection failed, keep draining queue
+        if(client_fd == SocketHandler::ACCEPT_CONN_ABORTED){
             continue;
         }
-        if(client_fd == -3){
+        if(client_fd == SocketHandler::ACCEPT_FD_EXHAUSTION){
             // FD exhaustion (EMFILE/ENFILE).
             // Use the "idle fd trick": close a reserved fd to make room for
             // one accept, immediately close the accepted connection (we can't
@@ -103,7 +90,7 @@ void Acceptor::NewConnection(){
             // Continue loop to drain more or reach EAGAIN
             continue;
         }
-        if(client_fd == -4){
+        if(client_fd == SocketHandler::ACCEPT_MEMORY_PRESSURE){
             // Memory/buffer pressure (ENOBUFS/ENOMEM).
             // The idle fd trick doesn't help — closing fds frees fd slots, not memory.
             // Can't drain the queue (accept keeps failing), can't spin (starvation).

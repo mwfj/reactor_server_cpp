@@ -2,11 +2,7 @@
 
 #include "http/http_request.h"
 #include "http/http_response.h"
-
-#include <string>
-#include <vector>
-#include <functional>
-#include <memory>
+// <string>, <vector>, <functional>, <memory> provided by common.h (via http_request.h)
 
 // Forward declaration
 class HttpConnectionHandler;

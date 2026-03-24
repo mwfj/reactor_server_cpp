@@ -63,22 +63,18 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
     if(clientfd == -1){
         // Don't close listening socket on accept error
         if(errno == EAGAIN || errno == EWOULDBLOCK) {
-            // Queue drained — no more pending connections
-            return -1;
+            return ACCEPT_QUEUE_DRAINED;
         }
-        // ECONNABORTED: one connection failed, but more may be queued — keep draining
         if(errno == ECONNABORTED) {
-            return -2;  // Continue accept loop
+            return ACCEPT_CONN_ABORTED;
         }
-        // FD exhaustion: the idle fd trick can recover by freeing one slot
         if(errno == EMFILE || errno == ENFILE) {
             std::cerr << "[Socket Handler] Accept failed (fd exhaustion): " << strerror(errno) << std::endl;
-            return -3;  // Recoverable via idle fd trick
+            return ACCEPT_FD_EXHAUSTION;
         }
-        // Memory/buffer pressure: closing fds doesn't help, must back off
         if(errno == ENOBUFS || errno == ENOMEM) {
             std::cerr << "[Socket Handler] Accept failed (memory pressure): " << strerror(errno) << std::endl;
-            return -4;  // Not recoverable via idle fd trick — return to event loop
+            return ACCEPT_MEMORY_PRESSURE;
         }
         std::cout << "[Socket Handler] Error occurred when accepting connection: " << strerror(errno) << std::endl;
         throw std::runtime_error(std::string("Error accepting connection: ") + strerror(errno));

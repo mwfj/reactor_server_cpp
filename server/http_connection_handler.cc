@@ -5,20 +5,20 @@
 HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn)
     : conn_(std::move(conn)) {}
 
-void HttpConnectionHandler::SetRequestHandler(RequestHandler handler) {
-    request_handler_ = std::move(handler);
+void HttpConnectionHandler::SetRequestCallback(RequestCallback callback) {
+    request_callback_ = std::move(callback);
 }
 
-void HttpConnectionHandler::SetRouteChecker(RouteChecker checker) {
-    route_checker_ = std::move(checker);
+void HttpConnectionHandler::SetRouteCheckCallback(RouteCheckCallback callback) {
+    route_check_callback_ = std::move(callback);
 }
 
-void HttpConnectionHandler::SetMiddlewareRunner(MiddlewareRunner runner) {
-    middleware_runner_ = std::move(runner);
+void HttpConnectionHandler::SetMiddlewareCallback(MiddlewareCallback callback) {
+    middleware_callback_ = std::move(callback);
 }
 
-void HttpConnectionHandler::SetUpgradeHandler(UpgradeHandler handler) {
-    upgrade_handler_ = std::move(handler);
+void HttpConnectionHandler::SetUpgradeCallback(UpgradeCallback callback) {
+    upgrade_callback_ = std::move(callback);
 }
 
 void HttpConnectionHandler::SetMaxBodySize(size_t max) {
@@ -208,14 +208,14 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             }
 
             // Check for WebSocket upgrade
-            if (req.upgrade && route_checker_) {
+            if (req.upgrade && route_check_callback_) {
                 try {
                 // Run middleware before upgrade (auth, CORS, rate limiting, etc.)
                 // Hoist mw_response so successful middleware headers can be merged
                 // into the 101 response (e.g., Set-Cookie, auth tokens).
                 HttpResponse mw_response;
-                if (middleware_runner_) {
-                    if (!middleware_runner_(req, mw_response)) {
+                if (middleware_callback_) {
+                    if (!middleware_callback_(req, mw_response)) {
                         // Middleware rejected — default to 403 if nothing was set.
                         // Only apply when the response is completely untouched
                         // (default status + no body + no headers). This allows
@@ -253,7 +253,7 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 }
 
                 // Check route existence BEFORE sending 101
-                if (!route_checker_(req.path)) {
+                if (!route_check_callback_(req.path)) {
                     auto not_found = HttpResponse::NotFound();
                     not_found.Header("Connection", "close");
                     SendResponse(not_found);
@@ -319,8 +319,8 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 }
 
                 // Wire WS callbacks (called exactly once, ws_conn_ guaranteed to exist)
-                if (upgrade_handler_) {
-                    upgrade_handler_(shared_from_this(), req);
+                if (upgrade_callback_) {
+                    upgrade_callback_(shared_from_this(), req);
                 }
 
                 // Forward any trailing bytes after the HTTP headers as WebSocket data
@@ -357,10 +357,10 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             }
 
             // Normal HTTP request -- dispatch to handler
-            if (request_handler_) {
+            if (request_callback_) {
                 HttpResponse response;
                 try {
-                    request_handler_(shared_from_this(), req, response);
+                    request_callback_(shared_from_this(), req, response);
                 } catch (const std::exception& e) {
                     // Log the exception server-side; never send e.what() to the
                     // client — it can contain stack traces, file paths, DB strings.

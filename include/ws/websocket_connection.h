@@ -4,24 +4,22 @@
 #include "ws/websocket_frame.h"
 #include "connection_handler.h"
 
-#include <memory>
-#include <functional>
-#include <string>
+// <memory>, <functional>, <string> provided by common.h (via connection_handler.h)
 
 class WebSocketConnection {
 public:
     explicit WebSocketConnection(std::shared_ptr<ConnectionHandler> conn);
 
     // Message-level callbacks
-    using MessageHandler = std::function<void(WebSocketConnection& ws, const std::string& message, bool is_binary)>;
-    using CloseHandler = std::function<void(WebSocketConnection& ws, uint16_t code, const std::string& reason)>;
-    using PingHandler = std::function<void(WebSocketConnection& ws, const std::string& payload)>;
-    using ErrorHandler = std::function<void(WebSocketConnection& ws, const std::string& error)>;
+    using MessageCallback = std::function<void(WebSocketConnection& ws, const std::string& message, bool is_binary)>;
+    using CloseCallback = std::function<void(WebSocketConnection& ws, uint16_t code, const std::string& reason)>;
+    using PingCallback = std::function<void(WebSocketConnection& ws, const std::string& payload)>;
+    using ErrorCallback = std::function<void(WebSocketConnection& ws, const std::string& error)>;
 
-    void OnMessage(MessageHandler handler);
-    void OnClose(CloseHandler handler);
-    void OnPing(PingHandler handler);
-    void OnError(ErrorHandler handler);
+    void OnMessage(MessageCallback callback);
+    void OnClose(CloseCallback callback);
+    void OnPing(PingCallback callback);
+    void OnError(ErrorCallback callback);
 
     // Send operations
     void SendText(const std::string& message);
@@ -55,10 +53,10 @@ private:
     uint16_t sent_close_code_ = 0;     // Close code we sent (for NotifyTransportClose)
     std::string sent_close_reason_;    // Close reason we sent
 
-    MessageHandler message_handler_;
-    CloseHandler close_handler_;
-    PingHandler ping_handler_;
-    ErrorHandler error_handler_;
+    MessageCallback message_callback_;
+    CloseCallback close_callback_;
+    PingCallback ping_callback_;
+    ErrorCallback error_callback_;
 
     // Fragmentation reassembly
     std::string fragment_buffer_;

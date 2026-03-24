@@ -1,7 +1,7 @@
 #pragma once
 
+#include "common.h"
 #include <openssl/ssl.h>
-#include <string>
 
 class TlsContext {
 public:

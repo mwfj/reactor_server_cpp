@@ -51,15 +51,7 @@ WebSocketFrame WebSocketFrame::CloseFrame(uint16_t code, const std::string& reas
     WebSocketFrame f;
     f.opcode = WebSocketOpcode::Close;
 
-    // RFC 6455 §7.4: only specific codes may appear on the wire.
-    // Valid for server: 1000-1003, 1007-1009, 1011-1014 (IANA), 3000-4999 (private use).
-    // 1010 is client-only ("Missing Extension" — RFC 6455 §7.4.1).
-    // Invalid: 1004-1006, 1010, 1015, 1016-2999, >4999 — replace with 1000.
-    bool valid_code = (code >= 1000 && code <= 1003) ||
-                      (code >= 1007 && code <= 1009) ||
-                      (code >= 1011 && code <= 1014) ||
-                      (code >= 3000 && code <= 4999);
-    if (!valid_code) {
+    if (!IsValidServerCloseCode(code)) {
         code = 1000;
     }
 
@@ -123,4 +115,23 @@ WebSocketFrame WebSocketFrame::PongFrame(const std::string& payload) {
     f.payload = payload.size() > 125 ? payload.substr(0, 125) : payload;
     f.payload_length = f.payload.size();
     return f;
+}
+
+bool WebSocketFrame::IsValidCloseCode(uint16_t code) {
+    // RFC 6455 §7.4: codes that may appear on the wire (both directions).
+    // 1000-1003: defined by RFC, usable by both endpoints
+    // 1007-1014: IANA registered (includes 1010 client-only, valid to receive)
+    // 3000-4999: private use
+    return (code >= 1000 && code <= 1003) ||
+           (code >= 1007 && code <= 1014) ||
+           (code >= 3000 && code <= 4999);
+}
+
+bool WebSocketFrame::IsValidServerCloseCode(uint16_t code) {
+    // Same as IsValidCloseCode but excludes 1010 ("Missing Extension"),
+    // which is designated client-only per RFC 6455 §7.4.1.
+    return (code >= 1000 && code <= 1003) ||
+           (code >= 1007 && code <= 1009) ||
+           (code >= 1011 && code <= 1014) ||
+           (code >= 3000 && code <= 4999);
 }

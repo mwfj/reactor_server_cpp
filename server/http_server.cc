@@ -187,7 +187,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetRequestTimeout(request_timeout_sec_);
 
     // Set request handler: dispatch through router
-    http_conn->SetRequestHandler(
+    http_conn->SetRequestCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
                const HttpRequest& request,
                HttpResponse& response) {
@@ -200,21 +200,21 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     );
 
     // Middleware runner for WebSocket upgrades (auth, CORS, rate limiting)
-    http_conn->SetMiddlewareRunner(
+    http_conn->SetMiddlewareCallback(
         [this](const HttpRequest& request, HttpResponse& response) -> bool {
             return router_.RunMiddleware(request, response);
         }
     );
 
     // Route checker: determines if a WebSocket route exists (called before 101)
-    http_conn->SetRouteChecker(
+    http_conn->SetRouteCheckCallback(
         [this](const std::string& path) -> bool {
             return router_.HasWebSocketRoute(path);
         }
     );
 
     // Upgrade handler: wires WS callbacks (called exactly once, after ws_conn_ created)
-    http_conn->SetUpgradeHandler(
+    http_conn->SetUpgradeCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
                const HttpRequest& request) {
             auto ws_handler = router_.GetWebSocketHandler(request.path);

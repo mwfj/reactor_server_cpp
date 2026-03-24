@@ -1,8 +1,6 @@
 #pragma once
 
-#include <string>
-#include <vector>
-#include <utility>
+#include "common.h"
 
 class HttpResponse {
 public:

@@ -1,14 +1,18 @@
 #pragma once
 
 // Common C++ headers (available on all platforms)
+#include <cstdint>
 #include <cstring>
 #include <string.h>
 #include <stdexcept>
 #include <iostream>
+#include <algorithm>
+#include <utility>
 #include <chrono>
 #include <thread>
 #include <mutex>
 #include <vector>
+#include <deque>
 #include <memory>
 #include <functional>
 #include <map>

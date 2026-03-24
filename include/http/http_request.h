@@ -1,8 +1,6 @@
 #pragma once
 
-#include <string>
-#include <map>
-#include <algorithm>
+#include "common.h"
 
 struct HttpRequest {
     std::string method;           // "GET", "POST", "PUT", "DELETE", etc.

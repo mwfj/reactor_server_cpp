@@ -7,39 +7,37 @@
 #include "ws/websocket_handshake.h"
 #include "connection_handler.h"
 
-#include <memory>
-#include <functional>
-#include <chrono>
+// <memory>, <functional>, <chrono> provided by common.h (via connection_handler.h)
 
 class HttpConnectionHandler : public std::enable_shared_from_this<HttpConnectionHandler> {
 public:
     explicit HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn);
 
     // Handler for complete HTTP requests
-    using RequestHandler = std::function<void(
+    using RequestCallback = std::function<void(
         std::shared_ptr<HttpConnectionHandler> self,
         const HttpRequest& request,
         HttpResponse& response
     )>;
-    void SetRequestHandler(RequestHandler handler);
+    void SetRequestCallback(RequestCallback callback);
 
     // Check if a WebSocket route exists for the given path.
     // Returns true if upgrade should proceed, false to reject.
-    using RouteChecker = std::function<bool(const std::string& path)>;
-    void SetRouteChecker(RouteChecker checker);
+    using RouteCheckCallback = std::function<bool(const std::string& path)>;
+    void SetRouteCheckCallback(RouteCheckCallback callback);
 
     // Run middleware chain before WebSocket upgrade.
     // Returns true if all middleware passed, false if any short-circuited (response is set).
-    using MiddlewareRunner = std::function<bool(const HttpRequest& request, HttpResponse& response)>;
-    void SetMiddlewareRunner(MiddlewareRunner runner);
+    using MiddlewareCallback = std::function<bool(const HttpRequest& request, HttpResponse& response)>;
+    void SetMiddlewareCallback(MiddlewareCallback callback);
 
     // Handler called ONCE after WebSocket upgrade is complete and ws_conn_ exists.
     // Wires application-level OnMessage/OnClose callbacks on the WebSocketConnection.
-    using UpgradeHandler = std::function<void(
+    using UpgradeCallback = std::function<void(
         std::shared_ptr<HttpConnectionHandler> self,
         const HttpRequest& request
     )>;
-    void SetUpgradeHandler(UpgradeHandler handler);
+    void SetUpgradeCallback(UpgradeCallback callback);
 
     // Send an HTTP response
     void SendResponse(const HttpResponse& response);
@@ -87,10 +85,10 @@ private:
     void CloseConnection();
     std::shared_ptr<ConnectionHandler> conn_;
     HttpParser parser_;
-    RequestHandler request_handler_;
-    RouteChecker route_checker_;
-    MiddlewareRunner middleware_runner_;
-    UpgradeHandler upgrade_handler_;
+    RequestCallback request_callback_;
+    RouteCheckCallback route_check_callback_;
+    MiddlewareCallback middleware_callback_;
+    UpgradeCallback upgrade_callback_;
     bool upgraded_ = false;
     std::unique_ptr<WebSocketConnection> ws_conn_;
 };

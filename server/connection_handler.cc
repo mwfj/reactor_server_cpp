@@ -52,13 +52,13 @@ void ConnectionHandler::OnMessage(){
     // TLS handshake phase
     if (tls_state_ == TlsState::HANDSHAKE) {
         int result = tls_->DoHandshake();
-        if (result == 0) {
+        if (result == TlsConnection::TLS_COMPLETE) {
             tls_state_ = TlsState::READY;
             // Handshake complete, fall through to read any buffered data
-        } else if (result == 1) {
+        } else if (result == TlsConnection::TLS_WANT_READ) {
             // Want read — already enabled
             return;
-        } else if (result == 2) {
+        } else if (result == TlsConnection::TLS_WANT_WRITE) {
             // Want write
             client_channel_->EnableWriteMode();
             return;
@@ -95,18 +95,18 @@ void ConnectionHandler::OnMessage(){
 
         if (tls_state_ == TlsState::READY) {
             nread = tls_->Read(buffer, sizeof buffer);
-            if (nread == 0) {
+            if (nread == TlsConnection::TLS_COMPLETE) {
                 // WANT_READ — wait for more data (already in read mode)
                 break;
             }
-            if (nread == -3) {
+            if (nread == TlsConnection::TLS_CROSS_RW) {
                 // WANT_WRITE — SSL needs write readiness to complete this read
                 // (renegotiation/key update). Set flag so CallWriteCb retries the read.
                 tls_read_wants_write_ = true;
                 client_channel_->EnableWriteMode();
                 break;
             }
-            if (nread == -2) {
+            if (nread == TlsConnection::TLS_PEER_CLOSED) {
                 // Peer closed TLS connection cleanly (close_notify).
                 // Break out of the read loop — dispatch any buffered data first,
                 // then the peer_closed flag will trigger CloseAfterWrite.
@@ -256,11 +256,12 @@ void ConnectionHandler::DoSend(const char *data, size_t size){
         if (tls_state_ == TlsState::READY) {
             size_t try_len = output_bf_.Size();
             written = tls_->Write(output_bf_.Data(), try_len);
-            if (written == 0) {
+            if (written == TlsConnection::TLS_COMPLETE) {
+                // WANT_WRITE — treat as EAGAIN for the send path
                 tls_pending_write_size_ = try_len;
-                written = -1;
+                written = TlsConnection::TLS_ERROR;
                 errno = EAGAIN;
-            } else if (written == -3) {
+            } else if (written == TlsConnection::TLS_CROSS_RW) {
                 tls_pending_write_size_ = try_len;
                 tls_write_wants_read_ = true;
                 client_channel_->EnableReadMode();
@@ -342,12 +343,12 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
         ssize_t written;
         if (tls_state_ == TlsState::READY) {
             written = tls_->Write(data, size);
-            if (written == 0) {
+            if (written == TlsConnection::TLS_COMPLETE) {
                 // WANT_WRITE — data will be buffered below, record size for retry
                 tls_pending_write_size_ = size;
-                written = -1;
+                written = TlsConnection::TLS_ERROR;
                 errno = EAGAIN;
-            } else if (written == -3) {
+            } else if (written == TlsConnection::TLS_CROSS_RW) {
                 tls_pending_write_size_ = size;
                 tls_write_wants_read_ = true;
                 client_channel_->EnableReadMode();
@@ -562,7 +563,7 @@ void ConnectionHandler::CallWriteCb(){
     // TLS handshake WANT_WRITE handling
     if (tls_state_ == TlsState::HANDSHAKE) {
         int result = tls_->DoHandshake();
-        if (result == 0) {
+        if (result == TlsConnection::TLS_COMPLETE) {
             tls_state_ = TlsState::READY;
             // Handshake complete — OpenSSL may have buffered application data.
             OnMessage();
@@ -571,11 +572,11 @@ void ConnectionHandler::CallWriteCb(){
                 return;
             }
             // Fall through to normal write logic to flush any pending output buffer
-        } else if (result == 1) {
+        } else if (result == TlsConnection::TLS_WANT_READ) {
             client_channel_->DisableWriteMode();
             // Want read — read mode already enabled
             return;
-        } else if (result == 2) {
+        } else if (result == TlsConnection::TLS_WANT_WRITE) {
             // Want write again, will get another EPOLLOUT
             return;
         } else {
@@ -602,11 +603,11 @@ void ConnectionHandler::CallWriteCb(){
         // Use pending size for retry, or full buffer for new write
         size_t write_len = tls_pending_write_size_ > 0 ? tls_pending_write_size_ : output_bf_.Size();
         write_sz = tls_->Write(output_bf_.Data(), write_len);
-        if (write_sz == 0) {
+        if (write_sz == TlsConnection::TLS_COMPLETE) {
             tls_pending_write_size_ = write_len;  // Track for retry
             return;  // WANT_WRITE — try again on next EPOLLOUT
         }
-        if (write_sz == -3) {
+        if (write_sz == TlsConnection::TLS_CROSS_RW) {
             tls_pending_write_size_ = write_len;  // Track for retry
             tls_write_wants_read_ = true;
             client_channel_->EnableReadMode();

@@ -1,7 +1,6 @@
 #pragma once
 
-#include <string>
-#include <cstdint>
+#include "common.h"
 
 enum class WebSocketOpcode : uint8_t {
     Continuation = 0x0,
@@ -29,4 +28,11 @@ struct WebSocketFrame {
     static WebSocketFrame CloseFrame(uint16_t code = 1000, const std::string& reason = "");
     static WebSocketFrame PingFrame(const std::string& payload = "");
     static WebSocketFrame PongFrame(const std::string& payload = "");
+
+    // RFC 6455 §7.4 close code validation.
+    // Checks whether a close code may appear on the wire.
+    // For incoming frames: accepts 1000-1003, 1007-1014, 3000-4999.
+    // For outgoing (server-sent) frames: same but excludes 1010 (client-only).
+    static bool IsValidCloseCode(uint16_t code);
+    static bool IsValidServerCloseCode(uint16_t code);
 };
