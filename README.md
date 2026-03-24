@@ -1,4 +1,4 @@
-# Reactor Server
+# Reactor pattern based HTTP/Websocket Server
 
 A high-performance C++ network server built on the Reactor pattern with epoll/kqueue I/O multiplexing. Supports HTTP/1.1, WebSocket (RFC 6455), and TLS — all layered on top of a non-blocking, edge-triggered event loop designed for thousands of concurrent connections.
 
