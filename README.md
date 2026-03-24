@@ -71,7 +71,7 @@ server.WebSocket("/ws", [](WebSocketConnection& ws) {
 
 ```cpp
 ServerConfig config;
-config.bind_ip = "0.0.0.0";
+config.bind_host = "0.0.0.0";
 config.bind_port = 443;
 config.tls.enabled = true;
 config.tls.cert_file = "/etc/ssl/server.pem";
@@ -88,7 +88,7 @@ JSON config file or environment variables:
 
 ```json
 {
-    "bind_ip": "0.0.0.0",
+    "bind_host": "0.0.0.0",
     "bind_port": 8080,
     "max_connections": 10000,
     "max_body_size": 1048576,
@@ -103,7 +103,7 @@ JSON config file or environment variables:
 }
 ```
 
-Environment overrides: `REACTOR_BIND_IP`, `REACTOR_BIND_PORT`, `REACTOR_TLS_ENABLED`, etc.
+Environment overrides: `REACTOR_BIND_HOST`, `REACTOR_BIND_PORT`, `REACTOR_TLS_ENABLED`, etc.
 
 ### Raw TCP (Legacy)
 

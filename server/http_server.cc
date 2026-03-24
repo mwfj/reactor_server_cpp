@@ -15,6 +15,21 @@ void HttpServer::WireNetServerCallbacks() {
         [this](std::shared_ptr<ConnectionHandler> conn, std::string& msg) { HandleMessage(conn, msg); });
 }
 
+// Validate host is a numeric IPv4 address — inet_addr() silently returns
+// INADDR_NONE for hostnames like "localhost" or IPv6 literals, causing
+// a confusing bind failure much later.
+static const std::string& ValidateHost(const std::string& host) {
+    if (host.empty()) {
+        throw std::invalid_argument("bind host must not be empty");
+    }
+    if (inet_addr(host.c_str()) == INADDR_NONE && host != "255.255.255.255") {
+        throw std::invalid_argument(
+            "Invalid bind host: '" + host +
+            "' (must be a numeric IPv4 address, e.g. '0.0.0.0' or '127.0.0.1')");
+    }
+    return host;
+}
+
 // Validate port before member construction — must run in the initializer
 // list, before net_server_ tries to bind/listen on the (possibly invalid) port.
 static size_t ValidatePort(int port) {
@@ -26,9 +41,10 @@ static size_t ValidatePort(int port) {
 }
 
 HttpServer::HttpServer(const std::string& ip, int port)
-    : net_server_(ip, ValidatePort(port),
+    : net_server_(ValidateHost(ip), ValidatePort(port),
                   10,                          // scan interval: 30s default timeout / 3
-                  std::chrono::seconds(300))   // default idle timeout
+                  std::chrono::seconds(300),   // default idle timeout
+                  ServerConfig{}.worker_threads)
 {
     WireNetServerCallbacks();
     // Apply the same defaults as the config constructor — must match ServerConfig defaults.
