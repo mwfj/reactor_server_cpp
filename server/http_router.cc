@@ -53,10 +53,15 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     }
 
     // HEAD fallback: if no explicit HEAD handler, try GET (RFC 7231 §4.3.2)
+    // Clone the request with method = "GET" so handlers that branch on
+    // req.method see "GET" and behave correctly (body stripping happens later
+    // in HttpConnectionHandler).
     if (request.method == "HEAD") {
         for (const auto& route : routes_) {
             if (route.path == request.path && route.method == "GET") {
-                route.handler(request, response);
+                HttpRequest get_req = request;
+                get_req.method = "GET";
+                route.handler(get_req, response);
                 return true;
             }
         }

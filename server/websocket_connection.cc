@@ -51,10 +51,14 @@ void WebSocketConnection::SendClose(uint16_t code, const std::string& reason) {
 }
 
 void WebSocketConnection::SendPing(const std::string& payload) {
+    std::lock_guard<std::recursive_mutex> lck(send_mtx_);
+    if (close_sent_ || !is_open_) return;
     SendFrame(WebSocketFrame::PingFrame(payload));
 }
 
 void WebSocketConnection::SendPong(const std::string& payload) {
+    std::lock_guard<std::recursive_mutex> lck(send_mtx_);
+    if (close_sent_ || !is_open_) return;
     SendFrame(WebSocketFrame::PongFrame(payload));
 }
 
@@ -279,7 +283,11 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
 
         case WebSocketOpcode::Ping: {
             // Auto-respond with pong
-            SendPong(frame.payload);
+            // RFC 6455 §5.5.3: MUST respond to Ping even during close handshake.
+            // Call SendFrame directly instead of SendPong() — the public API
+            // no-ops after close_sent_, but the RFC requires auto-pong until
+            // the Close frame is received.
+            SendFrame(WebSocketFrame::PongFrame(frame.payload));
             if (ping_callback_) {
                 ping_callback_(*this, frame.payload);
             }
