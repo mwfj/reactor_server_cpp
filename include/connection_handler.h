@@ -56,7 +56,9 @@ private:
 public:
     ConnectionHandler() = delete;
     ConnectionHandler(std::shared_ptr<Dispatcher>, std::unique_ptr<SocketHandler>);
-    ~ConnectionHandler() = default; // no need the release resource for smart pointer
+    // Out-of-line: unique_ptr<TlsConnection> needs complete type for destruction.
+    // TlsConnection is forward-declared here; the full definition is in connection_handler.cc.
+    ~ConnectionHandler();
 
     // Two-phase initialization: must be called after object is wrapped in shared_ptr
     void RegisterCallbacks();

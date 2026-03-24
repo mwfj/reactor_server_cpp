@@ -31,10 +31,13 @@ void WebSocketConnection::SendBinary(const std::string& data) {
 void WebSocketConnection::SendClose(uint16_t code, const std::string& reason) {
     std::lock_guard<std::recursive_mutex> lck(send_mtx_);
     if (close_sent_) return;  // Already sent a close frame
-    SendFrame(WebSocketFrame::CloseFrame(code, reason));
+    // Set close_sent_ BEFORE SendFrame: if the send fails synchronously
+    // (→ CallCloseCb → NotifyTransportClose → user close callback), a
+    // re-entrant SendClose() must see close_sent_ == true and return.
     close_sent_ = true;
     sent_close_code_ = code;
     sent_close_reason_ = reason;
+    SendFrame(WebSocketFrame::CloseFrame(code, reason));
     // Keep is_open_ true so OnRawData can receive the peer's Close reply.
     // Arm a deadline — if the peer doesn't reply within this window, the
     // timer scanner will force-close. Do NOT call CloseAfterWrite here:

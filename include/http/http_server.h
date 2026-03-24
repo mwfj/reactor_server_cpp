@@ -55,7 +55,7 @@ private:
     // Compute the pre-read input buffer cap from configured limits.
     size_t ComputeInputCap() const;
 
-    std::unique_ptr<TlsContext> tls_ctx_;
+    std::shared_ptr<TlsContext> tls_ctx_;  // Shared with NetServer for safe lifetime
 
     // Request limits — defaults match ServerConfig defaults.
     // The ip/port constructor uses these; the config constructor overwrites them.

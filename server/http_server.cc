@@ -109,7 +109,7 @@ HttpServer::HttpServer(const ServerConfig& config)
     net_server_.SetMaxInputSize(ComputeInputCap());
 
     if (config.tls.enabled) {
-        tls_ctx_ = std::make_unique<TlsContext>(config.tls.cert_file, config.tls.key_file);
+        tls_ctx_ = std::make_shared<TlsContext>(config.tls.cert_file, config.tls.key_file);
         if (config.tls.min_version == "1.2") {
             // Default — already set in TlsContext constructor
         } else if (config.tls.min_version == "1.3") {
@@ -119,7 +119,7 @@ HttpServer::HttpServer(const ServerConfig& config)
                 "Unsupported tls.min_version: '" + config.tls.min_version +
                 "' (must be '1.2' or '1.3')");
         }
-        net_server_.SetTlsContext(tls_ctx_.get());
+        net_server_.SetTlsContext(tls_ctx_);
     }
 }
 

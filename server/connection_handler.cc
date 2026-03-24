@@ -10,6 +10,10 @@ ConnectionHandler::ConnectionHandler(std::shared_ptr<Dispatcher> _dispatcher, st
     // Callbacks registered in RegisterCallbacks() after shared_ptr is created
 }
 
+// Out-of-line destructor: unique_ptr<TlsConnection> requires complete type.
+// TlsConnection is forward-declared in the header; full definition is available here.
+ConnectionHandler::~ConnectionHandler() = default;
+
 void ConnectionHandler::RegisterCallbacks(){
     // Use weak_ptr to avoid keeping ConnectionHandler alive via callbacks
     // This prevents use-after-free when server shuts down during callback execution

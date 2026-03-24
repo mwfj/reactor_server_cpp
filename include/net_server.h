@@ -53,7 +53,7 @@ private:
     int timer_interval_;  // How often to check for timeouts (seconds)
     std::chrono::seconds connection_timeout_;  // Connection idle timeout duration
 
-    TlsContext* tls_ctx_ = nullptr;  // Non-owning, owned by HttpServer
+    std::shared_ptr<TlsContext> tls_ctx_;  // Shared with HttpServer for safe lifetime
     int max_connections_ = 0;         // 0 = unlimited
     size_t max_input_size_ = 0;       // 0 = unlimited, set before RegisterCallbacks
 
@@ -85,7 +85,7 @@ public:
     void SetSendCompletionCb(CALLBACKS_NAMESPACE::NetSrvSendCompleteCallback);
     void SetTimerCb(CALLBACKS_NAMESPACE::NetSrvTimerCallback);
 
-    void SetTlsContext(TlsContext* ctx) { tls_ctx_ = ctx; }
+    void SetTlsContext(std::shared_ptr<TlsContext> ctx) { tls_ctx_ = std::move(ctx); }
     void SetMaxConnections(int max) { max_connections_ = max; }
     void SetMaxInputSize(size_t max) { max_input_size_ = max; }
 };

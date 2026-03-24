@@ -171,8 +171,11 @@ static int on_headers_complete(llhttp_t* parser) {
     // "GET http://example.com?x=1 HTTP/1.1"     → path="/",    query="x=1"
     // "GET http://example.com HTTP/1.1"          → path="/"
     std::string target = self->request_.url;
-    if (target.compare(0, 7, "http://") == 0 ||
-        target.compare(0, 8, "https://") == 0) {
+    // Case-insensitive scheme check (RFC 3986 §3.1: scheme is case-insensitive)
+    std::string scheme_check = target.substr(0, 8);
+    std::transform(scheme_check.begin(), scheme_check.end(), scheme_check.begin(), ::tolower);
+    if (scheme_check.compare(0, 7, "http://") == 0 ||
+        scheme_check.compare(0, 8, "https://") == 0) {
         auto scheme_end = target.find("://");
         auto authority_start = scheme_end + 3;
         auto path_pos = target.find('/', authority_start);
