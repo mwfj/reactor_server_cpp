@@ -188,19 +188,22 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             // RFC 6455 §7.1.5: close body must be 0 bytes or >= 2 bytes
             if (frame.payload.size() == 1) {
                 if (error_handler_) error_handler_(*this, "Invalid close frame: 1-byte payload");
+                // Set is_open_ = false BEFORE SendClose so that if the send
+                // fails synchronously (→ CallCloseCb → NotifyTransportClose),
+                // the transport-close path sees is_open_ == false and skips,
+                // preventing a duplicate close callback.
+                is_open_ = false;
                 SendClose(1002, "Protocol error");
                 // The peer already sent their Close frame — the handshake is
                 // complete once we send ours. Close the transport immediately
                 // instead of waiting 5s for a reply that won't come.
-                is_open_ = false;
                 if (conn_) conn_->CloseAfterWrite();
-                // Notify the app — is_open_ is already false so NotifyTransportClose
-                // will skip, making this the only close notification the app gets.
                 if (close_handler_) close_handler_(*this, 1002, "Protocol error");
                 return;
             }
             // If payload is empty, echo an empty close frame (no code/reason)
             if (frame.payload.empty()) {
+                is_open_ = false;
                 if (!close_sent_) {
                     // Send empty close frame to match
                     WebSocketFrame empty_close;
@@ -209,7 +212,6 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                     SendFrame(empty_close);
                     close_sent_ = true;
                 }
-                is_open_ = false;
                 if (conn_) conn_->CloseAfterWrite();
                 if (close_handler_) close_handler_(*this, 1005, "");  // 1005 = no status received
                 break;
@@ -227,13 +229,11 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             // RFC 6455 §7.1.6: close reason must be valid UTF-8
             if (!reason.empty() && !IsValidUtf8(reason)) {
                 if (error_handler_) error_handler_(*this, "Close reason is not valid UTF-8");
+                is_open_ = false;
                 SendClose(1007, "Invalid UTF-8 in close reason");
                 // The peer already sent their Close frame — handshake complete.
                 // Close transport immediately instead of waiting 5s.
-                is_open_ = false;
                 if (conn_) conn_->CloseAfterWrite();
-                // Notify the app — is_open_ is already false so NotifyTransportClose
-                // will skip, making this the only close notification the app gets.
                 if (close_handler_) close_handler_(*this, 1007, "Invalid UTF-8 in close reason");
                 return;
             }
@@ -249,6 +249,10 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 code = 1002;
                 reason = "Invalid close code";
             }
+            // Set is_open_ = false BEFORE sending the reply so that a
+            // synchronous send failure (→ NotifyTransportClose) is a no-op,
+            // preventing duplicate close callbacks.
+            is_open_ = false;
             // Echo close frame back if we haven't sent one yet (peer-initiated close).
             // If close_sent_ is already true, this is the peer's reply to our close.
             if (!close_sent_) {
@@ -258,7 +262,6 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 uint16_t echo_code = (code == 1010) ? 1000 : code;
                 SendClose(echo_code, reason);
             }
-            is_open_ = false;
             // Close the TCP transport — handshake is complete (both sides sent close).
             // This runs on the reactor thread (via OnRawData callback chain),
             // so CloseAfterWrite is safe to call inline.

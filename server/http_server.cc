@@ -142,17 +142,33 @@ void HttpServer::Start() {
 void HttpServer::Stop() {
     logging::Get()->info("HttpServer stopping");
 
-    // Send WebSocket 1001 Going Away close frames before tearing down transport.
-    // SendClose → SendFrame → SendRaw → EnQueue(DoSendRaw) on each dispatcher,
-    // which is processed before NetServer::Stop() stops the event loops.
+    // Collect WS connections while holding the lock, then send close frames
+    // AFTER releasing. Sending under the lock would deadlock: a failed inline
+    // write in DoSendRaw → CallCloseCb → HandleCloseConnection → conn_mtx_.
+    std::vector<std::pair<std::shared_ptr<HttpConnectionHandler>,
+                          std::shared_ptr<ConnectionHandler>>> ws_conns;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         for (auto& pair : http_connections_) {
             auto* ws = pair.second->GetWebSocket();
             if (ws && ws->IsOpen()) {
-                try { ws->SendClose(1001, "Going Away"); }
-                catch (...) {}
+                ws_conns.emplace_back(pair.second, pair.second->GetConnection());
             }
+        }
+    }
+    // Send 1001 Going Away close frames outside the lock.
+    for (auto& [http_conn, conn] : ws_conns) {
+        auto* ws = http_conn->GetWebSocket();
+        if (ws && ws->IsOpen()) {
+            try {
+                ws->SendClose(1001, "Going Away");
+                // During shutdown, close transport after the close frame drains.
+                // SendClose() normally avoids CloseAfterWrite to wait 5s for the
+                // peer's reply, but during shutdown that wait is unnecessary —
+                // the 1001 code in the frame tells the client why we're closing.
+                if (conn) conn->CloseAfterWrite();
+            }
+            catch (...) {}
         }
     }
 

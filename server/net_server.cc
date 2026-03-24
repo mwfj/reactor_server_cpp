@@ -110,7 +110,11 @@ void NetServer::Stop(){
         connections_.clear();
     }
     for (auto& conn : conns_to_close) {
-        conn->CloseAfterWrite();
+        // Skip connections already marked by a higher layer (e.g., HttpServer
+        // sent a WS close frame and called CloseAfterWrite on them).
+        if (!conn->IsCloseDeferred()) {
+            conn->CloseAfterWrite();
+        }
     }
     conns_to_close.clear();
 
