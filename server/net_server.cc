@@ -127,6 +127,12 @@ void NetServer::Stop(){
     // triggers one final WaitForEvent that includes the write-ready channels.
     for (auto& disp : socket_dispatchers_) {
         if (disp->was_stopped()) continue;
+        // Skip barrier for the current thread's dispatcher — if Stop() is called
+        // from a handler on this dispatcher, future.wait() would deadlock (the
+        // barrier task can only run on the thread that's blocked waiting for it).
+        // CloseAfterWrite for connections on this dispatcher already ran inline
+        // (SendRaw/CloseAfterWrite route inline when on the loop thread).
+        if (disp->is_on_loop_thread()) continue;
         auto barrier = std::make_shared<std::promise<void>>();
         auto future = barrier->get_future();
         disp->EnQueue([barrier]() { barrier->set_value(); });

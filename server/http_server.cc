@@ -242,6 +242,12 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
 }
 
 void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
+    // Guard: if the connection already closed (fast disconnect between
+    // RegisterCallbacks enabling epoll and new_conn_callback running here),
+    // skip entirely. Inserting a handler for a closed connection would leave
+    // stale state in http_connections_ (potentially under fd -1 after ReleaseFd).
+    if (conn->IsClosing()) return;
+
     std::shared_ptr<HttpConnectionHandler> old_handler;
     bool already_initialized = false;
     {
