@@ -1,14 +1,18 @@
 #pragma once
 
 // Common C++ headers (available on all platforms)
+#include <cstdint>
 #include <cstring>
 #include <string.h>
 #include <stdexcept>
 #include <iostream>
+#include <algorithm>
+#include <utility>
 #include <chrono>
 #include <thread>
 #include <mutex>
 #include <vector>
+#include <deque>
 #include <memory>
 #include <functional>
 #include <map>
@@ -57,6 +61,14 @@
 //     typedef int socklen_t;    
 #else
     #error "Unsupported platform"
+#endif
+
+// Platform-safe send flags to suppress SIGPIPE
+#if defined(__linux__)
+    #define SEND_FLAGS MSG_NOSIGNAL
+#else
+    // macOS: SO_NOSIGPIPE is set per-socket in SocketHandler::SetNonBlocking()
+    #define SEND_FLAGS 0
 #endif
 
 #define MAX_BUFFER_SIZE 1024

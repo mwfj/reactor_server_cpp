@@ -9,8 +9,10 @@
 
 # Compiler and flags
 CXX = g++
-CXXFLAGS = -std=c++11 -g -Wall -Iinclude -Ithread_pool/include -Iutil -Itest
-LDFLAGS = -lpthread
+CC = gcc
+CXXFLAGS = -std=c++17 -g -Wall -Iinclude -Ithread_pool/include -Iutil -Itest -Ithird_party
+CFLAGS = -g -Wall -Ithird_party/llhttp
+LDFLAGS = -lpthread -lssl -lcrypto
 
 # Directories
 SERVER_DIR = server
@@ -18,6 +20,7 @@ LIB_DIR = include
 TEST_DIR = test
 THREAD_POOL_DIR = thread_pool
 UTIL_DIR = util
+THIRD_PARTY_DIR = third_party
 
 # Target executable
 TARGET = run
@@ -35,14 +38,30 @@ SERVER_SRCS = $(SERVER_DIR)/net_server.cc $(SERVER_DIR)/buffer.cc
 # Thread pool sources
 THREAD_POOL_SRCS = $(THREAD_POOL_DIR)/src/threadpool.cc $(THREAD_POOL_DIR)/src/threadtask.cc
 
+# Foundation sources (logging, config)
+FOUNDATION_SRCS = $(SERVER_DIR)/logger.cc $(SERVER_DIR)/config_loader.cc
+
+# HTTP layer sources
+HTTP_SRCS = $(SERVER_DIR)/http_response.cc $(SERVER_DIR)/http_parser.cc $(SERVER_DIR)/http_router.cc $(SERVER_DIR)/http_connection_handler.cc $(SERVER_DIR)/http_server.cc
+
+# WebSocket layer sources
+WS_SRCS = $(SERVER_DIR)/websocket_frame.cc $(SERVER_DIR)/websocket_handshake.cc $(SERVER_DIR)/websocket_parser.cc $(SERVER_DIR)/websocket_connection.cc
+
+# TLS layer sources
+TLS_SRCS = $(SERVER_DIR)/tls_context.cc $(SERVER_DIR)/tls_connection.cc
+
 # Application code
 APP_SRCS = $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/run_test.cc
 
 # TimeStamp Code
 UTIL_SRCS = $(UTIL_DIR)/timestamp.cc
 
+# llhttp C sources
+LLHTTP_SRC = $(THIRD_PARTY_DIR)/llhttp/llhttp.c $(THIRD_PARTY_DIR)/llhttp/api.c $(THIRD_PARTY_DIR)/llhttp/http.c
+LLHTTP_OBJ = $(LLHTTP_SRC:.c=.o)
+
 # All sources combined
-SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(APP_SRCS) $(UTIL_SRCS)
+SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(FOUNDATION_SRCS) $(HTTP_SRCS) $(WS_SRCS) $(TLS_SRCS) $(APP_SRCS) $(UTIL_SRCS)
 
 # Header files (organized by category)
 CORE_HEADERS = $(LIB_DIR)/common.h $(LIB_DIR)/inet_addr.h
@@ -52,23 +71,28 @@ NETWORK_HEADERS = $(LIB_DIR)/socket_handler.h $(LIB_DIR)/acceptor.h $(LIB_DIR)/c
 SERVER_HEADERS = $(LIB_DIR)/net_server.h $(LIB_DIR)/buffer.h $(LIB_DIR)/reactor_server.h
 THREAD_POOL_HEADERS = $(THREAD_POOL_DIR)/include/threadpool.h $(THREAD_POOL_DIR)/include/threadtask.h
 UTIL_HEADERS = $(UTIL_DIR)/timestamp.h
-TEST_HEADERS = $(TEST_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h
+FOUNDATION_HEADERS = $(LIB_DIR)/log/logger.h $(LIB_DIR)/config/server_config.h $(LIB_DIR)/config/config_loader.h
+TEST_HEADERS = $(TEST_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h
 
 # All headers combined
-HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(TEST_HEADERS)
+HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(FOUNDATION_HEADERS) $(TEST_HEADERS)
 
 # Default target
 .DEFAULT_GOAL := all
 
 all: $(TARGET)
 
+# Compile llhttp C sources to object files
+$(THIRD_PARTY_DIR)/llhttp/%.o: $(THIRD_PARTY_DIR)/llhttp/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # Build the executable
-$(TARGET): $(SRCS) $(HEADERS)
-	$(CXX) $(CXXFLAGS) $(SRCS) $(LDFLAGS) -o $(TARGET)
+$(TARGET): $(SRCS) $(HEADERS) $(LLHTTP_OBJ)
+	$(CXX) $(CXXFLAGS) $(SRCS) $(LLHTTP_OBJ) $(LDFLAGS) -o $(TARGET)
 
 # Clean build artifacts
 clean:
-	rm -rf $(TARGET)*
+	rm -rf $(TARGET)* $(LLHTTP_OBJ)
 
 # Run all tests
 test: $(TARGET)
@@ -90,6 +114,26 @@ test_basic: $(TARGET)
 	@echo "Running basic tests only..."
 	./$(TARGET) basic
 
+# Run only config tests
+test_config: $(TARGET)
+	@echo "Running config tests only..."
+	./$(TARGET) config
+
+# Run only HTTP tests (placeholder for Phase 2)
+test_http: $(TARGET)
+	@echo "Running HTTP tests only..."
+	./$(TARGET) http
+
+# Run only WebSocket tests (placeholder for Phase 3)
+test_ws: $(TARGET)
+	@echo "Running WebSocket tests only..."
+	./$(TARGET) ws
+
+# Run only TLS tests (placeholder for Phase 4)
+test_tls: $(TARGET)
+	@echo "Running TLS tests only..."
+	./$(TARGET) tls
+
 # Display help information
 help:
 	@echo "Reactor Server C++ - Makefile Help"
@@ -100,28 +144,37 @@ help:
 	@echo "                     Compiles all source files and creates './run' executable"
 	@echo ""
 	@echo "  make test        - Build and run all tests"
-	@echo "                     Runs BasicTests (port 8888), StressTests (port 8889),"
-	@echo "                     and RaceConditionTests (port 9000)"
+	@echo "                     Runs BasicTests (port 9888), StressTests (port 9889),"
+	@echo "                     RaceConditionTests (port 10000), and ConfigTests"
 	@echo ""
 	@echo "  make test_basic  - Build and run only basic tests"
 	@echo "                     Equivalent to './run basic'"
 	@echo ""
 	@echo "  make test_stress - Build and run only stress tests"
-	@echo "                     Runs 1000 concurrent clients (equivalent to './run stress' or './run -s')"
+	@echo "                     Runs 100 concurrent clients (equivalent to './run stress' or './run -s')"
 	@echo "                     Validates fixes from STRESS_TEST_BUG_FIXES.md"
 	@echo ""
 	@echo "  make test_race   - Build and run only race condition tests"
 	@echo "                     Runs 7 race condition tests (equivalent to './run race')"
 	@echo "                     Validates fixes from EVENTFD_RACE_CONDITION_FIXES.md"
 	@echo ""
+	@echo "  make test_config - Build and run only config tests"
+	@echo "                     Runs configuration loading/validation tests"
+	@echo ""
+	@echo "  make test_http   - Build and run only HTTP tests (Phase 2)"
+	@echo ""
+	@echo "  make test_ws     - Build and run only WebSocket tests (Phase 3)"
+	@echo ""
+	@echo "  make test_tls    - Build and run only TLS tests (Phase 4)"
+	@echo ""
 	@echo "  make clean       - Remove build artifacts"
-	@echo "                     Deletes './run' executable"
+	@echo "                     Deletes './run' executable and llhttp object files"
 	@echo ""
 	@echo "  make help        - Show this help message"
 	@echo ""
 	@echo "Build configuration:"
 	@echo "  Compiler:      $(CXX)"
-	@echo "  C++ Standard:  C++11"
+	@echo "  C++ Standard:  C++17"
 	@echo "  Flags:         $(CXXFLAGS)"
 	@echo "  Linker:        $(LDFLAGS)"
 	@echo ""
@@ -129,6 +182,7 @@ help:
 	@echo "  Headers:       include/*.h"
 	@echo "  Source:        server/*.cc"
 	@echo "  Thread Pool:   thread_pool/include/*.h thread_pool/src/*.cc"
+	@echo "  Third Party:   third_party/ (nlohmann/json, spdlog, llhttp)"
 	@echo "  Tests:         test/*.cc test/*.h"
 	@echo "  Executable:    ./run"
 	@echo ""
@@ -139,12 +193,15 @@ help:
 	@echo "  make test_basic   # Run only basic tests"
 	@echo "  make test_stress  # Run only stress tests (100 concurrent clients)"
 	@echo "  make test_race    # Run only race condition tests"
+	@echo "  make test_config  # Run only config tests"
 	@echo ""
 	@echo "Direct executable usage (after building):"
 	@echo "  ./run             # Run all tests"
 	@echo "  ./run basic       # Run basic tests only (or: ./run -b)"
 	@echo "  ./run stress      # Run stress tests only (or: ./run -s)"
 	@echo "  ./run race        # Run race condition tests only (or: ./run -r)"
+	@echo "  ./run timeout     # Run timeout tests only (or: ./run -t)"
+	@echo "  ./run config      # Run config tests only (or: ./run -c)"
 	@echo "  ./run help        # Show help message (or: ./run -h)"
 	@echo ""
 	@echo "For more information, see:"
@@ -153,4 +210,4 @@ help:
 	@echo "  - test/RACE_CONDITION_TESTS_README.md - Race condition tests"
 
 # Phony targets
-.PHONY: all clean test test_basic test_stress test_race help
+.PHONY: all clean test test_basic test_stress test_race test_config test_http test_ws test_tls help

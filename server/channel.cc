@@ -38,7 +38,11 @@ void Channel::EnableReadMode(){
 
 void Channel::DisableReadMode(){
     if(is_channel_closed_) return;
-    event_ &= ~EVENT_READ;
+    // Clear both EVENT_READ and EVENT_RDHUP (set together by EnableReadMode).
+    // On kqueue, UpdateEvent() treats events != 0 as "still registered".
+    // Without clearing RDHUP, the channel stays in channel_map_ with
+    // is_read_event_ true even after both filters are deleted.
+    event_ &= ~(EVENT_READ | EVENT_RDHUP);
     std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
     if(ep_shared)
         ep_shared -> UpdateChannel(shared_from_this());
@@ -75,16 +79,10 @@ void Channel::HandleEvent() {
 
     const uint32_t events = devent_;
 
-    // Handle close events with highest priority
-    // If connection is closing, don't process other events
-    if(events & (EVENT_RDHUP | EVENT_HUP)){
-        if(callbacks_.close_callback)
-            callbacks_.close_callback();
-        CloseChannel();
-        return; // Don't process other events if closing
-    }
-
-    // Handle read events
+    // Handle read events BEFORE close events.
+    // When RDHUP arrives with EVENT_READ (client sends final bytes then closes),
+    // we must read the pending data first. ConnectionHandler::OnMessage() handles
+    // EOF (read==0) by dispatching buffered data then closing.
     if(events & (EVENT_READ | EVENT_PRI)){
         // Call Acceptor::NewConnection if it is acceptor channel
         // Call ConnectionHandler::OnMessage if it is client channel
@@ -92,16 +90,49 @@ void Channel::HandleEvent() {
             callbacks_.read_callback();
     }
 
-    // Handle write events
+    // Handle write events BEFORE close events.
+    // When RDHUP arrives with EPOLLOUT (client half-closed but socket is writable),
+    // the server may have a buffered response (queued via CloseAfterWrite) that must
+    // flush before the fd is closed.
     if(events & EVENT_WRITE){
         if(callbacks_.write_callback)
             callbacks_.write_callback();
+    }
+
+    // Handle close events AFTER read AND write.
+    // Invoke the close callback (ConnectionHandler::CallCloseCb), which either:
+    //   1. Closes inline (calls CloseChannel internally), OR
+    //   2. Defers if close_after_write_ with buffered data (response still flushing)
+    // Do NOT call CloseChannel here — CallCloseCb handles it when appropriate.
+    if(events & (EVENT_RDHUP | EVENT_HUP)){
+        // Only close if:
+        // - Channel isn't already closed (by read/write callbacks), AND
+        // - No close callback is wired (fallback), OR
+        // - The close callback doesn't defer (CallCloseCb returns early if
+        //   close_after_write_ is set with buffered data)
+        if (!is_channel_closed()) {
+            if(callbacks_.close_callback) {
+                callbacks_.close_callback();
+            } else {
+                CloseChannel();
+            }
+        }
+        // Note: if CallCloseCb deferred (close_after_write_ + buffer), the channel
+        // stays open. CallWriteCb will close after the buffer drains. For async
+        // handlers, DoSend will enable write mode when data arrives.
+        return;
     }
 
     // Handle error events
     if(events & EVENT_ERR){
         if(callbacks_.error_callback)
             callbacks_.error_callback();
+    }
+}
+
+void Channel::InvokeCloseCallback() {
+    if (callbacks_.close_callback) {
+        callbacks_.close_callback();
     }
 }
 

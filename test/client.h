@@ -166,11 +166,12 @@ public:
      * This matches the server's Buffer::AppendWithHead format
      */
     void Receive(){
-        // First, read the 4-byte length header
+        // First, read the 4-byte length header (network byte order)
         uint32_t msg_length = 0;
         if(!RecvN(&msg_length, 4)){
             throw std::runtime_error("Receive header failed");
         }
+        msg_length = ntohl(msg_length);  // Convert from network to host byte order
 
         // Validate message length
         if(msg_length == 0) {

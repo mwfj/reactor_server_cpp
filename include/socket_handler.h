@@ -3,12 +3,19 @@
 #include "inet_addr.h"
 
 class SocketHandler {
+public:
+    // Accept() return codes for non-fd results
+    static constexpr int ACCEPT_QUEUE_DRAINED   = -1;  // EAGAIN/EWOULDBLOCK
+    static constexpr int ACCEPT_CONN_ABORTED    = -2;  // ECONNABORTED
+    static constexpr int ACCEPT_FD_EXHAUSTION   = -3;  // EMFILE/ENFILE (recoverable via idle fd trick)
+    static constexpr int ACCEPT_MEMORY_PRESSURE = -4;  // ENOBUFS/ENOMEM
+
 private:
     int fd_;
     std::string ip_addr_;
     int port_;
     void SetNonBlocking(int fd);
-    
+
 public:
     SocketHandler();
     explicit SocketHandler(int);
@@ -40,7 +47,11 @@ public:
     int fd() const { return fd_; }
     const std::string& ip_addr() const {return ip_addr_;}
     int port() const {return port_;}
+    
 
+    // Release ownership of the fd without closing it (used when Channel takes over)
+    void ReleaseFd() { fd_ = -1; }
+    
     bool SetTcpNoDelay(bool);
     bool SetReuseAddr(bool);
     bool SetReusePort(bool);

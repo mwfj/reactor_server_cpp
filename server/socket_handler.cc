@@ -63,27 +63,34 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
     if(clientfd == -1){
         // Don't close listening socket on accept error
         if(errno == EAGAIN || errno == EWOULDBLOCK) {
-            // No connections available right now - not an error
-            return -1;
+            return ACCEPT_QUEUE_DRAINED;
         }
-        // On macOS under high load, we can get ECONNABORTED, EMFILE, ENFILE
-        // These should not crash the server - just log and return
-        if(errno == ECONNABORTED || errno == EMFILE || errno == ENFILE ||
-           errno == ENOBUFS || errno == ENOMEM) {
-            // Temporary resource exhaustion - log but don't crash
-            // ECONNABORTED: Connection aborted before accept completed
-            // EMFILE: Process file descriptor limit reached
-            // ENFILE: System file descriptor limit reached
-            // ENOBUFS/ENOMEM: Insufficient resources
-            std::cerr << "[Socket Handler] Accept failed (temporary): " << strerror(errno) << std::endl;
-            return -1;
+        if(errno == ECONNABORTED) {
+            return ACCEPT_CONN_ABORTED;
+        }
+        if(errno == EMFILE || errno == ENFILE) {
+            std::cerr << "[Socket Handler] Accept failed (fd exhaustion): " << strerror(errno) << std::endl;
+            return ACCEPT_FD_EXHAUSTION;
+        }
+        if(errno == ENOBUFS || errno == ENOMEM) {
+            std::cerr << "[Socket Handler] Accept failed (memory pressure): " << strerror(errno) << std::endl;
+            return ACCEPT_MEMORY_PRESSURE;
         }
         std::cout << "[Socket Handler] Error occurred when accepting connection: " << strerror(errno) << std::endl;
         throw std::runtime_error(std::string("Error accepting connection: ") + strerror(errno));
     }
 #if defined(__APPLE__) || defined(__MACH__)
-    // Set non-blocking after successful accept on macOS
+    // Set non-blocking after successful accept on macOS.
+    // On Linux, accept4(SOCK_NONBLOCK) handles this atomically.
+    // Check fd validity after SetNonBlocking: if it silently returned
+    // on EBADF (fd-reuse race), the fd is dead and must not be handed
+    // to the reactor — later epoll/kqueue registration would operate
+    // on an fd that may already belong to another connection.
     SetNonBlocking(clientfd);
+    if (fcntl(clientfd, F_GETFL) == -1) {
+        // fd is dead — treat as aborted connection, continue draining
+        return ACCEPT_CONN_ABORTED;
+    }
 #endif
     _clientAddr.SetAddr(acceptAddr);
     return clientfd;
@@ -138,4 +145,13 @@ void SocketHandler::SetNonBlocking(int fd) {
                   << strerror(errno) << " (errno=" << errno << ")" << std::endl;
         throw std::runtime_error(std::string("Failed to set non-blocking mode: ") + strerror(errno));
     }
+
+    // macOS: suppress SIGPIPE per-socket since MSG_NOSIGNAL is not available
+#ifdef SO_NOSIGPIPE
+    int set = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set)) < 0) {
+        std::cerr << "[Socket Handler] Failed to set SO_NOSIGPIPE: "
+                  << strerror(errno) << std::endl;
+    }
+#endif
 }

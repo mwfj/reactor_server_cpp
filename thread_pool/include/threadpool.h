@@ -26,7 +26,12 @@ private:
     const int DEFAULT_THREAD_NUMS = 6;
     std::atomic_int running_threads_{0};
     std::atomic_bool is_running_{false};
+    // When Stop() is called from a worker thread, the self-thread can't be
+    // joined inline (deadlock). It is moved here and joined at the next
+    // safe point (destructor or Start()) to avoid detach-related races.
+    std::thread pending_self_stop_;
     void Run();
+    void JoinPendingSelfStop();
 public:
     ThreadPool() = default;
 

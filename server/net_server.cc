@@ -1,27 +1,49 @@
 #include "net_server.h"
+#include "tls/tls_context.h"
+#include "tls/tls_connection.h"
 
+#include <csignal>
+#include <future>
 
 NetServer::NetServer(const std::string& _ip, const size_t _port,
                      int timer_interval,
-                     std::chrono::seconds connection_timeout)
+                     std::chrono::seconds connection_timeout,
+                     int worker_threads)
     : conn_dispatcher_(std::make_shared<Dispatcher>()),
       acceptor_(nullptr),
       timer_interval_(timer_interval),
       connection_timeout_(connection_timeout)
 {
+    // Suppress SIGPIPE if the current handler is the default (which kills
+    // the process). OpenSSL's SSL_write/SSL_shutdown use the underlying
+    // socket's write() which bypasses MSG_NOSIGNAL. Without suppression,
+    // a single peer reset on a TLS connection kills the entire process.
+    // Only override SIG_DFL — if the embedder has installed their own
+    // handler, leave it alone to avoid breaking their signal handling.
+    {
+        struct sigaction sa_cur;
+        sigaction(SIGPIPE, nullptr, &sa_cur);
+        if (sa_cur.sa_handler == SIG_DFL) {
+            signal(SIGPIPE, SIG_IGN);
+        }
+    }
     // Initialize conn_dispatcher_ after shared_ptr is constructed (required for eventfd setup)
     conn_dispatcher_->Init();
     conn_dispatcher_->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
 
     // Now create acceptor with initialized dispatcher
     acceptor_ = std::unique_ptr<Acceptor>(new Acceptor(conn_dispatcher_, _ip, _port));
-    // Should we replace std::bind with lambda here?
     acceptor_->SetNewConnCb(std::bind(&NetServer::HandleNewConnection, this, std::placeholders::_1));
-    sock_workers_.Init();
+    if (worker_threads > 0) {
+        sock_workers_.Init(worker_threads);
+    } else {
+        sock_workers_.Init();
+    }
     sock_workers_.Start();
 }
 
 NetServer::~NetServer(){
+    Stop();
     socket_dispatchers_.clear();
     connections_.clear();
 }
@@ -53,35 +75,163 @@ void NetServer::Start(){
 
 // stop event loop
 void NetServer::Stop(){
-    // First: Close all active connections to ensure clean shutdown
-    // This prevents connections from holding references to dispatchers during shutdown
-    {
-        std::lock_guard<std::mutex> lck(conn_mtx_);
-        connections_.clear();  // This will trigger ConnectionHandler destructors
-    }
+    // Close the listening socket to release the port immediately.
+    // EnQueue BEFORE StopEventLoop (which sets was_stopped_ and rejects tasks).
+    // The task runs on the conn_dispatcher thread sequentially with accept
+    // callbacks, so there's no race with Acceptor::NewConnection().
+    // ~Acceptor destructor will be a no-op (channel already closed, fd released).
+    conn_dispatcher_->EnQueue([this]() {
+        if (acceptor_) {
+            acceptor_->CloseListenSocket();
+        }
+    });
 
-    // Second: Stop all event loops (now with no active connections)
-    for(auto task : socket_dispatchers_)
-        task -> StopEventLoop();
+    // Stop the connection dispatcher so no more accept events fire.
     conn_dispatcher_->StopEventLoop();
 
-    // Third: Now safe to join worker threads
+    // Second: Release dispatcher-held connection references via EnQueue
+    // (ClearConnections must run on the dispatcher thread to avoid racing TimerHandler)
+    for (auto& disp : socket_dispatchers_) {
+        disp->EnQueue([d = disp]() {
+            d->ClearConnections();
+        });
+    }
+
+    // Third: Gracefully close all active connections — CloseAfterWrite lets pending
+    // output (including WS close frames) drain via the still-running event loops.
+    // Connections with empty output buffers close immediately (ForceClose path).
+    std::vector<std::shared_ptr<ConnectionHandler>> conns_to_close;
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        for (auto& pair : connections_) {
+            if (pair.second) {
+                conns_to_close.push_back(pair.second);
+            }
+        }
+        connections_.clear();
+    }
+    for (auto& conn : conns_to_close) {
+        // Skip connections already marked by a higher layer (e.g., HttpServer
+        // sent a WS close frame and called CloseAfterWrite on them).
+        if (!conn->IsCloseDeferred()) {
+            conn->CloseAfterWrite();
+        }
+    }
+    // Do NOT clear conns_to_close here. The shared_ptrs must keep
+    // ConnectionHandlers alive until the deferred CloseAfterWrite lambdas
+    // (which capture weak_ptr) have executed. Without this, ClearConnections
+    // + clear() can drop the last strong ref before the drain/close lambda
+    // runs, causing weak_ptr::lock() to fail and skipping graceful close.
+
+    // Fourth: Wait for each dispatcher to process enqueued CloseAfterWrite tasks.
+    // Without this barrier, StopEventLoop would exit the event loop before
+    // EnableWriteMode (from CloseAfterWrite) triggers a write event, truncating
+    // buffered output (WS close frames, in-flight HTTP responses) under backpressure.
+    // The barrier ensures write mode is registered; StopEventLoop's WakeUp then
+    // triggers one final WaitForEvent that includes the write-ready channels.
+    for (auto& disp : socket_dispatchers_) {
+        if (disp->was_stopped()) continue;
+        // Skip barrier for the current thread's dispatcher — if Stop() is called
+        // from a handler on this dispatcher, future.wait() would deadlock (the
+        // barrier task can only run on the thread that's blocked waiting for it).
+        // CloseAfterWrite for connections on this dispatcher already ran inline
+        // (SendRaw/CloseAfterWrite route inline when on the loop thread).
+        if (disp->is_on_loop_thread()) continue;
+        auto barrier = std::make_shared<std::promise<void>>();
+        auto future = barrier->get_future();
+        disp->EnQueue([barrier]() { barrier->set_value(); });
+        future.wait();
+    }
+
+    // Fifth: Stop socket dispatcher event loops (conn_dispatcher already stopped above).
+    // StopEventLoop's WakeUp triggers one final loop iteration that processes any
+    // write-ready channels (from EnableWriteMode set above), draining buffered output.
+    for(auto task : socket_dispatchers_)
+        task -> StopEventLoop();
+
+    // Sixth: Now safe to join worker threads
     sock_workers_.Stop();
+
+    // Seventh: Release shutdown connection references. All deferred work has
+    // completed — the event loops are stopped and workers are joined.
+    conns_to_close.clear();
 }
 
 void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
+    // Enforce max_connections limit
+    if (max_connections_ > 0) {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        if (static_cast<int>(connections_.size()) >= max_connections_) {
+            std::cerr << "[NetServer] Max connections (" << max_connections_
+                      << ") reached, rejecting fd " << cilent_sock->fd() << std::endl;
+            return;  // SocketHandler destructor closes the fd
+        }
+    }
+
     int idx = cilent_sock -> fd() % sock_workers_.GetThreadWorkerNum();
     std::shared_ptr<ConnectionHandler> conn = std::shared_ptr<ConnectionHandler>(new ConnectionHandler(socket_dispatchers_[idx], std::move(cilent_sock)));
 
-    // Two-phase initialization: register callbacks after shared_ptr is created
-    // This allows callbacks to safely capture weak_ptr instead of raw 'this'
-    conn -> RegisterCallbacks();
+    // Inject TLS BEFORE RegisterCallbacks to avoid race:
+    // RegisterCallbacks() enables epoll read, so data could arrive immediately.
+    // OnMessage() must know about TLS before the first read event.
+    if (tls_ctx_) {
+        try {
+            auto tls = std::make_unique<TlsConnection>(*tls_ctx_, conn->fd());
+            conn->SetTlsConnection(std::move(tls));
+        } catch (const std::exception& e) {
+            std::cerr << "[NetServer] TLS setup failed for fd " << conn->fd() << ": " << e.what() << std::endl;
+            // Close properly to avoid double-close: both Channel and SocketHandler
+            // hold the same fd. CallCloseCb closes the channel fd and releases from SocketHandler.
+            conn->CallCloseCb();
+            return;
+        }
+    }
 
+    // Set application callbacks and per-connection limits BEFORE RegisterCallbacks().
+    // RegisterCallbacks() enables epoll (EPOLL_CTL_ADD), after which data can arrive
+    // on the socket dispatcher thread. All connection state must be configured before
+    // this point — the epoll_ctl syscall provides the memory barrier ensuring writes
+    // here are visible to reads on the socket dispatcher thread.
     conn -> SetCloseCb(std::bind(&NetServer::HandleCloseConnection, this, std::placeholders::_1));
     conn -> SetErrorCb(std::bind(&NetServer::HandleErrorConnection, this, std::placeholders::_1));
     conn -> SetOnMessageCb(std::bind(&NetServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
     conn -> SetCompletionCb(std::bind(&NetServer::HandleSendComplete, this, std::placeholders::_1));
+
+    // Set input buffer cap BEFORE epoll registration to eliminate the race where
+    // the first read arrives uncapped before HttpServer::HandleNewConnection runs.
+    if (max_input_size_ > 0) {
+        conn->SetMaxInputSize(max_input_size_);
+    }
+
     AddConnection(conn);
+
+    // Two-phase initialization: register channel callbacks and enable epoll.
+    // Uses weak_ptr captures so callbacks are safe if ConnectionHandler is destroyed.
+    // If epoll_ctl fails (ENOMEM/ENOSPC), clean up the half-initialized connection
+    // to prevent leaking a connection slot and fd.
+    try {
+        conn -> RegisterCallbacks();
+    } catch (const std::exception& e) {
+        std::cerr << "[NetServer] epoll registration failed for fd " << conn->fd()
+                  << ": " << e.what() << std::endl;
+        // CallCloseCb handles: close channel, fire close callback (removes from
+        // connections_ map), release fd from SocketHandler (prevents double-close).
+        conn->CallCloseCb();
+        return;
+    }
+
+    // Register with socket dispatcher's timer for idle timeout scanning.
+    // Must go through EnQueue so AddConnection runs on the dispatcher thread,
+    // avoiding lock inversion between timer_mtx_ and conn_mtx_.
+    {
+        std::weak_ptr<ConnectionHandler> weak_conn = conn;
+        auto dispatcher = socket_dispatchers_[idx];
+        dispatcher->EnQueue([weak_conn, dispatcher]() {
+            if (auto c = weak_conn.lock()) {
+                dispatcher->AddConnection(c);
+            }
+        });
+    }
 
     std::cout << "[Reactor Server] new connection(fd: "
         << conn -> fd() << ", ip: " << conn -> ip_addr() << ", port: " << conn -> port() << ").\n"
@@ -92,21 +242,60 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
 }
 
 void NetServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn){
+    // Capture fd BEFORE any cleanup that might invalidate it (CallCloseCb → ReleaseFd)
+    // Note: HandleCloseConnection is called FROM CallCloseCb, so fd() should still be
+    // valid at this point (ReleaseFd runs after the callback). But under fd-reuse the
+    // number could belong to a new connection, so we verify identity.
+    int close_fd = conn->fd();
+
     if(callbacks_.close_conn_callback)
         callbacks_.close_conn_callback(conn);
 
-    std::cout << "[NetServer] client fd: " << conn -> fd() << " disconnected." << std::endl;
-    RemoveConnection(conn -> fd());
-    // close this connection
+    std::cout << "[NetServer] client fd: " << close_fd << " disconnected." << std::endl;
+
+    // Remove from dispatcher's timer map with identity check to avoid fd-reuse race
+    int idx = close_fd % sock_workers_.GetThreadWorkerNum();
+    auto dispatcher = socket_dispatchers_[idx];
+    std::weak_ptr<ConnectionHandler> weak_conn = conn;
+    dispatcher->EnQueue([close_fd, weak_conn, dispatcher]() {
+        dispatcher->RemoveTimerConnectionIfMatch(close_fd, weak_conn.lock());
+    });
+
+    // Remove from connections_ map with identity check to avoid removing a reused fd
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        auto it = connections_.find(close_fd);
+        if (it != connections_.end() && it->second == conn) {
+            connections_.erase(it);
+        }
+    }
     conn.reset();
 }
 
 void NetServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn){
+    int close_fd = conn->fd();
+
     if(callbacks_.error_callback)
         callbacks_.error_callback(conn);
 
-    std::cout << "[NetServer] client fd: " << conn -> fd() << "error occurred, disconnect." << std::endl;
-    RemoveConnection(conn -> fd());
+    std::cout << "[NetServer] client fd: " << close_fd << " error occurred, disconnect." << std::endl;
+
+    // Remove from dispatcher's timer map with identity check to avoid fd-reuse race
+    int idx = close_fd % sock_workers_.GetThreadWorkerNum();
+    auto dispatcher = socket_dispatchers_[idx];
+    std::weak_ptr<ConnectionHandler> weak_conn = conn;
+    dispatcher->EnQueue([close_fd, weak_conn, dispatcher]() {
+        dispatcher->RemoveTimerConnectionIfMatch(close_fd, weak_conn.lock());
+    });
+
+    // Remove from connections_ map with identity check
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        auto it = connections_.find(close_fd);
+        if (it != connections_.end() && it->second == conn) {
+            connections_.erase(it);
+        }
+    }
     conn.reset();
 }
 

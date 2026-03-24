@@ -9,7 +9,7 @@ ReactorServer::ReactorServer(const std::string& _ip, const size_t _port,
     // Should we replace std::bind with lambda here?
     net_server_.SetNewConnectionCb(std::bind(&ReactorServer::NewConnection, this, std::placeholders::_1));
     net_server_.SetCloseConnectionCb(std::bind(&ReactorServer::CloseConnecition, this, std::placeholders::_1));
-    net_server_.SetErrorCb(std::bind(&ReactorServer::CloseConnecition, this, std::placeholders::_1));
+    net_server_.SetErrorCb(std::bind(&ReactorServer::Error, this, std::placeholders::_1));
     net_server_.SetOnMessageCb(std::bind(&ReactorServer::ProcessMessage, this, std::placeholders::_1, std::placeholders::_2));
     net_server_.SetSendCompletionCb(std::bind(&ReactorServer::SendComplete, this, std::placeholders::_1));
 }
@@ -41,6 +41,10 @@ void ReactorServer::Error(std::shared_ptr<ConnectionHandler> conn){
     // Can add some extra features related code below
 }
 
+// NOTE: This legacy TCP echo server treats each callback invocation as one
+// logical message. This is stream-unsafe: TCP fragmentation/coalescing can
+// split or merge application messages across callbacks. For proper message
+// framing, use HttpServer (HTTP framing) or WebSocket (frame-based protocol).
 void ReactorServer::ProcessMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message){
     std::cout << "Thread Id: " << std::this_thread::get_id() << " Process Message: " << message << std::endl;
 

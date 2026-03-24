@@ -4,6 +4,13 @@ ThreadPool::~ThreadPool() {
     // RAII: Ensure threads are properly stopped and joined during destruction
     // This is safe because Stop() is idempotent - calling it multiple times is harmless
     Stop();
+    JoinPendingSelfStop();
+}
+
+void ThreadPool::JoinPendingSelfStop() {
+    if (pending_self_stop_.joinable()) {
+        pending_self_stop_.join();
+    }
 }
 
 inline void ThreadPool::SetThreadWorkerNum(int nums, bool set_by_init){
@@ -36,6 +43,11 @@ void ThreadPool::Init(){
 
 
 void ThreadPool::Start(){
+    // Join any pending self-stop worker from a previous Stop() cycle.
+    // This acts as a barrier: the old worker has fully exited before
+    // new workers are created, preventing untracked extra workers.
+    JoinPendingSelfStop();
+
     std::lock_guard<std::mutex> lck(mtx_);
 
     if(GetThreadWorkerNum() <= 0) {
@@ -76,10 +88,21 @@ void ThreadPool::Stop(){
     // Signal all worker threads to exit (safe to call after releasing lock)
     cv_.notify_all();
 
-    // Wait for all worker threads to finish
+    // Wait for all worker threads to finish.
+    // If Stop() is called from a worker thread (e.g., a request handler
+    // calling HttpServer::Stop()), move the self-thread to pending_self_stop_
+    // instead of joining (self-join would deadlock). The pending thread is
+    // joined at the next safe point: ~ThreadPool() or Start(). This avoids
+    // detach races where the worker outlives the pool.
+    auto self_id = std::this_thread::get_id();
     for(std::thread& th : workers_){
-        if(th.joinable())
-            th.join();
+        if(th.joinable()) {
+            if (th.get_id() == self_id) {
+                pending_self_stop_ = std::move(th);
+            } else {
+                th.join();
+            }
+        }
     }
 
     {

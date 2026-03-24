@@ -60,19 +60,34 @@ void Dispatcher::Init() {
     wake_channel_->SetReadCallBackFn(std::bind(&Dispatcher::HandleEventId, this));
     wake_channel_->EnableReadMode();
 
-    // Only initialize timer if this is a socket dispatcher with timeout configured
-    if (is_sock_dispatcher_ && timeout_.count() > 0) {
-        timer_fd_ = TimeStamp::GenTimerFd(timeout_, std::chrono::nanoseconds(0));
-        timer_channel_ = std::make_shared<Channel>(shared_from_this(), timer_fd_);
-        timer_channel_->SetReadCallBackFn(std::bind(&Dispatcher::TimerHandler, this));
-        timer_channel_->EnableReadMode();
+    // Initialize timer for socket dispatchers.
+    // Timer is needed for both idle timeout (timeout_.count() > 0) and request
+    // deadline scanning (has_deadline_ per-connection). Always create when
+    // end_t_ > 0 (scan interval configured), even if idle timeout is disabled.
+    if (is_sock_dispatcher_ && end_t_ > 0) {
+        // Use end_t_ (scan interval) for the initial timer fire, not timeout_ (idle timeout).
+        // TimerHandler re-arms with end_t_ on each fire. Using timeout_ here would delay
+        // the first scan to 300s, missing 30s request deadlines.
+        timer_fd_ = TimeStamp::GenTimerFd(std::chrono::seconds(end_t_), std::chrono::nanoseconds(0));
+        // Guard against platforms where GenTimerFd returns -1 (e.g., macOS)
+        if (timer_fd_ >= 0) {
+            timer_channel_ = std::make_shared<Channel>(shared_from_this(), timer_fd_);
+            timer_channel_->SetReadCallBackFn(std::bind(&Dispatcher::TimerHandler, this));
+            timer_channel_->EnableReadMode();
+        }
     }
 }
 
 Dispatcher::~Dispatcher() {
     // Let smart pointers handle cleanup automatically
-    // wake_channel_ destructor will close the eventfd
-    // No need to explicitly remove from epoll - ep_ is being destroyed anyway
+    // wake_channel_ destructor will close the eventfd / wakeup_pipe_[0]
+#if defined(__APPLE__) || defined(__MACH__)
+    // Close the write end of the wakeup pipe (not owned by wake_channel_)
+    if (wakeup_pipe_[1] >= 0) {
+        ::close(wakeup_pipe_[1]);
+        wakeup_pipe_[1] = -1;
+    }
+#endif
 }
 
 void Dispatcher::set_running_state(bool status){
@@ -82,9 +97,10 @@ void Dispatcher::set_running_state(bool status){
 void Dispatcher::RunEventLoop(){
     set_running_state(true);
 
-    thread_id_ = std::this_thread::get_id();
+    thread_id_.store(std::this_thread::get_id(), std::memory_order_release);
 
     while(is_running()){
+      try {
         // Use 1000ms timeout instead of blocking indefinitely
         // This allows the server to check is_running() periodically
         std::vector<std::shared_ptr<Channel>> channels = ep_->WaitForEvent(1000);
@@ -92,9 +108,14 @@ void Dispatcher::RunEventLoop(){
         // If no events, just continue loop (don't shutdown!)
         // The timeout is for periodic checking, not termination
         if(channels.size() == 0){
-            // Optional: Call timeout callback if set (but don't stop the loop)
+            // Call timeout callback if set
             if(callbacks_.timeout_trigger_callback){
                 callbacks_.timeout_trigger_callback(shared_from_this());
+            }
+            // Fallback timer for platforms without timerfd (macOS):
+            // Must also run here so idle connections are caught even with no traffic.
+            if (is_sock_dispatcher_ && timer_fd_ < 0 && end_t_ > 0) {
+                TimerHandler();
             }
             continue;
         }
@@ -109,16 +130,55 @@ void Dispatcher::RunEventLoop(){
             try {
                 ch->HandleEvent();
             } catch (const std::exception& e) {
-                // Log error but continue serving other clients
-                // Don't re-throw - just log and continue processing other events
+                // Log error and tear down via the close callback so server maps
+                // (connections_, http_connections_) are properly cleaned up.
+                // Just calling CloseChannel() would leave stale entries.
                 std::cerr << "[Dispatcher] Error handling event: " << e.what() << std::endl;
+                if (!ch->is_channel_closed()) {
+                    // Invoke the close callback (wired to ConnectionHandler::CallCloseCb
+                    // which handles channel close + server map cleanup + fd release)
+                    ch->InvokeCloseCallback();
+                }
             }
         }
 
+        // Fallback timer for platforms without timerfd (macOS):
+        // Run TimerHandler after processing events so it works even under load.
+        // WaitForEvent has a 1s timeout, so this runs approximately once per second.
+        if (is_sock_dispatcher_ && timer_fd_ < 0 && end_t_ > 0) {
+            TimerHandler();
+        }
+
+      } catch (const std::exception& e) {
+        // Catch exceptions from WaitForEvent, TimerHandler, or timeout callbacks
+        // that escape the inner try/catch. Without this, the dispatcher thread dies
+        // and NetServer::Stop()'s barrier future.wait() hangs forever.
+        std::cerr << "[Dispatcher] Event loop error: " << e.what() << std::endl;
+      } catch (...) {
+        std::cerr << "[Dispatcher] Unknown event loop error" << std::endl;
+      }
+    } // end of while(is_running())
+
+    // Final drain: process all tasks enqueued during shutdown.
+    // Loop because a task may EnQueue more work (e.g., close callback
+    // triggers timer removal which enqueues to this dispatcher).
+    // Note: EnQueue guards against was_stopped_, but tasks enqueued BEFORE
+    // was_stopped_ was set may themselves enqueue more work.
+    for (int drain_rounds = 0; drain_rounds < 10; ++drain_rounds) {
+        std::deque<std::function<void()>> tasks;
+        {
+            std::lock_guard<std::mutex> lck(mtx_);
+            if (task_que_.empty()) break;
+            tasks.swap(task_que_);
+        }
+        for (auto& fn : tasks) {
+            try { fn(); } catch (...) {}
+        }
     }
 }
 
 void Dispatcher::StopEventLoop(){
+    was_stopped_.store(true, std::memory_order_release);
     set_running_state(false);
     WakeUp();  // Wake up epoll_wait() immediately for fast shutdown
 }
@@ -232,6 +292,8 @@ void Dispatcher::HandleEventId(){
 }
 
 void Dispatcher::EnQueue(std::function<void()> fn){
+    // Only discard tasks after explicit stop — allow during startup (before RunEventLoop)
+    if (was_stopped_.load(std::memory_order_acquire)) return;
     {
         std::lock_guard<std::mutex> lck(mtx_);
         task_que_.push_back(fn);
@@ -240,8 +302,23 @@ void Dispatcher::EnQueue(std::function<void()> fn){
 }
 
 void Dispatcher::AddConnection(std::shared_ptr<ConnectionHandler> conn){
-    std::lock_guard<std::mutex> lck(timer_mtx_);
     connections_[conn -> fd()] = conn;
+}
+
+void Dispatcher::ClearConnections(){
+    connections_.clear();
+}
+
+void Dispatcher::RemoveTimerConnection(int fd) {
+    connections_.erase(fd);
+}
+
+void Dispatcher::RemoveTimerConnectionIfMatch(int fd, std::shared_ptr<ConnectionHandler> conn) {
+    if (!conn) return;  // Original connection already destroyed — can't verify identity
+    auto it = connections_.find(fd);
+    if (it != connections_.end() && it->second == conn) {
+        connections_.erase(it);
+    }
 }
 
 void Dispatcher::SetTimerCB(CALLBACKS_NAMESPACE::DispatcherTimerCallback fn){
@@ -253,36 +330,49 @@ void Dispatcher::SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCal
 }
 
 void Dispatcher::TimerHandler(){
+    // Drain the timerfd expiration count before re-arming.
+    // On Linux, timerfd stays readable until read(); without draining,
+    // epoll_wait returns the timer channel continuously in a tight loop.
+#if defined(__linux__)
+    uint64_t expirations;
+    ::read(timer_fd_, &expirations, sizeof(expirations));
+#endif
     TimeStamp::ResetTimerFd(timer_fd_, end_t_);
 
     if(is_sock_dispatcher()){
         std::cout << "[Dispatcher - " << std::this_thread::get_id() << "]: reset timer" << std::endl;
 
         // Collect all timed-out connection fds first to avoid iterator invalidation
+        // No mutex needed: AddConnection/RemoveTimerConnection/TimerHandler all run
+        // on this dispatcher's event-loop thread via EnQueue.
         std::vector<int> timeout_fds;
 
-        {
-            // Lock before iterating to prevent data races
-            std::lock_guard<std::mutex> lck(timer_mtx_);
-
-            // Check every connection to find whether it has timeout
-            for(auto& conn : connections_){
-                // fd -> connection handler shared_ptr
-                if(conn.second && conn.second->IsTimeOut(timeout_)){
-                    timeout_fds.push_back(conn.first);
-                }
-            }
-
-            // Remove timed-out connections from our map
-            for(int fd : timeout_fds){
-                connections_.erase(fd);
+        // Check every connection to find whether it has timeout
+        // Collect shared_ptrs so we can close them after map cleanup
+        std::vector<std::shared_ptr<ConnectionHandler>> timed_out_conns;
+        for(auto& conn : connections_){
+            if(conn.second && conn.second->IsTimeOut(timeout_)){
+                timeout_fds.push_back(conn.first);
+                timed_out_conns.push_back(conn.second);
             }
         }
 
-        // Call callback for each timed-out connection to remove from NetServer
-        if(callbacks_.timer_callback){
-            for(int fd : timeout_fds){
-                callbacks_.timer_callback(fd);
+        // Close timed-out connections.
+        for(auto& conn : timed_out_conns){
+            if (conn->IsClosing() || conn->IsCloseDeferred()) {
+                // Already closing (previous timeout triggered CloseAfterWrite but flush stalled).
+                // Force close now — the buffered response will never drain.
+                conn->ForceClose();
+            } else {
+                // First timeout: send 408 (if deadline callback set), then deferred close.
+                conn->CallDeadlineTimeoutCb();
+                // Re-arm deadline to give the response time to flush (30s drain window).
+                // Without this, the expired request deadline causes the next timer scan
+                // to see IsCloseDeferred() and ForceClose before the 408 has drained.
+                // The write path refreshes this deadline on each successful write,
+                // so actively-draining connections won't be killed.
+                conn->SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(30));
+                conn->CloseAfterWrite();
             }
         }
     }

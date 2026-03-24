@@ -13,6 +13,8 @@
 #include "threadpool.h"
 #include <mutex>
 
+class TlsContext;
+
 // For socket connection related task, use this type of worker
 // SocketWorker: Handles I/O event loops for client connections in thread pool
 class SocketWorker : public ThreadTaskInterface{
@@ -51,11 +53,16 @@ private:
     int timer_interval_;  // How often to check for timeouts (seconds)
     std::chrono::seconds connection_timeout_;  // Connection idle timeout duration
 
+    std::shared_ptr<TlsContext> tls_ctx_;  // Shared with HttpServer for safe lifetime
+    int max_connections_ = 0;         // 0 = unlimited
+    size_t max_input_size_ = 0;       // 0 = unlimited, set before RegisterCallbacks
+
 public:
     NetServer() = delete;
     NetServer(const std::string& _ip, const size_t _port,
               int timer_interval = 60,
-              std::chrono::seconds connection_timeout = std::chrono::seconds(300));
+              std::chrono::seconds connection_timeout = std::chrono::seconds(300),
+              int worker_threads = 0);  // 0 = use hardware_concurrency default
     ~NetServer(); 
 
     void Start();
@@ -77,4 +84,8 @@ public:
     void SetOnMessageCb(CALLBACKS_NAMESPACE::NetSrvOnMsgCallback);
     void SetSendCompletionCb(CALLBACKS_NAMESPACE::NetSrvSendCompleteCallback);
     void SetTimerCb(CALLBACKS_NAMESPACE::NetSrvTimerCallback);
+
+    void SetTlsContext(std::shared_ptr<TlsContext> ctx) { tls_ctx_ = std::move(ctx); }
+    void SetMaxConnections(int max) { max_connections_ = max; }
+    void SetMaxInputSize(size_t max) { max_input_size_ = max; }
 };
