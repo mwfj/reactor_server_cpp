@@ -93,14 +93,13 @@ void Acceptor::NewConnection(){
         if(client_fd == SocketHandler::ACCEPT_MEMORY_PRESSURE){
             // Memory/buffer pressure (ENOBUFS/ENOMEM).
             // The idle fd trick doesn't help — closing fds frees fd slots, not memory.
-            // Can't drain the queue (accept keeps failing), can't spin (starvation).
-            // Re-arm the channel via EPOLL_CTL_MOD — on Linux this re-triggers the
-            // edge if the fd is still ready, so the next epoll_wait cycle retries.
-            // Without this, the listen socket stays readable but ET mode never
-            // delivers another edge (no transition occurred).
-            if (acceptor_channel_ && !acceptor_channel_->is_channel_closed()) {
-                acceptor_channel_->EnableReadMode();
-            }
+            // Cannot drain the queue (accept keeps failing).
+            // Do NOT rely on EPOLL_CTL_MOD to re-trigger the ET edge — the epoll
+            // spec does not guarantee a new edge when the fd is already readable.
+            // Return and wait: the next new connection creates a readiness transition
+            // that fires a fresh edge, retrying the entire backlog. Existing backlog
+            // entries are delayed until memory pressure resolves, which is acceptable
+            // since the server cannot handle more connections under memory pressure.
             return;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));

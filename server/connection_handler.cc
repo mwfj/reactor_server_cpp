@@ -393,13 +393,14 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
 
 void ConnectionHandler::CloseAfterWrite(){
     close_after_write_.store(true, std::memory_order_release);
-    // Route to the dispatcher thread so this runs after any previously
-    // enqueued sends (e.g., WS close frames queued via SendRaw from
-    // HttpServer::Stop()). Without this, an off-thread caller sees an
-    // empty output_bf_ and takes the ForceClose path before the
-    // enqueued DoSendRaw has had a chance to fill the buffer.
-    if (event_dispatcher_ && !event_dispatcher_->is_on_loop_thread()
-        && !event_dispatcher_->was_stopped()) {
+    // Always enqueue the buffer-check/close so it runs after any previously
+    // queued send tasks (e.g., WS close frames via SendRaw, or cross-thread
+    // broadcast sends). Without this, an inline call on the loop thread can
+    // see an empty output_bf_ (queued sends haven't executed yet) and
+    // ForceClose, truncating in-flight data. The close_after_write_ flag
+    // (set above) ensures that concurrent CallCloseCb and write-completion
+    // paths also defer properly.
+    if (event_dispatcher_ && !event_dispatcher_->was_stopped()) {
         std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
         event_dispatcher_->EnQueue([weak_self]() {
             if (auto self = weak_self.lock()) {
@@ -412,12 +413,10 @@ void ConnectionHandler::CloseAfterWrite(){
         });
         return;
     }
+    // Dispatcher stopped — execute inline as last resort
     if (output_bf_.Size() > 0) {
         client_channel_ -> EnableWriteMode();
     } else {
-        // Nothing to flush — close immediately.
-        // Callers that need async handler support (EOF path) should set a
-        // deadline before calling CloseAfterWrite.
         ForceClose();
     }
 }
