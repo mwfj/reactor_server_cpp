@@ -388,6 +388,25 @@ void ConnectionHandler::DoSendRaw(const char *data, size_t size){
 
 void ConnectionHandler::CloseAfterWrite(){
     close_after_write_.store(true, std::memory_order_release);
+    // Route to the dispatcher thread so this runs after any previously
+    // enqueued sends (e.g., WS close frames queued via SendRaw from
+    // HttpServer::Stop()). Without this, an off-thread caller sees an
+    // empty output_bf_ and takes the ForceClose path before the
+    // enqueued DoSendRaw has had a chance to fill the buffer.
+    if (event_dispatcher_ && !event_dispatcher_->is_on_loop_thread()
+        && !event_dispatcher_->was_stopped()) {
+        std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
+        event_dispatcher_->EnQueue([weak_self]() {
+            if (auto self = weak_self.lock()) {
+                if (self->output_bf_.Size() > 0) {
+                    self->client_channel_->EnableWriteMode();
+                } else {
+                    self->ForceClose();
+                }
+            }
+        });
+        return;
+    }
     if (output_bf_.Size() > 0) {
         client_channel_ -> EnableWriteMode();
     } else {
@@ -719,6 +738,12 @@ bool ConnectionHandler::IsTimeOut(std::chrono::seconds duration) const {
     if (has_deadline_ && std::chrono::steady_clock::now() > deadline_) {
         return true;
     }
+    // If a protocol-specific deadline is active but not yet expired, skip
+    // the idle timeout — the deadline governs this connection's lifetime
+    // (e.g., HTTP 30s close-drain, WS 5s close-handshake). Without this,
+    // a shorter idle timeout would force-close healthy drain/handshake
+    // phases, causing truncated HTTP responses or spurious WS 1006 closures.
+    if (has_deadline_) return false;
     // duration == 0 means idle timeout is disabled
     if (duration.count() == 0) return false;
     return ts_.IsTimeOut(duration);
