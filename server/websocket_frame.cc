@@ -130,8 +130,5 @@ bool WebSocketFrame::IsValidCloseCode(uint16_t code) {
 bool WebSocketFrame::IsValidServerCloseCode(uint16_t code) {
     // Same as IsValidCloseCode but excludes 1010 ("Missing Extension"),
     // which is designated client-only per RFC 6455 §7.4.1.
-    return (code >= 1000 && code <= 1003) ||
-           (code >= 1007 && code <= 1009) ||
-           (code >= 1011 && code <= 1014) ||
-           (code >= 3000 && code <= 4999);
+    return IsValidCloseCode(code) && code != 1010;
 }
