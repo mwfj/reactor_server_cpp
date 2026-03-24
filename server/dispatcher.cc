@@ -100,6 +100,7 @@ void Dispatcher::RunEventLoop(){
     thread_id_.store(std::this_thread::get_id(), std::memory_order_release);
 
     while(is_running()){
+      try {
         // Use 1000ms timeout instead of blocking indefinitely
         // This allows the server to check is_running() periodically
         std::vector<std::shared_ptr<Channel>> channels = ep_->WaitForEvent(1000);
@@ -148,6 +149,14 @@ void Dispatcher::RunEventLoop(){
             TimerHandler();
         }
 
+      } catch (const std::exception& e) {
+        // Catch exceptions from WaitForEvent, TimerHandler, or timeout callbacks
+        // that escape the inner try/catch. Without this, the dispatcher thread dies
+        // and NetServer::Stop()'s barrier future.wait() hangs forever.
+        std::cerr << "[Dispatcher] Event loop error: " << e.what() << std::endl;
+      } catch (...) {
+        std::cerr << "[Dispatcher] Unknown event loop error" << std::endl;
+      }
     } // end of while(is_running())
 
     // Final drain: process all tasks enqueued during shutdown.

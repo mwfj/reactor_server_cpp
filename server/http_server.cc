@@ -68,7 +68,11 @@ HttpServer::HttpServer(const ServerConfig& config)
                           ? std::max(config.idle_timeout_sec / 6, 1) : 0;
                       int req_interval = config.request_timeout_sec > 0
                           ? std::max(config.request_timeout_sec / 3, 1) : 0;
-                      if (idle_interval == 0 && req_interval == 0) return 60;  // both disabled
+                      // Both user timeouts disabled, but protocol-level deadlines
+                      // (WS close handshake 5s, HTTP close-drain 30s) still need
+                      // the timer scan to enforce them. Use 5s to match the
+                      // shortest protocol deadline.
+                      if (idle_interval == 0 && req_interval == 0) return 5;
                       if (idle_interval == 0) return req_interval;
                       if (req_interval == 0) return idle_interval;
                       return std::min(idle_interval, req_interval);

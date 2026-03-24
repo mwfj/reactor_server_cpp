@@ -80,8 +80,17 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
         throw std::runtime_error(std::string("Error accepting connection: ") + strerror(errno));
     }
 #if defined(__APPLE__) || defined(__MACH__)
-    // Set non-blocking after successful accept on macOS
+    // Set non-blocking after successful accept on macOS.
+    // On Linux, accept4(SOCK_NONBLOCK) handles this atomically.
+    // Check fd validity after SetNonBlocking: if it silently returned
+    // on EBADF (fd-reuse race), the fd is dead and must not be handed
+    // to the reactor — later epoll/kqueue registration would operate
+    // on an fd that may already belong to another connection.
     SetNonBlocking(clientfd);
+    if (fcntl(clientfd, F_GETFL) == -1) {
+        // fd is dead — treat as aborted connection, continue draining
+        return ACCEPT_CONN_ABORTED;
+    }
 #endif
     _clientAddr.SetAddr(acceptAddr);
     return clientfd;
