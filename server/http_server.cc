@@ -129,16 +129,27 @@ size_t HttpServer::ComputeInputCap() const {
     // after the parser processes what it has. No data is discarded.
     // No multiplier needed — the parser processes data incrementally across
     // cycles. Wire overhead (chunked framing etc.) is handled naturally.
+    size_t http_cap = 0;
     if (max_header_size_ > 0 && max_body_size_ > 0) {
         size_t sum = max_header_size_ + max_body_size_;
-        if (sum < max_header_size_) return 0;  // overflow guard
-        return sum;
+        if (sum >= max_header_size_) http_cap = sum;  // overflow guard
     } else if (max_header_size_ > 0) {
-        return max_header_size_;
+        http_cap = max_header_size_;
     } else if (max_body_size_ > 0) {
-        return max_body_size_;
+        http_cap = max_body_size_;
     }
-    return 0;
+
+    // Also bound by WS message size. A client can coalesce an HTTP upgrade
+    // request with a large first WS frame in one read. Without this, the
+    // pre-upgrade cap (based on HTTP limits) allows more data than
+    // max_ws_message_size_ to be buffered before the cap switches post-upgrade.
+    // The HTTP parser processes incrementally, so a smaller cap is fine —
+    // it just means more read cycles for large HTTP bodies.
+    if (max_ws_message_size_ > 0) {
+        if (http_cap == 0) return max_ws_message_size_;
+        return std::min(http_cap, max_ws_message_size_);
+    }
+    return http_cap;
 }
 
 HttpServer::~HttpServer() {

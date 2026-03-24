@@ -165,14 +165,25 @@ static int on_headers_complete(llhttp_t* parser) {
     self->request_.http_major = parser->http_major;
     self->request_.http_minor = parser->http_minor;
 
-    // Parse URL into path and query
-    const std::string& url = self->request_.url;
-    auto qpos = url.find('?');
+    // Parse URL into path and query.
+    // Handle absolute-form request-targets (RFC 7230 §5.3.2):
+    // "GET http://example.com/foo?x=1 HTTP/1.1" → path = "/foo"
+    std::string target = self->request_.url;
+    if (target.compare(0, 7, "http://") == 0 ||
+        target.compare(0, 8, "https://") == 0) {
+        // Skip scheme + authority: find the first '/' after "://"
+        auto scheme_end = target.find("://");
+        auto path_pos = target.find('/', scheme_end + 3);
+        target = (path_pos != std::string::npos)
+                 ? target.substr(path_pos)
+                 : "/";
+    }
+    auto qpos = target.find('?');
     if (qpos != std::string::npos) {
-        self->request_.path = url.substr(0, qpos);
-        self->request_.query = url.substr(qpos + 1);
+        self->request_.path = target.substr(0, qpos);
+        self->request_.query = target.substr(qpos + 1);
     } else {
-        self->request_.path = url;
+        self->request_.path = target;
     }
 
     // Keep-alive
