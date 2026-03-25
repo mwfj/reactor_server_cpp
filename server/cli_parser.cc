@@ -6,6 +6,8 @@
 #include <openssl/opensslv.h>
 #include <openssl/crypto.h>
 
+#include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -15,9 +17,10 @@
 // ── Validation helpers (file-scope) ──────────────────────────────
 
 static int ParsePort(const char* str) {
+    errno = 0;
     char* end = nullptr;
     long val = std::strtol(str, &end, 10);
-    if (end == str || *end != '\0' || val < 1 || val > 65535) {
+    if (end == str || *end != '\0' || errno == ERANGE || val < 1 || val > 65535) {
         throw std::runtime_error(
             std::string("Invalid port: '") + str + "' (must be 1-65535)");
     }
@@ -25,9 +28,11 @@ static int ParsePort(const char* str) {
 }
 
 static int ParsePositiveInt(const char* str, const char* flag_name) {
+    errno = 0;
     char* end = nullptr;
     long val = std::strtol(str, &end, 10);
-    if (end == str || *end != '\0' || val <= 0) {
+    if (end == str || *end != '\0' || errno == ERANGE ||
+        val <= 0 || val > INT_MAX) {
         throw std::runtime_error(
             std::string("Invalid value for ") + flag_name +
             ": '" + str + "' (must be a positive integer)");
@@ -100,9 +105,13 @@ static const char* short_options = "c:ts:p:H:l:w:P:vVh";
 CliOptions CliParser::Parse(int argc, char* argv[]) {
     CliOptions options;
 
-    // Reset getopt global state (important for testability)
+    // Reset getopt global state (important for testability).
+    // BSD/macOS getopt_long also requires optreset = 1 for repeated parsing.
     optind = 1;
     opterr = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    optreset = 1;
+#endif
 
     int opt;
     while ((opt = getopt_long(argc, argv, short_options, long_options, nullptr)) != -1) {

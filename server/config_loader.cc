@@ -1,4 +1,5 @@
 #include "config/config_loader.h"
+#include "log/logger.h"
 #include "nlohmann/json.hpp"
 
 #include <fstream>
@@ -252,6 +253,18 @@ void ConfigLoader::Validate(const ServerConfig& config) {
         throw std::invalid_argument(
             "Invalid request_timeout_sec: " + std::to_string(config.request_timeout_sec) +
             " (must be >= 0, 0 = disabled)");
+    }
+
+    // Validate log level against the set recognized by logging::ParseLevel().
+    // ParseLevel returns info for unrecognized strings — if the input isn't
+    // literally "info" but maps to info, it's unrecognized (including empty).
+    {
+        spdlog::level::level_enum parsed = logging::ParseLevel(config.log.level);
+        if (parsed == spdlog::level::info && config.log.level != "info") {
+            throw std::invalid_argument(
+                "Invalid log.level: '" + config.log.level +
+                "' (must be trace, debug, info, warn, error, or critical)");
+        }
     }
 
     // Validate log rotation settings when file logging is configured.

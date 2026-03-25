@@ -1,5 +1,7 @@
 #pragma once
 
+// Lightweight CLI header — only needs <string> (not in common.h).
+// Intentionally avoids pulling common.h to keep the CLI interface minimal.
 #include <string>
 
 inline constexpr const char* DEFAULT_CONFIG_PATH = "config/server.json";

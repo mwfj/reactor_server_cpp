@@ -133,9 +133,11 @@ pid_t PidFile::CheckRunning(const std::string& path) {
         unlink(path.c_str());
         return -1;
     }
+    // Save errno before close() — POSIX doesn't guarantee close() preserves it
+    int flock_errno = errno;
     close(fd);
 
-    if (errno == EWOULDBLOCK) {
+    if (flock_errno == EWOULDBLOCK) {
         // Lock held by another process — server is running
         return pid;
     }

@@ -12,9 +12,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
 #include <iostream>
 #include <thread>
+#include <unistd.h>
 
 static constexpr int EXIT_OK          = 0;
 static constexpr int EXIT_ERROR       = 1;
@@ -113,17 +113,15 @@ int main(int argc, char* argv[]) {
     // Load and resolve config (precedence: defaults < file < env < CLI)
     ServerConfig config;
     try {
-        // Only fall back to defaults if the default config path doesn't exist.
-        // If the file exists but has parse errors, always report the error —
-        // even for the default path. User-specified paths always error on missing.
-        std::ifstream probe(options.config_path);
-        if (probe.good()) {
-            probe.close();
+        // Only the default config path may be absent (ENOENT). All other
+        // access failures (EACCES, ENOTDIR, etc.) are always reported.
+        if (access(options.config_path.c_str(), F_OK) == 0) {
             config = ConfigLoader::LoadFromFile(options.config_path);
-        } else if (options.config_path == DEFAULT_CONFIG_PATH) {
+        } else if (errno == ENOENT && options.config_path == DEFAULT_CONFIG_PATH) {
             config = ConfigLoader::Default();
         } else {
-            std::cerr << "Error: Cannot open config file: " << options.config_path << "\n";
+            std::cerr << "Error: " << options.config_path << ": "
+                      << std::strerror(errno) << "\n";
             return EXIT_ERROR;
         }
         ConfigLoader::ApplyEnvOverrides(config);

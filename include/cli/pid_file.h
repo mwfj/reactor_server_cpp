@@ -1,5 +1,6 @@
 #pragma once
 
+// Lightweight CLI header — only needs <string> and pid_t (not in common.h).
 #include <string>
 #include <sys/types.h>
 
