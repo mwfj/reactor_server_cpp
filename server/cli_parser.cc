@@ -1,5 +1,6 @@
 #include "cli/cli_parser.h"
 #include "cli/version.h"
+#include "log/logger.h"
 
 #include <getopt.h>
 #include <openssl/opensslv.h>
@@ -34,14 +35,15 @@ static int ParsePositiveInt(const char* str, const char* flag_name) {
     return static_cast<int>(val);
 }
 
+// Validates against the same set recognized by logging::ParseLevel().
+// Delegates to ParseLevel and rejects strings that map to the default fallback.
 static std::string ValidateLogLevel(const char* str) {
-    if (std::strcmp(str, "trace") == 0 ||
-        std::strcmp(str, "debug") == 0 ||
-        std::strcmp(str, "info") == 0 ||
-        std::strcmp(str, "warn") == 0 ||
-        std::strcmp(str, "error") == 0 ||
-        std::strcmp(str, "critical") == 0) {
-        return str;
+    std::string level_str(str);
+    spdlog::level::level_enum parsed = logging::ParseLevel(level_str);
+    // ParseLevel returns info for unrecognized strings. If the input isn't
+    // literally "info" but parsed to info, it's unrecognized.
+    if (parsed != spdlog::level::info || level_str == "info") {
+        return level_str;
     }
     throw std::runtime_error(
         std::string("Invalid log level: '") + str +

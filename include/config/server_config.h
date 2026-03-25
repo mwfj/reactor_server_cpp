@@ -17,6 +17,9 @@ struct LogConfig {
     int max_files = 3;
 };
 
+// NOTE: When adding fields, also update ConfigLoader::LoadFromString(),
+// ConfigLoader::ToJson(), ConfigLoader::ApplyEnvOverrides(), and
+// ConfigLoader::Validate() to keep serialization/deserialization in sync.
 struct ServerConfig {
     std::string bind_host = "127.0.0.1";
     int bind_port = 8080;

@@ -102,28 +102,37 @@ void SignalHandler::WaitForSignal(HttpServer* server) {
 #if defined(__linux__)
     uint64_t val;
     while (true) {
-        ssize_t n = read(g_signal_eventfd, &val, sizeof(val));
+        // Snapshot the fd — Cleanup() may close it concurrently.
+        int fd = g_signal_eventfd;
+        if (fd < 0) break;
+
+        ssize_t n = read(fd, &val, sizeof(val));
         if (n == static_cast<ssize_t>(sizeof(val))) {
             received_signal = true;
             break;
         }
         if (n == -1 && errno == EINTR) continue;
         if (n == -1 && errno == EAGAIN) {
-            // eventfd is non-blocking; use poll to block until data arrives
             struct pollfd pfd;
-            pfd.fd = g_signal_eventfd;
+            pfd.fd = fd;
             pfd.events = POLLIN;
-            int ret = poll(&pfd, 1, -1);
+            int ret = poll(&pfd, 1, 500);  // 500ms timeout to recheck fd validity
             if (ret < 0 && errno == EINTR) continue;
-            if (ret < 0) break;  // poll error, treat as cleanup
+            if (ret == 0) continue;  // timeout — recheck g_signal_eventfd
+            if (ret < 0) break;
+            // Check for POLLNVAL — fd was closed by Cleanup()
+            if (pfd.revents & POLLNVAL) break;
             continue;
         }
-        break;  // read error or fd closed (Cleanup called) — exit
+        break;  // read error or EBADF from closed fd
     }
 #else
     char buf[16];
     while (true) {
-        ssize_t n = read(g_signal_pipe[0], buf, sizeof(buf));
+        int fd = g_signal_pipe[0];
+        if (fd < 0) break;
+
+        ssize_t n = read(fd, buf, sizeof(buf));
         if (n > 0) {
             received_signal = true;
             break;
@@ -131,16 +140,17 @@ void SignalHandler::WaitForSignal(HttpServer* server) {
         if (n == 0) break;  // pipe closed (Cleanup called)
         if (n == -1 && errno == EINTR) continue;
         if (n == -1 && errno == EAGAIN) {
-            // Pipe is non-blocking; use poll to wait for data
             struct pollfd pfd;
-            pfd.fd = g_signal_pipe[0];
+            pfd.fd = fd;
             pfd.events = POLLIN;
-            int ret = poll(&pfd, 1, -1);
+            int ret = poll(&pfd, 1, 500);
             if (ret < 0 && errno == EINTR) continue;
-            if (ret < 0) break;  // poll error
+            if (ret == 0) continue;
+            if (ret < 0) break;
+            if (pfd.revents & POLLNVAL) break;
             continue;
         }
-        break;  // unexpected error
+        break;
     }
 #endif
 

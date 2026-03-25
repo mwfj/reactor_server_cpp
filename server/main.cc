@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <thread>
 
@@ -70,7 +71,7 @@ MakeHealthHandler(std::chrono::steady_clock::time_point start_time) {
         auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
             now - start_time).count();
 
-        char buf[128];
+        char buf[256];
         std::snprintf(buf, sizeof(buf),
             R"({"status":"ok","pid":%d,"uptime_seconds":%lld})",
             static_cast<int>(getpid()), static_cast<long long>(uptime));
@@ -81,7 +82,6 @@ MakeHealthHandler(std::chrono::steady_clock::time_point start_time) {
 // ── main ─────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
-    // Phase 1: Parse CLI arguments
     CliOptions options;
     try {
         options = CliParser::Parse(argc, argv);
@@ -91,7 +91,7 @@ int main(int argc, char* argv[]) {
         return EXIT_USAGE_ERROR;
     }
 
-    // Phase 2: Handle info commands (no config needed)
+    // Handle info commands (no config needed)
     if (options.help) {
         CliParser::PrintUsage(argv[0]);
         return EXIT_OK;
@@ -105,25 +105,26 @@ int main(int argc, char* argv[]) {
         return EXIT_OK;
     }
 
-    // Phase 3: Handle signal commands (stop/status)
+    // Handle signal commands (stop/status)
     if (!options.signal_action.empty()) {
         return HandleSignalCommand(options);
     }
 
-    // Phase 4: Load and resolve config
-    //   Precedence: defaults < config file < env vars < CLI flags
+    // Load and resolve config (precedence: defaults < file < env < CLI)
     ServerConfig config;
     try {
-        try {
+        // Only fall back to defaults if the default config path doesn't exist.
+        // If the file exists but has parse errors, always report the error —
+        // even for the default path. User-specified paths always error on missing.
+        std::ifstream probe(options.config_path);
+        if (probe.good()) {
+            probe.close();
             config = ConfigLoader::LoadFromFile(options.config_path);
-        } catch (const std::runtime_error&) {
-            // Default config path missing is OK — use defaults.
-            // User-specified path missing is an error.
-            if (options.config_path == DEFAULT_CONFIG_PATH) {
-                config = ConfigLoader::Default();
-            } else {
-                throw;
-            }
+        } else if (options.config_path == DEFAULT_CONFIG_PATH) {
+            config = ConfigLoader::Default();
+        } else {
+            std::cerr << "Error: Cannot open config file: " << options.config_path << "\n";
+            return EXIT_ERROR;
         }
         ConfigLoader::ApplyEnvOverrides(config);
         ApplyCliOverrides(config, options);
@@ -132,7 +133,7 @@ int main(int argc, char* argv[]) {
         return EXIT_ERROR;
     }
 
-    // Phase 5: Config inspection commands
+    // Config inspection commands
     if (options.test_config) {
         try {
             ConfigLoader::Validate(config);
@@ -143,12 +144,7 @@ int main(int argc, char* argv[]) {
             return EXIT_ERROR;
         }
     }
-    if (options.dump_effective_config) {
-        std::cout << ConfigLoader::ToJson(config) << "\n";
-        return EXIT_OK;
-    }
-
-    // Phase 6: Validate config for server startup
+    // Validate config (needed for both --dump-effective-config and server startup)
     try {
         ConfigLoader::Validate(config);
     } catch (const std::invalid_argument& e) {
@@ -156,13 +152,18 @@ int main(int argc, char* argv[]) {
         return EXIT_ERROR;
     }
 
-    // Phase 7: PID file
+    if (options.dump_effective_config) {
+        std::cout << ConfigLoader::ToJson(config) << "\n";
+        return EXIT_OK;
+    }
+
+    // PID file
     if (!PidFile::Acquire(options.pid_file)) {
         return EXIT_ERROR;
     }
     std::atexit(PidFile::Release);
 
-    // Phase 8: Signal handler (self-pipe pattern)
+    // Signal handler (self-pipe pattern)
     try {
         SignalHandler::Install();
     } catch (const std::runtime_error& e) {
@@ -196,15 +197,15 @@ int main(int argc, char* argv[]) {
             logging::Get()->info("  Health:  /health");
         }
 
-        // Phase 12: Start signal-watcher thread
+        // Start signal-watcher thread
         signal_thread = std::thread(SignalHandler::WaitForSignal, server.get());
 
-        // Phase 13: Start server (blocks until Stop() is called)
+        // Start server (blocks until Stop() is called)
         logging::Get()->info("{} ready, accepting connections",
                              REACTOR_SERVER_NAME);
         server->Start();
 
-        // Phase 14: Wait for signal thread
+        // Wait for signal thread
         if (signal_thread.joinable()) {
             signal_thread.join();
         }
@@ -223,7 +224,7 @@ int main(int argc, char* argv[]) {
     // Server destroyed here — after signal_thread is joined
     server.reset();
 
-    // Phase 15: Cleanup
+    // Cleanup
     SignalHandler::Cleanup();
     // PidFile::Release() called by atexit
     logging::Shutdown();

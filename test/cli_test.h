@@ -720,11 +720,12 @@ void TestPidFileCheckRunningNotRunning() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Helper: apply CLI overrides exactly as main.cc does.
+// Must match the implementation in server/main.cc exactly.
 static void ApplyCliOverrides(ServerConfig& config, const CliOptions& opts) {
-    if (opts.port >= 0)           config.bind_port       = static_cast<uint16_t>(opts.port);
+    if (opts.port >= 0)           config.bind_port       = opts.port;
     if (!opts.host.empty())       config.bind_host       = opts.host;
     if (!opts.log_level.empty())  config.log.level       = opts.log_level;
-    if (opts.workers >= 0)        config.worker_threads  = static_cast<size_t>(opts.workers);
+    if (opts.workers >= 0)        config.worker_threads  = opts.workers;
 }
 
 // Test 25: ConfigLoader::Default() values preserved when no overrides applied.
@@ -905,31 +906,8 @@ void TestConfigUnsetCliDoesNotRevertEnv() {
 void TestSignalHandlerInstallAndCleanup() {
     std::cout << "\n[TEST] SignalHandler: Install and Cleanup succeeds..." << std::endl;
     try {
-        // Count open fds before
-        int fd_before = -1;
-        {
-            // /proc/self/fd is Linux-specific; use a count-via-getdtablesize
-            // approach that works cross-platform: attempt open at successively
-            // higher fds.  Simpler: just count entries in /proc/self/fd if
-            // available, otherwise skip the count check.
-            int dir_fd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
-            if (dir_fd >= 0) {
-                fd_before = dir_fd;
-                close(dir_fd);
-            }
-        }
-
         SignalHandler::Install();
         SignalHandler::Cleanup();
-
-        // Count open fds after
-        if (fd_before >= 0) {
-            int dir_fd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
-            // If /proc/self/fd opened, the fd number should be roughly the same
-            // (Install + Cleanup should not leave fds open).
-            // We just verify we can open /proc/self/fd again without running out.
-            if (dir_fd >= 0) close(dir_fd);
-        }
 
         TestFramework::RecordTest("SignalHandler: Install and Cleanup", true, "", CLI_CATEGORY);
     } catch (const std::exception& e) {

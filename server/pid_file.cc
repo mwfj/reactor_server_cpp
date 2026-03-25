@@ -20,7 +20,7 @@ static std::string g_pid_path;
 // ── Acquire ──────────────────────────────────────────────────────
 
 bool PidFile::Acquire(const std::string& path) {
-    int fd = open(path.c_str(), O_RDWR | O_CREAT, 0644);
+    int fd = open(path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW, 0644);
     if (fd < 0) {
         std::cerr << "Error: Cannot open PID file '" << path
                   << "': " << std::strerror(errno) << "\n";
@@ -59,7 +59,11 @@ bool PidFile::Acquire(const std::string& path) {
         return false;
     }
 
-    dprintf(fd, "%d\n", static_cast<int>(getpid()));
+    if (dprintf(fd, "%d\n", static_cast<int>(getpid())) < 0) {
+        std::cerr << "Error: Cannot write PID: " << std::strerror(errno) << "\n";
+        close(fd);
+        return false;
+    }
 
     // Keep fd open (holds the flock) until Release()
     g_pid_fd = fd;
@@ -112,22 +116,34 @@ pid_t PidFile::CheckRunning(const std::string& path) {
         return -1;
     }
 
-    if (kill(pid, 0) == 0) {
-        // Process is alive (or we have permission to signal it)
-        return pid;
+    // Use flock probe to verify the PID file is actually held by a running
+    // reactor_server instance. This prevents PID-reuse false positives where
+    // kill(pid, 0) succeeds on an unrelated process that reused the PID.
+    int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        return -1;
     }
-
-    if (errno == ESRCH) {
-        // Process does not exist — stale PID file
+    // Try to acquire an exclusive lock (non-blocking).
+    // If we succeed → no one holds it → stale file.
+    // If EWOULDBLOCK → a live reactor_server holds it.
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        // We got the lock — previous holder is gone (stale PID file)
+        flock(fd, LOCK_UN);
+        close(fd);
         unlink(path.c_str());
         return -1;
     }
+    close(fd);
 
-    if (errno == EPERM) {
-        // Process exists but we lack permission to signal it
+    if (errno == EWOULDBLOCK) {
+        // Lock held by another process — server is running
         return pid;
     }
 
-    // Unexpected error — treat as not running
+    // Unexpected flock error — fall back to kill() check
+    if (kill(pid, 0) == 0 || errno == EPERM) {
+        return pid;
+    }
+    unlink(path.c_str());
     return -1;
 }
