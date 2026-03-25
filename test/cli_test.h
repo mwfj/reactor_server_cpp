@@ -660,6 +660,26 @@ void TestPidFileReadPidInvalid() {
     }
 }
 
+// Test 23b: ReadPid rejects numeric-prefix garbage like "123abc".
+void TestPidFileReadPidNumericPrefixGarbage() {
+    std::cout << "\n[TEST] PidFile: ReadPid rejects numeric-prefix garbage..." << std::endl;
+    const std::string path = MakeTmpPidPath();
+    std::remove(path.c_str());
+
+    try {
+        WriteFile(path, "123abc\n");
+        pid_t result = PidFile::ReadPid(path);
+        bool pass = (result == -1);
+        std::string err = pass ? "" :
+            "Expected -1 for '123abc', got " + std::to_string(result);
+        std::remove(path.c_str());
+        TestFramework::RecordTest("PidFile: ReadPid numeric-prefix garbage", pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        std::remove(path.c_str());
+        TestFramework::RecordTest("PidFile: ReadPid numeric-prefix garbage", false, e.what(), CLI_CATEGORY);
+    }
+}
+
 // Test 24: CheckRunning with a dead PID removes the file and returns -1.
 // We pick a PID that is almost certainly not running: POSIX allows PIDs up to
 // at least 32767; we pick something large and use kill(pid,0) to confirm.
@@ -1018,6 +1038,7 @@ void RunAllTests() {
     TestPidFileReadPidValid();
     TestPidFileReadPidMissing();
     TestPidFileReadPidInvalid();
+    TestPidFileReadPidNumericPrefixGarbage();
     TestPidFileCheckRunningNotRunning();
 
     // ── Section 3: Config override precedence ─────────────────────

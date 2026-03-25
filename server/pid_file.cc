@@ -2,6 +2,7 @@
 #include "cli/version.h"
 
 #include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,9 +37,11 @@ bool PidFile::Acquire(const std::string& path) {
             close(fd);
             if (n > 0) {
                 buf[n] = '\0';
+                char* pend = nullptr;
+                long rival_pid = std::strtol(buf, &pend, 10);
                 std::cerr << "Error: " << REACTOR_SERVER_NAME
                           << " is already running (PID "
-                          << std::atol(buf) << ")\n";
+                          << (rival_pid > 0 ? rival_pid : 0L) << ")\n";
             } else {
                 std::cerr << "Error: " << REACTOR_SERVER_NAME
                           << " is already running (PID file locked)\n";
@@ -99,10 +102,19 @@ pid_t PidFile::ReadPid(const std::string& path) {
     }
 
     buf[n] = '\0';
+    errno = 0;
     char* end = nullptr;
     long pid = std::strtol(buf, &end, 10);
-    if (end == buf || pid <= 0) {
+
+    // Reject: no digits parsed, overflow, negative/zero
+    if (end == buf || errno == ERANGE || pid <= 0 || pid > INT_MAX) {
         return -1;
+    }
+    while (*end != '\0') {
+        if (*end != ' ' && *end != '\t' && *end != '\n' && *end != '\r') {
+            return -1;
+        }
+        ++end;
     }
 
     return static_cast<pid_t>(pid);
