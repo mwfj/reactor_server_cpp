@@ -113,11 +113,11 @@ int main(int argc, char* argv[]) {
     // Load and resolve config (precedence: defaults < file < env < CLI)
     ServerConfig config;
     try {
-        // Only the default config path may be absent (ENOENT). All other
-        // access failures (EACCES, ENOTDIR, etc.) are always reported.
+        // If the user explicitly passed -c, the file MUST exist.
+        // Only the implicit default path may be absent.
         if (access(options.config_path.c_str(), F_OK) == 0) {
             config = ConfigLoader::LoadFromFile(options.config_path);
-        } else if (errno == ENOENT && options.config_path == DEFAULT_CONFIG_PATH) {
+        } else if (!options.config_path_explicit && errno == ENOENT) {
             config = ConfigLoader::Default();
         } else {
             std::cerr << "Error: " << options.config_path << ": "

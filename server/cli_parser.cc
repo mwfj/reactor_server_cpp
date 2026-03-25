@@ -118,6 +118,7 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
         switch (opt) {
             case 'c':
                 options.config_path = optarg;
+                options.config_path_explicit = true;
                 break;
             case 't':
                 options.test_config = true;

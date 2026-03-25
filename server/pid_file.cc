@@ -68,9 +68,19 @@ bool PidFile::Acquire(const std::string& path) {
     }
 
     // Reject non-regular files (attacker could pre-create a FIFO/device)
-    if (!IsRegularFile(fd)) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
         std::cerr << "Error: PID file '" << path
                   << "' is not a regular file\n";
+        close(fd);
+        return false;
+    }
+
+    // Reject files owned by a different user. In world-writable directories
+    // like /tmp, another user could pre-create the file to interfere.
+    if (st.st_size > 0 && st.st_uid != geteuid()) {
+        std::cerr << "Error: PID file '" << path
+                  << "' is owned by a different user\n";
         close(fd);
         return false;
     }

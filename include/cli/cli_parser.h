@@ -9,6 +9,7 @@ inline constexpr const char* DEFAULT_CONFIG_PATH = "config/server.json";
 struct CliOptions {
     // Config
     std::string config_path = DEFAULT_CONFIG_PATH;
+    bool config_path_explicit = false;  // true if user passed -c/--config
     bool test_config = false;
     bool dump_effective_config = false;
 
