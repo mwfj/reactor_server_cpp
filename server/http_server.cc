@@ -256,6 +256,17 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     );
 }
 
+void HttpServer::SafeNotifyWsClose(const std::shared_ptr<HttpConnectionHandler>& http_conn) {
+    if (!http_conn) return;
+    auto* ws = http_conn->GetWebSocket();
+    if (ws) {
+        try { ws->NotifyTransportClose(); }
+        catch (const std::exception& e) {
+            logging::Get()->error("Exception in WS close handler: {}", e.what());
+        }
+    }
+}
+
 void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
     // Guard: if the connection already closed (fast disconnect between
     // RegisterCallbacks enabling epoll and new_conn_callback running here),
@@ -288,17 +299,7 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         }
     }
     // Notify old WS handler outside the lock to prevent deadlock.
-    // Catch exceptions from user close handlers to prevent breaking
-    // core cleanup (ReleaseFd, timer removal, connection map erasure).
-    if (old_handler) {
-        auto* ws = old_handler->GetWebSocket();
-        if (ws) {
-            try { ws->NotifyTransportClose(); }
-            catch (const std::exception& e) {
-                logging::Get()->error("Exception in WS close handler: {}", e.what());
-            }
-        }
-    }
+    SafeNotifyWsClose(old_handler);
 
     // Arm a connection-level deadline covering the TLS handshake + first HTTP request.
     // Without this, a client can slow-drip the TLS handshake indefinitely, bypassing
@@ -331,16 +332,7 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
         }
     }
     // Notify WS close handler OUTSIDE the lock to prevent deadlock.
-    // Catch exceptions to prevent breaking core cleanup (ReleaseFd, etc.).
-    if (http_conn) {
-        auto* ws = http_conn->GetWebSocket();
-        if (ws) {
-            try { ws->NotifyTransportClose(); }
-            catch (const std::exception& e) {
-                logging::Get()->error("Exception in WS close handler: {}", e.what());
-            }
-        }
-    }
+    SafeNotifyWsClose(http_conn);
 }
 
 void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) {
@@ -354,15 +346,7 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
             http_connections_.erase(it);
         }
     }
-    if (http_conn) {
-        auto* ws = http_conn->GetWebSocket();
-        if (ws) {
-            try { ws->NotifyTransportClose(); }
-            catch (const std::exception& e) {
-                logging::Get()->error("Exception in WS close handler: {}", e.what());
-            }
-        }
-    }
+    SafeNotifyWsClose(http_conn);
 }
 
 void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message) {
@@ -386,13 +370,7 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
     // notify the old WS handler and replace with a fresh one.
     if (http_conn->GetConnection() != conn) {
         // Notify old WebSocket close handler before discarding
-        auto* old_ws = http_conn->GetWebSocket();
-        if (old_ws) {
-            try { old_ws->NotifyTransportClose(); }
-            catch (const std::exception& e) {
-                logging::Get()->error("Exception in WS close handler: {}", e.what());
-            }
-        }
+        SafeNotifyWsClose(http_conn);
         http_conn = std::make_shared<HttpConnectionHandler>(conn);
         SetupHandlers(http_conn);
         std::lock_guard<std::mutex> lck(conn_mtx_);
