@@ -1,9 +1,7 @@
 #pragma once
 
-#include <functional>
-#include <memory>
-#include <string>
-#include <cstdint>
+#include "common.h"
+// <functional>, <memory>, <string>, <cstdint> provided by common.h
 
 // Forward declarations
 class HttpConnectionHandler;

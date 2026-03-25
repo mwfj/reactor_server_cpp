@@ -76,6 +76,7 @@ private:
     // Returns true to continue pipelining loop, false to stop processing
     bool HandleCompleteRequest(const char*& buf, size_t& remaining, size_t consumed);
     void HandleIncompleteRequest();
+
     std::shared_ptr<ConnectionHandler> conn_;
     HttpParser parser_;
     HTTP_CALLBACKS_NAMESPACE::HttpConnCallbacks callbacks_;
