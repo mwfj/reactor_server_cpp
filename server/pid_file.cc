@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // ── File-scope static state ──────────────────────────────────────
@@ -88,8 +89,17 @@ void PidFile::Release() {
 // ── ReadPid ──────────────────────────────────────────────────────
 
 pid_t PidFile::ReadPid(const std::string& path) {
-    int fd = open(path.c_str(), O_RDONLY);
+    // O_NOFOLLOW: don't follow symlinks (matches Acquire/CheckRunning)
+    // O_NONBLOCK: don't hang on FIFOs/devices
+    int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) {
+        return -1;
+    }
+
+    // Reject non-regular files (FIFOs, devices, directories, sockets)
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
         return -1;
     }
 
@@ -131,7 +141,7 @@ pid_t PidFile::CheckRunning(const std::string& path) {
     // Use flock probe to verify the PID file is actually held by a running
     // reactor_server instance. This prevents PID-reuse false positives where
     // kill(pid, 0) succeeds on an unrelated process that reused the PID.
-    int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+    int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) {
         return -1;
     }
