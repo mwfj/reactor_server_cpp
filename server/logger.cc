@@ -56,4 +56,14 @@ void Shutdown() {
     g_logger.reset();
 }
 
+spdlog::level::level_enum ParseLevel(const std::string& level) {
+    if (level == "trace")    return spdlog::level::trace;
+    if (level == "debug")    return spdlog::level::debug;
+    if (level == "info")     return spdlog::level::info;
+    if (level == "warn")     return spdlog::level::warn;
+    if (level == "error")    return spdlog::level::err;
+    if (level == "critical") return spdlog::level::critical;
+    return spdlog::level::info;
+}
+
 } // namespace logging

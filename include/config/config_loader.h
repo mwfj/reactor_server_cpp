@@ -29,4 +29,7 @@ public:
 
     // Return a ServerConfig with all default values.
     static ServerConfig Default();
+
+    // Serialize a ServerConfig to formatted JSON string.
+    static std::string ToJson(const ServerConfig& config);
 };

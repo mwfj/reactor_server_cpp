@@ -85,18 +85,8 @@ HttpServer::HttpServer(const ServerConfig& config)
     WireNetServerCallbacks();
 
     // Initialize logging from config
-    {
-        spdlog::level::level_enum log_level = spdlog::level::info;
-        if (config.log.level == "trace") log_level = spdlog::level::trace;
-        else if (config.log.level == "debug") log_level = spdlog::level::debug;
-        else if (config.log.level == "info") log_level = spdlog::level::info;
-        else if (config.log.level == "warn") log_level = spdlog::level::warn;
-        else if (config.log.level == "error") log_level = spdlog::level::err;
-        else if (config.log.level == "critical") log_level = spdlog::level::critical;
-
-        logging::Init("reactor", log_level, config.log.file,
-                       config.log.max_file_size, config.log.max_files);
-    }
+    logging::Init("reactor", logging::ParseLevel(config.log.level),
+                  config.log.file, config.log.max_file_size, config.log.max_files);
 
     max_body_size_ = config.max_body_size;
     max_header_size_ = config.max_header_size;

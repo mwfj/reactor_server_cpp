@@ -8,6 +8,7 @@
 #include "http_test.h"
 #include "websocket_test.h"
 #include "tls_test.h"
+#include "cli_test.h"
 #include "test_framework.h"
 #include <algorithm>
 
@@ -46,6 +47,10 @@ void RunAllTest(){
     std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     TlsTests::RunAllTests();
 
+    // Run CLI tests
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    CliTests::RunAllTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -60,6 +65,7 @@ void PrintUsage(const char* program_name) {
     std::cout << "  http,    -H    Run HTTP layer tests only" << std::endl;
     std::cout << "  ws,      -w    Run WebSocket layer tests only" << std::endl;
     std::cout << "  tls,     -T    Run TLS/SSL tests only" << std::endl;
+    std::cout << "  cli,     -C    Run CLI entry point tests only" << std::endl;
     std::cout << "  help,    -h    Show this help message" << std::endl;
     std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls)" << std::endl;
 }
@@ -95,6 +101,9 @@ int main(int argc, char* argv[]) {
         // Run TLS tests
         }else if(mode == "tls" || mode == "-T"){
             TlsTests::RunAllTests();
+        // Run CLI tests
+        }else if(mode == "cli" || mode == "-C"){
+            CliTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

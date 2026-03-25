@@ -289,3 +289,25 @@ void ConfigLoader::Validate(const ServerConfig& config) {
 ServerConfig ConfigLoader::Default() {
     return ServerConfig{};
 }
+
+std::string ConfigLoader::ToJson(const ServerConfig& config) {
+    nlohmann::json j;
+    j["bind_host"]          = config.bind_host;
+    j["bind_port"]          = config.bind_port;
+    j["max_connections"]    = config.max_connections;
+    j["idle_timeout_sec"]   = config.idle_timeout_sec;
+    j["worker_threads"]     = config.worker_threads;
+    j["max_header_size"]    = config.max_header_size;
+    j["max_body_size"]      = config.max_body_size;
+    j["max_ws_message_size"]= config.max_ws_message_size;
+    j["request_timeout_sec"]= config.request_timeout_sec;
+    j["tls"]["enabled"]     = config.tls.enabled;
+    j["tls"]["cert_file"]   = config.tls.cert_file;
+    j["tls"]["key_file"]    = config.tls.key_file;
+    j["tls"]["min_version"] = config.tls.min_version;
+    j["log"]["level"]       = config.log.level;
+    j["log"]["file"]        = config.log.file;
+    j["log"]["max_file_size"] = config.log.max_file_size;
+    j["log"]["max_files"]   = config.log.max_files;
+    return j.dump(4);
+}
