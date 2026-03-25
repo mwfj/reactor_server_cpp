@@ -9,7 +9,6 @@
 #include <iostream>
 
 #include <fcntl.h>
-#include <signal.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -149,52 +148,18 @@ pid_t PidFile::ReadPid(const std::string& path) {
 }
 
 // ── CheckRunning ─────────────────────────────────────────────────
-
-// On Linux, verify that process `pid` actually holds an fd open on the
-// same inode as `pid_fd`. This guards against PID file content tampering
-// where the file says one PID but the flock is held by a different process.
-static bool VerifyLockHolder(pid_t pid, int pid_fd) {
-#if defined(__linux__)
-    struct stat pid_file_st;
-    if (fstat(pid_fd, &pid_file_st) != 0) {
-        return false;
-    }
-
-    // Scan /proc/<pid>/fd/ for an fd pointing to the same inode
-    char proc_dir[64];
-    std::snprintf(proc_dir, sizeof(proc_dir), "/proc/%d/fd", static_cast<int>(pid));
-    int dfd = open(proc_dir, O_RDONLY | O_DIRECTORY);
-    if (dfd < 0) {
-        // Can't read /proc/<pid>/fd — the PID in the file may be
-        // tampered, so reject rather than trust unverifiable content
-        return false;
-    }
-    close(dfd);
-
-    // Scan fd numbers 0-255 for a matching inode
-    // (the server holds the PID file on a low fd)
-    for (int i = 0; i < 256; ++i) {
-        char link_path[80];
-        struct stat link_st;
-        std::snprintf(link_path, sizeof(link_path), "/proc/%d/fd/%d",
-                      static_cast<int>(pid), i);
-        if (stat(link_path, &link_st) == 0 &&
-            link_st.st_dev == pid_file_st.st_dev &&
-            link_st.st_ino == pid_file_st.st_ino) {
-            return true;
-        }
-    }
-    return false;
-#else
-    // macOS: no /proc, fall back to kill check
-    (void)pid_fd;
-    return (kill(pid, 0) == 0 || errno == EPERM);
-#endif
-}
+//
+// Security model: the flock probe is the authoritative check. If we
+// cannot acquire the exclusive lock, a reactor_server instance holds it.
+// The PID read from the file was written by the lock holder at startup.
+//
+// Known limitation (shared with nginx/haproxy): a same-user attacker
+// who can write to the PID file can change the recorded PID. Advisory
+// locks cannot prevent this. However, such an attacker can already
+// kill same-user processes directly, so the PID file is not the
+// weakest link. Cross-user tampering is prevented by file ownership.
 
 pid_t PidFile::CheckRunning(const std::string& path) {
-    // Single open: flock probe + PID read on the same fd to eliminate
-    // the TOCTOU window where file content could change between reads.
     int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) {
         return -1;
@@ -207,10 +172,11 @@ pid_t PidFile::CheckRunning(const std::string& path) {
 
     // Probe the flock to determine if a reactor_server instance holds it.
     if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
-        // We got the lock — no server holds it (stale PID file)
-        flock(fd, LOCK_UN);
-        close(fd);
+        // We got the lock — no server holds it. Unlink while we still
+        // hold the lock to prevent a race where a new server acquires
+        // the file between our close() and unlink().
         unlink(path.c_str());
+        close(fd);
         return -1;
     }
     int flock_errno = errno;
@@ -220,23 +186,10 @@ pid_t PidFile::CheckRunning(const std::string& path) {
         return -1;
     }
 
-    // Lock held by another process. Read PID from THIS fd.
+    // Lock held by another process. Read PID from this fd.
     char buf[32];
     ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
-    pid_t pid = ParsePidBuf(buf, n);
-
-    if (pid <= 0) {
-        close(fd);
-        return -1;
-    }
-
-    // Verify the PID in the file is actually the process holding the flock.
-    // Defends against content tampering (advisory locks don't prevent writes).
-    if (!VerifyLockHolder(pid, fd)) {
-        close(fd);
-        return -1;
-    }
-
     close(fd);
-    return pid;
+
+    return ParsePidBuf(buf, n);
 }
