@@ -37,8 +37,9 @@ THREAD_POOL_DIR = thread_pool
 UTIL_DIR = util
 THIRD_PARTY_DIR = third_party
 
-# Target executable
+# Target executables
 TARGET = run
+SERVER_TARGET = reactor_server
 
 # Source files (organized by component)
 # Core reactor components
@@ -65,8 +66,14 @@ WS_SRCS = $(SERVER_DIR)/websocket_frame.cc $(SERVER_DIR)/websocket_handshake.cc 
 # TLS layer sources
 TLS_SRCS = $(SERVER_DIR)/tls_context.cc $(SERVER_DIR)/tls_connection.cc
 
-# Application code
+# CLI layer sources
+CLI_SRCS = $(SERVER_DIR)/cli_parser.cc $(SERVER_DIR)/signal_handler.cc $(SERVER_DIR)/pid_file.cc
+
+# Application code (test entry point)
 APP_SRCS = $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/run_test.cc
+
+# Production entry point
+MAIN_SRC = $(SERVER_DIR)/main.cc
 
 # TimeStamp Code
 UTIL_SRCS = $(UTIL_DIR)/timestamp.cc
@@ -75,8 +82,11 @@ UTIL_SRCS = $(UTIL_DIR)/timestamp.cc
 LLHTTP_SRC = $(THIRD_PARTY_DIR)/llhttp/llhttp.c $(THIRD_PARTY_DIR)/llhttp/api.c $(THIRD_PARTY_DIR)/llhttp/http.c
 LLHTTP_OBJ = $(LLHTTP_SRC:.c=.o)
 
-# All sources combined
-SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(FOUNDATION_SRCS) $(HTTP_SRCS) $(WS_SRCS) $(TLS_SRCS) $(APP_SRCS) $(UTIL_SRCS)
+# Server library sources (shared between test and production binaries)
+LIB_SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(FOUNDATION_SRCS) $(HTTP_SRCS) $(WS_SRCS) $(TLS_SRCS) $(CLI_SRCS) $(UTIL_SRCS)
+
+# Test binary sources
+TEST_SRCS = $(LIB_SRCS) $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/run_test.cc
 
 # Header files (organized by category)
 CORE_HEADERS = $(LIB_DIR)/common.h $(LIB_DIR)/inet_addr.h
@@ -87,27 +97,32 @@ SERVER_HEADERS = $(LIB_DIR)/net_server.h $(LIB_DIR)/buffer.h $(LIB_DIR)/reactor_
 THREAD_POOL_HEADERS = $(THREAD_POOL_DIR)/include/threadpool.h $(THREAD_POOL_DIR)/include/threadtask.h
 UTIL_HEADERS = $(UTIL_DIR)/timestamp.h
 FOUNDATION_HEADERS = $(LIB_DIR)/log/logger.h $(LIB_DIR)/config/server_config.h $(LIB_DIR)/config/config_loader.h
-TEST_HEADERS = $(TEST_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h
+CLI_HEADERS = $(LIB_DIR)/cli/cli_parser.h $(LIB_DIR)/cli/signal_handler.h $(LIB_DIR)/cli/pid_file.h $(LIB_DIR)/cli/version.h
+TEST_HEADERS = $(TEST_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h
 
 # All headers combined
-HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(FOUNDATION_HEADERS) $(TEST_HEADERS)
+HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(FOUNDATION_HEADERS) $(CLI_HEADERS) $(TEST_HEADERS)
 
 # Default target
 .DEFAULT_GOAL := all
 
-all: $(TARGET)
+all: $(TARGET) $(SERVER_TARGET)
 
 # Compile llhttp C sources to object files
 $(THIRD_PARTY_DIR)/llhttp/%.o: $(THIRD_PARTY_DIR)/llhttp/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Build the executable
-$(TARGET): $(SRCS) $(HEADERS) $(LLHTTP_OBJ)
-	$(CXX) $(CXXFLAGS) $(SRCS) $(LLHTTP_OBJ) $(LDFLAGS) -o $(TARGET)
+# Build the test executable
+$(TARGET): $(TEST_SRCS) $(HEADERS) $(LLHTTP_OBJ)
+	$(CXX) $(CXXFLAGS) $(TEST_SRCS) $(LLHTTP_OBJ) $(LDFLAGS) -o $(TARGET)
+
+# Build the production server binary
+$(SERVER_TARGET): $(LIB_SRCS) $(MAIN_SRC) $(HEADERS) $(LLHTTP_OBJ)
+	$(CXX) $(CXXFLAGS) $(LIB_SRCS) $(MAIN_SRC) $(LLHTTP_OBJ) $(LDFLAGS) -o $(SERVER_TARGET)
 
 # Clean build artifacts
 clean:
-	rm -rf $(TARGET)* $(LLHTTP_OBJ)
+	rm -rf $(TARGET)* $(SERVER_TARGET) $(LLHTTP_OBJ)
 
 # Run all tests
 test: $(TARGET)
@@ -148,6 +163,11 @@ test_ws: $(TARGET)
 test_tls: $(TARGET)
 	@echo "Running TLS tests only..."
 	./$(TARGET) tls
+
+# Run only CLI entry point tests
+test_cli: $(TARGET)
+	@echo "Running CLI tests only..."
+	./$(TARGET) cli
 
 # Display help information
 help:
@@ -225,4 +245,7 @@ help:
 	@echo "  - test/RACE_CONDITION_TESTS_README.md - Race condition tests"
 
 # Phony targets
-.PHONY: all clean test test_basic test_stress test_race test_config test_http test_ws test_tls help
+# Build only the production server binary
+server: $(SERVER_TARGET)
+
+.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli help

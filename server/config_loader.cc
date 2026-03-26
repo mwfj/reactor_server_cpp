@@ -1,4 +1,5 @@
 #include "config/config_loader.h"
+#include "log/logger.h"
 #include "nlohmann/json.hpp"
 
 #include <fstream>
@@ -254,6 +255,18 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             " (must be >= 0, 0 = disabled)");
     }
 
+    // Validate log level against the set recognized by logging::ParseLevel().
+    // ParseLevel returns info for unrecognized strings — if the input isn't
+    // literally "info" but maps to info, it's unrecognized (including empty).
+    {
+        spdlog::level::level_enum parsed = logging::ParseLevel(config.log.level);
+        if (parsed == spdlog::level::info && config.log.level != "info") {
+            throw std::invalid_argument(
+                "Invalid log.level: '" + config.log.level +
+                "' (must be trace, debug, info, warn, error, or critical)");
+        }
+    }
+
     // Validate log rotation settings when file logging is configured.
     // spdlog::rotating_file_sink_mt throws on max_size == 0, and negative
     // max_files converts to a huge size_t causing resource exhaustion.
@@ -288,4 +301,26 @@ void ConfigLoader::Validate(const ServerConfig& config) {
 
 ServerConfig ConfigLoader::Default() {
     return ServerConfig{};
+}
+
+std::string ConfigLoader::ToJson(const ServerConfig& config) {
+    nlohmann::json j;
+    j["bind_host"]          = config.bind_host;
+    j["bind_port"]          = config.bind_port;
+    j["max_connections"]    = config.max_connections;
+    j["idle_timeout_sec"]   = config.idle_timeout_sec;
+    j["worker_threads"]     = config.worker_threads;
+    j["max_header_size"]    = config.max_header_size;
+    j["max_body_size"]      = config.max_body_size;
+    j["max_ws_message_size"]= config.max_ws_message_size;
+    j["request_timeout_sec"]= config.request_timeout_sec;
+    j["tls"]["enabled"]     = config.tls.enabled;
+    j["tls"]["cert_file"]   = config.tls.cert_file;
+    j["tls"]["key_file"]    = config.tls.key_file;
+    j["tls"]["min_version"] = config.tls.min_version;
+    j["log"]["level"]       = config.log.level;
+    j["log"]["file"]        = config.log.file;
+    j["log"]["max_file_size"] = config.log.max_file_size;
+    j["log"]["max_files"]   = config.log.max_files;
+    return j.dump(4);
 }

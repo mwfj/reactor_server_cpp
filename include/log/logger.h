@@ -25,6 +25,11 @@ void Init(const std::string& name = "reactor",
 // If Init() has not been called, returns spdlog's default logger.
 std::shared_ptr<spdlog::logger> Get();
 
+// Parse a log level string to spdlog enum.
+// Accepts: "trace", "debug", "info", "warn", "error", "critical".
+// Returns spdlog::level::info for unrecognized strings.
+spdlog::level::level_enum ParseLevel(const std::string& level);
+
 // Flush all sinks and shut down the logging system.
 void Shutdown();
 
