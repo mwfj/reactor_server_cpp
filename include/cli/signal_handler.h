@@ -20,7 +20,7 @@ public:
     // server.Stop(). Intended to run on a dedicated thread.
     static void WaitForSignal(HttpServer* server);
 
-    // Restore default signal dispositions. Safe to call multiple times.
+    // Ignore and unblock shutdown signals for clean teardown. Safe to call multiple times.
     static void Cleanup();
 
     // Returns true if a shutdown signal has been received.
