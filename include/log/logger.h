@@ -30,6 +30,17 @@ std::shared_ptr<spdlog::logger> Get();
 // Returns spdlog::level::info for unrecognized strings.
 spdlog::level::level_enum ParseLevel(const std::string& level);
 
+// Set whether Init() creates a console (stdout) sink. Sticky: survives
+// subsequent Init() calls. Daemon mode sets this to false before Init()
+// so that HttpServer's re-Init() inherits the preference.
+void SetConsoleEnabled(bool enabled);
+
+// Close and reopen file sinks for log rotation (SIGHUP handler).
+// Reconstructs the logger with fresh file handles while preserving
+// console preference and log level. Thread-safe. No-op if no file
+// sink is configured or Init() has not been called.
+void Reopen();
+
 // Flush all sinks and shut down the logging system.
 void Shutdown();
 

@@ -1,4 +1,5 @@
 #include "cli/cli_parser.h"
+#include "cli/daemonizer.h"
 #include "cli/signal_handler.h"
 #include "cli/pid_file.h"
 #include "cli/version.h"
@@ -112,24 +113,78 @@ MakeHealthHandler(std::chrono::steady_clock::time_point start_time) {
     };
 }
 
+// ── Daemon path helper: reject relative paths (CWD changes to "/") ──
+static bool RequireAbsolutePath(const std::string& path, const char* description) {
+    if (!path.empty() && path[0] != '/') {
+        std::cerr << "Error: daemon mode requires an absolute "
+                  << description << " path\n";
+        return false;
+    }
+    return true;
+}
+
 // ── Handle start command ─────────────────────────────────────────
 static int HandleStart(const CliOptions& options) {
     ServerConfig config;
     int rc = LoadConfig(config, options);
     if (rc != EXIT_OK) return rc;
 
+    // ── Daemon pre-validation ───────────────────────────────
+    if (options.daemonize) {
+        if (config.log.file.empty()) {
+            std::cerr << "Error: daemon mode requires a log file "
+                      << "(set log.file in config or REACTOR_LOG_FILE env var)\n";
+            return EXIT_ERROR;
+        }
+        if (!RequireAbsolutePath(config.log.file, "log file") ||
+            !RequireAbsolutePath(options.pid_file, "PID file")) {
+            return EXIT_ERROR;
+        }
+        if (config.tls.enabled) {
+            if (!RequireAbsolutePath(config.tls.cert_file, "TLS cert file") ||
+                !RequireAbsolutePath(config.tls.key_file, "TLS key file")) {
+                return EXIT_ERROR;
+            }
+        }
+    }
+
+    // ── Daemonize (if requested) ────────────────────────────
+    // MUST happen: after config validation, before PidFile/signals/logging
+    if (options.daemonize) {
+        Daemonizer::Daemonize();
+        // We are now the grandchild daemon process.
+        // stdin/stdout/stderr -> /dev/null, CWD -> "/", new session.
+
+        // Early logging init so PidFile/SignalHandler failures are logged
+        // to the file sink (stderr is /dev/null after fork). HttpServer's
+        // constructor will re-Init() which is safe — it replaces the logger.
+        logging::SetConsoleEnabled(false);
+        logging::Init("reactor", logging::ParseLevel(config.log.level),
+                      config.log.file, config.log.max_file_size, config.log.max_files);
+    }
+
+    // ── PID file ────────────────────────────────────────────
     if (!PidFile::Acquire(options.pid_file)) {
+        if (options.daemonize) {
+            logging::Get()->error("Failed to acquire PID file: {}", options.pid_file);
+        }
         return EXIT_ERROR;
     }
     std::atexit(PidFile::Release);
 
+    // ── Signal handler ──────────────────────────────────────
     try {
         SignalHandler::Install();
     } catch (const std::runtime_error& e) {
-        std::cerr << "Error setting up signal handler: " << e.what() << "\n";
+        if (options.daemonize) {
+            logging::Get()->error("Signal handler setup failed: {}", e.what());
+        } else {
+            std::cerr << "Error setting up signal handler: " << e.what() << "\n";
+        }
         return EXIT_ERROR;
     }
 
+    // ── Server construction ─────────────────────────────────
     int exit_code = EXIT_OK;
     std::unique_ptr<HttpServer> server;
     try {
@@ -150,6 +205,9 @@ static int HandleStart(const CliOptions& options) {
             : "disabled");
     logging::Get()->info("  Workers: {}", config.worker_threads);
     logging::Get()->info("  PID:     {} ({})", getpid(), options.pid_file);
+    if (options.daemonize) {
+        logging::Get()->info("  Mode:    daemon");
+    }
 
     if (options.health_endpoint) {
         auto start_time = std::chrono::steady_clock::now();
@@ -157,6 +215,7 @@ static int HandleStart(const CliOptions& options) {
         logging::Get()->info("  Health:  /health");
     }
 
+    // ── Server thread ───────────────────────────────────────
     std::exception_ptr server_error;
     std::atomic<bool> server_failed{false};
     std::thread server_thread([&server, &server_error, &server_failed]() {
@@ -171,9 +230,18 @@ static int HandleStart(const CliOptions& options) {
         }
     });
 
+    // ── Signal loop ─────────────────────────────────────────
     logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
-    SignalHandler::WaitForShutdown();
+    while (true) {
+        SignalResult sig = SignalHandler::WaitForSignal();
+        if (sig == SignalResult::SHUTDOWN) break;
+        // SIGHUP: reopen log files for rotation
+        logging::Get()->info("Received SIGHUP, reopening log files");
+        logging::Reopen();
+        logging::Get()->info("Log files reopened");
+    }
 
+    // ── Shutdown ────────────────────────────────────────────
     logging::Get()->info("{} shutting down...", REACTOR_SERVER_NAME);
     server->Stop();
 

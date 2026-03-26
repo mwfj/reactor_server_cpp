@@ -27,7 +27,7 @@ make server
 Usage: reactor_server <command> [options]
 
 Commands:
-  start       Start the server (foreground)
+  start       Start the server (foreground, or -d for daemon)
   stop        Stop a running server
   status      Check server status
   validate    Validate configuration
@@ -43,6 +43,7 @@ Start options:
                               (trace, debug, info, warn, error, critical)
   -w, --workers <N>           Override worker thread count (0 = auto)
   -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)
+  -d, --daemonize             Run as a background daemon
   --no-health-endpoint       Disable the /health endpoint
 
 Stop/status options:
@@ -117,6 +118,26 @@ This outputs formatted JSON that can be redirected to a file and used as a confi
 #   PID file:   /tmp/reactor_server.pid
 ```
 
+### Daemon Mode
+
+Run the server as a background daemon:
+
+```bash
+# Requires a log file (daemon has no terminal)
+./reactor_server start -d -c config/production.json
+
+# Or set log file via environment variable
+REACTOR_LOG_FILE=/var/log/reactor.log ./reactor_server start -d
+
+# Verify it started
+./reactor_server status
+```
+
+**Daemon mode requirements:**
+- A log file must be configured (`log.file` in config or `REACTOR_LOG_FILE` env var)
+- Log file, PID file, and TLS cert/key paths must be absolute
+- The launching shell sees exit code 0 immediately after fork; use `status` to verify
+
 ### Graceful Stop
 
 ```bash
@@ -136,9 +157,28 @@ kill -TERM $(cat /tmp/reactor_server.pid)
 |--------|----------|
 | `SIGTERM` | Graceful shutdown (sends WS Close 1001, drains connections, exits) |
 | `SIGINT` | Same as SIGTERM (Ctrl+C in foreground) |
+| `SIGHUP` | Reopen log files (for log rotation with `logrotate`) |
 | `SIGPIPE` | Ignored (handled by MSG_NOSIGNAL) |
 
-Signal handling uses `sigwait()` (POSIX synchronous signal wait). Signals are blocked in all threads via `pthread_sigmask`; the main thread calls `sigwait()` which synchronously dequeues blocked signals. No async signal handler is needed. When `sigwait()` returns, the main thread calls `HttpServer::Stop()` directly.
+Signal handling uses `sigwait()` (POSIX synchronous signal wait). Signals are blocked in all threads via `pthread_sigmask`; the main thread loops on `sigwait()` which synchronously dequeues blocked signals. SIGHUP triggers log file rotation; SIGTERM/SIGINT break the loop and call `HttpServer::Stop()`.
+
+### Log Rotation
+
+The server supports `logrotate`-style log rotation via SIGHUP:
+
+```bash
+# Manual rotation
+kill -HUP $(cat /tmp/reactor_server.pid)
+
+# logrotate config example (/etc/logrotate.d/reactor_server):
+# /var/log/reactor.log {
+#     daily
+#     rotate 7
+#     postrotate
+#         kill -HUP $(cat /tmp/reactor_server.pid) 2>/dev/null || true
+#     endscript
+# }
+```
 
 ## PID File
 

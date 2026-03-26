@@ -86,10 +86,11 @@ static const struct option subcmd_long_options[] = {
     {"workers",            required_argument, nullptr, 'w'},
     {"pid-file",           required_argument, nullptr, 'P'},
     {"no-health-endpoint", no_argument,       nullptr, OPT_NO_HEALTH},
+    {"daemonize",          no_argument,       nullptr, 'd'},
     {nullptr, 0, nullptr, 0}
 };
 
-static const char* subcmd_short_options = "c:p:H:l:w:P:";
+static const char* subcmd_short_options = "c:p:H:l:w:P:d";
 
 // ── CliParser implementation ─────────────────────────────────────
 
@@ -205,6 +206,9 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
             case OPT_NO_HEALTH:
                 options.health_endpoint = false;
                 break;
+            case 'd':
+                options.daemonize = true;
+                break;
             case '?':
                 throw std::runtime_error("Invalid option (see above)");
             default:
@@ -225,13 +229,14 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
     if (cmd == CliCommand::STOP || cmd == CliCommand::STATUS) {
         if (options.config_path_explicit || options.port >= 0 ||
             !options.host.empty() || !options.log_level.empty() ||
-            options.workers >= 0 || !options.health_endpoint) {
+            options.workers >= 0 || !options.health_endpoint ||
+            options.daemonize) {
             throw std::runtime_error(
                 std::string("'") + argv[1] + "' only accepts -P/--pid-file");
         }
     }
 
-    // validate/config accept -c, -p, -H, -l, -w but NOT -P or --no-health-endpoint
+    // validate/config accept -c, -p, -H, -l, -w but NOT -P, --no-health-endpoint, or -d
     if (cmd == CliCommand::VALIDATE || cmd == CliCommand::CONFIG) {
         if (options.pid_file_explicit) {
             throw std::runtime_error(
@@ -240,6 +245,10 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
         if (!options.health_endpoint) {
             throw std::runtime_error(
                 std::string("'") + argv[1] + "' does not accept --no-health-endpoint");
+        }
+        if (options.daemonize) {
+            throw std::runtime_error(
+                std::string("'") + argv[1] + "' does not accept -d/--daemonize");
         }
     }
 
@@ -253,7 +262,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "A high-performance C++17 HTTP/WebSocket/TLS server.\n"
         << "\n"
         << "Commands:\n"
-        << "  start       Start the server (foreground)\n"
+        << "  start       Start the server (foreground, or -d for daemon)\n"
         << "  stop        Stop a running server\n"
         << "  status      Check server status\n"
         << "  validate    Validate configuration\n"
@@ -269,6 +278,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "                              (trace, debug, info, warn, error, critical)\n"
         << "  -w, --workers <N>           Override worker thread count (0 = auto)\n"
         << "  -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)\n"
+        << "  -d, --daemonize             Run as a background daemon\n"
         << "  --no-health-endpoint       Disable the /health endpoint\n"
         << "\n"
         << "Stop/status options:\n"
@@ -301,7 +311,8 @@ void CliParser::PrintUsage(const char* program_name) {
         << "  " << program_name << " stop\n"
         << "  " << program_name << " status\n"
         << "  " << program_name << " validate -c config/server.example.json\n"
-        << "  " << program_name << " config -p 9090 -l debug\n";
+        << "  " << program_name << " config -p 9090 -l debug\n"
+        << "  " << program_name << " start -d -c config/production.json\n";
 }
 
 void CliParser::PrintVersion() {

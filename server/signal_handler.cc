@@ -10,8 +10,8 @@
 #include <pthread.h>
 
 static std::atomic<bool> g_shutdown_requested{false};
-static sigset_t g_block_mask;     // all signals we block (SIGTERM, SIGINT, SIGPIPE)
-static sigset_t g_shutdown_mask;  // only shutdown signals we sigwait on (SIGTERM, SIGINT)
+static sigset_t g_block_mask;  // all signals we block (SIGTERM, SIGINT, SIGPIPE, SIGHUP)
+static sigset_t g_wait_mask;   // signals we sigwait on (SIGTERM, SIGINT, SIGHUP)
 static bool g_installed = false;
 
 void SignalHandler::Install() {
@@ -19,6 +19,7 @@ void SignalHandler::Install() {
     sigaddset(&g_block_mask, SIGTERM);
     sigaddset(&g_block_mask, SIGINT);
     sigaddset(&g_block_mask, SIGPIPE);
+    sigaddset(&g_block_mask, SIGHUP);
 
     int rc = pthread_sigmask(SIG_BLOCK, &g_block_mask, nullptr);
     if (rc != 0) {
@@ -26,20 +27,38 @@ void SignalHandler::Install() {
             std::string("Failed to block signals: ") + std::strerror(rc));
     }
 
-    sigemptyset(&g_shutdown_mask);
-    sigaddset(&g_shutdown_mask, SIGTERM);
-    sigaddset(&g_shutdown_mask, SIGINT);
+    sigemptyset(&g_wait_mask);
+    sigaddset(&g_wait_mask, SIGTERM);
+    sigaddset(&g_wait_mask, SIGINT);
+    sigaddset(&g_wait_mask, SIGHUP);
 
     g_shutdown_requested.store(false);
     g_installed = true;
 }
 
-void SignalHandler::WaitForShutdown() {
+SignalResult SignalHandler::WaitForSignal() {
     int sig = 0;
-    sigwait(&g_shutdown_mask, &sig);
-
-    if (sig == SIGTERM || sig == SIGINT) {
+    int rc = sigwait(&g_wait_mask, &sig);
+    if (rc != 0) {
+        // sigwait failed — treat as shutdown for safety
         g_shutdown_requested.store(true, std::memory_order_release);
+        return SignalResult::SHUTDOWN;
+    }
+
+    if (sig == SIGHUP) {
+        return SignalResult::RELOAD;
+    }
+    // SIGTERM or SIGINT
+    g_shutdown_requested.store(true, std::memory_order_release);
+    return SignalResult::SHUTDOWN;
+}
+
+void SignalHandler::WaitForShutdown() {
+    // Loop until we get a shutdown signal (ignore SIGHUP in legacy path)
+    while (true) {
+        SignalResult result = WaitForSignal();
+        if (result == SignalResult::SHUTDOWN) return;
+        // RELOAD: no handler in legacy path, just loop
     }
 }
 
@@ -52,6 +71,7 @@ void SignalHandler::Cleanup() {
         signal(SIGTERM, SIG_IGN);
         signal(SIGINT, SIG_IGN);
         signal(SIGPIPE, SIG_IGN);
+        signal(SIGHUP, SIG_IGN);
         pthread_sigmask(SIG_UNBLOCK, &g_block_mask, nullptr);
         g_installed = false;
     }

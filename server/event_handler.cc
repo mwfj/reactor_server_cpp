@@ -1,5 +1,6 @@
 #include "event_handler.h"
 #include "channel.h"
+#include "log/logger.h"
 
 EventHandler::EventHandler(){
 #if defined(__linux__)
@@ -12,13 +13,13 @@ EventHandler::EventHandler(){
 void EventHandler::UpdateEvent(std::shared_ptr<Channel> ch){
 #if defined(__linux__)
     if(!epoll_event_){
-        std::cout << "[Event Handler] Nullptr of epoll_event: " << strerror(errno) << std::endl;
+        logging::Get()->error("Nullptr of epoll_event");
         throw std::runtime_error("Nullptr of epoll_event");
     }
     epoll_event_ -> UpdateEvent(ch);
 #elif defined(__APPLE__) || defined(__MACH__)
     if(!kqueue_event_){
-        std::cout << "[Event Handler] Nullptr of kqueue_event: " << strerror(errno) << std::endl;
+        logging::Get()->error("Nullptr of kqueue_event");
         throw std::runtime_error("Nullptr of kqueue_event");
     }
     kqueue_event_ -> UpdateEvent(ch);
@@ -28,13 +29,13 @@ void EventHandler::UpdateEvent(std::shared_ptr<Channel> ch){
 void EventHandler::RemoveChannel(std::shared_ptr<Channel> ch) {
 #if defined(__linux__)
     if(!epoll_event_){
-        std::cout << "[Event Handler] Nullptr of epoll_event: " << strerror(errno) << std::endl;
+        logging::Get()->error("Nullptr of epoll_event");
         throw std::runtime_error("Nullptr of epoll_event");
     }
     epoll_event_ -> RemoveChannel(ch);
 #elif defined(__APPLE__) || defined(__MACH__)
     if(!kqueue_event_){
-        std::cout << "[Event Handler] Nullptr of kqueue_event: " << strerror(errno) << std::endl;
+        logging::Get()->error("Nullptr of kqueue_event");
         throw std::runtime_error("Nullptr of kqueue_event");
     }
     kqueue_event_ -> RemoveChannel(ch);
@@ -44,13 +45,13 @@ void EventHandler::RemoveChannel(std::shared_ptr<Channel> ch) {
 std::vector<std::shared_ptr<Channel>> EventHandler::WaitForEvent(int timeout) {
 #if defined(__linux__)
     if(!epoll_event_){
-        std::cout << "[Event Handler] Nullptr of epoll_event: " << strerror(errno) << std::endl;
+        logging::Get()->error("Nullptr of epoll_event");
         throw std::runtime_error("Nullptr of epoll_event");
     }
     return epoll_event_ -> WaitForEvent(timeout);
 #elif defined(__APPLE__) || defined(__MACH__)
     if(!kqueue_event_){
-        std::cout << "[Event Handler] Nullptr of kqueue_event: " << strerror(errno) << std::endl;
+        logging::Get()->error("Nullptr of kqueue_event");
         throw std::runtime_error("Nullptr of kqueue_event");
     }
     return kqueue_event_ -> WaitForEvent(timeout);

@@ -1,10 +1,11 @@
 #if defined(__APPLE__) || defined(__MACH__)
 #include "kqueue_handler.h"
 #include "channel.h"
+#include "log/logger.h"
 
 KqueueHandler::KqueueHandler(){
     if((kqueuefd_ = ::kqueue()) == -1){
-        std::cout << "[Kqueue Handler] kqueue() failed: " << strerror(errno) << std::endl;
+        logging::Get()->error("kqueue() failed: {}", strerror(errno));
         throw std::runtime_error("kqueue() failed");
     }
 }
@@ -68,7 +69,7 @@ void KqueueHandler::UpdateEvent(std::shared_ptr<Channel> ch){
             if (errno == EBADF || errno == ENOENT) {
                 return;  // Gracefully handle race condition
             }
-            std::cout << "[Kqueue Handler] kevent failed (fd=" << fd << "): " << strerror(errno) << std::endl;
+            logging::Get()->error("kevent failed (fd={}): {}", fd, strerror(errno));
             // Don't throw - just log and continue
             return;
         }
@@ -100,8 +101,7 @@ void KqueueHandler::RemoveChannel(std::shared_ptr<Channel> ch){
             // EBADF means fd is invalid (already closed)
             // Both are ok - we just want to ensure it's not in kqueue
             if(errno != ENOENT && errno != EBADF){
-                std::cout << "[KqueueHandler] kevent DEL warning for fd=" << fd
-                          << ": " << strerror(errno) << std::endl;
+                logging::Get()->warn("kevent DEL warning fd={}: {}", fd, strerror(errno));
             }
         }
     }
@@ -136,10 +136,10 @@ std::vector<std::shared_ptr<Channel>> KqueueHandler::WaitForEvent(int timeout){
     if(nevents < 0){
         // interrupted by other signal
         if(errno == EINTR){
-             std::cout << "[Kqueue Handler] kevent() failed, interrupted by signal: " << strerror(errno) << std::endl;
+             logging::Get()->debug("kevent() interrupted by signal");
              return {};
         }
-        std::cout << "[Kqueue Handler] kevent() failed: " << strerror(errno) << std::endl;
+        logging::Get()->error("kevent() failed: {}", strerror(errno));
         throw std::runtime_error("kevent() failed");
     }
 

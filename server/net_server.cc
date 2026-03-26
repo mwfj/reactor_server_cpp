@@ -1,6 +1,7 @@
 #include "net_server.h"
 #include "tls/tls_context.h"
 #include "tls/tls_connection.h"
+#include "log/logger.h"
 
 #include <csignal>
 #include <future>
@@ -162,8 +163,8 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
     if (max_connections_ > 0) {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         if (static_cast<int>(connections_.size()) >= max_connections_) {
-            std::cerr << "[NetServer] Max connections (" << max_connections_
-                      << ") reached, rejecting fd " << cilent_sock->fd() << std::endl;
+            logging::Get()->warn("Max connections ({}) reached, rejecting fd {}",
+                                max_connections_, cilent_sock->fd());
             return;  // SocketHandler destructor closes the fd
         }
     }
@@ -179,7 +180,7 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
             auto tls = std::make_unique<TlsConnection>(*tls_ctx_, conn->fd());
             conn->SetTlsConnection(std::move(tls));
         } catch (const std::exception& e) {
-            std::cerr << "[NetServer] TLS setup failed for fd " << conn->fd() << ": " << e.what() << std::endl;
+            logging::Get()->error("TLS setup failed for fd {}: {}", conn->fd(), e.what());
             // Close properly to avoid double-close: both Channel and SocketHandler
             // hold the same fd. CallCloseCb closes the channel fd and releases from SocketHandler.
             conn->CallCloseCb();
@@ -212,8 +213,7 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
     try {
         conn -> RegisterCallbacks();
     } catch (const std::exception& e) {
-        std::cerr << "[NetServer] epoll registration failed for fd " << conn->fd()
-                  << ": " << e.what() << std::endl;
+        logging::Get()->error("epoll registration failed for fd {}: {}", conn->fd(), e.what());
         // CallCloseCb handles: close channel, fire close callback (removes from
         // connections_ map), release fd from SocketHandler (prevents double-close).
         conn->CallCloseCb();
@@ -233,9 +233,7 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
         });
     }
 
-    std::cout << "[Reactor Server] new connection(fd: "
-        << conn -> fd() << ", ip: " << conn -> ip_addr() << ", port: " << conn -> port() << ").\n"
-        << "ok" << std::endl;
+    logging::Get()->debug("New connection fd={} from {}:{}", conn->fd(), conn->ip_addr(), conn->port());
 
     if(callbacks_.new_conn_callback)
         callbacks_.new_conn_callback(conn);
@@ -251,7 +249,7 @@ void NetServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn){
     if(callbacks_.close_conn_callback)
         callbacks_.close_conn_callback(conn);
 
-    std::cout << "[NetServer] client fd: " << close_fd << " disconnected." << std::endl;
+    logging::Get()->debug("Client fd={} disconnected", close_fd);
 
     // Remove from dispatcher's timer map with identity check to avoid fd-reuse race
     int idx = close_fd % sock_workers_.GetThreadWorkerNum();
@@ -278,7 +276,7 @@ void NetServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn){
     if(callbacks_.error_callback)
         callbacks_.error_callback(conn);
 
-    std::cout << "[NetServer] client fd: " << close_fd << " error occurred, disconnect." << std::endl;
+    logging::Get()->debug("Client fd={} error occurred, disconnect", close_fd);
 
     // Remove from dispatcher's timer map with identity check to avoid fd-reuse race
     int idx = close_fd % sock_workers_.GetThreadWorkerNum();

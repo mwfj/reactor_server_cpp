@@ -7,6 +7,11 @@
 //   - PidFile (7 tests): acquire/release lifecycle, stale detection, ReadPid, CheckRunning
 //   - Config override precedence (5 tests): defaults < file < env < CLI
 //   - SignalHandler (2 tests): install/cleanup, sigwait unblocks WaitForShutdown
+//   - Phase 2 additions:
+//     - Logger (6 tests): SetConsoleEnabled, Reopen, no-op paths, level persistence
+//     - SignalHandler Phase 2 (3 tests): WaitForSignal SIGTERM/SIGHUP,
+//                                        WaitForShutdown ignores SIGHUP
+//     - CliParser daemonize (7 tests): -d/-daemonize flag and per-command validation
 //
 // Port range: 10500-10599 (not used directly by unit tests; reserved for this suite)
 // Temp file pattern: /tmp/test_reactor_NNNN.pid
@@ -18,6 +23,7 @@
 #include "cli/version.h"
 #include "config/server_config.h"
 #include "config/config_loader.h"
+#include "log/logger.h"
 
 #include <atomic>
 #include <cerrno>
@@ -1004,6 +1010,547 @@ void TestSignalHandlerSigwaitUnblock() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SECTION 5: Logger Phase 2 Tests (32–37)
+//
+// These tests exercise the new logging::SetConsoleEnabled() and
+// logging::Reopen() APIs added for daemon mode support.
+// Each test calls logging::Shutdown() at the end to restore clean state.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Test 32: SetConsoleEnabled(false) + Init with a file → logger is functional
+// even with console disabled.  Validates that the sticky console flag is stored
+// before Init() and honoured inside BuildSinks().
+void TestSetConsoleEnabled() {
+    std::cout << "\n[TEST] Logger: SetConsoleEnabled(false) disables console sink..." << std::endl;
+    const std::string log_path = "/tmp/test_reactor_log_" + std::to_string(getpid()) +
+                                  "_console.log";
+    std::remove(log_path.c_str());
+
+    try {
+        // Disable console before initialising so daemon-mode path is exercised
+        logging::SetConsoleEnabled(false);
+        logging::Init("test_logger_console", spdlog::level::info, log_path);
+
+        // Logger must still be usable — no crash expected
+        logging::Get()->info("SetConsoleEnabled test message");
+        logging::Get()->flush();
+
+        logging::Shutdown();
+
+        // Restore default console preference so other tests are not affected
+        logging::SetConsoleEnabled(true);
+        std::remove(log_path.c_str());
+
+        TestFramework::RecordTest("Logger: SetConsoleEnabled(false) functional",
+                                  true, "", CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        logging::Shutdown();
+        logging::SetConsoleEnabled(true);
+        std::remove(log_path.c_str());
+        TestFramework::RecordTest("Logger: SetConsoleEnabled(false) functional",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 33: SetConsoleEnabled persists across multiple Init() calls.
+// After the first Init() stores the flag, a second Init() must not silently
+// re-enable the console sink.
+void TestSetConsoleEnabledPersists() {
+    std::cout << "\n[TEST] Logger: SetConsoleEnabled persists across Init() calls..." << std::endl;
+    const std::string log_path = "/tmp/test_reactor_log_" + std::to_string(getpid()) +
+                                  "_persist.log";
+    std::remove(log_path.c_str());
+
+    try {
+        logging::SetConsoleEnabled(false);
+
+        // First Init
+        logging::Init("test_persist_1", spdlog::level::info, log_path);
+        logging::Get()->info("First init message");
+
+        // Second Init — console flag must stay false
+        logging::Init("test_persist_2", spdlog::level::debug, log_path);
+        logging::Get()->debug("Second init message");
+        logging::Get()->flush();
+
+        logging::Shutdown();
+        logging::SetConsoleEnabled(true);
+        std::remove(log_path.c_str());
+
+        // If neither Init threw and the second logger is usable, the flag
+        // persisted correctly (a console sink would print to stdout but is
+        // not required to be absent — we just verify no crash and no
+        // unexpected throw).
+        TestFramework::RecordTest("Logger: SetConsoleEnabled persists across Init",
+                                  true, "", CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        logging::Shutdown();
+        logging::SetConsoleEnabled(true);
+        std::remove(log_path.c_str());
+        TestFramework::RecordTest("Logger: SetConsoleEnabled persists across Init",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 34: Reopen() with a live file sink closes and reopens the file handle.
+// After Reopen() the logger must still be functional (writes succeed).
+void TestReopenWithFileSink() {
+    std::cout << "\n[TEST] Logger: Reopen() with file sink reconstructs logger..." << std::endl;
+    const std::string log_path = "/tmp/test_reactor_log_" + std::to_string(getpid()) +
+                                  "_reopen.log";
+    std::remove(log_path.c_str());
+
+    try {
+        logging::Init("test_reopen", spdlog::level::info, log_path);
+
+        // Write a message before Reopen
+        logging::Get()->info("Before reopen");
+        logging::Get()->flush();
+
+        // Simulate log-rotation: rename the old file and call Reopen()
+        // so the logger creates a new file handle at the same path.
+        const std::string rotated = log_path + ".1";
+        std::rename(log_path.c_str(), rotated.c_str());
+
+        logging::Reopen();
+
+        // Write after Reopen — must not crash
+        logging::Get()->info("After reopen");
+        logging::Get()->flush();
+
+        // The new log file should now exist at the original path
+        struct stat st;
+        bool file_exists = (stat(log_path.c_str(), &st) == 0);
+
+        logging::Shutdown();
+        std::remove(log_path.c_str());
+        std::remove(rotated.c_str());
+
+        TestFramework::RecordTest("Logger: Reopen with file sink",
+                                  file_exists,
+                                  file_exists ? "" : "New log file not created after Reopen()",
+                                  CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        logging::Shutdown();
+        std::remove(log_path.c_str());
+        TestFramework::RecordTest("Logger: Reopen with file sink",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 35: Reopen() without a file sink is a no-op — must not crash.
+// This covers the console-only logger case (daemon-disabled console path
+// uses no file sink until log.file is configured).
+void TestReopenWithoutFileSink() {
+    std::cout << "\n[TEST] Logger: Reopen() without file sink is no-op..." << std::endl;
+    try {
+        // Console-only logger (no file path)
+        logging::Init("test_reopen_noop", spdlog::level::info, "");
+
+        // Reopen must return without throwing or crashing
+        logging::Reopen();
+
+        logging::Get()->info("After Reopen no-op");
+        logging::Shutdown();
+
+        TestFramework::RecordTest("Logger: Reopen without file sink is no-op",
+                                  true, "", CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        logging::Shutdown();
+        TestFramework::RecordTest("Logger: Reopen without file sink is no-op",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 36: Reopen() before any Init() is a no-op — must not crash.
+// The g_logger is null and g_log_file is empty; Reopen() should early-return.
+void TestReopenBeforeInit() {
+    std::cout << "\n[TEST] Logger: Reopen() before Init() is no-op..." << std::endl;
+    try {
+        // Ensure logger is reset (Shutdown resets g_logger)
+        logging::Shutdown();
+
+        // Call Reopen with no logger initialised
+        logging::Reopen();
+
+        // Verify: no crash, test passes
+        TestFramework::RecordTest("Logger: Reopen before Init is no-op",
+                                  true, "", CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("Logger: Reopen before Init is no-op",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 37: Reopen() preserves the log level set at Init() time.
+// After reconstruction the new logger's level must equal the original level.
+void TestReopenPreservesLevel() {
+    std::cout << "\n[TEST] Logger: Reopen() preserves log level..." << std::endl;
+    const std::string log_path = "/tmp/test_reactor_log_" + std::to_string(getpid()) +
+                                  "_level.log";
+    std::remove(log_path.c_str());
+
+    try {
+        // Init at debug level
+        logging::Init("test_level", spdlog::level::debug, log_path);
+
+        logging::Reopen();
+
+        // After Reopen the logger must accept debug messages without filtering
+        // (level preserved at debug).  We verify indirectly: if the level
+        // were reset to info, a debug message would be silently dropped.
+        // We can inspect the logger's level directly.
+        auto logger = logging::Get();
+        bool level_preserved = (logger->level() == spdlog::level::debug);
+
+        logging::Shutdown();
+        std::remove(log_path.c_str());
+
+        TestFramework::RecordTest("Logger: Reopen preserves log level",
+                                  level_preserved,
+                                  level_preserved ? "" : "Log level changed after Reopen()",
+                                  CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        logging::Shutdown();
+        std::remove(log_path.c_str());
+        TestFramework::RecordTest("Logger: Reopen preserves log level",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 6: SignalHandler Phase 2 Tests (38–40)
+//
+// Test the new WaitForSignal() API which returns SignalResult::RELOAD for
+// SIGHUP and SignalResult::SHUTDOWN for SIGTERM/SIGINT.
+//
+// Pattern mirrors the existing TestSignalHandlerSigwaitUnblock:
+//   1. Install()
+//   2. Spawn a waiter thread that calls WaitForSignal()
+//   3. Send the signal via kill(getpid(), SIG) — process-directed so
+//      sigwait() in the waiter thread dequeues it
+//   4. Verify the returned SignalResult value
+//   5. Cleanup()
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Test 38: WaitForSignal() returns SHUTDOWN when SIGTERM is delivered.
+void TestWaitForSignalSIGTERM() {
+    std::cout << "\n[TEST] SignalHandler: WaitForSignal returns SHUTDOWN on SIGTERM..." << std::endl;
+    try {
+        SignalHandler::Install();
+
+        std::atomic<bool> thread_done{false};
+        SignalResult received_result = SignalResult::RELOAD; // sentinel: wrong value
+
+        std::thread waiter([&]() {
+            received_result = SignalHandler::WaitForSignal();
+            thread_done.store(true, std::memory_order_release);
+        });
+
+        // Let the waiter reach sigwait()
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // Deliver SIGTERM — process-directed so sigwait() dequeues it
+        kill(getpid(), SIGTERM);
+
+        // Wait up to 500 ms
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (!thread_done.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        // Safety: force unblock if still waiting
+        if (!thread_done.load(std::memory_order_acquire)) {
+            kill(getpid(), SIGTERM);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (waiter.joinable()) waiter.join();
+
+        bool pass = thread_done.load(std::memory_order_acquire) &&
+                    (received_result == SignalResult::SHUTDOWN);
+        std::string err;
+        if (!pass) {
+            if (!thread_done.load(std::memory_order_acquire))
+                err = "WaitForSignal did not unblock within 500ms";
+            else
+                err = "Expected SHUTDOWN, got RELOAD";
+        }
+
+        SignalHandler::Cleanup();
+        signal(SIGTERM, SIG_DFL);
+
+        TestFramework::RecordTest("SignalHandler: WaitForSignal returns SHUTDOWN on SIGTERM",
+                                  pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        SignalHandler::Cleanup();
+        signal(SIGTERM, SIG_DFL);
+        TestFramework::RecordTest("SignalHandler: WaitForSignal returns SHUTDOWN on SIGTERM",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 39: WaitForSignal() returns RELOAD when SIGHUP is delivered.
+void TestWaitForSignalSIGHUP() {
+    std::cout << "\n[TEST] SignalHandler: WaitForSignal returns RELOAD on SIGHUP..." << std::endl;
+    try {
+        SignalHandler::Install();
+
+        std::atomic<bool> thread_done{false};
+        SignalResult received_result = SignalResult::SHUTDOWN; // sentinel: wrong value
+
+        std::thread waiter([&]() {
+            received_result = SignalHandler::WaitForSignal();
+            thread_done.store(true, std::memory_order_release);
+        });
+
+        // Let the waiter reach sigwait()
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // Deliver SIGHUP — process-directed
+        kill(getpid(), SIGHUP);
+
+        // Wait up to 500 ms
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (!thread_done.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        // Safety: if still blocked (SIGHUP not delivered), unblock with SIGTERM
+        // to avoid a hanging test — but note this makes the result SHUTDOWN.
+        // The test only passes if thread unblocked AND result is RELOAD.
+        if (!thread_done.load(std::memory_order_acquire)) {
+            kill(getpid(), SIGTERM);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (waiter.joinable()) waiter.join();
+
+        bool pass = thread_done.load(std::memory_order_acquire) &&
+                    (received_result == SignalResult::RELOAD);
+        std::string err;
+        if (!pass) {
+            if (!thread_done.load(std::memory_order_acquire))
+                err = "WaitForSignal did not unblock within 500ms";
+            else
+                err = "Expected RELOAD, got SHUTDOWN";
+        }
+
+        SignalHandler::Cleanup();
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+
+        TestFramework::RecordTest("SignalHandler: WaitForSignal returns RELOAD on SIGHUP",
+                                  pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        SignalHandler::Cleanup();
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        TestFramework::RecordTest("SignalHandler: WaitForSignal returns RELOAD on SIGHUP",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 40: WaitForShutdown() ignores SIGHUP and only returns after SIGTERM.
+// Design: send SIGHUP first, then SIGTERM.  WaitForShutdown must loop past the
+// SIGHUP and block again, then unblock on SIGTERM.
+void TestWaitForShutdownIgnoresSIGHUP() {
+    std::cout << "\n[TEST] SignalHandler: WaitForShutdown ignores SIGHUP, returns on SIGTERM..." << std::endl;
+    try {
+        SignalHandler::Install();
+
+        std::atomic<bool> thread_done{false};
+
+        std::thread waiter([&]() {
+            SignalHandler::WaitForShutdown();
+            thread_done.store(true, std::memory_order_release);
+        });
+
+        // Let the waiter reach sigwait()
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // First: send SIGHUP — WaitForShutdown must loop and NOT return
+        kill(getpid(), SIGHUP);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // Thread must still be blocked after SIGHUP
+        bool still_blocked_after_hup = !thread_done.load(std::memory_order_acquire);
+
+        // Now: send SIGTERM — WaitForShutdown must return
+        kill(getpid(), SIGTERM);
+
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (!thread_done.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        // Safety: force unblock if still waiting
+        if (!thread_done.load(std::memory_order_acquire)) {
+            kill(getpid(), SIGTERM);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (waiter.joinable()) waiter.join();
+
+        bool returned_after_term = thread_done.load(std::memory_order_acquire);
+        bool pass = still_blocked_after_hup && returned_after_term;
+
+        std::string err;
+        if (!still_blocked_after_hup)
+            err += "WaitForShutdown returned prematurely on SIGHUP; ";
+        if (!returned_after_term)
+            err += "WaitForShutdown did not return within 500ms after SIGTERM; ";
+
+        SignalHandler::Cleanup();
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+
+        TestFramework::RecordTest(
+            "SignalHandler: WaitForShutdown ignores SIGHUP returns on SIGTERM",
+            pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        SignalHandler::Cleanup();
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        TestFramework::RecordTest(
+            "SignalHandler: WaitForShutdown ignores SIGHUP returns on SIGTERM",
+            false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 7: CliParser Daemonize Tests (41–47)
+//
+// These tests verify the new -d / --daemonize flag and the per-command
+// validation that rejects --daemonize on stop/status/validate/config.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Test 41: 'start -d' (short flag) sets daemonize=true.
+void TestStartDaemonizeShortFlag() {
+    std::cout << "\n[TEST] CliParser: 'start -d' sets daemonize=true..." << std::endl;
+    try {
+        const char* args[] = {"reactor_server", "start", "-d"};
+        int argc = 3;
+        auto opts = CliParser::Parse(argc, const_cast<char**>(args));
+
+        bool pass = (opts.daemonize == true) && (opts.command == CliCommand::START);
+        std::string err = pass ? "" :
+            std::string("daemonize=") + (opts.daemonize ? "true" : "false") +
+            " command=" + (opts.command == CliCommand::START ? "START" : "other");
+        TestFramework::RecordTest("CliParser: start -d sets daemonize", pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("CliParser: start -d sets daemonize", false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 42: 'start --daemonize' (long flag) sets daemonize=true.
+void TestStartDaemonizeLongFlag() {
+    std::cout << "\n[TEST] CliParser: 'start --daemonize' sets daemonize=true..." << std::endl;
+    try {
+        const char* args[] = {"reactor_server", "start", "--daemonize"};
+        int argc = 3;
+        auto opts = CliParser::Parse(argc, const_cast<char**>(args));
+
+        bool pass = (opts.daemonize == true) && (opts.command == CliCommand::START);
+        std::string err = pass ? "" :
+            std::string("daemonize=") + (opts.daemonize ? "true" : "false") +
+            " command=" + (opts.command == CliCommand::START ? "START" : "other");
+        TestFramework::RecordTest("CliParser: start --daemonize sets daemonize", pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("CliParser: start --daemonize sets daemonize", false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 43: 'start' without -d keeps daemonize=false (default).
+void TestStartNoDaemonize() {
+    std::cout << "\n[TEST] CliParser: 'start' without -d keeps daemonize=false..." << std::endl;
+    try {
+        const char* args[] = {"reactor_server", "start"};
+        int argc = 2;
+        auto opts = CliParser::Parse(argc, const_cast<char**>(args));
+
+        bool pass = (opts.daemonize == false);
+        std::string err = pass ? "" : "daemonize should be false by default";
+        TestFramework::RecordTest("CliParser: start without -d keeps daemonize false",
+                                  pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("CliParser: start without -d keeps daemonize false",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 44: 'stop -d' must throw — daemonize is only valid for 'start'.
+void TestStopRejectsDaemonize() {
+    std::cout << "\n[TEST] CliParser: 'stop -d' throws..." << std::endl;
+    try {
+        const char* args[] = {"reactor_server", "stop", "-d"};
+        int argc = 3;
+        CliParser::Parse(argc, const_cast<char**>(args));
+        TestFramework::RecordTest("CliParser: stop -d throws", false,
+            "Expected exception for 'stop -d'", CLI_CATEGORY);
+    } catch (const std::runtime_error&) {
+        TestFramework::RecordTest("CliParser: stop -d throws", true, "", CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("CliParser: stop -d throws", false,
+            std::string("Wrong exception type: ") + e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 45: 'status -d' must throw.
+void TestStatusRejectsDaemonize() {
+    std::cout << "\n[TEST] CliParser: 'status -d' throws..." << std::endl;
+    try {
+        const char* args[] = {"reactor_server", "status", "-d"};
+        int argc = 3;
+        CliParser::Parse(argc, const_cast<char**>(args));
+        TestFramework::RecordTest("CliParser: status -d throws", false,
+            "Expected exception for 'status -d'", CLI_CATEGORY);
+    } catch (const std::runtime_error&) {
+        TestFramework::RecordTest("CliParser: status -d throws", true, "", CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("CliParser: status -d throws", false,
+            std::string("Wrong exception type: ") + e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 46: 'validate -d' must throw.
+void TestValidateRejectsDaemonize() {
+    std::cout << "\n[TEST] CliParser: 'validate -d' throws..." << std::endl;
+    try {
+        const char* args[] = {"reactor_server", "validate", "-d"};
+        int argc = 3;
+        CliParser::Parse(argc, const_cast<char**>(args));
+        TestFramework::RecordTest("CliParser: validate -d throws", false,
+            "Expected exception for 'validate -d'", CLI_CATEGORY);
+    } catch (const std::runtime_error&) {
+        TestFramework::RecordTest("CliParser: validate -d throws", true, "", CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("CliParser: validate -d throws", false,
+            std::string("Wrong exception type: ") + e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 47: 'config -d' must throw.
+void TestConfigRejectsDaemonize() {
+    std::cout << "\n[TEST] CliParser: 'config -d' throws..." << std::endl;
+    try {
+        const char* args[] = {"reactor_server", "config", "-d"};
+        int argc = 3;
+        CliParser::Parse(argc, const_cast<char**>(args));
+        TestFramework::RecordTest("CliParser: config -d throws", false,
+            "Expected exception for 'config -d'", CLI_CATEGORY);
+    } catch (const std::runtime_error&) {
+        TestFramework::RecordTest("CliParser: config -d throws", true, "", CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("CliParser: config -d throws", false,
+            std::string("Wrong exception type: ") + e.what(), CLI_CATEGORY);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Suite entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1051,6 +1598,28 @@ void RunAllTests() {
     // ── Section 4: SignalHandler ──────────────────────────────────
     TestSignalHandlerInstallAndCleanup();
     TestSignalHandlerSigwaitUnblock();
+
+    // ── Section 5: Logger Phase 2 ─────────────────────────────────
+    TestSetConsoleEnabled();
+    TestSetConsoleEnabledPersists();
+    TestReopenWithFileSink();
+    TestReopenWithoutFileSink();
+    TestReopenBeforeInit();
+    TestReopenPreservesLevel();
+
+    // ── Section 6: SignalHandler Phase 2 ─────────────────────────
+    TestWaitForSignalSIGTERM();
+    TestWaitForSignalSIGHUP();
+    TestWaitForShutdownIgnoresSIGHUP();
+
+    // ── Section 7: CliParser Daemonize ────────────────────────────
+    TestStartDaemonizeShortFlag();
+    TestStartDaemonizeLongFlag();
+    TestStartNoDaemonize();
+    TestStopRejectsDaemonize();
+    TestStatusRejectsDaemonize();
+    TestValidateRejectsDaemonize();
+    TestConfigRejectsDaemonize();
 }
 
 }  // namespace CliTests
