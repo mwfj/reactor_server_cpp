@@ -6,7 +6,7 @@
 //   - CliParser (17 tests): default values, all short/long options, validation errors
 //   - PidFile (7 tests): acquire/release lifecycle, stale detection, ReadPid, CheckRunning
 //   - Config override precedence (5 tests): defaults < file < env < CLI
-//   - SignalHandler (2 tests): install/cleanup fd lifecycle, self-pipe unblocks WaitForSignal
+//   - SignalHandler (2 tests): install/cleanup, sigwait unblocks WaitForShutdown
 //
 // Port range: 10500-10599 (not used directly by unit tests; reserved for this suite)
 // Temp file pattern: /tmp/test_reactor_NNNN.pid
@@ -261,7 +261,7 @@ void TestParseInvalidLogLevel() {
 
 // Test 9: Unknown command must throw.
 // "restart" is not a recognized subcommand and must be rejected.
-void TestParseInvalidSignalAction() {
+void TestParseUnknownCommand() {
     std::cout << "\n[TEST] CliParser: Unknown command throws..." << std::endl;
     try {
         const char* args[] = {"reactor_server", "restart"};
@@ -360,9 +360,9 @@ void TestParseTestConfig() {
 
         bool pass = (opts.command == CliCommand::VALIDATE);
         std::string err = pass ? "" : "command should be VALIDATE after 'validate'";
-        TestFramework::RecordTest("CliParser: -t test-config flag", pass, err, CLI_CATEGORY);
+        TestFramework::RecordTest("CliParser: validate command", pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("CliParser: -t test-config flag", false, e.what(), CLI_CATEGORY);
+        TestFramework::RecordTest("CliParser: validate command", false, e.what(), CLI_CATEGORY);
     }
 }
 
@@ -376,9 +376,9 @@ void TestParseDumpConfig() {
 
         bool pass = (opts.command == CliCommand::CONFIG);
         std::string err = pass ? "" : "command should be CONFIG after 'config'";
-        TestFramework::RecordTest("CliParser: --dump-effective-config", pass, err, CLI_CATEGORY);
+        TestFramework::RecordTest("CliParser: config command", pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("CliParser: --dump-effective-config", false, e.what(), CLI_CATEGORY);
+        TestFramework::RecordTest("CliParser: config command", false, e.what(), CLI_CATEGORY);
     }
 }
 
@@ -408,9 +408,9 @@ void TestParseSignalStop() {
 
         bool pass = (opts.command == CliCommand::STOP);
         std::string err = pass ? "" : "command should be STOP after 'stop'";
-        TestFramework::RecordTest("CliParser: -s stop", pass, err, CLI_CATEGORY);
+        TestFramework::RecordTest("CliParser: stop command", pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("CliParser: -s stop", false, e.what(), CLI_CATEGORY);
+        TestFramework::RecordTest("CliParser: stop command", false, e.what(), CLI_CATEGORY);
     }
 }
 
@@ -424,9 +424,9 @@ void TestParseSignalStatus() {
 
         bool pass = (opts.command == CliCommand::STATUS);
         std::string err = pass ? "" : "command should be STATUS after 'status'";
-        TestFramework::RecordTest("CliParser: -s status", pass, err, CLI_CATEGORY);
+        TestFramework::RecordTest("CliParser: status command", pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("CliParser: -s status", false, e.what(), CLI_CATEGORY);
+        TestFramework::RecordTest("CliParser: status command", false, e.what(), CLI_CATEGORY);
     }
 }
 
@@ -935,12 +935,11 @@ void TestSignalHandlerInstallAndCleanup() {
     }
 }
 
-// Test 31: After Install(), sending SIGTERM causes WaitForSignal to unblock.
+// Test 31: After Install(), sending SIGTERM causes WaitForShutdown to unblock.
 //
 // Design:
 //   1. Install() — blocks SIGTERM/SIGINT via pthread_sigmask
-//   2. Spawn a thread that calls WaitForSignal(nullptr)
-//      (nullptr: WaitForSignal just sets the shutdown flag, no Stop() call)
+//   2. Spawn a thread that calls WaitForShutdown()
 //   3. Main thread: kill(getpid(), SIGTERM) — process-directed so sigwait() dequeues it
 //   4. Thread should unblock within a reasonable timeout (500 ms)
 //   5. If not, send another SIGTERM to force unblock
@@ -948,7 +947,7 @@ void TestSignalHandlerInstallAndCleanup() {
 // Note: kill(getpid(), ...) is process-directed. sigwait() in the waiter thread
 // dequeues it. This exercises the complete sigwait-based shutdown path.
 void TestSignalHandlerSigwaitUnblock() {
-    std::cout << "\n[TEST] SignalHandler: SIGTERM unblocks WaitForSignal..." << std::endl;
+    std::cout << "\n[TEST] SignalHandler: SIGTERM unblocks WaitForShutdown..." << std::endl;
     try {
         SignalHandler::Install();
 
@@ -957,7 +956,7 @@ void TestSignalHandlerSigwaitUnblock() {
         std::thread waiter([&]() {
             // Pass nullptr: we just want to verify the pipe read unblocks.
             // The CAS on g_shutdown_requested prevents a real Stop() call.
-            SignalHandler::WaitForSignal(nullptr);
+            SignalHandler::WaitForShutdown();
             thread_unblocked.store(true, std::memory_order_release);
         });
 
@@ -986,7 +985,7 @@ void TestSignalHandlerSigwaitUnblock() {
         }
 
         bool pass = thread_unblocked.load(std::memory_order_acquire);
-        std::string err = pass ? "" : "WaitForSignal did not unblock within 500ms after SIGTERM";
+        std::string err = pass ? "" : "WaitForShutdown did not unblock within 500ms after SIGTERM";
 
         // Always cleanup (safe to call again: guards against double-close)
         SignalHandler::Cleanup();
@@ -994,12 +993,12 @@ void TestSignalHandlerSigwaitUnblock() {
         // Restore SIGTERM to default so subsequent tests are not surprised
         signal(SIGTERM, SIG_DFL);
 
-        TestFramework::RecordTest("SignalHandler: SIGTERM unblocks WaitForSignal",
+        TestFramework::RecordTest("SignalHandler: SIGTERM unblocks WaitForShutdown",
                                   pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
         SignalHandler::Cleanup();
         signal(SIGTERM, SIG_DFL);
-        TestFramework::RecordTest("SignalHandler: SIGTERM unblocks WaitForSignal",
+        TestFramework::RecordTest("SignalHandler: SIGTERM unblocks WaitForShutdown",
                                   false, e.what(), CLI_CATEGORY);
     }
 }
@@ -1022,7 +1021,7 @@ void RunAllTests() {
     TestParseInvalidPortNegative();
     TestParseInvalidPortNonNumeric();
     TestParseInvalidLogLevel();
-    TestParseInvalidSignalAction();
+    TestParseUnknownCommand();
     TestParseUnknownOption();
     TestParseVersionFlags();
     TestParseTestConfig();

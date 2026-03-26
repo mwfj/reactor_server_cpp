@@ -1,24 +1,20 @@
 #pragma once
 
-class HttpServer;  // forward declaration
-
-// Async-signal-safe shutdown using sigwait (no self-pipe, no shared fds).
+// Shutdown signal handling using sigwait (no self-pipe, no shared fds).
 //
 // Design: Install() blocks SIGTERM/SIGINT/SIGPIPE in ALL threads via
-// pthread_sigmask. WaitForSignal() calls sigwait() which synchronously
+// pthread_sigmask. WaitForShutdown() calls sigwait() which synchronously
 // dequeues a blocked signal — no async signal handler, no pipe/eventfd,
-// no fd sharing between threads. This eliminates UB from concurrent fd
-// access and avoids the Stop()/Start() race: Stop() only runs after
-// sigwait() returns, and signals are only delivered to sigwait().
+// no fd sharing between threads.
 class SignalHandler {
 public:
     // Block SIGTERM, SIGINT, SIGPIPE in all threads via pthread_sigmask.
     // Must be called from the main thread before spawning any threads.
     static void Install();
 
-    // Synchronously wait for SIGTERM or SIGINT via sigwait(), then call
-    // server.Stop(). Intended to run on a dedicated thread.
-    static void WaitForSignal(HttpServer* server);
+    // Synchronously wait for SIGTERM or SIGINT via sigwait().
+    // Blocks until a shutdown signal is delivered. Caller handles Stop().
+    static void WaitForShutdown();
 
     // Ignore and unblock shutdown signals for clean teardown. Safe to call multiple times.
     static void Cleanup();

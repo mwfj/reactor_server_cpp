@@ -186,8 +186,8 @@ Disable it with `--no-health-endpoint`.
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success (normal exit, config valid, status check) |
-| 1 | General error (config invalid, bind failure, signal send failure) |
+| 0 | Success (normal exit, config valid, status confirms running, stop sent) |
+| 1 | General error (config invalid, bind failure, server not running) |
 | 2 | Usage error (unknown command, invalid option) |
 
 ## Build

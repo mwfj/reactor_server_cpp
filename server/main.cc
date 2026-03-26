@@ -172,7 +172,7 @@ static int HandleStart(const CliOptions& options) {
     });
 
     logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
-    SignalHandler::WaitForSignal(nullptr);
+    SignalHandler::WaitForShutdown();
 
     logging::Get()->info("{} shutting down...", REACTOR_SERVER_NAME);
     server->Stop();
