@@ -935,8 +935,16 @@ void TestSignalHandlerInstallAndCleanup() {
         SignalHandler::Install();
         SignalHandler::Cleanup();
 
+        // Restore default disposition — Cleanup() sets SIG_IGN before unblocking.
+        // Without this, subsequent sigwait()-based tests hang on macOS/BSD
+        // (kernel discards SIG_IGN signals before they become pending).
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+
         TestFramework::RecordTest("SignalHandler: Install and Cleanup", true, "", CLI_CATEGORY);
     } catch (const std::exception& e) {
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
         TestFramework::RecordTest("SignalHandler: Install and Cleanup", false, e.what(), CLI_CATEGORY);
     }
 }
