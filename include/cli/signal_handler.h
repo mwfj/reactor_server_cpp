@@ -20,6 +20,9 @@ public:
     // Also unblocks WaitForSignal if it's still blocking.
     static void Cleanup();
 
+    // Returns true if a shutdown signal has been received and processed.
+    static bool ShutdownRequested();
+
     SignalHandler() = delete;
 
 private:

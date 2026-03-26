@@ -198,10 +198,13 @@ int main(int argc, char* argv[]) {
         // Start signal-watcher thread
         signal_thread = std::thread(SignalHandler::WaitForSignal, server.get());
 
-        // Start server (blocks until Stop() is called)
-        logging::Get()->info("{} ready, accepting connections",
-                             REACTOR_SERVER_NAME);
-        server->Start();
+        // Guard against signal arriving between thread creation and Start().
+        // If Stop() already ran, Start() would enqueue into a stopped pool.
+        if (!SignalHandler::ShutdownRequested()) {
+            logging::Get()->info("{} ready, accepting connections",
+                                 REACTOR_SERVER_NAME);
+            server->Start();
+        }
 
         // Wait for signal thread
         if (signal_thread.joinable()) {

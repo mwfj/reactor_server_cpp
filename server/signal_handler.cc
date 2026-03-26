@@ -165,6 +165,10 @@ void SignalHandler::WaitForSignal(HttpServer* server) {
     }
 }
 
+bool SignalHandler::ShutdownRequested() {
+    return g_shutdown_requested.load(std::memory_order_acquire);
+}
+
 // ── Cleanup ──────────────────────────────────────────────────────
 
 void SignalHandler::Cleanup() {
