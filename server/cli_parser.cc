@@ -68,7 +68,17 @@ static CliCommand ParseCommand(const char* str) {
 
 static constexpr int OPT_NO_HEALTH = 256;
 
-static const struct option long_options[] = {
+// Global options — only -v/-V/-h, valid without a command
+static const struct option global_long_options[] = {
+    {"version",            no_argument, nullptr, 'v'},
+    {"version-verbose",    no_argument, nullptr, 'V'},
+    {"help",               no_argument, nullptr, 'h'},
+    {nullptr, 0, nullptr, 0}
+};
+static const char* global_short_options = "vVh";
+
+// Subcommand options — NO -v/-V/-h (those are global-only, parsed before the command)
+static const struct option subcmd_long_options[] = {
     {"config",             required_argument, nullptr, 'c'},
     {"port",               required_argument, nullptr, 'p'},
     {"host",               required_argument, nullptr, 'H'},
@@ -76,13 +86,10 @@ static const struct option long_options[] = {
     {"workers",            required_argument, nullptr, 'w'},
     {"pid-file",           required_argument, nullptr, 'P'},
     {"no-health-endpoint", no_argument,       nullptr, OPT_NO_HEALTH},
-    {"version",            no_argument,       nullptr, 'v'},
-    {"version-verbose",    no_argument,       nullptr, 'V'},
-    {"help",               no_argument,       nullptr, 'h'},
     {nullptr, 0, nullptr, 0}
 };
 
-static const char* short_options = "c:p:H:l:w:P:vVh";
+static const char* subcmd_short_options = "c:p:H:l:w:P:";
 
 // ── CliParser implementation ─────────────────────────────────────
 
@@ -105,26 +112,30 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
     // Check for global shortcuts -v, -V, -h before command parsing.
     // These work without a command: `./reactor_server -v`
     if (argv[1][0] == '-') {
-        // No command given — parse flags only.
-        // Only -v, -V, -h are valid without a command.
+        // No command given — only -v, -V, -h are valid.
         int opt;
-        while ((opt = getopt_long(argc, argv, short_options, long_options, nullptr)) != -1) {
+        while ((opt = getopt_long(argc, argv, global_short_options, global_long_options, nullptr)) != -1) {
             switch (opt) {
                 case 'v':
                     options.command = CliCommand::VERSION;
-                    return options;
+                    break;
                 case 'V':
                     options.command = CliCommand::VERSION;
                     options.version_verbose = true;
-                    return options;
+                    break;
                 case 'h':
                     options.command = CliCommand::HELP;
-                    return options;
+                    break;
                 default:
                     throw std::runtime_error(
                         std::string("A command is required. Try '") +
                         REACTOR_SERVER_NAME + " help' for usage.");
             }
+        }
+        // Reject trailing positional args (e.g., "-V foo")
+        if (optind < argc) {
+            throw std::runtime_error(
+                std::string("Unexpected argument: '") + argv[optind] + "'");
         }
         return options;
     }
@@ -166,7 +177,7 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
 #endif
 
     int opt;
-    while ((opt = getopt_long(argc, argv, short_options, long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, subcmd_short_options, subcmd_long_options, nullptr)) != -1) {
         switch (opt) {
             case 'c':
                 options.config_path = optarg;
@@ -194,16 +205,6 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
             case OPT_NO_HEALTH:
                 options.health_endpoint = false;
                 break;
-            case 'v':
-                options.command = CliCommand::VERSION;
-                return options;
-            case 'V':
-                options.command = CliCommand::VERSION;
-                options.version_verbose = true;
-                return options;
-            case 'h':
-                options.command = CliCommand::HELP;
-                return options;
             case '?':
                 throw std::runtime_error("Invalid option (see above)");
             default:
