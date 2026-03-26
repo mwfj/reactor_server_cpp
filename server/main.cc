@@ -206,50 +206,51 @@ int main(int argc, char* argv[]) {
         logging::Get()->info("  Health:  /health");
     }
 
-    // Architecture: server runs in its own thread, main thread waits for signals.
+    // Server runs in its own thread; main thread waits for signals via sigwait.
     //
-    // This eliminates the Start()/Stop() race:
-    //   - Server thread calls Start() which does AddTask + RunEventLoop (blocks)
-    //   - Main thread calls sigwait() which blocks until SIGTERM/SIGINT
-    //   - When sigwait() returns, Stop() is called from the main thread
-    //   - Start() returns (event loop exited), server thread joins
+    // Normal shutdown: sigwait returns (external SIGTERM/SIGINT) → main calls
+    // Stop() → Start() returns → server thread exits normally.
     //
-    // sigwait() only returns when a real signal is delivered to the process.
-    // By that time, the server thread has completed AddTask and entered
-    // RunEventLoop — the setup phase takes microseconds while signal delivery
-    // requires an external event (user Ctrl+C, kill, service manager).
+    // Startup failure: Start() throws → server thread checks if a shutdown
+    // signal already happened (ShutdownRequested). If not, it's a real failure:
+    // set server_failed and send SIGTERM to unblock main's sigwait.
+    // If yes, the exception was caused by Stop() racing Start() — clean exit.
     std::exception_ptr server_error;
-    std::thread server_thread([&server, &server_error]() {
+    std::atomic<bool> server_failed{false};
+    std::thread server_thread([&server, &server_error, &server_failed]() {
         try {
             server->Start();
         } catch (...) {
             server_error = std::current_exception();
-            // Start() failed — send SIGTERM to unblock main's sigwait().
-            // Normal exit (after Stop) doesn't need this: main already
-            // returned from sigwait and called Stop before Start returns.
-            kill(getpid(), SIGTERM);
+            if (!SignalHandler::ShutdownRequested()) {
+                // Real startup/runtime failure (not caused by Stop()).
+                // Wake main's sigwait so it doesn't hang.
+                server_failed.store(true, std::memory_order_release);
+                kill(getpid(), SIGTERM);
+            }
+            // else: exception was caused by Stop() racing Start() — clean exit.
+            // Main already returned from sigwait (it called Stop()), so no
+            // wakeup needed and no pending SIGTERM to worry about.
         }
     });
 
-    // Main thread: synchronously wait for shutdown signal.
-    // The "ready" message is logged after a brief yield to let the server
-    // thread enter Start(). This is cosmetic — sigwait blocks regardless.
-    std::this_thread::yield();
     logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
     SignalHandler::WaitForSignal(nullptr);
+
+    // After sigwait returns, call Stop() to unblock Start().
+    // Safe even if Start() already exited — Stop() is idempotent on
+    // a server that's no longer in its event loop.
     logging::Get()->info("{} shutting down...", REACTOR_SERVER_NAME);
     server->Stop();
 
     server_thread.join();
 
-    if (server_error) {
+    if (server_failed.load(std::memory_order_acquire) && server_error) {
         try {
             std::rethrow_exception(server_error);
         } catch (const std::exception& e) {
-            if (!SignalHandler::ShutdownRequested()) {
-                logging::Get()->error("Server error: {}", e.what());
-                exit_code = EXIT_ERROR;
-            }
+            logging::Get()->error("Server error: {}", e.what());
+            exit_code = EXIT_ERROR;
         }
     }
 
