@@ -26,6 +26,14 @@ void SignalHandler::Install() {
             std::string("Failed to block signals: ") + std::strerror(rc));
     }
 
+    // Restore default dispositions now that signals are blocked.
+    // On macOS/BSD, sigwait() cannot receive signals whose disposition is SIG_IGN —
+    // the kernel discards them before they become pending. Cleanup() sets SIG_IGN
+    // before unblocking, so a subsequent Install() must reset to SIG_DFL.
+    // Safe: signals are blocked, so default action (terminate) cannot fire.
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGINT, SIG_DFL);
+
     sigemptyset(&g_shutdown_mask);
     sigaddset(&g_shutdown_mask, SIGTERM);
     sigaddset(&g_shutdown_mask, SIGINT);
