@@ -206,21 +206,11 @@ int main(int argc, char* argv[]) {
             logging::Get()->info("  Health:  /health");
         }
 
-        // Start signal-watcher thread. WaitForSignal will not call Stop()
-        // until NotifyServerStarted() is called, preventing the race where
-        // Stop() destroys worker infrastructure before Start() sets it up.
         signal_thread = std::thread(SignalHandler::WaitForSignal, server.get());
 
-        // If a signal arrived during setup, skip Start() entirely.
-        if (SignalHandler::ShutdownRequested()) {
-            // Unblock the signal thread's server-started spin
-            SignalHandler::NotifyServerStarted();
-        } else {
-            logging::Get()->info("{} ready, accepting connections",
-                                 REACTOR_SERVER_NAME);
-            SignalHandler::NotifyServerStarted();
-            server->Start();
-        }
+        logging::Get()->info("{} ready, accepting connections",
+                             REACTOR_SERVER_NAME);
+        server->Start();
 
         // Wait for signal thread
         if (signal_thread.joinable()) {
@@ -230,13 +220,19 @@ int main(int argc, char* argv[]) {
         logging::Get()->info("{} stopped", REACTOR_SERVER_NAME);
 
     } catch (const std::exception& e) {
-        logging::Get()->error("Fatal error: {}", e.what());
-        // Close the self-pipe to unblock the signal thread
+        if (SignalHandler::ShutdownRequested()) {
+            // Signal arrived during startup — Stop() raced with Start().
+            // This is a clean shutdown, not a fatal error.
+            logging::Get()->info("{} stopped (signal during startup)",
+                                 REACTOR_SERVER_NAME);
+        } else {
+            logging::Get()->error("Fatal error: {}", e.what());
+            exit_code = EXIT_ERROR;
+        }
         SignalHandler::Cleanup();
         if (signal_thread.joinable()) {
             signal_thread.join();
         }
-        exit_code = EXIT_ERROR;
     }
     // Server destroyed here — after signal_thread is joined
     server.reset();

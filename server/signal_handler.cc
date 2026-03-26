@@ -18,67 +18,76 @@
 #endif
 
 // ── File-scope static state ──────────────────────────────────────
-// Signal handlers are C function pointers that cannot capture state,
-// so the pipe fds must be module-level.
+// std::atomic<int> for the fds: accessed from signal handler, waiter
+// thread, and Cleanup(). Atomics eliminate the data race on the fd
+// values themselves. The signal handler uses relaxed load which
+// compiles to a plain load on all relevant architectures.
 
 #if defined(__linux__)
-static int g_signal_eventfd = -1;
+static std::atomic<int> g_signal_fd{-1};
 #else
-static int g_signal_pipe[2] = {-1, -1};
+static std::atomic<int> g_signal_read_fd{-1};
+static std::atomic<int> g_signal_write_fd{-1};
 #endif
 
 static std::atomic<bool> g_shutdown_requested{false};
-static std::atomic<bool> g_server_started{false};
 
 // ── Signal handler (async-signal-safe) ───────────────────────────
 
 void SignalHandler::HandleSignal(int /*signum*/) {
     // ONLY write() is called here — it is on the POSIX async-signal-safe list.
     // Return value intentionally ignored: if the pipe is full, one wakeup is enough.
+    // relaxed load: compiles to a plain load, safe in signal context.
 #if defined(__linux__)
-    uint64_t val = 1;
-    (void)write(g_signal_eventfd, &val, sizeof(val));
+    int fd = g_signal_fd.load(std::memory_order_relaxed);
+    if (fd >= 0) {
+        uint64_t val = 1;
+        (void)write(fd, &val, sizeof(val));
+    }
 #else
-    char c = 1;
-    (void)write(g_signal_pipe[1], &c, 1);
+    int fd = g_signal_write_fd.load(std::memory_order_relaxed);
+    if (fd >= 0) {
+        char c = 1;
+        (void)write(fd, &c, 1);
+    }
 #endif
 }
 
 // ── Install ──────────────────────────────────────────────────────
 
 void SignalHandler::Install() {
-    // 1. Create self-pipe / eventfd
 #if defined(__linux__)
-    g_signal_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (g_signal_eventfd < 0) {
+    int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (fd < 0) {
         throw std::runtime_error(
             std::string("Failed to create signal eventfd: ") + std::strerror(errno));
     }
+    g_signal_fd.store(fd, std::memory_order_release);
 #else
-    if (pipe(g_signal_pipe) != 0) {
+    int pfd[2];
+    if (pipe(pfd) != 0) {
         throw std::runtime_error(
             std::string("Failed to create signal pipe: ") + std::strerror(errno));
     }
-    // Set both ends non-blocking + close-on-exec
     for (int i = 0; i < 2; ++i) {
-        int flags = fcntl(g_signal_pipe[i], F_GETFL, 0);
+        int flags = fcntl(pfd[i], F_GETFL, 0);
         if (flags == -1 ||
-            fcntl(g_signal_pipe[i], F_SETFL, flags | O_NONBLOCK) == -1 ||
-            fcntl(g_signal_pipe[i], F_SETFD, FD_CLOEXEC) == -1) {
-            close(g_signal_pipe[0]);
-            close(g_signal_pipe[1]);
-            g_signal_pipe[0] = g_signal_pipe[1] = -1;
+            fcntl(pfd[i], F_SETFL, flags | O_NONBLOCK) == -1 ||
+            fcntl(pfd[i], F_SETFD, FD_CLOEXEC) == -1) {
+            close(pfd[0]);
+            close(pfd[1]);
             throw std::runtime_error(
                 std::string("Failed to configure signal pipe: ") + std::strerror(errno));
         }
     }
+    g_signal_read_fd.store(pfd[0], std::memory_order_release);
+    g_signal_write_fd.store(pfd[1], std::memory_order_release);
 #endif
 
-    // 2. Install signal handlers
     struct sigaction sa;
     std::memset(&sa, 0, sizeof(sa));
     sa.sa_handler = HandleSignal;
-    sa.sa_flags = SA_RESTART;  // restart interrupted system calls
+    sa.sa_flags = SA_RESTART;
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGTERM, &sa, nullptr) != 0 ||
         sigaction(SIGINT, &sa, nullptr) != 0) {
@@ -87,12 +96,8 @@ void SignalHandler::Install() {
             std::string("Failed to install signal handlers: ") + std::strerror(errno));
     }
 
-    // 3. Ignore SIGPIPE (already handled by MSG_NOSIGNAL on Linux,
-    //    but explicit ignore is a safety net)
     signal(SIGPIPE, SIG_IGN);
-
     g_shutdown_requested.store(false);
-    g_server_started.store(false);
 }
 
 // ── WaitForSignal ────────────────────────────────────────────────
@@ -103,8 +108,7 @@ void SignalHandler::WaitForSignal(HttpServer* server) {
 #if defined(__linux__)
     uint64_t val;
     while (true) {
-        // Snapshot the fd — Cleanup() may close it concurrently.
-        int fd = g_signal_eventfd;
+        int fd = g_signal_fd.load(std::memory_order_acquire);
         if (fd < 0) break;
 
         ssize_t n = read(fd, &val, sizeof(val));
@@ -117,20 +121,19 @@ void SignalHandler::WaitForSignal(HttpServer* server) {
             struct pollfd pfd;
             pfd.fd = fd;
             pfd.events = POLLIN;
-            int ret = poll(&pfd, 1, 500);  // 500ms timeout to recheck fd validity
+            int ret = poll(&pfd, 1, 500);
             if (ret < 0 && errno == EINTR) continue;
-            if (ret == 0) continue;  // timeout — recheck g_signal_eventfd
+            if (ret == 0) continue;
             if (ret < 0) break;
-            // Check for POLLNVAL — fd was closed by Cleanup()
             if (pfd.revents & POLLNVAL) break;
             continue;
         }
-        break;  // read error or EBADF from closed fd
+        break;
     }
 #else
     char buf[16];
     while (true) {
-        int fd = g_signal_pipe[0];
+        int fd = g_signal_read_fd.load(std::memory_order_acquire);
         if (fd < 0) break;
 
         ssize_t n = read(fd, buf, sizeof(buf));
@@ -138,7 +141,7 @@ void SignalHandler::WaitForSignal(HttpServer* server) {
             received_signal = true;
             break;
         }
-        if (n == 0) break;  // pipe closed (Cleanup called)
+        if (n == 0) break;
         if (n == -1 && errno == EINTR) continue;
         if (n == -1 && errno == EAGAIN) {
             struct pollfd pfd;
@@ -155,16 +158,9 @@ void SignalHandler::WaitForSignal(HttpServer* server) {
     }
 #endif
 
-    // Only call Stop() if a real signal arrived (not pipe closed by Cleanup)
     if (received_signal) {
         bool expected = false;
         if (g_shutdown_requested.compare_exchange_strong(expected, true)) {
-            // Wait until the server is actually started before calling Stop().
-            // This prevents the race where Stop() destroys worker infrastructure
-            // before Start() finishes setting it up.
-            while (server && !g_server_started.load(std::memory_order_acquire)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
             if (server) {
                 server->Stop();
             }
@@ -176,28 +172,16 @@ bool SignalHandler::ShutdownRequested() {
     return g_shutdown_requested.load(std::memory_order_acquire);
 }
 
-void SignalHandler::NotifyServerStarted() {
-    g_server_started.store(true, std::memory_order_release);
-}
-
 // ── Cleanup ──────────────────────────────────────────────────────
 
 void SignalHandler::Cleanup() {
-    // Unblock WaitForSignal's server-started spin if it's waiting
-    g_server_started.store(true, std::memory_order_release);
 #if defined(__linux__)
-    if (g_signal_eventfd >= 0) {
-        close(g_signal_eventfd);
-        g_signal_eventfd = -1;
-    }
+    int fd = g_signal_fd.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0) close(fd);
 #else
-    if (g_signal_pipe[0] >= 0) {
-        close(g_signal_pipe[0]);
-        g_signal_pipe[0] = -1;
-    }
-    if (g_signal_pipe[1] >= 0) {
-        close(g_signal_pipe[1]);
-        g_signal_pipe[1] = -1;
-    }
+    int rfd = g_signal_read_fd.exchange(-1, std::memory_order_acq_rel);
+    if (rfd >= 0) close(rfd);
+    int wfd = g_signal_write_fd.exchange(-1, std::memory_order_acq_rel);
+    if (wfd >= 0) close(wfd);
 #endif
 }

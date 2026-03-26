@@ -23,10 +23,6 @@ public:
     // Returns true if a shutdown signal has been received and processed.
     static bool ShutdownRequested();
 
-    // Notify that the server is started and Stop() is safe to call.
-    // Must be called from main thread right before HttpServer::Start().
-    static void NotifyServerStarted();
-
     SignalHandler() = delete;
 
 private:
