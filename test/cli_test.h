@@ -917,12 +917,8 @@ void TestConfigUnsetCliDoesNotRevertEnv() {
 // SECTION 4: SignalHandler Tests (30–31)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Test 30: Install() and Cleanup() complete without throwing and without
-// leaking file descriptors.
-//
-// Strategy: snapshot /proc/self/fd (Linux) or use a simpler approach of
-// calling Install() + Cleanup() and verifying no exception is raised.
-// A strict fd-leak check would require counting open fds before and after.
+// Test 30: Install() blocks signals via pthread_sigmask, Cleanup() unblocks.
+// Verify neither throws.
 void TestSignalHandlerInstallAndCleanup() {
     std::cout << "\n[TEST] SignalHandler: Install and Cleanup succeeds..." << std::endl;
     try {
@@ -938,17 +934,16 @@ void TestSignalHandlerInstallAndCleanup() {
 // Test 31: After Install(), sending SIGTERM causes WaitForSignal to unblock.
 //
 // Design:
-//   1. Install() — creates self-pipe/eventfd
+//   1. Install() — blocks SIGTERM/SIGINT via pthread_sigmask
 //   2. Spawn a thread that calls WaitForSignal(nullptr)
-//      (nullptr server ptr is safe: WaitForSignal checks before calling Stop())
-//   3. Main thread: raise(SIGTERM) — writes to self-pipe via signal handler
+//      (nullptr: WaitForSignal just sets the shutdown flag, no Stop() call)
+//   3. Main thread: kill(getpid(), SIGTERM) — process-directed so sigwait() dequeues it
 //   4. Thread should unblock within a reasonable timeout (500 ms)
-//   5. Cleanup() — close the pipe to unblock the thread if it somehow missed
+//   5. If not, send another SIGTERM to force unblock
 //
-// Note: raise(SIGTERM) is delivered to the calling thread.  The signal handler
-// writes to the self-pipe.  WaitForSignal() on the other thread reads from the
-// read end.  This exercises the complete async-signal-safe path.
-void TestSignalHandlerSelfPipeWrite() {
+// Note: kill(getpid(), ...) is process-directed. sigwait() in the waiter thread
+// dequeues it. This exercises the complete sigwait-based shutdown path.
+void TestSignalHandlerSigwaitUnblock() {
     std::cout << "\n[TEST] SignalHandler: SIGTERM unblocks WaitForSignal..." << std::endl;
     try {
         SignalHandler::Install();
@@ -1052,7 +1047,7 @@ void RunAllTests() {
 
     // ── Section 4: SignalHandler ──────────────────────────────────
     TestSignalHandlerInstallAndCleanup();
-    TestSignalHandlerSelfPipeWrite();
+    TestSignalHandlerSigwaitUnblock();
 }
 
 }  // namespace CliTests

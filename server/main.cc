@@ -224,12 +224,18 @@ int main(int argc, char* argv[]) {
             server->Start();
         } catch (...) {
             server_error = std::current_exception();
+            // Start() failed — send SIGTERM to unblock main's sigwait().
+            // Normal exit (after Stop) doesn't need this: main already
+            // returned from sigwait and called Stop before Start returns.
+            kill(getpid(), SIGTERM);
         }
     });
 
-    logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
-
     // Main thread: synchronously wait for shutdown signal.
+    // The "ready" message is logged after a brief yield to let the server
+    // thread enter Start(). This is cosmetic — sigwait blocks regardless.
+    std::this_thread::yield();
+    logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
     SignalHandler::WaitForSignal(nullptr);
     logging::Get()->info("{} shutting down...", REACTOR_SERVER_NAME);
     server->Stop();
