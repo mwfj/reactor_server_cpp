@@ -8,5 +8,5 @@ inline constexpr const char* REACTOR_SERVER_NAME    = "reactor_server";
 #elif defined(__APPLE__) || defined(__MACH__)
     inline constexpr const char* REACTOR_PLATFORM = "macOS";
 #else
-    inline constexpr const char* REACTOR_PLATFORM = "Unknown";
+    inline constexpr const char* REACTOR_PLATFORM = "Unsupported";
 #endif

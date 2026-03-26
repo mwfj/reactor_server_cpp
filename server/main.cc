@@ -5,22 +5,20 @@
 #include "config/config_loader.h"
 #include "config/server_config.h"
 #include "http/http_server.h"
+// <chrono>, <iostream>, <thread>, <signal.h>, <unistd.h> provided by
+// common.h (via http_server.h → net_server.h)
 #include "http/http_request.h"
 #include "http/http_response.h"
 #include "log/logger.h"
 
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
-#include <iostream>
-#include <thread>
-#include <signal.h>
-#include <unistd.h>
 
 static constexpr int EXIT_OK          = 0;
 static constexpr int EXIT_ERROR       = 1;
 static constexpr int EXIT_USAGE_ERROR = 2;
+static constexpr size_t HEALTH_BUF_SIZE = 256;
 
 // ── Apply CLI flag overrides to config ───────────────────────────
 static void ApplyCliOverrides(ServerConfig& config, const CliOptions& options) {
@@ -82,7 +80,7 @@ MakeHealthHandler(std::chrono::steady_clock::time_point start_time) {
         auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
             now - start_time).count();
 
-        char buf[256];
+        char buf[HEALTH_BUF_SIZE];
         std::snprintf(buf, sizeof(buf),
             R"({"status":"ok","pid":%d,"uptime_seconds":%lld})",
             static_cast<int>(getpid()), static_cast<long long>(uptime));

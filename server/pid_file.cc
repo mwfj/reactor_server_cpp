@@ -1,19 +1,20 @@
 #include "cli/pid_file.h"
 #include "cli/version.h"
+#include "common.h"
+// <cstring>, <iostream>, <fcntl.h>, <unistd.h> provided by common.h
 
 #include <cerrno>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <iostream>
 
-#include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
 // ── File-scope static state ──────────────────────────────────────
+
+// Max bytes needed to represent a PID string (INT_MAX = 10 digits + newline + null)
+static constexpr size_t PID_BUF_SIZE = 32;
 
 static int g_pid_fd = -1;
 static std::string g_pid_path;
@@ -27,7 +28,7 @@ static pid_t ParsePidBuf(const char* buf, ssize_t len) {
     }
 
     // Need a null-terminated copy for strtol
-    char tmp[32];
+    char tmp[PID_BUF_SIZE];
     if (len >= static_cast<ssize_t>(sizeof(tmp))) {
         return -1;
     }
@@ -90,7 +91,7 @@ bool PidFile::Acquire(const std::string& path) {
     // Try to acquire an exclusive non-blocking lock
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK) {
-            char buf[32];
+            char buf[PID_BUF_SIZE];
             ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
             close(fd);
             pid_t rival = (n > 0) ? ParsePidBuf(buf, n) : -1;
@@ -152,7 +153,7 @@ pid_t PidFile::ReadPid(const std::string& path) {
         return -1;
     }
 
-    char buf[32];
+    char buf[PID_BUF_SIZE];
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
 
@@ -209,7 +210,7 @@ pid_t PidFile::CheckRunning(const std::string& path) {
     }
 
     // Lock held by another process. Read PID from this fd.
-    char buf[32];
+    char buf[PID_BUF_SIZE];
     ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
     close(fd);
 
