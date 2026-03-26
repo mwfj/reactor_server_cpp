@@ -176,6 +176,9 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
                 options.port = ParsePort(optarg);
                 break;
             case 'H':
+                if (optarg[0] == '\0') {
+                    throw std::runtime_error("--host requires a non-empty address");
+                }
                 options.host = optarg;
                 break;
             case 'l':
@@ -186,6 +189,7 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
                 break;
             case 'P':
                 options.pid_file = optarg;
+                options.pid_file_explicit = true;
                 break;
             case OPT_NO_HEALTH:
                 options.health_endpoint = false;
@@ -228,6 +232,10 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
 
     // validate/config accept -c, -p, -H, -l, -w but NOT -P or --no-health-endpoint
     if (cmd == CliCommand::VALIDATE || cmd == CliCommand::CONFIG) {
+        if (options.pid_file_explicit) {
+            throw std::runtime_error(
+                std::string("'") + argv[1] + "' does not accept -P/--pid-file");
+        }
         if (!options.health_endpoint) {
             throw std::runtime_error(
                 std::string("'") + argv[1] + "' does not accept --no-health-endpoint");

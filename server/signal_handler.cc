@@ -26,9 +26,10 @@ void SignalHandler::Install() {
     sigaddset(&g_block_mask, SIGINT);
     sigaddset(&g_block_mask, SIGPIPE);
 
-    if (pthread_sigmask(SIG_BLOCK, &g_block_mask, nullptr) != 0) {
+    int rc = pthread_sigmask(SIG_BLOCK, &g_block_mask, nullptr);
+    if (rc != 0) {
         throw std::runtime_error(
-            std::string("Failed to block signals: ") + std::strerror(errno));
+            std::string("Failed to block signals: ") + std::strerror(rc));
     }
 
     // Only wait on shutdown signals — SIGPIPE is blocked but not waited on.
