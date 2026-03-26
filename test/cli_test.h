@@ -965,8 +965,9 @@ void TestSignalHandlerSelfPipeWrite() {
         // Give the waiter thread a moment to reach the blocking read/poll
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-        // Send SIGTERM to this process — the signal handler writes to the pipe
-        raise(SIGTERM);
+        // Send process-directed SIGTERM so sigwait() in the waiter thread can dequeue it.
+        // (raise() is thread-directed and won't be seen by sigwait in another thread)
+        kill(getpid(), SIGTERM);
 
         // Wait up to 500 ms for the thread to unblock
         auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
@@ -975,9 +976,10 @@ void TestSignalHandlerSelfPipeWrite() {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
-        // If the thread is still blocked, force it to exit by closing the pipe
+        // If the thread is still blocked, send another signal to unblock sigwait
         if (!thread_unblocked.load(std::memory_order_acquire)) {
-            SignalHandler::Cleanup();
+            kill(getpid(), SIGTERM);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
         if (waiter.joinable()) {

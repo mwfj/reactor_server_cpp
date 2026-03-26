@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <thread>
+#include <signal.h>
 #include <unistd.h>
 
 static constexpr int EXIT_OK          = 0;
@@ -21,8 +22,6 @@ static constexpr int EXIT_ERROR       = 1;
 static constexpr int EXIT_USAGE_ERROR = 2;
 
 // ── Apply CLI flag overrides to config ───────────────────────────
-// Only modifies fields that were explicitly set on the command line.
-// Sentinel values (-1 for ints, "" for strings) mean "not overridden".
 static void ApplyCliOverrides(ServerConfig& config, const CliOptions& options) {
     if (options.port >= 0)            config.bind_port = options.port;
     if (!options.host.empty())        config.bind_host = options.host;
@@ -124,8 +123,6 @@ int main(int argc, char* argv[]) {
     // Load and resolve config (precedence: defaults < file < env < CLI)
     ServerConfig config;
     try {
-        // If the user explicitly passed -c, the file MUST exist.
-        // Only the implicit default path may be absent.
         if (access(options.config_path.c_str(), F_OK) == 0) {
             config = ConfigLoader::LoadFromFile(options.config_path);
         } else if (!options.config_path_explicit && errno == ENOENT) {
@@ -153,7 +150,6 @@ int main(int argc, char* argv[]) {
             return EXIT_ERROR;
         }
     }
-    // Validate config (needed for both --dump-effective-config and server startup)
     try {
         ConfigLoader::Validate(config);
     } catch (const std::invalid_argument& e) {
@@ -172,7 +168,8 @@ int main(int argc, char* argv[]) {
     }
     std::atexit(PidFile::Release);
 
-    // Signal handler (self-pipe pattern)
+    // Block SIGTERM/SIGINT/SIGPIPE before spawning any threads.
+    // All threads inherit the blocked mask; only sigwait() receives them.
     try {
         SignalHandler::Install();
     } catch (const std::runtime_error& e) {
@@ -180,15 +177,13 @@ int main(int argc, char* argv[]) {
         return EXIT_ERROR;
     }
 
-    // Construct server — HttpServer(config) initializes logging internally
+    // Construct and run server
     int exit_code = EXIT_OK;
     std::unique_ptr<HttpServer> server;
     std::thread signal_thread;
     try {
         server = std::make_unique<HttpServer>(config);
 
-        // Startup banner (logged after HttpServer construction for consistent
-        // logger name — HttpServer(config) re-initializes the global logger)
         logging::Get()->info("{} version {} starting", REACTOR_SERVER_NAME,
                              REACTOR_SERVER_VERSION);
         logging::Get()->info("  Listen:  {}:{}", config.bind_host, config.bind_port);
@@ -199,20 +194,21 @@ int main(int argc, char* argv[]) {
         logging::Get()->info("  Workers: {}", config.worker_threads);
         logging::Get()->info("  PID:     {} ({})", getpid(), options.pid_file);
 
-        // Register optional /health endpoint
         if (options.health_endpoint) {
             auto start_time = std::chrono::steady_clock::now();
             server->Get("/health", MakeHealthHandler(start_time));
             logging::Get()->info("  Health:  /health");
         }
 
+        // Signal thread: sigwait blocks until SIGTERM/SIGINT, then calls Stop().
+        // Since signals are blocked in all threads, Stop() can only run after
+        // sigwait returns — which requires an actual signal delivery.
         signal_thread = std::thread(SignalHandler::WaitForSignal, server.get());
 
         logging::Get()->info("{} ready, accepting connections",
                              REACTOR_SERVER_NAME);
         server->Start();
 
-        // Wait for signal thread
         if (signal_thread.joinable()) {
             signal_thread.join();
         }
@@ -221,25 +217,24 @@ int main(int argc, char* argv[]) {
 
     } catch (const std::exception& e) {
         if (SignalHandler::ShutdownRequested()) {
-            // Signal arrived during startup — Stop() raced with Start().
-            // This is a clean shutdown, not a fatal error.
             logging::Get()->info("{} stopped (signal during startup)",
                                  REACTOR_SERVER_NAME);
         } else {
             logging::Get()->error("Fatal error: {}", e.what());
             exit_code = EXIT_ERROR;
         }
+        // Unblock signals so we can send SIGTERM to ourselves to unblock
+        // the signal thread's sigwait() on the error path.
         SignalHandler::Cleanup();
         if (signal_thread.joinable()) {
+            // Send ourselves SIGTERM to unblock sigwait in the signal thread
+            kill(getpid(), SIGTERM);
             signal_thread.join();
         }
     }
-    // Server destroyed here — after signal_thread is joined
     server.reset();
 
-    // Cleanup
     SignalHandler::Cleanup();
-    // PidFile::Release() called by atexit
     logging::Shutdown();
     return exit_code;
 }

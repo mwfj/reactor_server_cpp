@@ -27,15 +27,15 @@ static int ParsePort(const char* str) {
     return static_cast<int>(val);
 }
 
-static int ParsePositiveInt(const char* str, const char* flag_name) {
+static int ParseNonNegativeInt(const char* str, const char* flag_name) {
     errno = 0;
     char* end = nullptr;
     long val = std::strtol(str, &end, 10);
     if (end == str || *end != '\0' || errno == ERANGE ||
-        val <= 0 || val > INT_MAX) {
+        val < 0 || val > INT_MAX) {
         throw std::runtime_error(
             std::string("Invalid value for ") + flag_name +
-            ": '" + str + "' (must be a positive integer)");
+            ": '" + str + "' (must be a non-negative integer)");
     }
     return static_cast<int>(val);
 }
@@ -139,7 +139,7 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
                 options.log_level = ValidateLogLevel(optarg);
                 break;
             case 'w':
-                options.workers = ParsePositiveInt(optarg, "--workers");
+                options.workers = ParseNonNegativeInt(optarg, "--workers");
                 break;
             case 'P':
                 options.pid_file = optarg;
@@ -190,7 +190,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "  -H, --host <address>        Override bind address (numeric IPv4 only)\n"
         << "  -l, --log-level <level>     Override log level\n"
         << "                              (trace, debug, info, warn, error, critical)\n"
-        << "  -w, --workers <N>           Override worker thread count\n"
+        << "  -w, --workers <N>           Override worker thread count (0 = auto)\n"
         << "\n"
         << "Process Management:\n"
         << "  -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)\n"
