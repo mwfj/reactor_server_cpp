@@ -12,7 +12,7 @@ make server
 ./reactor_server start
 
 # Start with custom config and port
-./reactor_server start -c config/server.json -p 9090
+./reactor_server start -c config/server.example.json -p 9090
 
 # Check if the server is running
 ./reactor_server status
@@ -70,7 +70,7 @@ Values are resolved in this order (highest wins):
 ```
 4. CLI flags      (-p 9090, -H 0.0.0.0, -l debug, -w 4)
 3. Environment    (REACTOR_BIND_PORT=9090)
-2. Config file    (config/server.json: {"bind_port": 9090})
+2. Config file    (config/server.example.json: {"bind_port": 9090})
 1. Defaults       (ServerConfig{} defaults: bind_port=8080)
 ```
 
@@ -79,7 +79,7 @@ Values are resolved in this order (highest wins):
 Validate a configuration file without starting the server:
 
 ```bash
-./reactor_server validate -c config/server.json
+./reactor_server validate -c config/server.example.json
 # Output: "Configuration is valid." (exit 0) or error (exit 1)
 ```
 
@@ -105,7 +105,7 @@ This outputs formatted JSON that can be redirected to a file and used as a confi
 ```bash
 ./reactor_server start
 ./reactor_server start -p 9090 -l debug
-./reactor_server start -c config/server.json --no-health-endpoint
+./reactor_server start -c config/server.example.json --no-health-endpoint
 ```
 
 ### Status Check

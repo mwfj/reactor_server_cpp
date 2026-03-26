@@ -27,7 +27,7 @@ make
 ./reactor_server start -p 9090 -l debug
 
 # Start with a config file
-./reactor_server start -c config/server.json
+./reactor_server start -c config/server.example.json
 
 # Check server status
 ./reactor_server status
@@ -48,7 +48,7 @@ make
 ./reactor_server start -H 0.0.0.0 -p 8080
 
 # Validate config without starting
-./reactor_server validate -c config/server.json
+./reactor_server validate -c config/server.example.json
 
 # Show resolved config (defaults + file + env + CLI)
 ./reactor_server config -p 9090 -l debug

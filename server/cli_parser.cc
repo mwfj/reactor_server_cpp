@@ -137,16 +137,22 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
             "'. Try '" + REACTOR_SERVER_NAME + " help' for usage.");
     }
 
-    // Commands that take no options — return immediately.
-    if (options.command == CliCommand::VERSION ||
-        options.command == CliCommand::HELP) {
-        // Check for -V after "version" command
-        if (options.command == CliCommand::VERSION && argc > 2) {
-            for (int i = 2; i < argc; ++i) {
-                if (std::strcmp(argv[i], "-V") == 0 ||
-                    std::strcmp(argv[i], "--version-verbose") == 0) {
-                    options.version_verbose = true;
-                }
+    // Commands that take no options (except version accepts -V).
+    if (options.command == CliCommand::HELP) {
+        if (argc > 2) {
+            throw std::runtime_error(
+                "'help' does not accept arguments");
+        }
+        return options;
+    }
+    if (options.command == CliCommand::VERSION) {
+        for (int i = 2; i < argc; ++i) {
+            if (std::strcmp(argv[i], "-V") == 0 ||
+                std::strcmp(argv[i], "--version-verbose") == 0) {
+                options.version_verbose = true;
+            } else {
+                throw std::runtime_error(
+                    std::string("'version' does not accept '") + argv[i] + "'");
             }
         }
         return options;
@@ -207,6 +213,27 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
             std::string("Unexpected argument: '") + argv[optind] + "'");
     }
 
+    // Per-command option validation: reject flags that don't apply.
+    auto cmd = options.command;
+
+    // stop/status only accept -P
+    if (cmd == CliCommand::STOP || cmd == CliCommand::STATUS) {
+        if (options.config_path_explicit || options.port >= 0 ||
+            !options.host.empty() || !options.log_level.empty() ||
+            options.workers >= 0 || !options.health_endpoint) {
+            throw std::runtime_error(
+                std::string("'") + argv[1] + "' only accepts -P/--pid-file");
+        }
+    }
+
+    // validate/config accept -c, -p, -H, -l, -w but NOT -P or --no-health-endpoint
+    if (cmd == CliCommand::VALIDATE || cmd == CliCommand::CONFIG) {
+        if (!options.health_endpoint) {
+            throw std::runtime_error(
+                std::string("'") + argv[1] + "' does not accept --no-health-endpoint");
+        }
+    }
+
     return options;
 }
 
@@ -261,10 +288,10 @@ void CliParser::PrintUsage(const char* program_name) {
         << "Examples:\n"
         << "  " << program_name << " start\n"
         << "  " << program_name << " start -p 9090 -l debug\n"
-        << "  " << program_name << " start -c config/server.json\n"
+        << "  " << program_name << " start -c config/server.example.json\n"
         << "  " << program_name << " stop\n"
         << "  " << program_name << " status\n"
-        << "  " << program_name << " validate -c config/server.json\n"
+        << "  " << program_name << " validate -c config/server.example.json\n"
         << "  " << program_name << " config -p 9090 -l debug\n";
 }
 
