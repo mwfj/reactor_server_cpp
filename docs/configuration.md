@@ -23,11 +23,20 @@ struct LogConfig {
     int max_files = 3;
 };
 
+struct Http2Config {
+    bool enabled = true;                   // Enable HTTP/2 (h2 + h2c)
+    uint32_t max_concurrent_streams = 100; // Max simultaneous streams
+    uint32_t initial_window_size = 65535;  // Flow control window (64 KB - 1)
+    uint32_t max_frame_size = 16384;       // Max frame payload (16 KB)
+    uint32_t max_header_list_size = 65536; // Max header block size (64 KB)
+};
+
 struct ServerConfig {
     std::string bind_host = "127.0.0.1";
     int bind_port = 8080;
     TlsConfig tls;
     LogConfig log;
+    Http2Config http2;
     int max_connections = 10000;
     int idle_timeout_sec = 300;      // 5 minutes
     int worker_threads = 3;
@@ -83,6 +92,13 @@ Reference config at `config/server.example.json`:
         "key_file": "",
         "min_version": "1.2"
     },
+    "http2": {
+        "enabled": true,
+        "max_concurrent_streams": 100,
+        "initial_window_size": 65535,
+        "max_frame_size": 16384,
+        "max_header_list_size": 65536
+    },
     "log": {
         "level": "info",
         "file": "",
@@ -111,6 +127,11 @@ Environment variables take precedence over JSON file values:
 | `REACTOR_IDLE_TIMEOUT` | `idle_timeout_sec` | int |
 | `REACTOR_WORKER_THREADS` | `worker_threads` | int |
 | `REACTOR_REQUEST_TIMEOUT` | `request_timeout_sec` | int |
+| `REACTOR_HTTP2_ENABLED` | `http2.enabled` | bool (`1`/`true`/`yes`) |
+| `REACTOR_HTTP2_MAX_CONCURRENT_STREAMS` | `http2.max_concurrent_streams` | int |
+| `REACTOR_HTTP2_INITIAL_WINDOW_SIZE` | `http2.initial_window_size` | int |
+| `REACTOR_HTTP2_MAX_FRAME_SIZE` | `http2.max_frame_size` | int |
+| `REACTOR_HTTP2_MAX_HEADER_LIST_SIZE` | `http2.max_header_list_size` | int |
 
 ### Validation
 
@@ -118,6 +139,7 @@ Environment variables take precedence over JSON file values:
 - Port in valid range (1-65535)
 - Worker threads > 0
 - If TLS enabled, cert_file and key_file must be non-empty
+- If HTTP/2 enabled: max_concurrent_streams >= 1, initial_window_size 1 to 2^31-1, max_frame_size 16384 to 16777215, max_header_list_size >= 1
 
 Throws `std::invalid_argument` on validation failure.
 

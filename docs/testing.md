@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all tests (51 tests across 8 suites)
+make test               # Build and run all tests (114 tests across 10 suites)
 ./run                   # Run all tests directly (after building)
 
 # Individual test suites
@@ -15,6 +15,8 @@ make test               # Build and run all tests (51 tests across 8 suites)
 ./run http              # HTTP protocol tests (or: ./run -H)
 ./run ws                # WebSocket protocol tests (or: ./run -w)
 ./run tls               # TLS/SSL tests (or: ./run -T)
+./run http2             # HTTP/2 protocol tests (or: ./run -2)
+./run cli               # CLI entry point tests (or: ./run -C)
 ./run help              # Show all options
 
 # Make targets for individual suites
@@ -25,6 +27,8 @@ make test_config        # Build and run config tests
 make test_http          # Build and run HTTP tests
 make test_ws            # Build and run WebSocket tests
 make test_tls           # Build and run TLS tests
+make test_http2         # Build and run HTTP/2 tests
+make test_cli           # Build and run CLI tests
 ```
 
 ## Test Suites
@@ -39,6 +43,8 @@ make test_tls           # Build and run TLS tests
 | HTTP | 13 | 10201 | `test/http_test.h` | `./run http` |
 | WebSocket | 10 | 10301 | `test/websocket_test.h` | `./run ws` |
 | TLS | 2 | 10401 | `test/tls_test.h` | `./run tls` |
+| HTTP/2 | 31 | 10500 | `test/http2_test.h` | `./run http2` |
+| CLI | 31 | N/A | `test/cli_test.h` | `./run cli` |
 
 ### Basic Tests (port 9888)
 - Single client connection
@@ -93,6 +99,22 @@ RC-5 is the most critical test -- it directly prevents the segfault (`Channel::H
 - Certificate loading and validation
 - TLS 1.2/1.3 minimum version enforcement
 
+### HTTP/2 Tests (port 10500-10599)
+
+**Configuration (6 tests):** Http2Config defaults, JSON parsing, RFC 9113 validation, env overrides, disabled mode, serialization round-trip.
+
+**Protocol Detection (8 tests):** ALPN h2/http1.1/empty, preface detection, HTTP/1.1 fallback, short data, partial preface, MinDetectionBytes constant.
+
+**Stream Unit Tests (7 tests):** Pseudo-header mapping (:method, :path, :authority), regular headers lowercase, cookie concatenation (RFC 9113 Section 8.2.3), body accumulation, stream state lifecycle, request completeness, path without query.
+
+**H2C Functional (6 tests):** Simple GET via cleartext h2c, POST with body, 404 routing, middleware execution, multiple concurrent streams on one connection, large body within limit.
+
+**Error Handling (2 tests):** Invalid preface (garbage bytes), body exceeding max_body_size (RST_STREAM).
+
+**Race Conditions (2 tests):** Concurrent HTTP/2 clients, mixed HTTP/1.1 + HTTP/2 clients.
+
+Uses `Http2TestClient` — a test helper wrapping nghttp2 in client mode with `mem_recv`/`mem_send` for frame-level control.
+
 ### Configuration Tests
 - Default values, JSON loading, file I/O
 - Invalid JSON handling, port validation
@@ -100,7 +122,7 @@ RC-5 is the most critical test -- it directly prevents the segfault (`Channel::H
 
 ## Port Configuration
 
-Each test suite uses separate ports (9800-10500 range) to allow independent execution. If you see "Address already in use" errors, check for conflicting services or wait for TIME_WAIT to expire.
+Each test suite uses separate ports (9800-10600 range) to allow independent execution. If you see "Address already in use" errors, check for conflicting services or wait for TIME_WAIT to expire.
 
 ## Test Framework
 
@@ -149,7 +171,7 @@ OVERALL SUMMARY
   Race Condition Tests: 7/7 (100%)
   ...
 ----------------------------------------------------------------------
-Total Tests: 51 | Passed: 51 | Failed: 0
+Total Tests: 114 | Passed: 114 | Failed: 0
 Success Rate: 100%
 ======================================================================
 ```

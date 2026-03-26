@@ -42,6 +42,7 @@ TlsContext(const std::string& cert_file, const std::string& key_file);
 - Sets TLS 1.2 minimum by default (constructor checks return value, throws on failure)
 - `SetMinProtocolVersion(version)` — throws if OpenSSL rejects the floor (prevents silent fail-open)
 - `SetCipherList(ciphers)` — configurable cipher suites
+- `SetAlpnProtocols({"h2", "http/1.1"})` — registers ALPN selection callback for HTTP/2 negotiation
 - Non-copyable, non-movable
 - **Shared ownership**: `HttpServer` creates via `make_shared`, passes to `NetServer` — guarantees context outlives both regardless of destruction order
 
@@ -71,6 +72,7 @@ TlsConnection(TlsContext& ctx, int fd);
 - `Write(buf, len)` — returns >0 bytes, TLS_COMPLETE (would_block), TLS_CROSS_RW, or TLS_ERROR
 - `Shutdown()` — sends close_notify
 - `IsHandshakeComplete()`, `GetCipherName()`, `GetProtocolVersion()`
+- `GetAlpnProtocol()` — returns the ALPN-negotiated protocol (e.g., `"h2"`, `"http/1.1"`, or `""` if not negotiated)
 
 ## TLS State Machine in ConnectionHandler
 
