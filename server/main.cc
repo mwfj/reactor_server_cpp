@@ -31,6 +31,7 @@ static void ApplyCliOverrides(ServerConfig& config, const CliOptions& options) {
 }
 
 // ── Handle -s stop|status commands ───────────────────────────────
+// CheckRunning returns: >0 = running (known PID), 0 = running (PID unreadable), -1 = not running
 static int HandleSignalCommand(const CliOptions& options) {
     pid_t pid = PidFile::CheckRunning(options.pid_file);
 
@@ -41,13 +42,23 @@ static int HandleSignalCommand(const CliOptions& options) {
                       << "  PID file:   " << options.pid_file << "\n";
             return EXIT_OK;
         }
+        if (pid == 0) {
+            std::cerr << REACTOR_SERVER_NAME
+                      << " is running (PID file locked but PID unreadable)\n";
+            return EXIT_ERROR;
+        }
         std::cout << REACTOR_SERVER_NAME << " is not running\n";
         return EXIT_ERROR;
     }
 
     if (options.signal_action == "stop") {
-        if (pid <= 0) {
+        if (pid < 0) {
             std::cout << REACTOR_SERVER_NAME << " is not running\n";
+            return EXIT_ERROR;
+        }
+        if (pid == 0) {
+            std::cerr << REACTOR_SERVER_NAME
+                      << " is running but PID is unreadable — cannot send signal\n";
             return EXIT_ERROR;
         }
         if (kill(pid, SIGTERM) == 0) {
@@ -195,14 +206,19 @@ int main(int argc, char* argv[]) {
             logging::Get()->info("  Health:  /health");
         }
 
-        // Start signal-watcher thread
+        // Start signal-watcher thread. WaitForSignal will not call Stop()
+        // until NotifyServerStarted() is called, preventing the race where
+        // Stop() destroys worker infrastructure before Start() sets it up.
         signal_thread = std::thread(SignalHandler::WaitForSignal, server.get());
 
-        // Guard against signal arriving between thread creation and Start().
-        // If Stop() already ran, Start() would enqueue into a stopped pool.
-        if (!SignalHandler::ShutdownRequested()) {
+        // If a signal arrived during setup, skip Start() entirely.
+        if (SignalHandler::ShutdownRequested()) {
+            // Unblock the signal thread's server-started spin
+            SignalHandler::NotifyServerStarted();
+        } else {
             logging::Get()->info("{} ready, accepting connections",
                                  REACTOR_SERVER_NAME);
+            SignalHandler::NotifyServerStarted();
             server->Start();
         }
 

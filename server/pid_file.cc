@@ -203,5 +203,11 @@ pid_t PidFile::CheckRunning(const std::string& path) {
     ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
     close(fd);
 
-    return ParsePidBuf(buf, n);
+    pid_t pid = ParsePidBuf(buf, n);
+    // Return 0 when the lock proves something is running but the PID
+    // content is unreadable/corrupt. Callers can distinguish:
+    //   >0 = running with known PID
+    //    0 = running but PID unknown
+    //   -1 = not running
+    return (pid > 0) ? pid : 0;
 }

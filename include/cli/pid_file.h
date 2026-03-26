@@ -20,7 +20,7 @@ public:
 
     // Check if a PID file exists and its process is alive.
     // If stale (process dead), removes the file.
-    // Returns the live PID, or -1 if not running.
+    // Returns: >0 = running (known PID), 0 = locked but PID unreadable, -1 = not running.
     static pid_t CheckRunning(const std::string& path);
 
     PidFile() = delete;

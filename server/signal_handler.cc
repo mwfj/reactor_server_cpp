@@ -28,6 +28,7 @@ static int g_signal_pipe[2] = {-1, -1};
 #endif
 
 static std::atomic<bool> g_shutdown_requested{false};
+static std::atomic<bool> g_server_started{false};
 
 // ── Signal handler (async-signal-safe) ───────────────────────────
 
@@ -90,8 +91,8 @@ void SignalHandler::Install() {
     //    but explicit ignore is a safety net)
     signal(SIGPIPE, SIG_IGN);
 
-    // Reset shutdown flag
     g_shutdown_requested.store(false);
+    g_server_started.store(false);
 }
 
 // ── WaitForSignal ────────────────────────────────────────────────
@@ -158,6 +159,12 @@ void SignalHandler::WaitForSignal(HttpServer* server) {
     if (received_signal) {
         bool expected = false;
         if (g_shutdown_requested.compare_exchange_strong(expected, true)) {
+            // Wait until the server is actually started before calling Stop().
+            // This prevents the race where Stop() destroys worker infrastructure
+            // before Start() finishes setting it up.
+            while (server && !g_server_started.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
             if (server) {
                 server->Stop();
             }
@@ -169,9 +176,15 @@ bool SignalHandler::ShutdownRequested() {
     return g_shutdown_requested.load(std::memory_order_acquire);
 }
 
+void SignalHandler::NotifyServerStarted() {
+    g_server_started.store(true, std::memory_order_release);
+}
+
 // ── Cleanup ──────────────────────────────────────────────────────
 
 void SignalHandler::Cleanup() {
+    // Unblock WaitForSignal's server-started spin if it's waiting
+    g_server_started.store(true, std::memory_order_release);
 #if defined(__linux__)
     if (g_signal_eventfd >= 0) {
         close(g_signal_eventfd);
