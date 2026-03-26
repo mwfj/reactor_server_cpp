@@ -64,8 +64,13 @@ bool SignalHandler::ShutdownRequested() {
 
 void SignalHandler::Cleanup() {
     if (g_installed) {
+        // Ignore shutdown signals BEFORE unblocking. Any pending SIGTERM/SIGINT
+        // (e.g., repeated Ctrl+C, supervisor retry) is harmlessly discarded
+        // instead of killing the process mid-cleanup with default SIG_DFL.
+        signal(SIGTERM, SIG_IGN);
+        signal(SIGINT, SIG_IGN);
+        signal(SIGPIPE, SIG_IGN);
         pthread_sigmask(SIG_UNBLOCK, &g_block_mask, nullptr);
-        signal(SIGPIPE, SIG_IGN);  // keep SIGPIPE ignored
         g_installed = false;
     }
 }
