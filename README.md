@@ -21,19 +21,19 @@ A high-performance C++ network server built on the Reactor pattern with epoll/kq
 make
 
 # Start the server
-./reactor_server
+./reactor_server start
 
 # Start with custom port and log level
-./reactor_server -p 9090 -l debug
+./reactor_server start -p 9090 -l debug
 
 # Start with a config file
-./reactor_server -c config/server.json
+./reactor_server start -c config/server.json
 
 # Check server status
-./reactor_server -s status
+./reactor_server status
 
 # Graceful shutdown
-./reactor_server -s stop
+./reactor_server stop
 ```
 
 ## Running the Server
@@ -42,46 +42,54 @@ make
 
 ```bash
 # Start with defaults (127.0.0.1:8080)
-./reactor_server
+./reactor_server start
 
 # Override host and port
-./reactor_server -H 0.0.0.0 -p 8080
+./reactor_server start -H 0.0.0.0 -p 8080
 
 # Validate config without starting
-./reactor_server -c config/server.json -t
+./reactor_server validate -c config/server.json
 
 # Show resolved config (defaults + file + env + CLI)
-./reactor_server --dump-effective-config -p 9090 -l debug
+./reactor_server config -p 9090 -l debug
 
 # Version info
-./reactor_server -V
+./reactor_server version -V
+
+# Show usage
+./reactor_server
 ```
 
 ### CLI Reference
 
 ```
-reactor_server [options]
+reactor_server <command> [options]
 
-Server Control:
-  -c, --config <file>         Config file path (default: config/server.json)
-  -t, --test-config           Validate config and exit
-  -s, --signal <action>       Send signal to running instance (stop, status)
-  --dump-effective-config     Show resolved config and exit
+Commands:
+  start       Start the server (foreground)
+  stop        Stop a running server
+  status      Check server status
+  validate    Validate configuration
+  config      Show effective configuration
+  version     Show version information
+  help        Show this help
 
-Runtime Overrides:
+Start options:
+  -c, --config <file>         Config file (default: config/server.json)
   -p, --port <port>           Override bind port (1-65535)
   -H, --host <address>        Override bind address (numeric IPv4 only)
   -l, --log-level <level>     Override log level (trace/debug/info/warn/error/critical)
   -w, --workers <N>           Override worker thread count (0 = auto)
-
-Process Management:
   -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)
   --no-health-endpoint       Disable the /health endpoint
 
-Info:
-  -v, --version               Print version and exit
-  -V, --version-verbose       Print version with build details and exit
-  -h, --help                  Print this help and exit
+Stop/status options:
+  -P, --pid-file <file>       PID file path
+
+Global options:
+  -v, --version               Same as 'version'
+  -V, --version-verbose       Verbose version with build details
+  -h, --help                  Same as 'help'
 ```
 
 ### Signal Handling

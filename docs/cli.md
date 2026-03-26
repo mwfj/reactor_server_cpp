@@ -9,45 +9,59 @@ The `reactor_server` binary provides a production entry point for running, manag
 make server
 
 # Start with default config
-./reactor_server
+./reactor_server start
 
 # Start with custom config and port
-./reactor_server -c config/server.json -p 9090
+./reactor_server start -c config/server.json -p 9090
 
 # Check if the server is running
-./reactor_server -s status
+./reactor_server status
 
 # Graceful shutdown
-./reactor_server -s stop
+./reactor_server stop
 ```
 
 ## Usage
 
 ```
-reactor_server [options]
+Usage: reactor_server <command> [options]
 
-Server Control:
-  -c, --config <file>         Config file path (default: config/server.json)
-  -t, --test-config           Validate config and exit
-  -s, --signal <action>       Send signal to running instance (stop, status)
-  --dump-effective-config     Show resolved config and exit
+Commands:
+  start       Start the server (foreground)
+  stop        Stop a running server
+  status      Check server status
+  validate    Validate configuration
+  config      Show effective configuration
+  version     Show version information
+  help        Show this help
 
-Runtime Overrides:
+Start options:
+  -c, --config <file>         Config file (default: config/server.json)
   -p, --port <port>           Override bind port (1-65535)
   -H, --host <address>        Override bind address (numeric IPv4 only)
   -l, --log-level <level>     Override log level
                               (trace, debug, info, warn, error, critical)
-  -w, --workers <N>           Override worker thread count
-
-Process Management:
+  -w, --workers <N>           Override worker thread count (0 = auto)
   -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)
   --no-health-endpoint       Disable the /health endpoint
 
-Info:
-  -v, --version               Print version and exit
-  -V, --version-verbose       Print version with build details and exit
-  -h, --help                  Print this help and exit
+Stop/status options:
+  -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)
+
+Validate/config options:
+  -c, --config <file>         Config file
+  -p, --port <port>           Override bind port
+  -H, --host <address>        Override bind address
+  -l, --log-level <level>     Override log level
+  -w, --workers <N>           Override worker threads
+
+Global options:
+  -v, --version               Same as 'version'
+  -V, --version-verbose       Verbose version with build details
+  -h, --help                  Same as 'help'
 ```
+
+Running `./reactor_server` with no arguments prints the usage summary.
 
 ## Config Override Precedence
 
@@ -65,7 +79,7 @@ Values are resolved in this order (highest wins):
 Validate a configuration file without starting the server:
 
 ```bash
-./reactor_server -t -c config/server.json
+./reactor_server validate -c config/server.json
 # Output: "Configuration is valid." (exit 0) or error (exit 1)
 ```
 
@@ -74,22 +88,30 @@ Validate a configuration file without starting the server:
 Show the fully resolved config (after applying file, env, and CLI overrides):
 
 ```bash
-./reactor_server --dump-effective-config -p 9090 -l debug
+./reactor_server config -p 9090 -l debug
 ```
 
 This outputs formatted JSON that can be redirected to a file and used as a config:
 
 ```bash
-./reactor_server --dump-effective-config -p 9090 > my_config.json
-./reactor_server -c my_config.json
+./reactor_server config -p 9090 > my_config.json
+./reactor_server start -c my_config.json
 ```
 
-## Signal Management
+## Server Management
+
+### Start
+
+```bash
+./reactor_server start
+./reactor_server start -p 9090 -l debug
+./reactor_server start -c config/server.json --no-health-endpoint
+```
 
 ### Status Check
 
 ```bash
-./reactor_server -s status
+./reactor_server status
 # reactor_server is running
 #   PID:        12345
 #   PID file:   /tmp/reactor_server.pid
@@ -98,7 +120,7 @@ This outputs formatted JSON that can be redirected to a file and used as a confi
 ### Graceful Stop
 
 ```bash
-./reactor_server -s stop
+./reactor_server stop
 # Sent SIGTERM to reactor_server (PID 12345)
 ```
 
@@ -124,15 +146,15 @@ The server writes its PID to a file on startup and removes it on exit. The PID f
 
 - Default path: `/tmp/reactor_server.pid`
 - Override: `-P /path/to/custom.pid`
-- If the server crashes (SIGKILL), the stale PID file is automatically detected and removed on the next start
+- If the server crashes (SIGKILL), the stale PID file is automatically detected on the next start
 
 ### Multiple Instances
 
 Run multiple instances with different PID files and ports:
 
 ```bash
-./reactor_server -p 8080 -P /tmp/reactor_8080.pid &
-./reactor_server -p 8081 -P /tmp/reactor_8081.pid &
+./reactor_server start -p 8080 -P /tmp/reactor_8080.pid &
+./reactor_server start -p 8081 -P /tmp/reactor_8081.pid &
 ```
 
 ## Health Endpoint
@@ -149,10 +171,10 @@ Disable it with `--no-health-endpoint`.
 ## Version Info
 
 ```bash
-./reactor_server -v
+./reactor_server version
 # reactor_server version 1.0.0
 
-./reactor_server -V
+./reactor_server version -V
 # reactor_server version 1.0.0
 #   Compiler:  13.3.0 (C++17)
 #   OpenSSL:   OpenSSL 3.0.13 30 Jan 2024
@@ -164,9 +186,9 @@ Disable it with `--no-health-endpoint`.
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success (normal exit, config test passed, status check) |
+| 0 | Success (normal exit, config valid, status check) |
 | 1 | General error (config invalid, bind failure, signal send failure) |
-| 2 | Usage error (invalid CLI arguments) |
+| 2 | Usage error (unknown command, invalid option) |
 
 ## Build
 

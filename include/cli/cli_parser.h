@@ -1,18 +1,29 @@
 #pragma once
 
+// Lightweight CLI header — only needs <string> (not in common.h).
+// Intentionally avoids pulling common.h to keep the CLI interface minimal.
 #include <string>
 
 inline constexpr const char* DEFAULT_CONFIG_PATH = "config/server.json";
 
+// Subcommands recognized by the CLI.
+enum class CliCommand {
+    NONE,       // no command given → print usage
+    START,      // start the server
+    STOP,       // stop a running server
+    STATUS,     // check if server is running
+    VALIDATE,   // validate configuration
+    CONFIG,     // dump effective configuration
+    VERSION,    // print version
+    HELP,       // print usage
+};
+
 struct CliOptions {
+    CliCommand command = CliCommand::NONE;
+
     // Config
     std::string config_path = DEFAULT_CONFIG_PATH;
     bool config_path_explicit = false;  // true if user passed -c/--config
-    bool test_config = false;
-    bool dump_effective_config = false;
-
-    // Signal command ("", "stop", "status")
-    std::string signal_action;
 
     // Runtime overrides (sentinel values = not specified by user)
     int port = -1;
@@ -23,18 +34,17 @@ struct CliOptions {
     // Process management
     std::string pid_file = "/tmp/reactor_server.pid";
 
-    // Info flags
-    bool version = false;
-    bool version_verbose = false;
-    bool help = false;
-
     // Health endpoint
     bool health_endpoint = true;
+
+    // -V flag (verbose version)
+    bool version_verbose = false;
 };
 
 class CliParser {
 public:
     // Parse command-line arguments into CliOptions.
+    // First positional argument is the command (start, stop, status, etc.).
     // Throws std::runtime_error on invalid arguments.
     static CliOptions Parse(int argc, char* argv[]);
 

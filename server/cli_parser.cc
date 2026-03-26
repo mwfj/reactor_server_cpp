@@ -40,13 +40,9 @@ static int ParseNonNegativeInt(const char* str, const char* flag_name) {
     return static_cast<int>(val);
 }
 
-// Validates against the same set recognized by logging::ParseLevel().
-// Delegates to ParseLevel and rejects strings that map to the default fallback.
 static std::string ValidateLogLevel(const char* str) {
     std::string level_str(str);
     spdlog::level::level_enum parsed = logging::ParseLevel(level_str);
-    // ParseLevel returns info for unrecognized strings. If the input isn't
-    // literally "info" but parsed to info, it's unrecognized.
     if (parsed != spdlog::level::info || level_str == "info") {
         return level_str;
     }
@@ -55,50 +51,38 @@ static std::string ValidateLogLevel(const char* str) {
         "' (must be trace, debug, info, warn, error, or critical)");
 }
 
-static std::string ValidateSignalAction(const char* str) {
-    if (std::strcmp(str, "stop") == 0 ||
-        std::strcmp(str, "status") == 0) {
-        return str;
-    }
-    throw std::runtime_error(
-        std::string("Unknown signal action: '") + str +
-        "' (must be 'stop' or 'status')");
+// ── Command parsing ──────────────────────────────────────────────
+
+static CliCommand ParseCommand(const char* str) {
+    if (std::strcmp(str, "start") == 0)    return CliCommand::START;
+    if (std::strcmp(str, "stop") == 0)     return CliCommand::STOP;
+    if (std::strcmp(str, "status") == 0)   return CliCommand::STATUS;
+    if (std::strcmp(str, "validate") == 0) return CliCommand::VALIDATE;
+    if (std::strcmp(str, "config") == 0)   return CliCommand::CONFIG;
+    if (std::strcmp(str, "version") == 0)  return CliCommand::VERSION;
+    if (std::strcmp(str, "help") == 0)     return CliCommand::HELP;
+    return CliCommand::NONE;
 }
 
 // ── getopt_long option table ─────────────────────────────────────
 
-// Long-only option IDs (must not collide with ASCII short options)
-static constexpr int OPT_DUMP_CONFIG     = 256;
-static constexpr int OPT_NO_HEALTH       = 257;
+static constexpr int OPT_NO_HEALTH = 256;
 
 static const struct option long_options[] = {
-    // Server control
-    {"config",                required_argument, nullptr, 'c'},
-    {"test-config",           no_argument,       nullptr, 't'},
-    {"signal",                required_argument, nullptr, 's'},
-    {"dump-effective-config", no_argument,       nullptr, OPT_DUMP_CONFIG},
-
-    // Runtime overrides
-    {"port",                  required_argument, nullptr, 'p'},
-    {"host",                  required_argument, nullptr, 'H'},
-    {"log-level",             required_argument, nullptr, 'l'},
-    {"workers",               required_argument, nullptr, 'w'},
-
-    // Process management
-    {"pid-file",              required_argument, nullptr, 'P'},
-
-    // Health endpoint
-    {"no-health-endpoint",    no_argument,       nullptr, OPT_NO_HEALTH},
-
-    // Info
-    {"version",               no_argument,       nullptr, 'v'},
-    {"version-verbose",       no_argument,       nullptr, 'V'},
-    {"help",                  no_argument,       nullptr, 'h'},
-
+    {"config",             required_argument, nullptr, 'c'},
+    {"port",               required_argument, nullptr, 'p'},
+    {"host",               required_argument, nullptr, 'H'},
+    {"log-level",          required_argument, nullptr, 'l'},
+    {"workers",            required_argument, nullptr, 'w'},
+    {"pid-file",           required_argument, nullptr, 'P'},
+    {"no-health-endpoint", no_argument,       nullptr, OPT_NO_HEALTH},
+    {"version",            no_argument,       nullptr, 'v'},
+    {"version-verbose",    no_argument,       nullptr, 'V'},
+    {"help",               no_argument,       nullptr, 'h'},
     {nullptr, 0, nullptr, 0}
 };
 
-static const char* short_options = "c:ts:p:H:l:w:P:vVh";
+static const char* short_options = "c:p:H:l:w:P:vVh";
 
 // ── CliParser implementation ─────────────────────────────────────
 
@@ -113,21 +97,74 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
     optreset = 1;
 #endif
 
+    // If no arguments at all, command is NONE (prints usage).
+    if (argc < 2) {
+        return options;
+    }
+
+    // Check for global shortcuts -v, -V, -h before command parsing.
+    // These work without a command: `./reactor_server -v`
+    if (argv[1][0] == '-') {
+        // No command given — parse flags only.
+        // Only -v, -V, -h are valid without a command.
+        int opt;
+        while ((opt = getopt_long(argc, argv, short_options, long_options, nullptr)) != -1) {
+            switch (opt) {
+                case 'v':
+                    options.command = CliCommand::VERSION;
+                    return options;
+                case 'V':
+                    options.command = CliCommand::VERSION;
+                    options.version_verbose = true;
+                    return options;
+                case 'h':
+                    options.command = CliCommand::HELP;
+                    return options;
+                default:
+                    throw std::runtime_error(
+                        std::string("A command is required. Try '") +
+                        REACTOR_SERVER_NAME + " help' for usage.");
+            }
+        }
+        return options;
+    }
+
+    // First positional argument is the command.
+    options.command = ParseCommand(argv[1]);
+    if (options.command == CliCommand::NONE) {
+        throw std::runtime_error(
+            std::string("Unknown command: '") + argv[1] +
+            "'. Try '" + REACTOR_SERVER_NAME + " help' for usage.");
+    }
+
+    // Commands that take no options — return immediately.
+    if (options.command == CliCommand::VERSION ||
+        options.command == CliCommand::HELP) {
+        // Check for -V after "version" command
+        if (options.command == CliCommand::VERSION && argc > 2) {
+            for (int i = 2; i < argc; ++i) {
+                if (std::strcmp(argv[i], "-V") == 0 ||
+                    std::strcmp(argv[i], "--version-verbose") == 0) {
+                    options.version_verbose = true;
+                }
+            }
+        }
+        return options;
+    }
+
+    // Parse remaining options after the command.
+    // Skip argv[0] (program) and argv[1] (command) by setting optind = 2.
+    optind = 2;
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    optreset = 1;
+#endif
+
     int opt;
     while ((opt = getopt_long(argc, argv, short_options, long_options, nullptr)) != -1) {
         switch (opt) {
             case 'c':
                 options.config_path = optarg;
                 options.config_path_explicit = true;
-                break;
-            case 't':
-                options.test_config = true;
-                break;
-            case 's':
-                options.signal_action = ValidateSignalAction(optarg);
-                break;
-            case OPT_DUMP_CONFIG:
-                options.dump_effective_config = true;
                 break;
             case 'p':
                 options.port = ParsePort(optarg);
@@ -148,23 +185,23 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
                 options.health_endpoint = false;
                 break;
             case 'v':
-                options.version = true;
-                break;
+                options.command = CliCommand::VERSION;
+                return options;
             case 'V':
+                options.command = CliCommand::VERSION;
                 options.version_verbose = true;
-                break;
+                return options;
             case 'h':
-                options.help = true;
-                break;
+                options.command = CliCommand::HELP;
+                return options;
             case '?':
-                // getopt_long already printed an error message
                 throw std::runtime_error("Invalid option (see above)");
             default:
                 throw std::runtime_error("Unexpected option parsing error");
         }
     }
 
-    // Check for unexpected positional arguments
+    // Check for unexpected positional arguments after the command
     if (optind < argc) {
         throw std::runtime_error(
             std::string("Unexpected argument: '") + argv[optind] + "'");
@@ -175,31 +212,43 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
 
 void CliParser::PrintUsage(const char* program_name) {
     std::cout
-        << "Usage: " << program_name << " [options]\n"
+        << "Usage: " << program_name << " <command> [options]\n"
         << "\n"
         << "A high-performance C++17 HTTP/WebSocket/TLS server.\n"
         << "\n"
-        << "Server Control:\n"
-        << "  -c, --config <file>         Config file path (default: config/server.json)\n"
-        << "  -t, --test-config           Validate config and exit\n"
-        << "  -s, --signal <action>       Send signal to running instance (stop, status)\n"
-        << "  --dump-effective-config     Show resolved config and exit\n"
+        << "Commands:\n"
+        << "  start       Start the server (foreground)\n"
+        << "  stop        Stop a running server\n"
+        << "  status      Check server status\n"
+        << "  validate    Validate configuration\n"
+        << "  config      Show effective configuration\n"
+        << "  version     Show version information\n"
+        << "  help        Show this help\n"
         << "\n"
-        << "Runtime Overrides:\n"
+        << "Start options:\n"
+        << "  -c, --config <file>         Config file (default: config/server.json)\n"
         << "  -p, --port <port>           Override bind port (1-65535)\n"
         << "  -H, --host <address>        Override bind address (numeric IPv4 only)\n"
         << "  -l, --log-level <level>     Override log level\n"
         << "                              (trace, debug, info, warn, error, critical)\n"
         << "  -w, --workers <N>           Override worker thread count (0 = auto)\n"
-        << "\n"
-        << "Process Management:\n"
         << "  -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)\n"
         << "  --no-health-endpoint       Disable the /health endpoint\n"
         << "\n"
-        << "Info:\n"
-        << "  -v, --version               Print version and exit\n"
-        << "  -V, --version-verbose       Print version with build details and exit\n"
-        << "  -h, --help                  Print this help and exit\n"
+        << "Stop/status options:\n"
+        << "  -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)\n"
+        << "\n"
+        << "Validate/config options:\n"
+        << "  -c, --config <file>         Config file\n"
+        << "  -p, --port <port>           Override bind port\n"
+        << "  -H, --host <address>        Override bind address\n"
+        << "  -l, --log-level <level>     Override log level\n"
+        << "  -w, --workers <N>           Override worker threads\n"
+        << "\n"
+        << "Global options:\n"
+        << "  -v, --version               Same as 'version'\n"
+        << "  -V, --version-verbose       Verbose version with build details\n"
+        << "  -h, --help                  Same as 'help'\n"
         << "\n"
         << "Config override precedence: defaults < config file < env vars < CLI flags\n"
         << "\n"
@@ -207,7 +256,16 @@ void CliParser::PrintUsage(const char* program_name) {
         << "  REACTOR_BIND_HOST, REACTOR_BIND_PORT, REACTOR_TLS_ENABLED,\n"
         << "  REACTOR_TLS_CERT, REACTOR_TLS_KEY, REACTOR_LOG_LEVEL,\n"
         << "  REACTOR_LOG_FILE, REACTOR_MAX_CONNECTIONS, REACTOR_IDLE_TIMEOUT,\n"
-        << "  REACTOR_WORKER_THREADS, REACTOR_REQUEST_TIMEOUT\n";
+        << "  REACTOR_WORKER_THREADS, REACTOR_REQUEST_TIMEOUT\n"
+        << "\n"
+        << "Examples:\n"
+        << "  " << program_name << " start\n"
+        << "  " << program_name << " start -p 9090 -l debug\n"
+        << "  " << program_name << " start -c config/server.json\n"
+        << "  " << program_name << " stop\n"
+        << "  " << program_name << " status\n"
+        << "  " << program_name << " validate -c config/server.json\n"
+        << "  " << program_name << " config -p 9090 -l debug\n";
 }
 
 void CliParser::PrintVersion() {

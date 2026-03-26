@@ -74,17 +74,11 @@ void TestParseDefaults() {
         bool pass = true;
         std::string err;
 
+        if (opts.command != CliCommand::NONE) {
+            pass = false; err += "command should be NONE with no args; ";
+        }
         if (opts.config_path != "config/server.json") {
             pass = false; err += "config_path default wrong; ";
-        }
-        if (opts.test_config != false) {
-            pass = false; err += "test_config should be false; ";
-        }
-        if (opts.dump_effective_config != false) {
-            pass = false; err += "dump_effective_config should be false; ";
-        }
-        if (!opts.signal_action.empty()) {
-            pass = false; err += "signal_action should be empty; ";
         }
         if (opts.port != -1) {
             pass = false; err += "port default should be -1; ";
@@ -101,14 +95,8 @@ void TestParseDefaults() {
         if (opts.pid_file != "/tmp/reactor_server.pid") {
             pass = false; err += "pid_file default wrong; ";
         }
-        if (opts.version != false) {
-            pass = false; err += "version should be false; ";
-        }
         if (opts.version_verbose != false) {
             pass = false; err += "version_verbose should be false; ";
-        }
-        if (opts.help != false) {
-            pass = false; err += "help should be false; ";
         }
         if (opts.health_endpoint != true) {
             pass = false; err += "health_endpoint should default to true; ";
@@ -124,8 +112,8 @@ void TestParseDefaults() {
 void TestParseConfigPath() {
     std::cout << "\n[TEST] CliParser: -c overrides config_path..." << std::endl;
     try {
-        const char* args[] = {"reactor_server", "-c", "/custom/path.json"};
-        int argc = 3;
+        const char* args[] = {"reactor_server", "start", "-c", "/custom/path.json"};
+        int argc = 4;
         auto opts = CliParser::Parse(argc, const_cast<char**>(args));
 
         bool pass = (opts.config_path == "/custom/path.json");
@@ -143,12 +131,13 @@ void TestParseAllShortOptions() {
     try {
         const char* args[] = {
             "reactor_server",
+            "start",
             "-p", "9090",
             "-H", "0.0.0.0",
             "-l", "debug",
             "-w", "4"
         };
-        int argc = 9;
+        int argc = 10;
         auto opts = CliParser::Parse(argc, const_cast<char**>(args));
 
         bool pass = true;
@@ -171,12 +160,13 @@ void TestParseAllLongOptions() {
     try {
         const char* args[] = {
             "reactor_server",
+            "start",
             "--port",      "9090",
             "--host",      "0.0.0.0",
             "--log-level", "debug",
             "--workers",   "4"
         };
-        int argc = 9;
+        int argc = 10;
         auto opts = CliParser::Parse(argc, const_cast<char**>(args));
 
         bool pass = true;
@@ -197,8 +187,8 @@ void TestParseAllLongOptions() {
 void TestParseInvalidPort() {
     std::cout << "\n[TEST] CliParser: Port 99999 throws..." << std::endl;
     try {
-        const char* args[] = {"reactor_server", "--port", "99999"};
-        int argc = 3;
+        const char* args[] = {"reactor_server", "start", "--port", "99999"};
+        int argc = 4;
         CliParser::Parse(argc, const_cast<char**>(args));
         // Should not reach here
         TestFramework::RecordTest("CliParser: Port out of range", false,
@@ -222,8 +212,8 @@ void TestParseInvalidPortNegative() {
     // exercise ParsePort with value 0 (boundary), we use port 0 as the
     // "too low" case (valid range is 1-65535).
     try {
-        const char* args[] = {"reactor_server", "--port", "0"};
-        int argc = 3;
+        const char* args[] = {"reactor_server", "start", "--port", "0"};
+        int argc = 4;
         CliParser::Parse(argc, const_cast<char**>(args));
         TestFramework::RecordTest("CliParser: Port 0 throws", false,
             "Expected exception for port 0", CLI_CATEGORY);
@@ -239,8 +229,8 @@ void TestParseInvalidPortNegative() {
 void TestParseInvalidPortNonNumeric() {
     std::cout << "\n[TEST] CliParser: Port 'abc' throws..." << std::endl;
     try {
-        const char* args[] = {"reactor_server", "--port", "abc"};
-        int argc = 3;
+        const char* args[] = {"reactor_server", "start", "--port", "abc"};
+        int argc = 4;
         CliParser::Parse(argc, const_cast<char**>(args));
         TestFramework::RecordTest("CliParser: Port non-numeric", false,
             "Expected exception for port 'abc'", CLI_CATEGORY);
@@ -256,8 +246,8 @@ void TestParseInvalidPortNonNumeric() {
 void TestParseInvalidLogLevel() {
     std::cout << "\n[TEST] CliParser: Invalid log level throws..." << std::endl;
     try {
-        const char* args[] = {"reactor_server", "--log-level", "foo"};
-        int argc = 3;
+        const char* args[] = {"reactor_server", "start", "--log-level", "foo"};
+        int argc = 4;
         CliParser::Parse(argc, const_cast<char**>(args));
         TestFramework::RecordTest("CliParser: Invalid log level", false,
             "Expected exception for log-level 'foo'", CLI_CATEGORY);
@@ -269,20 +259,20 @@ void TestParseInvalidLogLevel() {
     }
 }
 
-// Test 9: Unknown signal action must throw.
-// "restart" is not in {stop, status} and must be rejected.
+// Test 9: Unknown command must throw.
+// "restart" is not a recognized subcommand and must be rejected.
 void TestParseInvalidSignalAction() {
-    std::cout << "\n[TEST] CliParser: Invalid signal action throws..." << std::endl;
+    std::cout << "\n[TEST] CliParser: Unknown command throws..." << std::endl;
     try {
-        const char* args[] = {"reactor_server", "-s", "restart"};
-        int argc = 3;
+        const char* args[] = {"reactor_server", "restart"};
+        int argc = 2;
         CliParser::Parse(argc, const_cast<char**>(args));
-        TestFramework::RecordTest("CliParser: Invalid signal action", false,
-            "Expected exception for signal action 'restart'", CLI_CATEGORY);
+        TestFramework::RecordTest("CliParser: Unknown command", false,
+            "Expected exception for unknown command 'restart'", CLI_CATEGORY);
     } catch (const std::runtime_error&) {
-        TestFramework::RecordTest("CliParser: Invalid signal action", true, "", CLI_CATEGORY);
+        TestFramework::RecordTest("CliParser: Unknown command", true, "", CLI_CATEGORY);
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("CliParser: Invalid signal action", false,
+        TestFramework::RecordTest("CliParser: Unknown command", false,
             std::string("Wrong exception type: ") + e.what(), CLI_CATEGORY);
     }
 }
@@ -298,8 +288,8 @@ void TestParseUnknownOption() {
     // getopt from printing before the exception.  That's acceptable for
     // tests.  We just verify that a runtime_error is thrown.
     try {
-        const char* args[] = {"reactor_server", "--unknown-flag"};
-        int argc = 2;
+        const char* args[] = {"reactor_server", "start", "--unknown-flag"};
+        int argc = 3;
         CliParser::Parse(argc, const_cast<char**>(args));
         TestFramework::RecordTest("CliParser: Unknown option", false,
             "Expected exception for --unknown-flag", CLI_CATEGORY);
@@ -311,29 +301,47 @@ void TestParseUnknownOption() {
     }
 }
 
-// Test 11: -v sets version=true; -V sets version_verbose=true.
+// Test 11: -v and 'version' set command=VERSION; -V and 'version -V' set version_verbose.
 void TestParseVersionFlags() {
     std::cout << "\n[TEST] CliParser: Version flags set correctly..." << std::endl;
     try {
         bool pass = true;
         std::string err;
 
-        // -v
+        // -v sets command=VERSION, not version_verbose
         {
             const char* args[] = {"reactor_server", "-v"};
             int argc = 2;
             auto opts = CliParser::Parse(argc, const_cast<char**>(args));
-            if (!opts.version) { pass = false; err += "-v should set version=true; "; }
+            if (opts.command != CliCommand::VERSION) { pass = false; err += "-v should set command=VERSION; "; }
             if (opts.version_verbose) { pass = false; err += "-v should NOT set version_verbose; "; }
         }
 
-        // -V
+        // -V sets command=VERSION and version_verbose=true
         {
             const char* args[] = {"reactor_server", "-V"};
             int argc = 2;
             auto opts = CliParser::Parse(argc, const_cast<char**>(args));
-            if (opts.version) { pass = false; err += "-V should NOT set version; "; }
+            if (opts.command != CliCommand::VERSION) { pass = false; err += "-V should set command=VERSION; "; }
             if (!opts.version_verbose) { pass = false; err += "-V should set version_verbose=true; "; }
+        }
+
+        // 'version' subcommand sets command=VERSION, not version_verbose
+        {
+            const char* args[] = {"reactor_server", "version"};
+            int argc = 2;
+            auto opts = CliParser::Parse(argc, const_cast<char**>(args));
+            if (opts.command != CliCommand::VERSION) { pass = false; err += "'version' should set command=VERSION; "; }
+            if (opts.version_verbose) { pass = false; err += "'version' should NOT set version_verbose; "; }
+        }
+
+        // 'version -V' sets command=VERSION and version_verbose=true
+        {
+            const char* args[] = {"reactor_server", "version", "-V"};
+            int argc = 3;
+            auto opts = CliParser::Parse(argc, const_cast<char**>(args));
+            if (opts.command != CliCommand::VERSION) { pass = false; err += "'version -V' should set command=VERSION; "; }
+            if (!opts.version_verbose) { pass = false; err += "'version -V' should set version_verbose=true; "; }
         }
 
         TestFramework::RecordTest("CliParser: Version flags", pass, err, CLI_CATEGORY);
@@ -342,32 +350,32 @@ void TestParseVersionFlags() {
     }
 }
 
-// Test 12: -t sets test_config=true.
+// Test 12: 'validate' subcommand sets command=VALIDATE.
 void TestParseTestConfig() {
-    std::cout << "\n[TEST] CliParser: -t sets test_config=true..." << std::endl;
+    std::cout << "\n[TEST] CliParser: 'validate' sets command=VALIDATE..." << std::endl;
     try {
-        const char* args[] = {"reactor_server", "-t"};
+        const char* args[] = {"reactor_server", "validate"};
         int argc = 2;
         auto opts = CliParser::Parse(argc, const_cast<char**>(args));
 
-        bool pass = opts.test_config;
-        std::string err = pass ? "" : "test_config should be true after -t";
+        bool pass = (opts.command == CliCommand::VALIDATE);
+        std::string err = pass ? "" : "command should be VALIDATE after 'validate'";
         TestFramework::RecordTest("CliParser: -t test-config flag", pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("CliParser: -t test-config flag", false, e.what(), CLI_CATEGORY);
     }
 }
 
-// Test 13: --dump-effective-config sets dump_effective_config=true.
+// Test 13: 'config' subcommand sets command=CONFIG.
 void TestParseDumpConfig() {
-    std::cout << "\n[TEST] CliParser: --dump-effective-config flag..." << std::endl;
+    std::cout << "\n[TEST] CliParser: 'config' sets command=CONFIG..." << std::endl;
     try {
-        const char* args[] = {"reactor_server", "--dump-effective-config"};
+        const char* args[] = {"reactor_server", "config"};
         int argc = 2;
         auto opts = CliParser::Parse(argc, const_cast<char**>(args));
 
-        bool pass = opts.dump_effective_config;
-        std::string err = pass ? "" : "dump_effective_config should be true";
+        bool pass = (opts.command == CliCommand::CONFIG);
+        std::string err = pass ? "" : "command should be CONFIG after 'config'";
         TestFramework::RecordTest("CliParser: --dump-effective-config", pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("CliParser: --dump-effective-config", false, e.what(), CLI_CATEGORY);
@@ -378,8 +386,8 @@ void TestParseDumpConfig() {
 void TestParsePidFile() {
     std::cout << "\n[TEST] CliParser: -P overrides pid_file..." << std::endl;
     try {
-        const char* args[] = {"reactor_server", "-P", "/custom/my.pid"};
-        int argc = 3;
+        const char* args[] = {"reactor_server", "start", "-P", "/custom/my.pid"};
+        int argc = 4;
         auto opts = CliParser::Parse(argc, const_cast<char**>(args));
 
         bool pass = (opts.pid_file == "/custom/my.pid");
@@ -390,32 +398,32 @@ void TestParsePidFile() {
     }
 }
 
-// Test 15: -s stop sets signal_action="stop".
+// Test 15: 'stop' subcommand sets command=STOP.
 void TestParseSignalStop() {
-    std::cout << "\n[TEST] CliParser: -s stop..." << std::endl;
+    std::cout << "\n[TEST] CliParser: 'stop' command..." << std::endl;
     try {
-        const char* args[] = {"reactor_server", "-s", "stop"};
-        int argc = 3;
+        const char* args[] = {"reactor_server", "stop"};
+        int argc = 2;
         auto opts = CliParser::Parse(argc, const_cast<char**>(args));
 
-        bool pass = (opts.signal_action == "stop");
-        std::string err = pass ? "" : "signal_action should be 'stop'";
+        bool pass = (opts.command == CliCommand::STOP);
+        std::string err = pass ? "" : "command should be STOP after 'stop'";
         TestFramework::RecordTest("CliParser: -s stop", pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("CliParser: -s stop", false, e.what(), CLI_CATEGORY);
     }
 }
 
-// Test 16: -s status sets signal_action="status".
+// Test 16: 'status' subcommand sets command=STATUS.
 void TestParseSignalStatus() {
-    std::cout << "\n[TEST] CliParser: -s status..." << std::endl;
+    std::cout << "\n[TEST] CliParser: 'status' command..." << std::endl;
     try {
-        const char* args[] = {"reactor_server", "-s", "status"};
-        int argc = 3;
+        const char* args[] = {"reactor_server", "status"};
+        int argc = 2;
         auto opts = CliParser::Parse(argc, const_cast<char**>(args));
 
-        bool pass = (opts.signal_action == "status");
-        std::string err = pass ? "" : "signal_action should be 'status'";
+        bool pass = (opts.command == CliCommand::STATUS);
+        std::string err = pass ? "" : "command should be STATUS after 'status'";
         TestFramework::RecordTest("CliParser: -s status", pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("CliParser: -s status", false, e.what(), CLI_CATEGORY);
@@ -426,8 +434,8 @@ void TestParseSignalStatus() {
 void TestParseNoHealthEndpoint() {
     std::cout << "\n[TEST] CliParser: --no-health-endpoint..." << std::endl;
     try {
-        const char* args[] = {"reactor_server", "--no-health-endpoint"};
-        int argc = 2;
+        const char* args[] = {"reactor_server", "start", "--no-health-endpoint"};
+        int argc = 3;
         auto opts = CliParser::Parse(argc, const_cast<char**>(args));
 
         bool pass = (opts.health_endpoint == false);
@@ -841,8 +849,8 @@ void TestConfigCliOverridesEnv() {
         ConfigLoader::ApplyEnvOverrides(config);
 
         // CLI sets 5555 — should win
-        const char* args[] = {"reactor_server", "-p", "5555"};
-        int argc = 3;
+        const char* args[] = {"reactor_server", "start", "-p", "5555"};
+        int argc = 4;
         auto opts = CliParser::Parse(argc, const_cast<char**>(args));
         ApplyCliOverrides(config, opts);
 
