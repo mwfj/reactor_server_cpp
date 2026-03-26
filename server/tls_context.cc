@@ -51,3 +51,45 @@ void TlsContext::SetCipherList(const std::string& ciphers) {
         throw std::runtime_error("Failed to set cipher list: " + ciphers);
     }
 }
+
+void TlsContext::SetAlpnProtocols(const std::vector<std::string>& protocols) {
+    // Build wire-format ALPN list: each protocol prefixed by its length byte
+    alpn_wire_.clear();
+    for (const auto& proto : protocols) {
+        if (proto.size() > 255) {
+            throw std::runtime_error("ALPN protocol too long: " + proto);
+        }
+        alpn_wire_.push_back(static_cast<unsigned char>(proto.size()));
+        alpn_wire_.insert(alpn_wire_.end(), proto.begin(), proto.end());
+    }
+
+    // Register ALPN selection callback
+    SSL_CTX_set_alpn_select_cb(ctx_, AlpnSelectCallback, this);
+}
+
+int TlsContext::AlpnSelectCallback(
+    SSL* /*ssl*/,
+    const unsigned char** out,
+    unsigned char* outlen,
+    const unsigned char* in,
+    unsigned int inlen,
+    void* arg) {
+
+    auto* self = static_cast<TlsContext*>(arg);
+    if (self->alpn_wire_.empty()) {
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+
+    // Use OpenSSL's helper to select the preferred protocol.
+    // SSL_select_next_proto picks the first server protocol found in the
+    // client list, giving server-preference ordering.
+    if (SSL_select_next_proto(
+            const_cast<unsigned char**>(out), outlen,
+            self->alpn_wire_.data(),
+            static_cast<unsigned int>(self->alpn_wire_.size()),
+            in, inlen) != OPENSSL_NPN_NEGOTIATED) {
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+
+    return SSL_TLSEXT_ERR_OK;
+}

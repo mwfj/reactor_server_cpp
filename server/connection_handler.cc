@@ -689,6 +689,13 @@ void ConnectionHandler::SetTlsConnection(std::unique_ptr<TlsConnection> tls) {
     tls_state_ = TlsState::HANDSHAKE;
 }
 
+std::string ConnectionHandler::GetAlpnProtocol() const {
+    if (tls_ && tls_state_ == TlsState::READY) {
+        return tls_->GetAlpnProtocol();
+    }
+    return "";
+}
+
 void ConnectionHandler::SetDeadlineTimeoutCb(DeadlineTimeoutCb cb) {
     deadline_timeout_cb_ = std::move(cb);
 }

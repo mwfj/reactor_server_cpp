@@ -1,6 +1,7 @@
 #include "http/http_server.h"
 #include "config/config_loader.h"
 #include "ws/websocket_frame.h"
+#include "http2/http2_constants.h"
 #include "log/logger.h"
 #include <algorithm>
 
@@ -98,6 +99,10 @@ HttpServer::HttpServer(const ServerConfig& config)
     // to eliminate the race where data arrives before the cap is set.
     net_server_.SetMaxInputSize(ComputeInputCap());
 
+    // Initialize HTTP/2 enabled flag BEFORE the TLS section so that ALPN
+    // protocol selection below uses the config value, not the member default.
+    http2_enabled_ = config.http2.enabled;
+
     if (config.tls.enabled) {
         tls_ctx_ = std::make_shared<TlsContext>(config.tls.cert_file, config.tls.key_file);
         if (config.tls.min_version == "1.2") {
@@ -109,8 +114,22 @@ HttpServer::HttpServer(const ServerConfig& config)
                 "Unsupported tls.min_version: '" + config.tls.min_version +
                 "' (must be '1.2' or '1.3')");
         }
+
+        // Register ALPN protocols for HTTP/2 negotiation
+        if (http2_enabled_) {
+            tls_ctx_->SetAlpnProtocols({"h2", "http/1.1"});
+        } else {
+            tls_ctx_->SetAlpnProtocols({"http/1.1"});
+        }
+
         net_server_.SetTlsContext(tls_ctx_);
     }
+
+    // Initialize HTTP/2 session settings from config
+    h2_settings_.max_concurrent_streams = config.http2.max_concurrent_streams;
+    h2_settings_.initial_window_size    = config.http2.initial_window_size;
+    h2_settings_.max_frame_size         = config.http2.max_frame_size;
+    h2_settings_.max_header_list_size   = config.http2.max_header_list_size;
 }
 
 size_t HttpServer::ComputeInputCap() const {
@@ -193,10 +212,27 @@ void HttpServer::Stop() {
         }
     }
 
+    // Send GOAWAY to HTTP/2 connections (outside lock to prevent deadlock)
+    std::vector<std::pair<std::shared_ptr<Http2ConnectionHandler>,
+                          std::shared_ptr<ConnectionHandler>>> h2_conns;
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        for (auto& pair : h2_connections_) {
+            h2_conns.emplace_back(pair.second, pair.second->GetConnection());
+        }
+    }
+    for (auto& [h2_conn, conn] : h2_conns) {
+        try {
+            h2_conn->SendGoaway();
+            if (conn) conn->CloseAfterWrite();
+        } catch (...) {}
+    }
+
     net_server_.Stop();
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         http_connections_.clear();
+        h2_connections_.clear();
     }
 }
 
@@ -312,9 +348,16 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
 
 void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->debug("HTTP connection closed fd={}", conn->fd());
+
+    // Single lock: check both H2 and HTTP/1.x maps
     std::shared_ptr<HttpConnectionHandler> http_conn;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
+        auto h2_it = h2_connections_.find(conn->fd());
+        if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
+            h2_connections_.erase(h2_it);
+            return;
+        }
         auto it = http_connections_.find(conn->fd());
         if (it != http_connections_.end() && it->second->GetConnection() == conn) {
             http_conn = it->second;
@@ -327,9 +370,16 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
 
 void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->error("HTTP connection error fd={}", conn->fd());
+
+    // Single lock: check both H2 and HTTP/1.x maps
     std::shared_ptr<HttpConnectionHandler> http_conn;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
+        auto h2_it = h2_connections_.find(conn->fd());
+        if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
+            h2_connections_.erase(h2_it);
+            return;
+        }
         auto it = http_connections_.find(conn->fd());
         if (it != http_connections_.end() && it->second->GetConnection() == conn) {
             http_conn = it->second;
@@ -340,33 +390,139 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
 }
 
 void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message) {
+    // Single lock: look up both H2 and HTTP/1.x maps.
+    // Copy shared_ptrs under the lock, then call OnRawData outside it:
+    // OnRawData can trigger callbacks that acquire conn_mtx_ — deadlock.
+    std::shared_ptr<Http2ConnectionHandler> h2_conn;
     std::shared_ptr<HttpConnectionHandler> http_conn;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        auto it = http_connections_.find(conn->fd());
-        if (it == http_connections_.end()) {
-            // Race condition: data arrived before HandleNewConnection created
-            // the HttpConnectionHandler. Create it now (lazy initialization).
-            http_conn = std::make_shared<HttpConnectionHandler>(conn);
-            SetupHandlers(http_conn);
-            http_connections_[conn->fd()] = http_conn;
-            // Note: max_input_size_ already set by NetServer before RegisterCallbacks.
-        } else {
-            http_conn = it->second;
+
+        // Check HTTP/2 connections
+        auto h2_it = h2_connections_.find(conn->fd());
+        if (h2_it != h2_connections_.end()) {
+            if (h2_it->second->GetConnection() == conn) {
+                h2_conn = h2_it->second;
+            } else {
+                // fd reused — remove stale entry (will fall through to detection)
+                h2_connections_.erase(h2_it);
+            }
+        }
+
+        // Check HTTP/1.x connections (only if not H2)
+        if (!h2_conn) {
+            auto it = http_connections_.find(conn->fd());
+            if (it != http_connections_.end()) {
+                http_conn = it->second;
+            }
         }
     }
 
-    // Guard against fd-reuse: if the handler wraps a stale connection,
-    // notify the old WS handler and replace with a fresh one.
-    if (http_conn->GetConnection() != conn) {
-        // Notify old WebSocket close handler before discarding
-        SafeNotifyWsClose(http_conn);
-        http_conn = std::make_shared<HttpConnectionHandler>(conn);
-        SetupHandlers(http_conn);
-        std::lock_guard<std::mutex> lck(conn_mtx_);
-        http_connections_[conn->fd()] = http_conn;
-        // Note: max_input_size_ already set by NetServer before RegisterCallbacks.
+    if (h2_conn) {
+        h2_conn->OnRawData(conn, message);
+        return;
     }
 
+    if (http_conn) {
+        // Guard against fd-reuse: if the handler wraps a stale connection,
+        // notify the old WS handler and replace with a fresh one.
+        if (http_conn->GetConnection() != conn) {
+            SafeNotifyWsClose(http_conn);
+            http_conn = nullptr;
+            {
+                std::lock_guard<std::mutex> lck(conn_mtx_);
+                http_connections_.erase(conn->fd());
+            }
+            // Fall through to DetectAndRouteProtocol below
+        } else if (!http_conn->IsUpgraded()) {
+            // For cleartext HTTP/2 (h2c), the preface may arrive on a connection
+            // that HandleNewConnection already registered as HTTP/1.x.
+            // Before routing to the HTTP/1.x handler, check for the h2c preface.
+            if (http2_enabled_) {
+                auto proto = ProtocolDetector::DetectFromData(message.data(), message.size());
+                if (proto == ProtocolDetector::Protocol::HTTP2) {
+                    // Remove the placeholder HTTP/1.x handler and create HTTP/2
+                    {
+                        std::lock_guard<std::mutex> lck(conn_mtx_);
+                        http_connections_.erase(conn->fd());
+                    }
+                    http_conn = nullptr;
+                    DetectAndRouteProtocol(conn, message);
+                    return;
+                }
+            }
+            http_conn->OnRawData(conn, message);
+            return;
+        } else {
+            http_conn->OnRawData(conn, message);
+            return;
+        }
+    }
+
+    // No handler exists yet (or stale fd-reuse removed above) — detect protocol and create one
+    DetectAndRouteProtocol(conn, message);
+}
+
+bool HttpServer::DetectAndRouteProtocol(
+    std::shared_ptr<ConnectionHandler> conn, std::string& message) {
+
+    ProtocolDetector::Protocol proto = ProtocolDetector::Protocol::HTTP1;
+
+    if (http2_enabled_) {
+        // For TLS connections, check ALPN result
+        std::string alpn = conn->GetAlpnProtocol();
+        if (!alpn.empty()) {
+            proto = ProtocolDetector::DetectFromAlpn(alpn);
+        } else {
+            // Cleartext: check for HTTP/2 client preface
+            proto = ProtocolDetector::DetectFromData(message.data(), message.size());
+            if (proto == ProtocolDetector::Protocol::UNKNOWN) {
+                // Not enough data — default to HTTP/1.x.
+                // In practice, TCP segments are always >= MSS (~1460 bytes),
+                // so this is extremely unlikely.
+                proto = ProtocolDetector::Protocol::HTTP1;
+            }
+        }
+    }
+
+    if (proto == ProtocolDetector::Protocol::HTTP2) {
+        // Create HTTP/2 handler
+        auto h2_conn = std::make_shared<Http2ConnectionHandler>(conn, h2_settings_);
+        SetupH2Handlers(h2_conn);
+        {
+            std::lock_guard<std::mutex> lck(conn_mtx_);
+            h2_connections_[conn->fd()] = h2_conn;
+        }
+        // Initialize and feed the initial data
+        h2_conn->Initialize(message);
+        return true;
+    }
+
+    // HTTP/1.x — create handler (existing path)
+    auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
+    SetupHandlers(http_conn);
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        http_connections_[conn->fd()] = http_conn;
+    }
     http_conn->OnRawData(conn, message);
+    return true;
+}
+
+void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn) {
+    h2_conn->SetMaxBodySize(max_body_size_);
+    h2_conn->SetMaxHeaderSize(max_header_size_);
+    h2_conn->SetRequestTimeout(request_timeout_sec_);
+
+    // Set request callback: dispatch through HttpRouter (same as HTTP/1.x)
+    h2_conn->SetRequestCallback(
+        [this](std::shared_ptr<Http2ConnectionHandler> /*self*/,
+               int32_t /*stream_id*/,
+               const HttpRequest& request,
+               HttpResponse& response) {
+            if (!router_.Dispatch(request, response)) {
+                response.Status(404).Text("Not Found");
+            }
+        }
+    );
 }

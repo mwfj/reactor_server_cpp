@@ -3,6 +3,8 @@
 #include "net_server.h"
 #include "http/http_router.h"
 #include "http/http_connection_handler.h"
+#include "http2/http2_connection_handler.h"
+#include "http2/protocol_detector.h"
 #include "config/server_config.h"
 #include "tls/tls_context.h"
 
@@ -66,4 +68,17 @@ private:
     size_t max_header_size_ = 8192;        // 8 KB
     size_t max_ws_message_size_ = 16777216; // 16 MB
     int request_timeout_sec_ = 30;         // Slowloris protection
+
+    // HTTP/2 support
+    bool http2_enabled_ = true;
+    Http2Session::Settings h2_settings_;
+    std::map<int, std::shared_ptr<Http2ConnectionHandler>> h2_connections_;
+
+    // Helper: set up request handler on an Http2ConnectionHandler
+    void SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn);
+
+    // Detect protocol and create the appropriate handler (HTTP/1.x or HTTP/2).
+    // Returns true if handler was created and data was routed.
+    bool DetectAndRouteProtocol(std::shared_ptr<ConnectionHandler> conn,
+                                std::string& message);
 };

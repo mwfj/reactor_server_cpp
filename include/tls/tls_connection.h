@@ -37,6 +37,10 @@ public:
     std::string GetCipherName() const;
     std::string GetProtocolVersion() const;
 
+    // Get the ALPN-negotiated protocol (e.g., "h2", "http/1.1").
+    // Returns empty string if no ALPN was negotiated or handshake not complete.
+    std::string GetAlpnProtocol() const;
+
 private:
     SSL* ssl_;
     bool handshake_complete_ = false;

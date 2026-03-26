@@ -1,4 +1,5 @@
 #include "config/config_loader.h"
+#include "http2/http2_constants.h"
 #include "log/logger.h"
 #include "nlohmann/json.hpp"
 
@@ -114,6 +115,38 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
         }
     }
 
+    // HTTP/2 section
+    if (j.contains("http2")) {
+        if (!j["http2"].is_object())
+            throw std::runtime_error("http2 must be an object");
+        auto& h2 = j["http2"];
+        if (h2.contains("enabled")) {
+            if (!h2["enabled"].is_boolean())
+                throw std::runtime_error("http2.enabled must be a boolean");
+            config.http2.enabled = h2["enabled"].get<bool>();
+        }
+        if (h2.contains("max_concurrent_streams")) {
+            if (!h2["max_concurrent_streams"].is_number_unsigned())
+                throw std::runtime_error("http2.max_concurrent_streams must be a non-negative integer");
+            config.http2.max_concurrent_streams = h2["max_concurrent_streams"].get<uint32_t>();
+        }
+        if (h2.contains("initial_window_size")) {
+            if (!h2["initial_window_size"].is_number_unsigned())
+                throw std::runtime_error("http2.initial_window_size must be a non-negative integer");
+            config.http2.initial_window_size = h2["initial_window_size"].get<uint32_t>();
+        }
+        if (h2.contains("max_frame_size")) {
+            if (!h2["max_frame_size"].is_number_unsigned())
+                throw std::runtime_error("http2.max_frame_size must be a non-negative integer");
+            config.http2.max_frame_size = h2["max_frame_size"].get<uint32_t>();
+        }
+        if (h2.contains("max_header_list_size")) {
+            if (!h2["max_header_list_size"].is_number_unsigned())
+                throw std::runtime_error("http2.max_header_list_size must be a non-negative integer");
+            config.http2.max_header_list_size = h2["max_header_list_size"].get<uint32_t>();
+        }
+    }
+
     // Log section
     if (j.contains("log")) {
         if (!j["log"].is_object())
@@ -207,6 +240,25 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
 
     val = std::getenv("REACTOR_REQUEST_TIMEOUT");
     if (val) config.request_timeout_sec = EnvToInt(val, "REACTOR_REQUEST_TIMEOUT");
+
+    // HTTP/2 env overrides
+    val = std::getenv("REACTOR_HTTP2_ENABLED");
+    if (val) {
+        std::string s(val);
+        config.http2.enabled = (s == "1" || s == "true" || s == "yes");
+    }
+    val = std::getenv("REACTOR_HTTP2_MAX_CONCURRENT_STREAMS");
+    if (val) config.http2.max_concurrent_streams = static_cast<uint32_t>(
+                 EnvToInt(val, "REACTOR_HTTP2_MAX_CONCURRENT_STREAMS"));
+    val = std::getenv("REACTOR_HTTP2_INITIAL_WINDOW_SIZE");
+    if (val) config.http2.initial_window_size = static_cast<uint32_t>(
+                 EnvToInt(val, "REACTOR_HTTP2_INITIAL_WINDOW_SIZE"));
+    val = std::getenv("REACTOR_HTTP2_MAX_FRAME_SIZE");
+    if (val) config.http2.max_frame_size = static_cast<uint32_t>(
+                 EnvToInt(val, "REACTOR_HTTP2_MAX_FRAME_SIZE"));
+    val = std::getenv("REACTOR_HTTP2_MAX_HEADER_LIST_SIZE");
+    if (val) config.http2.max_header_list_size = static_cast<uint32_t>(
+                 EnvToInt(val, "REACTOR_HTTP2_MAX_HEADER_LIST_SIZE"));
 }
 
 void ConfigLoader::Validate(const ServerConfig& config) {
@@ -282,6 +334,28 @@ void ConfigLoader::Validate(const ServerConfig& config) {
         }
     }
 
+    // HTTP/2 validation (RFC 9113 constraints)
+    if (config.http2.enabled) {
+        if (config.http2.max_concurrent_streams < 1) {
+            throw std::invalid_argument(
+                "http2.max_concurrent_streams must be >= 1");
+        }
+        if (config.http2.initial_window_size < 1 ||
+            config.http2.initial_window_size > HTTP2_CONSTANTS::MAX_WINDOW_SIZE) {
+            throw std::invalid_argument(
+                "http2.initial_window_size must be 1 to 2^31-1");
+        }
+        if (config.http2.max_frame_size < HTTP2_CONSTANTS::MIN_MAX_FRAME_SIZE ||
+            config.http2.max_frame_size > HTTP2_CONSTANTS::MAX_MAX_FRAME_SIZE) {
+            throw std::invalid_argument(
+                "http2.max_frame_size must be 16384 to 16777215");
+        }
+        if (config.http2.max_header_list_size < 1) {
+            throw std::invalid_argument(
+                "http2.max_header_list_size must be >= 1");
+        }
+    }
+
     if (config.tls.enabled) {
         if (config.tls.cert_file.empty()) {
             throw std::invalid_argument(
@@ -322,5 +396,10 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
     j["log"]["file"]        = config.log.file;
     j["log"]["max_file_size"] = config.log.max_file_size;
     j["log"]["max_files"]   = config.log.max_files;
+    j["http2"]["enabled"]                = config.http2.enabled;
+    j["http2"]["max_concurrent_streams"] = config.http2.max_concurrent_streams;
+    j["http2"]["initial_window_size"]    = config.http2.initial_window_size;
+    j["http2"]["max_frame_size"]         = config.http2.max_frame_size;
+    j["http2"]["max_header_list_size"]   = config.http2.max_header_list_size;
     return j.dump(4);
 }

@@ -25,8 +25,9 @@ ifeq ($(UNAME_S),Darwin)
     endif
 endif
 
-CXXFLAGS = -std=c++17 -g -Wall -Iinclude -Ithread_pool/include -Iutil -Itest -Ithird_party $(OPENSSL_CFLAGS)
+CXXFLAGS = -std=c++17 -g -Wall -Iinclude -Ithread_pool/include -Iutil -Itest -Ithird_party -Ithird_party/nghttp2 $(OPENSSL_CFLAGS)
 CFLAGS = -g -Wall -Ithird_party/llhttp
+NGHTTP2_CFLAGS = -std=c99 -g -Wall -DHAVE_CONFIG_H -Ithird_party/nghttp2
 LDFLAGS = $(OPENSSL_LDFLAGS) -lpthread -lssl -lcrypto
 
 # Directories
@@ -63,6 +64,9 @@ HTTP_SRCS = $(SERVER_DIR)/http_response.cc $(SERVER_DIR)/http_parser.cc $(SERVER
 # WebSocket layer sources
 WS_SRCS = $(SERVER_DIR)/websocket_frame.cc $(SERVER_DIR)/websocket_handshake.cc $(SERVER_DIR)/websocket_parser.cc $(SERVER_DIR)/websocket_connection.cc
 
+# HTTP/2 layer sources
+HTTP2_SRCS = $(SERVER_DIR)/http2_session.cc $(SERVER_DIR)/http2_stream.cc $(SERVER_DIR)/http2_connection_handler.cc $(SERVER_DIR)/protocol_detector.cc
+
 # TLS layer sources
 TLS_SRCS = $(SERVER_DIR)/tls_context.cc $(SERVER_DIR)/tls_connection.cc
 
@@ -82,8 +86,37 @@ UTIL_SRCS = $(UTIL_DIR)/timestamp.cc
 LLHTTP_SRC = $(THIRD_PARTY_DIR)/llhttp/llhttp.c $(THIRD_PARTY_DIR)/llhttp/api.c $(THIRD_PARTY_DIR)/llhttp/http.c
 LLHTTP_OBJ = $(LLHTTP_SRC:.c=.o)
 
+# nghttp2 C sources (vendored HTTP/2 library)
+NGHTTP2_SRC = $(THIRD_PARTY_DIR)/nghttp2/nghttp2_alpn.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_buf.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_callbacks.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_debug.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_extpri.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_frame.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_hd.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_hd_huffman.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_hd_huffman_data.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_helper.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_http.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_map.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_mem.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_option.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_outbound_item.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_pq.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_priority_spec.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_queue.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_ratelim.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_rcbuf.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_session.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_stream.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_submit.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_time.c \
+              $(THIRD_PARTY_DIR)/nghttp2/nghttp2_version.c \
+              $(THIRD_PARTY_DIR)/nghttp2/sfparse.c
+NGHTTP2_OBJ = $(NGHTTP2_SRC:.c=.o)
+
 # Server library sources (shared between test and production binaries)
-LIB_SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(FOUNDATION_SRCS) $(HTTP_SRCS) $(WS_SRCS) $(TLS_SRCS) $(CLI_SRCS) $(UTIL_SRCS)
+LIB_SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(FOUNDATION_SRCS) $(HTTP_SRCS) $(HTTP2_SRCS) $(WS_SRCS) $(TLS_SRCS) $(CLI_SRCS) $(UTIL_SRCS)
 
 # Test binary sources
 TEST_SRCS = $(LIB_SRCS) $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/run_test.cc
@@ -98,7 +131,7 @@ THREAD_POOL_HEADERS = $(THREAD_POOL_DIR)/include/threadpool.h $(THREAD_POOL_DIR)
 UTIL_HEADERS = $(UTIL_DIR)/timestamp.h
 FOUNDATION_HEADERS = $(LIB_DIR)/log/logger.h $(LIB_DIR)/config/server_config.h $(LIB_DIR)/config/config_loader.h
 CLI_HEADERS = $(LIB_DIR)/cli/cli_parser.h $(LIB_DIR)/cli/signal_handler.h $(LIB_DIR)/cli/pid_file.h $(LIB_DIR)/cli/version.h
-TEST_HEADERS = $(TEST_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h
+TEST_HEADERS = $(TEST_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h
 
 # All headers combined
 HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(FOUNDATION_HEADERS) $(CLI_HEADERS) $(TEST_HEADERS)
@@ -112,17 +145,21 @@ all: $(TARGET) $(SERVER_TARGET)
 $(THIRD_PARTY_DIR)/llhttp/%.o: $(THIRD_PARTY_DIR)/llhttp/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Compile nghttp2 C sources to object files
+$(THIRD_PARTY_DIR)/nghttp2/%.o: $(THIRD_PARTY_DIR)/nghttp2/%.c
+	$(CC) $(NGHTTP2_CFLAGS) -c $< -o $@
+
 # Build the test executable
-$(TARGET): $(TEST_SRCS) $(HEADERS) $(LLHTTP_OBJ)
-	$(CXX) $(CXXFLAGS) $(TEST_SRCS) $(LLHTTP_OBJ) $(LDFLAGS) -o $(TARGET)
+$(TARGET): $(TEST_SRCS) $(HEADERS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ)
+	$(CXX) $(CXXFLAGS) $(TEST_SRCS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) $(LDFLAGS) -o $(TARGET)
 
 # Build the production server binary
-$(SERVER_TARGET): $(LIB_SRCS) $(MAIN_SRC) $(HEADERS) $(LLHTTP_OBJ)
-	$(CXX) $(CXXFLAGS) $(LIB_SRCS) $(MAIN_SRC) $(LLHTTP_OBJ) $(LDFLAGS) -o $(SERVER_TARGET)
+$(SERVER_TARGET): $(LIB_SRCS) $(MAIN_SRC) $(HEADERS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ)
+	$(CXX) $(CXXFLAGS) $(LIB_SRCS) $(MAIN_SRC) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) $(LDFLAGS) -o $(SERVER_TARGET)
 
 # Clean build artifacts
 clean:
-	rm -rf $(TARGET)* $(SERVER_TARGET) $(LLHTTP_OBJ)
+	rm -rf $(TARGET)* $(SERVER_TARGET) $(LLHTTP_OBJ) $(NGHTTP2_OBJ)
 
 # Run all tests
 test: $(TARGET)
@@ -168,6 +205,11 @@ test_tls: $(TARGET)
 test_cli: $(TARGET)
 	@echo "Running CLI tests only..."
 	./$(TARGET) cli
+
+# Run only HTTP/2 tests
+test_http2: $(TARGET)
+	@echo "Running HTTP/2 tests only..."
+	./$(TARGET) http2
 
 # Display help information
 help:
@@ -248,4 +290,4 @@ help:
 # Build only the production server binary
 server: $(SERVER_TARGET)
 
-.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli help
+.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 help

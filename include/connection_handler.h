@@ -91,6 +91,10 @@ public:
     void SetTlsConnection(std::unique_ptr<TlsConnection> tls);
     void SetMaxInputSize(size_t max) { max_input_size_ = max; }
 
+    // Get the ALPN-negotiated protocol from the TLS connection.
+    // Returns empty string if no TLS or ALPN not negotiated.
+    std::string GetAlpnProtocol() const;
+
     // Deadline: if set, IsTimeOut returns true when deadline is exceeded
     void SetDeadline(std::chrono::steady_clock::time_point deadline);
     void ClearDeadline();

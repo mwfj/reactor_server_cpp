@@ -20,6 +20,22 @@ public:
     void SetMinProtocolVersion(int version);
     void SetCipherList(const std::string& ciphers);
 
+    // ALPN negotiation: set the list of supported protocols in preference order.
+    // Protocol strings: "h2", "http/1.1". The server selects the first match.
+    void SetAlpnProtocols(const std::vector<std::string>& protocols);
+
 private:
     SSL_CTX* ctx_;
+
+    // Stored ALPN protocol list (wire-format: length-prefixed concatenation)
+    std::vector<unsigned char> alpn_wire_;
+
+    // Static ALPN selection callback for OpenSSL
+    static int AlpnSelectCallback(
+        SSL* ssl,
+        const unsigned char** out,
+        unsigned char* outlen,
+        const unsigned char* in,
+        unsigned int inlen,
+        void* arg);
 };

@@ -77,3 +77,13 @@ std::string TlsConnection::GetProtocolVersion() const {
     const char* version = SSL_get_version(ssl_);
     return version ? version : "unknown";
 }
+
+std::string TlsConnection::GetAlpnProtocol() const {
+    const unsigned char* data = nullptr;
+    unsigned int len = 0;
+    SSL_get0_alpn_selected(ssl_, &data, &len);
+    if (data && len > 0) {
+        return std::string(reinterpret_cast<const char*>(data), len);
+    }
+    return "";
+}

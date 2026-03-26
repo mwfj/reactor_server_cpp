@@ -1,0 +1,86 @@
+#pragma once
+
+#include "http/http_request.h"
+#include "http/http_response.h"
+// <string>, <cstdint>, <memory> provided by common.h (via http_request.h)
+
+// Response body data source for nghttp2. Defined here so Http2Stream can
+// own it via unique_ptr, ensuring cleanup when the stream is removed.
+struct ResponseDataSource {
+    std::string body;
+    size_t offset = 0;
+};
+
+class Http2Stream {
+public:
+    // Stream states (RFC 9113 Section 5.1)
+    enum class State {
+        IDLE,
+        OPEN,
+        HALF_CLOSED_REMOTE,   // Client sent END_STREAM
+        HALF_CLOSED_LOCAL,    // Server sent END_STREAM
+        CLOSED
+    };
+
+    explicit Http2Stream(int32_t stream_id);
+    ~Http2Stream();
+
+    // Non-copyable, movable
+    Http2Stream(const Http2Stream&) = delete;
+    Http2Stream& operator=(const Http2Stream&) = delete;
+    Http2Stream(Http2Stream&&) = default;
+    Http2Stream& operator=(Http2Stream&&) = default;
+
+    // Header accumulation (called from nghttp2 on_header_callback).
+    // Handles pseudo-headers (:method, :path, :scheme, :authority).
+    void AddHeader(const std::string& name, const std::string& value);
+
+    // Body accumulation (called from nghttp2 on_data_chunk_recv_callback)
+    void AppendBody(const char* data, size_t len);
+
+    // Mark headers complete (END_HEADERS received)
+    void MarkHeadersComplete();
+
+    // Mark stream as END_STREAM received from client
+    void MarkEndStream();
+
+    // Check if request is ready for dispatch
+    bool IsRequestComplete() const;
+
+    // State transitions
+    void SetState(State new_state);
+    State GetState() const { return state_; }
+    bool IsClosed() const { return state_ == State::CLOSED; }
+
+    // Accessors
+    int32_t StreamId() const { return stream_id_; }
+    HttpRequest& GetRequest() { return request_; }
+    const HttpRequest& GetRequest() const { return request_; }
+
+    // Track response state
+    bool IsResponseHeadersSent() const { return response_headers_sent_; }
+    void MarkResponseHeadersSent() { response_headers_sent_ = true; }
+    bool IsResponseComplete() const { return response_complete_; }
+    void MarkResponseComplete() { response_complete_ = true; }
+
+    // Body size tracking for limit enforcement
+    size_t AccumulatedBodySize() const { return accumulated_body_size_; }
+
+    // Owns the ResponseDataSource for this stream's response body.
+    // nghttp2 holds a raw pointer to it via nghttp2_data_source.ptr;
+    // we keep ownership here so it is freed when the stream is destroyed.
+    void SetDataSource(std::unique_ptr<ResponseDataSource> src) {
+        data_source_ = std::move(src);
+    }
+
+private:
+    int32_t stream_id_;
+    State state_ = State::IDLE;
+    HttpRequest request_;
+    bool headers_complete_ = false;
+    bool end_stream_received_ = false;
+    bool response_headers_sent_ = false;
+    bool response_complete_ = false;
+    size_t accumulated_body_size_ = 0;
+    std::unique_ptr<ResponseDataSource> data_source_;
+};
