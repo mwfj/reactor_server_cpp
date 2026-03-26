@@ -10,23 +10,108 @@ A high-performance C++ network server built on the Reactor pattern with epoll/kq
 - **Reactor Core** — edge-triggered epoll (Linux) / kqueue (macOS), non-blocking I/O, multi-threaded dispatcher pool
 - **Thread Pool** — configurable worker threads for event loop dispatchers
 - **Connection Management** — idle timeout detection, request deadlines (Slowloris protection), graceful shutdown with WS close frames
-- **Configuration** — JSON config files + environment variable overrides
+- **CLI** — production binary with config validation, signal management, PID file tracking, health endpoint
+- **Configuration** — JSON config files + environment variable overrides + CLI flag overrides
 - **Structured Logging** — spdlog-based async logging with file rotation
 
 ## Quick Start
 
 ```bash
-# Build
+# Build everything (test runner + production server)
 make
 
-# Run all tests (51 tests)
-make test
+# Start the server
+./reactor_server
 
-# Run specific suites
-./run basic stress race timeout http ws tls config
+# Start with custom port and log level
+./reactor_server -p 9090 -l debug
+
+# Start with a config file
+./reactor_server -c config/server.json
+
+# Check server status
+./reactor_server -s status
+
+# Graceful shutdown
+./reactor_server -s stop
 ```
 
-## Usage
+## Running the Server
+
+### Basic Usage
+
+```bash
+# Start with defaults (127.0.0.1:8080)
+./reactor_server
+
+# Override host and port
+./reactor_server -H 0.0.0.0 -p 8080
+
+# Validate config without starting
+./reactor_server -c config/server.json -t
+
+# Show resolved config (defaults + file + env + CLI)
+./reactor_server --dump-effective-config -p 9090 -l debug
+
+# Version info
+./reactor_server -V
+```
+
+### CLI Reference
+
+```
+reactor_server [options]
+
+Server Control:
+  -c, --config <file>         Config file path (default: config/server.json)
+  -t, --test-config           Validate config and exit
+  -s, --signal <action>       Send signal to running instance (stop, status)
+  --dump-effective-config     Show resolved config and exit
+
+Runtime Overrides:
+  -p, --port <port>           Override bind port (1-65535)
+  -H, --host <address>        Override bind address (numeric IPv4 only)
+  -l, --log-level <level>     Override log level (trace/debug/info/warn/error/critical)
+  -w, --workers <N>           Override worker thread count (0 = auto)
+
+Process Management:
+  -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)
+  --no-health-endpoint       Disable the /health endpoint
+
+Info:
+  -v, --version               Print version and exit
+  -V, --version-verbose       Print version with build details and exit
+  -h, --help                  Print this help and exit
+```
+
+### Signal Handling
+
+| Signal | Behavior |
+|--------|----------|
+| `SIGTERM` | Graceful shutdown (sends WS Close 1001, drains connections, exits) |
+| `SIGINT` | Same as SIGTERM (Ctrl+C) |
+| `SIGPIPE` | Ignored |
+
+### Config Override Precedence
+
+```
+defaults < config file < environment variables < CLI flags
+```
+
+Environment variables: `REACTOR_BIND_HOST`, `REACTOR_BIND_PORT`, `REACTOR_TLS_ENABLED`, `REACTOR_TLS_CERT`, `REACTOR_TLS_KEY`, `REACTOR_LOG_LEVEL`, `REACTOR_LOG_FILE`, `REACTOR_MAX_CONNECTIONS`, `REACTOR_IDLE_TIMEOUT`, `REACTOR_WORKER_THREADS`, `REACTOR_REQUEST_TIMEOUT`
+
+### Health Endpoint
+
+Enabled by default at `/health`:
+
+```bash
+curl http://127.0.0.1:8080/health
+# {"status":"ok","pid":12345,"uptime_seconds":3600}
+```
+
+Disable with `--no-health-endpoint`.
+
+## Programming API
 
 ### HTTP Server
 
@@ -84,36 +169,32 @@ server.Start();
 
 ### Configuration
 
-JSON config file or environment variables:
+JSON config file:
 
 ```json
 {
     "bind_host": "0.0.0.0",
     "bind_port": 8080,
     "max_connections": 10000,
+    "idle_timeout_sec": 300,
+    "worker_threads": 3,
     "max_body_size": 1048576,
     "max_header_size": 8192,
+    "max_ws_message_size": 16777216,
     "request_timeout_sec": 30,
     "tls": {
         "enabled": false,
         "cert_file": "",
         "key_file": "",
         "min_version": "1.2"
+    },
+    "log": {
+        "level": "info",
+        "file": "",
+        "max_file_size": 10485760,
+        "max_files": 3
     }
 }
-```
-
-Environment overrides: `REACTOR_BIND_HOST`, `REACTOR_BIND_PORT`, `REACTOR_TLS_ENABLED`, etc.
-
-### Raw TCP (Legacy)
-
-For custom protocols without HTTP framing:
-
-```cpp
-#include "reactor_server.h"
-
-ReactorServer server("0.0.0.0", 8888);
-server.Start();  // echo server with length-prefix protocol
 ```
 
 ## Architecture
@@ -138,29 +219,40 @@ reactor_server_cpp/
 │   ├── http/             #   HTTP layer (server, router, parser, request/response)
 │   ├── ws/               #   WebSocket layer (connection, parser, frame, handshake)
 │   ├── tls/              #   TLS layer (context, connection)
+│   ├── cli/              #   CLI layer (parser, signal handler, PID file, version)
+│   ├── config/           #   Configuration (server_config, config_loader)
+│   ├── log/              #   Logging (logger)
 │   └── *.h               #   Reactor core (dispatcher, channel, connection, etc.)
 ├── server/               # Implementation (.cc)
-├── test/                 # Test suites (basic, stress, race, timeout, http, ws, tls)
+│   ├── main.cc           #   Production entry point
+│   └── *.cc              #   All component implementations
+├── test/                 # Test suites (basic, stress, race, timeout, http, ws, tls, cli)
 ├── thread_pool/          # Standalone thread pool (separate build)
 ├── third_party/          # llhttp (HTTP parser), nlohmann/json, spdlog
-├── util/                 # Utilities (timestamp)
+├── config/               # Example config files
 ├── docs/                 # Documentation
-│   ├── architecture.md          #   Core design and data flow
-│   ├── callback_architecture.md #   Callback layer design
-│   ├── testing.md               #   Test suites and running tests
-│   ├── http.md                  #   HTTP/1.1 layer
-│   ├── websocket.md             #   WebSocket (RFC 6455)
-│   ├── tls.md                   #   TLS/SSL support
-│   └── configuration.md        #   Config and logging
 └── Makefile
 ```
 
 ## Build
 
 ```bash
-make                # Build (g++ with C++17, links pthread + OpenSSL)
+make                # Build both test runner (./run) and server (./reactor_server)
+make server         # Build only the production server
+make test           # Build and run all tests (83 tests)
 make clean          # Remove artifacts
 make help           # Show all targets
+
+# Run specific test suites
+./run basic         # Basic functionality (6 tests)
+./run stress        # Stress tests — 100 concurrent clients (1 test)
+./run race          # Race condition tests (7 tests)
+./run timeout       # Connection timeout tests (3 tests)
+./run config        # Configuration tests (8 tests)
+./run http          # HTTP protocol tests (14 tests)
+./run ws            # WebSocket protocol tests (10 tests)
+./run tls           # TLS/SSL tests (2 tests)
+./run cli           # CLI entry point tests (32 tests)
 
 # Thread pool subproject (independent)
 cd thread_pool && make && ./run
@@ -172,7 +264,8 @@ cd thread_pool && make && ./run
 
 | Document | Description |
 |----------|-------------|
-| [docs/architecture.md](docs/architecture.md) | Reactor pattern, layered design, data flow, memory management, cross-platform support |
+| [docs/cli.md](docs/cli.md) | CLI usage, flags, signal handling, PID files |
+| [docs/architecture.md](docs/architecture.md) | Reactor pattern, layered design, data flow, memory management |
 | [docs/callback_architecture.md](docs/callback_architecture.md) | 3-layer callback chain, type definitions, weak_ptr design pattern |
 | [docs/testing.md](docs/testing.md) | Test suites, running tests, port configuration |
 | [docs/http.md](docs/http.md) | HTTP/1.1 layer — routing, middleware, request/response API |

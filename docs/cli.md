@@ -116,7 +116,7 @@ kill -TERM $(cat /tmp/reactor_server.pid)
 | `SIGINT` | Same as SIGTERM (Ctrl+C in foreground) |
 | `SIGPIPE` | Ignored (handled by MSG_NOSIGNAL) |
 
-Signal handling uses the self-pipe pattern for async-signal-safety. The signal handler only calls `write()` to a pipe; a dedicated thread reads the pipe and calls `HttpServer::Stop()` from a normal execution context.
+Signal handling uses `sigwait()` (POSIX synchronous signal wait). Signals are blocked in all threads via `pthread_sigmask`; the main thread calls `sigwait()` which synchronously dequeues blocked signals. No async signal handler is needed. When `sigwait()` returns, the main thread calls `HttpServer::Stop()` directly.
 
 ## PID File
 
