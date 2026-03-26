@@ -236,7 +236,9 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
         }
     }
 
-    // validate/config accept -c, -p, -H, -l, -w but NOT -P, --no-health-endpoint, or -d
+    // validate accepts -c, -p, -H, -l, -w, -d (for daemon pre-validation)
+    // config accepts -c, -p, -H, -l, -w but NOT -d
+    // Neither accepts -P or --no-health-endpoint
     if (cmd == CliCommand::VALIDATE || cmd == CliCommand::CONFIG) {
         if (options.pid_file_explicit) {
             throw std::runtime_error(
@@ -246,9 +248,9 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
             throw std::runtime_error(
                 std::string("'") + argv[1] + "' does not accept --no-health-endpoint");
         }
-        if (options.daemonize) {
+        if (cmd == CliCommand::CONFIG && options.daemonize) {
             throw std::runtime_error(
-                std::string("'") + argv[1] + "' does not accept -d/--daemonize");
+                "'config' does not accept -d/--daemonize");
         }
     }
 
@@ -290,6 +292,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "  -H, --host <address>        Override bind address\n"
         << "  -l, --log-level <level>     Override log level\n"
         << "  -w, --workers <N>           Override worker threads\n"
+        << "  -d, --daemonize             Check daemon-mode constraints (validate only)\n"
         << "\n"
         << "Global options:\n"
         << "  -v, --version               Same as 'version'\n"

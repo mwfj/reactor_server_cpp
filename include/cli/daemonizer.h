@@ -6,6 +6,10 @@
 // standard double-fork pattern: fork → setsid → fork → redirect stdio.
 // After return, the caller is the grandchild (daemon) process.
 //
+// The parent waits for a readiness signal from the grandchild via a pipe.
+// The caller MUST call NotifyReady() after successful startup, or
+// NotifyFailed() on failure, so the parent can exit with the correct code.
+//
 // Not available on Windows — guarded by #if !defined(_WIN32).
 
 #if !defined(_WIN32)
@@ -15,7 +19,7 @@ public:
     // Execute the double-fork daemon sequence.
     // On success, returns in the grandchild process (session leader's child).
     // On failure, prints error to stderr and calls _exit(1).
-    // The parent and intermediate child both _exit(0) on success.
+    // The parent blocks on a readiness pipe until NotifyReady/NotifyFailed.
     //
     // After this call:
     //   - stdin/stdout/stderr point to /dev/null
@@ -32,6 +36,14 @@ public:
     //   - BEFORE SignalHandler::Install (signal masks per-process)
     //   - BEFORE any thread creation
     static void Daemonize();
+
+    // Signal the parent that the daemon started successfully.
+    // Parent exits with code 0. Must be called exactly once after startup.
+    static void NotifyReady();
+
+    // Signal the parent that the daemon failed to start.
+    // Parent exits with code 1. Must be called on startup failure.
+    static void NotifyFailed();
 
     Daemonizer() = delete;
 };

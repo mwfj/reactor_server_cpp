@@ -924,6 +924,42 @@ void TestConfigUnsetCliDoesNotRevertEnv() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ── Signal test helper ────────────────────────────────────────────────────────
+
+// Drain any pending signals and safely restore default dispositions.
+// Must be called AFTER Cleanup() (which sets SIG_IGN + unblocks) and
+// AFTER the waiter thread is joined. Without this, a late safety-kill()
+// could arrive after SIG_DFL is restored, terminating the test process.
+static void DrainAndRestoreSignals() {
+    sigset_t drain_set;
+    sigemptyset(&drain_set);
+    sigaddset(&drain_set, SIGTERM);
+    sigaddset(&drain_set, SIGINT);
+    sigaddset(&drain_set, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &drain_set, nullptr);
+
+#if defined(__linux__)
+    struct timespec zero_timeout = {0, 0};
+    while (sigtimedwait(&drain_set, nullptr, &zero_timeout) > 0) {}
+#else
+    // macOS/BSD: sigtimedwait doesn't exist. Use sigpending + sigwait loop.
+    sigset_t pending;
+    while (sigpending(&pending) == 0) {
+        bool any = sigismember(&pending, SIGTERM) ||
+                   sigismember(&pending, SIGINT) ||
+                   sigismember(&pending, SIGHUP);
+        if (!any) break;
+        int sig;
+        sigwait(&drain_set, &sig);
+    }
+#endif
+
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGINT, SIG_DFL);
+    signal(SIGHUP, SIG_DFL);
+    pthread_sigmask(SIG_UNBLOCK, &drain_set, nullptr);
+}
+
 // SECTION 4: SignalHandler Tests (30–31)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1003,15 +1039,13 @@ void TestSignalHandlerSigwaitUnblock() {
 
         // Always cleanup (safe to call again: guards against double-close)
         SignalHandler::Cleanup();
-
-        // Restore SIGTERM to default so subsequent tests are not surprised
-        signal(SIGTERM, SIG_DFL);
+        DrainAndRestoreSignals();
 
         TestFramework::RecordTest("SignalHandler: SIGTERM unblocks WaitForShutdown",
                                   pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
         SignalHandler::Cleanup();
-        signal(SIGTERM, SIG_DFL);
+        DrainAndRestoreSignals();
         TestFramework::RecordTest("SignalHandler: SIGTERM unblocks WaitForShutdown",
                                   false, e.what(), CLI_CATEGORY);
     }
@@ -1043,17 +1077,13 @@ void TestSetConsoleEnabled() {
         logging::Get()->info("SetConsoleEnabled test message");
         logging::Get()->flush();
 
-        logging::Shutdown();
-
-        // Restore default console preference so other tests are not affected
-        logging::SetConsoleEnabled(true);
+        logging::Shutdown();  // resets g_console_enabled to true
         std::remove(log_path.c_str());
 
         TestFramework::RecordTest("Logger: SetConsoleEnabled(false) functional",
                                   true, "", CLI_CATEGORY);
     } catch (const std::exception& e) {
         logging::Shutdown();
-        logging::SetConsoleEnabled(true);
         std::remove(log_path.c_str());
         TestFramework::RecordTest("Logger: SetConsoleEnabled(false) functional",
                                   false, e.what(), CLI_CATEGORY);
@@ -1081,8 +1111,7 @@ void TestSetConsoleEnabledPersists() {
         logging::Get()->debug("Second init message");
         logging::Get()->flush();
 
-        logging::Shutdown();
-        logging::SetConsoleEnabled(true);
+        logging::Shutdown();  // resets g_console_enabled to true
         std::remove(log_path.c_str());
 
         // If neither Init threw and the second logger is usable, the flag
@@ -1093,7 +1122,6 @@ void TestSetConsoleEnabledPersists() {
                                   true, "", CLI_CATEGORY);
     } catch (const std::exception& e) {
         logging::Shutdown();
-        logging::SetConsoleEnabled(true);
         std::remove(log_path.c_str());
         TestFramework::RecordTest("Logger: SetConsoleEnabled persists across Init",
                                   false, e.what(), CLI_CATEGORY);
@@ -1163,6 +1191,7 @@ void TestReopenWithFileSink() {
     } catch (const std::exception& e) {
         logging::Shutdown();
         std::remove(log_path.c_str());
+        std::remove((log_path + ".1").c_str());
         TestFramework::RecordTest("Logger: Reopen with file sink",
                                   false, e.what(), CLI_CATEGORY);
     }
@@ -1262,32 +1291,6 @@ void TestReopenPreservesLevel() {
 //   4. Verify the returned SignalResult value
 //   5. Cleanup()
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Drain any pending signals and safely restore default dispositions.
-// Must be called AFTER Cleanup() (which sets SIG_IGN + unblocks) and
-// AFTER the waiter thread is joined. Without this, a late safety-kill()
-// could arrive after SIG_DFL is restored, terminating the test process.
-static void DrainAndRestoreSignals() {
-    // Block signals briefly so we can drain with sigtimedwait
-    sigset_t drain_set;
-    sigemptyset(&drain_set);
-    sigaddset(&drain_set, SIGTERM);
-    sigaddset(&drain_set, SIGINT);
-    sigaddset(&drain_set, SIGHUP);
-    pthread_sigmask(SIG_BLOCK, &drain_set, nullptr);
-
-    // Drain all pending signals (non-blocking)
-    struct timespec zero_timeout = {0, 0};
-    while (sigtimedwait(&drain_set, nullptr, &zero_timeout) > 0) {
-        // consumed a pending signal
-    }
-
-    // Now safe to restore SIG_DFL — no pending signals remain
-    signal(SIGTERM, SIG_DFL);
-    signal(SIGINT, SIG_DFL);
-    signal(SIGHUP, SIG_DFL);
-    pthread_sigmask(SIG_UNBLOCK, &drain_set, nullptr);
-}
 
 // Test 38: WaitForSignal() returns SHUTDOWN when SIGTERM is delivered.
 void TestWaitForSignalSIGTERM() {
@@ -1568,20 +1571,19 @@ void TestStatusRejectsDaemonize() {
     }
 }
 
-// Test 46: 'validate -d' must throw.
-void TestValidateRejectsDaemonize() {
-    std::cout << "\n[TEST] CliParser: 'validate -d' throws..." << std::endl;
+// Test 46: 'validate -d' sets daemonize=true (enables daemon-specific validation).
+void TestValidateAcceptsDaemonize() {
+    std::cout << "\n[TEST] CliParser: 'validate -d' sets daemonize=true..." << std::endl;
     try {
         const char* args[] = {"reactor_server", "validate", "-d"};
         int argc = 3;
-        CliParser::Parse(argc, const_cast<char**>(args));
-        TestFramework::RecordTest("CliParser: validate -d throws", false,
-            "Expected exception for 'validate -d'", CLI_CATEGORY);
-    } catch (const std::runtime_error&) {
-        TestFramework::RecordTest("CliParser: validate -d throws", true, "", CLI_CATEGORY);
+        auto opts = CliParser::Parse(argc, const_cast<char**>(args));
+
+        bool pass = (opts.daemonize == true) && (opts.command == CliCommand::VALIDATE);
+        std::string err = pass ? "" : "validate -d should set daemonize=true";
+        TestFramework::RecordTest("CliParser: validate -d sets daemonize", pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("CliParser: validate -d throws", false,
-            std::string("Wrong exception type: ") + e.what(), CLI_CATEGORY);
+        TestFramework::RecordTest("CliParser: validate -d sets daemonize", false, e.what(), CLI_CATEGORY);
     }
 }
 
@@ -1670,7 +1672,7 @@ void RunAllTests() {
     TestStartNoDaemonize();
     TestStopRejectsDaemonize();
     TestStatusRejectsDaemonize();
-    TestValidateRejectsDaemonize();
+    TestValidateAcceptsDaemonize();
     TestConfigRejectsDaemonize();
 }
 

@@ -123,6 +123,29 @@ static bool RequireAbsolutePath(const std::string& path, const char* description
     return true;
 }
 
+// ── Validate daemon-specific constraints ─────────────────────────
+// Shared between HandleStart (runtime) and validate -d (dry-run).
+// Returns EXIT_OK on success, EXIT_ERROR on failure.
+static int ValidateDaemonConfig(const ServerConfig& config,
+                                const CliOptions& options) {
+    if (config.log.file.empty()) {
+        std::cerr << "Error: daemon mode requires a log file "
+                  << "(set log.file in config or REACTOR_LOG_FILE env var)\n";
+        return EXIT_ERROR;
+    }
+    if (!RequireAbsolutePath(config.log.file, "log file") ||
+        !RequireAbsolutePath(options.pid_file, "PID file")) {
+        return EXIT_ERROR;
+    }
+    if (config.tls.enabled) {
+        if (!RequireAbsolutePath(config.tls.cert_file, "TLS cert file") ||
+            !RequireAbsolutePath(config.tls.key_file, "TLS key file")) {
+            return EXIT_ERROR;
+        }
+    }
+    return EXIT_OK;
+}
+
 // ── Handle start command ─────────────────────────────────────────
 static int HandleStart(const CliOptions& options) {
     ServerConfig config;
@@ -131,25 +154,13 @@ static int HandleStart(const CliOptions& options) {
 
     // ── Daemon pre-validation ───────────────────────────────
     if (options.daemonize) {
-        if (config.log.file.empty()) {
-            std::cerr << "Error: daemon mode requires a log file "
-                      << "(set log.file in config or REACTOR_LOG_FILE env var)\n";
-            return EXIT_ERROR;
-        }
-        if (!RequireAbsolutePath(config.log.file, "log file") ||
-            !RequireAbsolutePath(options.pid_file, "PID file")) {
-            return EXIT_ERROR;
-        }
-        if (config.tls.enabled) {
-            if (!RequireAbsolutePath(config.tls.cert_file, "TLS cert file") ||
-                !RequireAbsolutePath(config.tls.key_file, "TLS key file")) {
-                return EXIT_ERROR;
-            }
-        }
+        rc = ValidateDaemonConfig(config, options);
+        if (rc != EXIT_OK) return rc;
     }
 
     // ── Daemonize (if requested) ────────────────────────────
     // MUST happen: after config validation, before PidFile/signals/logging
+#if !defined(_WIN32)
     if (options.daemonize) {
         Daemonizer::Daemonize();
         // We are now the grandchild daemon process.
@@ -159,15 +170,35 @@ static int HandleStart(const CliOptions& options) {
         // to the file sink (stderr is /dev/null after fork). HttpServer's
         // constructor will re-Init() which is safe — it replaces the logger.
         logging::SetConsoleEnabled(false);
-        logging::Init("reactor", logging::ParseLevel(config.log.level),
-                      config.log.file, config.log.max_file_size, config.log.max_files);
+        try {
+            logging::Init("reactor", logging::ParseLevel(config.log.level),
+                          config.log.file, config.log.max_file_size, config.log.max_files);
+        } catch (...) {
+            Daemonizer::NotifyFailed();
+            _exit(EXIT_ERROR);
+        }
     }
+#else
+    if (options.daemonize) {
+        std::cerr << "Error: daemon mode is not supported on this platform\n";
+        return EXIT_ERROR;
+    }
+#endif
+
+    // Helper: notify daemon parent of failure before returning an error.
+    // No-op in foreground mode (NotifyFailed checks the pipe fd).
+    auto daemon_fail = [&]() {
+#if !defined(_WIN32)
+        if (options.daemonize) Daemonizer::NotifyFailed();
+#endif
+    };
 
     // ── PID file ────────────────────────────────────────────
     if (!PidFile::Acquire(options.pid_file)) {
         if (options.daemonize) {
             logging::Get()->error("Failed to acquire PID file: {}", options.pid_file);
         }
+        daemon_fail();
         return EXIT_ERROR;
     }
     std::atexit(PidFile::Release);
@@ -181,6 +212,7 @@ static int HandleStart(const CliOptions& options) {
         } else {
             std::cerr << "Error setting up signal handler: " << e.what() << "\n";
         }
+        daemon_fail();
         return EXIT_ERROR;
     }
 
@@ -191,6 +223,7 @@ static int HandleStart(const CliOptions& options) {
         server = std::make_unique<HttpServer>(config);
     } catch (const std::exception& e) {
         logging::Get()->error("Fatal error: {}", e.what());
+        daemon_fail();
         SignalHandler::Cleanup();
         logging::Shutdown();
         return EXIT_ERROR;
@@ -229,6 +262,13 @@ static int HandleStart(const CliOptions& options) {
             }
         }
     });
+
+    // ── Signal the daemon parent that startup succeeded ────
+#if !defined(_WIN32)
+    if (options.daemonize) {
+        Daemonizer::NotifyReady();
+    }
+#endif
 
     // ── Signal loop ─────────────────────────────────────────
     logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
@@ -298,6 +338,10 @@ int main(int argc, char* argv[]) {
             ServerConfig config;
             int rc = LoadConfig(config, options);
             if (rc != EXIT_OK) return rc;
+            if (options.daemonize) {
+                rc = ValidateDaemonConfig(config, options);
+                if (rc != EXIT_OK) return rc;
+            }
             std::cout << "Configuration is valid.\n";
             return EXIT_OK;
         }

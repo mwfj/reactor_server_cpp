@@ -180,6 +180,8 @@ kill -HUP $(cat /tmp/reactor_server.pid)
 # }
 ```
 
+**Note:** The server uses spdlog's rotating file sink, which has its own size-based rotation using `.1`, `.2`, `.3` suffixes. When using external `logrotate`, set `log.max_files` to `1` in the config to disable spdlog's built-in rotation and avoid naming conflicts between the two rotation schemes.
+
 ## PID File
 
 The server writes its PID to a file on startup and removes it on exit. The PID file uses `flock()` for race-free singleton enforcement.
