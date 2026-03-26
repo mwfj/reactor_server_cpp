@@ -177,7 +177,14 @@ pid_t PidFile::CheckRunning(const std::string& path) {
         return -1;
     }
 
-    if (!IsRegularFile(fd)) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return -1;
+    }
+
+    // Reject files owned by a different user (matches Acquire's check).
+    if (st.st_uid != geteuid()) {
         close(fd);
         return -1;
     }

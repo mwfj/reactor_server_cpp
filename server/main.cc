@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <thread>
+#include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -223,14 +224,15 @@ int main(int argc, char* argv[]) {
             logging::Get()->error("Fatal error: {}", e.what());
             exit_code = EXIT_ERROR;
         }
-        // Unblock signals so we can send SIGTERM to ourselves to unblock
-        // the signal thread's sigwait() on the error path.
-        SignalHandler::Cleanup();
         if (signal_thread.joinable()) {
-            // Send ourselves SIGTERM to unblock sigwait in the signal thread
-            kill(getpid(), SIGTERM);
+            // Send SIGTERM directly to the signal thread to unblock its
+            // sigwait(). Use pthread_kill (thread-directed) BEFORE Cleanup()
+            // unblocks signals in the main thread — otherwise the signal
+            // could hit the main thread's default disposition.
+            pthread_kill(signal_thread.native_handle(), SIGTERM);
             signal_thread.join();
         }
+        SignalHandler::Cleanup();
     }
     server.reset();
 
