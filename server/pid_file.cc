@@ -193,10 +193,11 @@ pid_t PidFile::CheckRunning(const std::string& path) {
 
     // Probe the flock to determine if a reactor_server instance holds it.
     if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
-        // We got the lock — no server holds it. Unlink while we still
-        // hold the lock to prevent a race where a new server acquires
-        // the file between our close() and unlink().
-        unlink(path.c_str());
+        // We got the lock — no server holds it (stale PID file).
+        // Do NOT unlink: that would race with a concurrent Acquire() that
+        // has already opened the file but hasn't locked it yet. The stale
+        // file is harmless — Acquire() will lock, truncate, and rewrite it.
+        flock(fd, LOCK_UN);
         close(fd);
         return -1;
     }

@@ -716,13 +716,9 @@ void TestPidFileCheckRunningNotRunning() {
             "Expected -1 for dead PID " + std::to_string(dead_pid) +
             ", got " + std::to_string(result);
 
-        // Verify the file was removed by CheckRunning
-        bool file_removed = (access(path.c_str(), F_OK) != 0);
-        if (!file_removed) {
-            pass = false;
-            err += " + PID file not removed after stale detection";
-            std::remove(path.c_str());
-        }
+        // CheckRunning does NOT unlink stale files (avoids race with Acquire).
+        // Clean up ourselves.
+        std::remove(path.c_str());
 
         TestFramework::RecordTest("PidFile: CheckRunning dead PID", pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
