@@ -172,7 +172,9 @@ pid_t PidFile::ReadPid(const std::string& path) {
 // weakest link. Cross-user tampering is prevented by file ownership.
 
 pid_t PidFile::CheckRunning(const std::string& path) {
-    int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    // O_RDWR: BSD/macOS requires a writable fd for flock(LOCK_EX).
+    // O_NOFOLLOW + O_NONBLOCK: symlink/FIFO protection (matches ReadPid).
+    int fd = open(path.c_str(), O_RDWR | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) {
         return -1;
     }

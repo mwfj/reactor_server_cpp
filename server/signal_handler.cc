@@ -13,23 +13,28 @@
 // ── File-scope static state ──────────────────────────────────────
 
 static std::atomic<bool> g_shutdown_requested{false};
-static sigset_t g_block_mask;   // signals we block/wait on
+static sigset_t g_block_mask;     // all signals we block (SIGTERM, SIGINT, SIGPIPE)
+static sigset_t g_shutdown_mask;  // only shutdown signals we sigwait on (SIGTERM, SIGINT)
 static bool g_installed = false;
 
 // ── Install ──────────────────────────────────────────────────────
 
 void SignalHandler::Install() {
+    // Block SIGTERM, SIGINT, SIGPIPE in all threads.
     sigemptyset(&g_block_mask);
     sigaddset(&g_block_mask, SIGTERM);
     sigaddset(&g_block_mask, SIGINT);
     sigaddset(&g_block_mask, SIGPIPE);
 
-    // Block these signals in ALL threads (inherited by child threads).
-    // Blocked signals are queued by the kernel and only delivered to sigwait().
     if (pthread_sigmask(SIG_BLOCK, &g_block_mask, nullptr) != 0) {
         throw std::runtime_error(
             std::string("Failed to block signals: ") + std::strerror(errno));
     }
+
+    // Only wait on shutdown signals — SIGPIPE is blocked but not waited on.
+    sigemptyset(&g_shutdown_mask);
+    sigaddset(&g_shutdown_mask, SIGTERM);
+    sigaddset(&g_shutdown_mask, SIGINT);
 
     g_shutdown_requested.store(false);
     g_installed = true;
@@ -38,11 +43,8 @@ void SignalHandler::Install() {
 // ── WaitForSignal ────────────────────────────────────────────────
 
 void SignalHandler::WaitForSignal(HttpServer* server) {
-    // sigwait() synchronously dequeues a blocked signal. No async signal
-    // handler, no pipe/eventfd, no shared fds. The call blocks until
-    // SIGTERM or SIGINT is delivered to this process.
     int sig = 0;
-    int ret = sigwait(&g_block_mask, &sig);
+    int ret = sigwait(&g_shutdown_mask, &sig);
 
     if (ret == 0 && (sig == SIGTERM || sig == SIGINT)) {
         bool expected = false;
@@ -62,8 +64,6 @@ bool SignalHandler::ShutdownRequested() {
 
 void SignalHandler::Cleanup() {
     if (g_installed) {
-        // Restore default dispositions so the process can be killed normally
-        // after cleanup (e.g., if it hangs during shutdown).
         pthread_sigmask(SIG_UNBLOCK, &g_block_mask, nullptr);
         signal(SIGPIPE, SIG_IGN);  // keep SIGPIPE ignored
         g_installed = false;
