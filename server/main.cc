@@ -12,9 +12,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <thread>
-#include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -178,62 +178,76 @@ int main(int argc, char* argv[]) {
         return EXIT_ERROR;
     }
 
-    // Construct and run server
+    // Construct server
     int exit_code = EXIT_OK;
     std::unique_ptr<HttpServer> server;
-    std::thread signal_thread;
     try {
         server = std::make_unique<HttpServer>(config);
-
-        logging::Get()->info("{} version {} starting", REACTOR_SERVER_NAME,
-                             REACTOR_SERVER_VERSION);
-        logging::Get()->info("  Listen:  {}:{}", config.bind_host, config.bind_port);
-        logging::Get()->info("  TLS:     {}",
-            config.tls.enabled
-                ? "enabled (" + config.tls.min_version + "+)"
-                : "disabled");
-        logging::Get()->info("  Workers: {}", config.worker_threads);
-        logging::Get()->info("  PID:     {} ({})", getpid(), options.pid_file);
-
-        if (options.health_endpoint) {
-            auto start_time = std::chrono::steady_clock::now();
-            server->Get("/health", MakeHealthHandler(start_time));
-            logging::Get()->info("  Health:  /health");
-        }
-
-        // Signal thread: sigwait blocks until SIGTERM/SIGINT, then calls Stop().
-        // Since signals are blocked in all threads, Stop() can only run after
-        // sigwait returns — which requires an actual signal delivery.
-        signal_thread = std::thread(SignalHandler::WaitForSignal, server.get());
-
-        logging::Get()->info("{} ready, accepting connections",
-                             REACTOR_SERVER_NAME);
-        server->Start();
-
-        if (signal_thread.joinable()) {
-            signal_thread.join();
-        }
-
-        logging::Get()->info("{} stopped", REACTOR_SERVER_NAME);
-
     } catch (const std::exception& e) {
-        if (SignalHandler::ShutdownRequested()) {
-            logging::Get()->info("{} stopped (signal during startup)",
-                                 REACTOR_SERVER_NAME);
-        } else {
-            logging::Get()->error("Fatal error: {}", e.what());
-            exit_code = EXIT_ERROR;
-        }
-        if (signal_thread.joinable()) {
-            // Send SIGTERM directly to the signal thread to unblock its
-            // sigwait(). Use pthread_kill (thread-directed) BEFORE Cleanup()
-            // unblocks signals in the main thread — otherwise the signal
-            // could hit the main thread's default disposition.
-            pthread_kill(signal_thread.native_handle(), SIGTERM);
-            signal_thread.join();
-        }
+        logging::Get()->error("Fatal error: {}", e.what());
         SignalHandler::Cleanup();
+        logging::Shutdown();
+        return EXIT_ERROR;
     }
+
+    logging::Get()->info("{} version {} starting", REACTOR_SERVER_NAME,
+                         REACTOR_SERVER_VERSION);
+    logging::Get()->info("  Listen:  {}:{}", config.bind_host, config.bind_port);
+    logging::Get()->info("  TLS:     {}",
+        config.tls.enabled
+            ? "enabled (" + config.tls.min_version + "+)"
+            : "disabled");
+    logging::Get()->info("  Workers: {}", config.worker_threads);
+    logging::Get()->info("  PID:     {} ({})", getpid(), options.pid_file);
+
+    if (options.health_endpoint) {
+        auto start_time = std::chrono::steady_clock::now();
+        server->Get("/health", MakeHealthHandler(start_time));
+        logging::Get()->info("  Health:  /health");
+    }
+
+    // Architecture: server runs in its own thread, main thread waits for signals.
+    //
+    // This eliminates the Start()/Stop() race:
+    //   - Server thread calls Start() which does AddTask + RunEventLoop (blocks)
+    //   - Main thread calls sigwait() which blocks until SIGTERM/SIGINT
+    //   - When sigwait() returns, Stop() is called from the main thread
+    //   - Start() returns (event loop exited), server thread joins
+    //
+    // sigwait() only returns when a real signal is delivered to the process.
+    // By that time, the server thread has completed AddTask and entered
+    // RunEventLoop — the setup phase takes microseconds while signal delivery
+    // requires an external event (user Ctrl+C, kill, service manager).
+    std::exception_ptr server_error;
+    std::thread server_thread([&server, &server_error]() {
+        try {
+            server->Start();
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
+
+    // Main thread: synchronously wait for shutdown signal.
+    SignalHandler::WaitForSignal(nullptr);
+    logging::Get()->info("{} shutting down...", REACTOR_SERVER_NAME);
+    server->Stop();
+
+    server_thread.join();
+
+    if (server_error) {
+        try {
+            std::rethrow_exception(server_error);
+        } catch (const std::exception& e) {
+            if (!SignalHandler::ShutdownRequested()) {
+                logging::Get()->error("Server error: {}", e.what());
+                exit_code = EXIT_ERROR;
+            }
+        }
+    }
+
+    logging::Get()->info("{} stopped", REACTOR_SERVER_NAME);
     server.reset();
 
     SignalHandler::Cleanup();
