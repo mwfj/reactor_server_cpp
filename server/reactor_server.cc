@@ -28,12 +28,12 @@ void ReactorServer::Stop(){
 }
 
 void ReactorServer::NewConnection(std::shared_ptr<ConnectionHandler> conn){
-    logging::Get()->info("New Connection Comes In");
+    logging::Get()->debug("New Connection Comes In");
     // Can add some extra features related code below
 }
 
 void ReactorServer::CloseConnecition(std::shared_ptr<ConnectionHandler> conn){
-    logging::Get()->info("Connection Closed");
+    logging::Get()->debug("Connection Closed");
     // Can add some extra features related code below
 }
 
@@ -82,6 +82,6 @@ void ReactorServer::OnMessage(std::shared_ptr<ConnectionHandler> conn, std::stri
 }
 
 void ReactorServer::SendComplete(std::shared_ptr<ConnectionHandler> conn){
-    logging::Get()->info("Message Send Completed");
+    logging::Get()->debug("Message Send Completed");
     // Can add some feature related code below
 }

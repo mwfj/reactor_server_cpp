@@ -1101,7 +1101,8 @@ void TestSetConsoleEnabledPersists() {
 }
 
 // Test 34: Reopen() with a live file sink closes and reopens the file handle.
-// After Reopen() the logger must still be functional (writes succeed).
+// Simulates logrotate: write "Before", rename file, Reopen(), write "After".
+// Verifies: rotated file has "Before", new file has "After".
 void TestReopenWithFileSink() {
     std::cout << "\n[TEST] Logger: Reopen() with file sink reconstructs logger..." << std::endl;
     const std::string log_path = "/tmp/test_reactor_log_" + std::to_string(getpid()) +
@@ -1122,22 +1123,43 @@ void TestReopenWithFileSink() {
 
         logging::Reopen();
 
-        // Write after Reopen — must not crash
+        // Write after Reopen — must go to the NEW file at log_path
         logging::Get()->info("After reopen");
         logging::Get()->flush();
 
-        // The new log file should now exist at the original path
-        struct stat st;
-        bool file_exists = (stat(log_path.c_str(), &st) == 0);
-
         logging::Shutdown();
+
+        // Verify: rotated file has "Before reopen"
+        std::string rotated_content;
+        {
+            std::ifstream f(rotated);
+            if (f.is_open()) {
+                std::string line;
+                while (std::getline(f, line)) rotated_content += line + "\n";
+            }
+        }
+        bool rotated_has_before = rotated_content.find("Before reopen") != std::string::npos;
+
+        // Verify: new file has "After reopen"
+        std::string new_content;
+        {
+            std::ifstream f(log_path);
+            if (f.is_open()) {
+                std::string line;
+                while (std::getline(f, line)) new_content += line + "\n";
+            }
+        }
+        bool new_has_after = new_content.find("After reopen") != std::string::npos;
+
         std::remove(log_path.c_str());
         std::remove(rotated.c_str());
 
-        TestFramework::RecordTest("Logger: Reopen with file sink",
-                                  file_exists,
-                                  file_exists ? "" : "New log file not created after Reopen()",
-                                  CLI_CATEGORY);
+        bool pass = rotated_has_before && new_has_after;
+        std::string err;
+        if (!rotated_has_before) err += "Rotated file missing 'Before reopen'; ";
+        if (!new_has_after) err += "New file missing 'After reopen'; ";
+
+        TestFramework::RecordTest("Logger: Reopen with file sink", pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
         logging::Shutdown();
         std::remove(log_path.c_str());
@@ -1241,6 +1263,32 @@ void TestReopenPreservesLevel() {
 //   5. Cleanup()
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Drain any pending signals and safely restore default dispositions.
+// Must be called AFTER Cleanup() (which sets SIG_IGN + unblocks) and
+// AFTER the waiter thread is joined. Without this, a late safety-kill()
+// could arrive after SIG_DFL is restored, terminating the test process.
+static void DrainAndRestoreSignals() {
+    // Block signals briefly so we can drain with sigtimedwait
+    sigset_t drain_set;
+    sigemptyset(&drain_set);
+    sigaddset(&drain_set, SIGTERM);
+    sigaddset(&drain_set, SIGINT);
+    sigaddset(&drain_set, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &drain_set, nullptr);
+
+    // Drain all pending signals (non-blocking)
+    struct timespec zero_timeout = {0, 0};
+    while (sigtimedwait(&drain_set, nullptr, &zero_timeout) > 0) {
+        // consumed a pending signal
+    }
+
+    // Now safe to restore SIG_DFL — no pending signals remain
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGINT, SIG_DFL);
+    signal(SIGHUP, SIG_DFL);
+    pthread_sigmask(SIG_UNBLOCK, &drain_set, nullptr);
+}
+
 // Test 38: WaitForSignal() returns SHUTDOWN when SIGTERM is delivered.
 void TestWaitForSignalSIGTERM() {
     std::cout << "\n[TEST] SignalHandler: WaitForSignal returns SHUTDOWN on SIGTERM..." << std::endl;
@@ -1287,13 +1335,13 @@ void TestWaitForSignalSIGTERM() {
         }
 
         SignalHandler::Cleanup();
-        signal(SIGTERM, SIG_DFL);
+        DrainAndRestoreSignals();
 
         TestFramework::RecordTest("SignalHandler: WaitForSignal returns SHUTDOWN on SIGTERM",
                                   pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
         SignalHandler::Cleanup();
-        signal(SIGTERM, SIG_DFL);
+        DrainAndRestoreSignals();
         TestFramework::RecordTest("SignalHandler: WaitForSignal returns SHUTDOWN on SIGTERM",
                                   false, e.what(), CLI_CATEGORY);
     }
@@ -1347,15 +1395,13 @@ void TestWaitForSignalSIGHUP() {
         }
 
         SignalHandler::Cleanup();
-        signal(SIGHUP, SIG_DFL);
-        signal(SIGTERM, SIG_DFL);
+        DrainAndRestoreSignals();
 
         TestFramework::RecordTest("SignalHandler: WaitForSignal returns RELOAD on SIGHUP",
                                   pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
         SignalHandler::Cleanup();
-        signal(SIGHUP, SIG_DFL);
-        signal(SIGTERM, SIG_DFL);
+        DrainAndRestoreSignals();
         TestFramework::RecordTest("SignalHandler: WaitForSignal returns RELOAD on SIGHUP",
                                   false, e.what(), CLI_CATEGORY);
     }
@@ -1413,16 +1459,14 @@ void TestWaitForShutdownIgnoresSIGHUP() {
             err += "WaitForShutdown did not return within 500ms after SIGTERM; ";
 
         SignalHandler::Cleanup();
-        signal(SIGHUP, SIG_DFL);
-        signal(SIGTERM, SIG_DFL);
+        DrainAndRestoreSignals();
 
         TestFramework::RecordTest(
             "SignalHandler: WaitForShutdown ignores SIGHUP returns on SIGTERM",
             pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
         SignalHandler::Cleanup();
-        signal(SIGHUP, SIG_DFL);
-        signal(SIGTERM, SIG_DFL);
+        DrainAndRestoreSignals();
         TestFramework::RecordTest(
             "SignalHandler: WaitForShutdown ignores SIGHUP returns on SIGTERM",
             false, e.what(), CLI_CATEGORY);

@@ -78,6 +78,16 @@ void Shutdown() {
     }
     spdlog::shutdown();
     g_logger.reset();
+
+    // Reset all config to defaults so Reopen()/Init() after Shutdown()
+    // starts from a clean slate. Prevents stale g_console_enabled from
+    // leaking across test runs if a test crashes before cleanup.
+    g_console_enabled = true;
+    g_logger_name = "reactor";
+    g_log_level = spdlog::level::info;
+    g_log_file.clear();
+    g_max_size = 10485760;
+    g_max_files = 3;
 }
 
 spdlog::level::level_enum ParseLevel(const std::string& level) {

@@ -1,10 +1,14 @@
 #pragma once
 
-// Double-fork daemon mode for Unix systems.
+// Double-fork daemon mode for Unix systems (Linux, macOS/BSD).
 //
 // Daemonize() detaches the process from the controlling terminal via the
 // standard double-fork pattern: fork → setsid → fork → redirect stdio.
 // After return, the caller is the grandchild (daemon) process.
+//
+// Not available on Windows — guarded by #if !defined(_WIN32).
+
+#if !defined(_WIN32)
 
 class Daemonizer {
 public:
@@ -16,7 +20,7 @@ public:
     // After this call:
     //   - stdin/stdout/stderr point to /dev/null
     //   - CWD is "/"
-    //   - umask is 0
+    //   - umask is 027 (owner rwx, group r-x, other ---)
     //   - Process is not a session leader (cannot acquire terminal)
     //   - getpid() returns the daemon PID
     //
@@ -31,3 +35,5 @@ public:
 
     Daemonizer() = delete;
 };
+
+#endif // !defined(_WIN32)

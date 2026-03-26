@@ -1,5 +1,7 @@
 #include "cli/daemonizer.h"
 
+#if !defined(_WIN32)
+
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -46,8 +48,9 @@ void Daemonizer::Daemonize() {
 
     // ── Grandchild: the actual daemon ───────────────────────
 
-    // Clear file creation mask so files are created with exact permissions.
-    umask(0);
+    // Restrict file creation: owner full, group read, other nothing.
+    // Prevents log files and PID files from being world-writable.
+    umask(027);
 
     // Change to root to avoid holding a mount point busy.
     if (chdir("/") < 0) {
@@ -63,9 +66,11 @@ void Daemonizer::Daemonize() {
         _exit(1);  // cannot continue without /dev/null
     }
 
-    dup2(devnull, STDIN_FILENO);
-    dup2(devnull, STDOUT_FILENO);
-    dup2(devnull, STDERR_FILENO);
+    if (dup2(devnull, STDIN_FILENO) < 0 ||
+        dup2(devnull, STDOUT_FILENO) < 0 ||
+        dup2(devnull, STDERR_FILENO) < 0) {
+        _exit(1);
+    }
 
     if (devnull > STDERR_FILENO) {
         close(devnull);
@@ -74,3 +79,5 @@ void Daemonizer::Daemonize() {
     // Return to caller in the grandchild. Caller proceeds with:
     // PidFile::Acquire, SignalHandler::Install, logging::Init, HttpServer.
 }
+
+#endif // !defined(_WIN32)
