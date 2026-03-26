@@ -33,6 +33,7 @@ struct CliOptions {
 
     // Process management
     std::string pid_file = "/tmp/reactor_server.pid";
+    bool pid_file_explicit = false;  // true if user passed -P/--pid-file
 
     // Health endpoint
     bool health_endpoint = true;
