@@ -77,8 +77,10 @@ bool PidFile::Acquire(const std::string& path) {
     }
 
     // Reject files owned by a different user. In world-writable directories
-    // like /tmp, another user could pre-create the file to interfere.
-    if (st.st_size > 0 && st.st_uid != geteuid()) {
+    // like /tmp, another user could pre-create the file (even empty) to
+    // interfere. O_CREAT creates files owned by our euid, so this check
+    // passes for files we just created.
+    if (st.st_uid != geteuid()) {
         std::cerr << "Error: PID file '" << path
                   << "' is owned by a different user\n";
         close(fd);
