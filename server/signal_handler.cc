@@ -15,7 +15,7 @@ static sigset_t g_wait_mask;   // signals we sigwait on (SIGTERM, SIGINT, SIGHUP
 static bool g_installed = false;
 static bool g_was_cleaned_up = false;  // true after Cleanup() sets SIG_IGN
 
-void SignalHandler::Install() {
+void SignalHandler::Install(bool daemon_mode) {
     sigemptyset(&g_block_mask);
     sigaddset(&g_block_mask, SIGTERM);
     sigaddset(&g_block_mask, SIGINT);
@@ -30,13 +30,14 @@ void SignalHandler::Install() {
 
     // On macOS/BSD, sigwait() cannot receive signals whose disposition is SIG_IGN —
     // the kernel discards them before they become pending. SIGTERM/SIGINT must
-    // always be SIG_DFL so shutdown signals reach sigwait(). SIGHUP is only
-    // reset after our own Cleanup() set it to SIG_IGN — inherited SIG_IGN from
-    // nohup is preserved (nohup only affects SIGHUP, not TERM/INT).
+    // always be SIG_DFL so shutdown signals reach sigwait().
+    // SIGHUP: in daemon mode, always reset (no terminal → inherited SIG_IGN is
+    // meaningless and would break log rotation). In foreground, only undo our
+    // own Cleanup()'s SIG_IGN — preserve nohup's inherited SIG_IGN.
     // Safe: signals are blocked, so SIG_DFL cannot fire.
     signal(SIGTERM, SIG_DFL);
     signal(SIGINT, SIG_DFL);
-    if (g_was_cleaned_up) {
+    if (daemon_mode || g_was_cleaned_up) {
         signal(SIGHUP, SIG_DFL);
         g_was_cleaned_up = false;
     }

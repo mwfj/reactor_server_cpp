@@ -216,7 +216,7 @@ static int HandleStart(const CliOptions& options) {
 
     // ── Signal handler ──────────────────────────────────────
     try {
-        SignalHandler::Install();
+        SignalHandler::Install(options.daemonize);
     } catch (const std::runtime_error& e) {
         if (options.daemonize) {
             logging::Get()->error("Signal handler setup failed: {}", e.what());

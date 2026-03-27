@@ -20,7 +20,11 @@ class SignalHandler {
 public:
     // Block SIGTERM, SIGINT, SIGPIPE, SIGHUP in all threads via pthread_sigmask.
     // Must be called from the main thread before spawning any threads.
-    static void Install();
+    // @param daemon_mode  If true, SIGHUP is always reset to SIG_DFL even if
+    //                     inherited as SIG_IGN (nohup). A daemon has no terminal,
+    //                     so inherited SIG_IGN is meaningless and would silently
+    //                     break SIGHUP-based log rotation.
+    static void Install(bool daemon_mode = false);
 
     // Wait for the next actionable signal via sigwait().
     // Returns SHUTDOWN for SIGTERM/SIGINT, RELOAD for SIGHUP.
