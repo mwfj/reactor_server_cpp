@@ -307,13 +307,20 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         // intercept h2c preface bytes before protocol detection can run.
         //
         // Guard against accept/data race: if HandleMessage already ran and
-        // created a handler, skip the deadline arming below — the handler's
-        // own deadline logic is authoritative.
+        // created a handler for THIS connection, skip the deadline arming
+        // below — the handler's own deadline logic is authoritative.
+        // Must check connection identity (not just fd) to handle fd-reuse.
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
-            if (h2_connections_.count(conn->fd()) ||
-                http_connections_.count(conn->fd())) {
-                return;  // Handler already exists — HandleMessage won the race
+            auto h2_it = h2_connections_.find(conn->fd());
+            if (h2_it != h2_connections_.end() &&
+                h2_it->second->GetConnection() == conn) {
+                return;
+            }
+            auto h1_it = http_connections_.find(conn->fd());
+            if (h1_it != http_connections_.end() &&
+                h1_it->second->GetConnection() == conn) {
+                return;
             }
         }
     } else {
@@ -451,12 +458,16 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
 
     // No handler exists yet (or stale fd-reuse removed above) — detect protocol and create one.
     // Prepend any buffered partial-preface bytes accumulated from a prior call.
+    // Verify connection identity to guard against fd-reuse races.
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         auto pd_it = pending_detection_.find(conn->fd());
         if (pd_it != pending_detection_.end()) {
-            pd_it->second += message;
-            message = std::move(pd_it->second);
+            if (pd_it->second.conn == conn) {
+                pd_it->second.data += message;
+                message = std::move(pd_it->second.data);
+            }
+            // If conn doesn't match, discard stale entry (fd reused)
             pending_detection_.erase(pd_it);
         }
     }
@@ -483,9 +494,15 @@ bool HttpServer::DetectAndRouteProtocol(
             if (proto == ProtocolDetector::Protocol::UNKNOWN) {
                 // Not enough data to classify — buffer and wait for more bytes.
                 // This handles h2c clients that send the 24-byte preface split
-                // across multiple TCP segments.
+                // across multiple TCP segments. Store connection identity to
+                // guard against fd-reuse races.
                 std::lock_guard<std::mutex> lck(conn_mtx_);
-                pending_detection_[conn->fd()] += message;
+                auto& pd = pending_detection_[conn->fd()];
+                if (pd.conn == conn) {
+                    pd.data += message;
+                } else {
+                    pd = {conn, message};
+                }
                 return true;
             }
         }
