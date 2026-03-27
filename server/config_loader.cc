@@ -245,20 +245,37 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     val = std::getenv("REACTOR_HTTP2_ENABLED");
     if (val) {
         std::string s(val);
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
         config.http2.enabled = (s == "1" || s == "true" || s == "yes");
     }
     val = std::getenv("REACTOR_HTTP2_MAX_CONCURRENT_STREAMS");
-    if (val) config.http2.max_concurrent_streams = static_cast<uint32_t>(
-                 EnvToInt(val, "REACTOR_HTTP2_MAX_CONCURRENT_STREAMS"));
+    if (val) {
+        int v = EnvToInt(val, "REACTOR_HTTP2_MAX_CONCURRENT_STREAMS");
+        if (v < 0) throw std::runtime_error(
+            "REACTOR_HTTP2_MAX_CONCURRENT_STREAMS must be non-negative");
+        config.http2.max_concurrent_streams = static_cast<uint32_t>(v);
+    }
     val = std::getenv("REACTOR_HTTP2_INITIAL_WINDOW_SIZE");
-    if (val) config.http2.initial_window_size = static_cast<uint32_t>(
-                 EnvToInt(val, "REACTOR_HTTP2_INITIAL_WINDOW_SIZE"));
+    if (val) {
+        int v = EnvToInt(val, "REACTOR_HTTP2_INITIAL_WINDOW_SIZE");
+        if (v < 0) throw std::runtime_error(
+            "REACTOR_HTTP2_INITIAL_WINDOW_SIZE must be non-negative");
+        config.http2.initial_window_size = static_cast<uint32_t>(v);
+    }
     val = std::getenv("REACTOR_HTTP2_MAX_FRAME_SIZE");
-    if (val) config.http2.max_frame_size = static_cast<uint32_t>(
-                 EnvToInt(val, "REACTOR_HTTP2_MAX_FRAME_SIZE"));
+    if (val) {
+        int v = EnvToInt(val, "REACTOR_HTTP2_MAX_FRAME_SIZE");
+        if (v < 0) throw std::runtime_error(
+            "REACTOR_HTTP2_MAX_FRAME_SIZE must be non-negative");
+        config.http2.max_frame_size = static_cast<uint32_t>(v);
+    }
     val = std::getenv("REACTOR_HTTP2_MAX_HEADER_LIST_SIZE");
-    if (val) config.http2.max_header_list_size = static_cast<uint32_t>(
-                 EnvToInt(val, "REACTOR_HTTP2_MAX_HEADER_LIST_SIZE"));
+    if (val) {
+        int v = EnvToInt(val, "REACTOR_HTTP2_MAX_HEADER_LIST_SIZE");
+        if (v < 0) throw std::runtime_error(
+            "REACTOR_HTTP2_MAX_HEADER_LIST_SIZE must be non-negative");
+        config.http2.max_header_list_size = static_cast<uint32_t>(v);
+    }
 }
 
 void ConfigLoader::Validate(const ServerConfig& config) {

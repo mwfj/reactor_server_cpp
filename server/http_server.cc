@@ -225,7 +225,11 @@ void HttpServer::Stop() {
         try {
             h2_conn->SendGoaway();
             if (conn) conn->CloseAfterWrite();
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            logging::Get()->warn("Exception during HTTP/2 shutdown: {}", e.what());
+        } catch (...) {
+            logging::Get()->warn("Unknown exception during HTTP/2 shutdown");
+        }
     }
 
     net_server_.Stop();
@@ -353,6 +357,7 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
     std::shared_ptr<HttpConnectionHandler> http_conn;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
+        pending_detection_.erase(conn->fd());
         auto h2_it = h2_connections_.find(conn->fd());
         if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
             h2_connections_.erase(h2_it);
@@ -375,6 +380,7 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
     std::shared_ptr<HttpConnectionHandler> http_conn;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
+        pending_detection_.erase(conn->fd());
         auto h2_it = h2_connections_.find(conn->fd());
         if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
             h2_connections_.erase(h2_it);
@@ -459,7 +465,17 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         }
     }
 
-    // No handler exists yet (or stale fd-reuse removed above) — detect protocol and create one
+    // No handler exists yet (or stale fd-reuse removed above) — detect protocol and create one.
+    // Prepend any buffered partial-preface bytes accumulated from a prior call.
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        auto pd_it = pending_detection_.find(conn->fd());
+        if (pd_it != pending_detection_.end()) {
+            pd_it->second += message;
+            message = std::move(pd_it->second);
+            pending_detection_.erase(pd_it);
+        }
+    }
     DetectAndRouteProtocol(conn, message);
 }
 
@@ -477,10 +493,12 @@ bool HttpServer::DetectAndRouteProtocol(
             // Cleartext: check for HTTP/2 client preface
             proto = ProtocolDetector::DetectFromData(message.data(), message.size());
             if (proto == ProtocolDetector::Protocol::UNKNOWN) {
-                // Not enough data — default to HTTP/1.x.
-                // In practice, TCP segments are always >= MSS (~1460 bytes),
-                // so this is extremely unlikely.
-                proto = ProtocolDetector::Protocol::HTTP1;
+                // Not enough data to classify — buffer and wait for more bytes.
+                // This handles h2c clients that send the 24-byte preface split
+                // across multiple TCP segments.
+                std::lock_guard<std::mutex> lck(conn_mtx_);
+                pending_detection_[conn->fd()] += message;
+                return true;
             }
         }
     }

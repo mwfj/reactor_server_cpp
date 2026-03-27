@@ -2,12 +2,6 @@
 #include "http/http_response.h"
 #include "log/logger.h"
 
-// nghttp2 error codes used for GOAWAY/RST_STREAM.
-// Duplicated here to avoid including nghttp2.h in this file.
-// Values from nghttp2.h (RFC 9113 Section 7).
-static constexpr uint32_t H2_NO_ERROR        = 0x0;
-static constexpr uint32_t H2_INTERNAL_ERROR  = 0x2;
-
 Http2ConnectionHandler::Http2ConnectionHandler(
     std::shared_ptr<ConnectionHandler> conn,
     const Http2Session::Settings& settings)
@@ -50,6 +44,7 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
 
     // Create the HTTP/2 session
     session_ = std::make_unique<Http2Session>(conn_, settings_);
+    session_->SetOwner(weak_from_this());
 
     // Apply stored callbacks, then clear them (no longer needed)
     if (pending_request_cb_) {
@@ -71,6 +66,13 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
 
     // Send server connection preface (SETTINGS)
     session_->SendServerPreface();
+
+    // Arm per-connection activity deadline for slowloris protection.
+    // Reset on each OnRawData call. Cleared when GOAWAY is sent.
+    if (request_timeout_sec_ > 0) {
+        conn_->SetDeadline(std::chrono::steady_clock::now() +
+                           std::chrono::seconds(request_timeout_sec_));
+    }
 
     // If there's initial data (buffered during detection), process it now
     if (!initial_data.empty()) {
@@ -102,7 +104,7 @@ void Http2ConnectionHandler::OnRawData(
     ssize_t consumed = session_->ReceiveData(data.data(), data.size());
     if (consumed < 0) {
         logging::Get()->error("HTTP/2 session error, closing connection");
-        session_->SendGoaway(H2_INTERNAL_ERROR);
+        session_->SendGoaway(HTTP2_CONSTANTS::ERROR_INTERNAL_ERROR);
         session_->SendPendingFrames();
         conn_->CloseAfterWrite();
         return;
@@ -114,6 +116,12 @@ void Http2ConnectionHandler::OnRawData(
     // Send pending frames (responses, WINDOW_UPDATEs, etc.)
     session_->SendPendingFrames();
 
+    // Reset activity deadline — data received means the connection is alive
+    if (request_timeout_sec_ > 0) {
+        conn_->SetDeadline(std::chrono::steady_clock::now() +
+                           std::chrono::seconds(request_timeout_sec_));
+    }
+
     // Check if session wants to close
     if (!session_->IsAlive()) {
         conn_->CloseAfterWrite();
@@ -122,7 +130,8 @@ void Http2ConnectionHandler::OnRawData(
 
 void Http2ConnectionHandler::SendGoaway() {
     if (session_) {
-        session_->SendGoaway(H2_NO_ERROR);
+        conn_->ClearDeadline();
+        session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
         session_->SendPendingFrames();
     }
 }

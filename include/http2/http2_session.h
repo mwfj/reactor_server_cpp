@@ -91,7 +91,17 @@ public:
     size_t MaxBodySize() const { return max_body_size_; }
 
     // Header list size limit (applied by nghttp2 SETTINGS)
-    void SetMaxHeaderListSize(size_t max) { max_header_list_size_ = max; }
+    void SetMaxHeaderListSize(size_t max) {
+        max_header_list_size_ = max;
+        settings_.max_header_list_size = static_cast<uint32_t>(max);
+    }
+
+    // Owner reference — set by Http2ConnectionHandler after construction.
+    // Used to pass a valid shared_ptr to request/stream-close callbacks.
+    void SetOwner(std::weak_ptr<Http2ConnectionHandler> owner) {
+        owner_ = std::move(owner);
+    }
+    std::shared_ptr<Http2ConnectionHandler> Owner() const { return owner_.lock(); }
 
     // Access callbacks (used by static nghttp2 callback functions)
     HTTP2_CALLBACKS_NAMESPACE::Http2SessionCallbacks& Callbacks() { return callbacks_; }
@@ -107,6 +117,8 @@ private:
 
     HTTP2_CALLBACKS_NAMESPACE::Http2SessionCallbacks callbacks_;
 
+    std::weak_ptr<Http2ConnectionHandler> owner_;
+
     int32_t last_stream_id_ = 0;
     bool goaway_sent_ = false;
     size_t max_body_size_ = 0;
@@ -116,7 +128,6 @@ private:
     int settings_count_ = 0;
     int ping_count_ = 0;
     int rst_stream_count_ = 0;
-    int empty_frame_count_ = 0;
     std::chrono::steady_clock::time_point flood_window_start_;
 
     // Deferred stream deletion list (never delete during nghttp2 callback)

@@ -33,7 +33,8 @@ public:
 
     // Header accumulation (called from nghttp2 on_header_callback).
     // Handles pseudo-headers (:method, :path, :scheme, :authority).
-    void AddHeader(const std::string& name, const std::string& value);
+    // Returns 0 on success, -1 if the header value is invalid (e.g., bad content-length).
+    int AddHeader(const std::string& name, const std::string& value);
 
     // Body accumulation (called from nghttp2 on_data_chunk_recv_callback)
     void AppendBody(const char* data, size_t len);

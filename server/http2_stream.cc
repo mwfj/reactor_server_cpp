@@ -11,7 +11,7 @@ Http2Stream::Http2Stream(int32_t stream_id)
 
 Http2Stream::~Http2Stream() = default;
 
-void Http2Stream::AddHeader(const std::string& name, const std::string& value) {
+int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
     // Handle pseudo-headers (RFC 9113 Section 8.3.1)
     if (!name.empty() && name[0] == ':') {
         if (name == ":method") {
@@ -32,7 +32,7 @@ void Http2Stream::AddHeader(const std::string& name, const std::string& value) {
             request_.headers["host"] = value;
         }
         // :scheme is informational — not stored in HttpRequest
-        return;
+        return 0;
     }
 
     // Regular headers — store lowercase (matching HTTP/1.x convention)
@@ -48,7 +48,7 @@ void Http2Stream::AddHeader(const std::string& name, const std::string& value) {
         } else {
             request_.headers["cookie"] = value;
         }
-        return;
+        return 0;
     }
 
     request_.headers[lower_name] = value;
@@ -58,10 +58,11 @@ void Http2Stream::AddHeader(const std::string& name, const std::string& value) {
         try {
             request_.content_length = std::stoull(value);
         } catch (...) {
-            // Invalid content-length — will be caught during validation
-            request_.content_length = 0;
+            return -1;  // Invalid content-length — caller should RST_STREAM
         }
     }
+
+    return 0;
 }
 
 void Http2Stream::AppendBody(const char* data, size_t len) {

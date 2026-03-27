@@ -110,7 +110,12 @@ static int OnHeaderCallback(
         return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
     }
 
-    stream->AddHeader(hdr_name, hdr_value);
+    int add_rv = stream->AddHeader(hdr_name, hdr_value);
+    if (add_rv != 0) {
+        logging::Get()->warn("HTTP/2 stream {} invalid header value for: {}",
+                             frame->hd.stream_id, hdr_name);
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
     return 0;
 }
 
@@ -187,11 +192,8 @@ static int OnFrameRecvCallback(
         if (stream->IsRequestComplete() && self->Callbacks().request_callback) {
             HttpResponse response;
             try {
-                // nullptr is intentional: Http2Session has no reference to
-                // Http2ConnectionHandler. The HttpServer callback captures
-                // its context via lambda and ignores this parameter.
                 self->Callbacks().request_callback(
-                    nullptr, frame->hd.stream_id,
+                    self->Owner(), frame->hd.stream_id,
                     stream->GetRequest(), response);
             } catch (const std::exception& e) {
                 logging::Get()->error("Exception in HTTP/2 request handler: {}",
@@ -213,9 +215,8 @@ static int OnFrameRecvCallback(
             if (stream->IsRequestComplete() && self->Callbacks().request_callback) {
                 HttpResponse response;
                 try {
-                    // nullptr is intentional: see HEADERS case above.
                     self->Callbacks().request_callback(
-                        nullptr, frame->hd.stream_id,
+                        self->Owner(), frame->hd.stream_id,
                         stream->GetRequest(), response);
                 } catch (const std::exception& e) {
                     logging::Get()->error("Exception in HTTP/2 request handler: {}",
@@ -252,7 +253,7 @@ static int OnStreamCloseCallback(
     // nghttp2 state (e.g., submit frames) inside the callback.
     if (self->Callbacks().stream_close_callback) {
         try {
-            self->Callbacks().stream_close_callback(nullptr, stream_id, error_code);
+            self->Callbacks().stream_close_callback(self->Owner(), stream_id, error_code);
         } catch (const std::exception& e) {
             logging::Get()->error("Exception in stream close callback: {}", e.what());
         }
@@ -560,7 +561,6 @@ bool Http2Session::CheckFloodProtection(
         settings_count_ = 0;
         ping_count_ = 0;
         rst_stream_count_ = 0;
-        empty_frame_count_ = 0;
         flood_window_start_ = now;
     }
 

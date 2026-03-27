@@ -74,6 +74,10 @@ private:
     Http2Session::Settings h2_settings_;
     std::map<int, std::shared_ptr<Http2ConnectionHandler>> h2_connections_;
 
+    // Connections whose protocol has not yet been determined due to insufficient
+    // data. Keyed by fd. Protected by conn_mtx_.
+    std::map<int, std::string> pending_detection_;
+
     // Helper: set up request handler on an Http2ConnectionHandler
     void SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn);
 
