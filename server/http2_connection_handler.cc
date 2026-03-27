@@ -103,7 +103,11 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
                 deadline_armed_ = true;
                 last_seen_generation_ = gen;
             }
-            if (session_->IncompleteStreamCount() == 0 && deadline_armed_) {
+            // Only clear if streams were actually opened and all completed.
+            // If no streams were ever seen (preface-only), keep the initial
+            // deadline — the client must send a request within request_timeout_sec.
+            if (session_->IncompleteStreamCount() == 0 &&
+                session_->LastStreamId() > 0 && deadline_armed_) {
                 conn_->ClearDeadline();
                 deadline_armed_ = false;
             }
@@ -151,7 +155,8 @@ void Http2ConnectionHandler::OnRawData(
             deadline_armed_ = true;
             last_seen_generation_ = gen;
         }
-        if (session_->IncompleteStreamCount() == 0 && deadline_armed_) {
+        if (session_->IncompleteStreamCount() == 0 &&
+            session_->LastStreamId() > 0 && deadline_armed_) {
             // All incomplete streams resolved — clear deadline
             conn_->ClearDeadline();
             deadline_armed_ = false;

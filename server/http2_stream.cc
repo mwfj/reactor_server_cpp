@@ -73,14 +73,19 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
         return 0;
     }
 
-    // RFC 9113 Section 8.3.1: if :authority and host are both present,
-    // they MUST be identical. Reject if they conflict.
-    if (lower_name == "host" && has_authority_ && value != authority_) {
-        return -1;  // Malformed: conflicting :authority and host
-    }
-    // If host matches :authority, skip — already set by :authority processing
-    if (lower_name == "host" && has_authority_) {
-        return 0;
+    // Host header handling:
+    // - If :authority was set, host must match it (RFC 9113 Section 8.3.1)
+    // - Only one host header allowed (singleton, same as HTTP/1.x)
+    if (lower_name == "host") {
+        if (has_authority_ && value != authority_) {
+            return -1;  // Malformed: conflicting :authority and host
+        }
+        if (request_.headers.count("host")) {
+            return -1;  // Duplicate host header
+        }
+        if (has_authority_) {
+            return 0;   // Already set by :authority — skip
+        }
     }
 
     // Handle duplicate headers consistently with the HTTP/1.x parser:
