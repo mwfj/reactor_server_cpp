@@ -236,21 +236,28 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
         }
     }
 
-    // validate accepts -c, -p, -H, -l, -w, -d (for daemon pre-validation)
-    // config accepts -c, -p, -H, -l, -w but NOT -d
-    // Neither accepts -P or --no-health-endpoint
+    // validate accepts -c, -p, -H, -l, -w, -d, -P (for daemon pre-validation)
+    // config accepts -c, -p, -H, -l, -w but NOT -d or -P
+    // Neither accepts --no-health-endpoint
     if (cmd == CliCommand::VALIDATE || cmd == CliCommand::CONFIG) {
-        if (options.pid_file_explicit) {
-            throw std::runtime_error(
-                std::string("'") + argv[1] + "' does not accept -P/--pid-file");
-        }
         if (!options.health_endpoint) {
             throw std::runtime_error(
                 std::string("'") + argv[1] + "' does not accept --no-health-endpoint");
         }
-        if (cmd == CliCommand::CONFIG && options.daemonize) {
+        if (cmd == CliCommand::CONFIG) {
+            if (options.daemonize) {
+                throw std::runtime_error(
+                    "'config' does not accept -d/--daemonize");
+            }
+            if (options.pid_file_explicit) {
+                throw std::runtime_error(
+                    "'config' does not accept -P/--pid-file");
+            }
+        }
+        // validate: -P is only meaningful with -d (daemon PID file validation)
+        if (cmd == CliCommand::VALIDATE && options.pid_file_explicit && !options.daemonize) {
             throw std::runtime_error(
-                "'config' does not accept -d/--daemonize");
+                "'validate' only accepts -P/--pid-file with -d/--daemonize");
         }
     }
 
@@ -293,6 +300,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "  -l, --log-level <level>     Override log level\n"
         << "  -w, --workers <N>           Override worker threads\n"
         << "  -d, --daemonize             Check daemon-mode constraints (validate only)\n"
+        << "  -P, --pid-file <file>       PID file to validate (validate -d only)\n"
         << "\n"
         << "Global options:\n"
         << "  -v, --version               Same as 'version'\n"

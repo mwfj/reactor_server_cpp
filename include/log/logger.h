@@ -3,6 +3,7 @@
 #include "spdlog/spdlog.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/sinks/rotating_file_sink.h"
+#include "spdlog/sinks/basic_file_sink.h"
 
 #include <string>
 #include <memory>
@@ -39,7 +40,8 @@ void SetConsoleEnabled(bool enabled);
 // Reconstructs the logger with fresh file handles while preserving
 // console preference and log level. Thread-safe. No-op if no file
 // sink is configured or Init() has not been called.
-void Reopen();
+// Returns true on success, false on failure (old logger kept active).
+bool Reopen();
 
 // Flush all sinks and shut down the logging system.
 void Shutdown();

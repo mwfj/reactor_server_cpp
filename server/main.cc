@@ -262,7 +262,7 @@ static int HandleStart(const CliOptions& options) {
     // ── Wire daemon readiness to fire after init, before event loop ──
 #if !defined(_WIN32)
     if (options.daemonize) {
-        server->SetReadyCallback([&]() {
+        server->SetReadyCallback([]() {
             Daemonizer::NotifyReady();
         });
     }
@@ -301,8 +301,11 @@ static int HandleStart(const CliOptions& options) {
         if (options.daemonize) {
             // Daemon mode: reopen log files for rotation
             logging::Get()->info("Received SIGHUP, reopening log files");
-            logging::Reopen();
-            logging::Get()->info("Log files reopened");
+            if (logging::Reopen()) {
+                logging::Get()->info("Log files reopened");
+            } else {
+                logging::Get()->warn("Log file reopen failed, continuing with old file");
+            }
         } else {
             // Foreground mode: treat SIGHUP as shutdown (terminal hangup)
             logging::Get()->info("Received SIGHUP (terminal hangup), shutting down");

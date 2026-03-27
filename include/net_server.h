@@ -8,6 +8,7 @@
 #include "connection_handler.h"
 #include "acceptor.h"
 #include "callbacks.h"
+#include "log/logger.h"
 
 #include "threadtask.h"
 #include "threadpool.h"
@@ -26,7 +27,7 @@ protected:
             func_();
             return 0;  // Success
         }catch (const std::exception& e){
-            std::cerr << "[NetServer] SocketWorker: Error handling event: " << e.what() << std::endl;
+            logging::Get()->error("SocketWorker error: {}", e.what());
             return -1;
         }
     }
@@ -56,6 +57,7 @@ private:
     std::shared_ptr<TlsContext> tls_ctx_;  // Shared with HttpServer for safe lifetime
     int max_connections_ = 0;         // 0 = unlimited
     size_t max_input_size_ = 0;       // 0 = unlimited, set before RegisterCallbacks
+    std::function<void()> ready_callback_ = nullptr;  // Fires after init, before event loop
 
 public:
     NetServer() = delete;
@@ -92,7 +94,4 @@ public:
     // Called after init completes but before the blocking event loop.
     // Used by daemon mode to signal readiness to the parent process.
     void SetReadyCallback(std::function<void()> cb) { ready_callback_ = std::move(cb); }
-
-private:
-    std::function<void()> ready_callback_;
 };

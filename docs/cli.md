@@ -55,6 +55,8 @@ Validate/config options:
   -H, --host <address>        Override bind address
   -l, --log-level <level>     Override log level
   -w, --workers <N>           Override worker threads
+  -d, --daemonize             Check daemon-mode constraints (validate only)
+  -P, --pid-file <file>       PID file to validate (validate -d only)
 
 Global options:
   -v, --version               Same as 'version'
@@ -180,7 +182,7 @@ kill -HUP $(cat /tmp/reactor_server.pid)
 # }
 ```
 
-**Note:** The server uses spdlog's rotating file sink, which has its own size-based rotation using `.1`, `.2`, `.3` suffixes. When using external `logrotate`, set `log.max_files` to `1` in the config to disable spdlog's built-in rotation and avoid naming conflicts between the two rotation schemes.
+**Note:** By default, the server uses spdlog's rotating file sink with size-based rotation (`.1`, `.2`, `.3` suffixes). When using external `logrotate`, set `log.max_files` to `1` in the config to switch to a non-rotating file sink that is fully compatible with external rotation. With `max_files > 1`, spdlog's built-in rotation naming can conflict with logrotate's file renaming.
 
 ## PID File
 

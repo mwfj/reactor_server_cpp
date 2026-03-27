@@ -29,8 +29,19 @@ static std::vector<spdlog::sink_ptr> BuildSinks(spdlog::level::level_enum level)
     }
 
     if (!g_log_file.empty()) {
-        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-            g_log_file, g_max_size, g_max_files);
+        spdlog::sink_ptr file_sink;
+        if (g_max_files <= 1) {
+            // Non-rotating sink: compatible with external logrotate.
+            // logrotate renames the file, SIGHUP triggers Reopen() which
+            // creates a fresh sink at the original path. No .1/.2 conflicts.
+            file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
+                g_log_file, /*truncate=*/false);
+        } else {
+            // spdlog built-in size-based rotation with .1, .2, ... suffixes.
+            // Do NOT combine with external logrotate (naming conflict).
+            file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+                g_log_file, g_max_size, g_max_files);
+        }
         file_sink->set_level(level);
         sinks.push_back(file_sink);
     }
@@ -105,9 +116,9 @@ void SetConsoleEnabled(bool enabled) {
     g_console_enabled = enabled;
 }
 
-void Reopen() {
+bool Reopen() {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
-    if (!g_logger || g_log_file.empty()) return;
+    if (!g_logger || g_log_file.empty()) return true;  // no-op is success
 
     try {
         g_logger->flush();
@@ -124,9 +135,11 @@ void Reopen() {
         // Get() picks up the new one. This brief overlap is acceptable.
         spdlog::set_default_logger(new_logger);
         g_logger = new_logger;
+        return true;
     } catch (const std::exception& e) {
         // Keep old logger active — never fail open
         g_logger->error("Failed to reopen log file: {}", e.what());
+        return false;
     }
 }
 

@@ -1604,6 +1604,72 @@ void TestConfigRejectsDaemonize() {
     }
 }
 
+// Test 48: 'validate -d' with no log file configured should fail (daemon requires log file).
+// This tests the actual daemon config validation, not just the CLI parsing.
+void TestValidateDaemonRejectsNoLogFile() {
+    std::cout << "\n[TEST] CliParser: 'validate -d' catches missing log file..." << std::endl;
+
+    // Build a minimal config file with no log.file
+    const std::string cfg_path = "/tmp/test_reactor_cfg_" + std::to_string(getpid()) + "_nolog.json";
+    WriteFile(cfg_path, R"({"bind_port": 8080})");
+
+    // Run the actual binary with validate -d to check daemon constraints
+    std::string cmd = "./reactor_server validate -d -c " + cfg_path + " 2>&1; echo $?";
+    FILE* fp = popen(cmd.c_str(), "r");
+    std::string output;
+    if (fp) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), fp)) output += buf;
+        pclose(fp);
+    }
+
+    std::remove(cfg_path.c_str());
+
+    // The last line should be the exit code (1 = error, since daemon needs log file)
+    bool has_error = output.find("daemon mode requires a log file") != std::string::npos;
+    bool exit_nonzero = !output.empty() && output.back() != '0';
+
+    bool pass = has_error && exit_nonzero;
+    std::string err;
+    if (!has_error) err += "Expected 'daemon mode requires a log file' error; ";
+    if (!exit_nonzero) err += "Expected non-zero exit code; ";
+
+    TestFramework::RecordTest("CliParser: validate -d catches missing log file",
+                              pass, err, CLI_CATEGORY);
+}
+
+// Test 49: 'validate -d -P /relative/path' should fail (daemon requires absolute PID path).
+void TestValidateDaemonRejectsRelativePidPath() {
+    std::cout << "\n[TEST] CliParser: 'validate -d -P relative' catches relative PID path..." << std::endl;
+
+    // Build a config with an absolute log file (so that check passes)
+    const std::string cfg_path = "/tmp/test_reactor_cfg_" + std::to_string(getpid()) + "_relpid.json";
+    WriteFile(cfg_path, R"({"log":{"file":"/tmp/test.log"}})");
+
+    std::string cmd = "./reactor_server validate -d -c " + cfg_path + " -P relative.pid 2>&1; echo $?";
+    FILE* fp = popen(cmd.c_str(), "r");
+    std::string output;
+    if (fp) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), fp)) output += buf;
+        pclose(fp);
+    }
+
+    std::remove(cfg_path.c_str());
+
+    bool has_error = output.find("absolute") != std::string::npos &&
+                     output.find("PID file") != std::string::npos;
+    bool exit_nonzero = !output.empty() && output.back() != '0';
+
+    bool pass = has_error && exit_nonzero;
+    std::string err;
+    if (!has_error) err += "Expected absolute PID file path error; ";
+    if (!exit_nonzero) err += "Expected non-zero exit code; ";
+
+    TestFramework::RecordTest("CliParser: validate -d -P catches relative PID path",
+                              pass, err, CLI_CATEGORY);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Suite entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1674,6 +1740,8 @@ void RunAllTests() {
     TestStatusRejectsDaemonize();
     TestValidateAcceptsDaemonize();
     TestConfigRejectsDaemonize();
+    TestValidateDaemonRejectsNoLogFile();
+    TestValidateDaemonRejectsRelativePidPath();
 }
 
 }  // namespace CliTests
