@@ -65,8 +65,8 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
     // Send server connection preface (SETTINGS)
     session_->SendServerPreface();
 
-    // Arm per-connection activity deadline for slowloris protection.
-    // Reset on each OnRawData call. Cleared when GOAWAY is sent.
+    // Arm deadline for the initial SETTINGS exchange / first request.
+    // Will be managed by UpdateDeadline() based on active stream count.
     if (request_timeout_sec_ > 0) {
         conn_->SetDeadline(std::chrono::steady_clock::now() +
                            std::chrono::seconds(request_timeout_sec_));
@@ -114,10 +114,17 @@ void Http2ConnectionHandler::OnRawData(
     // Send pending frames (responses, WINDOW_UPDATEs, etc.)
     session_->SendPendingFrames();
 
-    // Reset activity deadline — data received means the connection is alive
+    // Manage deadline based on active stream count:
+    // - If streams are open, reset the deadline (data arrived, connection active)
+    // - If no streams remain, clear the deadline — let idle_timeout handle it
+    //   (prevents killing healthy keep-alive h2 connections after request_timeout)
     if (request_timeout_sec_ > 0) {
-        conn_->SetDeadline(std::chrono::steady_clock::now() +
-                           std::chrono::seconds(request_timeout_sec_));
+        if (session_->ActiveStreamCount() > 0) {
+            conn_->SetDeadline(std::chrono::steady_clock::now() +
+                               std::chrono::seconds(request_timeout_sec_));
+        } else {
+            conn_->ClearDeadline();
+        }
     }
 
     // Check if session wants to close

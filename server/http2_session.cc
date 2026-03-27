@@ -392,6 +392,13 @@ bool Http2Session::SendPendingFrames() {
                         static_cast<size_t>(len));
         sent_any = true;
     }
+
+    // Flush deferred stream removals. OnStreamCloseCallback can fire during
+    // mem_send2 (when nghttp2 finalizes response frames). Without this,
+    // closed streams and their ResponseDataSource stay resident until the
+    // next ReceiveData call, which may not come on idle keep-alive connections.
+    FlushDeferredRemovals();
+
     return sent_any;
 }
 
