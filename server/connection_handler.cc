@@ -700,10 +700,11 @@ void ConnectionHandler::SetDeadlineTimeoutCb(DeadlineTimeoutCb cb) {
     deadline_timeout_cb_ = std::move(cb);
 }
 
-void ConnectionHandler::CallDeadlineTimeoutCb() {
+bool ConnectionHandler::CallDeadlineTimeoutCb() {
     if (deadline_timeout_cb_) {
-        deadline_timeout_cb_();
+        return deadline_timeout_cb_();
     }
+    return false;
 }
 
 void ConnectionHandler::SetDeadline(std::chrono::steady_clock::time_point deadline) {

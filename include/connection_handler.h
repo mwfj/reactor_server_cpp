@@ -29,7 +29,7 @@ private:
     TimeStamp ts_; // Each connection owns a timestamp to manage
     bool has_deadline_ = false;
     std::chrono::steady_clock::time_point deadline_;
-    std::function<void()> deadline_timeout_cb_;
+    std::function<bool()> deadline_timeout_cb_;
     // Monotonic counter incremented on every on-thread deadline write/clear.
     // Off-thread SetDeadline captures the generation at queue time and only
     // applies the deadline if the generation hasn't changed, preventing stale
@@ -102,11 +102,12 @@ public:
     void SetDeadline(std::chrono::steady_clock::time_point deadline);
     void ClearDeadline();
 
-    // Pre-close callback for deadline timeouts — allows upper layers (HttpConnectionHandler)
-    // to send a 408 response before the connection is closed by the timer.
-    using DeadlineTimeoutCb = std::function<void()>;
+    // Deadline timeout callback. Returns true if the timeout was handled
+    // (e.g., HTTP/2 RST'd expired streams and re-armed) — connection stays alive.
+    // Returns false to proceed with the default close behavior.
+    using DeadlineTimeoutCb = std::function<bool()>;
     void SetDeadlineTimeoutCb(DeadlineTimeoutCb cb);
-    void CallDeadlineTimeoutCb();
+    bool CallDeadlineTimeoutCb();  // returns true if handled (keep alive)
 
     bool IsTimeOut(std::chrono::seconds) const;
 };

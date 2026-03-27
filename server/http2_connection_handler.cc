@@ -65,10 +65,30 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
     // Send server connection preface (SETTINGS)
     session_->SendServerPreface();
 
-    // Arm deadline for the initial SETTINGS exchange / first request.
-    // Mark deadline_armed_ so the clear path in OnRawData works correctly
-    // even if the first request completes within initial_data processing.
+    // Install HTTP/2 deadline timeout callback. When the deadline fires,
+    // RST expired streams instead of closing the whole connection.
+    // Returns true (handled) if any streams remain after RST, keeping
+    // the connection alive for healthy streams.
     if (request_timeout_sec_ > 0) {
+        std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
+        conn_->SetDeadlineTimeoutCb([weak_self]() -> bool {
+            auto self = weak_self.lock();
+            if (!self || !self->session_) return false;
+
+            size_t reset = self->session_->ResetExpiredStreams(
+                self->request_timeout_sec_);
+            if (reset > 0) {
+                self->session_->SendPendingFrames();
+            }
+            self->UpdateDeadline();
+
+            // If incomplete streams remain, deadline was re-armed → keep alive.
+            // If no incomplete streams, UpdateDeadline cleared it → keep alive
+            // (idle timeout governs). Only close if session is dead.
+            return self->session_->IsAlive();
+        });
+
+        // Arm initial deadline for SETTINGS exchange / first request.
         conn_->SetDeadline(std::chrono::steady_clock::now() +
                            std::chrono::seconds(request_timeout_sec_));
         deadline_armed_ = true;

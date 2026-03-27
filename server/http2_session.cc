@@ -747,6 +747,27 @@ std::chrono::steady_clock::time_point Http2Session::OldestIncompleteStreamStart(
     return std::chrono::steady_clock::time_point::max();
 }
 
+size_t Http2Session::ResetExpiredStreams(int timeout_sec) {
+    auto now = std::chrono::steady_clock::now();
+    auto limit = std::chrono::seconds(timeout_sec);
+    size_t count = 0;
+
+    for (auto& [id, stream] : streams_) {
+        if (stream->IsCounterDecremented() || stream->IsRejected()) continue;
+        // This stream is incomplete — check if it's expired
+        if (now - stream->CreatedAt() > limit) {
+            logging::Get()->warn("HTTP/2 stream {} timed out ({}s)", id, timeout_sec);
+            stream->MarkRejected();
+            nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
+                                      id, NGHTTP2_CANCEL);
+            OnStreamNoLongerIncomplete();
+            stream->MarkCounterDecremented();
+            ++count;
+        }
+    }
+    return count;
+}
+
 // --- Callbacks ---
 
 void Http2Session::SetRequestCallback(

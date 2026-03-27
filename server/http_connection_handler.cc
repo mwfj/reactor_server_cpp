@@ -401,12 +401,13 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         request_start_ = std::chrono::steady_clock::now();
         conn_->SetDeadline(request_start_ + std::chrono::seconds(request_timeout_sec_));
         std::weak_ptr<HttpConnectionHandler> weak_self = shared_from_this();
-        conn_->SetDeadlineTimeoutCb([weak_self]() {
+        conn_->SetDeadlineTimeoutCb([weak_self]() -> bool {
             if (auto self = weak_self.lock()) {
                 HttpResponse timeout_resp = HttpResponse::RequestTimeout();
                 timeout_resp.Header("Connection", "close");
                 self->SendResponse(timeout_resp);
             }
+            return false;  // Proceed with connection close
         });
     }
 
@@ -534,12 +535,13 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             conn_->SetDeadline(request_start_ + std::chrono::seconds(request_timeout_sec_));
             // Set callback so timer-driven timeout sends 408 before close
             std::weak_ptr<HttpConnectionHandler> weak_self = shared_from_this();
-            conn_->SetDeadlineTimeoutCb([weak_self]() {
+            conn_->SetDeadlineTimeoutCb([weak_self]() -> bool {
                 if (auto self = weak_self.lock()) {
                     HttpResponse timeout_resp = HttpResponse::RequestTimeout();
                     timeout_resp.Header("Connection", "close");
                     self->SendResponse(timeout_resp);
                 }
+                return false;  // Proceed with connection close
             });
         } else {
             // Request still in progress — check elapsed time

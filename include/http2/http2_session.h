@@ -101,6 +101,11 @@ public:
     // streams. Returns time_point::max() if no incomplete streams exist.
     std::chrono::steady_clock::time_point OldestIncompleteStreamStart() const;
 
+    // RST_STREAM all incomplete streams that have exceeded the given timeout.
+    // Returns the number of streams reset. Caller should call SendPendingFrames()
+    // and UpdateDeadline() after this.
+    size_t ResetExpiredStreams(int timeout_sec);
+
     // Body size limit (set from config, checked during data ingestion)
     void SetMaxBodySize(size_t max) { max_body_size_ = max; }
     size_t MaxBodySize() const { return max_body_size_; }
