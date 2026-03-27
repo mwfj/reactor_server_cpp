@@ -88,16 +88,20 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
         // Send any pending frames (SETTINGS ACK, responses, etc.)
         session_->SendPendingFrames();
 
-        // Update deadline: if the first request completed in initial_data,
-        // clear the deadline so idle_timeout governs the keep-alive connection.
-        if (request_timeout_sec_ > 0) {
-            if (session_->ActiveStreamCount() > 0) {
-                conn_->SetDeadline(std::chrono::steady_clock::now() +
-                                   std::chrono::seconds(request_timeout_sec_));
-            } else {
-                conn_->ClearDeadline();
-            }
+        // Update deadline based on what initial_data contained:
+        // - If streams are still open → reset deadline (active request)
+        // - If streams opened AND completed → clear deadline (idle keep-alive)
+        // - If no streams opened (preface-only) → keep deadline armed
+        //   (client must send a request within request_timeout_sec)
+        if (request_timeout_sec_ > 0 && session_->ActiveStreamCount() > 0) {
+            conn_->SetDeadline(std::chrono::steady_clock::now() +
+                               std::chrono::seconds(request_timeout_sec_));
+        } else if (request_timeout_sec_ > 0 && session_->LastStreamId() > 0 &&
+                   session_->ActiveStreamCount() == 0) {
+            // Streams were processed and completed — idle keep-alive
+            conn_->ClearDeadline();
         }
+        // else: preface-only, no streams seen yet — keep original deadline
     }
 }
 

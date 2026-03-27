@@ -71,15 +71,15 @@ static int OnHeaderCallback(
 
     auto* self = static_cast<Http2Session*>(user_data);
 
-    if (frame->hd.type != NGHTTP2_HEADERS ||
-        frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
+    if (frame->hd.type != NGHTTP2_HEADERS) {
         return 0;
     }
 
     auto* stream = self->FindStream(frame->hd.stream_id);
     if (!stream) return 0;
 
-    // Enforce max_header_list_size (RFC 7541 Section 4.1: entry size = name + value + 32).
+    // Enforce max_header_list_size on ALL header frames (request + trailers).
+    // RFC 7541 Section 4.1: entry size = name + value + 32.
     // nghttp2 advertises this in SETTINGS but does NOT enforce it on the receive side.
     stream->AddHeaderBytes(namelen, valuelen);
     if (self->MaxHeaderListSize() > 0 &&
@@ -88,6 +88,11 @@ static int OnHeaderCallback(
                              frame->hd.stream_id, stream->AccumulatedHeaderSize(),
                              self->MaxHeaderListSize());
         return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
+
+    // Only process header values for request headers (not trailers)
+    if (frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
+        return 0;
     }
 
     std::string hdr_name(reinterpret_cast<const char*>(name), namelen);
@@ -485,9 +490,10 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     const std::string& raw_body = response.GetBody();
     bool has_body = !raw_body.empty() && !suppress_body;
 
-    // Add content-length header.
-    // For HEAD: include content-length reflecting the body size (as if GET)
-    // but do not send the body itself (RFC 9110 Section 9.3.2).
+    // Add content-length header when appropriate.
+    // HEAD: include content-length reflecting the body size as if GET (RFC 9110 §9.3.2)
+    // 204/205/304: MUST NOT include content-length for a non-existent body
+    // Normal responses: auto-add content-length if body is non-empty
     std::string content_length_str;
     bool has_content_length = false;
     for (const auto& hdr : headers) {
@@ -498,7 +504,11 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
             break;
         }
     }
-    if (!raw_body.empty() && !has_content_length) {
+    // Only auto-add content-length if: body is present AND either
+    // (a) body is not suppressed, or (b) it's a HEAD response (needs GET-equivalent CL)
+    bool should_add_cl = !raw_body.empty() && !has_content_length &&
+                         (!suppress_body || req.method == "HEAD");
+    if (should_add_cl) {
         content_length_str = std::to_string(raw_body.size());
         nva.push_back({
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("content-length")),
