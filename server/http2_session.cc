@@ -347,6 +347,11 @@ static int OnStreamCloseCallback(
 
     auto* stream = self->FindStream(stream_id);
     if (stream) {
+        // If the stream's request was never dispatched (rejected, or closed
+        // before END_STREAM), it's still counted as incomplete.
+        if (!stream->IsRequestComplete() || stream->IsRejected()) {
+            self->DecrementIncompleteStreams();
+        }
         stream->SetState(Http2Stream::State::CLOSED);
     }
 
@@ -633,6 +638,9 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
 }
 
 void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id) {
+    // Request is complete — no longer counts as "incomplete" for timeout purposes
+    DecrementIncompleteStreams();
+
     const HttpRequest& req = stream->GetRequest();
 
     // RFC 9110 Section 8.6: If content-length is declared, the actual body
@@ -699,6 +707,7 @@ Http2Stream* Http2Session::CreateStream(int32_t stream_id) {
         logging::Get()->warn("Stream {} already exists", stream_id);
         return it->second.get();
     }
+    ++incomplete_stream_count_;
     return it->second.get();
 }
 

@@ -94,16 +94,16 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
 
         // Update deadline based on what initial_data contained:
         if (request_timeout_sec_ > 0) {
-            size_t current_count = session_->ActiveStreamCount();
-            if (current_count > 0 && current_count > last_seen_stream_count_) {
+            size_t incomplete = session_->IncompleteStreamCount();
+            if (incomplete > 0 && incomplete > last_seen_stream_count_) {
                 conn_->SetDeadline(std::chrono::steady_clock::now() +
                                    std::chrono::seconds(request_timeout_sec_));
                 deadline_armed_ = true;
-            } else if (current_count == 0 && session_->LastStreamId() > 0) {
+            } else if (incomplete == 0 && session_->LastStreamId() > 0) {
                 conn_->ClearDeadline();
                 deadline_armed_ = false;
             }
-            last_seen_stream_count_ = current_count;
+            last_seen_stream_count_ = incomplete;
         }
     }
 }
@@ -113,6 +113,12 @@ void Http2ConnectionHandler::OnRawData(
 
     if (!initialized_ || !session_) {
         logging::Get()->error("HTTP/2 OnRawData called before Initialize()");
+        return;
+    }
+
+    // During shutdown drain (CloseAfterWrite set), don't process new data.
+    // This prevents clients from opening new streams while we're draining.
+    if (conn_->IsCloseDeferred()) {
         return;
     }
 
@@ -132,24 +138,21 @@ void Http2ConnectionHandler::OnRawData(
     // Send pending frames (responses, WINDOW_UPDATEs, etc.)
     session_->SendPendingFrames();
 
-    // Manage deadline based on active stream count.
-    // Reset the deadline whenever a new stream appears (stream count increases),
-    // so each new stream gets a full request_timeout_sec window. This prevents
-    // a late-arriving stream B from being killed by stream A's earlier deadline.
-    // Cleared when all streams complete (idle keep-alive → idle_timeout governs).
+    // Manage deadline based on incomplete (not-yet-dispatched) stream count.
+    // Only incomplete requests count — response draining should not trigger
+    // the request timeout. Reset when new incomplete streams appear so each
+    // gets a full window. Clear when all requests are dispatched/rejected.
     if (request_timeout_sec_ > 0) {
-        size_t current_count = session_->ActiveStreamCount();
-        if (current_count > 0 && current_count > last_seen_stream_count_) {
-            // New stream(s) appeared — (re)arm the deadline
+        size_t incomplete = session_->IncompleteStreamCount();
+        if (incomplete > 0 && incomplete > last_seen_stream_count_) {
             conn_->SetDeadline(std::chrono::steady_clock::now() +
                                std::chrono::seconds(request_timeout_sec_));
             deadline_armed_ = true;
-        } else if (current_count == 0 && session_->LastStreamId() > 0) {
-            // All streams completed — clear deadline, let idle_timeout govern
+        } else if (incomplete == 0 && deadline_armed_) {
             conn_->ClearDeadline();
             deadline_armed_ = false;
         }
-        last_seen_stream_count_ = current_count;
+        last_seen_stream_count_ = incomplete;
     }
 
     // Check if session wants to close

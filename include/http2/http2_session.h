@@ -86,6 +86,16 @@ public:
     // Get the last stream ID we have processed (for GOAWAY)
     int32_t LastStreamId() const { return last_stream_id_; }
 
+    // Count of streams whose request is not yet complete (headers received
+    // but END_STREAM not yet seen). Used for request-timeout enforcement:
+    // the deadline should only be active while incomplete requests exist,
+    // not while completed requests are draining responses.
+    size_t IncompleteStreamCount() const { return incomplete_stream_count_; }
+    void IncrementIncompleteStreams() { ++incomplete_stream_count_; }
+    void DecrementIncompleteStreams() {
+        if (incomplete_stream_count_ > 0) --incomplete_stream_count_;
+    }
+
     // Body size limit (set from config, checked during data ingestion)
     void SetMaxBodySize(size_t max) { max_body_size_ = max; }
     size_t MaxBodySize() const { return max_body_size_; }
@@ -127,6 +137,7 @@ private:
     int32_t last_stream_id_ = 0;
     bool goaway_sent_ = false;
     size_t max_body_size_ = 0;
+    size_t incomplete_stream_count_ = 0;
     size_t max_header_list_size_ = 0;
 
     // Flood protection counters (sliding window)
