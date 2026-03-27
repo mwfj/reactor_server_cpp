@@ -283,7 +283,10 @@ static int OnFrameRecvCallback(
                                            frame->hd.stream_id, nullptr,
                                            nva_100, 1, nullptr);
                 } else {
-                    // Unsupported Expect value — reject with 417
+                    // Unsupported Expect value — reject with 417 and RST.
+                    // submit_response2 with no data provider sends END_STREAM
+                    // from the server side. RST_STREAM then closes the client
+                    // side so the stream doesn't linger in half-closed state.
                     nghttp2_nv nva_417[] = {
                         {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
                          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("417")),
@@ -291,6 +294,8 @@ static int OnFrameRecvCallback(
                     };
                     nghttp2_submit_response2(session, frame->hd.stream_id,
                                              nva_417, 1, nullptr);
+                    nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                              frame->hd.stream_id, NGHTTP2_NO_ERROR);
                     stream->MarkRejected();
                     break;
                 }

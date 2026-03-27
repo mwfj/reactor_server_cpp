@@ -94,15 +94,16 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
 
         // Update deadline based on what initial_data contained:
         if (request_timeout_sec_ > 0) {
-            if (session_->ActiveStreamCount() > 0 && !deadline_armed_) {
+            size_t current_count = session_->ActiveStreamCount();
+            if (current_count > 0 && current_count > last_seen_stream_count_) {
                 conn_->SetDeadline(std::chrono::steady_clock::now() +
                                    std::chrono::seconds(request_timeout_sec_));
                 deadline_armed_ = true;
-            } else if (session_->ActiveStreamCount() == 0 && session_->LastStreamId() > 0) {
+            } else if (current_count == 0 && session_->LastStreamId() > 0) {
                 conn_->ClearDeadline();
                 deadline_armed_ = false;
             }
-            // else: preface-only, no streams seen yet — keep original deadline
+            last_seen_stream_count_ = current_count;
         }
     }
 }
@@ -132,20 +133,23 @@ void Http2ConnectionHandler::OnRawData(
     session_->SendPendingFrames();
 
     // Manage deadline based on active stream count.
-    // Unlike the HTTP/1.x inactivity-based refresh, we use an absolute deadline:
-    // set once when the first incomplete stream appears, never refreshed by
-    // subsequent data. This prevents a client from keeping a stalled stream
-    // alive indefinitely by drip-feeding frames on other streams.
+    // Reset the deadline whenever a new stream appears (stream count increases),
+    // so each new stream gets a full request_timeout_sec window. This prevents
+    // a late-arriving stream B from being killed by stream A's earlier deadline.
     // Cleared when all streams complete (idle keep-alive → idle_timeout governs).
     if (request_timeout_sec_ > 0) {
-        if (session_->ActiveStreamCount() > 0 && !deadline_armed_) {
+        size_t current_count = session_->ActiveStreamCount();
+        if (current_count > 0 && current_count > last_seen_stream_count_) {
+            // New stream(s) appeared — (re)arm the deadline
             conn_->SetDeadline(std::chrono::steady_clock::now() +
                                std::chrono::seconds(request_timeout_sec_));
             deadline_armed_ = true;
-        } else if (session_->ActiveStreamCount() == 0 && session_->LastStreamId() > 0) {
+        } else if (current_count == 0 && session_->LastStreamId() > 0) {
+            // All streams completed — clear deadline, let idle_timeout govern
             conn_->ClearDeadline();
             deadline_armed_ = false;
         }
+        last_seen_stream_count_ = current_count;
     }
 
     // Check if session wants to close
