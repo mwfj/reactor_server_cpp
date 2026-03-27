@@ -67,6 +67,12 @@ public:
     // Body size tracking for limit enforcement
     size_t AccumulatedBodySize() const { return accumulated_body_size_; }
 
+    // Header size tracking (name + value + 32 per RFC 7541 Section 4.1)
+    size_t AccumulatedHeaderSize() const { return accumulated_header_size_; }
+    void AddHeaderBytes(size_t name_len, size_t value_len) {
+        accumulated_header_size_ += name_len + value_len + 32;
+    }
+
     // Mark stream as rejected (RST_STREAM sent) — prevents dispatch
     void MarkRejected() { rejected_ = true; }
     bool IsRejected() const { return rejected_; }
@@ -95,6 +101,7 @@ private:
     bool response_headers_sent_ = false;
     bool response_complete_ = false;
     size_t accumulated_body_size_ = 0;
+    size_t accumulated_header_size_ = 0;
     bool rejected_ = false;
     bool has_scheme_ = false;
     std::string scheme_;

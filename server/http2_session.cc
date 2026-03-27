@@ -79,6 +79,17 @@ static int OnHeaderCallback(
     auto* stream = self->FindStream(frame->hd.stream_id);
     if (!stream) return 0;
 
+    // Enforce max_header_list_size (RFC 7541 Section 4.1: entry size = name + value + 32).
+    // nghttp2 advertises this in SETTINGS but does NOT enforce it on the receive side.
+    stream->AddHeaderBytes(namelen, valuelen);
+    if (self->MaxHeaderListSize() > 0 &&
+        stream->AccumulatedHeaderSize() > self->MaxHeaderListSize()) {
+        logging::Get()->warn("HTTP/2 stream {} header list size ({}) exceeds limit ({})",
+                             frame->hd.stream_id, stream->AccumulatedHeaderSize(),
+                             self->MaxHeaderListSize());
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
+
     std::string hdr_name(reinterpret_cast<const char*>(name), namelen);
     std::string hdr_value(reinterpret_cast<const char*>(value), valuelen);
 
@@ -423,10 +434,13 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
 
     // Determine if the response body must be suppressed.
     // RFC 9110 Section 9.3.2: HEAD responses include headers as if GET but no body.
-    // RFC 9110 Section 15.3.5/15.4.5: 204 and 304 MUST NOT contain a body.
+    // RFC 9110 Section 15.3.5: 204 MUST NOT contain a body.
+    // RFC 9110 Section 15.3.6: 205 MUST NOT generate content.
+    // RFC 9110 Section 15.4.5: 304 MUST NOT contain a body.
     const HttpRequest& req = stream->GetRequest();
     bool suppress_body = (req.method == "HEAD" ||
-                          status_code == 204 || status_code == 304);
+                          status_code == 204 || status_code == 205 ||
+                          status_code == 304);
 
     // Build nghttp2 header name-value pairs.
     // We do NOT use NGHTTP2_NV_FLAG_NO_COPY_NAME or NO_COPY_VALUE:

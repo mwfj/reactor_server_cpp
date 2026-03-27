@@ -87,6 +87,17 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
 
         // Send any pending frames (SETTINGS ACK, responses, etc.)
         session_->SendPendingFrames();
+
+        // Update deadline: if the first request completed in initial_data,
+        // clear the deadline so idle_timeout governs the keep-alive connection.
+        if (request_timeout_sec_ > 0) {
+            if (session_->ActiveStreamCount() > 0) {
+                conn_->SetDeadline(std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(request_timeout_sec_));
+            } else {
+                conn_->ClearDeadline();
+            }
+        }
     }
 }
 

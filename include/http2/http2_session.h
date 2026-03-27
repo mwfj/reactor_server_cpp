@@ -90,11 +90,12 @@ public:
     void SetMaxBodySize(size_t max) { max_body_size_ = max; }
     size_t MaxBodySize() const { return max_body_size_; }
 
-    // Header list size limit (applied by nghttp2 SETTINGS)
+    // Header list size limit — advertised via SETTINGS and enforced in OnHeaderCallback
     void SetMaxHeaderListSize(size_t max) {
         max_header_list_size_ = max;
         settings_.max_header_list_size = static_cast<uint32_t>(max);
     }
+    size_t MaxHeaderListSize() const { return settings_.max_header_list_size; }
 
     // Owner reference — set by Http2ConnectionHandler after construction.
     // Used to pass a valid shared_ptr to request/stream-close callbacks.
