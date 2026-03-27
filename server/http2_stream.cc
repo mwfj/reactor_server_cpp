@@ -78,13 +78,25 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
     if (lower_name == "host" && has_authority_ && value != authority_) {
         return -1;  // Malformed: conflicting :authority and host
     }
+    // If host matches :authority, skip — already set by :authority processing
+    if (lower_name == "host" && has_authority_) {
+        return 0;
+    }
 
-    // RFC 9110 Section 5.3: combine duplicate header fields with ", ".
-    // This is semantically equivalent for list-valued headers and consistent
-    // with how HTTP/1.x parsers handle duplicate header lines.
-    // Exception: content-length duplicates are handled separately below.
+    // Handle duplicate headers consistently with the HTTP/1.x parser:
+    // - Reject duplicates of singleton headers (security/routing-critical)
+    // - Comma-fold list-valued headers per RFC 9110 Section 5.3
+    // - Cookie uses "; " per RFC 6265 Section 5.4
+    // - content-length handled separately below
     auto it = request_.headers.find(lower_name);
-    if (it != request_.headers.end() && lower_name != "content-length") {
+    if (it != request_.headers.end()) {
+        // Reject singleton headers that must not be duplicated
+        if (lower_name == "host" || lower_name == "authorization" ||
+            lower_name == "content-type" || lower_name == "content-length" ||
+            lower_name == "content-range" || lower_name == "content-disposition") {
+            return -1;
+        }
+        // List-valued headers: comma-fold
         it->second += ", " + value;
     } else {
         request_.headers[lower_name] = value;
