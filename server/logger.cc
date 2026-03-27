@@ -79,7 +79,14 @@ std::shared_ptr<spdlog::logger> Get() {
     if (g_logger) {
         return g_logger;
     }
-    return spdlog::default_logger();
+    auto fallback = spdlog::default_logger();
+    if (fallback) return fallback;
+    // After Shutdown(), spdlog's default logger is null. Create a minimal
+    // stderr fallback so callers never dereference null. Not registered with
+    // spdlog — immune to future Shutdown() calls.
+    static auto stderr_sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
+    static auto stderr_fallback = std::make_shared<spdlog::logger>("fallback", stderr_sink);
+    return stderr_fallback;
 }
 
 void Shutdown() {
