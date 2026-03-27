@@ -75,35 +75,36 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
     }
 
     // Host header handling:
-    // - If :authority was set, host must match it (RFC 9113 Section 8.3.1)
-    // - Only one host header allowed (singleton, same as HTTP/1.x)
-    if (lower_name == "host") {
-        if (has_authority_ && value != authority_) {
+    // - If :authority was set and matches, skip (already stored)
+    // - If :authority was set and conflicts, reject
+    // - Duplicate host headers (without :authority) rejected below as singleton
+    if (lower_name == "host" && has_authority_) {
+        if (value != authority_) {
             return -1;  // Malformed: conflicting :authority and host
         }
-        if (request_.headers.count("host")) {
-            return -1;  // Duplicate host header
-        }
-        if (has_authority_) {
-            return 0;   // Already set by :authority — skip
-        }
+        return 0;  // Matches :authority — already set, skip
     }
 
     // Handle duplicate headers consistently with the HTTP/1.x parser:
     // - Reject duplicates of singleton headers (security/routing-critical)
     // - Comma-fold list-valued headers per RFC 9110 Section 5.3
     // - Cookie uses "; " per RFC 6265 Section 5.4
-    // - content-length handled separately below
+    // - content-length handled separately below (allows identical duplicates)
     auto it = request_.headers.find(lower_name);
     if (it != request_.headers.end()) {
         // Reject singleton headers that must not be duplicated
         if (lower_name == "host" || lower_name == "authorization" ||
-            lower_name == "content-type" || lower_name == "content-length" ||
+            lower_name == "content-type" ||
             lower_name == "content-range" || lower_name == "content-disposition") {
             return -1;
         }
-        // List-valued headers: comma-fold
-        it->second += ", " + value;
+        // content-length: don't reject here — reconciliation below allows
+        // identical values (common in proxied/translated requests)
+        if (lower_name != "content-length") {
+            // List-valued headers: comma-fold
+            it->second += ", " + value;
+            return 0;
+        }
     } else {
         request_.headers[lower_name] = value;
     }
