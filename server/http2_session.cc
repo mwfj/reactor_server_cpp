@@ -132,6 +132,7 @@ static int OnDataChunkRecvCallback(
         stream->AccumulatedBodySize() + len > self->MaxBodySize()) {
         logging::Get()->warn("HTTP/2 stream {} body exceeds max size ({})",
                              stream_id, self->MaxBodySize());
+        stream->MarkRejected();
         int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                            stream_id, NGHTTP2_CANCEL);
         if (rv < 0) {
@@ -140,6 +141,9 @@ static int OnDataChunkRecvCallback(
         }
         return 0;
     }
+
+    // Skip body accumulation on rejected streams (RST_STREAM already sent)
+    if (stream->IsRejected()) return 0;
 
     stream->AppendBody(reinterpret_cast<const char*>(data), len);
     return 0;
@@ -186,10 +190,12 @@ static int OnFrameRecvCallback(
         }
 
         // If request is complete (END_STREAM on HEADERS), dispatch now.
+        // Skip if stream was rejected (RST_STREAM sent for body-too-large, etc.)
         // It is safe to call nghttp2_submit_response from within
         // on_frame_recv_callback — the response is queued internally
         // and flushed by the next SendPendingFrames() call.
-        if (stream->IsRequestComplete() && self->Callbacks().request_callback) {
+        if (stream->IsRequestComplete() && !stream->IsRejected() &&
+            self->Callbacks().request_callback) {
             HttpResponse response;
             try {
                 self->Callbacks().request_callback(
@@ -211,8 +217,10 @@ static int OnFrameRecvCallback(
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
             stream->MarkEndStream();
 
-            // Request with body is now complete — dispatch
-            if (stream->IsRequestComplete() && self->Callbacks().request_callback) {
+            // Request with body is now complete — dispatch.
+            // Skip if stream was rejected (RST_STREAM sent for body-too-large, etc.)
+            if (stream->IsRequestComplete() && !stream->IsRejected() &&
+                self->Callbacks().request_callback) {
                 HttpResponse response;
                 try {
                     self->Callbacks().request_callback(
@@ -427,8 +435,11 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
         NGHTTP2_NV_FLAG_NONE
     });
 
-    // Regular headers — skip connection-level headers forbidden in HTTP/2
+    // Regular headers — lowercase names (RFC 9113 Section 8.2: field names MUST
+    // be lowercase) and skip connection-level headers forbidden in HTTP/2.
     const auto& headers = response.GetHeaders();
+    std::vector<std::string> lowered_names;  // storage for lowered name strings
+    lowered_names.reserve(headers.size());
     for (const auto& hdr : headers) {
         std::string key = hdr.first;
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
@@ -437,10 +448,11 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
             key == "transfer-encoding" || key == "upgrade") {
             continue;
         }
+        lowered_names.push_back(std::move(key));
         nva.push_back({
-            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hdr.first.c_str())),
+            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(lowered_names.back().c_str())),
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hdr.second.c_str())),
-            hdr.first.size(), hdr.second.size(),
+            lowered_names.back().size(), hdr.second.size(),
             NGHTTP2_NV_FLAG_NONE
         });
     }

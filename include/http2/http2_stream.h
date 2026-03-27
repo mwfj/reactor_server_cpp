@@ -67,6 +67,10 @@ public:
     // Body size tracking for limit enforcement
     size_t AccumulatedBodySize() const { return accumulated_body_size_; }
 
+    // Mark stream as rejected (RST_STREAM sent) — prevents dispatch
+    void MarkRejected() { rejected_ = true; }
+    bool IsRejected() const { return rejected_; }
+
     // Owns the ResponseDataSource for this stream's response body.
     // nghttp2 holds a raw pointer to it via nghttp2_data_source.ptr;
     // we keep ownership here so it is freed when the stream is destroyed.
@@ -83,5 +87,6 @@ private:
     bool response_headers_sent_ = false;
     bool response_complete_ = false;
     size_t accumulated_body_size_ = 0;
+    bool rejected_ = false;
     std::unique_ptr<ResponseDataSource> data_source_;
 };
