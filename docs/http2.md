@@ -197,12 +197,18 @@ For h2 over TLS:
 
 ```
 HttpServer::Stop()
-  1. Collect HTTP/2 connections under conn_mtx_, release lock
-  2. Send GOAWAY(NO_ERROR) to each h2 connection
-  3. CloseAfterWrite() to drain pending responses
-  4. Existing HTTP/1.x + WS shutdown (WS Close 1001)
-  5. NetServer::Stop()
+  1. Existing HTTP/1.x + WS shutdown (WS Close 1001)
+  2. For each HTTP/2 connection: RequestShutdown()
+     → Sets atomic flag (thread-safe)
+     → Arms near-immediate deadline for dispatcher wakeup
+  3. Timer fires on dispatcher thread:
+     → Sends GOAWAY(NO_ERROR) with correct last_stream_id
+     → New streams refused, existing streams continue draining
+     → CloseAfterWrite() once all active streams complete
+  4. NetServer::Stop() force-closes any stragglers
 ```
+
+The shutdown is fully graceful: GOAWAY carries `last_stream_id` so clients know which requests to retry, active streams drain with full flow control (WINDOW_UPDATE still processed), and the nghttp2 session is only touched on its dispatcher thread (no cross-thread mutation).
 
 ## Pseudo-Header Mapping
 
@@ -218,6 +224,16 @@ HTTP/2 pseudo-headers are mapped to `HttpRequest` fields:
 For HTTP/2 requests, `request.http_major = 2` and `request.http_minor = 0`.
 
 Cookie headers arriving as separate HTTP/2 header fields are concatenated with `"; "` per RFC 9113 Section 8.2.3.
+
+## Request Timeout
+
+HTTP/2 request timeouts are enforced per-stream via `request_timeout_sec`:
+
+- Each stream's creation time is tracked. The connection deadline is set to `oldest_incomplete_start + request_timeout_sec`.
+- When the deadline fires, only the expired stream(s) are RST'd (`RST_STREAM(CANCEL)`). Healthy streams on the same connection are unaffected.
+- The `DeadlineTimeoutCb` returns `true` (keep connection alive) after RST'ing expired streams and re-arming the deadline for remaining ones.
+- Once all incomplete streams are resolved, the deadline is cleared and `idle_timeout` governs.
+- New streams cannot extend the deadline for older stalled streams (the deadline always reflects the oldest incomplete stream).
 
 ## Limitations
 
