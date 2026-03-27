@@ -247,7 +247,7 @@ reactor_server_cpp/
 ```bash
 make                # Build both test runner (./run) and server (./reactor_server)
 make server         # Build only the production server
-make test           # Build and run all tests (83 tests)
+make test           # Build and run all tests (101 tests)
 make clean          # Remove artifacts
 make help           # Show all targets
 
@@ -260,7 +260,7 @@ make help           # Show all targets
 ./run http          # HTTP protocol tests (14 tests)
 ./run ws            # WebSocket protocol tests (10 tests)
 ./run tls           # TLS/SSL tests (2 tests)
-./run cli           # CLI entry point tests (32 tests)
+./run cli           # CLI entry point tests (50 tests)
 
 # Thread pool subproject (independent)
 cd thread_pool && make && ./run

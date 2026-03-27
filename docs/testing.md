@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all tests (51 tests across 8 suites)
+make test               # Build and run all tests (101 tests across 9 suites)
 ./run                   # Run all tests directly (after building)
 
 # Individual test suites
@@ -15,6 +15,7 @@ make test               # Build and run all tests (51 tests across 8 suites)
 ./run http              # HTTP protocol tests (or: ./run -H)
 ./run ws                # WebSocket protocol tests (or: ./run -w)
 ./run tls               # TLS/SSL tests (or: ./run -T)
+./run cli               # CLI entry point tests (or: ./run -C)
 ./run help              # Show all options
 
 # Make targets for individual suites
@@ -25,6 +26,7 @@ make test_config        # Build and run config tests
 make test_http          # Build and run HTTP tests
 make test_ws            # Build and run WebSocket tests
 make test_tls           # Build and run TLS tests
+make test_cli           # Build and run CLI tests
 ```
 
 ## Test Suites
@@ -39,6 +41,7 @@ make test_tls           # Build and run TLS tests
 | HTTP | 13 | 10201 | `test/http_test.h` | `./run http` |
 | WebSocket | 10 | 10301 | `test/websocket_test.h` | `./run ws` |
 | TLS | 2 | 10401 | `test/tls_test.h` | `./run tls` |
+| CLI | 50 | N/A | `test/cli_test.h` | `./run cli` |
 
 ### Basic Tests (port 9888)
 - Single client connection
