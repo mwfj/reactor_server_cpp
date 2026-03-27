@@ -35,7 +35,12 @@ void Daemonizer::Daemonize() {
         // Parent: close write end, wait for grandchild's status byte.
         close(g_ready_pipe[1]);
         unsigned char status = 1;
-        ssize_t n = read(g_ready_pipe[0], &status, 1);
+        ssize_t n;
+        // Retry on EINTR — a stray signal during the blocking read must not
+        // cause a false failure report to the launching shell.
+        do {
+            n = read(g_ready_pipe[0], &status, 1);
+        } while (n < 0 && errno == EINTR);
         close(g_ready_pipe[0]);
         // n==0: grandchild died without writing (pipe closed) → failure
         // n==1: got status byte (0 = success, nonzero = failure)

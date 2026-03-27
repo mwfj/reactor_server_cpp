@@ -13,6 +13,7 @@ static std::atomic<bool> g_shutdown_requested{false};
 static sigset_t g_block_mask;  // all signals we block (SIGTERM, SIGINT, SIGPIPE, SIGHUP)
 static sigset_t g_wait_mask;   // signals we sigwait on (SIGTERM, SIGINT, SIGHUP)
 static bool g_installed = false;
+static bool g_was_cleaned_up = false;  // true after Cleanup() sets SIG_IGN
 
 void SignalHandler::Install() {
     sigemptyset(&g_block_mask);
@@ -27,14 +28,17 @@ void SignalHandler::Install() {
             std::string("Failed to block signals: ") + std::strerror(rc));
     }
 
-    // Restore default dispositions now that signals are blocked.
     // On macOS/BSD, sigwait() cannot receive signals whose disposition is SIG_IGN —
-    // the kernel discards them before they become pending. Cleanup() sets SIG_IGN
-    // before unblocking, so a subsequent Install() must reset to SIG_DFL.
-    // Safe: signals are blocked, so default action (terminate) cannot fire.
-    signal(SIGTERM, SIG_DFL);
-    signal(SIGINT, SIG_DFL);
-    signal(SIGHUP, SIG_DFL);
+    // the kernel discards them before they become pending. If Cleanup() previously
+    // set SIG_IGN, we must undo it. But we must NOT override inherited SIG_IGN
+    // from nohup or a supervisor (first Install() call).
+    // Safe: signals are blocked, so SIG_DFL cannot fire.
+    if (g_was_cleaned_up) {
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        g_was_cleaned_up = false;
+    }
 
     sigemptyset(&g_wait_mask);
     sigaddset(&g_wait_mask, SIGTERM);
@@ -83,5 +87,6 @@ void SignalHandler::Cleanup() {
         signal(SIGHUP, SIG_IGN);
         pthread_sigmask(SIG_UNBLOCK, &g_block_mask, nullptr);
         g_installed = false;
+        g_was_cleaned_up = true;
     }
 }
