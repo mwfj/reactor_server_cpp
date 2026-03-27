@@ -138,7 +138,7 @@ REACTOR_LOG_FILE=/var/log/reactor.log ./reactor_server start -d
 **Daemon mode requirements:**
 - A log file must be configured (`log.file` in config or `REACTOR_LOG_FILE` env var)
 - Log file, PID file, and TLS cert/key paths must be absolute
-- The launching shell sees exit code 0 immediately after fork; use `status` to verify
+- The launching shell sees exit code 0 once the daemon is ready (readiness pipe), or exit code 1 on startup failure
 
 ### Graceful Stop
 

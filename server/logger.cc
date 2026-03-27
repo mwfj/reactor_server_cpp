@@ -69,6 +69,7 @@ void Init(const std::string& name,
     g_logger = std::make_shared<spdlog::logger>(name, sinks.begin(), sinks.end());
     g_logger->set_level(level);
     g_logger->set_pattern(LOG_PATTERN);
+    g_logger->flush_on(spdlog::level::info);
 
     // Register as default logger
     spdlog::set_default_logger(g_logger);
@@ -136,6 +137,7 @@ bool Reopen() {
             g_logger_name, sinks.begin(), sinks.end());
         new_logger->set_level(g_log_level);
         new_logger->set_pattern(LOG_PATTERN);
+        new_logger->flush_on(spdlog::level::info);
 
         // Swap under lock. Callers that already hold a shared_ptr from a prior
         // Get() will finish their in-flight log call on the old logger; the next
