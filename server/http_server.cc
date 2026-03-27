@@ -510,7 +510,10 @@ bool HttpServer::DetectAndRouteProtocol(
 
 void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn) {
     h2_conn->SetMaxBodySize(max_body_size_);
-    h2_conn->SetMaxHeaderSize(max_header_size_);
+    // Note: NOT calling SetMaxHeaderSize here. HTTP/2 header limits come from
+    // h2_settings_.max_header_list_size (Http2Config, default 64KB), which is
+    // already baked into the session settings and advertised via SETTINGS frame.
+    // Calling SetMaxHeaderSize would overwrite it with the HTTP/1.x limit (8KB).
     h2_conn->SetRequestTimeout(request_timeout_sec_);
 
     // Set request callback: dispatch through HttpRouter (same as HTTP/1.x)

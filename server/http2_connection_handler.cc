@@ -56,12 +56,10 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
         pending_stream_close_cb_ = nullptr;
     }
 
-    // Apply limits
+    // Apply body size limit. Header list size comes from h2_settings_
+    // (passed to Http2Session constructor) and is advertised in SETTINGS.
     if (max_body_size_ > 0) {
         session_->SetMaxBodySize(max_body_size_);
-    }
-    if (max_header_size_ > 0) {
-        session_->SetMaxHeaderListSize(max_header_size_);
     }
 
     // Send server connection preface (SETTINGS)

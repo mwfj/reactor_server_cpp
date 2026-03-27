@@ -29,6 +29,8 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
             }
         } else if (name == ":authority") {
             // Map :authority to Host header (RFC 9113 Section 8.3.1)
+            has_authority_ = true;
+            authority_ = value;
             request_.headers["host"] = value;
         } else if (name == ":scheme") {
             has_scheme_ = true;
@@ -51,6 +53,12 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
             request_.headers["cookie"] = value;
         }
         return 0;
+    }
+
+    // RFC 9113 Section 8.3.1: if :authority and host are both present,
+    // they MUST be identical. Reject if they conflict.
+    if (lower_name == "host" && has_authority_ && value != authority_) {
+        return -1;  // Malformed: conflicting :authority and host
     }
 
     request_.headers[lower_name] = value;

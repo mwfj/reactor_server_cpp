@@ -75,6 +75,10 @@ public:
     bool HasScheme() const { return has_scheme_; }
     const std::string& Scheme() const { return scheme_; }
 
+    // :authority tracking (for conflict detection with host header)
+    bool HasAuthority() const { return has_authority_; }
+    const std::string& Authority() const { return authority_; }
+
     // Owns the ResponseDataSource for this stream's response body.
     // nghttp2 holds a raw pointer to it via nghttp2_data_source.ptr;
     // we keep ownership here so it is freed when the stream is destroyed.
@@ -94,5 +98,7 @@ private:
     bool rejected_ = false;
     bool has_scheme_ = false;
     std::string scheme_;
+    bool has_authority_ = false;
+    std::string authority_;
     std::unique_ptr<ResponseDataSource> data_source_;
 };

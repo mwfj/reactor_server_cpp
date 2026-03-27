@@ -170,27 +170,25 @@ static int OnFrameRecvCallback(
             stream->MarkHeadersComplete();
 
             // Validate required pseudo-headers (RFC 9113 Section 8.3.1).
-            // Non-CONNECT requests MUST include :method, :path, and :scheme.
             const auto& req = stream->GetRequest();
-            if (req.method.empty() || req.path.empty() || !stream->HasScheme()) {
-                logging::Get()->warn("HTTP/2 stream {} missing required pseudo-headers",
-                                     frame->hd.stream_id);
-                int rst_rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                                       frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
-                if (rst_rv < 0) {
-                    logging::Get()->error("nghttp2_submit_rst_stream failed: {}",
-                                          nghttp2_strerror(rst_rv));
-                    return NGHTTP2_ERR_CALLBACK_FAILURE;
+            bool valid = true;
+
+            if (req.method == "CONNECT") {
+                // CONNECT: MUST have :method + :authority. MUST NOT have :path/:scheme.
+                if (!req.HasHeader("host")) valid = false;
+                if (!req.path.empty() || stream->HasScheme()) valid = false;
+            } else {
+                // Non-CONNECT: MUST have :method, :path, :scheme.
+                if (req.method.empty() || req.path.empty() || !stream->HasScheme()) {
+                    valid = false;
                 }
-                stream->MarkRejected();
-                break;
+                // :authority or host SHOULD be present
+                if (!req.HasHeader("host")) valid = false;
             }
 
-            // Validate :authority or host header present
-            // (RFC 9113 Section 8.3.1: clients SHOULD send :authority)
-            if (!req.HasHeader("host")) {
-                logging::Get()->warn("HTTP/2 stream {} missing :authority/host",
-                                     frame->hd.stream_id);
+            if (!valid) {
+                logging::Get()->warn("HTTP/2 stream {} invalid pseudo-headers for {} request",
+                                     frame->hd.stream_id, req.method);
                 int rst_rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                                        frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
                 if (rst_rv < 0) {
