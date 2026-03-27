@@ -85,6 +85,7 @@ public:
 
     // Get the last stream ID we have processed (for GOAWAY)
     int32_t LastStreamId() const { return last_stream_id_; }
+    bool IsGoawaySent() const { return goaway_sent_; }
 
     // Incomplete stream tracking for request-timeout enforcement.
     // incomplete_stream_count_: streams whose request hasn't been dispatched yet.

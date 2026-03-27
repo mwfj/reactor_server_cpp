@@ -119,13 +119,10 @@ void Http2ConnectionHandler::OnRawData(
         return;
     }
 
-    // During shutdown drain (CloseAfterWrite set), don't process new data.
-    // This prevents clients from opening new streams while we're draining.
-    if (conn_->IsCloseDeferred()) {
-        return;
-    }
-
-    // Feed data to nghttp2
+    // Feed data to nghttp2 — even during shutdown drain, we must continue
+    // processing frames so that WINDOW_UPDATE/SETTINGS/RST_STREAM reach
+    // nghttp2 and in-flight responses can complete. New stream creation is
+    // blocked in OnBeginHeadersCallback via the goaway_sent_ flag.
     ssize_t consumed = session_->ReceiveData(data.data(), data.size());
     if (consumed < 0) {
         logging::Get()->error("HTTP/2 session error, closing connection");

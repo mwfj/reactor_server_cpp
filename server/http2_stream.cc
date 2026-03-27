@@ -79,7 +79,16 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
         return -1;  // Malformed: conflicting :authority and host
     }
 
-    request_.headers[lower_name] = value;
+    // RFC 9110 Section 5.3: combine duplicate header fields with ", ".
+    // This is semantically equivalent for list-valued headers and consistent
+    // with how HTTP/1.x parsers handle duplicate header lines.
+    // Exception: content-length duplicates are handled separately below.
+    auto it = request_.headers.find(lower_name);
+    if (it != request_.headers.end() && lower_name != "content-length") {
+        it->second += ", " + value;
+    } else {
+        request_.headers[lower_name] = value;
+    }
 
     // Track content-length for body size expectations.
     // RFC 9110 Section 8.6: content-length must be a valid non-negative integer.

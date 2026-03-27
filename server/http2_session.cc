@@ -52,6 +52,15 @@ static int OnBeginHeadersCallback(
     }
 
     if (frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
+        // During shutdown drain, reject new streams. Control frames
+        // (WINDOW_UPDATE, SETTINGS, RST_STREAM) are still processed so
+        // in-flight responses can complete.
+        if (self->IsGoawaySent() || self->GetConnection()->IsCloseDeferred()) {
+            nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                      frame->hd.stream_id, NGHTTP2_REFUSED_STREAM);
+            return 0;
+        }
+
         // New request — create stream
         int32_t stream_id = frame->hd.stream_id;
         auto* stream = self->CreateStream(stream_id);
