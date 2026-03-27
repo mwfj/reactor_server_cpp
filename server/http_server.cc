@@ -304,44 +304,40 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
     // stale state in http_connections_ (potentially under fd -1 after ReleaseFd).
     if (conn->IsClosing()) return;
 
-    std::shared_ptr<HttpConnectionHandler> old_handler;
-    bool already_initialized = false;
-    {
-        std::lock_guard<std::mutex> lck(conn_mtx_);
-        auto it = http_connections_.find(conn->fd());
-        if (it != http_connections_.end()) {
-            if (it->second->GetConnection() == conn) {
-                // Already created by HandleMessage lazy-init — don't overwrite.
-                // The handler is already processing data, so skip deadline arming
-                // below to avoid overwriting real request/keep-alive state.
-                already_initialized = true;
+    if (http2_enabled_) {
+        // When HTTP/2 is enabled, defer handler creation until HandleMessage
+        // detects the protocol via ALPN (TLS) or client preface (cleartext).
+        // This avoids eagerly creating an HttpConnectionHandler that would
+        // intercept h2c preface bytes before protocol detection can run.
+    } else {
+        // HTTP/2 disabled — always create HTTP/1.x handler immediately.
+        std::shared_ptr<HttpConnectionHandler> old_handler;
+        bool already_initialized = false;
+        {
+            std::lock_guard<std::mutex> lck(conn_mtx_);
+            auto it = http_connections_.find(conn->fd());
+            if (it != http_connections_.end()) {
+                if (it->second->GetConnection() == conn) {
+                    already_initialized = true;
+                } else {
+                    old_handler = it->second;
+                    auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
+                    SetupHandlers(http_conn);
+                    http_connections_[conn->fd()] = http_conn;
+                }
             } else {
-                // FD reused — save old handler for WS notification outside the lock
-                old_handler = it->second;
                 auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
                 SetupHandlers(http_conn);
                 http_connections_[conn->fd()] = http_conn;
             }
-        } else {
-            auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
-            SetupHandlers(http_conn);
-            http_connections_[conn->fd()] = http_conn;
         }
+        SafeNotifyWsClose(old_handler);
+        if (already_initialized) return;
     }
-    // Notify old WS handler outside the lock to prevent deadlock.
-    SafeNotifyWsClose(old_handler);
 
-    // Arm a connection-level deadline covering the TLS handshake + first HTTP request.
-    // Without this, a client can slow-drip the TLS handshake indefinitely, bypassing
-    // the request timeout (which only activates after parsed HTTP bytes in OnRawData).
-    // When OnRawData fires after handshake completion, it overwrites this with the
-    // per-request deadline.
-    //
-    // Skip if HandleMessage already lazy-created the handler: the handler has already
-    // started processing data, so re-arming the "first request" deadline would overwrite
-    // the real state and could close a healthy keep-alive connection after
-    // request_timeout_sec instead of the configured idle timeout.
-    if (request_timeout_sec_ > 0 && !already_initialized) {
+    // Arm a connection-level deadline covering the TLS handshake + first request
+    // / protocol detection. Prevents slow-drip attacks during the detection window.
+    if (request_timeout_sec_ > 0) {
         conn->SetDeadline(std::chrono::steady_clock::now() +
                           std::chrono::seconds(request_timeout_sec_));
     }
@@ -440,25 +436,6 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
                 http_connections_.erase(conn->fd());
             }
             // Fall through to DetectAndRouteProtocol below
-        } else if (!http_conn->IsUpgraded()) {
-            // For cleartext HTTP/2 (h2c), the preface may arrive on a connection
-            // that HandleNewConnection already registered as HTTP/1.x.
-            // Before routing to the HTTP/1.x handler, check for the h2c preface.
-            if (http2_enabled_) {
-                auto proto = ProtocolDetector::DetectFromData(message.data(), message.size());
-                if (proto == ProtocolDetector::Protocol::HTTP2) {
-                    // Remove the placeholder HTTP/1.x handler and create HTTP/2
-                    {
-                        std::lock_guard<std::mutex> lck(conn_mtx_);
-                        http_connections_.erase(conn->fd());
-                    }
-                    http_conn = nullptr;
-                    DetectAndRouteProtocol(conn, message);
-                    return;
-                }
-            }
-            http_conn->OnRawData(conn, message);
-            return;
         } else {
             http_conn->OnRawData(conn, message);
             return;
@@ -485,12 +462,16 @@ bool HttpServer::DetectAndRouteProtocol(
     ProtocolDetector::Protocol proto = ProtocolDetector::Protocol::HTTP1;
 
     if (http2_enabled_) {
-        // For TLS connections, check ALPN result
-        std::string alpn = conn->GetAlpnProtocol();
-        if (!alpn.empty()) {
-            proto = ProtocolDetector::DetectFromAlpn(alpn);
+        if (conn->HasTls()) {
+            // TLS: HTTP/2 MUST be negotiated via ALPN (RFC 9113 Section 3.2).
+            // No preface sniffing — empty ALPN means HTTP/1.x.
+            std::string alpn = conn->GetAlpnProtocol();
+            if (!alpn.empty()) {
+                proto = ProtocolDetector::DetectFromAlpn(alpn);
+            }
+            // else: no ALPN negotiated → stays HTTP1
         } else {
-            // Cleartext: check for HTTP/2 client preface
+            // Cleartext: check for HTTP/2 client preface (h2c prior knowledge)
             proto = ProtocolDetector::DetectFromData(message.data(), message.size());
             if (proto == ProtocolDetector::Protocol::UNKNOWN) {
                 // Not enough data to classify — buffer and wait for more bytes.

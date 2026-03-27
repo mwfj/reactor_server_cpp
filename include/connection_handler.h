@@ -91,6 +91,9 @@ public:
     void SetTlsConnection(std::unique_ptr<TlsConnection> tls);
     void SetMaxInputSize(size_t max) { max_input_size_ = max; }
 
+    // Returns true if this connection has TLS (any state: handshake or ready).
+    bool HasTls() const { return tls_state_ != TlsState::NONE; }
+
     // Get the ALPN-negotiated protocol from the TLS connection.
     // Returns empty string if no TLS or ALPN not negotiated.
     std::string GetAlpnProtocol() const;

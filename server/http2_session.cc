@@ -401,13 +401,22 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
         return -1;
     }
 
+    int status_code = response.GetStatusCode();
+
+    // Determine if the response body must be suppressed.
+    // RFC 9110 Section 9.3.2: HEAD responses include headers as if GET but no body.
+    // RFC 9110 Section 15.3.5/15.4.5: 204 and 304 MUST NOT contain a body.
+    const HttpRequest& req = stream->GetRequest();
+    bool suppress_body = (req.method == "HEAD" ||
+                          status_code == 204 || status_code == 304);
+
     // Build nghttp2 header name-value pairs.
     // We do NOT use NGHTTP2_NV_FLAG_NO_COPY_NAME or NO_COPY_VALUE:
     // those flags skip nghttp2's internal copy, but we cannot guarantee
     // the string storage (status_str, content_length_str, and the
     // HttpResponse headers) outlives the nghttp2_submit_response2 call.
     // Without NO_COPY, nghttp2 copies the name/value data internally.
-    std::string status_str = std::to_string(response.GetStatusCode());
+    std::string status_str = std::to_string(status_code);
 
     std::vector<nghttp2_nv> nva;
     // :status pseudo-header (required first)
@@ -418,9 +427,16 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
         NGHTTP2_NV_FLAG_NONE
     });
 
-    // Regular headers
+    // Regular headers — skip connection-level headers forbidden in HTTP/2
     const auto& headers = response.GetHeaders();
     for (const auto& hdr : headers) {
+        std::string key = hdr.first;
+        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+        // Skip HTTP/1.x connection-level headers (RFC 9113 Section 8.2.2)
+        if (key == "connection" || key == "keep-alive" ||
+            key == "transfer-encoding" || key == "upgrade") {
+            continue;
+        }
         nva.push_back({
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hdr.first.c_str())),
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hdr.second.c_str())),
@@ -429,9 +445,14 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
         });
     }
 
-    // Add content-length if body is non-empty and not already present
+    // Determine the effective body for the wire
+    const std::string& raw_body = response.GetBody();
+    bool has_body = !raw_body.empty() && !suppress_body;
+
+    // Add content-length header.
+    // For HEAD: include content-length reflecting the body size (as if GET)
+    // but do not send the body itself (RFC 9110 Section 9.3.2).
     std::string content_length_str;
-    const std::string& body = response.GetBody();
     bool has_content_length = false;
     for (const auto& hdr : headers) {
         std::string key = hdr.first;
@@ -441,8 +462,8 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
             break;
         }
     }
-    if (!body.empty() && !has_content_length) {
-        content_length_str = std::to_string(body.size());
+    if (!raw_body.empty() && !has_content_length) {
+        content_length_str = std::to_string(raw_body.size());
         nva.push_back({
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("content-length")),
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(content_length_str.c_str())),
@@ -452,15 +473,15 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     }
 
     int rv;
-    if (body.empty()) {
-        // No body — submit headers with END_STREAM
+    if (!has_body) {
+        // No body (or body suppressed for HEAD/204/304) — submit headers with END_STREAM
         rv = nghttp2_submit_response2(impl_->session, stream_id,
                                       nva.data(), nva.size(), nullptr);
     } else {
         // Body present — use data provider.
         // Store the ResponseDataSource on the stream so it is owned and freed
         // when the stream is destroyed (avoids the prior raw-new leak).
-        auto src_owned = std::make_unique<ResponseDataSource>(ResponseDataSource{body, 0});
+        auto src_owned = std::make_unique<ResponseDataSource>(ResponseDataSource{raw_body, 0});
         ResponseDataSource* src = src_owned.get();
 
         nghttp2_data_provider2 data_prd;
