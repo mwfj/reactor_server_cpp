@@ -189,17 +189,33 @@ void Http2ConnectionHandler::OnRawData(
 }
 
 void Http2ConnectionHandler::RequestShutdown() {
-    // Thread-safe: just set the flag. The actual GOAWAY + drain happens
-    // on the dispatcher thread (in OnRawData or the deadline callback).
     shutdown_requested_.store(true, std::memory_order_release);
+    if (!conn_) return;
 
-    // Arm a near-immediate deadline so the timer scan triggers the timeout
-    // callback on the dispatcher thread even if no client data arrives.
-    // Use 1 second — the timer scan interval is typically shorter.
-    if (conn_) {
-        conn_->SetDeadline(std::chrono::steady_clock::now() +
-                           std::chrono::seconds(1));
-    }
+    // Send a raw GOAWAY frame via SendRaw (thread-safe via EnQueue).
+    // We can't use nghttp2 here (not thread-safe), so we manually
+    // serialize the GOAWAY frame (fixed format, 17 bytes total).
+    //
+    // Use max stream ID (0x7FFFFFFF) instead of reading last_stream_id_
+    // which is updated on the dispatcher thread — reading it here would
+    // be a data race. Max ID tells the client "all streams may have been
+    // processed" which is conservative but safe for shutdown.
+    static constexpr int32_t MAX_STREAM_ID = 0x7FFFFFFF;
+    uint8_t goaway[17] = {
+        0x00, 0x00, 0x08,              // Length: 8 bytes payload
+        0x07,                           // Type: GOAWAY
+        0x00,                           // Flags: none
+        0x00, 0x00, 0x00, 0x00,        // Stream ID: 0 (connection-level)
+        // Last-Stream-ID (4 bytes, network byte order)
+        static_cast<uint8_t>((MAX_STREAM_ID >> 24) & 0xFF),
+        static_cast<uint8_t>((MAX_STREAM_ID >> 16) & 0xFF),
+        static_cast<uint8_t>((MAX_STREAM_ID >> 8) & 0xFF),
+        static_cast<uint8_t>(MAX_STREAM_ID & 0xFF),
+        // Error Code: NO_ERROR (0x00000000)
+        0x00, 0x00, 0x00, 0x00
+    };
+    conn_->SendRaw(reinterpret_cast<const char*>(goaway), sizeof(goaway));
+    conn_->CloseAfterWrite();
 }
 
 void Http2ConnectionHandler::DispatchPendingRequests() {
