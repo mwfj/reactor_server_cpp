@@ -159,10 +159,10 @@ kill -TERM $(cat /tmp/reactor_server.pid)
 |--------|----------|
 | `SIGTERM` | Graceful shutdown (sends WS Close 1001, drains connections, exits) |
 | `SIGINT` | Same as SIGTERM (Ctrl+C in foreground) |
-| `SIGHUP` | Reopen log files (for log rotation with `logrotate`) |
+| `SIGHUP` | Daemon: reopen log files for rotation. Foreground: graceful shutdown (terminal hangup) |
 | `SIGPIPE` | Ignored (handled by MSG_NOSIGNAL) |
 
-Signal handling uses `sigwait()` (POSIX synchronous signal wait). Signals are blocked in all threads via `pthread_sigmask`; the main thread loops on `sigwait()` which synchronously dequeues blocked signals. SIGHUP triggers log file rotation; SIGTERM/SIGINT break the loop and call `HttpServer::Stop()`.
+Signal handling uses `sigwait()` (POSIX synchronous signal wait). Signals are blocked in all threads via `pthread_sigmask`; the main thread loops on `sigwait()`. In daemon mode, SIGHUP triggers log file rotation; in foreground mode, SIGHUP causes graceful shutdown (standard Unix terminal hangup behavior). SIGTERM/SIGINT always trigger shutdown.
 
 ### Log Rotation
 

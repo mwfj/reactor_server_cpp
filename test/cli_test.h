@@ -40,6 +40,7 @@
 #include <sys/file.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 namespace CliTests {
 
@@ -1614,25 +1615,26 @@ void TestValidateDaemonRejectsNoLogFile() {
     WriteFile(cfg_path, R"({"bind_port": 8080})");
 
     // Run the actual binary with validate -d to check daemon constraints
-    std::string cmd = "./reactor_server validate -d -c " + cfg_path + " 2>&1; echo $?";
+    std::string cmd = "./reactor_server validate -d -c " + cfg_path + " 2>&1";
     FILE* fp = popen(cmd.c_str(), "r");
     std::string output;
+    int exit_code = -1;
     if (fp) {
         char buf[256];
         while (fgets(buf, sizeof(buf), fp)) output += buf;
-        pclose(fp);
+        int status = pclose(fp);
+        if (WIFEXITED(status)) exit_code = WEXITSTATUS(status);
     }
 
     std::remove(cfg_path.c_str());
 
-    // The last line should be the exit code (1 = error, since daemon needs log file)
     bool has_error = output.find("daemon mode requires a log file") != std::string::npos;
-    bool exit_nonzero = !output.empty() && output.back() != '0';
+    bool exit_nonzero = (exit_code != 0);
 
     bool pass = has_error && exit_nonzero;
     std::string err;
     if (!has_error) err += "Expected 'daemon mode requires a log file' error; ";
-    if (!exit_nonzero) err += "Expected non-zero exit code; ";
+    if (!exit_nonzero) err += "Expected non-zero exit code, got " + std::to_string(exit_code) + "; ";
 
     TestFramework::RecordTest("CliParser: validate -d catches missing log file",
                               pass, err, CLI_CATEGORY);
@@ -1646,25 +1648,27 @@ void TestValidateDaemonRejectsRelativePidPath() {
     const std::string cfg_path = "/tmp/test_reactor_cfg_" + std::to_string(getpid()) + "_relpid.json";
     WriteFile(cfg_path, R"({"log":{"file":"/tmp/test.log"}})");
 
-    std::string cmd = "./reactor_server validate -d -c " + cfg_path + " -P relative.pid 2>&1; echo $?";
+    std::string cmd = "./reactor_server validate -d -c " + cfg_path + " -P relative.pid 2>&1";
     FILE* fp = popen(cmd.c_str(), "r");
     std::string output;
+    int exit_code = -1;
     if (fp) {
         char buf[256];
         while (fgets(buf, sizeof(buf), fp)) output += buf;
-        pclose(fp);
+        int status = pclose(fp);
+        if (WIFEXITED(status)) exit_code = WEXITSTATUS(status);
     }
 
     std::remove(cfg_path.c_str());
 
     bool has_error = output.find("absolute") != std::string::npos &&
                      output.find("PID file") != std::string::npos;
-    bool exit_nonzero = !output.empty() && output.back() != '0';
+    bool exit_nonzero = (exit_code != 0);
 
     bool pass = has_error && exit_nonzero;
     std::string err;
     if (!has_error) err += "Expected absolute PID file path error; ";
-    if (!exit_nonzero) err += "Expected non-zero exit code; ";
+    if (!exit_nonzero) err += "Expected non-zero exit code, got " + std::to_string(exit_code) + "; ";
 
     TestFramework::RecordTest("CliParser: validate -d -P catches relative PID path",
                               pass, err, CLI_CATEGORY);

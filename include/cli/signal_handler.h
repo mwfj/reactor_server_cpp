@@ -13,7 +13,7 @@
 // Return value from WaitForSignal() indicating which signal category was received.
 enum class SignalResult {
     SHUTDOWN,   // SIGTERM or SIGINT — caller should stop the server
-    RELOAD,     // SIGHUP — caller should reopen logs (and later, reload config)
+    RELOAD,     // SIGHUP — caller decides: daemon reopens logs, foreground shuts down
 };
 
 class SignalHandler {
