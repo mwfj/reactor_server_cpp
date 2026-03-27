@@ -2,15 +2,12 @@
 
 #if !defined(_WIN32)
 
-#include <cerrno>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "common.h"
+// <cstring>, <cerrno>/<errno.h>, <fcntl.h>, <sys/types.h>, <unistd.h>
+// provided by common.h
+#include <cstdio>      // std::fprintf
+#include <cstdlib>     // _exit
+#include <sys/stat.h>  // umask
 
 // Readiness pipe: grandchild writes a status byte, parent reads it.
 // [0] = read end (parent), [1] = write end (grandchild).
