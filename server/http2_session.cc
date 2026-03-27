@@ -47,18 +47,27 @@ static int OnBeginHeadersCallback(
     nghttp2_session* session, const nghttp2_frame* frame, void* user_data) {
     auto* self = static_cast<Http2Session*>(user_data);
 
-    if (frame->hd.type != NGHTTP2_HEADERS ||
-        frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
+    if (frame->hd.type != NGHTTP2_HEADERS) {
         return 0;
     }
 
-    int32_t stream_id = frame->hd.stream_id;
-    auto* stream = self->CreateStream(stream_id);
-    if (!stream) {
-        // Too many streams or allocation failure
-        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    if (frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
+        // New request — create stream
+        int32_t stream_id = frame->hd.stream_id;
+        auto* stream = self->CreateStream(stream_id);
+        if (!stream) {
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+        stream->SetState(Http2Stream::State::OPEN);
+    } else {
+        // Trailer headers — reset per-block header size counter.
+        // SETTINGS_MAX_HEADER_LIST_SIZE applies per header block, not
+        // cumulatively across all header blocks on a stream.
+        auto* stream = self->FindStream(frame->hd.stream_id);
+        if (stream) {
+            stream->ResetHeaderSize();
+        }
     }
-    stream->SetState(Http2Stream::State::OPEN);
 
     return 0;
 }
@@ -113,17 +122,22 @@ static int OnHeaderCallback(
         return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
     }
 
-    // TE header: only "trailers" is allowed in HTTP/2 (RFC 9113 Section 8.2.2)
-    if (hdr_name == "te" && hdr_value != "trailers") {
-        logging::Get()->warn("HTTP/2 stream {} received invalid TE value: {}",
-                             frame->hd.stream_id, hdr_value);
-        int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                           frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
-        if (rv < 0) {
-            logging::Get()->error("nghttp2_submit_rst_stream failed: {}", nghttp2_strerror(rv));
-            return NGHTTP2_ERR_CALLBACK_FAILURE;
+    // TE header: only "trailers" is allowed in HTTP/2 (RFC 9113 Section 8.2.2).
+    // Comparison is case-insensitive per RFC 9110 Section 5.6.2 (HTTP tokens).
+    if (hdr_name == "te") {
+        std::string te_lower = hdr_value;
+        std::transform(te_lower.begin(), te_lower.end(), te_lower.begin(), ::tolower);
+        if (te_lower != "trailers") {
+            logging::Get()->warn("HTTP/2 stream {} received invalid TE value: {}",
+                                 frame->hd.stream_id, hdr_value);
+            int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                               frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
+            if (rv < 0) {
+                logging::Get()->error("nghttp2_submit_rst_stream failed: {}", nghttp2_strerror(rv));
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            }
+            return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
         }
-        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
     }
 
     int add_rv = stream->AddHeader(hdr_name, hdr_value);
