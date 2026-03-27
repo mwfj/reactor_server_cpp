@@ -53,8 +53,8 @@ private:
     int request_timeout_sec_ = 0;
 
     bool initialized_ = false;
-    bool deadline_armed_ = false;  // true while a request deadline is active
-    size_t last_seen_stream_count_ = 0;  // for detecting new stream arrivals
+    bool deadline_armed_ = false;     // true while a request deadline is active
+    uint64_t last_seen_generation_ = 0;  // for detecting new incomplete streams
 
     // Internal: called after ReceiveData; a no-op since dispatch is
     // synchronous inside nghttp2 callbacks.

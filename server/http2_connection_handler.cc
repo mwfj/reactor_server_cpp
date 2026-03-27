@@ -66,10 +66,12 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
     session_->SendServerPreface();
 
     // Arm deadline for the initial SETTINGS exchange / first request.
-    // Will be managed by UpdateDeadline() based on active stream count.
+    // Mark deadline_armed_ so the clear path in OnRawData works correctly
+    // even if the first request completes within initial_data processing.
     if (request_timeout_sec_ > 0) {
         conn_->SetDeadline(std::chrono::steady_clock::now() +
                            std::chrono::seconds(request_timeout_sec_));
+        deadline_armed_ = true;
     }
 
     // If there's initial data (buffered during detection), process it now
@@ -94,16 +96,17 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
 
         // Update deadline based on what initial_data contained:
         if (request_timeout_sec_ > 0) {
-            size_t incomplete = session_->IncompleteStreamCount();
-            if (incomplete > 0 && incomplete > last_seen_stream_count_) {
+            uint64_t gen = session_->IncompleteGeneration();
+            if (gen > last_seen_generation_) {
                 conn_->SetDeadline(std::chrono::steady_clock::now() +
                                    std::chrono::seconds(request_timeout_sec_));
                 deadline_armed_ = true;
-            } else if (incomplete == 0 && session_->LastStreamId() > 0) {
+                last_seen_generation_ = gen;
+            }
+            if (session_->IncompleteStreamCount() == 0 && deadline_armed_) {
                 conn_->ClearDeadline();
                 deadline_armed_ = false;
             }
-            last_seen_stream_count_ = incomplete;
         }
     }
 }
@@ -138,21 +141,24 @@ void Http2ConnectionHandler::OnRawData(
     // Send pending frames (responses, WINDOW_UPDATEs, etc.)
     session_->SendPendingFrames();
 
-    // Manage deadline based on incomplete (not-yet-dispatched) stream count.
-    // Only incomplete requests count — response draining should not trigger
-    // the request timeout. Reset when new incomplete streams appear so each
-    // gets a full window. Clear when all requests are dispatched/rejected.
+    // Manage deadline based on incomplete (not-yet-dispatched) streams.
+    // Uses a generation counter to detect new stream arrivals, which handles
+    // same-batch open+close correctly (count stays flat but generation bumps).
+    // Response draining does not keep the deadline armed.
     if (request_timeout_sec_ > 0) {
-        size_t incomplete = session_->IncompleteStreamCount();
-        if (incomplete > 0 && incomplete > last_seen_stream_count_) {
+        uint64_t gen = session_->IncompleteGeneration();
+        if (gen > last_seen_generation_) {
+            // New incomplete stream(s) appeared — (re)arm deadline
             conn_->SetDeadline(std::chrono::steady_clock::now() +
                                std::chrono::seconds(request_timeout_sec_));
             deadline_armed_ = true;
-        } else if (incomplete == 0 && deadline_armed_) {
+            last_seen_generation_ = gen;
+        }
+        if (session_->IncompleteStreamCount() == 0 && deadline_armed_) {
+            // All incomplete streams resolved — clear deadline
             conn_->ClearDeadline();
             deadline_armed_ = false;
         }
-        last_seen_stream_count_ = incomplete;
     }
 
     // Check if session wants to close

@@ -79,6 +79,12 @@ public:
     void MarkRejected() { rejected_ = true; }
     bool IsRejected() const { return rejected_; }
 
+    // Track whether the incomplete-stream counter was already decremented
+    // for this stream (by DispatchStreamRequest). Prevents double-decrement
+    // in OnStreamCloseCallback.
+    void MarkCounterDecremented() { counter_decremented_ = true; }
+    bool IsCounterDecremented() const { return counter_decremented_; }
+
     // :scheme pseudo-header tracking (required for validation)
     bool HasScheme() const { return has_scheme_; }
     const std::string& Scheme() const { return scheme_; }
@@ -105,6 +111,7 @@ private:
     size_t accumulated_body_size_ = 0;
     size_t accumulated_header_size_ = 0;
     bool rejected_ = false;
+    bool counter_decremented_ = false;
     bool has_content_length_ = false;
     bool seen_regular_header_ = false;  // true after first non-pseudo header
     bool has_method_ = false;

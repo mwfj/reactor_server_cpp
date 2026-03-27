@@ -86,13 +86,18 @@ public:
     // Get the last stream ID we have processed (for GOAWAY)
     int32_t LastStreamId() const { return last_stream_id_; }
 
-    // Count of streams whose request is not yet complete (headers received
-    // but END_STREAM not yet seen). Used for request-timeout enforcement:
-    // the deadline should only be active while incomplete requests exist,
-    // not while completed requests are draining responses.
+    // Incomplete stream tracking for request-timeout enforcement.
+    // incomplete_stream_count_: streams whose request hasn't been dispatched yet.
+    // incomplete_generation_: bumped each time a new incomplete stream is created.
+    //   Used to detect "new stream arrived" even when same-batch close+open
+    //   leaves the count unchanged.
     size_t IncompleteStreamCount() const { return incomplete_stream_count_; }
-    void IncrementIncompleteStreams() { ++incomplete_stream_count_; }
-    void DecrementIncompleteStreams() {
+    uint64_t IncompleteGeneration() const { return incomplete_generation_; }
+    void OnStreamBecameIncomplete() {
+        ++incomplete_stream_count_;
+        ++incomplete_generation_;
+    }
+    void OnStreamNoLongerIncomplete() {
         if (incomplete_stream_count_ > 0) --incomplete_stream_count_;
     }
 
@@ -138,6 +143,7 @@ private:
     bool goaway_sent_ = false;
     size_t max_body_size_ = 0;
     size_t incomplete_stream_count_ = 0;
+    uint64_t incomplete_generation_ = 0;
     size_t max_header_list_size_ = 0;
 
     // Flood protection counters (sliding window)
