@@ -30,8 +30,10 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
         } else if (name == ":authority") {
             // Map :authority to Host header (RFC 9113 Section 8.3.1)
             request_.headers["host"] = value;
+        } else if (name == ":scheme") {
+            has_scheme_ = true;
+            scheme_ = value;
         }
-        // :scheme is informational — not stored in HttpRequest
         return 0;
     }
 

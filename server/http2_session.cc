@@ -162,51 +162,59 @@ static int OnFrameRecvCallback(
 
     switch (frame->hd.type) {
     case NGHTTP2_HEADERS: {
-        if (frame->headers.cat != NGHTTP2_HCAT_REQUEST) break;
-
         auto* stream = self->FindStream(frame->hd.stream_id);
         if (!stream) break;
 
-        stream->MarkHeadersComplete();
+        if (frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
+            // Initial request headers
+            stream->MarkHeadersComplete();
 
-        // Validate required pseudo-headers
-        const auto& req = stream->GetRequest();
-        if (req.method.empty() || req.path.empty()) {
-            logging::Get()->warn("HTTP/2 stream {} missing required pseudo-headers",
-                                 frame->hd.stream_id);
-            int rst_rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                                   frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
-            if (rst_rv < 0) {
-                logging::Get()->error("nghttp2_submit_rst_stream failed: {}",
-                                      nghttp2_strerror(rst_rv));
-                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            // Validate required pseudo-headers (RFC 9113 Section 8.3.1).
+            // Non-CONNECT requests MUST include :method, :path, and :scheme.
+            const auto& req = stream->GetRequest();
+            if (req.method.empty() || req.path.empty() || !stream->HasScheme()) {
+                logging::Get()->warn("HTTP/2 stream {} missing required pseudo-headers",
+                                     frame->hd.stream_id);
+                int rst_rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                                       frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
+                if (rst_rv < 0) {
+                    logging::Get()->error("nghttp2_submit_rst_stream failed: {}",
+                                          nghttp2_strerror(rst_rv));
+                    return NGHTTP2_ERR_CALLBACK_FAILURE;
+                }
+                stream->MarkRejected();
+                break;
             }
-            break;
-        }
 
-        // If END_STREAM is set on HEADERS, the request has no body
+            // Validate :authority or host header present
+            // (RFC 9113 Section 8.3.1: clients SHOULD send :authority)
+            if (!req.HasHeader("host")) {
+                logging::Get()->warn("HTTP/2 stream {} missing :authority/host",
+                                     frame->hd.stream_id);
+                int rst_rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                                       frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
+                if (rst_rv < 0) {
+                    logging::Get()->error("nghttp2_submit_rst_stream failed: {}",
+                                          nghttp2_strerror(rst_rv));
+                    return NGHTTP2_ERR_CALLBACK_FAILURE;
+                }
+                stream->MarkRejected();
+                break;
+            }
+        }
+        // else: NGHTTP2_HCAT_HEADERS = trailing headers (trailers).
+        // We don't process trailer content, but we do need to check END_STREAM.
+
+        // Check END_STREAM on both request headers and trailers
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
             stream->MarkEndStream();
         }
 
-        // If request is complete (END_STREAM on HEADERS), dispatch now.
+        // If request is complete, dispatch now.
         // Skip if stream was rejected (RST_STREAM sent for body-too-large, etc.)
-        // It is safe to call nghttp2_submit_response from within
-        // on_frame_recv_callback — the response is queued internally
-        // and flushed by the next SendPendingFrames() call.
         if (stream->IsRequestComplete() && !stream->IsRejected() &&
             self->Callbacks().request_callback) {
-            HttpResponse response;
-            try {
-                self->Callbacks().request_callback(
-                    self->Owner(), frame->hd.stream_id,
-                    stream->GetRequest(), response);
-            } catch (const std::exception& e) {
-                logging::Get()->error("Exception in HTTP/2 request handler: {}",
-                                      e.what());
-                response = HttpResponse::InternalError();
-            }
-            self->SubmitResponse(frame->hd.stream_id, response);
+            self->DispatchStreamRequest(stream, frame->hd.stream_id);
         }
         break;
     }
@@ -221,17 +229,7 @@ static int OnFrameRecvCallback(
             // Skip if stream was rejected (RST_STREAM sent for body-too-large, etc.)
             if (stream->IsRequestComplete() && !stream->IsRejected() &&
                 self->Callbacks().request_callback) {
-                HttpResponse response;
-                try {
-                    self->Callbacks().request_callback(
-                        self->Owner(), frame->hd.stream_id,
-                        stream->GetRequest(), response);
-                } catch (const std::exception& e) {
-                    logging::Get()->error("Exception in HTTP/2 request handler: {}",
-                                          e.what());
-                    response = HttpResponse::InternalError();
-                }
-                self->SubmitResponse(frame->hd.stream_id, response);
+                self->DispatchStreamRequest(stream, frame->hd.stream_id);
             }
         }
         break;
@@ -518,6 +516,43 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
 
     stream->MarkResponseHeadersSent();
     return 0;
+}
+
+void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id) {
+    const HttpRequest& req = stream->GetRequest();
+
+    // RFC 9110 Section 8.6: If content-length is declared, the actual body
+    // size must match. A mismatch means the message is malformed.
+    if (req.content_length > 0 &&
+        stream->AccumulatedBodySize() != req.content_length) {
+        logging::Get()->warn("HTTP/2 stream {} content-length mismatch: "
+                             "declared={} actual={}",
+                             stream_id, req.content_length,
+                             stream->AccumulatedBodySize());
+        nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
+                                  stream_id, NGHTTP2_PROTOCOL_ERROR);
+        stream->MarkRejected();
+        return;
+    }
+    // Also reject: content-length: 0 but body is non-empty
+    if (req.HasHeader("content-length") && req.content_length == 0 &&
+        stream->AccumulatedBodySize() > 0) {
+        logging::Get()->warn("HTTP/2 stream {} content-length:0 but body present",
+                             stream_id);
+        nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
+                                  stream_id, NGHTTP2_PROTOCOL_ERROR);
+        stream->MarkRejected();
+        return;
+    }
+
+    HttpResponse response;
+    try {
+        callbacks_.request_callback(Owner(), stream_id, req, response);
+    } catch (const std::exception& e) {
+        logging::Get()->error("Exception in HTTP/2 request handler: {}", e.what());
+        response = HttpResponse::InternalError();
+    }
+    SubmitResponse(stream_id, response);
 }
 
 void Http2Session::SendGoaway(uint32_t error_code) {

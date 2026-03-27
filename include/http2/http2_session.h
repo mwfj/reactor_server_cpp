@@ -106,6 +106,10 @@ public:
     // Access callbacks (used by static nghttp2 callback functions)
     HTTP2_CALLBACKS_NAMESPACE::Http2SessionCallbacks& Callbacks() { return callbacks_; }
 
+    // Validate and dispatch a complete request on a stream.
+    // Called from OnFrameRecvCallback (static) for both HEADERS and DATA END_STREAM.
+    void DispatchStreamRequest(Http2Stream* stream, int32_t stream_id);
+
 private:
     // Pimpl for nghttp2
     struct Impl;

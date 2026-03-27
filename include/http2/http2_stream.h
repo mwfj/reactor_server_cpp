@@ -71,6 +71,10 @@ public:
     void MarkRejected() { rejected_ = true; }
     bool IsRejected() const { return rejected_; }
 
+    // :scheme pseudo-header tracking (required for validation)
+    bool HasScheme() const { return has_scheme_; }
+    const std::string& Scheme() const { return scheme_; }
+
     // Owns the ResponseDataSource for this stream's response body.
     // nghttp2 holds a raw pointer to it via nghttp2_data_source.ptr;
     // we keep ownership here so it is freed when the stream is destroyed.
@@ -88,5 +92,7 @@ private:
     bool response_complete_ = false;
     size_t accumulated_body_size_ = 0;
     bool rejected_ = false;
+    bool has_scheme_ = false;
+    std::string scheme_;
     std::unique_ptr<ResponseDataSource> data_source_;
 };
