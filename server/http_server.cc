@@ -216,20 +216,19 @@ void HttpServer::Stop() {
         }
     }
 
-    // Close HTTP/2 connections. We do NOT call SendGoaway() here because that
-    // mutates nghttp2_session from the stopper thread while the dispatcher thread
-    // may be in ReceiveData — a data race. CloseAfterWrite() is thread-safe
-    // (routes through EnQueue) and the TCP FIN serves as the shutdown signal.
-    // This matches how NetServer::Stop() handles remaining connections.
-    std::vector<std::shared_ptr<ConnectionHandler>> h2_conns_to_close;
+    // Graceful HTTP/2 shutdown: request GOAWAY + drain on the dispatcher thread.
+    // RequestShutdown() is thread-safe (sets atomic flag + arms near-immediate
+    // deadline). The deadline callback runs on the dispatcher thread, sends GOAWAY,
+    // and closes once all active streams complete.
+    std::vector<std::shared_ptr<Http2ConnectionHandler>> h2_conns_to_shutdown;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         for (auto& pair : h2_connections_) {
-            h2_conns_to_close.push_back(pair.second->GetConnection());
+            h2_conns_to_shutdown.push_back(pair.second);
         }
     }
-    for (auto& conn : h2_conns_to_close) {
-        if (conn) conn->CloseAfterWrite();
+    for (auto& h2_conn : h2_conns_to_shutdown) {
+        h2_conn->RequestShutdown();
     }
 
     net_server_.Stop();

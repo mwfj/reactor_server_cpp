@@ -80,11 +80,27 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
             if (reset > 0) {
                 self->session_->SendPendingFrames();
             }
+            // Handle graceful shutdown on dispatcher thread
+            if (self->shutdown_requested_.load(std::memory_order_acquire) &&
+                !self->session_->IsGoawaySent()) {
+                self->session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
+                self->session_->SendPendingFrames();
+            }
+
             self->UpdateDeadline();
 
-            // If incomplete streams remain, deadline was re-armed → keep alive.
-            // If no incomplete streams, UpdateDeadline cleared it → keep alive
-            // (idle timeout governs). Only close if session is dead.
+            // Preface-only idle client — close
+            if (self->session_->LastStreamId() == 0) {
+                return false;
+            }
+
+            // During shutdown: if all active streams completed, close now.
+            if (self->shutdown_requested_.load(std::memory_order_acquire) &&
+                self->session_->ActiveStreamCount() == 0) {
+                return false;  // Quiescent — proceed with close
+            }
+
+            // Otherwise keep connection alive (deadline re-armed or idle).
             return self->session_->IsAlive();
         });
 
@@ -126,10 +142,18 @@ void Http2ConnectionHandler::OnRawData(
         return;
     }
 
-    // Feed data to nghttp2 — even during shutdown drain, we must continue
-    // processing frames so that WINDOW_UPDATE/SETTINGS/RST_STREAM reach
-    // nghttp2 and in-flight responses can complete. New stream creation is
+    // Handle pending shutdown request (from Stop()) on the dispatcher thread.
+    // Send GOAWAY, then let existing streams drain. New stream creation is
     // blocked in OnBeginHeadersCallback via the goaway_sent_ flag.
+    if (shutdown_requested_.load(std::memory_order_acquire) &&
+        session_ && !session_->IsGoawaySent()) {
+        session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
+        session_->SendPendingFrames();
+    }
+
+    // Feed data to nghttp2 — during shutdown drain, we continue processing
+    // frames so that WINDOW_UPDATE/SETTINGS/RST_STREAM reach nghttp2 and
+    // in-flight responses can complete.
     ssize_t consumed = session_->ReceiveData(data.data(), data.size());
     if (consumed < 0) {
         logging::Get()->error("HTTP/2 session error, closing connection");
@@ -154,14 +178,27 @@ void Http2ConnectionHandler::OnRawData(
     // Check if session wants to close
     if (!session_->IsAlive()) {
         conn_->CloseAfterWrite();
+        return;
+    }
+
+    // During shutdown drain: close once all active streams have completed.
+    if (shutdown_requested_.load(std::memory_order_acquire) &&
+        session_->ActiveStreamCount() == 0) {
+        conn_->CloseAfterWrite();
     }
 }
 
-void Http2ConnectionHandler::SendGoaway() {
-    if (session_) {
-        conn_->ClearDeadline();
-        session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
-        session_->SendPendingFrames();
+void Http2ConnectionHandler::RequestShutdown() {
+    // Thread-safe: just set the flag. The actual GOAWAY + drain happens
+    // on the dispatcher thread (in OnRawData or the deadline callback).
+    shutdown_requested_.store(true, std::memory_order_release);
+
+    // Arm a near-immediate deadline so the timer scan triggers the timeout
+    // callback on the dispatcher thread even if no client data arrives.
+    // Use 1 second — the timer scan interval is typically shorter.
+    if (conn_) {
+        conn_->SetDeadline(std::chrono::steady_clock::now() +
+                           std::chrono::seconds(1));
     }
 }
 

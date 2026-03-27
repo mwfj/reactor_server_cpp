@@ -31,8 +31,10 @@ public:
     // Optionally accepts initial data (preface bytes already buffered).
     void Initialize(const std::string& initial_data = "");
 
-    // Send GOAWAY and prepare for shutdown
-    void SendGoaway();
+    // Request graceful shutdown. Thread-safe (sets atomic flag).
+    // Actual GOAWAY + drain happens on the dispatcher thread via the
+    // deadline timeout callback or next OnRawData.
+    void RequestShutdown();
 
     // Access the underlying connection
     std::shared_ptr<ConnectionHandler> GetConnection() const { return conn_; }
@@ -54,6 +56,7 @@ private:
 
     bool initialized_ = false;
     bool deadline_armed_ = false;
+    std::atomic<bool> shutdown_requested_{false};
     std::chrono::steady_clock::time_point last_deadline_;  // avoids redundant SetDeadline calls
 
     // Internal: called after ReceiveData; a no-op since dispatch is
