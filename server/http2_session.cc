@@ -114,6 +114,13 @@ static int OnHeaderCallback(
     if (add_rv != 0) {
         logging::Get()->warn("HTTP/2 stream {} invalid header value for: {}",
                              frame->hd.stream_id, hdr_name);
+        int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                           frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
+        if (rv < 0) {
+            logging::Get()->error("nghttp2_submit_rst_stream failed: {}",
+                                  nghttp2_strerror(rv));
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
         return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
     }
     return 0;
