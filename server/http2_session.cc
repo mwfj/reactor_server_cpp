@@ -329,8 +329,10 @@ Http2Session::Http2Session(std::shared_ptr<ConnectionHandler> conn,
     , settings_(settings)
     , flood_window_start_(std::chrono::steady_clock::now()) {
 
-    // Create callbacks
-    nghttp2_session_callbacks_new(&impl_->callbacks);
+    // Create callbacks — check for allocation failure (OOM)
+    if (nghttp2_session_callbacks_new(&impl_->callbacks) != 0) {
+        throw std::runtime_error("Failed to allocate nghttp2 session callbacks");
+    }
     nghttp2_session_callbacks_set_on_begin_headers_callback(
         impl_->callbacks, OnBeginHeadersCallback);
     nghttp2_session_callbacks_set_on_header_callback(
@@ -346,8 +348,10 @@ Http2Session::Http2Session(std::shared_ptr<ConnectionHandler> conn,
     nghttp2_session_callbacks_set_on_invalid_frame_recv_callback(
         impl_->callbacks, OnInvalidFrameRecvCallback);
 
-    // Create options
-    nghttp2_option_new(&impl_->option);
+    // Create options — check for allocation failure (OOM)
+    if (nghttp2_option_new(&impl_->option) != 0) {
+        throw std::runtime_error("Failed to allocate nghttp2 session options");
+    }
     // Don't track closed streams for priority (saves memory)
     nghttp2_option_set_no_closed_streams(impl_->option, 1);
 
@@ -391,14 +395,16 @@ ssize_t Http2Session::ReceiveData(const char* data, size_t len) {
         impl_->session,
         reinterpret_cast<const uint8_t*>(data), len);
 
+    // Always update last_stream_id_ — even on error, nghttp2 may have
+    // processed valid streams before hitting the bad frame. Using a stale
+    // value in GOAWAY would tell clients to retry already-processed requests.
+    last_stream_id_ = nghttp2_session_get_last_proc_stream_id(impl_->session);
+
     if (rv < 0) {
         logging::Get()->error("nghttp2_session_mem_recv2 error: {}",
                               nghttp2_strerror(static_cast<int>(rv)));
         return rv;
     }
-
-    // Update last_stream_id_ for GOAWAY
-    last_stream_id_ = nghttp2_session_get_last_proc_stream_id(impl_->session);
 
     // Flush deferred stream removals now that we're outside callbacks
     FlushDeferredRemovals();
