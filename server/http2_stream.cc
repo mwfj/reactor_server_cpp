@@ -64,9 +64,14 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
     request_.headers[lower_name] = value;
 
     // Track content-length for body size expectations.
-    // RFC 9110 Section 8.6: multiple content-length fields with differing
-    // values make the message malformed. Reject unless identical.
+    // RFC 9110 Section 8.6: content-length must be a valid non-negative integer.
+    // Multiple content-length fields with differing values are malformed.
     if (lower_name == "content-length") {
+        // Reject leading/trailing whitespace, signs, or non-digit chars
+        if (value.empty()) return -1;
+        for (char c : value) {
+            if (c < '0' || c > '9') return -1;
+        }
         try {
             size_t new_cl = std::stoull(value);
             if (has_content_length_ && request_.content_length != new_cl) {
@@ -75,7 +80,7 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
             request_.content_length = new_cl;
             has_content_length_ = true;
         } catch (...) {
-            return -1;  // Invalid content-length — caller should RST_STREAM
+            return -1;  // Overflow or other parse error
         }
     }
 

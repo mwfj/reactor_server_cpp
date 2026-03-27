@@ -212,7 +212,9 @@ static int OnFrameRecvCallback(
 
             if (req.method == "CONNECT") {
                 // CONNECT: MUST have :method + :authority. MUST NOT have :path/:scheme.
-                if (!req.HasHeader("host")) valid = false;
+                // Check HasAuthority (not HasHeader("host")) — a regular host header
+                // is not a substitute for the :authority pseudo-header.
+                if (!stream->HasAuthority()) valid = false;
                 if (!req.path.empty() || stream->HasScheme()) valid = false;
             } else {
                 // Non-CONNECT: MUST have :method, :path, :scheme.
@@ -485,7 +487,7 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     });
 
     // Regular headers — lowercase names (RFC 9113 Section 8.2: field names MUST
-    // be lowercase) and skip connection-level headers forbidden in HTTP/2.
+    // be lowercase). Skip forbidden and server-managed headers.
     const auto& headers = response.GetHeaders();
     std::vector<std::string> lowered_names;  // storage for lowered name strings
     lowered_names.reserve(headers.size());
@@ -494,7 +496,13 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
         // Skip HTTP/1.x connection-level headers (RFC 9113 Section 8.2.2)
         if (key == "connection" || key == "keep-alive" ||
+            key == "proxy-connection" || key == "te" ||
             key == "transfer-encoding" || key == "upgrade") {
+            continue;
+        }
+        // Skip content-length — we compute the correct value below to
+        // prevent mismatches between declared and actual body size.
+        if (key == "content-length") {
             continue;
         }
         lowered_names.push_back(std::move(key));
@@ -510,25 +518,13 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     const std::string& raw_body = response.GetBody();
     bool has_body = !raw_body.empty() && !suppress_body;
 
-    // Add content-length header when appropriate.
-    // HEAD: include content-length reflecting the body size as if GET (RFC 9110 §9.3.2)
-    // 204/205/304: MUST NOT include content-length for a non-existent body
-    // Normal responses: auto-add content-length if body is non-empty
+    // Compute correct content-length. Always server-managed to prevent
+    // mismatches between declared length and actual body size.
+    // HEAD: content-length reflects the GET body size (RFC 9110 §9.3.2)
+    // 204/205/304: no content-length (body suppressed)
+    // Normal: content-length = actual body size
     std::string content_length_str;
-    bool has_content_length = false;
-    for (const auto& hdr : headers) {
-        std::string key = hdr.first;
-        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-        if (key == "content-length") {
-            has_content_length = true;
-            break;
-        }
-    }
-    // Only auto-add content-length if: body is present AND either
-    // (a) body is not suppressed, or (b) it's a HEAD response (needs GET-equivalent CL)
-    bool should_add_cl = !raw_body.empty() && !has_content_length &&
-                         (!suppress_body || req.method == "HEAD");
-    if (should_add_cl) {
+    if (!raw_body.empty() && (!suppress_body || req.method == "HEAD")) {
         content_length_str = std::to_string(raw_body.size());
         nva.push_back({
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("content-length")),
