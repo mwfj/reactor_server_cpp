@@ -307,8 +307,11 @@ static int HandleStart(const CliOptions& options) {
                 logging::Get()->warn("Log file reopen failed, continuing with old file");
             }
         } else {
-            // Foreground mode: treat SIGHUP as shutdown (terminal hangup)
+            // Foreground mode: treat SIGHUP as shutdown (terminal hangup).
+            // Must mark shutdown so the server thread's catch block recognizes
+            // this as an expected stop, not a server failure.
             logging::Get()->info("Received SIGHUP (terminal hangup), shutting down");
+            SignalHandler::MarkShutdownRequested();
             break;
         }
     }
@@ -371,8 +374,13 @@ int main(int argc, char* argv[]) {
             int rc = LoadConfig(config, options);
             if (rc != EXIT_OK) return rc;
             if (options.daemonize) {
+#if defined(_WIN32)
+                std::cerr << "Error: daemon mode is not supported on this platform\n";
+                return EXIT_ERROR;
+#else
                 rc = ValidateDaemonConfig(config, options);
                 if (rc != EXIT_OK) return rc;
+#endif
             }
             std::cout << "Configuration is valid.\n";
             return EXIT_OK;

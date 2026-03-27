@@ -81,6 +81,10 @@ bool SignalHandler::ShutdownRequested() {
     return g_shutdown_requested.load(std::memory_order_acquire);
 }
 
+void SignalHandler::MarkShutdownRequested() {
+    g_shutdown_requested.store(true, std::memory_order_release);
+}
+
 void SignalHandler::Cleanup() {
     if (g_installed) {
         signal(SIGTERM, SIG_IGN);

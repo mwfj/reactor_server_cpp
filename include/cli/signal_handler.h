@@ -43,5 +43,9 @@ public:
     // Returns true if a shutdown signal has been received.
     static bool ShutdownRequested();
 
+    // Mark shutdown as requested. Used when the caller decides to shut down
+    // based on a RELOAD signal (foreground SIGHUP = terminal hangup).
+    static void MarkShutdownRequested();
+
     SignalHandler() = delete;
 };
