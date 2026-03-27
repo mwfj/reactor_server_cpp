@@ -29,13 +29,14 @@ void SignalHandler::Install() {
     }
 
     // On macOS/BSD, sigwait() cannot receive signals whose disposition is SIG_IGN —
-    // the kernel discards them before they become pending. If Cleanup() previously
-    // set SIG_IGN, we must undo it. But we must NOT override inherited SIG_IGN
-    // from nohup or a supervisor (first Install() call).
+    // the kernel discards them before they become pending. SIGTERM/SIGINT must
+    // always be SIG_DFL so shutdown signals reach sigwait(). SIGHUP is only
+    // reset after our own Cleanup() set it to SIG_IGN — inherited SIG_IGN from
+    // nohup is preserved (nohup only affects SIGHUP, not TERM/INT).
     // Safe: signals are blocked, so SIG_DFL cannot fire.
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGINT, SIG_DFL);
     if (g_was_cleaned_up) {
-        signal(SIGTERM, SIG_DFL);
-        signal(SIGINT, SIG_DFL);
         signal(SIGHUP, SIG_DFL);
         g_was_cleaned_up = false;
     }
