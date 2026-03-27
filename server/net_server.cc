@@ -71,6 +71,13 @@ void NetServer::Start(){
             }));
         sock_workers_.AddTask(work_task);
     }
+    // Init complete — fire ready callback before entering the blocking loop.
+    // Daemon mode uses this to signal the parent process that startup succeeded.
+    if (ready_callback_) {
+        ready_callback_();
+        ready_callback_ = nullptr;  // one-shot
+    }
+
     conn_dispatcher_->RunEventLoop();
 }
 

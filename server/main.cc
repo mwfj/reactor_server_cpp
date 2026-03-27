@@ -15,6 +15,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#if !defined(_WIN32)
+#include <syslog.h>
+#endif
 
 static constexpr int EXIT_OK          = 0;
 static constexpr int EXIT_ERROR       = 1;
@@ -173,7 +176,15 @@ static int HandleStart(const CliOptions& options) {
         try {
             logging::Init("reactor", logging::ParseLevel(config.log.level),
                           config.log.file, config.log.max_file_size, config.log.max_files);
+        } catch (const std::exception& e) {
+            // stderr is /dev/null, but try syslog as last resort for debugging
+            syslog(LOG_ERR, "%s: failed to initialize logging: %s",
+                   REACTOR_SERVER_NAME, e.what());
+            Daemonizer::NotifyFailed();
+            _exit(EXIT_ERROR);
         } catch (...) {
+            syslog(LOG_ERR, "%s: failed to initialize logging (unknown error)",
+                   REACTOR_SERVER_NAME);
             Daemonizer::NotifyFailed();
             _exit(EXIT_ERROR);
         }
@@ -248,14 +259,32 @@ static int HandleStart(const CliOptions& options) {
         logging::Get()->info("  Health:  /health");
     }
 
+    // ── Wire daemon readiness to fire after init, before event loop ──
+#if !defined(_WIN32)
+    if (options.daemonize) {
+        server->SetReadyCallback([&]() {
+            Daemonizer::NotifyReady();
+        });
+    }
+#endif
+
     // ── Server thread ───────────────────────────────────────
     std::exception_ptr server_error;
     std::atomic<bool> server_failed{false};
-    std::thread server_thread([&server, &server_error, &server_failed]() {
+    std::thread server_thread([&server, &server_error, &server_failed
+#if !defined(_WIN32)
+                                , &options
+#endif
+                               ]() {
         try {
             server->Start();
         } catch (...) {
             server_error = std::current_exception();
+#if !defined(_WIN32)
+            // If Start() throws before the ready callback fires (init failure),
+            // notify the daemon parent of failure so it doesn't hang.
+            if (options.daemonize) Daemonizer::NotifyFailed();
+#endif
             if (!SignalHandler::ShutdownRequested()) {
                 server_failed.store(true, std::memory_order_release);
                 kill(getpid(), SIGTERM);
@@ -263,22 +292,22 @@ static int HandleStart(const CliOptions& options) {
         }
     });
 
-    // ── Signal the daemon parent that startup succeeded ────
-#if !defined(_WIN32)
-    if (options.daemonize) {
-        Daemonizer::NotifyReady();
-    }
-#endif
-
     // ── Signal loop ─────────────────────────────────────────
     logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
     while (true) {
         SignalResult sig = SignalHandler::WaitForSignal();
         if (sig == SignalResult::SHUTDOWN) break;
-        // SIGHUP: reopen log files for rotation
-        logging::Get()->info("Received SIGHUP, reopening log files");
-        logging::Reopen();
-        logging::Get()->info("Log files reopened");
+        // SIGHUP received
+        if (options.daemonize) {
+            // Daemon mode: reopen log files for rotation
+            logging::Get()->info("Received SIGHUP, reopening log files");
+            logging::Reopen();
+            logging::Get()->info("Log files reopened");
+        } else {
+            // Foreground mode: treat SIGHUP as shutdown (terminal hangup)
+            logging::Get()->info("Received SIGHUP (terminal hangup), shutting down");
+            break;
+        }
     }
 
     // ── Shutdown ────────────────────────────────────────────

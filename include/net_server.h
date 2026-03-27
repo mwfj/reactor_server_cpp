@@ -88,4 +88,11 @@ public:
     void SetTlsContext(std::shared_ptr<TlsContext> ctx) { tls_ctx_ = std::move(ctx); }
     void SetMaxConnections(int max) { max_connections_ = max; }
     void SetMaxInputSize(size_t max) { max_input_size_ = max; }
+
+    // Called after init completes but before the blocking event loop.
+    // Used by daemon mode to signal readiness to the parent process.
+    void SetReadyCallback(std::function<void()> cb) { ready_callback_ = std::move(cb); }
+
+private:
+    std::function<void()> ready_callback_;
 };
