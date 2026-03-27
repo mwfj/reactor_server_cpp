@@ -93,6 +93,9 @@ public:
     bool HasAuthority() const { return has_authority_; }
     const std::string& Authority() const { return authority_; }
 
+    // When this stream was created (for oldest-incomplete-stream timeout)
+    std::chrono::steady_clock::time_point CreatedAt() const { return created_at_; }
+
     // Owns the ResponseDataSource for this stream's response body.
     // nghttp2 holds a raw pointer to it via nghttp2_data_source.ptr;
     // we keep ownership here so it is freed when the stream is destroyed.
@@ -121,4 +124,5 @@ private:
     bool has_authority_ = false;
     std::string authority_;
     std::unique_ptr<ResponseDataSource> data_source_;
+    std::chrono::steady_clock::time_point created_at_;
 };

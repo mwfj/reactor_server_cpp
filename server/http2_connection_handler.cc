@@ -94,24 +94,7 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
         // Send any pending frames (SETTINGS ACK, responses, etc.)
         session_->SendPendingFrames();
 
-        // Update deadline based on what initial_data contained:
-        if (request_timeout_sec_ > 0) {
-            uint64_t gen = session_->IncompleteGeneration();
-            if (gen > last_seen_generation_) {
-                conn_->SetDeadline(std::chrono::steady_clock::now() +
-                                   std::chrono::seconds(request_timeout_sec_));
-                deadline_armed_ = true;
-                last_seen_generation_ = gen;
-            }
-            // Only clear if streams were actually opened and all completed.
-            // If no streams were ever seen (preface-only), keep the initial
-            // deadline — the client must send a request within request_timeout_sec.
-            if (session_->IncompleteStreamCount() == 0 &&
-                session_->LastStreamId() > 0 && deadline_armed_) {
-                conn_->ClearDeadline();
-                deadline_armed_ = false;
-            }
-        }
+        UpdateDeadline();
     }
 }
 
@@ -142,26 +125,11 @@ void Http2ConnectionHandler::OnRawData(
     // Send pending frames (responses, WINDOW_UPDATEs, etc.)
     session_->SendPendingFrames();
 
-    // Manage deadline based on incomplete (not-yet-dispatched) streams.
-    // Uses a generation counter to detect new stream arrivals, which handles
-    // same-batch open+close correctly (count stays flat but generation bumps).
-    // Response draining does not keep the deadline armed.
-    if (request_timeout_sec_ > 0) {
-        uint64_t gen = session_->IncompleteGeneration();
-        if (gen > last_seen_generation_) {
-            // New incomplete stream(s) appeared — (re)arm deadline
-            conn_->SetDeadline(std::chrono::steady_clock::now() +
-                               std::chrono::seconds(request_timeout_sec_));
-            deadline_armed_ = true;
-            last_seen_generation_ = gen;
-        }
-        if (session_->IncompleteStreamCount() == 0 &&
-            session_->LastStreamId() > 0 && deadline_armed_) {
-            // All incomplete streams resolved — clear deadline
-            conn_->ClearDeadline();
-            deadline_armed_ = false;
-        }
-    }
+    // Manage deadline based on the OLDEST incomplete stream's creation time.
+    // The deadline = oldest_start + request_timeout_sec. New streams cannot
+    // extend the deadline for older stalled streams, which closes the bypass
+    // where fresh streams keep a stalled stream alive indefinitely.
+    UpdateDeadline();
 
     // Check if session wants to close
     if (!session_->IsAlive()) {
@@ -182,4 +150,27 @@ void Http2ConnectionHandler::DispatchPendingRequests() {
     // nghttp2's on_frame_recv_callback, which invokes the request_callback
     // and queues the response through SubmitResponse. SendPendingFrames()
     // called after ReceiveData flushes the queued frames.
+}
+
+void Http2ConnectionHandler::UpdateDeadline() {
+    if (request_timeout_sec_ <= 0 || !session_) return;
+
+    auto oldest = session_->OldestIncompleteStreamStart();
+    if (oldest != std::chrono::steady_clock::time_point::max()) {
+        // Set deadline based on the oldest incomplete stream's start time.
+        // New streams cannot extend the deadline for older stalled streams.
+        auto deadline = oldest + std::chrono::seconds(request_timeout_sec_);
+        // Only call SetDeadline when the value actually changes to avoid
+        // unnecessary atomic operations on every frame batch.
+        if (!deadline_armed_ || deadline != last_deadline_) {
+            conn_->SetDeadline(deadline);
+            deadline_armed_ = true;
+            last_deadline_ = deadline;
+        }
+    } else if (deadline_armed_ && session_->LastStreamId() > 0) {
+        // No incomplete streams and streams were seen — idle keep-alive
+        conn_->ClearDeadline();
+        deadline_armed_ = false;
+    }
+    // If no streams ever opened (preface-only), keep the initial deadline.
 }

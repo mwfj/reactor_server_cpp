@@ -53,12 +53,15 @@ private:
     int request_timeout_sec_ = 0;
 
     bool initialized_ = false;
-    bool deadline_armed_ = false;     // true while a request deadline is active
-    uint64_t last_seen_generation_ = 0;  // for detecting new incomplete streams
+    bool deadline_armed_ = false;
+    std::chrono::steady_clock::time_point last_deadline_;  // avoids redundant SetDeadline calls
 
     // Internal: called after ReceiveData; a no-op since dispatch is
     // synchronous inside nghttp2 callbacks.
     void DispatchPendingRequests();
+
+    // Internal: set connection deadline based on oldest incomplete stream.
+    void UpdateDeadline();
 
     // Stored callbacks for deferred initialization
     RequestCallback pending_request_cb_;

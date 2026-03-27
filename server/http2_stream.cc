@@ -2,7 +2,8 @@
 #include <algorithm>
 
 Http2Stream::Http2Stream(int32_t stream_id)
-    : stream_id_(stream_id) {
+    : stream_id_(stream_id)
+    , created_at_(std::chrono::steady_clock::now()) {
     // HTTP/2 requests are always version 2.0
     request_.http_major = 2;
     request_.http_minor = 0;

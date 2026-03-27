@@ -735,6 +735,18 @@ size_t Http2Session::ActiveStreamCount() const {
     return streams_.size();
 }
 
+std::chrono::steady_clock::time_point Http2Session::OldestIncompleteStreamStart() const {
+    // streams_ is std::map<int32_t, ...> sorted by stream ID.
+    // HTTP/2 stream IDs are monotonically increasing, so the first
+    // non-dispatched, non-rejected stream is the oldest incomplete one.
+    for (const auto& [id, stream] : streams_) {
+        if (!stream->IsCounterDecremented() && !stream->IsRejected()) {
+            return stream->CreatedAt();
+        }
+    }
+    return std::chrono::steady_clock::time_point::max();
+}
+
 // --- Callbacks ---
 
 void Http2Session::SetRequestCallback(

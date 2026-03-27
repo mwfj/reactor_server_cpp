@@ -88,19 +88,18 @@ public:
     bool IsGoawaySent() const { return goaway_sent_; }
 
     // Incomplete stream tracking for request-timeout enforcement.
-    // incomplete_stream_count_: streams whose request hasn't been dispatched yet.
-    // incomplete_generation_: bumped each time a new incomplete stream is created.
-    //   Used to detect "new stream arrived" even when same-batch close+open
-    //   leaves the count unchanged.
+    // The deadline is based on the OLDEST incomplete stream's creation time,
+    // so a fresh stream cannot extend the timeout for older stalled streams.
     size_t IncompleteStreamCount() const { return incomplete_stream_count_; }
-    uint64_t IncompleteGeneration() const { return incomplete_generation_; }
-    void OnStreamBecameIncomplete() {
-        ++incomplete_stream_count_;
-        ++incomplete_generation_;
-    }
+    void OnStreamBecameIncomplete() { ++incomplete_stream_count_; }
     void OnStreamNoLongerIncomplete() {
         if (incomplete_stream_count_ > 0) --incomplete_stream_count_;
     }
+
+    // Returns the creation time of the oldest incomplete (not-yet-dispatched)
+    // stream. Used to set an absolute deadline that cannot be extended by new
+    // streams. Returns time_point::max() if no incomplete streams exist.
+    std::chrono::steady_clock::time_point OldestIncompleteStreamStart() const;
 
     // Body size limit (set from config, checked during data ingestion)
     void SetMaxBodySize(size_t max) { max_body_size_ = max; }
@@ -144,7 +143,6 @@ private:
     bool goaway_sent_ = false;
     size_t max_body_size_ = 0;
     size_t incomplete_stream_count_ = 0;
-    uint64_t incomplete_generation_ = 0;
     size_t max_header_list_size_ = 0;
 
     // Flood protection counters (sliding window)
