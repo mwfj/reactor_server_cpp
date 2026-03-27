@@ -305,6 +305,17 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         // detects the protocol via ALPN (TLS) or client preface (cleartext).
         // This avoids eagerly creating an HttpConnectionHandler that would
         // intercept h2c preface bytes before protocol detection can run.
+        //
+        // Guard against accept/data race: if HandleMessage already ran and
+        // created a handler, skip the deadline arming below — the handler's
+        // own deadline logic is authoritative.
+        {
+            std::lock_guard<std::mutex> lck(conn_mtx_);
+            if (h2_connections_.count(conn->fd()) ||
+                http_connections_.count(conn->fd())) {
+                return;  // Handler already exists — HandleMessage won the race
+            }
+        }
     } else {
         // HTTP/2 disabled — always create HTTP/1.x handler immediately.
         std::shared_ptr<HttpConnectionHandler> old_handler;

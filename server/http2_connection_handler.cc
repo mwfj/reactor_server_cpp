@@ -78,6 +78,10 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
                                                   initial_data.size());
         if (consumed < 0) {
             logging::Get()->error("HTTP/2 initial data processing failed");
+            // Flush any queued error frames (GOAWAY from flood detection, etc.)
+            // before closing, so the peer sees the HTTP/2 error rather than
+            // a bare TCP close.
+            session_->SendPendingFrames();
             conn_->CloseAfterWrite();
             return;
         }

@@ -698,8 +698,11 @@ bool Http2Session::CheckFloodProtection(
                 // returns in Http2ConnectionHandler::OnRawData().
                 if (!goaway_sent_) {
                     goaway_sent_ = true;
+                    // Use live stream ID — last_stream_id_ may be stale mid-recv
+                    int32_t live_last = nghttp2_session_get_last_proc_stream_id(
+                        impl_->session);
                     nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
-                                         last_stream_id_, NGHTTP2_ENHANCE_YOUR_CALM,
+                                         live_last, NGHTTP2_ENHANCE_YOUR_CALM,
                                          nullptr, 0);
                 }
                 return false;
@@ -713,8 +716,10 @@ bool Http2Session::CheckFloodProtection(
                 logging::Get()->warn("HTTP/2 PING flood detected");
                 if (!goaway_sent_) {
                     goaway_sent_ = true;
+                    int32_t live_last = nghttp2_session_get_last_proc_stream_id(
+                        impl_->session);
                     nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
-                                         last_stream_id_, NGHTTP2_ENHANCE_YOUR_CALM,
+                                         live_last, NGHTTP2_ENHANCE_YOUR_CALM,
                                          nullptr, 0);
                 }
                 return false;
@@ -727,8 +732,10 @@ bool Http2Session::CheckFloodProtection(
             logging::Get()->warn("HTTP/2 RST_STREAM flood detected (rapid reset)");
             if (!goaway_sent_) {
                 goaway_sent_ = true;
+                int32_t live_last = nghttp2_session_get_last_proc_stream_id(
+                    impl_->session);
                 nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
-                                     last_stream_id_, NGHTTP2_ENHANCE_YOUR_CALM,
+                                     live_last, NGHTTP2_ENHANCE_YOUR_CALM,
                                      nullptr, 0);
             }
             return false;
