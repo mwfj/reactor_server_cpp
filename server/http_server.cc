@@ -212,24 +212,20 @@ void HttpServer::Stop() {
         }
     }
 
-    // Send GOAWAY to HTTP/2 connections (outside lock to prevent deadlock)
-    std::vector<std::pair<std::shared_ptr<Http2ConnectionHandler>,
-                          std::shared_ptr<ConnectionHandler>>> h2_conns;
+    // Close HTTP/2 connections. We do NOT call SendGoaway() here because that
+    // mutates nghttp2_session from the stopper thread while the dispatcher thread
+    // may be in ReceiveData — a data race. CloseAfterWrite() is thread-safe
+    // (routes through EnQueue) and the TCP FIN serves as the shutdown signal.
+    // This matches how NetServer::Stop() handles remaining connections.
+    std::vector<std::shared_ptr<ConnectionHandler>> h2_conns_to_close;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         for (auto& pair : h2_connections_) {
-            h2_conns.emplace_back(pair.second, pair.second->GetConnection());
+            h2_conns_to_close.push_back(pair.second->GetConnection());
         }
     }
-    for (auto& [h2_conn, conn] : h2_conns) {
-        try {
-            h2_conn->SendGoaway();
-            if (conn) conn->CloseAfterWrite();
-        } catch (const std::exception& e) {
-            logging::Get()->warn("Exception during HTTP/2 shutdown: {}", e.what());
-        } catch (...) {
-            logging::Get()->warn("Unknown exception during HTTP/2 shutdown");
-        }
+    for (auto& conn : h2_conns_to_close) {
+        if (conn) conn->CloseAfterWrite();
     }
 
     net_server_.Stop();

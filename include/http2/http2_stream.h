@@ -105,6 +105,7 @@ private:
     size_t accumulated_body_size_ = 0;
     size_t accumulated_header_size_ = 0;
     bool rejected_ = false;
+    bool has_content_length_ = false;
     bool has_scheme_ = false;
     std::string scheme_;
     bool has_authority_ = false;

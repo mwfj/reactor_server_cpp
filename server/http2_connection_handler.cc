@@ -131,15 +131,17 @@ void Http2ConnectionHandler::OnRawData(
 
     // Manage deadline based on active stream count:
     // - If streams are open, reset the deadline (data arrived, connection active)
-    // - If no streams remain, clear the deadline — let idle_timeout handle it
-    //   (prevents killing healthy keep-alive h2 connections after request_timeout)
+    // - If streams were opened and all completed, clear deadline (idle keep-alive)
+    // - If no streams ever opened yet, keep deadline armed (pre-request timeout)
     if (request_timeout_sec_ > 0) {
         if (session_->ActiveStreamCount() > 0) {
             conn_->SetDeadline(std::chrono::steady_clock::now() +
                                std::chrono::seconds(request_timeout_sec_));
-        } else {
+        } else if (session_->LastStreamId() > 0) {
+            // Streams were seen and all completed — idle keep-alive
             conn_->ClearDeadline();
         }
+        // else: no streams ever opened (preface/SETTINGS/PING only) — keep deadline
     }
 
     // Check if session wants to close

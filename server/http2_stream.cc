@@ -63,10 +63,17 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
 
     request_.headers[lower_name] = value;
 
-    // Track content-length for body size expectations
+    // Track content-length for body size expectations.
+    // RFC 9110 Section 8.6: multiple content-length fields with differing
+    // values make the message malformed. Reject unless identical.
     if (lower_name == "content-length") {
         try {
-            request_.content_length = std::stoull(value);
+            size_t new_cl = std::stoull(value);
+            if (has_content_length_ && request_.content_length != new_cl) {
+                return -1;  // Conflicting content-length values
+            }
+            request_.content_length = new_cl;
+            has_content_length_ = true;
         } catch (...) {
             return -1;  // Invalid content-length — caller should RST_STREAM
         }
