@@ -1,4 +1,5 @@
 #include "reactor_server.h"
+#include "log/logger.h"
 
 
 ReactorServer::ReactorServer(const std::string& _ip, const size_t _port,
@@ -27,17 +28,17 @@ void ReactorServer::Stop(){
 }
 
 void ReactorServer::NewConnection(std::shared_ptr<ConnectionHandler> conn){
-    std::cout << "New Connection Comes In" << std::endl;
+    logging::Get()->debug("New Connection Comes In");
     // Can add some extra features related code below
 }
 
 void ReactorServer::CloseConnecition(std::shared_ptr<ConnectionHandler> conn){
-    std::cout << "Connection Closed" << std::endl;
+    logging::Get()->debug("Connection Closed");
     // Can add some extra features related code below
 }
 
 void ReactorServer::Error(std::shared_ptr<ConnectionHandler> conn){
-    std::cout << "Error Function Called" << std::endl;
+    logging::Get()->warn("Error Function Called");
     // Can add some extra features related code below
 }
 
@@ -46,7 +47,7 @@ void ReactorServer::Error(std::shared_ptr<ConnectionHandler> conn){
 // split or merge application messages across callbacks. For proper message
 // framing, use HttpServer (HTTP framing) or WebSocket (frame-based protocol).
 void ReactorServer::ProcessMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message){
-    std::cout << "Thread Id: " << std::this_thread::get_id() << " Process Message: " << message << std::endl;
+    logging::Get()->debug("Process Message: {}", message);
 
     if(task_workers_.is_running() && (task_workers_.GetThreadWorkerNum() > 0)){
         // Use lambda with COPY-BY-VALUE capture for thread safety
@@ -81,6 +82,6 @@ void ReactorServer::OnMessage(std::shared_ptr<ConnectionHandler> conn, std::stri
 }
 
 void ReactorServer::SendComplete(std::shared_ptr<ConnectionHandler> conn){
-    std::cout << "Message Send Completed" << std::endl;
+    logging::Get()->debug("Message Send Completed");
     // Can add some feature related code below
 }

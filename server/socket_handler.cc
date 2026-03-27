@@ -1,4 +1,5 @@
 #include "socket_handler.h"
+#include "log/logger.h"
 
 
 SocketHandler::SocketHandler() : fd_(CreateSocket()), port_(0) {}
@@ -26,7 +27,7 @@ bool SocketHandler::SetKeepAlive(bool _flag){
 int SocketHandler::CreateSocket() {
     int listenfd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listenfd == -1) {
-        std::cout << "[Socket Handler] Invalid socket..." << std::endl;
+        logging::Get()->error("Failed to create socket");
         throw std::runtime_error("Invalid socket...");
     }
     SetNonBlocking(listenfd);
@@ -37,8 +38,7 @@ void SocketHandler::Bind(const InetAddr& _servAddr){
     if(::bind(fd_, _servAddr.Addr(), sizeof(sockaddr_in)) < 0){
         int saved_errno = errno;  // Save errno before any other calls
         Close();
-        std::cout << "[Socket Handler] Error occurred when binding port: "
-                  << strerror(saved_errno) << " (errno=" << saved_errno << ")" << std::endl;
+        logging::Get()->error("Bind failed: {} (errno={})", strerror(saved_errno), saved_errno);
         throw std::runtime_error(std::string("Error binding port: ") + strerror(saved_errno));
     }
 }
@@ -46,7 +46,7 @@ void SocketHandler::Bind(const InetAddr& _servAddr){
 void SocketHandler::Listen(int _maxLen){
     if(::listen(fd_, _maxLen) != 0){
         Close();
-        std::cout << "[Socket Handler] Error occurred when listening ..." << std::endl;
+        logging::Get()->error("Listen failed");
         throw std::runtime_error("Error occurred when listening ...");
     }
 }
@@ -69,14 +69,14 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
             return ACCEPT_CONN_ABORTED;
         }
         if(errno == EMFILE || errno == ENFILE) {
-            std::cerr << "[Socket Handler] Accept failed (fd exhaustion): " << strerror(errno) << std::endl;
+            logging::Get()->error("Accept failed (fd exhaustion): {}", strerror(errno));
             return ACCEPT_FD_EXHAUSTION;
         }
         if(errno == ENOBUFS || errno == ENOMEM) {
-            std::cerr << "[Socket Handler] Accept failed (memory pressure): " << strerror(errno) << std::endl;
+            logging::Get()->error("Accept failed (memory pressure): {}", strerror(errno));
             return ACCEPT_MEMORY_PRESSURE;
         }
-        std::cout << "[Socket Handler] Error occurred when accepting connection: " << strerror(errno) << std::endl;
+        logging::Get()->error("Accept failed: {}", strerror(errno));
         throw std::runtime_error(std::string("Error accepting connection: ") + strerror(errno));
     }
 #if defined(__APPLE__) || defined(__MACH__)
@@ -130,8 +130,8 @@ void SocketHandler::SetNonBlocking(int fd) {
             return;
         }
         // Other errors are unexpected - log them
-        std::cerr << "[Socket Handler] Unexpected error getting socket flags: "
-                  << strerror(errno) << " (errno=" << errno << ")" << std::endl;
+        logging::Get()->error("Unexpected error getting socket flags: {} (errno={})",
+                              strerror(errno), errno);
         throw std::runtime_error(std::string("Failed to get socket flags: ") + strerror(errno));
     }
 
@@ -141,8 +141,8 @@ void SocketHandler::SetNonBlocking(int fd) {
             // File descriptor closed between F_GETFL and F_SETFL
             return;
         }
-        std::cerr << "[Socket Handler] Unexpected error setting non-blocking mode: "
-                  << strerror(errno) << " (errno=" << errno << ")" << std::endl;
+        logging::Get()->error("Unexpected error setting non-blocking mode: {} (errno={})",
+                              strerror(errno), errno);
         throw std::runtime_error(std::string("Failed to set non-blocking mode: ") + strerror(errno));
     }
 
@@ -150,8 +150,7 @@ void SocketHandler::SetNonBlocking(int fd) {
 #ifdef SO_NOSIGPIPE
     int set = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set)) < 0) {
-        std::cerr << "[Socket Handler] Failed to set SO_NOSIGPIPE: "
-                  << strerror(errno) << std::endl;
+        logging::Get()->warn("Failed to set SO_NOSIGPIPE: {}", strerror(errno));
     }
 #endif
 }

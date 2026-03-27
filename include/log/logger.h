@@ -3,6 +3,7 @@
 #include "spdlog/spdlog.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/sinks/rotating_file_sink.h"
+#include "spdlog/sinks/basic_file_sink.h"
 
 #include <string>
 #include <memory>
@@ -29,6 +30,18 @@ std::shared_ptr<spdlog::logger> Get();
 // Accepts: "trace", "debug", "info", "warn", "error", "critical".
 // Returns spdlog::level::info for unrecognized strings.
 spdlog::level::level_enum ParseLevel(const std::string& level);
+
+// Set whether Init() creates a console (stdout) sink. Sticky: survives
+// subsequent Init() calls. Daemon mode sets this to false before Init()
+// so that HttpServer's re-Init() inherits the preference.
+void SetConsoleEnabled(bool enabled);
+
+// Close and reopen file sinks for log rotation (SIGHUP handler).
+// Reconstructs the logger with fresh file handles while preserving
+// console preference and log level. Thread-safe. No-op if no file
+// sink is configured or Init() has not been called.
+// Returns true on success, false on failure (old logger kept active).
+bool Reopen();
 
 // Flush all sinks and shut down the logging system.
 void Shutdown();

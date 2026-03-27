@@ -179,6 +179,10 @@ void HttpServer::Start() {
     net_server_.Start();
 }
 
+void HttpServer::SetReadyCallback(std::function<void()> cb) {
+    net_server_.SetReadyCallback(std::move(cb));
+}
+
 void HttpServer::Stop() {
     logging::Get()->info("HttpServer stopping");
 

@@ -1,6 +1,7 @@
 #include "dispatcher.h"
 #include "channel.h"
 #include "connection_handler.h"
+#include "log/logger.h"
 
 Dispatcher::Dispatcher() :
     ep_(std::unique_ptr<EventHandler>(new EventHandler())),
@@ -124,7 +125,7 @@ void Dispatcher::RunEventLoop(){
         for(auto& ch : channels) {
             if (!ch) {
                 // Skip null/expired channel entry
-                std::cerr << "[Dispatcher] Skipping null Channel in channels list" << std::endl;
+                logging::Get()->warn("Skipping null Channel in channels list");
                 continue;
             }
             try {
@@ -133,7 +134,7 @@ void Dispatcher::RunEventLoop(){
                 // Log error and tear down via the close callback so server maps
                 // (connections_, http_connections_) are properly cleaned up.
                 // Just calling CloseChannel() would leave stale entries.
-                std::cerr << "[Dispatcher] Error handling event: " << e.what() << std::endl;
+                logging::Get()->error("Error handling event: {}", e.what());
                 if (!ch->is_channel_closed()) {
                     // Invoke the close callback (wired to ConnectionHandler::CallCloseCb
                     // which handles channel close + server map cleanup + fd release)
@@ -153,9 +154,9 @@ void Dispatcher::RunEventLoop(){
         // Catch exceptions from WaitForEvent, TimerHandler, or timeout callbacks
         // that escape the inner try/catch. Without this, the dispatcher thread dies
         // and NetServer::Stop()'s barrier future.wait() hangs forever.
-        std::cerr << "[Dispatcher] Event loop error: " << e.what() << std::endl;
+        logging::Get()->error("Event loop error: {}", e.what());
       } catch (...) {
-        std::cerr << "[Dispatcher] Unknown event loop error" << std::endl;
+        logging::Get()->error("Unknown event loop error");
       }
     } // end of while(is_running())
 
@@ -243,13 +244,13 @@ void Dispatcher::WakeUp(){
     uint64_t val = 1;
     ssize_t n = ::write(eventfd_, &val, sizeof val);
     if (n != sizeof val) {
-        std::cerr << "[Dispatcher] eventfd write failed: " << strerror(errno) << std::endl;
+        logging::Get()->error("eventfd write failed: {}", strerror(errno));
     }
 #elif defined(__APPLE__) || defined(__MACH__)
     char buf = 1;
     ssize_t n = ::write(wakeup_pipe_[1], &buf, sizeof buf);  // Write to pipe[1]
     if (n != sizeof buf) {
-        std::cerr << "[Dispatcher] pipe write failed: " << strerror(errno) << std::endl;
+        logging::Get()->error("pipe write failed: {}", strerror(errno));
     }
 #endif
 }
@@ -259,7 +260,7 @@ void Dispatcher::HandleEventId(){
     uint64_t val;
     ssize_t n = ::read(eventfd_, &val, sizeof val);
     if (n != sizeof val) {
-        std::cerr << "[Dispatcher] eventfd read failed" << std::endl;
+        logging::Get()->error("eventfd read failed");
         return;
     }
 #elif defined(__APPLE__) || defined(__MACH__)
@@ -286,7 +287,7 @@ void Dispatcher::HandleEventId(){
         try {
             fn();
         } catch (const std::exception& e) {
-            std::cerr << "[Dispatcher] Task execution error: " << e.what() << std::endl;
+            logging::Get()->error("Task execution error: {}", e.what());
         }
     }
 }
@@ -340,7 +341,7 @@ void Dispatcher::TimerHandler(){
     TimeStamp::ResetTimerFd(timer_fd_, end_t_);
 
     if(is_sock_dispatcher()){
-        std::cout << "[Dispatcher - " << std::this_thread::get_id() << "]: reset timer" << std::endl;
+        logging::Get()->trace("Dispatcher: reset timer");
 
         // Collect all timed-out connection fds first to avoid iterator invalidation
         // No mutex needed: AddConnection/RemoveTimerConnection/TimerHandler all run

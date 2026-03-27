@@ -1,4 +1,5 @@
 #include "cli/cli_parser.h"
+#include "cli/daemonizer.h"
 #include "cli/signal_handler.h"
 #include "cli/pid_file.h"
 #include "cli/version.h"
@@ -14,6 +15,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#if !defined(_WIN32)
+#include <syslog.h>
+#endif
 
 static constexpr int EXIT_OK          = 0;
 static constexpr int EXIT_ERROR       = 1;
@@ -112,30 +116,125 @@ MakeHealthHandler(std::chrono::steady_clock::time_point start_time) {
     };
 }
 
+// ── Daemon path helper: reject relative paths (CWD changes to "/") ──
+static bool RequireAbsolutePath(const std::string& path, const char* description) {
+    if (!path.empty() && path[0] != '/') {
+        std::cerr << "Error: daemon mode requires an absolute "
+                  << description << " path\n";
+        return false;
+    }
+    return true;
+}
+
+// ── Validate daemon-specific constraints ─────────────────────────
+// Shared between HandleStart (runtime) and validate -d (dry-run).
+// Returns EXIT_OK on success, EXIT_ERROR on failure.
+static int ValidateDaemonConfig(const ServerConfig& config,
+                                const CliOptions& options) {
+    if (config.log.file.empty()) {
+        std::cerr << "Error: daemon mode requires a log file "
+                  << "(set log.file in config or REACTOR_LOG_FILE env var)\n";
+        return EXIT_ERROR;
+    }
+    if (!RequireAbsolutePath(config.log.file, "log file") ||
+        !RequireAbsolutePath(options.pid_file, "PID file")) {
+        return EXIT_ERROR;
+    }
+    if (config.tls.enabled) {
+        if (!RequireAbsolutePath(config.tls.cert_file, "TLS cert file") ||
+            !RequireAbsolutePath(config.tls.key_file, "TLS key file")) {
+            return EXIT_ERROR;
+        }
+    }
+    return EXIT_OK;
+}
+
 // ── Handle start command ─────────────────────────────────────────
 static int HandleStart(const CliOptions& options) {
     ServerConfig config;
     int rc = LoadConfig(config, options);
     if (rc != EXIT_OK) return rc;
 
+    // ── Daemon pre-validation ───────────────────────────────
+    if (options.daemonize) {
+        rc = ValidateDaemonConfig(config, options);
+        if (rc != EXIT_OK) return rc;
+    }
+
+    // ── Daemonize (if requested) ────────────────────────────
+    // MUST happen: after config validation, before PidFile/signals/logging
+#if !defined(_WIN32)
+    if (options.daemonize) {
+        Daemonizer::Daemonize();
+        // We are now the grandchild daemon process.
+        // stdin/stdout/stderr -> /dev/null, CWD -> "/", new session.
+
+        // Early logging init so PidFile/SignalHandler failures are logged
+        // to the file sink (stderr is /dev/null after fork). HttpServer's
+        // constructor will re-Init() which is safe — it replaces the logger.
+        logging::SetConsoleEnabled(false);
+        try {
+            logging::Init("reactor", logging::ParseLevel(config.log.level),
+                          config.log.file, config.log.max_file_size, config.log.max_files);
+        } catch (const std::exception& e) {
+            // stderr is /dev/null, but try syslog as last resort for debugging
+            syslog(LOG_ERR, "%s: failed to initialize logging: %s",
+                   REACTOR_SERVER_NAME, e.what());
+            Daemonizer::NotifyFailed();
+            _exit(EXIT_ERROR);
+        } catch (...) {
+            syslog(LOG_ERR, "%s: failed to initialize logging (unknown error)",
+                   REACTOR_SERVER_NAME);
+            Daemonizer::NotifyFailed();
+            _exit(EXIT_ERROR);
+        }
+    }
+#else
+    if (options.daemonize) {
+        std::cerr << "Error: daemon mode is not supported on this platform\n";
+        return EXIT_ERROR;
+    }
+#endif
+
+    // Helper: notify daemon parent of failure before returning an error.
+    // No-op in foreground mode (NotifyFailed checks the pipe fd).
+    auto daemon_fail = [&]() {
+#if !defined(_WIN32)
+        if (options.daemonize) Daemonizer::NotifyFailed();
+#endif
+    };
+
+    // ── PID file ────────────────────────────────────────────
     if (!PidFile::Acquire(options.pid_file)) {
+        if (options.daemonize) {
+            logging::Get()->error("Failed to acquire PID file: {}", options.pid_file);
+        }
+        daemon_fail();
         return EXIT_ERROR;
     }
     std::atexit(PidFile::Release);
 
+    // ── Signal handler ──────────────────────────────────────
     try {
-        SignalHandler::Install();
+        SignalHandler::Install(options.daemonize);
     } catch (const std::runtime_error& e) {
-        std::cerr << "Error setting up signal handler: " << e.what() << "\n";
+        if (options.daemonize) {
+            logging::Get()->error("Signal handler setup failed: {}", e.what());
+        } else {
+            std::cerr << "Error setting up signal handler: " << e.what() << "\n";
+        }
+        daemon_fail();
         return EXIT_ERROR;
     }
 
+    // ── Server construction ─────────────────────────────────
     int exit_code = EXIT_OK;
     std::unique_ptr<HttpServer> server;
     try {
         server = std::make_unique<HttpServer>(config);
     } catch (const std::exception& e) {
         logging::Get()->error("Fatal error: {}", e.what());
+        daemon_fail();
         SignalHandler::Cleanup();
         logging::Shutdown();
         return EXIT_ERROR;
@@ -150,6 +249,9 @@ static int HandleStart(const CliOptions& options) {
             : "disabled");
     logging::Get()->info("  Workers: {}", config.worker_threads);
     logging::Get()->info("  PID:     {} ({})", getpid(), options.pid_file);
+    if (options.daemonize) {
+        logging::Get()->info("  Mode:    daemon");
+    }
 
     if (options.health_endpoint) {
         auto start_time = std::chrono::steady_clock::now();
@@ -157,13 +259,32 @@ static int HandleStart(const CliOptions& options) {
         logging::Get()->info("  Health:  /health");
     }
 
+    // ── Wire daemon readiness to fire after init, before event loop ──
+#if !defined(_WIN32)
+    if (options.daemonize) {
+        server->SetReadyCallback([]() {
+            Daemonizer::NotifyReady();
+        });
+    }
+#endif
+
+    // ── Server thread ───────────────────────────────────────
     std::exception_ptr server_error;
     std::atomic<bool> server_failed{false};
-    std::thread server_thread([&server, &server_error, &server_failed]() {
+    std::thread server_thread([&server, &server_error, &server_failed
+#if !defined(_WIN32)
+                                , &options
+#endif
+                               ]() {
         try {
             server->Start();
         } catch (...) {
             server_error = std::current_exception();
+#if !defined(_WIN32)
+            // If Start() throws before the ready callback fires (init failure),
+            // notify the daemon parent of failure so it doesn't hang.
+            if (options.daemonize) Daemonizer::NotifyFailed();
+#endif
             if (!SignalHandler::ShutdownRequested()) {
                 server_failed.store(true, std::memory_order_release);
                 kill(getpid(), SIGTERM);
@@ -171,9 +292,31 @@ static int HandleStart(const CliOptions& options) {
         }
     });
 
+    // ── Signal loop ─────────────────────────────────────────
     logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
-    SignalHandler::WaitForShutdown();
+    while (true) {
+        SignalResult sig = SignalHandler::WaitForSignal();
+        if (sig == SignalResult::SHUTDOWN) break;
+        // SIGHUP received
+        if (options.daemonize) {
+            // Daemon mode: reopen log files for rotation
+            logging::Get()->info("Received SIGHUP, reopening log files");
+            if (logging::Reopen()) {
+                logging::Get()->info("Log files reopened");
+            } else {
+                logging::Get()->warn("Log file reopen failed, continuing with old file");
+            }
+        } else {
+            // Foreground mode: treat SIGHUP as shutdown (terminal hangup).
+            // Must mark shutdown so the server thread's catch block recognizes
+            // this as an expected stop, not a server failure.
+            logging::Get()->info("Received SIGHUP (terminal hangup), shutting down");
+            SignalHandler::MarkShutdownRequested();
+            break;
+        }
+    }
 
+    // ── Shutdown ────────────────────────────────────────────
     logging::Get()->info("{} shutting down...", REACTOR_SERVER_NAME);
     server->Stop();
 
@@ -230,6 +373,15 @@ int main(int argc, char* argv[]) {
             ServerConfig config;
             int rc = LoadConfig(config, options);
             if (rc != EXIT_OK) return rc;
+            if (options.daemonize) {
+#if defined(_WIN32)
+                std::cerr << "Error: daemon mode is not supported on this platform\n";
+                return EXIT_ERROR;
+#else
+                rc = ValidateDaemonConfig(config, options);
+                if (rc != EXIT_OK) return rc;
+#endif
+            }
             std::cout << "Configuration is valid.\n";
             return EXIT_OK;
         }

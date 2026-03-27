@@ -39,6 +39,10 @@ public:
     void Start();  // Blocks in event loop
     void Stop();
 
+    // Called after init completes but before the blocking event loop.
+    // Used by daemon mode to signal readiness to the parent process.
+    void SetReadyCallback(std::function<void()> cb);
+
 private:
     NetServer net_server_;
     HttpRouter router_;

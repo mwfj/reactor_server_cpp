@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all tests (114 tests across 10 suites)
+make test               # Build and run all tests (133 tests across 11 suites)
 ./run                   # Run all tests directly (after building)
 
 # Individual test suites
@@ -43,8 +43,8 @@ make test_cli           # Build and run CLI tests
 | HTTP | 13 | 10201 | `test/http_test.h` | `./run http` |
 | WebSocket | 10 | 10301 | `test/websocket_test.h` | `./run ws` |
 | TLS | 2 | 10401 | `test/tls_test.h` | `./run tls` |
-| HTTP/2 | 31 | 10500 | `test/http2_test.h` | `./run http2` |
-| CLI | 31 | N/A | `test/cli_test.h` | `./run cli` |
+| HTTP/2 | 32 | 10500 | `test/http2_test.h` | `./run http2` |
+| CLI | 50 | N/A | `test/cli_test.h` | `./run cli` |
 
 ### Basic Tests (port 9888)
 - Single client connection
@@ -171,7 +171,7 @@ OVERALL SUMMARY
   Race Condition Tests: 7/7 (100%)
   ...
 ----------------------------------------------------------------------
-Total Tests: 114 | Passed: 114 | Failed: 0
+Total Tests: 133 | Passed: 133 | Failed: 0
 Success Rate: 100%
 ======================================================================
 ```
