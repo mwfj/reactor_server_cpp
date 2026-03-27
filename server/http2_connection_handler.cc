@@ -93,19 +93,17 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
         session_->SendPendingFrames();
 
         // Update deadline based on what initial_data contained:
-        // - If streams are still open → reset deadline (active request)
-        // - If streams opened AND completed → clear deadline (idle keep-alive)
-        // - If no streams opened (preface-only) → keep deadline armed
-        //   (client must send a request within request_timeout_sec)
-        if (request_timeout_sec_ > 0 && session_->ActiveStreamCount() > 0) {
-            conn_->SetDeadline(std::chrono::steady_clock::now() +
-                               std::chrono::seconds(request_timeout_sec_));
-        } else if (request_timeout_sec_ > 0 && session_->LastStreamId() > 0 &&
-                   session_->ActiveStreamCount() == 0) {
-            // Streams were processed and completed — idle keep-alive
-            conn_->ClearDeadline();
+        if (request_timeout_sec_ > 0) {
+            if (session_->ActiveStreamCount() > 0 && !deadline_armed_) {
+                conn_->SetDeadline(std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(request_timeout_sec_));
+                deadline_armed_ = true;
+            } else if (session_->ActiveStreamCount() == 0 && session_->LastStreamId() > 0) {
+                conn_->ClearDeadline();
+                deadline_armed_ = false;
+            }
+            // else: preface-only, no streams seen yet — keep original deadline
         }
-        // else: preface-only, no streams seen yet — keep original deadline
     }
 }
 
@@ -133,19 +131,21 @@ void Http2ConnectionHandler::OnRawData(
     // Send pending frames (responses, WINDOW_UPDATEs, etc.)
     session_->SendPendingFrames();
 
-    // Manage deadline based on active stream count:
-    // - If streams are open, reset the deadline (data arrived, connection active)
-    // - If streams were opened and all completed, clear deadline (idle keep-alive)
-    // - If no streams ever opened yet, keep deadline armed (pre-request timeout)
+    // Manage deadline based on active stream count.
+    // Unlike the HTTP/1.x inactivity-based refresh, we use an absolute deadline:
+    // set once when the first incomplete stream appears, never refreshed by
+    // subsequent data. This prevents a client from keeping a stalled stream
+    // alive indefinitely by drip-feeding frames on other streams.
+    // Cleared when all streams complete (idle keep-alive → idle_timeout governs).
     if (request_timeout_sec_ > 0) {
-        if (session_->ActiveStreamCount() > 0) {
+        if (session_->ActiveStreamCount() > 0 && !deadline_armed_) {
             conn_->SetDeadline(std::chrono::steady_clock::now() +
                                std::chrono::seconds(request_timeout_sec_));
-        } else if (session_->LastStreamId() > 0) {
-            // Streams were seen and all completed — idle keep-alive
+            deadline_armed_ = true;
+        } else if (session_->ActiveStreamCount() == 0 && session_->LastStreamId() > 0) {
             conn_->ClearDeadline();
+            deadline_armed_ = false;
         }
-        // else: no streams ever opened (preface/SETTINGS/PING only) — keep deadline
     }
 
     // Check if session wants to close

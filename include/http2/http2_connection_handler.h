@@ -53,6 +53,7 @@ private:
     int request_timeout_sec_ = 0;
 
     bool initialized_ = false;
+    bool deadline_armed_ = false;  // true while an absolute request deadline is active
 
     // Internal: called after ReceiveData; a no-op since dispatch is
     // synchronous inside nghttp2 callbacks.

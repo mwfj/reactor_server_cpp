@@ -250,6 +250,51 @@ static int OnFrameRecvCallback(
                 stream->MarkRejected();
                 break;
             }
+            // Early reject: if content-length exceeds body size limit, RST now
+            // instead of waiting for DATA frames that will be rejected anyway.
+            // Prevents stream slot exhaustion from impossible uploads.
+            if (self->MaxBodySize() > 0 && req.content_length > self->MaxBodySize()) {
+                logging::Get()->warn("HTTP/2 stream {} content-length {} exceeds max body size {}",
+                                     frame->hd.stream_id, req.content_length, self->MaxBodySize());
+                nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                          frame->hd.stream_id, NGHTTP2_CANCEL);
+                stream->MarkRejected();
+                break;
+            }
+
+            // Handle Expect: 100-continue (RFC 9110 Section 10.1.1).
+            // HTTP/2 clients may wait for 100 before sending the body.
+            // Must respond before END_STREAM to avoid stalling the upload.
+            if (req.HasHeader("expect")) {
+                std::string expect = req.GetHeader("expect");
+                std::transform(expect.begin(), expect.end(), expect.begin(), ::tolower);
+                while (!expect.empty() && (expect.front() == ' ' || expect.front() == '\t'))
+                    expect.erase(expect.begin());
+                while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
+                    expect.pop_back();
+                if (expect == "100-continue") {
+                    // Send 100 Continue — the client can proceed with body
+                    nghttp2_nv nva_100[] = {
+                        {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
+                         const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("100")),
+                         7, 3, NGHTTP2_NV_FLAG_NONE}
+                    };
+                    nghttp2_submit_headers(session, NGHTTP2_FLAG_NONE,
+                                           frame->hd.stream_id, nullptr,
+                                           nva_100, 1, nullptr);
+                } else {
+                    // Unsupported Expect value — reject with 417
+                    nghttp2_nv nva_417[] = {
+                        {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
+                         const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("417")),
+                         7, 3, NGHTTP2_NV_FLAG_NONE}
+                    };
+                    nghttp2_submit_response2(session, frame->hd.stream_id,
+                                             nva_417, 1, nullptr);
+                    stream->MarkRejected();
+                    break;
+                }
+            }
         }
         // else: NGHTTP2_HCAT_HEADERS = trailing headers (trailers).
         // We don't process trailer content, but we do need to check END_STREAM.
