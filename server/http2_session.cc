@@ -96,16 +96,47 @@ static int OnHeaderCallback(
         logging::Get()->warn("HTTP/2 stream {} header list size ({}) exceeds limit ({})",
                              frame->hd.stream_id, stream->AccumulatedHeaderSize(),
                              self->MaxHeaderListSize());
-        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
-    }
-
-    // Only process header values for request headers (not trailers)
-    if (frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
+        stream->MarkRejected();
+        nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                  frame->hd.stream_id, NGHTTP2_ENHANCE_YOUR_CALM);
         return 0;
     }
 
     std::string hdr_name(reinterpret_cast<const char*>(name), namelen);
     std::string hdr_value(reinterpret_cast<const char*>(value), valuelen);
+
+    // Helper: mark stream rejected, submit RST_STREAM(PROTOCOL_ERROR), return 0.
+    // We use explicit RST + return 0 instead of NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE
+    // because TEMPORAL makes nghttp2 send RST(INTERNAL_ERROR), which misrepresents
+    // client protocol violations as server faults. MarkRejected() prevents
+    // OnFrameRecvCallback from dispatching the malformed request.
+    auto reject_protocol_error = [&]() -> int {
+        stream->MarkRejected();
+        nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                  frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
+        return 0;
+    };
+
+    // RFC 9113 Section 8.1: trailers MUST NOT contain pseudo-headers.
+    // Forbidden connection-level headers are still invalid in trailers.
+    if (frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
+        if (!hdr_name.empty() && hdr_name[0] == ':') {
+            logging::Get()->warn("HTTP/2 stream {} pseudo-header in trailers: {}",
+                                 frame->hd.stream_id, hdr_name);
+            return reject_protocol_error();
+        }
+        if (hdr_name == "connection" || hdr_name == "keep-alive" ||
+            hdr_name == "proxy-connection" || hdr_name == "transfer-encoding" ||
+            hdr_name == "upgrade" || hdr_name == "te") {
+            logging::Get()->warn("HTTP/2 stream {} forbidden header in trailers: {}",
+                                 frame->hd.stream_id, hdr_name);
+            return reject_protocol_error();
+        }
+        // Valid trailer field — discard content (application doesn't use trailers)
+        return 0;
+    }
+
+    // --- Request headers below ---
 
     // Validate forbidden HTTP/2 connection-level headers (RFC 9113 Section 8.2.2)
     if (hdr_name == "connection" || hdr_name == "keep-alive" ||
@@ -113,13 +144,7 @@ static int OnHeaderCallback(
         hdr_name == "upgrade") {
         logging::Get()->warn("HTTP/2 stream {} received forbidden header: {}",
                              frame->hd.stream_id, hdr_name);
-        int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                           frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
-        if (rv < 0) {
-            logging::Get()->error("nghttp2_submit_rst_stream failed: {}", nghttp2_strerror(rv));
-            return NGHTTP2_ERR_CALLBACK_FAILURE;
-        }
-        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+        return reject_protocol_error();
     }
 
     // TE header: only "trailers" is allowed in HTTP/2 (RFC 9113 Section 8.2.2).
@@ -130,13 +155,7 @@ static int OnHeaderCallback(
         if (te_lower != "trailers") {
             logging::Get()->warn("HTTP/2 stream {} received invalid TE value: {}",
                                  frame->hd.stream_id, hdr_value);
-            int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                               frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
-            if (rv < 0) {
-                logging::Get()->error("nghttp2_submit_rst_stream failed: {}", nghttp2_strerror(rv));
-                return NGHTTP2_ERR_CALLBACK_FAILURE;
-            }
-            return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+            return reject_protocol_error();
         }
     }
 
@@ -144,14 +163,7 @@ static int OnHeaderCallback(
     if (add_rv != 0) {
         logging::Get()->warn("HTTP/2 stream {} invalid header value for: {}",
                              frame->hd.stream_id, hdr_name);
-        int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                           frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
-        if (rv < 0) {
-            logging::Get()->error("nghttp2_submit_rst_stream failed: {}",
-                                  nghttp2_strerror(rv));
-            return NGHTTP2_ERR_CALLBACK_FAILURE;
-        }
-        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+        return reject_protocol_error();
     }
     return 0;
 }

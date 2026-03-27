@@ -106,6 +106,9 @@ private:
     size_t accumulated_header_size_ = 0;
     bool rejected_ = false;
     bool has_content_length_ = false;
+    bool seen_regular_header_ = false;  // true after first non-pseudo header
+    bool has_method_ = false;
+    bool has_path_ = false;
     bool has_scheme_ = false;
     std::string scheme_;
     bool has_authority_ = false;

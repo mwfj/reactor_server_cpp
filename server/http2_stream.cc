@@ -12,11 +12,22 @@ Http2Stream::Http2Stream(int32_t stream_id)
 Http2Stream::~Http2Stream() = default;
 
 int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
-    // Handle pseudo-headers (RFC 9113 Section 8.3.1)
+    // Handle pseudo-headers (RFC 9113 Section 8.3)
     if (!name.empty() && name[0] == ':') {
+        // RFC 9113 Section 8.3: pseudo-headers MUST appear before all
+        // regular header fields. A pseudo-header after a regular header
+        // is malformed.
+        if (seen_regular_header_) {
+            return -1;  // Late pseudo-header
+        }
+
         if (name == ":method") {
+            if (has_method_) return -1;  // Duplicate
+            has_method_ = true;
             request_.method = value;
         } else if (name == ":path") {
+            if (has_path_) return -1;  // Duplicate
+            has_path_ = true;
             request_.url = value;
             // Split path and query
             auto qpos = value.find('?');
@@ -28,16 +39,23 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
                 request_.query.clear();
             }
         } else if (name == ":authority") {
-            // Map :authority to Host header (RFC 9113 Section 8.3.1)
+            if (has_authority_) return -1;  // Duplicate
             has_authority_ = true;
             authority_ = value;
             request_.headers["host"] = value;
         } else if (name == ":scheme") {
+            if (has_scheme_) return -1;  // Duplicate
             has_scheme_ = true;
             scheme_ = value;
+        } else {
+            // Unknown pseudo-header — malformed per RFC 9113 Section 8.3
+            return -1;
         }
         return 0;
     }
+
+    // First regular header — mark transition
+    seen_regular_header_ = true;
 
     // Regular headers — store lowercase (matching HTTP/1.x convention)
     std::string lower_name = name;

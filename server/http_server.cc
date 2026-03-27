@@ -371,7 +371,11 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
     std::shared_ptr<HttpConnectionHandler> http_conn;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        pending_detection_.erase(conn->fd());
+        // Only erase pending detection if it belongs to THIS connection
+        auto pd_it = pending_detection_.find(conn->fd());
+        if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
+            pending_detection_.erase(pd_it);
+        }
         auto h2_it = h2_connections_.find(conn->fd());
         if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
             h2_connections_.erase(h2_it);
@@ -394,7 +398,11 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
     std::shared_ptr<HttpConnectionHandler> http_conn;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        pending_detection_.erase(conn->fd());
+        // Only erase pending detection if it belongs to THIS connection
+        auto pd_it = pending_detection_.find(conn->fd());
+        if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
+            pending_detection_.erase(pd_it);
+        }
         auto h2_it = h2_connections_.find(conn->fd());
         if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
             h2_connections_.erase(h2_it);
