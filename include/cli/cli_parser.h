@@ -38,6 +38,9 @@ struct CliOptions {
     // Health endpoint
     bool health_endpoint = true;
 
+    // Daemon mode
+    bool daemonize = false;
+
     // -V flag (verbose version)
     bool version_verbose = false;
 };

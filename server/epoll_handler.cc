@@ -2,10 +2,11 @@
 
 #include "epoll_handler.h"
 #include "channel.h"
+#include "log/logger.h"
 
 EpollHandler::EpollHandler(){
     if((epollfd_ = ::epoll_create(1)) == -1){
-        std::cout << "[Epoll Handler] epoll_create failed: " << strerror(errno) << std::endl;
+        logging::Get()->error("epoll_create failed: {}", strerror(errno));
         throw std::runtime_error("Epoll created failed");
     }
 }
@@ -43,7 +44,7 @@ void EpollHandler::UpdateEvent(std::shared_ptr<Channel> ch){
             if (errno == EBADF || errno == ENOENT) {
                 return;  // Gracefully handle race condition
             }
-            std::cout << "[Epoll Handler] epoll_ctl MOD failed: " << strerror(errno) << std::endl;
+            logging::Get()->error("epoll_ctl MOD failed: {}", strerror(errno));
             throw std::runtime_error("epoll_ctl MOD failed");
         }
     }else{
@@ -52,7 +53,7 @@ void EpollHandler::UpdateEvent(std::shared_ptr<Channel> ch){
             if (errno == EBADF || errno == EEXIST) {
                 return;  // Gracefully handle race condition
             }
-            std::cout << "[Epoll Handler] epoll_ctl ADD failed: " << strerror(errno) << std::endl;
+            logging::Get()->error("epoll_ctl ADD failed: {}", strerror(errno));
             throw std::runtime_error("epoll_ctl ADD failed");
         }
         ch->SetEventRead();
@@ -78,8 +79,7 @@ void EpollHandler::RemoveChannel(std::shared_ptr<Channel> ch){
             // EBADF means fd is invalid (already closed)
             // Both are ok - we just want to ensure it's not in epoll
             if(errno != ENOENT && errno != EBADF){
-                std::cout << "[EpollHandler] epoll_ctl DEL warning for fd=" << fd
-                          << ": " << strerror(errno) << std::endl;
+                logging::Get()->warn("epoll_ctl DEL warning fd={}: {}", fd, strerror(errno));
             }
         }
     }
@@ -106,7 +106,7 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
             // Interrupted by signal — not an error, just return empty
             return channels;
         }
-        std::cout << "[Epoll Handler] epoll_wait() failed: " << strerror(errno) << std::endl;
+        logging::Get()->error("epoll_wait() failed: {}", strerror(errno));
         throw std::runtime_error("epoll_wait() failed");
     }
 
