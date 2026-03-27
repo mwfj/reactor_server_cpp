@@ -944,6 +944,39 @@ void TestStreamAddRegularHeaders() {
     }
 }
 
+void TestStreamInvalidHeaders() {
+    std::cout << "\n[TEST] Http2Stream: invalid header values rejected..." << std::endl;
+    try {
+        bool pass = true;
+        std::string err;
+
+        {
+            Http2Stream stream(4);
+            int rv = stream.AddHeader("content-length", "not-a-number");
+            if (rv == 0) {
+                pass = false;
+                err += "invalid content-length accepted; ";
+            }
+        }
+
+        {
+            Http2Stream stream(6);
+            int rv1 = stream.AddHeader(":authority", "example.com");
+            int rv2 = stream.AddHeader("host", "other.example.com");
+            if (rv1 != 0 || rv2 == 0) {
+                pass = false;
+                err += "conflicting :authority/host not rejected; ";
+            }
+        }
+
+        TestFramework::RecordTest("Http2Stream: invalid headers rejected", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("Http2Stream: invalid headers rejected", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestStreamCookieConcatenation() {
     std::cout << "\n[TEST] Http2Stream: cookie headers concatenated with \"; \"..." << std::endl;
     try {
@@ -1867,6 +1900,7 @@ void RunAllTests() {
     // --- Category 3: Http2Stream ---
     TestStreamAddPseudoHeaders();
     TestStreamAddRegularHeaders();
+    TestStreamInvalidHeaders();
     TestStreamCookieConcatenation();
     TestStreamBodyAppend();
     TestStreamLifecycle();
