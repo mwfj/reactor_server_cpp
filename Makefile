@@ -125,7 +125,7 @@ clean:
 	rm -rf $(TARGET)* $(SERVER_TARGET) $(LLHTTP_OBJ)
 
 # Run all tests
-test: $(TARGET)
+test: $(TARGET) $(SERVER_TARGET)
 	@echo "Running test suite..."
 	./$(TARGET)
 
@@ -165,7 +165,7 @@ test_tls: $(TARGET)
 	./$(TARGET) tls
 
 # Run only CLI entry point tests
-test_cli: $(TARGET)
+test_cli: $(TARGET) $(SERVER_TARGET)
 	@echo "Running CLI tests only..."
 	./$(TARGET) cli
 
