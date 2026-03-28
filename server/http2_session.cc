@@ -103,6 +103,11 @@ static int OnHeaderCallback(
     auto* stream = self->FindStream(frame->hd.stream_id);
     if (!stream) return 0;
 
+    // Skip remaining headers if this stream was already rejected (RST queued).
+    // Without this, a malformed HEADERS block continues accumulating strings
+    // past the configured limit until the block ends.
+    if (stream->IsRejected()) return 0;
+
     // Enforce max_header_list_size on ALL header frames (request + trailers).
     // RFC 7541 Section 4.1: entry size = name + value + 32.
     // nghttp2 advertises this in SETTINGS but does NOT enforce it on the receive side.
