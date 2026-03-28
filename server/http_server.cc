@@ -469,8 +469,11 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         if (already_initialized) return;
     }
 
-    // Arm a connection-level deadline covering the TLS handshake + first request
-    // / protocol detection. Prevents slow-drip attacks during the detection window.
+    // Arm a connection-level deadline for the TLS handshake + protocol detection
+    // window. The protocol handler resets this once it takes over, so the total
+    // exposure is up to 2× request_timeout_sec (handshake + first request).
+    // This is intentional: separating handshake and request timeouts is standard
+    // (cf. nginx ssl_handshake_timeout vs client_header_timeout).
     if (request_timeout_sec_ > 0) {
         conn->SetDeadline(std::chrono::steady_clock::now() +
                           std::chrono::seconds(request_timeout_sec_));

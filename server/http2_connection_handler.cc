@@ -73,7 +73,7 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
             session_->SendPendingFrames();
         }
         if (session_->ActiveStreamCount() == 0) {
-            NotifyDrainComplete();
+            conn_->CloseAfterWrite();  // OnSendComplete fires NotifyDrainComplete
             return;
         }
     }
@@ -107,11 +107,13 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
                 return false;
             }
 
-            // During shutdown: if all active streams completed, drain complete.
+            // During shutdown: if all active streams completed, start flushing.
+            // NotifyDrainComplete deferred to OnSendComplete (wire drain).
             if (self->shutdown_requested_.load(std::memory_order_acquire) &&
-                self->session_->ActiveStreamCount() == 0) {
-                self->NotifyDrainComplete();
-                return false;
+                self->session_->ActiveStreamCount() == 0 &&
+                !self->drain_notified_) {
+                self->conn_->CloseAfterWrite();
+                return true;  // keep alive until OnSendComplete fires
             }
 
             // During shutdown drain, keep alive until all streams finish
@@ -215,10 +217,12 @@ void Http2ConnectionHandler::OnRawData(
         return;
     }
 
-    // During shutdown drain: close once all active streams have completed.
+    // During shutdown drain: when all streams complete, start flushing.
+    // NotifyDrainComplete is deferred to OnSendComplete (buffer drained
+    // to zero) so the drain set isn't released until bytes are on the wire.
     if (shutdown_requested_.load(std::memory_order_acquire) &&
-        session_->ActiveStreamCount() == 0) {
-        NotifyDrainComplete();
+        session_->ActiveStreamCount() == 0 && !drain_notified_) {
+        conn_->CloseAfterWrite();
     }
 }
 
@@ -240,9 +244,10 @@ void Http2ConnectionHandler::RequestShutdown() {
             self->session_->SendPendingFrames();
         }
 
-        // If already idle, complete drain immediately
+        // If already idle, start flushing GOAWAY. NotifyDrainComplete
+        // fires from OnSendComplete when bytes reach the wire.
         if (self->session_->ActiveStreamCount() == 0) {
-            self->NotifyDrainComplete();
+            self->conn_->CloseAfterWrite();
         }
         // else: active streams exist — drain continues via OnRawData.
         // They'll call NotifyDrainComplete when ActiveStreamCount() == 0.
@@ -265,6 +270,15 @@ void Http2ConnectionHandler::NotifyDrainComplete() {
 }
 
 void Http2ConnectionHandler::OnSendComplete() {
+    // Output buffer drained to zero. If shutdown drain is active and all
+    // streams completed, this is the true drain-complete point — bytes are
+    // on the wire, not just serialized by nghttp2.
+    if (shutdown_requested_.load(std::memory_order_acquire) &&
+        session_ && session_->ActiveStreamCount() == 0) {
+        NotifyDrainComplete();
+        return;
+    }
+
     if (!session_ || !session_->HasDeferredOutput()) return;
     if (resume_scheduled_) return;
 
@@ -279,10 +293,12 @@ void Http2ConnectionHandler::OnSendComplete() {
         self->resume_scheduled_ = false;
         if (self->session_) {
             self->session_->ResumeOutput();
-            // Check if this resume completed the last stream during shutdown
+            // If resume completed the last stream during shutdown,
+            // start flushing. NotifyDrainComplete fires from OnSendComplete.
             if (self->shutdown_requested_.load(std::memory_order_acquire) &&
-                self->session_->ActiveStreamCount() == 0) {
-                self->NotifyDrainComplete();
+                self->session_->ActiveStreamCount() == 0 &&
+                !self->drain_notified_) {
+                self->conn_->CloseAfterWrite();
             }
         }
     });
