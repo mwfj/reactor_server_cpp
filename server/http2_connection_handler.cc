@@ -65,19 +65,6 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
     // Send server connection preface (SETTINGS)
     session_->SendServerPreface();
 
-    // If shutdown was requested before session_ existed (race with Stop()),
-    // replay the shutdown now that the session is ready.
-    if (shutdown_requested_.load(std::memory_order_acquire)) {
-        if (!session_->IsGoawaySent()) {
-            session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
-            session_->SendPendingFrames();
-        }
-        if (session_->ActiveStreamCount() == 0) {
-            conn_->CloseAfterWrite();  // OnSendComplete fires NotifyDrainComplete
-            return;
-        }
-    }
-
     // Install HTTP/2 deadline timeout callback. Always installed (not gated
     // on request_timeout_sec_) because it also handles shutdown drain logic.
     // Per-stream RST only runs when request_timeout_sec_ > 0.
@@ -166,6 +153,19 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
         session_->SendPendingFrames();
 
         UpdateDeadline();
+    }
+
+    // If shutdown was requested before session_ existed (race with Stop()),
+    // replay the shutdown now. Done AFTER initial_data processing so any
+    // buffered request is dispatched before GOAWAY closes the session.
+    if (shutdown_requested_.load(std::memory_order_acquire)) {
+        if (!session_->IsGoawaySent()) {
+            session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
+            session_->SendPendingFrames();
+        }
+        if (session_->ActiveStreamCount() == 0) {
+            conn_->CloseAfterWrite();
+        }
     }
 }
 
@@ -274,38 +274,41 @@ void Http2ConnectionHandler::NotifyDrainComplete() {
 }
 
 void Http2ConnectionHandler::OnSendComplete() {
-    // Output buffer drained to zero. If shutdown drain is active and all
-    // streams completed, this is the true drain-complete point — bytes are
-    // on the wire, not just serialized by nghttp2.
+    if (!session_) return;
+
+    // If deferred output exists, resume first — there may be GOAWAY or
+    // response tail frames that need to flush before we can declare drain.
+    if (session_->HasDeferredOutput()) {
+        if (resume_scheduled_) return;
+        resume_scheduled_ = true;
+        std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
+        conn_->RunOnDispatcher([weak_self]() {
+            auto self = weak_self.lock();
+            if (!self) return;
+            self->resume_scheduled_ = false;
+            if (self->session_) {
+                self->session_->ResumeOutput();
+                // After resume, if shutdown drain is done, start flushing
+                if (self->shutdown_requested_.load(std::memory_order_acquire) &&
+                    self->session_->ActiveStreamCount() == 0 &&
+                    !self->session_->HasDeferredOutput() &&
+                    !self->drain_notified_) {
+                    self->NotifyDrainComplete();
+                }
+            }
+        });
+        return;
+    }
+
+    // Output buffer drained to zero and no deferred frames. If shutdown
+    // drain is active and all streams completed, this is the true
+    // drain-complete point — all bytes are on the wire.
     if (shutdown_requested_.load(std::memory_order_acquire) &&
-        session_ && session_->ActiveStreamCount() == 0) {
+        session_->ActiveStreamCount() == 0) {
         NotifyDrainComplete();
         return;
     }
 
-    if (!session_ || !session_->HasDeferredOutput()) return;
-    if (resume_scheduled_) return;
-
-    // Schedule resume on next event loop iteration via RunOnDispatcher.
-    // Avoids reentrancy: completion callback may fire from a write handler
-    // that is on the call stack above SendPendingFrames.
-    resume_scheduled_ = true;
-    std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
-    conn_->RunOnDispatcher([weak_self]() {
-        auto self = weak_self.lock();
-        if (!self) return;
-        self->resume_scheduled_ = false;
-        if (self->session_) {
-            self->session_->ResumeOutput();
-            // If resume completed the last stream during shutdown,
-            // start flushing. NotifyDrainComplete fires from OnSendComplete.
-            if (self->shutdown_requested_.load(std::memory_order_acquire) &&
-                self->session_->ActiveStreamCount() == 0 &&
-                !self->drain_notified_) {
-                self->conn_->CloseAfterWrite();
-            }
-        }
-    });
 }
 
 void Http2ConnectionHandler::DispatchPendingRequests() {
