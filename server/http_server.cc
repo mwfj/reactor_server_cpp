@@ -254,22 +254,22 @@ void HttpServer::Stop() {
         h2_conn->RequestShutdown();
     }
 
-    // Configure NetServer to exempt draining H2 connections
-    net_server_.SetDrainingConns(std::move(draining_conn_ptrs));
-
     // If drain wait is safe (not on a dispatcher thread) and H2 connections
-    // exist, install the drain callback. Otherwise, degraded shutdown —
-    // H2 streams may be cut off (same as HTTP/1.x behavior).
+    // exist, exempt them from the close sweep and install the drain callback.
+    // On a dispatcher thread: degrade to normal close sweep (no exemption,
+    // no drain wait) to avoid deadlock.
     bool has_draining = false;
     {
         std::lock_guard<std::mutex> dlck(drain_mtx_);
         has_draining = !h2_draining_.empty();
     }
     if (has_draining && !net_server_.IsOnDispatcherThread()) {
+        net_server_.SetDrainingConns(std::move(draining_conn_ptrs));
         net_server_.SetPreStopDrainCallback([this]() { WaitForH2Drain(); });
     } else if (has_draining) {
         logging::Get()->warn("HttpServer::Stop() called from dispatcher thread — "
                              "HTTP/2 graceful drain skipped to avoid deadlock");
+        // Don't exempt H2 connections — let normal close sweep handle them
     }
 
     net_server_.Stop();

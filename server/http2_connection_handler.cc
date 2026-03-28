@@ -143,6 +143,15 @@ void Http2ConnectionHandler::OnRawData(
         return;
     }
 
+    // If shutdown requested but GOAWAY not yet sent (RequestShutdown's enqueued
+    // task hasn't run yet), send it now before feeding new frames. This prevents
+    // HEADERS in the current batch from being accepted as new requests.
+    if (shutdown_requested_.load(std::memory_order_acquire) &&
+        session_ && !session_->IsGoawaySent()) {
+        session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
+        session_->SendPendingFrames();
+    }
+
     // Feed data to nghttp2 — during shutdown drain, we continue processing
     // frames so that WINDOW_UPDATE/SETTINGS/RST_STREAM reach nghttp2 and
     // in-flight responses can complete.
