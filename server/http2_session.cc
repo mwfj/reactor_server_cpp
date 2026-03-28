@@ -215,6 +215,25 @@ static int OnDataChunkRecvCallback(
     // Skip body accumulation on rejected streams (RST_STREAM already sent)
     if (stream->IsRejected()) return 0;
 
+    // Reject DATA that exceeds the declared Content-Length.
+    // Without this, a malformed peer can force unbounded body buffering
+    // when max_body_size is high, since the mismatch is only caught later
+    // at dispatch time.
+    const auto& req = stream->GetRequest();
+    if (req.content_length > 0 &&
+        stream->AccumulatedBodySize() + len > req.content_length) {
+        logging::Get()->warn("HTTP/2 stream {} DATA exceeds declared content-length {}",
+                             stream_id, req.content_length);
+        stream->MarkRejected();
+        int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                           stream_id, NGHTTP2_PROTOCOL_ERROR);
+        if (rv < 0) {
+            logging::Get()->error("nghttp2_submit_rst_stream failed: {}", nghttp2_strerror(rv));
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+        return 0;
+    }
+
     stream->AppendBody(reinterpret_cast<const char*>(data), len);
     return 0;
 }

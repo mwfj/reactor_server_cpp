@@ -90,6 +90,14 @@ void NetServer::StopAccepting() {
             acceptor_->CloseListenSocket();
         }
     });
+    // Barrier: wait for the close task to complete. This ensures any in-flight
+    // accept callback has finished before the caller snapshots connections.
+    if (!conn_dispatcher_->is_on_loop_thread()) {
+        auto barrier = std::make_shared<std::promise<void>>();
+        auto future = barrier->get_future();
+        conn_dispatcher_->EnQueue([barrier]() { barrier->set_value(); });
+        future.wait();
+    }
     conn_dispatcher_->StopEventLoop();
 }
 
