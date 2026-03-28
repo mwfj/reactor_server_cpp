@@ -475,7 +475,9 @@ ssize_t Http2Session::ReceiveData(const char* data, size_t len) {
     // Always update last_stream_id_ — even on error, nghttp2 may have
     // processed valid streams before hitting the bad frame. Using a stale
     // value in GOAWAY would tell clients to retry already-processed requests.
-    last_stream_id_ = nghttp2_session_get_last_proc_stream_id(impl_->session);
+    last_stream_id_.store(
+        nghttp2_session_get_last_proc_stream_id(impl_->session),
+        std::memory_order_release);
 
     if (rv < 0) {
         logging::Get()->error("nghttp2_session_mem_recv2 error: {}",

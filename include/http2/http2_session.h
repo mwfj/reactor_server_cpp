@@ -84,7 +84,7 @@ public:
     std::shared_ptr<ConnectionHandler> GetConnection() const { return conn_; }
 
     // Get the last stream ID we have processed (for GOAWAY)
-    int32_t LastStreamId() const { return last_stream_id_; }
+    int32_t LastStreamId() const { return last_stream_id_.load(std::memory_order_acquire); }
     bool IsGoawaySent() const { return goaway_sent_; }
 
     // Incomplete stream tracking for request-timeout enforcement.
@@ -144,7 +144,7 @@ private:
 
     std::weak_ptr<Http2ConnectionHandler> owner_;
 
-    int32_t last_stream_id_ = 0;
+    std::atomic<int32_t> last_stream_id_{0};
     bool goaway_sent_ = false;
     size_t max_body_size_ = 0;
     size_t incomplete_stream_count_ = 0;

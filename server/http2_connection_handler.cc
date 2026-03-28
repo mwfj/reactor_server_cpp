@@ -156,8 +156,11 @@ void Http2ConnectionHandler::OnRawData(
     // in-flight responses can complete.
     ssize_t consumed = session_->ReceiveData(data.data(), data.size());
     if (consumed < 0) {
-        logging::Get()->error("HTTP/2 session error, closing connection");
-        session_->SendGoaway(HTTP2_CONSTANTS::ERROR_INTERNAL_ERROR);
+        // ReceiveData failures are almost always caused by malformed peer
+        // frames (bad preface, protocol violations, etc.). Use PROTOCOL_ERROR
+        // so clients get the correct retry/diagnostic signal.
+        logging::Get()->error("HTTP/2 session recv error, closing connection");
+        session_->SendGoaway(HTTP2_CONSTANTS::ERROR_PROTOCOL_ERROR);
         session_->SendPendingFrames();
         conn_->CloseAfterWrite();
         return;
@@ -195,22 +198,18 @@ void Http2ConnectionHandler::RequestShutdown() {
     // Send a raw GOAWAY frame via SendRaw (thread-safe via EnQueue).
     // We can't use nghttp2 here (not thread-safe), so we manually
     // serialize the GOAWAY frame (fixed format, 17 bytes total).
-    //
-    // Use max stream ID (0x7FFFFFFF) instead of reading last_stream_id_
-    // which is updated on the dispatcher thread — reading it here would
-    // be a data race. Max ID tells the client "all streams may have been
-    // processed" which is conservative but safe for shutdown.
-    static constexpr int32_t MAX_STREAM_ID = 0x7FFFFFFF;
+    // last_stream_id_ is atomic, safe to read from any thread.
+    int32_t last_id = session_ ? session_->LastStreamId() : 0;
     uint8_t goaway[17] = {
         0x00, 0x00, 0x08,              // Length: 8 bytes payload
         0x07,                           // Type: GOAWAY
         0x00,                           // Flags: none
         0x00, 0x00, 0x00, 0x00,        // Stream ID: 0 (connection-level)
         // Last-Stream-ID (4 bytes, network byte order)
-        static_cast<uint8_t>((MAX_STREAM_ID >> 24) & 0xFF),
-        static_cast<uint8_t>((MAX_STREAM_ID >> 16) & 0xFF),
-        static_cast<uint8_t>((MAX_STREAM_ID >> 8) & 0xFF),
-        static_cast<uint8_t>(MAX_STREAM_ID & 0xFF),
+        static_cast<uint8_t>((last_id >> 24) & 0x7F),  // clear R bit
+        static_cast<uint8_t>((last_id >> 16) & 0xFF),
+        static_cast<uint8_t>((last_id >> 8) & 0xFF),
+        static_cast<uint8_t>(last_id & 0xFF),
         // Error Code: NO_ERROR (0x00000000)
         0x00, 0x00, 0x00, 0x00
     };
