@@ -531,11 +531,13 @@ ssize_t Http2Session::ReceiveData(const char* data, size_t len) {
 bool Http2Session::SendPendingFrames() {
     bool sent_any = false;
     for (;;) {
-        // After ≥1 frame, check output buffer against watermark.
-        // Always pull at least one frame so control frames (SETTINGS ACK,
-        // GOAWAY, PING ACK) are never blocked. Overshoot is bounded to
-        // roughly one frame past the watermark.
-        if (sent_any && conn_->OutputBufferSize() > OutputHighWatermark()) {
+        // Check output buffer against watermark BEFORE pulling each frame.
+        // If already over limit, defer immediately — prevents repeated
+        // OnRawData calls from bypassing the watermark by adding one frame
+        // per read event. Control frames queued by nghttp2 callbacks
+        // (SETTINGS ACK, PING ACK) will be pulled on the next
+        // ResumeOutput() when the buffer drains.
+        if (conn_->OutputBufferSize() > OutputHighWatermark()) {
             output_deferred_ = true;
             break;
         }
