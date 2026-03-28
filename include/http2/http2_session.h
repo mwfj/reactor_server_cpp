@@ -63,6 +63,17 @@ public:
     // Check if the session is still alive
     bool IsAlive() const;
 
+    // Output backpressure: stop pulling frames when output buffer exceeds
+    // the watermark. Resume when buffer drains (triggered by handler).
+    // All state is dispatcher-thread only — no atomics needed.
+    bool HasDeferredOutput() const { return output_deferred_; }
+    void ClearDeferredOutput() { output_deferred_ = false; }
+    void ResumeOutput();
+    size_t OutputHighWatermark() const {
+        static constexpr size_t MIN_WATERMARK = 131072;  // 128 KB
+        return std::max(MIN_WATERMARK, static_cast<size_t>(settings_.max_frame_size));
+    }
+
     // --- Stream management ---
 
     Http2Stream* FindStream(int32_t stream_id);
@@ -146,6 +157,7 @@ private:
 
     std::atomic<int32_t> last_stream_id_{0};
     bool goaway_sent_ = false;
+    bool output_deferred_ = false;  // dispatcher-thread only
     size_t max_body_size_ = 0;
     size_t incomplete_stream_count_ = 0;
     size_t max_header_list_size_ = 0;

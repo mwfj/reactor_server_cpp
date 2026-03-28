@@ -15,6 +15,25 @@ void HttpServer::WireNetServerCallbacks() {
         [this](std::shared_ptr<ConnectionHandler> conn) { HandleErrorConnection(conn); });
     net_server_.SetOnMessageCb(
         [this](std::shared_ptr<ConnectionHandler> conn, std::string& msg) { HandleMessage(conn, msg); });
+
+    // Resume deferred H2 output when transport buffer drains to zero.
+    // HttpServer only does fd→handler lookup; scheduling is owned by
+    // Http2ConnectionHandler::OnSendComplete().
+    net_server_.SetSendCompletionCb(
+        [this](std::shared_ptr<ConnectionHandler> conn) {
+            std::shared_ptr<Http2ConnectionHandler> h2_conn;
+            {
+                std::lock_guard<std::mutex> lck(conn_mtx_);
+                auto it = h2_connections_.find(conn->fd());
+                if (it != h2_connections_.end() &&
+                    it->second->GetConnection() == conn) {
+                    h2_conn = it->second;
+                }
+            }
+            if (h2_conn) {
+                h2_conn->OnSendComplete();
+            }
+        });
 }
 
 // Validate host is a numeric IPv4 address — inet_addr() silently returns

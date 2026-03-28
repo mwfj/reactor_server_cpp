@@ -239,6 +239,10 @@ HTTP/2 request timeouts are enforced per-stream via `request_timeout_sec`:
 - Once all incomplete streams are resolved, the deadline is cleared and `idle_timeout` governs.
 - New streams cannot extend the deadline for older stalled streams (the deadline always reflects the oldest incomplete stream).
 
+## Output Backpressure
+
+`SendPendingFrames()` stops pulling frames from nghttp2 when the transport output buffer exceeds a high watermark (`max(128KB, max_frame_size)`). At least one frame is always pulled per call so control frames (SETTINGS ACK, GOAWAY) are never blocked. When the buffer drains to zero, `OnSendComplete()` schedules async resume via `RunOnDispatcher()`. This bounds per-connection output buffering and prevents slow peers from causing unbounded memory growth.
+
 ## Limitations
 
 - Server push disabled (SETTINGS_ENABLE_PUSH = 0)

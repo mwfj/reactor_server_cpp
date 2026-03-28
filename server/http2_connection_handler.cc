@@ -176,6 +176,8 @@ void Http2ConnectionHandler::OnRawData(
         // frames (bad preface, protocol violations, etc.). Use PROTOCOL_ERROR
         // so clients get the correct retry/diagnostic signal.
         logging::Get()->error("HTTP/2 session recv error, closing connection");
+        session_->ClearDeferredOutput();  // prevent stale resume
+        resume_scheduled_ = false;
         session_->SendGoaway(HTTP2_CONSTANTS::ERROR_PROTOCOL_ERROR);
         session_->SendPendingFrames();
         conn_->CloseAfterWrite();
@@ -241,11 +243,36 @@ void Http2ConnectionHandler::SetDrainCompleteCallback(DrainCompleteCallback cb) 
 void Http2ConnectionHandler::NotifyDrainComplete() {
     if (drain_notified_) return;
     drain_notified_ = true;
-    conn_->CloseAfterWrite();  // flush remaining response bytes
+    resume_scheduled_ = false;  // no more resumes needed
+    conn_->CloseAfterWrite();
     if (drain_complete_cb_) {
         try { drain_complete_cb_(); }
         catch (...) {}
     }
+}
+
+void Http2ConnectionHandler::OnSendComplete() {
+    if (!session_ || !session_->HasDeferredOutput()) return;
+    if (resume_scheduled_) return;
+
+    // Schedule resume on next event loop iteration via RunOnDispatcher.
+    // Avoids reentrancy: completion callback may fire from a write handler
+    // that is on the call stack above SendPendingFrames.
+    resume_scheduled_ = true;
+    std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
+    conn_->RunOnDispatcher([weak_self]() {
+        auto self = weak_self.lock();
+        if (!self) return;
+        self->resume_scheduled_ = false;
+        if (self->session_) {
+            self->session_->ResumeOutput();
+            // Check if this resume completed the last stream during shutdown
+            if (self->shutdown_requested_.load(std::memory_order_acquire) &&
+                self->session_->ActiveStreamCount() == 0) {
+                self->NotifyDrainComplete();
+            }
+        }
+    });
 }
 
 void Http2ConnectionHandler::DispatchPendingRequests() {

@@ -35,6 +35,10 @@ public:
     // dispatcher-thread task that sends GOAWAY and initiates drain.
     void RequestShutdown();
 
+    // Called when transport output buffer drains to zero.
+    // Schedules async resume if session has deferred output.
+    void OnSendComplete();
+
     // Callback invoked (once) when the connection finishes draining all
     // active streams during graceful shutdown. Called on dispatcher thread.
     using DrainCompleteCallback = std::function<void()>;
@@ -68,6 +72,7 @@ private:
     std::atomic<bool> shutdown_requested_{false};
     DrainCompleteCallback drain_complete_cb_;
     bool drain_notified_ = false;
+    bool resume_scheduled_ = false;  // dispatcher-thread only
     std::chrono::steady_clock::time_point last_deadline_;  // avoids redundant SetDeadline calls
 
     // Internal: called after ReceiveData; a no-op since dispatch is

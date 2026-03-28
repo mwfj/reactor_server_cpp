@@ -531,6 +531,15 @@ ssize_t Http2Session::ReceiveData(const char* data, size_t len) {
 bool Http2Session::SendPendingFrames() {
     bool sent_any = false;
     for (;;) {
+        // After ≥1 frame, check output buffer against watermark.
+        // Always pull at least one frame so control frames (SETTINGS ACK,
+        // GOAWAY, PING ACK) are never blocked. Overshoot is bounded to
+        // roughly one frame past the watermark.
+        if (sent_any && conn_->OutputBufferSize() > OutputHighWatermark()) {
+            output_deferred_ = true;
+            break;
+        }
+
         const uint8_t* data;
         ssize_t len = nghttp2_session_mem_send2(impl_->session, &data);
         if (len < 0) {
@@ -538,7 +547,10 @@ bool Http2Session::SendPendingFrames() {
                                   nghttp2_strerror(static_cast<int>(len)));
             break;
         }
-        if (len == 0) break;
+        if (len == 0) {
+            output_deferred_ = false;
+            break;
+        }
 
         conn_->SendRaw(reinterpret_cast<const char*>(data),
                         static_cast<size_t>(len));
@@ -552,6 +564,11 @@ bool Http2Session::SendPendingFrames() {
     FlushDeferredRemovals();
 
     return sent_any;
+}
+
+void Http2Session::ResumeOutput() {
+    if (!output_deferred_) return;
+    SendPendingFrames();
 }
 
 bool Http2Session::WantWrite() const {
