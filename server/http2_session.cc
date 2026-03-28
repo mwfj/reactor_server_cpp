@@ -598,12 +598,11 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     int status_code = response.GetStatusCode();
 
     // Determine if the response body must be suppressed.
-    // RFC 9110 Section 15.2: 1xx informational MUST NOT contain a body.
     // RFC 9110 Section 9.3.2: HEAD responses include headers as if GET but no body.
     // RFC 9110 Section 15.3.5/15.3.6/15.4.5: 204, 205, 304 MUST NOT contain a body.
+    // Note: 1xx is handled internally (not via SubmitResponse), so not checked here.
     const HttpRequest& req = stream->GetRequest();
-    bool suppress_body = (status_code < 200 ||
-                          req.method == "HEAD" ||
+    bool suppress_body = (req.method == "HEAD" ||
                           status_code == 204 || status_code == 205 ||
                           status_code == 304);
 
@@ -678,21 +677,12 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
         });
     }
 
+    // Note: 1xx informational responses (100-continue, 103 Early Hints) are
+    // handled internally via nghttp2_submit_headers in OnFrameRecvCallback,
+    // not through this method. If an app handler returns <200, it's treated
+    // as a normal final response (which is likely a bug in the handler, but
+    // sending it with END_STREAM is safer than leaving the stream open).
     int rv;
-    if (status_code < 200) {
-        // 1xx informational response — send as non-final HEADERS (no END_STREAM).
-        // The stream stays open for the final response.
-        rv = nghttp2_submit_headers(impl_->session, NGHTTP2_FLAG_NONE,
-                                     stream_id, nullptr,
-                                     nva.data(), nva.size(), nullptr);
-        if (rv < 0) {
-            logging::Get()->error("Failed to submit 1xx response for stream {}: {}",
-                                  stream_id, nghttp2_strerror(rv));
-            return rv;
-        }
-        // Don't mark response headers sent — the final response is still pending
-        return 0;
-    }
     if (!has_body) {
         // No body (or body suppressed for HEAD/204/304) — submit headers with END_STREAM
         rv = nghttp2_submit_response2(impl_->session, stream_id,

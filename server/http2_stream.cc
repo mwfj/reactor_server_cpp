@@ -1,6 +1,44 @@
 #include "http2/http2_stream.h"
 #include <algorithm>
 
+// Case-insensitive hostname comparison for :authority vs host.
+// Splits host[:port], lowercases the host portion, compares.
+// Port (if present) is compared exactly.
+static bool AuthorityMatch(const std::string& a, const std::string& b) {
+    // Find port separator (last colon not inside IPv6 brackets)
+    auto split_host_port = [](const std::string& s) -> std::pair<std::string, std::string> {
+        if (!s.empty() && s[0] == '[') {
+            // IPv6: [::1]:port
+            auto bracket = s.find(']');
+            if (bracket != std::string::npos && bracket + 1 < s.size() && s[bracket + 1] == ':') {
+                return {s.substr(0, bracket + 1), s.substr(bracket + 2)};
+            }
+            return {s, ""};
+        }
+        auto colon = s.rfind(':');
+        if (colon != std::string::npos) {
+            return {s.substr(0, colon), s.substr(colon + 1)};
+        }
+        return {s, ""};
+    };
+
+    auto [host_a, port_a] = split_host_port(a);
+    auto [host_b, port_b] = split_host_port(b);
+
+    // Port must match exactly (or both absent)
+    if (port_a != port_b) return false;
+
+    // Host comparison is case-insensitive (RFC 3986 Section 3.2.2)
+    if (host_a.size() != host_b.size()) return false;
+    for (size_t i = 0; i < host_a.size(); ++i) {
+        if (::tolower(static_cast<unsigned char>(host_a[i])) !=
+            ::tolower(static_cast<unsigned char>(host_b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 Http2Stream::Http2Stream(int32_t stream_id)
     : stream_id_(stream_id)
     , created_at_(std::chrono::steady_clock::now()) {
@@ -75,11 +113,11 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
     }
 
     // Host header handling:
-    // - If :authority was set and matches, skip (already stored)
+    // - If :authority was set and matches (case-insensitive hostname), skip
     // - If :authority was set and conflicts, reject
     // - Duplicate host headers (without :authority) rejected below as singleton
     if (lower_name == "host" && has_authority_) {
-        if (value != authority_) {
+        if (!AuthorityMatch(authority_, value)) {
             return -1;  // Malformed: conflicting :authority and host
         }
         return 0;  // Matches :authority — already set, skip
