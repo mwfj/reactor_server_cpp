@@ -155,22 +155,29 @@ public:
             Response r; r.error = true; return r;
         }
 
-        // Build headers
+        // Build headers — store name/value strings in a stable container
+        // first, then build nghttp2_nv entries pointing into it. This avoids
+        // dangling pointers from temporary std::string objects (string literals
+        // bind to const std::string& as temporaries that die at statement end).
+        std::vector<std::pair<std::string, std::string>> header_pairs;
+        header_pairs.reserve(4 + extra_headers.size());
+        header_pairs.emplace_back(":method", method);
+        header_pairs.emplace_back(":path", path);
+        header_pairs.emplace_back(":scheme", "http");
+        header_pairs.emplace_back(":authority", "localhost");
+        for (const auto& h : extra_headers) {
+            header_pairs.push_back(h);
+        }
+
         std::vector<nghttp2_nv> nva;
-        auto push_nv = [&](const std::string& n, const std::string& v) {
+        nva.reserve(header_pairs.size());
+        for (const auto& hp : header_pairs) {
             nva.push_back({
-                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(n.c_str())),
-                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(v.c_str())),
-                n.size(), v.size(),
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.first.c_str())),
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.second.c_str())),
+                hp.first.size(), hp.second.size(),
                 NGHTTP2_NV_FLAG_NONE
             });
-        };
-        push_nv(":method", method);
-        push_nv(":path", path);
-        push_nv(":scheme", "http");
-        push_nv(":authority", "localhost");
-        for (const auto& h : extra_headers) {
-            push_nv(h.first, h.second);
         }
 
         int32_t stream_id = -1;
