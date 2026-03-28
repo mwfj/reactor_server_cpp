@@ -12,6 +12,19 @@
 #include "http2_test.h"
 #include "test_framework.h"
 #include <algorithm>
+#include <sys/resource.h>
+
+// Raise fd limit on macOS where the default soft limit is 256.
+// 138 tests with concurrent servers can exhaust this quickly.
+static void RaiseFdLimit() {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        if (rl.rlim_cur < 4096) {
+            rl.rlim_cur = std::min(rl.rlim_max, (rlim_t)4096);
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+    }
+}
 
 
 void RunAllTest(){
@@ -77,6 +90,7 @@ void PrintUsage(const char* program_name) {
 }
 
 int main(int argc, char* argv[]) {
+    RaiseFdLimit();
     std::cout << "Reactor Network Server - Test Suite" << std::endl;
     std::cout << "====================================\n" << std::endl;
 
