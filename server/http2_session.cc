@@ -146,9 +146,15 @@ static int OnHeaderCallback(
                                  frame->hd.stream_id, hdr_name);
             return reject_protocol_error();
         }
+        // RFC 9110 Section 6.5.1: trailers MUST NOT include fields used for
+        // message framing, routing, request modifiers, authentication, or
+        // representation metadata that must be received before the body.
         if (hdr_name == "connection" || hdr_name == "keep-alive" ||
             hdr_name == "proxy-connection" || hdr_name == "transfer-encoding" ||
-            hdr_name == "upgrade" || hdr_name == "te") {
+            hdr_name == "upgrade" || hdr_name == "te" ||
+            hdr_name == "content-length" || hdr_name == "host" ||
+            hdr_name == "authorization" || hdr_name == "content-type" ||
+            hdr_name == "content-encoding" || hdr_name == "content-range") {
             logging::Get()->warn("HTTP/2 stream {} forbidden header in trailers: {}",
                                  frame->hd.stream_id, hdr_name);
             return reject_protocol_error();
@@ -597,10 +603,28 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
 
     int status_code = response.GetStatusCode();
 
+    // 101 Switching Protocols is invalid in HTTP/2 (RFC 9113 Section 8.6).
+    // Reject and RST the stream rather than sending an invalid response.
+    if (status_code == 101) {
+        logging::Get()->error("HTTP/2 stream {} handler returned 101 "
+                              "(invalid in HTTP/2)", stream_id);
+        nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
+                                  stream_id, NGHTTP2_INTERNAL_ERROR);
+        return -1;
+    }
+
+    // Other 1xx: internal 100-continue and 103 Early Hints are sent via
+    // nghttp2_submit_headers in OnFrameRecvCallback, not through here.
+    // If an app handler returns <200, log a warning and send as a final
+    // response (the handler is misusing the API, but better than hanging).
+    if (status_code < 200 && status_code != 100) {
+        logging::Get()->warn("HTTP/2 stream {} handler returned {} "
+                             "(1xx should not be a final response)", stream_id, status_code);
+    }
+
     // Determine if the response body must be suppressed.
     // RFC 9110 Section 9.3.2: HEAD responses include headers as if GET but no body.
     // RFC 9110 Section 15.3.5/15.3.6/15.4.5: 204, 205, 304 MUST NOT contain a body.
-    // Note: 1xx is handled internally (not via SubmitResponse), so not checked here.
     const HttpRequest& req = stream->GetRequest();
     bool suppress_body = (req.method == "HEAD" ||
                           status_code == 204 || status_code == 205 ||
