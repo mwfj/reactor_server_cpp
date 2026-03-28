@@ -537,12 +537,12 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     int status_code = response.GetStatusCode();
 
     // Determine if the response body must be suppressed.
+    // RFC 9110 Section 15.2: 1xx informational MUST NOT contain a body.
     // RFC 9110 Section 9.3.2: HEAD responses include headers as if GET but no body.
-    // RFC 9110 Section 15.3.5: 204 MUST NOT contain a body.
-    // RFC 9110 Section 15.3.6: 205 MUST NOT generate content.
-    // RFC 9110 Section 15.4.5: 304 MUST NOT contain a body.
+    // RFC 9110 Section 15.3.5/15.3.6/15.4.5: 204, 205, 304 MUST NOT contain a body.
     const HttpRequest& req = stream->GetRequest();
-    bool suppress_body = (req.method == "HEAD" ||
+    bool suppress_body = (status_code < 200 ||
+                          req.method == "HEAD" ||
                           status_code == 204 || status_code == 205 ||
                           status_code == 304);
 
