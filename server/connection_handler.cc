@@ -54,10 +54,12 @@ void ConnectionHandler::OnMessage(){
     }
 
     // TLS handshake phase
+    bool tls_just_ready = false;
     if (tls_state_ == TlsState::HANDSHAKE) {
         int result = tls_->DoHandshake();
         if (result == TlsConnection::TLS_COMPLETE) {
             tls_state_ = TlsState::READY;
+            tls_just_ready = true;
             // Handshake complete, fall through to read any buffered data
         } else if (result == TlsConnection::TLS_WANT_READ) {
             // Want read — already enabled
@@ -167,9 +169,12 @@ void ConnectionHandler::OnMessage(){
         close_after_write_.store(true, std::memory_order_release);
     }
 
-    // After reading all available data, call the application callback if data was received
+    // After reading all available data, call the application callback if data was received.
+    // Also fire on TLS handshake completion (even without data) so the upper layer can
+    // check ALPN and initialize HTTP/2 sessions immediately — prevents hanging clients
+    // that wait for the server SETTINGS preface after ALPN negotiation.
     bool callback_ran = false;
-    if(input_bf_.Size() > 0 && callbacks_.on_message_callback){
+    if((input_bf_.Size() > 0 || tls_just_ready) && callbacks_.on_message_callback){
         std::string message(input_bf_.Data(), input_bf_.Size());
         callbacks_.on_message_callback(shared_from_this(), message);
         // Update timestamp
