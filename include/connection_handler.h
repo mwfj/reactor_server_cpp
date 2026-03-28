@@ -39,6 +39,7 @@ private:
     std::atomic<unsigned> deadline_generation_{0};
 
     // TLS support
+    bool tls_ready_from_write_ = false;  // TLS handshake completed via CallWriteCb
     enum class TlsState { NONE, HANDSHAKE, READY };
     TlsState tls_state_ = TlsState::NONE;
     std::unique_ptr<TlsConnection> tls_;

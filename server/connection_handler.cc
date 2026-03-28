@@ -53,8 +53,9 @@ void ConnectionHandler::OnMessage(){
         return;
     }
 
-    // TLS handshake phase
-    bool tls_just_ready = false;
+    // TLS handshake phase — may also complete via CallWriteCb (EPOLLOUT path)
+    bool tls_just_ready = tls_ready_from_write_;
+    tls_ready_from_write_ = false;  // consume
     if (tls_state_ == TlsState::HANDSHAKE) {
         int result = tls_->DoHandshake();
         if (result == TlsConnection::TLS_COMPLETE) {
@@ -573,6 +574,7 @@ void ConnectionHandler::CallWriteCb(){
         int result = tls_->DoHandshake();
         if (result == TlsConnection::TLS_COMPLETE) {
             tls_state_ = TlsState::READY;
+            tls_ready_from_write_ = true;  // signal OnMessage to fire callback
             // Handshake complete — OpenSSL may have buffered application data.
             OnMessage();
             // OnMessage may have closed the channel
