@@ -462,9 +462,9 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
 
     // Single lock: check both H2 and HTTP/1.x maps
     std::shared_ptr<HttpConnectionHandler> http_conn;
+    bool was_h2 = false;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        // Only erase pending detection if it belongs to THIS connection
         auto pd_it = pending_detection_.find(conn->fd());
         if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
             pending_detection_.erase(pd_it);
@@ -472,15 +472,21 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
         auto h2_it = h2_connections_.find(conn->fd());
         if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
             h2_connections_.erase(h2_it);
-            return;
+            was_h2 = true;
         }
-        auto it = http_connections_.find(conn->fd());
-        if (it != http_connections_.end() && it->second->GetConnection() == conn) {
-            http_conn = it->second;
-            http_connections_.erase(it);
+        if (!was_h2) {
+            auto it = http_connections_.find(conn->fd());
+            if (it != http_connections_.end() && it->second->GetConnection() == conn) {
+                http_conn = it->second;
+                http_connections_.erase(it);
+            }
         }
     }
-    // Notify WS close handler OUTSIDE the lock to prevent deadlock.
+    // Outside lock: notify drain set and WS close handler
+    if (was_h2) {
+        OnH2DrainComplete(conn.get());
+        return;
+    }
     SafeNotifyWsClose(http_conn);
 }
 
@@ -489,9 +495,9 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
 
     // Single lock: check both H2 and HTTP/1.x maps
     std::shared_ptr<HttpConnectionHandler> http_conn;
+    bool was_h2 = false;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        // Only erase pending detection if it belongs to THIS connection
         auto pd_it = pending_detection_.find(conn->fd());
         if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
             pending_detection_.erase(pd_it);
@@ -499,13 +505,19 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
         auto h2_it = h2_connections_.find(conn->fd());
         if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
             h2_connections_.erase(h2_it);
-            return;
+            was_h2 = true;
         }
-        auto it = http_connections_.find(conn->fd());
-        if (it != http_connections_.end() && it->second->GetConnection() == conn) {
-            http_conn = it->second;
-            http_connections_.erase(it);
+        if (!was_h2) {
+            auto it = http_connections_.find(conn->fd());
+            if (it != http_connections_.end() && it->second->GetConnection() == conn) {
+                http_conn = it->second;
+                http_connections_.erase(it);
+            }
         }
+    }
+    if (was_h2) {
+        OnH2DrainComplete(conn.get());
+        return;
     }
     SafeNotifyWsClose(http_conn);
 }

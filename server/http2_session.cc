@@ -1,4 +1,5 @@
 #include "http2/http2_session.h"
+#include "http2/http2_connection_handler.h"
 #include "http/http_response.h"
 #include "log/logger.h"
 
@@ -55,7 +56,13 @@ static int OnBeginHeadersCallback(
         // During shutdown drain, reject new streams. Control frames
         // (WINDOW_UPDATE, SETTINGS, RST_STREAM) are still processed so
         // in-flight responses can complete.
-        if (self->IsGoawaySent() || self->GetConnection()->IsCloseDeferred()) {
+        // Also check owner's shutdown_requested_ for the race window where
+        // the atomic flag is set but GOAWAY hasn't been submitted yet.
+        auto owner = self->Owner();
+        bool shutdown_in_progress = self->IsGoawaySent() ||
+            self->GetConnection()->IsCloseDeferred() ||
+            (owner && owner->IsShutdownRequested());
+        if (shutdown_in_progress) {
             nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                       frame->hd.stream_id, NGHTTP2_REFUSED_STREAM);
             return 0;
