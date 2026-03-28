@@ -68,6 +68,7 @@ private:
     int request_timeout_sec_ = 0;
 
     bool initialized_ = false;
+    bool initializing_ = false;  // true during Initialize(), suppresses premature drain
     bool deadline_armed_ = false;
     std::atomic<bool> shutdown_requested_{false};
     DrainCompleteCallback drain_complete_cb_;

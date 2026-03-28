@@ -335,11 +335,10 @@ static int OnFrameRecvCallback(
                                            frame->hd.stream_id, nullptr,
                                            nva_100, 1, nullptr);
                 } else {
-                    // Unsupported Expect value — reject with 417 + RST.
+                    // Unsupported Expect value — reject with 417.
                     // submit_response2 sends the HTTP response with END_STREAM.
-                    // RST_STREAM(NO_ERROR) after ensures the client side closes
-                    // too — prevents the stream from staying half-open if the
-                    // client never sends END_STREAM (was waiting for 100-continue).
+                    // No RST_STREAM — clients should see a clean 417 and stop
+                    // sending. Per-stream timeout handles clients that don't.
                     nghttp2_nv nva_417[] = {
                         {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
                          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("417")),
@@ -347,8 +346,6 @@ static int OnFrameRecvCallback(
                     };
                     nghttp2_submit_response2(session, frame->hd.stream_id,
                                              nva_417, 1, nullptr);
-                    nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                              frame->hd.stream_id, NGHTTP2_NO_ERROR);
                     stream->MarkRejected();
                     break;
                 }
@@ -603,23 +600,18 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
 
     int status_code = response.GetStatusCode();
 
-    // 101 Switching Protocols is invalid in HTTP/2 (RFC 9113 Section 8.6).
-    // Reject and RST the stream rather than sending an invalid response.
-    if (status_code == 101) {
-        logging::Get()->error("HTTP/2 stream {} handler returned 101 "
-                              "(invalid in HTTP/2)", stream_id);
+    // 1xx informational responses must not come through SubmitResponse.
+    // Internal 100-continue uses nghttp2_submit_headers in OnFrameRecvCallback.
+    // 101 is invalid in HTTP/2 (RFC 9113 Section 8.6).
+    // Other 1xx (103 Early Hints etc.) need a separate non-final API.
+    // Reject all 1xx here — they would be sent as final with END_STREAM,
+    // closing the stream before the real response.
+    if (status_code < 200) {
+        logging::Get()->error("HTTP/2 stream {} SubmitResponse called with {} "
+                              "(1xx not supported as app response)", stream_id, status_code);
         nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
                                   stream_id, NGHTTP2_INTERNAL_ERROR);
         return -1;
-    }
-
-    // Other 1xx: internal 100-continue and 103 Early Hints are sent via
-    // nghttp2_submit_headers in OnFrameRecvCallback, not through here.
-    // If an app handler returns <200, log a warning and send as a final
-    // response (the handler is misusing the API, but better than hanging).
-    if (status_code < 200 && status_code != 100) {
-        logging::Get()->warn("HTTP/2 stream {} handler returned {} "
-                             "(1xx should not be a final response)", stream_id, status_code);
     }
 
     // Determine if the response body must be suppressed.

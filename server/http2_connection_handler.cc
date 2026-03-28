@@ -41,6 +41,7 @@ void Http2ConnectionHandler::SetMaxHeaderSize(size_t max) {
 void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
     if (initialized_) return;
     initialized_ = true;
+    initializing_ = true;  // suppress OnSendComplete drain during init
 
     // Create the HTTP/2 session
     session_ = std::make_unique<Http2Session>(conn_, settings_);
@@ -167,6 +168,7 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
             conn_->CloseAfterWrite();
         }
     }
+    initializing_ = false;
 }
 
 void Http2ConnectionHandler::OnRawData(
@@ -275,6 +277,9 @@ void Http2ConnectionHandler::NotifyDrainComplete() {
 
 void Http2ConnectionHandler::OnSendComplete() {
     if (!session_) return;
+    // Suppress during Initialize() — SendServerPreface can trigger this
+    // callback synchronously before initial_data is processed.
+    if (initializing_) return;
 
     // If deferred output exists, resume — pull remaining frames from nghttp2.
     if (session_->HasDeferredOutput()) {
