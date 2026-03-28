@@ -536,12 +536,13 @@ bool HttpServer::DetectAndRouteProtocol(
         // Create HTTP/2 handler
         auto h2_conn = std::make_shared<Http2ConnectionHandler>(conn, h2_settings_);
         SetupH2Handlers(h2_conn);
+        // Initialize BEFORE publishing to h2_connections_, so Stop() can't
+        // call RequestShutdown() while session_ is still being created.
+        h2_conn->Initialize(message);
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
             h2_connections_[conn->fd()] = h2_conn;
         }
-        // Initialize and feed the initial data
-        h2_conn->Initialize(message);
         return true;
     }
 

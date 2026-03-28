@@ -579,8 +579,14 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
         }
         // Skip content-length — we compute the correct value below to
         // prevent mismatches between declared and actual body size.
+        // Exception: for HEAD with empty body, preserve the caller-supplied
+        // content-length (the handler knows the representation size).
         if (key == "content-length") {
-            continue;
+            if (req.method == "HEAD" && response.GetBody().empty()) {
+                // Keep it — the handler explicitly set the representation length
+            } else {
+                continue;
+            }
         }
         lowered_names.push_back(std::move(key));
         nva.push_back({
