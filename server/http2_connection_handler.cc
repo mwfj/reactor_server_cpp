@@ -101,10 +101,22 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
                 return false;
             }
 
-            // deadline_armed_ reflects whether incomplete streams exist
-            // (set by UpdateDeadline above). If true, keep alive — the
-            // deadline is based on the oldest incomplete stream's created_at.
-            // If false (no incomplete streams), let idle timeout proceed.
+            // During shutdown drain, keep alive until all streams finish
+            // (WaitForH2Drain provides the bounded timeout, not idle timeout).
+            if (self->shutdown_requested_.load(std::memory_order_acquire)) {
+                return true;
+            }
+
+            // If we just reset expired streams and active streams remain
+            // (response draining), keep alive — this was a request-timeout
+            // callback, not an idle timeout. The draining responses will
+            // complete or be reclaimed by idle timeout on the next scan.
+            if (reset > 0 && self->session_->ActiveStreamCount() > 0) {
+                return true;
+            }
+
+            // deadline_armed_ reflects whether incomplete streams exist.
+            // If true, keep alive. If false, let idle timeout proceed.
             return self->deadline_armed_;
         });
 
