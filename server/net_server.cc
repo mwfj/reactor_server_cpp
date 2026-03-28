@@ -84,21 +84,23 @@ void NetServer::Start(){
 // stop event loop
 void NetServer::StopAccepting() {
     if (conn_dispatcher_->was_stopped()) return;  // already stopped
-    // Close the listening socket to release the port immediately.
-    conn_dispatcher_->EnQueue([this]() {
-        if (acceptor_) {
-            acceptor_->CloseListenSocket();
+
+    if (conn_dispatcher_->is_running()) {
+        // Event loop is active: enqueue close + barrier to ensure any
+        // in-flight accept callback has finished before we return.
+        conn_dispatcher_->EnQueue([this]() {
+            if (acceptor_) acceptor_->CloseListenSocket();
+        });
+        if (!conn_dispatcher_->is_on_loop_thread()) {
+            auto barrier = std::make_shared<std::promise<void>>();
+            auto future = barrier->get_future();
+            conn_dispatcher_->EnQueue([barrier]() { barrier->set_value(); });
+            future.wait();
         }
-    });
-    // Barrier: wait for the close task to complete. This ensures any in-flight
-    // accept callback has finished before the caller snapshots connections.
-    // Only wait if the event loop is running — otherwise the barrier task
-    // will never be serviced (e.g., Stop before Start, or ready_callback shutdown).
-    if (!conn_dispatcher_->is_on_loop_thread() && conn_dispatcher_->is_running()) {
-        auto barrier = std::make_shared<std::promise<void>>();
-        auto future = barrier->get_future();
-        conn_dispatcher_->EnQueue([barrier]() { barrier->set_value(); });
-        future.wait();
+    } else {
+        // Event loop not started (Stop before Start, ready_callback shutdown):
+        // close synchronously — no concurrent accept callbacks possible.
+        if (acceptor_) acceptor_->CloseListenSocket();
     }
     conn_dispatcher_->StopEventLoop();
 }
