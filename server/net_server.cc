@@ -97,13 +97,9 @@ void NetServer::Stop(){
     // Stop the connection dispatcher so no more accept events fire.
     conn_dispatcher_->StopEventLoop();
 
-    // Second: Release dispatcher-held connection references via EnQueue
-    // (ClearConnections must run on the dispatcher thread to avoid racing TimerHandler)
-    for (auto& disp : socket_dispatchers_) {
-        disp->EnQueue([d = disp]() {
-            d->ClearConnections();
-        });
-    }
+    // Second (deferred): ClearConnections is done AFTER the drain wait so that
+    // dispatcher TimerHandler continues enforcing per-connection deadlines during
+    // HTTP/2 graceful drain. The clear is enqueued later, before StopEventLoop.
 
     // Third: Gracefully close all active connections — CloseAfterWrite lets pending
     // output (including WS close frames) drain via the still-running event loops.
@@ -144,7 +140,14 @@ void NetServer::Stop(){
     auto wait_for_dispatcher_barrier = [this]() {
         for (auto& disp : socket_dispatchers_) {
             if (disp->was_stopped()) continue;
-            if (disp->is_on_loop_thread()) continue;
+            if (disp->is_on_loop_thread()) {
+                // Self-dispatcher: process pending tasks inline instead of
+                // skipping. Without this, CloseAfterWrite tasks queued onto
+                // this dispatcher never run (the thread is blocked in Stop()),
+                // and buffered output gets truncated.
+                disp->HandleEventId();
+                continue;
+            }
             auto barrier = std::make_shared<std::promise<void>>();
             auto future = barrier->get_future();
             disp->EnQueue([barrier]() { barrier->set_value(); });
@@ -165,6 +168,15 @@ void NetServer::Stop(){
         wait_for_dispatcher_barrier();
     }
     draining_conns_.clear();  // one-shot cleanup
+
+    // Fourth-C: Now safe to release dispatcher-held connection references.
+    // Deferred from earlier so TimerHandler continues enforcing deadlines during drain.
+    for (auto& disp : socket_dispatchers_) {
+        disp->EnQueue([d = disp]() {
+            d->ClearConnections();
+        });
+    }
+    wait_for_dispatcher_barrier();
 
     // Fifth: Stop socket dispatcher event loops (conn_dispatcher already stopped above).
     // StopEventLoop's WakeUp triggers one final loop iteration that processes any
