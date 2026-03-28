@@ -78,20 +78,22 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
         }
     }
 
-    // Install HTTP/2 deadline timeout callback. When the deadline fires,
-    // RST expired streams instead of closing the whole connection.
-    // Returns true (handled) if any streams remain after RST, keeping
-    // the connection alive for healthy streams.
-    if (request_timeout_sec_ > 0) {
+    // Install HTTP/2 deadline timeout callback. Always installed (not gated
+    // on request_timeout_sec_) because it also handles shutdown drain logic.
+    // Per-stream RST only runs when request_timeout_sec_ > 0.
+    {
         std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
         conn_->SetDeadlineTimeoutCb([weak_self]() -> bool {
             auto self = weak_self.lock();
             if (!self || !self->session_) return false;
 
-            size_t reset = self->session_->ResetExpiredStreams(
-                self->request_timeout_sec_);
-            if (reset > 0) {
-                self->session_->SendPendingFrames();
+            size_t reset = 0;
+            if (self->request_timeout_sec_ > 0) {
+                reset = self->session_->ResetExpiredStreams(
+                    self->request_timeout_sec_);
+                if (reset > 0) {
+                    self->session_->SendPendingFrames();
+                }
             }
             // Handle graceful shutdown on dispatcher thread
             if (self->shutdown_requested_.load(std::memory_order_acquire) &&
@@ -134,8 +136,10 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
             // If true, keep alive. If false, let idle timeout proceed.
             return self->deadline_armed_;
         });
+    }
 
-        // Arm initial deadline for SETTINGS exchange / first request.
+    // Arm initial deadline for SETTINGS exchange / first request.
+    if (request_timeout_sec_ > 0) {
         conn_->SetDeadline(std::chrono::steady_clock::now() +
                            std::chrono::seconds(request_timeout_sec_));
         deadline_armed_ = true;

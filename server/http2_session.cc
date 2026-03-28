@@ -329,10 +329,10 @@ static int OnFrameRecvCallback(
                                            frame->hd.stream_id, nullptr,
                                            nva_100, 1, nullptr);
                 } else {
-                    // Unsupported Expect value — reject with 417 and RST.
-                    // submit_response2 with no data provider sends END_STREAM
-                    // from the server side. RST_STREAM then closes the client
-                    // side so the stream doesn't linger in half-closed state.
+                    // Unsupported Expect value — reject with 417.
+                    // submit_response2 with no data provider sends END_STREAM,
+                    // which cleanly closes the server side. No RST_STREAM needed —
+                    // clients see a proper HTTP 417 response, not a transport error.
                     nghttp2_nv nva_417[] = {
                         {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
                          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("417")),
@@ -340,8 +340,6 @@ static int OnFrameRecvCallback(
                     };
                     nghttp2_submit_response2(session, frame->hd.stream_id,
                                              nva_417, 1, nullptr);
-                    nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                              frame->hd.stream_id, NGHTTP2_NO_ERROR);
                     stream->MarkRejected();
                     break;
                 }
@@ -529,16 +527,13 @@ ssize_t Http2Session::ReceiveData(const char* data, size_t len) {
 }
 
 bool Http2Session::SendPendingFrames() {
-    // If already deferred from a previous call, don't pull any frames.
-    // This prevents repeated OnRawData calls from bypassing the watermark.
-    if (output_deferred_) return false;
-
     bool sent_any = false;
     for (;;) {
         // After ≥1 frame, check output buffer against watermark.
-        // Always pull at least one frame so control frames (SETTINGS ACK,
-        // GOAWAY, PING ACK, WINDOW_UPDATE) are not head-of-line blocked
-        // by a large response. Overshoot bounded to one frame.
+        // Always pull at least one frame per call so control frames
+        // (SETTINGS ACK, GOAWAY, WINDOW_UPDATE) are not HOL-blocked
+        // by a large response under backpressure. Overshoot per call
+        // is bounded to one frame (~max_frame_size).
         if (sent_any && conn_->OutputBufferSize() > OutputHighWatermark()) {
             output_deferred_ = true;
             break;
