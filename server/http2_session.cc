@@ -238,12 +238,12 @@ static int OnFrameRecvCallback(
                 if (!stream->HasAuthority()) valid = false;
                 if (!req.path.empty() || stream->HasScheme()) valid = false;
             } else {
-                // Non-CONNECT: MUST have :method, :path, :scheme.
+                // Non-CONNECT: MUST have :method, :path, :scheme (RFC 9113 §8.3.1).
                 if (req.method.empty() || req.path.empty() || !stream->HasScheme()) {
                     valid = false;
                 }
-                // :authority or host SHOULD be present
-                if (!req.HasHeader("host")) valid = false;
+                // :authority/host is SHOULD, not MUST (RFC 9113 §8.3.1).
+                // Don't reject — some valid requests (e.g., OPTIONS *) omit it.
             }
 
             if (!valid) {
