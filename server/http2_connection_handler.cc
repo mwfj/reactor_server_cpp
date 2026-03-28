@@ -65,6 +65,19 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
     // Send server connection preface (SETTINGS)
     session_->SendServerPreface();
 
+    // If shutdown was requested before session_ existed (race with Stop()),
+    // replay the shutdown now that the session is ready.
+    if (shutdown_requested_.load(std::memory_order_acquire)) {
+        if (!session_->IsGoawaySent()) {
+            session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
+            session_->SendPendingFrames();
+        }
+        if (session_->ActiveStreamCount() == 0) {
+            NotifyDrainComplete();
+            return;
+        }
+    }
+
     // Install HTTP/2 deadline timeout callback. When the deadline fires,
     // RST expired streams instead of closing the whole connection.
     // Returns true (handled) if any streams remain after RST, keeping
