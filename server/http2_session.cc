@@ -679,6 +679,20 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     }
 
     int rv;
+    if (status_code < 200) {
+        // 1xx informational response — send as non-final HEADERS (no END_STREAM).
+        // The stream stays open for the final response.
+        rv = nghttp2_submit_headers(impl_->session, NGHTTP2_FLAG_NONE,
+                                     stream_id, nullptr,
+                                     nva.data(), nva.size(), nullptr);
+        if (rv < 0) {
+            logging::Get()->error("Failed to submit 1xx response for stream {}: {}",
+                                  stream_id, nghttp2_strerror(rv));
+            return rv;
+        }
+        // Don't mark response headers sent — the final response is still pending
+        return 0;
+    }
     if (!has_body) {
         // No body (or body suppressed for HEAD/204/304) — submit headers with END_STREAM
         rv = nghttp2_submit_response2(impl_->session, stream_id,

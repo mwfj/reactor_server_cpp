@@ -111,11 +111,11 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
                 return true;
             }
 
-            // If we just reset expired streams and active streams remain
-            // (response draining), keep alive. The stalled *incomplete*
-            // stream was RST'd; healthy draining responses continue.
-            // idle_timeout (if configured) reclaims truly stalled connections.
-            if (reset > 0 && self->session_->ActiveStreamCount() > 0) {
+            // If we just reset expired streams, keep the connection alive —
+            // this was a request-timeout (not idle timeout). The timed-out
+            // stream was RST'd; the connection remains usable for new requests
+            // or has draining responses. idle_timeout will reclaim if needed.
+            if (reset > 0) {
                 return true;
             }
 
