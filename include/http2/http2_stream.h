@@ -89,6 +89,9 @@ public:
     bool HasScheme() const { return has_scheme_; }
     const std::string& Scheme() const { return scheme_; }
 
+    // Content-length tracking
+    bool HasContentLength() const { return has_content_length_; }
+
     // :authority tracking (for conflict detection with host header)
     bool HasAuthority() const { return has_authority_; }
     const std::string& Authority() const { return authority_; }

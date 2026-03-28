@@ -215,13 +215,19 @@ static int OnDataChunkRecvCallback(
     // Skip body accumulation on rejected streams (RST_STREAM already sent)
     if (stream->IsRejected()) return 0;
 
-    // Reject DATA that exceeds the declared Content-Length.
-    // Without this, a malformed peer can force unbounded body buffering
-    // when max_body_size is high, since the mismatch is only caught later
-    // at dispatch time.
+    // Reject DATA that exceeds the declared Content-Length, or any DATA
+    // when content-length: 0 was declared. Without this, a malformed peer
+    // can force unbounded body buffering when max_body_size is high.
     const auto& req = stream->GetRequest();
-    if (req.content_length > 0 &&
-        stream->AccumulatedBodySize() + len > req.content_length) {
+    bool cl_violated = false;
+    if (stream->HasContentLength()) {
+        if (req.content_length == 0) {
+            cl_violated = true;  // content-length: 0 but body present
+        } else if (stream->AccumulatedBodySize() + len > req.content_length) {
+            cl_violated = true;  // body exceeds declared length
+        }
+    }
+    if (cl_violated) {
         logging::Get()->warn("HTTP/2 stream {} DATA exceeds declared content-length {}",
                              stream_id, req.content_length);
         stream->MarkRejected();
