@@ -572,6 +572,7 @@ bool Http2Session::SendPendingFrames() {
 
 void Http2Session::ResumeOutput() {
     if (!output_deferred_) return;
+    output_deferred_ = false;  // clear before re-entering SendPendingFrames
     SendPendingFrames();
 }
 
