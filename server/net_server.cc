@@ -82,20 +82,20 @@ void NetServer::Start(){
 }
 
 // stop event loop
-void NetServer::Stop(){
+void NetServer::StopAccepting() {
+    if (conn_dispatcher_->was_stopped()) return;  // already stopped
     // Close the listening socket to release the port immediately.
-    // EnQueue BEFORE StopEventLoop (which sets was_stopped_ and rejects tasks).
-    // The task runs on the conn_dispatcher thread sequentially with accept
-    // callbacks, so there's no race with Acceptor::NewConnection().
-    // ~Acceptor destructor will be a no-op (channel already closed, fd released).
     conn_dispatcher_->EnQueue([this]() {
         if (acceptor_) {
             acceptor_->CloseListenSocket();
         }
     });
-
-    // Stop the connection dispatcher so no more accept events fire.
     conn_dispatcher_->StopEventLoop();
+}
+
+void NetServer::Stop(){
+    // First: stop accepting (may already be done by HttpServer::Stop())
+    StopAccepting();
 
     // Second (deferred): ClearConnections is done AFTER the drain wait so that
     // dispatcher TimerHandler continues enforcing per-connection deadlines during

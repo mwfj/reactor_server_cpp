@@ -73,6 +73,11 @@ public:
     void Start();
     void Stop();
 
+    // Close the listening socket and stop accepting new connections.
+    // Called by HttpServer before building the H2 drain snapshot to prevent
+    // new connections from bypassing the graceful shutdown path.
+    void StopAccepting();
+
     void HandleNewConnection(std::unique_ptr<SocketHandler>);
     void HandleCloseConnection(std::shared_ptr<ConnectionHandler>);
     void HandleErrorConnection(std::shared_ptr<ConnectionHandler>);

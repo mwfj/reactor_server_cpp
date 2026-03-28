@@ -218,6 +218,10 @@ void HttpServer::Stop() {
         }
     }
 
+    // Stop accepting new connections before building the H2 drain snapshot.
+    // Prevents new connections from bypassing the graceful shutdown path.
+    net_server_.StopAccepting();
+
     // Graceful HTTP/2 shutdown: request GOAWAY + drain on the dispatcher thread.
     // Collect H2 connections under conn_mtx_ first, then release before
     // acquiring drain_mtx_ to avoid nested lock ordering (conn_mtx_ → drain_mtx_).
@@ -236,6 +240,8 @@ void HttpServer::Stop() {
 
     std::set<ConnectionHandler*> draining_conn_ptrs;
     for (auto& [h2_conn, conn] : h2_snapshot) {
+        // Skip connections that closed between snapshot and now
+        if (conn->IsClosing()) continue;
         ConnectionHandler* conn_ptr = conn.get();
 
         // Install drain-complete callback
