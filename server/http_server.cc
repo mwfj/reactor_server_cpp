@@ -268,7 +268,10 @@ void HttpServer::Stop() {
             OnH2DrainComplete(conn_ptr);
         });
 
-        // Strong refs — kept alive through drain
+        // Strong refs — kept alive through drain.
+        // Install callback + push atomically under drain_mtx_ to prevent
+        // the race where HandleCloseConnection runs OnH2DrainComplete
+        // between callback install and push (finding nothing to remove).
         {
             std::lock_guard<std::mutex> dlck(drain_mtx_);
             h2_draining_.push_back({h2_conn, conn});
@@ -277,6 +280,12 @@ void HttpServer::Stop() {
 
         // Enqueue GOAWAY + drain check on dispatcher thread
         h2_conn->RequestShutdown();
+
+        // Re-check: if the connection closed during setup, remove the stale
+        // entry now. HandleCloseConnection may have already tried and missed.
+        if (conn->IsClosing()) {
+            OnH2DrainComplete(conn_ptr);
+        }
     }
 
     // If drain wait is safe (not on a dispatcher thread) and H2 connections
