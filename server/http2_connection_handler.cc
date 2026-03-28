@@ -101,10 +101,12 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
                 return false;
             }
 
-            // If a request deadline is armed (incomplete streams exist),
-            // keep alive — the deadline will fire again for those streams.
-            // Otherwise, don't prevent idle timeout from closing the connection.
-            return self->deadline_armed_;
+            // Keep alive if:
+            // - A request deadline is armed (incomplete streams exist), or
+            // - Active streams remain (response draining, even if no incomplete)
+            // Otherwise, let idle timeout close the connection.
+            return self->deadline_armed_ ||
+                   self->session_->ActiveStreamCount() > 0;
         });
 
         // Arm initial deadline for SETTINGS exchange / first request.

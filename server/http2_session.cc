@@ -220,9 +220,9 @@ static int OnDataChunkRecvCallback(
     // can force unbounded body buffering when max_body_size is high.
     const auto& req = stream->GetRequest();
     bool cl_violated = false;
-    if (stream->HasContentLength()) {
+    if (stream->HasContentLength() && len > 0) {
         if (req.content_length == 0) {
-            cl_violated = true;  // content-length: 0 but body present
+            cl_violated = true;  // content-length: 0 but non-empty DATA
         } else if (stream->AccumulatedBodySize() + len > req.content_length) {
             cl_violated = true;  // body exceeds declared length
         }
