@@ -295,11 +295,14 @@ void Http2ConnectionHandler::OnSendComplete() {
         return;
     }
 
-    // Output buffer drained to zero AND no deferred nghttp2 frames.
-    // All bytes are on the wire. If shutdown drain is active and all
-    // streams completed, this is the true drain-complete point.
+    // Output buffer drained to zero AND no deferred nghttp2 frames AND
+    // nghttp2 has nothing more to send. All bytes are on the wire.
+    // If shutdown drain is active and all streams completed, drain is done.
     if (shutdown_requested_.load(std::memory_order_acquire) &&
-        session_->ActiveStreamCount() == 0 && !resume_scheduled_) {
+        session_->ActiveStreamCount() == 0 &&
+        !resume_scheduled_ &&
+        !session_->HasDeferredOutput() &&
+        !session_->WantWrite()) {
         NotifyDrainComplete();
     }
 }

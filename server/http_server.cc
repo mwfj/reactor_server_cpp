@@ -599,7 +599,12 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             http_conn = nullptr;
             {
                 std::lock_guard<std::mutex> lck(conn_mtx_);
-                http_connections_.erase(conn->fd());
+                // Identity check: only erase if the entry still wraps the stale conn
+                auto it = http_connections_.find(conn->fd());
+                if (it != http_connections_.end() &&
+                    it->second->GetConnection() != conn) {
+                    http_connections_.erase(it);
+                }
             }
             // Fall through to DetectAndRouteProtocol below
         } else {
@@ -681,6 +686,13 @@ bool HttpServer::DetectAndRouteProtocol(
     SetupHandlers(http_conn);
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
+        // Identity check: don't overwrite a handler for a different connection
+        // on the same fd (fd-reuse race with HandleNewConnection).
+        auto existing = http_connections_.find(conn->fd());
+        if (existing != http_connections_.end() &&
+            existing->second->GetConnection() != conn) {
+            // Stale entry — safe to overwrite
+        }
         http_connections_[conn->fd()] = http_conn;
     }
     http_conn->OnRawData(conn, message);
