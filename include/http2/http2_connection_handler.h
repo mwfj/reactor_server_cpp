@@ -31,10 +31,14 @@ public:
     // Optionally accepts initial data (preface bytes already buffered).
     void Initialize(const std::string& initial_data = "");
 
-    // Request graceful shutdown. Thread-safe (sets atomic flag).
-    // Actual GOAWAY + drain happens on the dispatcher thread via the
-    // deadline timeout callback or next OnRawData.
+    // Request graceful shutdown. Thread-safe: sets atomic flag and enqueues
+    // dispatcher-thread task that sends GOAWAY and initiates drain.
     void RequestShutdown();
+
+    // Callback invoked (once) when the connection finishes draining all
+    // active streams during graceful shutdown. Called on dispatcher thread.
+    using DrainCompleteCallback = std::function<void()>;
+    void SetDrainCompleteCallback(DrainCompleteCallback cb);
 
     // Access the underlying connection
     std::shared_ptr<ConnectionHandler> GetConnection() const { return conn_; }
@@ -57,6 +61,8 @@ private:
     bool initialized_ = false;
     bool deadline_armed_ = false;
     std::atomic<bool> shutdown_requested_{false};
+    DrainCompleteCallback drain_complete_cb_;
+    bool drain_notified_ = false;
     std::chrono::steady_clock::time_point last_deadline_;  // avoids redundant SetDeadline calls
 
     // Internal: called after ReceiveData; a no-op since dispatch is
@@ -65,6 +71,9 @@ private:
 
     // Internal: set connection deadline based on oldest incomplete stream.
     void UpdateDeadline();
+
+    // Internal: fire drain-complete callback once. Calls CloseAfterWrite first.
+    void NotifyDrainComplete();
 
     // Stored callbacks for deferred initialization
     RequestCallback pending_request_cb_;

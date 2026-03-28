@@ -4,6 +4,7 @@
 #include "http2/http2_constants.h"
 #include "log/logger.h"
 #include <algorithm>
+#include <set>
 
 void HttpServer::WireNetServerCallbacks() {
     net_server_.SetNewConnectionCb(
@@ -93,6 +94,7 @@ HttpServer::HttpServer(const ServerConfig& config)
     max_header_size_ = config.max_header_size;
     max_ws_message_size_ = config.max_ws_message_size;
     request_timeout_sec_ = config.request_timeout_sec;
+    shutdown_drain_timeout_sec_ = config.shutdown_drain_timeout_sec;
     net_server_.SetMaxConnections(config.max_connections);
 
     // Set input buffer cap on NetServer — applied BEFORE epoll registration
@@ -217,18 +219,57 @@ void HttpServer::Stop() {
     }
 
     // Graceful HTTP/2 shutdown: request GOAWAY + drain on the dispatcher thread.
-    // RequestShutdown() is thread-safe (sets atomic flag + arms near-immediate
-    // deadline). The deadline callback runs on the dispatcher thread, sends GOAWAY,
-    // and closes once all active streams complete.
-    std::vector<std::shared_ptr<Http2ConnectionHandler>> h2_conns_to_shutdown;
+    // Collect H2 connections under conn_mtx_ first, then release before
+    // acquiring drain_mtx_ to avoid nested lock ordering (conn_mtx_ → drain_mtx_).
+    using H2Pair = std::pair<std::shared_ptr<Http2ConnectionHandler>,
+                             std::shared_ptr<ConnectionHandler>>;
+    std::vector<H2Pair> h2_snapshot;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        for (auto& pair : h2_connections_) {
-            h2_conns_to_shutdown.push_back(pair.second);
+        h2_snapshot.reserve(h2_connections_.size());
+        for (auto& [fd, h2_conn] : h2_connections_) {
+            auto conn = h2_conn->GetConnection();
+            if (!conn) continue;
+            h2_snapshot.emplace_back(h2_conn, std::move(conn));
         }
     }
-    for (auto& h2_conn : h2_conns_to_shutdown) {
+
+    std::set<ConnectionHandler*> draining_conn_ptrs;
+    for (auto& [h2_conn, conn] : h2_snapshot) {
+        ConnectionHandler* conn_ptr = conn.get();
+
+        // Install drain-complete callback
+        h2_conn->SetDrainCompleteCallback([this, conn_ptr]() {
+            OnH2DrainComplete(conn_ptr);
+        });
+
+        // Strong refs — kept alive through drain
+        {
+            std::lock_guard<std::mutex> dlck(drain_mtx_);
+            h2_draining_.push_back({h2_conn, conn});
+        }
+        draining_conn_ptrs.insert(conn_ptr);
+
+        // Enqueue GOAWAY + drain check on dispatcher thread
         h2_conn->RequestShutdown();
+    }
+
+    // Configure NetServer to exempt draining H2 connections
+    net_server_.SetDrainingConns(std::move(draining_conn_ptrs));
+
+    // If drain wait is safe (not on a dispatcher thread) and H2 connections
+    // exist, install the drain callback. Otherwise, degraded shutdown —
+    // H2 streams may be cut off (same as HTTP/1.x behavior).
+    bool has_draining = false;
+    {
+        std::lock_guard<std::mutex> dlck(drain_mtx_);
+        has_draining = !h2_draining_.empty();
+    }
+    if (has_draining && !net_server_.IsOnDispatcherThread()) {
+        net_server_.SetPreStopDrainCallback([this]() { WaitForH2Drain(); });
+    } else if (has_draining) {
+        logging::Get()->warn("HttpServer::Stop() called from dispatcher thread — "
+                             "HTTP/2 graceful drain skipped to avoid deadlock");
     }
 
     net_server_.Stop();
@@ -236,6 +277,46 @@ void HttpServer::Stop() {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         http_connections_.clear();
         h2_connections_.clear();
+        pending_detection_.clear();
+    }
+    // Clear one-shot drain state (Stop may be called from destructor too)
+    {
+        std::lock_guard<std::mutex> dlck(drain_mtx_);
+        h2_draining_.clear();
+    }
+}
+
+void HttpServer::OnH2DrainComplete(ConnectionHandler* conn_ptr) {
+    // Called from dispatcher thread when an H2 connection finishes draining.
+    std::lock_guard<std::mutex> lck(drain_mtx_);
+    h2_draining_.erase(
+        std::remove_if(h2_draining_.begin(), h2_draining_.end(),
+            [conn_ptr](const DrainingH2Conn& d) {
+                return d.conn.get() == conn_ptr;
+            }),
+        h2_draining_.end());
+    if (h2_draining_.empty()) {
+        drain_cv_.notify_one();
+    }
+}
+
+void HttpServer::WaitForH2Drain() {
+    std::unique_lock<std::mutex> lck(drain_mtx_);
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::seconds(shutdown_drain_timeout_sec_);
+    drain_cv_.wait_until(lck, deadline, [this]() {
+        return h2_draining_.empty();
+    });
+
+    if (!h2_draining_.empty()) {
+        // Timeout: force-close remaining. Move to local to avoid holding
+        // drain_mtx_ during ForceClose (prevents lock coupling with late callbacks).
+        auto remaining = std::move(h2_draining_);
+        h2_draining_.clear();
+        lck.unlock();
+        for (auto& d : remaining) {
+            if (d.conn) d.conn->ForceClose();
+        }
     }
 }
 

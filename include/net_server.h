@@ -13,6 +13,7 @@
 #include "threadtask.h"
 #include "threadpool.h"
 #include <mutex>
+#include <set>
 
 class TlsContext;
 
@@ -58,6 +59,8 @@ private:
     int max_connections_ = 0;         // 0 = unlimited
     size_t max_input_size_ = 0;       // 0 = unlimited, set before RegisterCallbacks
     std::function<void()> ready_callback_ = nullptr;  // Fires after init, before event loop
+    std::set<ConnectionHandler*> draining_conns_;       // H2 connections exempt from force-close
+    std::function<void()> pre_stop_drain_cb_;           // H2 drain wait callback
 
 public:
     NetServer() = delete;
@@ -90,6 +93,22 @@ public:
     void SetTlsContext(std::shared_ptr<TlsContext> ctx) { tls_ctx_ = std::move(ctx); }
     void SetMaxConnections(int max) { max_connections_ = max; }
     void SetMaxInputSize(size_t max) { max_input_size_ = max; }
+
+    // Connections exempt from CloseAfterWrite during Stop().
+    // Set by HttpServer before Stop() for HTTP/2 graceful drain.
+    void SetDrainingConns(std::set<ConnectionHandler*> conns) {
+        draining_conns_ = std::move(conns);
+    }
+
+    // Callback invoked after the first drain barrier, while event loops are
+    // still running. Used by HttpServer to wait for HTTP/2 stream drain.
+    void SetPreStopDrainCallback(std::function<void()> cb) {
+        pre_stop_drain_cb_ = std::move(cb);
+    }
+
+    // Check if the calling thread is a socket dispatcher thread.
+    // Used to detect Stop-from-handler scenarios that would deadlock drain wait.
+    bool IsOnDispatcherThread() const;
 
     // Called after init completes but before the blocking event loop.
     // Used by daemon mode to signal readiness to the parent process.

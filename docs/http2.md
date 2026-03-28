@@ -198,17 +198,21 @@ For h2 over TLS:
 ```
 HttpServer::Stop()
   1. Existing HTTP/1.x + WS shutdown (WS Close 1001)
-  2. For each HTTP/2 connection: RequestShutdown()
-     → Sets atomic flag (thread-safe)
-     → Arms near-immediate deadline for dispatcher wakeup
-  3. Timer fires on dispatcher thread:
-     → Sends GOAWAY(NO_ERROR) with correct last_stream_id
-     → New streams refused, existing streams continue draining
-     → CloseAfterWrite() once all active streams complete
-  4. NetServer::Stop() force-closes any stragglers
+  2. For each HTTP/2 connection:
+     → Install DrainCompleteCallback
+     → RequestShutdown() → enqueues dispatcher-thread task via RunOnDispatcher
+     → On dispatcher: sends GOAWAY(NO_ERROR) via nghttp2
+     → New streams refused, existing streams drain with full flow control
+     → NotifyDrainComplete() when ActiveStreamCount() == 0
+  3. NetServer skips draining H2 connections in its CloseAfterWrite sweep
+  4. WaitForH2Drain() blocks until all drain or shutdown_drain_timeout_sec expires
+  5. Timeout: ForceClose remaining connections
+  6. Second drain barrier covers final H2 CloseAfterWrite tasks
 ```
 
-The shutdown is fully graceful: GOAWAY carries `last_stream_id` so clients know which requests to retry, active streams drain with full flow control (WINDOW_UPDATE still processed), and the nghttp2 session is only touched on its dispatcher thread (no cross-thread mutation).
+The shutdown is fully graceful: GOAWAY carries `last_stream_id` so clients know which requests to retry, active streams drain with full flow control (WINDOW_UPDATE still processed), and the nghttp2 session is only touched on its dispatcher thread (no cross-thread mutation). A configurable `shutdown_drain_timeout_sec` (default 30s) bounds the wait.
+
+If `Stop()` is called from a dispatcher thread (e.g., a request handler calling `HttpServer::Stop()`), the H2 drain wait is skipped to avoid deadlock. A warning is logged. This matches the existing `ThreadPool::Stop()` self-stop safety pattern.
 
 ## Pseudo-Header Mapping
 

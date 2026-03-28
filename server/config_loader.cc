@@ -85,6 +85,11 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
             throw std::runtime_error("request_timeout_sec must be an integer");
         config.request_timeout_sec = j["request_timeout_sec"].get<int>();
     }
+    if (j.contains("shutdown_drain_timeout_sec")) {
+        if (!j["shutdown_drain_timeout_sec"].is_number_integer())
+            throw std::runtime_error("shutdown_drain_timeout_sec must be an integer");
+        config.shutdown_drain_timeout_sec = j["shutdown_drain_timeout_sec"].get<int>();
+    }
 
     // TLS section
     if (j.contains("tls")) {
@@ -241,6 +246,9 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     val = std::getenv("REACTOR_REQUEST_TIMEOUT");
     if (val) config.request_timeout_sec = EnvToInt(val, "REACTOR_REQUEST_TIMEOUT");
 
+    val = std::getenv("REACTOR_SHUTDOWN_DRAIN_TIMEOUT");
+    if (val) config.shutdown_drain_timeout_sec = EnvToInt(val, "REACTOR_SHUTDOWN_DRAIN_TIMEOUT");
+
     // HTTP/2 env overrides
     val = std::getenv("REACTOR_HTTP2_ENABLED");
     if (val) {
@@ -316,6 +324,13 @@ void ConfigLoader::Validate(const ServerConfig& config) {
         throw std::invalid_argument(
             "Invalid idle_timeout_sec: " + std::to_string(config.idle_timeout_sec) +
             " (must be >= 0, 0 = disabled)");
+    }
+
+    if (config.shutdown_drain_timeout_sec < 0 || config.shutdown_drain_timeout_sec > 300) {
+        throw std::invalid_argument(
+            "Invalid shutdown_drain_timeout_sec: " +
+            std::to_string(config.shutdown_drain_timeout_sec) +
+            " (must be 0-300)");
     }
 
     if (config.request_timeout_sec < 0) {
@@ -405,6 +420,7 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
     j["max_body_size"]      = config.max_body_size;
     j["max_ws_message_size"]= config.max_ws_message_size;
     j["request_timeout_sec"]= config.request_timeout_sec;
+    j["shutdown_drain_timeout_sec"] = config.shutdown_drain_timeout_sec;
     j["tls"]["enabled"]     = config.tls.enabled;
     j["tls"]["cert_file"]   = config.tls.cert_file;
     j["tls"]["key_file"]    = config.tls.key_file;

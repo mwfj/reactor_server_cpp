@@ -94,10 +94,11 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
                 return false;
             }
 
-            // During shutdown: if all active streams completed, close now.
+            // During shutdown: if all active streams completed, drain complete.
             if (self->shutdown_requested_.load(std::memory_order_acquire) &&
                 self->session_->ActiveStreamCount() == 0) {
-                return false;  // Quiescent — proceed with close
+                self->NotifyDrainComplete();
+                return false;
             }
 
             // Otherwise keep connection alive (deadline re-armed or idle).
@@ -142,15 +143,6 @@ void Http2ConnectionHandler::OnRawData(
         return;
     }
 
-    // Handle pending shutdown request (from Stop()) on the dispatcher thread.
-    // Send GOAWAY, then let existing streams drain. New stream creation is
-    // blocked in OnBeginHeadersCallback via the goaway_sent_ flag.
-    if (shutdown_requested_.load(std::memory_order_acquire) &&
-        session_ && !session_->IsGoawaySent()) {
-        session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
-        session_->SendPendingFrames();
-    }
-
     // Feed data to nghttp2 — during shutdown drain, we continue processing
     // frames so that WINDOW_UPDATE/SETTINGS/RST_STREAM reach nghttp2 and
     // in-flight responses can complete.
@@ -187,39 +179,49 @@ void Http2ConnectionHandler::OnRawData(
     // During shutdown drain: close once all active streams have completed.
     if (shutdown_requested_.load(std::memory_order_acquire) &&
         session_->ActiveStreamCount() == 0) {
-        conn_->CloseAfterWrite();
+        NotifyDrainComplete();
     }
 }
 
 void Http2ConnectionHandler::RequestShutdown() {
-    shutdown_requested_.store(true, std::memory_order_release);
+    if (shutdown_requested_.exchange(true)) return;  // already requested
     if (!conn_) return;
 
-    // Send a raw GOAWAY frame via SendRaw (thread-safe via EnQueue).
-    // We can't use nghttp2 here (not thread-safe), so we manually
-    // serialize the GOAWAY frame (fixed format, 17 bytes total).
-    // last_stream_id_ is atomic, safe to read from any thread.
-    int32_t last_id = session_ ? session_->LastStreamId() : 0;
-    uint8_t goaway[17] = {
-        0x00, 0x00, 0x08,              // Length: 8 bytes payload
-        0x07,                           // Type: GOAWAY
-        0x00,                           // Flags: none
-        0x00, 0x00, 0x00, 0x00,        // Stream ID: 0 (connection-level)
-        // Last-Stream-ID (4 bytes, network byte order)
-        static_cast<uint8_t>((last_id >> 24) & 0x7F),  // clear R bit
-        static_cast<uint8_t>((last_id >> 16) & 0xFF),
-        static_cast<uint8_t>((last_id >> 8) & 0xFF),
-        static_cast<uint8_t>(last_id & 0xFF),
-        // Error Code: NO_ERROR (0x00000000)
-        0x00, 0x00, 0x00, 0x00
-    };
-    conn_->SendRaw(reinterpret_cast<const char*>(goaway), sizeof(goaway));
-    // Do NOT call CloseAfterWrite() here — that would close the connection
-    // as soon as the 17-byte GOAWAY flushes, aborting active streams.
-    // Instead, the OnRawData and deadline callback paths close the connection
-    // once all active streams have completed (ActiveStreamCount() == 0).
-    // For idle connections, the deadline callback fires after 1s and closes.
-    // NetServer::Stop() serves as the backstop for any stragglers.
+    // Enqueue GOAWAY + drain check on the dispatcher thread.
+    // RunOnDispatcher uses EnQueue — runs on the next event loop iteration.
+    // This avoids touching nghttp2 from the stopper thread.
+    std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
+    conn_->RunOnDispatcher([weak_self]() {
+        auto self = weak_self.lock();
+        if (!self || !self->session_) return;
+
+        // Send GOAWAY via nghttp2 (on dispatcher thread — safe)
+        if (!self->session_->IsGoawaySent()) {
+            self->session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
+            self->session_->SendPendingFrames();
+        }
+
+        // If already idle, complete drain immediately
+        if (self->session_->ActiveStreamCount() == 0) {
+            self->NotifyDrainComplete();
+        }
+        // else: active streams exist — drain continues via OnRawData.
+        // They'll call NotifyDrainComplete when ActiveStreamCount() == 0.
+    });
+}
+
+void Http2ConnectionHandler::SetDrainCompleteCallback(DrainCompleteCallback cb) {
+    drain_complete_cb_ = std::move(cb);
+}
+
+void Http2ConnectionHandler::NotifyDrainComplete() {
+    if (drain_notified_) return;
+    drain_notified_ = true;
+    conn_->CloseAfterWrite();  // flush remaining response bytes
+    if (drain_complete_cb_) {
+        try { drain_complete_cb_(); }
+        catch (...) {}
+    }
 }
 
 void Http2ConnectionHandler::DispatchPendingRequests() {

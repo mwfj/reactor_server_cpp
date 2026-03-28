@@ -121,9 +121,11 @@ void NetServer::Stop(){
     for (auto& conn : conns_to_close) {
         // Skip connections already marked by a higher layer (e.g., HttpServer
         // sent a WS close frame and called CloseAfterWrite on them).
-        if (!conn->IsCloseDeferred()) {
-            conn->CloseAfterWrite();
-        }
+        if (conn->IsCloseDeferred()) continue;
+        // Skip connections in the H2 graceful drain set — they close
+        // themselves after all active streams complete.
+        if (draining_conns_.count(conn.get())) continue;
+        conn->CloseAfterWrite();
     }
     // Do NOT clear conns_to_close here. The shared_ptrs must keep
     // ConnectionHandlers alive until the deferred CloseAfterWrite lambdas
@@ -137,19 +139,32 @@ void NetServer::Stop(){
     // buffered output (WS close frames, in-flight HTTP responses) under backpressure.
     // The barrier ensures write mode is registered; StopEventLoop's WakeUp then
     // triggers one final WaitForEvent that includes the write-ready channels.
-    for (auto& disp : socket_dispatchers_) {
-        if (disp->was_stopped()) continue;
-        // Skip barrier for the current thread's dispatcher — if Stop() is called
-        // from a handler on this dispatcher, future.wait() would deadlock (the
-        // barrier task can only run on the thread that's blocked waiting for it).
-        // CloseAfterWrite for connections on this dispatcher already ran inline
-        // (SendRaw/CloseAfterWrite route inline when on the loop thread).
-        if (disp->is_on_loop_thread()) continue;
-        auto barrier = std::make_shared<std::promise<void>>();
-        auto future = barrier->get_future();
-        disp->EnQueue([barrier]() { barrier->set_value(); });
-        future.wait();
+    // Wait for each socket dispatcher to process enqueued work.
+    // Skips self-dispatcher to avoid deadlock when Stop() is called from a handler.
+    auto wait_for_dispatcher_barrier = [this]() {
+        for (auto& disp : socket_dispatchers_) {
+            if (disp->was_stopped()) continue;
+            if (disp->is_on_loop_thread()) continue;
+            auto barrier = std::make_shared<std::promise<void>>();
+            auto future = barrier->get_future();
+            disp->EnQueue([barrier]() { barrier->set_value(); });
+            future.wait();
+        }
+    };
+
+    wait_for_dispatcher_barrier();
+
+    // Fourth-B: If H2 connections are draining, wait for them while event loops
+    // are still running. The pre_stop_drain_cb blocks until drain completes or timeout.
+    if (pre_stop_drain_cb_) {
+        pre_stop_drain_cb_();
+        pre_stop_drain_cb_ = nullptr;  // one-shot
+
+        // Second barrier: covers CloseAfterWrite tasks enqueued by H2 handlers
+        // during the drain wait above.
+        wait_for_dispatcher_barrier();
     }
+    draining_conns_.clear();  // one-shot cleanup
 
     // Fifth: Stop socket dispatcher event loops (conn_dispatcher already stopped above).
     // StopEventLoop's WakeUp triggers one final loop iteration that processes any
@@ -357,4 +372,11 @@ void NetServer::SetSendCompletionCb(CALLBACKS_NAMESPACE::NetSrvSendCompleteCallb
 void NetServer::SetTimerCb(CALLBACKS_NAMESPACE::NetSrvTimerCallback fn){
     if(fn)
         callbacks_.timer_callback = std::move(fn);
+}
+
+bool NetServer::IsOnDispatcherThread() const {
+    for (const auto& disp : socket_dispatchers_) {
+        if (disp->is_on_loop_thread()) return true;
+    }
+    return false;
 }

@@ -44,6 +44,7 @@ struct ServerConfig {
     size_t max_body_size = 1048576;      // 1 MB
     size_t max_ws_message_size = 16777216; // 16 MB
     int request_timeout_sec = 30;        // Slowloris protection
+    int shutdown_drain_timeout_sec = 30; // Max wait for in-flight H2 streams
 };
 ```
 
@@ -127,6 +128,7 @@ Environment variables take precedence over JSON file values:
 | `REACTOR_IDLE_TIMEOUT` | `idle_timeout_sec` | int |
 | `REACTOR_WORKER_THREADS` | `worker_threads` | int |
 | `REACTOR_REQUEST_TIMEOUT` | `request_timeout_sec` | int |
+| `REACTOR_SHUTDOWN_DRAIN_TIMEOUT` | `shutdown_drain_timeout_sec` | int |
 | `REACTOR_HTTP2_ENABLED` | `http2.enabled` | bool (`1`/`true`/`yes`) |
 | `REACTOR_HTTP2_MAX_CONCURRENT_STREAMS` | `http2.max_concurrent_streams` | int |
 | `REACTOR_HTTP2_INITIAL_WINDOW_SIZE` | `http2.initial_window_size` | int |
@@ -139,6 +141,7 @@ Environment variables take precedence over JSON file values:
 - Port in valid range (1-65535)
 - Worker threads > 0
 - If TLS enabled, cert_file and key_file must be non-empty
+- shutdown_drain_timeout_sec: 0-300 (0 = immediate close)
 - If HTTP/2 enabled: max_concurrent_streams >= 1, initial_window_size 1 to 2^31-1, max_frame_size 16384 to 16777215, max_header_list_size >= 1
 
 Throws `std::invalid_argument` on validation failure.

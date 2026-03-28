@@ -689,6 +689,12 @@ void ConnectionHandler::SetTlsConnection(std::unique_ptr<TlsConnection> tls) {
     tls_state_ = TlsState::HANDSHAKE;
 }
 
+void ConnectionHandler::RunOnDispatcher(std::function<void()> task) {
+    if (event_dispatcher_) {
+        event_dispatcher_->EnQueue(std::move(task));  // EnQueue handles was_stopped check
+    }
+}
+
 std::string ConnectionHandler::GetAlpnProtocol() const {
     if (tls_ && tls_state_ == TlsState::READY) {
         return tls_->GetAlpnProtocol();

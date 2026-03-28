@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <string>
 
 class HttpServer {
@@ -86,6 +87,18 @@ private:
         std::string data;
     };
     std::map<int, PendingDetection> pending_detection_;
+
+    // Graceful HTTP/2 shutdown drain
+    int shutdown_drain_timeout_sec_ = 30;
+    struct DrainingH2Conn {
+        std::shared_ptr<Http2ConnectionHandler> handler;
+        std::shared_ptr<ConnectionHandler> conn;
+    };
+    std::vector<DrainingH2Conn> h2_draining_;
+    std::mutex drain_mtx_;
+    std::condition_variable drain_cv_;
+    void OnH2DrainComplete(ConnectionHandler* conn_ptr);
+    void WaitForH2Drain();
 
     // Helper: set up request handler on an Http2ConnectionHandler
     void SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn);

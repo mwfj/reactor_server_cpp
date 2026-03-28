@@ -94,6 +94,11 @@ public:
     // Returns true if this connection has TLS (any state: handshake or ready).
     bool HasTls() const { return tls_state_ != TlsState::NONE; }
 
+    // Enqueue a task to run on this connection's dispatcher thread.
+    // Thread-safe. Used by protocol layers that need dispatcher-thread
+    // execution from other threads (e.g., HTTP/2 graceful shutdown).
+    void RunOnDispatcher(std::function<void()> task);
+
     // Get the ALPN-negotiated protocol from the TLS connection.
     // Returns empty string if no TLS or ALPN not negotiated.
     std::string GetAlpnProtocol() const;

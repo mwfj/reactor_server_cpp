@@ -739,6 +739,188 @@ void TestH2ConfigSerialization() {
 }
 
 // ============================================================
+// shutdown_drain_timeout_sec configuration tests
+// ============================================================
+
+// shutdown_drain_timeout_sec must default to 30.
+void TestShutdownDrainDefault() {
+    std::cout << "\n[TEST] H2 Config: shutdown_drain_timeout_sec default == 30..." << std::endl;
+    try {
+        ServerConfig cfg = ConfigLoader::Default();
+
+        bool pass = (cfg.shutdown_drain_timeout_sec == 30);
+        std::string err;
+        if (!pass) {
+            err = "shutdown_drain_timeout_sec default = " +
+                  std::to_string(cfg.shutdown_drain_timeout_sec) +
+                  ", expected 30";
+        }
+
+        TestFramework::RecordTest("H2 Config: shutdown_drain_timeout_sec default",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Config: shutdown_drain_timeout_sec default",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Validate must reject values outside [0, 300] and accept boundary values.
+void TestShutdownDrainValidation() {
+    std::cout << "\n[TEST] H2 Config: shutdown_drain_timeout_sec validation..." << std::endl;
+    try {
+        bool pass = true;
+        std::string err;
+
+        // -1 must be rejected
+        {
+            ServerConfig cfg;
+            cfg.shutdown_drain_timeout_sec = -1;
+            bool threw = false;
+            try {
+                ConfigLoader::Validate(cfg);
+            } catch (const std::invalid_argument&) {
+                threw = true;
+            }
+            if (!threw) { pass = false; err += "value -1 not rejected; "; }
+        }
+
+        // 301 must be rejected (above max 300)
+        {
+            ServerConfig cfg;
+            cfg.shutdown_drain_timeout_sec = 301;
+            bool threw = false;
+            try {
+                ConfigLoader::Validate(cfg);
+            } catch (const std::invalid_argument&) {
+                threw = true;
+            }
+            if (!threw) { pass = false; err += "value 301 not rejected; "; }
+        }
+
+        // 0 (immediate close) must be accepted
+        {
+            ServerConfig cfg;
+            cfg.shutdown_drain_timeout_sec = 0;
+            try {
+                ConfigLoader::Validate(cfg);
+            } catch (const std::exception& ex) {
+                pass = false;
+                err += std::string("value 0 rejected unexpectedly: ") + ex.what() + "; ";
+            }
+        }
+
+        // 300 (max) must be accepted
+        {
+            ServerConfig cfg;
+            cfg.shutdown_drain_timeout_sec = 300;
+            try {
+                ConfigLoader::Validate(cfg);
+            } catch (const std::exception& ex) {
+                pass = false;
+                err += std::string("value 300 rejected unexpectedly: ") + ex.what() + "; ";
+            }
+        }
+
+        TestFramework::RecordTest("H2 Config: shutdown_drain_timeout_sec validation",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Config: shutdown_drain_timeout_sec validation",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// JSON parsing must set shutdown_drain_timeout_sec when the key is present.
+void TestShutdownDrainJsonParsing() {
+    std::cout << "\n[TEST] H2 Config: shutdown_drain_timeout_sec JSON parse..." << std::endl;
+    try {
+        const std::string json = R"({"shutdown_drain_timeout_sec": 10})";
+        ServerConfig cfg = ConfigLoader::LoadFromString(json);
+
+        bool pass = (cfg.shutdown_drain_timeout_sec == 10);
+        std::string err;
+        if (!pass) {
+            err = "shutdown_drain_timeout_sec = " +
+                  std::to_string(cfg.shutdown_drain_timeout_sec) +
+                  ", expected 10";
+        }
+
+        TestFramework::RecordTest("H2 Config: shutdown_drain_timeout_sec JSON parse",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Config: shutdown_drain_timeout_sec JSON parse",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// REACTOR_SHUTDOWN_DRAIN_TIMEOUT env var must override shutdown_drain_timeout_sec.
+void TestShutdownDrainEnvOverride() {
+    std::cout << "\n[TEST] H2 Config: REACTOR_SHUTDOWN_DRAIN_TIMEOUT env override..." << std::endl;
+    try {
+        // Clean any prior value
+        unsetenv("REACTOR_SHUTDOWN_DRAIN_TIMEOUT");
+
+        setenv("REACTOR_SHUTDOWN_DRAIN_TIMEOUT", "5", 1);
+
+        ServerConfig cfg = ConfigLoader::Default();
+        ConfigLoader::ApplyEnvOverrides(cfg);
+
+        bool pass = (cfg.shutdown_drain_timeout_sec == 5);
+        std::string err;
+        if (!pass) {
+            err = "shutdown_drain_timeout_sec = " +
+                  std::to_string(cfg.shutdown_drain_timeout_sec) +
+                  " after env override, expected 5";
+        }
+
+        // Always clean up, even on failure
+        unsetenv("REACTOR_SHUTDOWN_DRAIN_TIMEOUT");
+
+        TestFramework::RecordTest("H2 Config: shutdown_drain_timeout_sec env override",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        unsetenv("REACTOR_SHUTDOWN_DRAIN_TIMEOUT");
+        TestFramework::RecordTest("H2 Config: shutdown_drain_timeout_sec env override",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ToJson must include shutdown_drain_timeout_sec with the correct value.
+void TestShutdownDrainSerialization() {
+    std::cout << "\n[TEST] H2 Config: shutdown_drain_timeout_sec serialization..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.shutdown_drain_timeout_sec = 15;
+
+        std::string json = ConfigLoader::ToJson(cfg);
+
+        bool pass = true;
+        std::string err;
+
+        if (json.find("\"shutdown_drain_timeout_sec\"") == std::string::npos) {
+            pass = false; err += "key shutdown_drain_timeout_sec missing from JSON; ";
+        }
+        if (json.find("15") == std::string::npos) {
+            pass = false; err += "value 15 not found in JSON; ";
+        }
+
+        // Verify round-trip: parse back what we serialized
+        ServerConfig cfg2 = ConfigLoader::LoadFromString(json);
+        if (cfg2.shutdown_drain_timeout_sec != 15) {
+            pass = false;
+            err += "round-trip value = " +
+                   std::to_string(cfg2.shutdown_drain_timeout_sec) +
+                   ", expected 15; ";
+        }
+
+        TestFramework::RecordTest("H2 Config: shutdown_drain_timeout_sec serialization",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Config: shutdown_drain_timeout_sec serialization",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ============================================================
 // ============================================================
 // TEST CATEGORY 2: ProtocolDetector (unit tests, no server)
 // ============================================================
@@ -1886,6 +2068,13 @@ void RunAllTests() {
     TestH2ConfigEnvOverride();
     TestH2ConfigDisabled();
     TestH2ConfigSerialization();
+
+    // --- shutdown_drain_timeout_sec ---
+    TestShutdownDrainDefault();
+    TestShutdownDrainValidation();
+    TestShutdownDrainJsonParsing();
+    TestShutdownDrainEnvOverride();
+    TestShutdownDrainSerialization();
 
     // --- Category 2: ProtocolDetector ---
     TestDetectFromAlpn_H2();
