@@ -276,8 +276,7 @@ void Http2ConnectionHandler::NotifyDrainComplete() {
 void Http2ConnectionHandler::OnSendComplete() {
     if (!session_) return;
 
-    // If deferred output exists, resume first — there may be GOAWAY or
-    // response tail frames that need to flush before we can declare drain.
+    // If deferred output exists, resume — pull remaining frames from nghttp2.
     if (session_->HasDeferredOutput()) {
         if (resume_scheduled_) return;
         resume_scheduled_ = true;
@@ -288,27 +287,21 @@ void Http2ConnectionHandler::OnSendComplete() {
             self->resume_scheduled_ = false;
             if (self->session_) {
                 self->session_->ResumeOutput();
-                // After resume, if shutdown drain is done, start flushing
-                if (self->shutdown_requested_.load(std::memory_order_acquire) &&
-                    self->session_->ActiveStreamCount() == 0 &&
-                    !self->session_->HasDeferredOutput() &&
-                    !self->drain_notified_) {
-                    self->NotifyDrainComplete();
-                }
             }
+            // ResumeOutput may have added bytes to output_bf_.
+            // Don't declare drain here — wait for the NEXT OnSendComplete
+            // (when those bytes actually drain to the wire).
         });
         return;
     }
 
-    // Output buffer drained to zero and no deferred frames. If shutdown
-    // drain is active and all streams completed, this is the true
-    // drain-complete point — all bytes are on the wire.
+    // Output buffer drained to zero AND no deferred nghttp2 frames.
+    // All bytes are on the wire. If shutdown drain is active and all
+    // streams completed, this is the true drain-complete point.
     if (shutdown_requested_.load(std::memory_order_acquire) &&
-        session_->ActiveStreamCount() == 0) {
+        session_->ActiveStreamCount() == 0 && !resume_scheduled_) {
         NotifyDrainComplete();
-        return;
     }
-
 }
 
 void Http2ConnectionHandler::DispatchPendingRequests() {
