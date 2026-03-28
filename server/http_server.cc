@@ -391,34 +391,10 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
     if (conn->IsClosing()) return;
 
     if (http2_enabled_) {
-        // For TLS connections that already negotiated h2 via ALPN, create the
-        // H2 session immediately so the server preface (SETTINGS) is sent
-        // without waiting for client data. This prevents deadlock with strict
-        // clients that wait for server SETTINGS before sending their preface.
-        std::string alpn = conn->GetAlpnProtocol();
-        if (!alpn.empty() &&
-            ProtocolDetector::DetectFromAlpn(alpn) == ProtocolDetector::Protocol::HTTP2) {
-            auto h2_conn = std::make_shared<Http2ConnectionHandler>(conn, h2_settings_);
-            SetupH2Handlers(h2_conn);
-            h2_conn->Initialize();  // sends server preface (SETTINGS)
-            {
-                std::lock_guard<std::mutex> lck(conn_mtx_);
-                h2_connections_[conn->fd()] = h2_conn;
-            }
-            logging::Get()->debug("New HTTP/2 (ALPN) connection fd={} from {}:{}",
-                                  conn->fd(), conn->ip_addr(), conn->port());
-            return;
-        }
-
-        // For cleartext or non-ALPN TLS, defer handler creation until
-        // HandleMessage detects the protocol via client preface.
-        //
         // Guard against accept/data race: if HandleMessage already ran and
-        // created a handler for THIS connection, skip the deadline arming
-        // below — the handler's own deadline logic is authoritative.
+        // created a handler for THIS connection, skip everything below.
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
-            // Check if HandleMessage already created a handler for THIS connection
             auto h2_it = h2_connections_.find(conn->fd());
             if (h2_it != h2_connections_.end()) {
                 if (h2_it->second->GetConnection() == conn) {
@@ -441,6 +417,25 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
             if (pd_it != pending_detection_.end() && pd_it->second.conn != conn) {
                 pending_detection_.erase(pd_it);
             }
+        }
+
+        // For TLS connections that negotiated h2 via ALPN, create the session
+        // immediately so the server SETTINGS preface is sent without waiting
+        // for client data (prevents deadlock with strict h2 clients).
+        // Cleartext connections still defer to HandleMessage for preface detection.
+        std::string alpn = conn->GetAlpnProtocol();
+        if (!alpn.empty() &&
+            ProtocolDetector::DetectFromAlpn(alpn) == ProtocolDetector::Protocol::HTTP2) {
+            auto h2_conn = std::make_shared<Http2ConnectionHandler>(conn, h2_settings_);
+            SetupH2Handlers(h2_conn);
+            h2_conn->Initialize();
+            {
+                std::lock_guard<std::mutex> lck(conn_mtx_);
+                h2_connections_[conn->fd()] = h2_conn;
+            }
+            logging::Get()->debug("New HTTP/2 (ALPN) connection fd={} from {}:{}",
+                                  conn->fd(), conn->ip_addr(), conn->port());
+            return;
         }
     } else {
         // HTTP/2 disabled — always create HTTP/1.x handler immediately.
