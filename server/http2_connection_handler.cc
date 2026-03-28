@@ -214,7 +214,12 @@ void Http2ConnectionHandler::RequestShutdown() {
         0x00, 0x00, 0x00, 0x00
     };
     conn_->SendRaw(reinterpret_cast<const char*>(goaway), sizeof(goaway));
-    conn_->CloseAfterWrite();
+    // Do NOT call CloseAfterWrite() here — that would close the connection
+    // as soon as the 17-byte GOAWAY flushes, aborting active streams.
+    // Instead, the OnRawData and deadline callback paths close the connection
+    // once all active streams have completed (ActiveStreamCount() == 0).
+    // For idle connections, the deadline callback fires after 1s and closes.
+    // NetServer::Stop() serves as the backstop for any stragglers.
 }
 
 void Http2ConnectionHandler::DispatchPendingRequests() {

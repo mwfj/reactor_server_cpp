@@ -315,15 +315,28 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         // Must check connection identity (not just fd) to handle fd-reuse.
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
+            // Check if HandleMessage already created a handler for THIS connection
             auto h2_it = h2_connections_.find(conn->fd());
-            if (h2_it != h2_connections_.end() &&
-                h2_it->second->GetConnection() == conn) {
-                return;
+            if (h2_it != h2_connections_.end()) {
+                if (h2_it->second->GetConnection() == conn) {
+                    return;  // Already initialized by HandleMessage
+                }
+                // Stale handler from fd reuse — evict
+                h2_connections_.erase(h2_it);
             }
             auto h1_it = http_connections_.find(conn->fd());
-            if (h1_it != http_connections_.end() &&
-                h1_it->second->GetConnection() == conn) {
-                return;
+            if (h1_it != http_connections_.end()) {
+                if (h1_it->second->GetConnection() == conn) {
+                    return;  // Already initialized by HandleMessage
+                }
+                // Stale handler from fd reuse — evict
+                h1_it->second = nullptr;  // prevent WS notify on stale handler
+                http_connections_.erase(h1_it);
+            }
+            // Also clean up stale pending detection
+            auto pd_it = pending_detection_.find(conn->fd());
+            if (pd_it != pending_detection_.end() && pd_it->second.conn != conn) {
+                pending_detection_.erase(pd_it);
             }
         }
     } else {
