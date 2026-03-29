@@ -687,8 +687,8 @@ bool HttpServer::DetectAndRouteProtocol(
     }
 
     if (proto == ProtocolDetector::Protocol::HTTP2) {
-        // Refuse new H2 sessions during shutdown — transport is already closing
-        if (conn->IsCloseDeferred() || conn->IsClosing()) return true;
+        // Skip if connection is fully closing (not just peer half-close)
+        if (conn->IsClosing()) return true;
         // Create HTTP/2 handler
         auto h2_conn = std::make_shared<Http2ConnectionHandler>(conn, h2_settings_);
         SetupH2Handlers(h2_conn);

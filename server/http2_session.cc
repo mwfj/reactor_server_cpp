@@ -65,8 +65,9 @@ static int OnBeginHeadersCallback(
         // of Initialize sends GOAWAY after those requests are dispatched.
         bool owner_shutting_down = owner && owner->IsShutdownRequested()
                                    && !owner->IsInitializing();
+        // Don't use IsCloseDeferred() here — it's also set on peer EOF,
+        // and streams in the same read batch as FIN should be serviced.
         bool shutdown_in_progress = self->IsGoawaySent() ||
-            self->GetConnection()->IsCloseDeferred() ||
             owner_shutting_down;
         if (shutdown_in_progress) {
             nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
