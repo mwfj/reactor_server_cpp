@@ -2,6 +2,7 @@
 
 #include <string>
 #include <chrono>
+#include <cstdint>
 
 struct TlsConfig {
     bool enabled = false;
@@ -15,6 +16,14 @@ struct LogConfig {
     std::string file;
     size_t max_file_size = 10485760;   // 10 MB
     int max_files = 3;
+};
+
+struct Http2Config {
+    bool enabled = true;                         // Enable HTTP/2 (h2 + h2c)
+    uint32_t max_concurrent_streams = 100;       // RFC 9113 default recommendation
+    uint32_t initial_window_size = 65535;         // RFC 9113 default (64 KB - 1)
+    uint32_t max_frame_size = 16384;             // RFC 9113 default (16 KB)
+    uint32_t max_header_list_size = 65536;       // 64 KB
 };
 
 // NOTE: When adding fields, also update ConfigLoader::LoadFromString(),
@@ -32,4 +41,6 @@ struct ServerConfig {
     size_t max_body_size = 1048576;      // 1 MB
     size_t max_ws_message_size = 16777216; // 16 MB
     int request_timeout_sec = 30;
+    int shutdown_drain_timeout_sec = 30; // Max seconds to wait for in-flight H2 streams during shutdown. 0 = immediate.
+    Http2Config http2;
 };

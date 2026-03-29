@@ -29,7 +29,7 @@ private:
     TimeStamp ts_; // Each connection owns a timestamp to manage
     bool has_deadline_ = false;
     std::chrono::steady_clock::time_point deadline_;
-    std::function<void()> deadline_timeout_cb_;
+    std::function<bool()> deadline_timeout_cb_;
     // Monotonic counter incremented on every on-thread deadline write/clear.
     // Off-thread SetDeadline captures the generation at queue time and only
     // applies the deadline if the generation hasn't changed, preventing stale
@@ -39,6 +39,7 @@ private:
     std::atomic<unsigned> deadline_generation_{0};
 
     // TLS support
+    bool tls_ready_from_write_ = false;  // TLS handshake completed via CallWriteCb
     enum class TlsState { NONE, HANDSHAKE, READY };
     TlsState tls_state_ = TlsState::NONE;
     std::unique_ptr<TlsConnection> tls_;
@@ -85,21 +86,36 @@ public:
 
     void SetOnMessageCb(CALLBACKS_NAMESPACE::ConnOnMsgCallback);
     void SetCompletionCb(CALLBACKS_NAMESPACE::ConnCompleteCallback);
+    void SetWriteProgressCb(CALLBACKS_NAMESPACE::ConnWriteProgressCallback);
     void SetCloseCb(CALLBACKS_NAMESPACE::ConnCloseCallback);
     void SetErrorCb(CALLBACKS_NAMESPACE::ConnErrorCallback);
 
     void SetTlsConnection(std::unique_ptr<TlsConnection> tls);
     void SetMaxInputSize(size_t max) { max_input_size_ = max; }
+    size_t OutputBufferSize() const { return output_bf_.Size(); }
+
+    // Returns true if this connection has TLS (any state: handshake or ready).
+    bool HasTls() const { return tls_state_ != TlsState::NONE; }
+
+    // Enqueue a task to run on this connection's dispatcher thread.
+    // Thread-safe. Used by protocol layers that need dispatcher-thread
+    // execution from other threads (e.g., HTTP/2 graceful shutdown).
+    void RunOnDispatcher(std::function<void()> task);
+
+    // Get the ALPN-negotiated protocol from the TLS connection.
+    // Returns empty string if no TLS or ALPN not negotiated.
+    std::string GetAlpnProtocol() const;
 
     // Deadline: if set, IsTimeOut returns true when deadline is exceeded
     void SetDeadline(std::chrono::steady_clock::time_point deadline);
     void ClearDeadline();
 
-    // Pre-close callback for deadline timeouts — allows upper layers (HttpConnectionHandler)
-    // to send a 408 response before the connection is closed by the timer.
-    using DeadlineTimeoutCb = std::function<void()>;
+    // Deadline timeout callback. Returns true if the timeout was handled
+    // (e.g., HTTP/2 RST'd expired streams and re-armed) — connection stays alive.
+    // Returns false to proceed with the default close behavior.
+    using DeadlineTimeoutCb = std::function<bool()>;
     void SetDeadlineTimeoutCb(DeadlineTimeoutCb cb);
-    void CallDeadlineTimeoutCb();
+    bool CallDeadlineTimeoutCb();  // returns true if handled (keep alive)
 
     bool IsTimeOut(std::chrono::seconds) const;
 };

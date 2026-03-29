@@ -9,8 +9,22 @@
 #include "websocket_test.h"
 #include "tls_test.h"
 #include "cli_test.h"
+#include "http2_test.h"
 #include "test_framework.h"
 #include <algorithm>
+#include <sys/resource.h>
+
+// Raise fd limit on macOS where the default soft limit is 256.
+// 138 tests with concurrent servers can exhaust this quickly.
+static void RaiseFdLimit() {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        if (rl.rlim_cur < 4096) {
+            rl.rlim_cur = std::min(rl.rlim_max, (rlim_t)4096);
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+    }
+}
 
 
 void RunAllTest(){
@@ -51,6 +65,10 @@ void RunAllTest(){
     std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     CliTests::RunAllTests();
 
+    // Run HTTP/2 tests
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    Http2Tests::RunAllTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -66,11 +84,13 @@ void PrintUsage(const char* program_name) {
     std::cout << "  ws,      -w    Run WebSocket layer tests only" << std::endl;
     std::cout << "  tls,     -T    Run TLS/SSL tests only" << std::endl;
     std::cout << "  cli,     -C    Run CLI entry point tests only" << std::endl;
+    std::cout << "  http2,   -2    Run HTTP/2 tests only" << std::endl;
     std::cout << "  help,    -h    Show this help message" << std::endl;
-    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls)" << std::endl;
+    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2)" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
+    RaiseFdLimit();
     std::cout << "Reactor Network Server - Test Suite" << std::endl;
     std::cout << "====================================\n" << std::endl;
 
@@ -104,6 +124,9 @@ int main(int argc, char* argv[]) {
         // Run CLI tests
         }else if(mode == "cli" || mode == "-C"){
             CliTests::RunAllTests();
+        // Run HTTP/2 tests
+        }else if(mode == "http2" || mode == "-2"){
+            Http2Tests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

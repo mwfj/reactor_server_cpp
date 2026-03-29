@@ -28,14 +28,17 @@ The server uses the [Reactor pattern](https://en.wikipedia.org/wiki/Reactor_patt
 ```
 Layer 5: HttpServer / ReactorServer         (application entry points)
 Layer 4: HttpRouter, WebSocketConnection    (routing, WS message API)
-Layer 3: HttpParser, WebSocketParser        (protocol parsing)
-         HttpConnectionHandler              (HTTP state machine)
-Layer 2: TlsContext, TlsConnection          (optional TLS)
+Layer 3: HttpParser, WebSocketParser        (HTTP/1.1 protocol parsing)
+         HttpConnectionHandler              (HTTP/1.1 state machine)
+         Http2Session, Http2Stream          (HTTP/2 session/stream management)
+         Http2ConnectionHandler             (HTTP/2 state machine, nghttp2 bridge)
+         ProtocolDetector                   (HTTP/1.x vs HTTP/2 auto-detection)
+Layer 2: TlsContext, TlsConnection          (optional TLS, ALPN negotiation)
 Layer 1: ConnectionHandler, Channel,        (reactor core)
          Dispatcher, EventHandler
 ```
 
-Layers 1–2 are the transport. Layers 3–5 are the protocol. Only 3 existing Layer 1 files were modified to add HTTP/WS/TLS support — everything else is new files.
+Layers 1–2 are the transport. Layers 3–5 are the protocol. HTTP/1.x and HTTP/2 are parallel handlers at Layer 3, selected by `ProtocolDetector` at connection time. Both converge on the same `HttpRouter` at Layer 4.
 
 ## Core Components
 

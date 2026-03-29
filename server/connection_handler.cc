@@ -53,11 +53,14 @@ void ConnectionHandler::OnMessage(){
         return;
     }
 
-    // TLS handshake phase
+    // TLS handshake phase — may also complete via CallWriteCb (EPOLLOUT path)
+    bool tls_just_ready = tls_ready_from_write_;
+    tls_ready_from_write_ = false;  // consume
     if (tls_state_ == TlsState::HANDSHAKE) {
         int result = tls_->DoHandshake();
         if (result == TlsConnection::TLS_COMPLETE) {
             tls_state_ = TlsState::READY;
+            tls_just_ready = true;
             // Handshake complete, fall through to read any buffered data
         } else if (result == TlsConnection::TLS_WANT_READ) {
             // Want read — already enabled
@@ -167,9 +170,14 @@ void ConnectionHandler::OnMessage(){
         close_after_write_.store(true, std::memory_order_release);
     }
 
-    // After reading all available data, call the application callback if data was received
+    // After reading all available data, call the application callback if data was received.
+    // Also fire on TLS handshake completion without data ONLY when ALPN negotiated h2,
+    // so the upper layer can send the server SETTINGS preface immediately.
+    // For HTTP/1.x, skip the empty callback to avoid arming request timeout prematurely.
+    bool alpn_h2_ready = tls_just_ready && input_bf_.Size() == 0 &&
+                         tls_ && GetAlpnProtocol() == "h2";
     bool callback_ran = false;
-    if(input_bf_.Size() > 0 && callbacks_.on_message_callback){
+    if((input_bf_.Size() > 0 || alpn_h2_ready) && callbacks_.on_message_callback){
         std::string message(input_bf_.Data(), input_bf_.Size());
         callbacks_.on_message_callback(shared_from_this(), message);
         // Update timestamp
@@ -568,6 +576,7 @@ void ConnectionHandler::CallWriteCb(){
         int result = tls_->DoHandshake();
         if (result == TlsConnection::TLS_COMPLETE) {
             tls_state_ = TlsState::READY;
+            tls_ready_from_write_ = true;  // signal OnMessage to fire callback
             // Handshake complete — OpenSSL may have buffered application data.
             OnMessage();
             // OnMessage may have closed the channel
@@ -646,7 +655,12 @@ void ConnectionHandler::CallWriteCb(){
         // Only refresh when close_after_write_ is set (close-drain deadline),
         // NOT for request deadlines (Slowloris protection) which should be absolute.
         if (has_deadline_ && close_after_write_.load(std::memory_order_acquire)) {
-            deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            // Extend the drain deadline to prevent force-close mid-transfer,
+            // but never shorten a tighter deadline (e.g. WS 5s close timeout).
+            auto new_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            if (new_deadline > deadline_) {
+                deadline_ = new_deadline;
+            }
         }
     }
 
@@ -660,6 +674,9 @@ void ConnectionHandler::CallWriteCb(){
         if(callbacks_.complete_callback)
             callbacks_.complete_callback(shared_from_this());
     } else {
+        // Partial write — notify progress (HTTP/2 low watermark resume)
+        if (write_sz > 0 && callbacks_.write_progress_callback)
+            callbacks_.write_progress_callback(shared_from_this(), output_bf_.Size());
         // Still data to send — ensure write mode is enabled.
         // This is essential after the WANT_READ recovery path (OnMessage → CallWriteCb)
         // where write mode was disabled while waiting for read readiness.
@@ -676,6 +693,10 @@ void ConnectionHandler::SetCompletionCb(CALLBACKS_NAMESPACE::ConnCompleteCallbac
     callbacks_.complete_callback = std::move(fn);
 }
 
+void ConnectionHandler::SetWriteProgressCb(CALLBACKS_NAMESPACE::ConnWriteProgressCallback fn){
+    callbacks_.write_progress_callback = std::move(fn);
+}
+
 void ConnectionHandler::SetCloseCb(CALLBACKS_NAMESPACE::ConnCloseCallback fn){
     callbacks_.close_callback = std::move(fn);
 }
@@ -689,14 +710,28 @@ void ConnectionHandler::SetTlsConnection(std::unique_ptr<TlsConnection> tls) {
     tls_state_ = TlsState::HANDSHAKE;
 }
 
+void ConnectionHandler::RunOnDispatcher(std::function<void()> task) {
+    if (event_dispatcher_) {
+        event_dispatcher_->EnQueue(std::move(task));  // EnQueue handles was_stopped check
+    }
+}
+
+std::string ConnectionHandler::GetAlpnProtocol() const {
+    if (tls_ && tls_state_ == TlsState::READY) {
+        return tls_->GetAlpnProtocol();
+    }
+    return "";
+}
+
 void ConnectionHandler::SetDeadlineTimeoutCb(DeadlineTimeoutCb cb) {
     deadline_timeout_cb_ = std::move(cb);
 }
 
-void ConnectionHandler::CallDeadlineTimeoutCb() {
+bool ConnectionHandler::CallDeadlineTimeoutCb() {
     if (deadline_timeout_cb_) {
-        deadline_timeout_cb_();
+        return deadline_timeout_cb_();
     }
+    return false;
 }
 
 void ConnectionHandler::SetDeadline(std::chrono::steady_clock::time_point deadline) {

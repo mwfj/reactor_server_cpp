@@ -1,8 +1,10 @@
 #include "http/http_server.h"
 #include "config/config_loader.h"
 #include "ws/websocket_frame.h"
+#include "http2/http2_constants.h"
 #include "log/logger.h"
 #include <algorithm>
+#include <set>
 
 void HttpServer::WireNetServerCallbacks() {
     net_server_.SetNewConnectionCb(
@@ -13,6 +15,42 @@ void HttpServer::WireNetServerCallbacks() {
         [this](std::shared_ptr<ConnectionHandler> conn) { HandleErrorConnection(conn); });
     net_server_.SetOnMessageCb(
         [this](std::shared_ptr<ConnectionHandler> conn, std::string& msg) { HandleMessage(conn, msg); });
+
+    // Resume deferred H2 output when transport buffer drains to zero.
+    // HttpServer only does fd→handler lookup; scheduling is owned by
+    // Http2ConnectionHandler::OnSendComplete().
+    net_server_.SetSendCompletionCb(
+        [this](std::shared_ptr<ConnectionHandler> conn) {
+            std::shared_ptr<Http2ConnectionHandler> h2_conn;
+            {
+                std::lock_guard<std::mutex> lck(conn_mtx_);
+                auto it = h2_connections_.find(conn->fd());
+                if (it != h2_connections_.end() &&
+                    it->second->GetConnection() == conn) {
+                    h2_conn = it->second;
+                }
+            }
+            if (h2_conn) {
+                h2_conn->OnSendComplete();
+            }
+        });
+
+    // Resume deferred H2 output at the low watermark (partial writes).
+    net_server_.SetWriteProgressCb(
+        [this](std::shared_ptr<ConnectionHandler> conn, size_t remaining) {
+            std::shared_ptr<Http2ConnectionHandler> h2_conn;
+            {
+                std::lock_guard<std::mutex> lck(conn_mtx_);
+                auto it = h2_connections_.find(conn->fd());
+                if (it != h2_connections_.end() &&
+                    it->second->GetConnection() == conn) {
+                    h2_conn = it->second;
+                }
+            }
+            if (h2_conn) {
+                h2_conn->OnWriteProgress(remaining);
+            }
+        });
 }
 
 // Validate host is a numeric IPv4 address — inet_addr() silently returns
@@ -92,11 +130,16 @@ HttpServer::HttpServer(const ServerConfig& config)
     max_header_size_ = config.max_header_size;
     max_ws_message_size_ = config.max_ws_message_size;
     request_timeout_sec_ = config.request_timeout_sec;
+    shutdown_drain_timeout_sec_ = config.shutdown_drain_timeout_sec;
     net_server_.SetMaxConnections(config.max_connections);
 
     // Set input buffer cap on NetServer — applied BEFORE epoll registration
     // to eliminate the race where data arrives before the cap is set.
     net_server_.SetMaxInputSize(ComputeInputCap());
+
+    // Initialize HTTP/2 enabled flag BEFORE the TLS section so that ALPN
+    // protocol selection below uses the config value, not the member default.
+    http2_enabled_ = config.http2.enabled;
 
     if (config.tls.enabled) {
         tls_ctx_ = std::make_shared<TlsContext>(config.tls.cert_file, config.tls.key_file);
@@ -109,8 +152,22 @@ HttpServer::HttpServer(const ServerConfig& config)
                 "Unsupported tls.min_version: '" + config.tls.min_version +
                 "' (must be '1.2' or '1.3')");
         }
+
+        // Register ALPN protocols for HTTP/2 negotiation
+        if (http2_enabled_) {
+            tls_ctx_->SetAlpnProtocols({"h2", "http/1.1"});
+        } else {
+            tls_ctx_->SetAlpnProtocols({"http/1.1"});
+        }
+
         net_server_.SetTlsContext(tls_ctx_);
     }
+
+    // Initialize HTTP/2 session settings from config
+    h2_settings_.max_concurrent_streams = config.http2.max_concurrent_streams;
+    h2_settings_.initial_window_size    = config.http2.initial_window_size;
+    h2_settings_.max_frame_size         = config.http2.max_frame_size;
+    h2_settings_.max_header_list_size   = config.http2.max_header_list_size;
 }
 
 size_t HttpServer::ComputeInputCap() const {
@@ -197,10 +254,120 @@ void HttpServer::Stop() {
         }
     }
 
+    // Stop accepting new connections before building the H2 drain snapshot.
+    // Prevents new connections from bypassing the graceful shutdown path.
+    net_server_.StopAccepting();
+
+    // Graceful HTTP/2 shutdown: request GOAWAY + drain on the dispatcher thread.
+    // Collect H2 connections under conn_mtx_ first, then release before
+    // acquiring drain_mtx_ to avoid nested lock ordering (conn_mtx_ → drain_mtx_).
+    using H2Pair = std::pair<std::shared_ptr<Http2ConnectionHandler>,
+                             std::shared_ptr<ConnectionHandler>>;
+    std::vector<H2Pair> h2_snapshot;
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        h2_snapshot.reserve(h2_connections_.size());
+        for (auto& [fd, h2_conn] : h2_connections_) {
+            auto conn = h2_conn->GetConnection();
+            if (!conn) continue;
+            h2_snapshot.emplace_back(h2_conn, std::move(conn));
+        }
+    }
+
+    std::set<ConnectionHandler*> draining_conn_ptrs;
+    for (auto& [h2_conn, conn] : h2_snapshot) {
+        // Skip connections that closed between snapshot and now
+        if (conn->IsClosing()) continue;
+        ConnectionHandler* conn_ptr = conn.get();
+
+        // Install drain-complete callback
+        h2_conn->SetDrainCompleteCallback([this, conn_ptr]() {
+            OnH2DrainComplete(conn_ptr);
+        });
+
+        // Strong refs — kept alive through drain.
+        // Install callback + push atomically under drain_mtx_ to prevent
+        // the race where HandleCloseConnection runs OnH2DrainComplete
+        // between callback install and push (finding nothing to remove).
+        {
+            std::lock_guard<std::mutex> dlck(drain_mtx_);
+            h2_draining_.push_back({h2_conn, conn});
+        }
+        draining_conn_ptrs.insert(conn_ptr);
+
+        // Enqueue GOAWAY + drain check on dispatcher thread
+        h2_conn->RequestShutdown();
+
+        // Re-check: if the connection closed during setup, remove the stale
+        // entry now. HandleCloseConnection may have already tried and missed.
+        if (conn->IsClosing()) {
+            OnH2DrainComplete(conn_ptr);
+        }
+    }
+
+    // If drain wait is safe (not on a dispatcher thread) and H2 connections
+    // exist, exempt them from the close sweep and install the drain callback.
+    // On a dispatcher thread: degrade to normal close sweep (no exemption,
+    // no drain wait) to avoid deadlock.
+    bool has_draining = false;
+    {
+        std::lock_guard<std::mutex> dlck(drain_mtx_);
+        has_draining = !h2_draining_.empty();
+    }
+    if (has_draining && !net_server_.IsOnDispatcherThread()) {
+        net_server_.SetDrainingConns(std::move(draining_conn_ptrs));
+        net_server_.SetPreStopDrainCallback([this]() { WaitForH2Drain(); });
+    } else if (has_draining) {
+        logging::Get()->warn("HttpServer::Stop() called from dispatcher thread — "
+                             "HTTP/2 graceful drain skipped to avoid deadlock");
+        // Don't exempt H2 connections — let normal close sweep handle them
+    }
+
     net_server_.Stop();
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         http_connections_.clear();
+        h2_connections_.clear();
+        pending_detection_.clear();
+    }
+    // Clear one-shot drain state (Stop may be called from destructor too)
+    {
+        std::lock_guard<std::mutex> dlck(drain_mtx_);
+        h2_draining_.clear();
+    }
+}
+
+void HttpServer::OnH2DrainComplete(ConnectionHandler* conn_ptr) {
+    // Called from dispatcher thread when an H2 connection finishes draining.
+    std::lock_guard<std::mutex> lck(drain_mtx_);
+    h2_draining_.erase(
+        std::remove_if(h2_draining_.begin(), h2_draining_.end(),
+            [conn_ptr](const DrainingH2Conn& d) {
+                return d.conn.get() == conn_ptr;
+            }),
+        h2_draining_.end());
+    if (h2_draining_.empty()) {
+        drain_cv_.notify_one();
+    }
+}
+
+void HttpServer::WaitForH2Drain() {
+    std::unique_lock<std::mutex> lck(drain_mtx_);
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::seconds(shutdown_drain_timeout_sec_);
+    drain_cv_.wait_until(lck, deadline, [this]() {
+        return h2_draining_.empty();
+    });
+
+    if (!h2_draining_.empty()) {
+        // Timeout: force-close remaining. Move to local to avoid holding
+        // drain_mtx_ during ForceClose (prevents lock coupling with late callbacks).
+        auto remaining = std::move(h2_draining_);
+        h2_draining_.clear();
+        lck.unlock();
+        for (auto& d : remaining) {
+            if (d.conn) d.conn->ForceClose();
+        }
     }
 }
 
@@ -268,44 +435,76 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
     // stale state in http_connections_ (potentially under fd -1 after ReleaseFd).
     if (conn->IsClosing()) return;
 
-    std::shared_ptr<HttpConnectionHandler> old_handler;
-    bool already_initialized = false;
-    {
-        std::lock_guard<std::mutex> lck(conn_mtx_);
-        auto it = http_connections_.find(conn->fd());
-        if (it != http_connections_.end()) {
-            if (it->second->GetConnection() == conn) {
-                // Already created by HandleMessage lazy-init — don't overwrite.
-                // The handler is already processing data, so skip deadline arming
-                // below to avoid overwriting real request/keep-alive state.
-                already_initialized = true;
+    if (http2_enabled_) {
+        // Guard against accept/data race: if HandleMessage already ran and
+        // created a handler for THIS connection, skip everything below.
+        std::shared_ptr<HttpConnectionHandler> stale_h1;
+        {
+            std::lock_guard<std::mutex> lck(conn_mtx_);
+            auto h2_it = h2_connections_.find(conn->fd());
+            if (h2_it != h2_connections_.end()) {
+                if (h2_it->second->GetConnection() == conn) {
+                    return;  // Already initialized by HandleMessage
+                }
+                // Stale handler from fd reuse — evict
+                h2_connections_.erase(h2_it);
+            }
+            auto h1_it = http_connections_.find(conn->fd());
+            if (h1_it != http_connections_.end()) {
+                if (h1_it->second->GetConnection() == conn) {
+                    return;  // Already initialized by HandleMessage
+                }
+                // Stale handler from fd reuse — save for WS close, then evict
+                stale_h1 = std::move(h1_it->second);
+                http_connections_.erase(h1_it);
+            }
+            // Also clean up stale pending detection
+            auto pd_it = pending_detection_.find(conn->fd());
+            if (pd_it != pending_detection_.end() && pd_it->second.conn != conn) {
+                pending_detection_.erase(pd_it);
+            }
+        }
+        // Notify stale WS handler outside the lock (avoids deadlock with
+        // CallCloseCb → conn_mtx_ and preserves the close notification).
+        SafeNotifyWsClose(stale_h1);
+
+        // Note: TLS ALPN h2 detection cannot happen here — HandleNewConnection
+        // runs before TLS handshake completes (tls_state_ == HANDSHAKE, not READY).
+        // GetAlpnProtocol() returns empty until handshake finishes.
+        // ALPN detection happens in HandleMessage → DetectAndRouteProtocol after
+        // the first OnMessage fires (which is post-handshake).
+    } else {
+        // HTTP/2 disabled — always create HTTP/1.x handler immediately.
+        std::shared_ptr<HttpConnectionHandler> old_handler;
+        bool already_initialized = false;
+        {
+            std::lock_guard<std::mutex> lck(conn_mtx_);
+            auto it = http_connections_.find(conn->fd());
+            if (it != http_connections_.end()) {
+                if (it->second->GetConnection() == conn) {
+                    already_initialized = true;
+                } else {
+                    old_handler = it->second;
+                    auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
+                    SetupHandlers(http_conn);
+                    http_connections_[conn->fd()] = http_conn;
+                }
             } else {
-                // FD reused — save old handler for WS notification outside the lock
-                old_handler = it->second;
                 auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
                 SetupHandlers(http_conn);
                 http_connections_[conn->fd()] = http_conn;
             }
-        } else {
-            auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
-            SetupHandlers(http_conn);
-            http_connections_[conn->fd()] = http_conn;
         }
+        SafeNotifyWsClose(old_handler);
+        if (already_initialized) return;
     }
-    // Notify old WS handler outside the lock to prevent deadlock.
-    SafeNotifyWsClose(old_handler);
 
-    // Arm a connection-level deadline covering the TLS handshake + first HTTP request.
-    // Without this, a client can slow-drip the TLS handshake indefinitely, bypassing
-    // the request timeout (which only activates after parsed HTTP bytes in OnRawData).
-    // When OnRawData fires after handshake completion, it overwrites this with the
-    // per-request deadline.
-    //
-    // Skip if HandleMessage already lazy-created the handler: the handler has already
-    // started processing data, so re-arming the "first request" deadline would overwrite
-    // the real state and could close a healthy keep-alive connection after
-    // request_timeout_sec instead of the configured idle timeout.
-    if (request_timeout_sec_ > 0 && !already_initialized) {
+    // Arm a connection-level deadline for the TLS handshake + protocol detection
+    // window. The protocol handler resets this once it takes over, so the total
+    // exposure is up to 2× request_timeout_sec (handshake + first request).
+    // This is intentional: separating handshake and request timeouts is standard
+    // (cf. nginx ssl_handshake_timeout vs client_header_timeout).
+    if (request_timeout_sec_ > 0) {
         conn->SetDeadline(std::chrono::steady_clock::now() +
                           std::chrono::seconds(request_timeout_sec_));
     }
@@ -316,61 +515,230 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
 
 void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->debug("HTTP connection closed fd={}", conn->fd());
+
+    // Single lock: check both H2 and HTTP/1.x maps
     std::shared_ptr<HttpConnectionHandler> http_conn;
+    bool was_h2 = false;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        auto it = http_connections_.find(conn->fd());
-        if (it != http_connections_.end() && it->second->GetConnection() == conn) {
-            http_conn = it->second;
-            http_connections_.erase(it);
+        auto pd_it = pending_detection_.find(conn->fd());
+        if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
+            pending_detection_.erase(pd_it);
+        }
+        auto h2_it = h2_connections_.find(conn->fd());
+        if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
+            h2_connections_.erase(h2_it);
+            was_h2 = true;
+        }
+        if (!was_h2) {
+            auto it = http_connections_.find(conn->fd());
+            if (it != http_connections_.end() && it->second->GetConnection() == conn) {
+                http_conn = it->second;
+                http_connections_.erase(it);
+            }
         }
     }
-    // Notify WS close handler OUTSIDE the lock to prevent deadlock.
+    // Outside lock: notify drain set and WS close handler
+    if (was_h2) {
+        OnH2DrainComplete(conn.get());
+        return;
+    }
     SafeNotifyWsClose(http_conn);
 }
 
 void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->error("HTTP connection error fd={}", conn->fd());
+
+    // Single lock: check both H2 and HTTP/1.x maps
     std::shared_ptr<HttpConnectionHandler> http_conn;
+    bool was_h2 = false;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        auto it = http_connections_.find(conn->fd());
-        if (it != http_connections_.end() && it->second->GetConnection() == conn) {
-            http_conn = it->second;
-            http_connections_.erase(it);
+        auto pd_it = pending_detection_.find(conn->fd());
+        if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
+            pending_detection_.erase(pd_it);
         }
+        auto h2_it = h2_connections_.find(conn->fd());
+        if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
+            h2_connections_.erase(h2_it);
+            was_h2 = true;
+        }
+        if (!was_h2) {
+            auto it = http_connections_.find(conn->fd());
+            if (it != http_connections_.end() && it->second->GetConnection() == conn) {
+                http_conn = it->second;
+                http_connections_.erase(it);
+            }
+        }
+    }
+    if (was_h2) {
+        OnH2DrainComplete(conn.get());
+        return;
     }
     SafeNotifyWsClose(http_conn);
 }
 
 void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message) {
+    // Single lock: look up both H2 and HTTP/1.x maps.
+    // Copy shared_ptrs under the lock, then call OnRawData outside it:
+    // OnRawData can trigger callbacks that acquire conn_mtx_ — deadlock.
+    std::shared_ptr<Http2ConnectionHandler> h2_conn;
     std::shared_ptr<HttpConnectionHandler> http_conn;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        auto it = http_connections_.find(conn->fd());
-        if (it == http_connections_.end()) {
-            // Race condition: data arrived before HandleNewConnection created
-            // the HttpConnectionHandler. Create it now (lazy initialization).
-            http_conn = std::make_shared<HttpConnectionHandler>(conn);
-            SetupHandlers(http_conn);
-            http_connections_[conn->fd()] = http_conn;
-            // Note: max_input_size_ already set by NetServer before RegisterCallbacks.
-        } else {
-            http_conn = it->second;
+
+        // Check HTTP/2 connections
+        auto h2_it = h2_connections_.find(conn->fd());
+        if (h2_it != h2_connections_.end()) {
+            if (h2_it->second->GetConnection() == conn) {
+                h2_conn = h2_it->second;
+            } else {
+                // fd reused — remove stale entry (will fall through to detection)
+                h2_connections_.erase(h2_it);
+            }
+        }
+
+        // Check HTTP/1.x connections (only if not H2)
+        if (!h2_conn) {
+            auto it = http_connections_.find(conn->fd());
+            if (it != http_connections_.end()) {
+                http_conn = it->second;
+            }
         }
     }
 
-    // Guard against fd-reuse: if the handler wraps a stale connection,
-    // notify the old WS handler and replace with a fresh one.
-    if (http_conn->GetConnection() != conn) {
-        // Notify old WebSocket close handler before discarding
-        SafeNotifyWsClose(http_conn);
-        http_conn = std::make_shared<HttpConnectionHandler>(conn);
-        SetupHandlers(http_conn);
-        std::lock_guard<std::mutex> lck(conn_mtx_);
-        http_connections_[conn->fd()] = http_conn;
-        // Note: max_input_size_ already set by NetServer before RegisterCallbacks.
+    if (h2_conn) {
+        h2_conn->OnRawData(conn, message);
+        return;
     }
 
+    if (http_conn) {
+        // Guard against fd-reuse: if the handler wraps a stale connection,
+        // notify the old WS handler and replace with a fresh one.
+        if (http_conn->GetConnection() != conn) {
+            SafeNotifyWsClose(http_conn);
+            http_conn = nullptr;
+            {
+                std::lock_guard<std::mutex> lck(conn_mtx_);
+                // Identity check: only erase if the entry still wraps the stale conn
+                auto it = http_connections_.find(conn->fd());
+                if (it != http_connections_.end() &&
+                    it->second->GetConnection() != conn) {
+                    http_connections_.erase(it);
+                }
+            }
+            // Fall through to DetectAndRouteProtocol below
+        } else {
+            http_conn->OnRawData(conn, message);
+            return;
+        }
+    }
+
+    // No handler exists yet (or stale fd-reuse removed above) — detect protocol and create one.
+    // Prepend any buffered partial-preface bytes accumulated from a prior call.
+    // Verify connection identity to guard against fd-reuse races.
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        auto pd_it = pending_detection_.find(conn->fd());
+        if (pd_it != pending_detection_.end()) {
+            if (pd_it->second.conn == conn) {
+                pd_it->second.data += message;
+                message = std::move(pd_it->second.data);
+            }
+            // If conn doesn't match, discard stale entry (fd reused)
+            pending_detection_.erase(pd_it);
+        }
+    }
+    DetectAndRouteProtocol(conn, message);
+}
+
+bool HttpServer::DetectAndRouteProtocol(
+    std::shared_ptr<ConnectionHandler> conn, std::string& message) {
+
+    ProtocolDetector::Protocol proto = ProtocolDetector::Protocol::HTTP1;
+
+    if (http2_enabled_) {
+        if (conn->HasTls()) {
+            // TLS: HTTP/2 MUST be negotiated via ALPN (RFC 9113 Section 3.2).
+            // No preface sniffing — empty ALPN means HTTP/1.x.
+            std::string alpn = conn->GetAlpnProtocol();
+            if (!alpn.empty()) {
+                proto = ProtocolDetector::DetectFromAlpn(alpn);
+            }
+            // else: no ALPN negotiated → stays HTTP1
+        } else {
+            // Cleartext: check for HTTP/2 client preface (h2c prior knowledge)
+            proto = ProtocolDetector::DetectFromData(message.data(), message.size());
+            if (proto == ProtocolDetector::Protocol::UNKNOWN) {
+                // Not enough data to classify — buffer and wait for more bytes.
+                // This handles h2c clients that send the 24-byte preface split
+                // across multiple TCP segments. Store connection identity to
+                // guard against fd-reuse races.
+                std::lock_guard<std::mutex> lck(conn_mtx_);
+                auto& pd = pending_detection_[conn->fd()];
+                if (pd.conn == conn) {
+                    pd.data += message;
+                } else {
+                    pd = {conn, message};
+                }
+                return true;
+            }
+        }
+    }
+
+    if (proto == ProtocolDetector::Protocol::HTTP2) {
+        // Skip if connection is fully closing (not just peer half-close)
+        if (conn->IsClosing()) return true;
+        // Create HTTP/2 handler
+        auto h2_conn = std::make_shared<Http2ConnectionHandler>(conn, h2_settings_);
+        SetupH2Handlers(h2_conn);
+        // Publish BEFORE Initialize so HandleCloseConnection can find and
+        // remove the handler if Initialize's SendRaw triggers a synchronous
+        // close (peer already disconnected). RequestShutdown safely handles
+        // uninitialized sessions (checks !session_ and returns early).
+        {
+            std::lock_guard<std::mutex> lck(conn_mtx_);
+            h2_connections_[conn->fd()] = h2_conn;
+        }
+        h2_conn->Initialize(message);
+        return true;
+    }
+
+    // HTTP/1.x — create handler (existing path)
+    auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
+    SetupHandlers(http_conn);
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        // Identity check: don't overwrite a handler for a different connection
+        // on the same fd (fd-reuse race with HandleNewConnection).
+        auto existing = http_connections_.find(conn->fd());
+        if (existing != http_connections_.end() &&
+            existing->second->GetConnection() != conn) {
+            // Stale entry — safe to overwrite
+        }
+        http_connections_[conn->fd()] = http_conn;
+    }
     http_conn->OnRawData(conn, message);
+    return true;
+}
+
+void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn) {
+    h2_conn->SetMaxBodySize(max_body_size_);
+    // Note: NOT calling SetMaxHeaderSize here. HTTP/2 header limits come from
+    // h2_settings_.max_header_list_size (Http2Config, default 64KB), which is
+    // already baked into the session settings and advertised via SETTINGS frame.
+    // Calling SetMaxHeaderSize would overwrite it with the HTTP/1.x limit (8KB).
+    h2_conn->SetRequestTimeout(request_timeout_sec_);
+
+    // Set request callback: dispatch through HttpRouter (same as HTTP/1.x)
+    h2_conn->SetRequestCallback(
+        [this](std::shared_ptr<Http2ConnectionHandler> /*self*/,
+               int32_t /*stream_id*/,
+               const HttpRequest& request,
+               HttpResponse& response) {
+            if (!router_.Dispatch(request, response)) {
+                response.Status(404).Text("Not Found");
+            }
+        }
+    );
 }

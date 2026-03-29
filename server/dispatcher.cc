@@ -365,13 +365,14 @@ void Dispatcher::TimerHandler(){
                 // Force close now — the buffered response will never drain.
                 conn->ForceClose();
             } else {
-                // First timeout: send 408 (if deadline callback set), then deferred close.
-                conn->CallDeadlineTimeoutCb();
+                // First timeout: invoke deadline callback. If it returns true,
+                // the protocol layer handled the timeout (e.g., HTTP/2 RST'd
+                // expired streams and re-armed the deadline) — keep connection alive.
+                if (conn->CallDeadlineTimeoutCb()) {
+                    continue;  // Handled — skip close
+                }
+                // Not handled: send 408 response (if callback set above), then close.
                 // Re-arm deadline to give the response time to flush (30s drain window).
-                // Without this, the expired request deadline causes the next timer scan
-                // to see IsCloseDeferred() and ForceClose before the 408 has drained.
-                // The write path refreshes this deadline on each successful write,
-                // so actively-draining connections won't be killed.
                 conn->SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(30));
                 conn->CloseAfterWrite();
             }

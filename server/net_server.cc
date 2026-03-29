@@ -82,28 +82,36 @@ void NetServer::Start(){
 }
 
 // stop event loop
-void NetServer::Stop(){
-    // Close the listening socket to release the port immediately.
-    // EnQueue BEFORE StopEventLoop (which sets was_stopped_ and rejects tasks).
-    // The task runs on the conn_dispatcher thread sequentially with accept
-    // callbacks, so there's no race with Acceptor::NewConnection().
-    // ~Acceptor destructor will be a no-op (channel already closed, fd released).
-    conn_dispatcher_->EnQueue([this]() {
-        if (acceptor_) {
-            acceptor_->CloseListenSocket();
-        }
-    });
+void NetServer::StopAccepting() {
+    if (conn_dispatcher_->was_stopped()) return;  // already stopped
 
-    // Stop the connection dispatcher so no more accept events fire.
-    conn_dispatcher_->StopEventLoop();
-
-    // Second: Release dispatcher-held connection references via EnQueue
-    // (ClearConnections must run on the dispatcher thread to avoid racing TimerHandler)
-    for (auto& disp : socket_dispatchers_) {
-        disp->EnQueue([d = disp]() {
-            d->ClearConnections();
+    if (conn_dispatcher_->is_running()) {
+        // Event loop is active: enqueue close + barrier to ensure any
+        // in-flight accept callback has finished before we return.
+        conn_dispatcher_->EnQueue([this]() {
+            if (acceptor_) acceptor_->CloseListenSocket();
         });
+        if (!conn_dispatcher_->is_on_loop_thread()) {
+            auto barrier = std::make_shared<std::promise<void>>();
+            auto future = barrier->get_future();
+            conn_dispatcher_->EnQueue([barrier]() { barrier->set_value(); });
+            future.wait();
+        }
+    } else {
+        // Event loop not started (Stop before Start, ready_callback shutdown):
+        // close synchronously — no concurrent accept callbacks possible.
+        if (acceptor_) acceptor_->CloseListenSocket();
     }
+    conn_dispatcher_->StopEventLoop();
+}
+
+void NetServer::Stop(){
+    // First: stop accepting (may already be done by HttpServer::Stop())
+    StopAccepting();
+
+    // Second (deferred): ClearConnections is done AFTER the drain wait so that
+    // dispatcher TimerHandler continues enforcing per-connection deadlines during
+    // HTTP/2 graceful drain. The clear is enqueued later, before StopEventLoop.
 
     // Third: Gracefully close all active connections — CloseAfterWrite lets pending
     // output (including WS close frames) drain via the still-running event loops.
@@ -121,9 +129,11 @@ void NetServer::Stop(){
     for (auto& conn : conns_to_close) {
         // Skip connections already marked by a higher layer (e.g., HttpServer
         // sent a WS close frame and called CloseAfterWrite on them).
-        if (!conn->IsCloseDeferred()) {
-            conn->CloseAfterWrite();
-        }
+        if (conn->IsCloseDeferred()) continue;
+        // Skip connections in the H2 graceful drain set — they close
+        // themselves after all active streams complete.
+        if (draining_conns_.count(conn.get())) continue;
+        conn->CloseAfterWrite();
     }
     // Do NOT clear conns_to_close here. The shared_ptrs must keep
     // ConnectionHandlers alive until the deferred CloseAfterWrite lambdas
@@ -137,19 +147,48 @@ void NetServer::Stop(){
     // buffered output (WS close frames, in-flight HTTP responses) under backpressure.
     // The barrier ensures write mode is registered; StopEventLoop's WakeUp then
     // triggers one final WaitForEvent that includes the write-ready channels.
-    for (auto& disp : socket_dispatchers_) {
-        if (disp->was_stopped()) continue;
-        // Skip barrier for the current thread's dispatcher — if Stop() is called
-        // from a handler on this dispatcher, future.wait() would deadlock (the
-        // barrier task can only run on the thread that's blocked waiting for it).
-        // CloseAfterWrite for connections on this dispatcher already ran inline
-        // (SendRaw/CloseAfterWrite route inline when on the loop thread).
-        if (disp->is_on_loop_thread()) continue;
-        auto barrier = std::make_shared<std::promise<void>>();
-        auto future = barrier->get_future();
-        disp->EnQueue([barrier]() { barrier->set_value(); });
-        future.wait();
+    // Wait for each socket dispatcher to process enqueued work.
+    // Skips self-dispatcher to avoid deadlock when Stop() is called from a handler.
+    auto wait_for_dispatcher_barrier = [this]() {
+        for (auto& disp : socket_dispatchers_) {
+            if (disp->was_stopped()) continue;
+            if (disp->is_on_loop_thread()) {
+                // Self-dispatcher: process pending tasks inline instead of
+                // skipping. Without this, CloseAfterWrite tasks queued onto
+                // this dispatcher never run (the thread is blocked in Stop()),
+                // and buffered output gets truncated.
+                disp->HandleEventId();
+                continue;
+            }
+            auto barrier = std::make_shared<std::promise<void>>();
+            auto future = barrier->get_future();
+            disp->EnQueue([barrier]() { barrier->set_value(); });
+            future.wait();
+        }
+    };
+
+    wait_for_dispatcher_barrier();
+
+    // Fourth-B: If H2 connections are draining, wait for them while event loops
+    // are still running. The pre_stop_drain_cb blocks until drain completes or timeout.
+    if (pre_stop_drain_cb_) {
+        pre_stop_drain_cb_();
+        pre_stop_drain_cb_ = nullptr;  // one-shot
+
+        // Second barrier: covers CloseAfterWrite tasks enqueued by H2 handlers
+        // during the drain wait above.
+        wait_for_dispatcher_barrier();
     }
+    draining_conns_.clear();  // one-shot cleanup
+
+    // Fourth-C: Now safe to release dispatcher-held connection references.
+    // Deferred from earlier so TimerHandler continues enforcing deadlines during drain.
+    for (auto& disp : socket_dispatchers_) {
+        disp->EnQueue([d = disp]() {
+            d->ClearConnections();
+        });
+    }
+    wait_for_dispatcher_barrier();
 
     // Fifth: Stop socket dispatcher event loops (conn_dispatcher already stopped above).
     // StopEventLoop's WakeUp triggers one final loop iteration that processes any
@@ -204,6 +243,7 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
     conn -> SetErrorCb(std::bind(&NetServer::HandleErrorConnection, this, std::placeholders::_1));
     conn -> SetOnMessageCb(std::bind(&NetServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
     conn -> SetCompletionCb(std::bind(&NetServer::HandleSendComplete, this, std::placeholders::_1));
+    conn -> SetWriteProgressCb(std::bind(&NetServer::HandleWriteProgress, this, std::placeholders::_1, std::placeholders::_2));
 
     // Set input buffer cap BEFORE epoll registration to eliminate the race where
     // the first read arrives uncapped before HttpServer::HandleNewConnection runs.
@@ -324,6 +364,11 @@ void NetServer::HandleSendComplete(std::shared_ptr<ConnectionHandler> conn){
         callbacks_.send_complete_callback(conn);
 }
 
+void NetServer::HandleWriteProgress(std::shared_ptr<ConnectionHandler> conn, size_t remaining){
+    if(callbacks_.write_progress_callback)
+        callbacks_.write_progress_callback(conn, remaining);
+}
+
 void NetServer::Timeout(std::shared_ptr<Dispatcher> sock_dispatcher){
     if(callbacks_.timer_callback)
         callbacks_.timer_callback(sock_dispatcher);
@@ -354,7 +399,19 @@ void NetServer::SetSendCompletionCb(CALLBACKS_NAMESPACE::NetSrvSendCompleteCallb
         callbacks_.send_complete_callback = std::move(fn);
 }
 
+void NetServer::SetWriteProgressCb(CALLBACKS_NAMESPACE::NetSrvWriteProgressCallback fn){
+    if(fn)
+        callbacks_.write_progress_callback = std::move(fn);
+}
+
 void NetServer::SetTimerCb(CALLBACKS_NAMESPACE::NetSrvTimerCallback fn){
     if(fn)
         callbacks_.timer_callback = std::move(fn);
+}
+
+bool NetServer::IsOnDispatcherThread() const {
+    for (const auto& disp : socket_dispatchers_) {
+        if (disp->is_on_loop_thread()) return true;
+    }
+    return false;
 }
