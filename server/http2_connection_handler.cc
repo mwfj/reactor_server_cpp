@@ -112,18 +112,11 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
                 return true;
             }
 
-            // If we just reset expired streams and truly incomplete streams
-            // remain, keep alive (connection is still processing requests).
-            // But if only rejected streams were reset (no incomplete left),
-            // return false to let idle timeout proceed — rejected half-open
-            // streams should not suppress a shorter idle timeout.
+            // If we just reset expired streams, keep the connection alive.
+            // The timed-out streams were RST'd; the connection remains valid
+            // for new requests. Idle timeout will reclaim if no activity.
             if (reset > 0) {
-                if (self->session_->IncompleteStreamCount() > 0 ||
-                    self->session_->ActiveStreamCount() > 0) {
-                    return true;
-                }
-                // Only rejected streams were reset — let idle timeout proceed
-                return false;
+                return true;
             }
 
             // deadline_armed_ reflects whether incomplete streams exist.

@@ -341,13 +341,8 @@ static int OnFrameRecvCallback(
                                            frame->hd.stream_id, nullptr,
                                            nva_100, 1, nullptr);
                 } else {
-                    // Unsupported Expect value — reject with 417 + RST.
+                    // Unsupported Expect value — reject with 417.
                     // submit_response2 queues the HTTP response (END_STREAM).
-                    // RST_STREAM(NO_ERROR) queued after ensures the client side
-                    // closes too. nghttp2 sends frames in order, so well-behaved
-                    // clients receive the 417 before the RST. Without RST, the
-                    // stream stays half-open and leaks a concurrent-stream slot
-                    // (especially when request_timeout_sec is 0).
                     nghttp2_nv nva_417[] = {
                         {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
                          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("417")),
@@ -355,8 +350,14 @@ static int OnFrameRecvCallback(
                     };
                     nghttp2_submit_response2(session, frame->hd.stream_id,
                                              nva_417, 1, nullptr);
-                    nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                              frame->hd.stream_id, NGHTTP2_NO_ERROR);
+                    // RST only when the client side is still open (no END_STREAM
+                    // on request). If HEADERS had END_STREAM, submit_response2
+                    // closes both sides cleanly — RST would be redundant and
+                    // some clients treat it as a transport failure.
+                    if (!(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+                        nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                                  frame->hd.stream_id, NGHTTP2_NO_ERROR);
+                    }
                     stream->MarkRejected();
                     break;
                 }

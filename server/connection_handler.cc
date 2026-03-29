@@ -171,11 +171,10 @@ void ConnectionHandler::OnMessage(){
     }
 
     // After reading all available data, call the application callback if data was received.
-    // Also fire on TLS handshake completion (even without data) so the upper layer can
-    // check ALPN and initialize HTTP/2 sessions immediately — prevents hanging clients
-    // that wait for the server SETTINGS preface after ALPN negotiation.
+    // For TLS handshake completion without data: rely on the next read event to
+    // trigger the callback — avoids arming HTTP/1.x request timeout prematurely.
     bool callback_ran = false;
-    if((input_bf_.Size() > 0 || tls_just_ready) && callbacks_.on_message_callback){
+    if(input_bf_.Size() > 0 && callbacks_.on_message_callback){
         std::string message(input_bf_.Data(), input_bf_.Size());
         callbacks_.on_message_callback(shared_from_this(), message);
         // Update timestamp
