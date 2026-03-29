@@ -363,14 +363,8 @@ void Http2ConnectionHandler::UpdateDeadline() {
             deadline_armed_ = true;
             last_deadline_ = deadline;
         }
-    } else if (session_->HasRejectedOpenStreams()) {
-        // No truly incomplete streams, but rejected half-open streams exist
-        // (e.g. 417). Keep deadline armed so ResetExpiredStreams can RST them.
-        // Don't update the deadline value — let the existing one fire.
-        // The timeout callback returns false for these, allowing idle timeout
-        // to proceed if it's shorter than request_timeout_sec.
     } else if (deadline_armed_ && session_->LastStreamId() > 0) {
-        // No incomplete or rejected streams and streams were seen — idle keep-alive
+        // No incomplete streams (including rejected) — idle keep-alive
         conn_->ClearDeadline();
         deadline_armed_ = false;
     }

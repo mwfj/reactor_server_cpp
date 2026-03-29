@@ -827,24 +827,18 @@ size_t Http2Session::ActiveStreamCount() const {
 std::chrono::steady_clock::time_point Http2Session::OldestIncompleteStreamStart() const {
     // streams_ is std::map<int32_t, ...> sorted by stream ID.
     // HTTP/2 stream IDs are monotonically increasing, so the first
-    // non-dispatched, non-rejected stream is the oldest incomplete one.
-    // Rejected streams are handled separately (HasRejectedOpenStreams)
-    // to avoid suppressing a shorter idle timeout.
+    // non-counter-decremented stream is the oldest needing a deadline.
+    // Includes rejected streams (e.g. 417 half-open) so they get RST'd
+    // by ResetExpiredStreams on schedule. Newer streams cannot push the
+    // deadline past an older rejected stream's timeout.
+    // Idle timeout suppression during this window is acceptable — bounded
+    // by request_timeout_sec and only affects misbehaving clients.
     for (const auto& [id, stream] : streams_) {
-        if (!stream->IsCounterDecremented() && !stream->IsRejected()) {
+        if (!stream->IsCounterDecremented()) {
             return stream->CreatedAt();
         }
     }
     return std::chrono::steady_clock::time_point::max();
-}
-
-bool Http2Session::HasRejectedOpenStreams() const {
-    for (const auto& [id, stream] : streams_) {
-        if (stream->IsRejected() && !stream->IsCounterDecremented()) {
-            return true;
-        }
-    }
-    return false;
 }
 
 size_t Http2Session::ResetExpiredStreams(int timeout_sec) {
