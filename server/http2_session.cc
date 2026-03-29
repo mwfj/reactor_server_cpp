@@ -842,8 +842,10 @@ size_t Http2Session::ResetExpiredStreams(int timeout_sec) {
     size_t count = 0;
 
     for (auto& [id, stream] : streams_) {
-        if (stream->IsCounterDecremented() || stream->IsRejected()) continue;
-        // This stream is incomplete — check if it's expired
+        if (stream->IsCounterDecremented()) continue;
+        // Check incomplete AND rejected-but-not-closed streams.
+        // Rejected streams (e.g. 417 Expect) may be half-open on the client
+        // side — RST them to free nghttp2 max_concurrent_streams slots.
         if (now - stream->CreatedAt() > limit) {
             logging::Get()->warn("HTTP/2 stream {} timed out ({}s)", id, timeout_sec);
             stream->MarkRejected();

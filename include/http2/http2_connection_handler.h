@@ -39,6 +39,10 @@ public:
     // Schedules async resume if session has deferred output.
     void OnSendComplete();
 
+    // Called after each partial write with the remaining buffer size.
+    // Resumes deferred nghttp2 output when buffer drops below watermark.
+    void OnWriteProgress(size_t remaining_bytes);
+
     // Callback invoked (once) when the connection finishes draining all
     // active streams during graceful shutdown. Called on dispatcher thread.
     using DrainCompleteCallback = std::function<void()>;

@@ -86,6 +86,7 @@ public:
 
     void SetOnMessageCb(CALLBACKS_NAMESPACE::ConnOnMsgCallback);
     void SetCompletionCb(CALLBACKS_NAMESPACE::ConnCompleteCallback);
+    void SetWriteProgressCb(CALLBACKS_NAMESPACE::ConnWriteProgressCallback);
     void SetCloseCb(CALLBACKS_NAMESPACE::ConnCloseCallback);
     void SetErrorCb(CALLBACKS_NAMESPACE::ConnErrorCallback);
 

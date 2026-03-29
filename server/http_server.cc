@@ -34,6 +34,23 @@ void HttpServer::WireNetServerCallbacks() {
                 h2_conn->OnSendComplete();
             }
         });
+
+    // Resume deferred H2 output at the low watermark (partial writes).
+    net_server_.SetWriteProgressCb(
+        [this](std::shared_ptr<ConnectionHandler> conn, size_t remaining) {
+            std::shared_ptr<Http2ConnectionHandler> h2_conn;
+            {
+                std::lock_guard<std::mutex> lck(conn_mtx_);
+                auto it = h2_connections_.find(conn->fd());
+                if (it != h2_connections_.end() &&
+                    it->second->GetConnection() == conn) {
+                    h2_conn = it->second;
+                }
+            }
+            if (h2_conn) {
+                h2_conn->OnWriteProgress(remaining);
+            }
+        });
 }
 
 // Validate host is a numeric IPv4 address — inet_addr() silently returns
@@ -666,6 +683,8 @@ bool HttpServer::DetectAndRouteProtocol(
     }
 
     if (proto == ProtocolDetector::Protocol::HTTP2) {
+        // Refuse new H2 sessions during shutdown — transport is already closing
+        if (conn->IsCloseDeferred() || conn->IsClosing()) return true;
         // Create HTTP/2 handler
         auto h2_conn = std::make_shared<Http2ConnectionHandler>(conn, h2_settings_);
         SetupH2Handlers(h2_conn);

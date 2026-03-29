@@ -243,6 +243,7 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
     conn -> SetErrorCb(std::bind(&NetServer::HandleErrorConnection, this, std::placeholders::_1));
     conn -> SetOnMessageCb(std::bind(&NetServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
     conn -> SetCompletionCb(std::bind(&NetServer::HandleSendComplete, this, std::placeholders::_1));
+    conn -> SetWriteProgressCb(std::bind(&NetServer::HandleWriteProgress, this, std::placeholders::_1, std::placeholders::_2));
 
     // Set input buffer cap BEFORE epoll registration to eliminate the race where
     // the first read arrives uncapped before HttpServer::HandleNewConnection runs.
@@ -363,6 +364,11 @@ void NetServer::HandleSendComplete(std::shared_ptr<ConnectionHandler> conn){
         callbacks_.send_complete_callback(conn);
 }
 
+void NetServer::HandleWriteProgress(std::shared_ptr<ConnectionHandler> conn, size_t remaining){
+    if(callbacks_.write_progress_callback)
+        callbacks_.write_progress_callback(conn, remaining);
+}
+
 void NetServer::Timeout(std::shared_ptr<Dispatcher> sock_dispatcher){
     if(callbacks_.timer_callback)
         callbacks_.timer_callback(sock_dispatcher);
@@ -391,6 +397,11 @@ void NetServer::SetOnMessageCb(CALLBACKS_NAMESPACE::NetSrvOnMsgCallback fn){
 void NetServer::SetSendCompletionCb(CALLBACKS_NAMESPACE::NetSrvSendCompleteCallback fn){
     if(fn)
         callbacks_.send_complete_callback = std::move(fn);
+}
+
+void NetServer::SetWriteProgressCb(CALLBACKS_NAMESPACE::NetSrvWriteProgressCallback fn){
+    if(fn)
+        callbacks_.write_progress_callback = std::move(fn);
 }
 
 void NetServer::SetTimerCb(CALLBACKS_NAMESPACE::NetSrvTimerCallback fn){

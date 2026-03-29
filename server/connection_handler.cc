@@ -667,6 +667,9 @@ void ConnectionHandler::CallWriteCb(){
         if(callbacks_.complete_callback)
             callbacks_.complete_callback(shared_from_this());
     } else {
+        // Partial write — notify progress (HTTP/2 low watermark resume)
+        if (write_sz > 0 && callbacks_.write_progress_callback)
+            callbacks_.write_progress_callback(shared_from_this(), output_bf_.Size());
         // Still data to send — ensure write mode is enabled.
         // This is essential after the WANT_READ recovery path (OnMessage → CallWriteCb)
         // where write mode was disabled while waiting for read readiness.
@@ -681,6 +684,10 @@ void ConnectionHandler::SetOnMessageCb(CALLBACKS_NAMESPACE::ConnOnMsgCallback fn
 
 void ConnectionHandler::SetCompletionCb(CALLBACKS_NAMESPACE::ConnCompleteCallback fn){
     callbacks_.complete_callback = std::move(fn);
+}
+
+void ConnectionHandler::SetWriteProgressCb(CALLBACKS_NAMESPACE::ConnWriteProgressCallback fn){
+    callbacks_.write_progress_callback = std::move(fn);
 }
 
 void ConnectionHandler::SetCloseCb(CALLBACKS_NAMESPACE::ConnCloseCallback fn){

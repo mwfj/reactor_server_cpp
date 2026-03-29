@@ -15,11 +15,17 @@ namespace CALLBACKS_NAMESPACE {
     using ConnCloseCallback    = std::function<void(std::shared_ptr<ConnectionHandler>)>;
     using ConnErrorCallback    = std::function<void(std::shared_ptr<ConnectionHandler>)>;
 
+    // Fires after a successful partial write when output buffer is still non-empty.
+    // Used by HTTP/2 to resume deferred output at the low watermark instead of
+    // waiting for the buffer to fully drain.
+    using ConnWriteProgressCallback = std::function<void(std::shared_ptr<ConnectionHandler>, size_t)>;
+
     struct ConnCallbacks {
-        ConnOnMsgCallback    on_message_callback = nullptr;
-        ConnCompleteCallback complete_callback   = nullptr;
-        ConnCloseCallback    close_callback      = nullptr;
-        ConnErrorCallback    error_callback      = nullptr;
+        ConnOnMsgCallback        on_message_callback      = nullptr;
+        ConnCompleteCallback     complete_callback        = nullptr;
+        ConnWriteProgressCallback write_progress_callback = nullptr;
+        ConnCloseCallback        close_callback           = nullptr;
+        ConnErrorCallback        error_callback           = nullptr;
     };
 
     // Channel
@@ -43,16 +49,18 @@ namespace CALLBACKS_NAMESPACE {
     using NetSrvCloseConnCallback    = std::function<void(std::shared_ptr<ConnectionHandler>)>;
     using NetSrvErrorCallback        = std::function<void(std::shared_ptr<ConnectionHandler>)>;
     using NetSrvOnMsgCallback        = std::function<void(std::shared_ptr<ConnectionHandler>, std::string&)>;
-    using NetSrvSendCompleteCallback = std::function<void(std::shared_ptr<ConnectionHandler>)>;
-    using NetSrvTimerCallback        = std::function<void(std::shared_ptr<Dispatcher>)>;
+    using NetSrvSendCompleteCallback  = std::function<void(std::shared_ptr<ConnectionHandler>)>;
+    using NetSrvWriteProgressCallback = std::function<void(std::shared_ptr<ConnectionHandler>, size_t)>;
+    using NetSrvTimerCallback         = std::function<void(std::shared_ptr<Dispatcher>)>;
 
     struct NetSrvCallbacks {
         NetSrvConnCallback         new_conn_callback      = nullptr;
         NetSrvCloseConnCallback    close_conn_callback    = nullptr;
         NetSrvErrorCallback        error_callback         = nullptr;
         NetSrvOnMsgCallback        on_message_callback    = nullptr;
-        NetSrvSendCompleteCallback send_complete_callback = nullptr;
-        NetSrvTimerCallback        timer_callback         = nullptr;
+        NetSrvSendCompleteCallback  send_complete_callback  = nullptr;
+        NetSrvWriteProgressCallback write_progress_callback = nullptr;
+        NetSrvTimerCallback         timer_callback          = nullptr;
     };
 
     // Dispatcher

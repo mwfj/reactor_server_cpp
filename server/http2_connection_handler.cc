@@ -312,6 +312,27 @@ void Http2ConnectionHandler::OnSendComplete() {
     }
 }
 
+void Http2ConnectionHandler::OnWriteProgress(size_t remaining_bytes) {
+    if (!session_ || initializing_) return;
+    // Resume deferred output when buffer drops below the high watermark.
+    // This lets multiplexed streams make progress without waiting for the
+    // buffer to fully drain to zero.
+    if (session_->HasDeferredOutput() &&
+        remaining_bytes <= session_->OutputHighWatermark()) {
+        if (resume_scheduled_) return;
+        resume_scheduled_ = true;
+        std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
+        conn_->RunOnDispatcher([weak_self]() {
+            auto self = weak_self.lock();
+            if (!self) return;
+            self->resume_scheduled_ = false;
+            if (self->session_) {
+                self->session_->ResumeOutput();
+            }
+        });
+    }
+}
+
 void Http2ConnectionHandler::DispatchPendingRequests() {
     // No-op: request dispatch happens synchronously during ReceiveData via
     // nghttp2's on_frame_recv_callback, which invokes the request_callback

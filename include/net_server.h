@@ -82,6 +82,7 @@ public:
     void HandleCloseConnection(std::shared_ptr<ConnectionHandler>);
     void HandleErrorConnection(std::shared_ptr<ConnectionHandler>);
     void HandleSendComplete(std::shared_ptr<ConnectionHandler>);
+    void HandleWriteProgress(std::shared_ptr<ConnectionHandler>, size_t);
 
     void OnMessage(std::shared_ptr<ConnectionHandler>, std::string&);
     void AddConnection(std::shared_ptr<ConnectionHandler>);
@@ -93,6 +94,7 @@ public:
     void SetErrorCb(CALLBACKS_NAMESPACE::NetSrvErrorCallback);
     void SetOnMessageCb(CALLBACKS_NAMESPACE::NetSrvOnMsgCallback);
     void SetSendCompletionCb(CALLBACKS_NAMESPACE::NetSrvSendCompleteCallback);
+    void SetWriteProgressCb(CALLBACKS_NAMESPACE::NetSrvWriteProgressCallback);
     void SetTimerCb(CALLBACKS_NAMESPACE::NetSrvTimerCallback);
 
     void SetTlsContext(std::shared_ptr<TlsContext> ctx) { tls_ctx_ = std::move(ctx); }
