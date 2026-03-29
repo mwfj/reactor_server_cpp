@@ -175,9 +175,15 @@ static int OnHeaderCallback(
     }
 
     // TE header: only "trailers" is allowed in HTTP/2 (RFC 9113 Section 8.2.2).
-    // Comparison is case-insensitive per RFC 9110 Section 5.6.2 (HTTP tokens).
+    // Trim OWS (RFC 9110 Section 5.5) and compare case-insensitively.
     if (hdr_name == "te") {
         std::string te_lower = hdr_value;
+        // Trim leading/trailing whitespace (OWS = SP / HTAB)
+        size_t start = te_lower.find_first_not_of(" \t");
+        size_t end = te_lower.find_last_not_of(" \t");
+        if (start != std::string::npos) {
+            te_lower = te_lower.substr(start, end - start + 1);
+        }
         std::transform(te_lower.begin(), te_lower.end(), te_lower.begin(), ::tolower);
         if (te_lower != "trailers") {
             logging::Get()->warn("HTTP/2 stream {} received invalid TE value: {}",
@@ -335,10 +341,13 @@ static int OnFrameRecvCallback(
                                            frame->hd.stream_id, nullptr,
                                            nva_100, 1, nullptr);
                 } else {
-                    // Unsupported Expect value — reject with 417.
-                    // submit_response2 sends the HTTP response with END_STREAM.
-                    // No RST_STREAM — clients should see a clean 417 and stop
-                    // sending. Per-stream timeout handles clients that don't.
+                    // Unsupported Expect value — reject with 417 + RST.
+                    // submit_response2 queues the HTTP response (END_STREAM).
+                    // RST_STREAM(NO_ERROR) queued after ensures the client side
+                    // closes too. nghttp2 sends frames in order, so well-behaved
+                    // clients receive the 417 before the RST. Without RST, the
+                    // stream stays half-open and leaks a concurrent-stream slot
+                    // (especially when request_timeout_sec is 0).
                     nghttp2_nv nva_417[] = {
                         {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
                          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("417")),
@@ -346,6 +355,8 @@ static int OnFrameRecvCallback(
                     };
                     nghttp2_submit_response2(session, frame->hd.stream_id,
                                              nva_417, 1, nullptr);
+                    nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                              frame->hd.stream_id, NGHTTP2_NO_ERROR);
                     stream->MarkRejected();
                     break;
                 }
