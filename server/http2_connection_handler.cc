@@ -265,10 +265,17 @@ void Http2ConnectionHandler::RequestShutdown() {
             self->session_->SendPendingFrames();
         }
 
-        // If already idle, start flushing GOAWAY. NotifyDrainComplete
-        // fires from OnSendComplete when bytes reach the wire.
+        // If already idle, start flushing GOAWAY. If deferred output
+        // exists (watermark hit), resume it first — CloseAfterWrite skips
+        // complete_callback so OnSendComplete would never flush deferred frames.
         if (self->session_->ActiveStreamCount() == 0) {
-            self->conn_->CloseAfterWrite();
+            if (self->session_->HasDeferredOutput()) {
+                self->session_->ResumeOutput();
+            }
+            if (!self->session_->HasDeferredOutput()) {
+                self->conn_->CloseAfterWrite();
+            }
+            // else: still deferred — OnSendComplete/OnWriteProgress will retry
         }
         // else: active streams exist — drain continues via OnRawData.
         // They'll call NotifyDrainComplete when ActiveStreamCount() == 0.

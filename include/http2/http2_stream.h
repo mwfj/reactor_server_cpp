@@ -85,7 +85,8 @@ public:
     void MarkCounterDecremented() { counter_decremented_ = true; }
     bool IsCounterDecremented() const { return counter_decremented_; }
 
-    // :scheme pseudo-header tracking (required for validation)
+    // Pseudo-header presence tracking (required for validation)
+    bool HasPath() const { return has_path_; }
     bool HasScheme() const { return has_scheme_; }
     const std::string& Scheme() const { return scheme_; }
 

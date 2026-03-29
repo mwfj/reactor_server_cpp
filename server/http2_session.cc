@@ -289,10 +289,10 @@ static int OnFrameRecvCallback(
 
             if (req.method == "CONNECT") {
                 // CONNECT: MUST have :method + :authority. MUST NOT have :path/:scheme.
-                // Check HasAuthority (not HasHeader("host")) — a regular host header
-                // is not a substitute for the :authority pseudo-header.
+                // Check HasPath() (presence), not req.path.empty() (value) —
+                // an explicit empty :path ("") is still a protocol error.
                 if (!stream->HasAuthority()) valid = false;
-                if (!req.path.empty() || stream->HasScheme()) valid = false;
+                if (stream->HasPath() || stream->HasScheme()) valid = false;
             } else {
                 // Non-CONNECT: MUST have :method, :path, :scheme (RFC 9113 §8.3.1).
                 if (req.method.empty() || req.path.empty() || !stream->HasScheme()) {
