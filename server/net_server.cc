@@ -206,11 +206,12 @@ void NetServer::Stop(){
 
 void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
     // Enforce max_connections limit
-    if (max_connections_ > 0) {
+    int max_conns = max_connections_.load(std::memory_order_relaxed);
+    if (max_conns > 0) {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        if (static_cast<int>(connections_.size()) >= max_connections_) {
+        if (static_cast<int>(connections_.size()) >= max_conns) {
             logging::Get()->warn("Max connections ({}) reached, rejecting fd {}",
-                                max_connections_, cilent_sock->fd());
+                                max_conns, cilent_sock->fd());
             return;  // SocketHandler destructor closes the fd
         }
     }
@@ -247,8 +248,9 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
 
     // Set input buffer cap BEFORE epoll registration to eliminate the race where
     // the first read arrives uncapped before HttpServer::HandleNewConnection runs.
-    if (max_input_size_ > 0) {
-        conn->SetMaxInputSize(max_input_size_);
+    size_t max_input = max_input_size_.load(std::memory_order_relaxed);
+    if (max_input > 0) {
+        conn->SetMaxInputSize(max_input);
     }
 
     AddConnection(conn);
@@ -414,4 +416,13 @@ bool NetServer::IsOnDispatcherThread() const {
         if (disp->is_on_loop_thread()) return true;
     }
     return false;
+}
+
+void NetServer::SetConnectionTimeout(std::chrono::seconds timeout) {
+    connection_timeout_ = timeout;
+    for (auto& disp : socket_dispatchers_) {
+        disp->EnQueue([d = disp, timeout]() {
+            d->SetTimeout(timeout);
+        });
+    }
 }

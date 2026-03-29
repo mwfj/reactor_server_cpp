@@ -43,6 +43,14 @@ void SetConsoleEnabled(bool enabled);
 // Returns true on success, false on failure (old logger kept active).
 bool Reopen();
 
+// Change the log level at runtime without reconstructing the logger.
+// Thread-safe. No-op if Init() has not been called.
+void SetLevel(spdlog::level::level_enum level);
+
+// Update the stored file sink config (file path, max size, max files).
+// Takes effect on next Reopen(). Thread-safe. Does NOT reopen immediately.
+void UpdateFileConfig(const std::string& file, size_t max_size, int max_files);
+
 // Flush all sinks and shut down the logging system.
 void Shutdown();
 

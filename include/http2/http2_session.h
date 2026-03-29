@@ -85,6 +85,10 @@ public:
 
     void SetRequestCallback(HTTP2_CALLBACKS_NAMESPACE::Http2RequestCallback cb);
     void SetStreamCloseCallback(HTTP2_CALLBACKS_NAMESPACE::Http2StreamCloseCallback cb);
+    // SetStreamOpenCallback: callback fires during nghttp2 frame processing
+    // (inside ReceiveData). Callers MUST NOT submit nghttp2 frames from
+    // within this callback — doing so is reentrant into nghttp2 and unsafe.
+    void SetStreamOpenCallback(HTTP2_CALLBACKS_NAMESPACE::Http2StreamOpenCallback cb);
 
     // --- Flood protection ---
 

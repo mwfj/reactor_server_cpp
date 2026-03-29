@@ -831,6 +831,13 @@ Http2Stream* Http2Session::CreateStream(int32_t stream_id) {
         return it->second.get();
     }
     OnStreamBecameIncomplete();
+    // Notify observer (HttpServer counters) of stream creation
+    if (callbacks_.stream_open_callback) {
+        try { callbacks_.stream_open_callback(Owner(), stream_id); }
+        catch (const std::exception& e) {
+            logging::Get()->error("Stream open callback error: {}", e.what());
+        }
+    }
     return it->second.get();
 }
 
@@ -899,6 +906,11 @@ void Http2Session::SetRequestCallback(
 void Http2Session::SetStreamCloseCallback(
     HTTP2_CALLBACKS_NAMESPACE::Http2StreamCloseCallback cb) {
     callbacks_.stream_close_callback = std::move(cb);
+}
+
+void Http2Session::SetStreamOpenCallback(
+    HTTP2_CALLBACKS_NAMESPACE::Http2StreamOpenCallback cb) {
+    callbacks_.stream_open_callback = std::move(cb);
 }
 
 // --- Flood protection ---

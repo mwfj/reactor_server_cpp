@@ -6,6 +6,13 @@
 #include <algorithm>
 #include <set>
 
+// RAII guard: decrements an atomic counter on scope exit. Used in request
+// dispatch callbacks to ensure active_requests_ is decremented even on throw.
+struct RequestGuard {
+    std::atomic<int64_t>& counter;
+    ~RequestGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
+};
+
 void HttpServer::WireNetServerCallbacks() {
     net_server_.SetNewConnectionCb(
         [this](std::shared_ptr<ConnectionHandler> conn) { HandleNewConnection(conn); });
@@ -126,11 +133,11 @@ HttpServer::HttpServer(const ServerConfig& config)
     logging::Init("reactor", logging::ParseLevel(config.log.level),
                   config.log.file, config.log.max_file_size, config.log.max_files);
 
-    max_body_size_ = config.max_body_size;
-    max_header_size_ = config.max_header_size;
-    max_ws_message_size_ = config.max_ws_message_size;
-    request_timeout_sec_ = config.request_timeout_sec;
-    shutdown_drain_timeout_sec_ = config.shutdown_drain_timeout_sec;
+    max_body_size_.store(config.max_body_size, std::memory_order_relaxed);
+    max_header_size_.store(config.max_header_size, std::memory_order_relaxed);
+    max_ws_message_size_.store(config.max_ws_message_size, std::memory_order_relaxed);
+    request_timeout_sec_.store(config.request_timeout_sec, std::memory_order_relaxed);
+    shutdown_drain_timeout_sec_.store(config.shutdown_drain_timeout_sec, std::memory_order_relaxed);
     net_server_.SetMaxConnections(config.max_connections);
 
     // Set input buffer cap on NetServer — applied BEFORE epoll registration
@@ -171,30 +178,29 @@ HttpServer::HttpServer(const ServerConfig& config)
 }
 
 size_t HttpServer::ComputeInputCap() const {
+    // Snapshot all three size-limit atomics locally before computing to
+    // prevent mixed-generation buffer caps during concurrent Reload().
+    size_t body_sz = max_body_size_.load(std::memory_order_relaxed);
+    size_t hdr_sz = max_header_size_.load(std::memory_order_relaxed);
+    size_t ws_sz = max_ws_message_size_.load(std::memory_order_relaxed);
+
     // Cap per-cycle input buffer allocation. When the cap is hit, the read
     // loop stops (data stays in kernel buffer) and schedules another read
     // after the parser processes what it has. No data is discarded.
-    // No multiplier needed — the parser processes data incrementally across
-    // cycles. Wire overhead (chunked framing etc.) is handled naturally.
     size_t http_cap = 0;
-    if (max_header_size_ > 0 && max_body_size_ > 0) {
-        size_t sum = max_header_size_ + max_body_size_;
-        if (sum >= max_header_size_) http_cap = sum;  // overflow guard
-    } else if (max_header_size_ > 0) {
-        http_cap = max_header_size_;
-    } else if (max_body_size_ > 0) {
-        http_cap = max_body_size_;
+    if (hdr_sz > 0 && body_sz > 0) {
+        size_t sum = hdr_sz + body_sz;
+        if (sum >= hdr_sz) http_cap = sum;  // overflow guard
+    } else if (hdr_sz > 0) {
+        http_cap = hdr_sz;
+    } else if (body_sz > 0) {
+        http_cap = body_sz;
     }
 
-    // Also bound by WS message size. A client can coalesce an HTTP upgrade
-    // request with a large first WS frame in one read. Without this, the
-    // pre-upgrade cap (based on HTTP limits) allows more data than
-    // max_ws_message_size_ to be buffered before the cap switches post-upgrade.
-    // The HTTP parser processes incrementally, so a smaller cap is fine —
-    // it just means more read cycles for large HTTP bodies.
-    if (max_ws_message_size_ > 0) {
-        if (http_cap == 0) return max_ws_message_size_;
-        return std::min(http_cap, max_ws_message_size_);
+    // Also bound by WS message size.
+    if (ws_sz > 0) {
+        if (http_cap == 0) return ws_sz;
+        return std::min(http_cap, ws_sz);
     }
     return http_cap;
 }
@@ -354,7 +360,8 @@ void HttpServer::OnH2DrainComplete(ConnectionHandler* conn_ptr) {
 void HttpServer::WaitForH2Drain() {
     std::unique_lock<std::mutex> lck(drain_mtx_);
     auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::seconds(shutdown_drain_timeout_sec_);
+                    std::chrono::seconds(
+                        shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
     drain_cv_.wait_until(lck, deadline, [this]() {
         return h2_draining_.empty();
     });
@@ -372,20 +379,24 @@ void HttpServer::WaitForH2Drain() {
 }
 
 void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn) {
-    // Apply request size limits
-    http_conn->SetMaxBodySize(max_body_size_);
-    http_conn->SetMaxHeaderSize(max_header_size_);
-    http_conn->SetMaxWsMessageSize(max_ws_message_size_);
-    http_conn->SetRequestTimeout(request_timeout_sec_);
+    // Apply request size limits (snapshot from atomics — cached per-connection)
+    http_conn->SetMaxBodySize(max_body_size_.load(std::memory_order_relaxed));
+    http_conn->SetMaxHeaderSize(max_header_size_.load(std::memory_order_relaxed));
+    http_conn->SetMaxWsMessageSize(max_ws_message_size_.load(std::memory_order_relaxed));
+    http_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
 
-    // Set request handler: dispatch through router
+    // Set request handler: dispatch through router.
+    // request_timeout_sec_ is loaded from the atomic at dispatch time (not
+    // cached per-connection) so keep-alive connections use updated timeout.
     http_conn->SetRequestCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
                const HttpRequest& request,
                HttpResponse& response) {
+            total_requests_.fetch_add(1, std::memory_order_relaxed);
+            active_requests_.fetch_add(1, std::memory_order_relaxed);
+            RequestGuard guard{active_requests_};
+
             if (!router_.Dispatch(request, response)) {
-                // Set 404 on the existing response to preserve any headers
-                // that middleware already added (CORS, request-id, etc.)
                 response.Status(404).Text("Not Found");
             }
         }
@@ -499,14 +510,17 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         if (already_initialized) return;
     }
 
+    // Counters: placed after all early-return guards to avoid double-counting
+    // connections already initialized by HandleMessage (accept/data race).
+    total_accepted_.fetch_add(1, std::memory_order_relaxed);
+    active_connections_.fetch_add(1, std::memory_order_relaxed);
+
     // Arm a connection-level deadline for the TLS handshake + protocol detection
-    // window. The protocol handler resets this once it takes over, so the total
-    // exposure is up to 2× request_timeout_sec (handshake + first request).
-    // This is intentional: separating handshake and request timeouts is standard
-    // (cf. nginx ssl_handshake_timeout vs client_header_timeout).
-    if (request_timeout_sec_ > 0) {
+    // window. Load from atomic at use time — not cached per-connection.
+    int req_timeout = request_timeout_sec_.load(std::memory_order_relaxed);
+    if (req_timeout > 0) {
         conn->SetDeadline(std::chrono::steady_clock::now() +
-                          std::chrono::seconds(request_timeout_sec_));
+                          std::chrono::seconds(req_timeout));
     }
 
     logging::Get()->debug("New HTTP connection fd={} from {}:{}",
@@ -515,6 +529,8 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
 
 void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->debug("HTTP connection closed fd={}", conn->fd());
+
+    active_connections_.fetch_sub(1, std::memory_order_relaxed);
 
     // Single lock: check both H2 and HTTP/1.x maps
     std::shared_ptr<HttpConnectionHandler> http_conn;
@@ -540,14 +556,20 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
     }
     // Outside lock: notify drain set and WS close handler
     if (was_h2) {
+        active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
         OnH2DrainComplete(conn.get());
         return;
+    }
+    if (http_conn) {
+        active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
     }
     SafeNotifyWsClose(http_conn);
 }
 
 void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->error("HTTP connection error fd={}", conn->fd());
+
+    active_connections_.fetch_sub(1, std::memory_order_relaxed);
 
     // Single lock: check both H2 and HTTP/1.x maps
     std::shared_ptr<HttpConnectionHandler> http_conn;
@@ -572,8 +594,12 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
         }
     }
     if (was_h2) {
+        active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
         OnH2DrainComplete(conn.get());
         return;
+    }
+    if (http_conn) {
+        active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
     }
     SafeNotifyWsClose(http_conn);
 }
@@ -689,15 +715,19 @@ bool HttpServer::DetectAndRouteProtocol(
     if (proto == ProtocolDetector::Protocol::HTTP2) {
         // Skip if connection is fully closing (not just peer half-close)
         if (conn->IsClosing()) return true;
-        // Create HTTP/2 handler
-        auto h2_conn = std::make_shared<Http2ConnectionHandler>(conn, h2_settings_);
-        SetupH2Handlers(h2_conn);
-        // Publish BEFORE Initialize so HandleCloseConnection can find and
-        // remove the handler if Initialize's SendRaw triggers a synchronous
-        // close (peer already disconnected). RequestShutdown safely handles
-        // uninitialized sessions (checks !session_ and returns early).
+        active_http2_connections_.fetch_add(1, std::memory_order_relaxed);
+        // Snapshot h2_settings_ and publish handler under a single lock to
+        // prevent race with Reload() and to avoid double mutex acquisition.
+        Http2Session::Settings settings_snapshot;
+        std::shared_ptr<Http2ConnectionHandler> h2_conn;
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
+            settings_snapshot = h2_settings_;
+            h2_conn = std::make_shared<Http2ConnectionHandler>(conn, settings_snapshot);
+            SetupH2Handlers(h2_conn);
+            // Publish BEFORE Initialize so HandleCloseConnection can find and
+            // remove the handler if Initialize's SendRaw triggers a synchronous
+            // close. RequestShutdown safely handles uninitialized sessions.
             h2_connections_[conn->fd()] = h2_conn;
         }
         h2_conn->Initialize(message);
@@ -705,6 +735,7 @@ bool HttpServer::DetectAndRouteProtocol(
     }
 
     // HTTP/1.x — create handler (existing path)
+    active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
     SetupHandlers(http_conn);
     {
@@ -723,12 +754,11 @@ bool HttpServer::DetectAndRouteProtocol(
 }
 
 void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn) {
-    h2_conn->SetMaxBodySize(max_body_size_);
+    h2_conn->SetMaxBodySize(max_body_size_.load(std::memory_order_relaxed));
     // Note: NOT calling SetMaxHeaderSize here. HTTP/2 header limits come from
     // h2_settings_.max_header_list_size (Http2Config, default 64KB), which is
     // already baked into the session settings and advertised via SETTINGS frame.
-    // Calling SetMaxHeaderSize would overwrite it with the HTTP/1.x limit (8KB).
-    h2_conn->SetRequestTimeout(request_timeout_sec_);
+    h2_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
 
     // Set request callback: dispatch through HttpRouter (same as HTTP/1.x)
     h2_conn->SetRequestCallback(
@@ -736,9 +766,71 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                int32_t /*stream_id*/,
                const HttpRequest& request,
                HttpResponse& response) {
+            total_requests_.fetch_add(1, std::memory_order_relaxed);
+            active_requests_.fetch_add(1, std::memory_order_relaxed);
+            RequestGuard guard{active_requests_};
+
             if (!router_.Dispatch(request, response)) {
                 response.Status(404).Text("Not Found");
             }
         }
     );
+
+    // Stream open/close counter callbacks
+    h2_conn->SetStreamOpenCallback(
+        [this](std::shared_ptr<Http2ConnectionHandler> /*self*/, int32_t /*stream_id*/) {
+            active_h2_streams_.fetch_add(1, std::memory_order_relaxed);
+        }
+    );
+    h2_conn->SetStreamCloseCallback(
+        [this](std::shared_ptr<Http2ConnectionHandler> /*self*/,
+               int32_t /*stream_id*/, uint32_t /*error_code*/) {
+            active_h2_streams_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    );
+}
+
+void HttpServer::Reload(const ServerConfig& new_config) {
+    // Update reload-safe limit fields (atomic stores)
+    max_body_size_.store(new_config.max_body_size, std::memory_order_relaxed);
+    max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);
+    max_ws_message_size_.store(new_config.max_ws_message_size, std::memory_order_relaxed);
+    request_timeout_sec_.store(new_config.request_timeout_sec, std::memory_order_relaxed);
+    shutdown_drain_timeout_sec_.store(new_config.shutdown_drain_timeout_sec,
+                                     std::memory_order_relaxed);
+
+    // Update max_connections and input buffer cap
+    net_server_.SetMaxConnections(new_config.max_connections);
+    net_server_.SetMaxInputSize(ComputeInputCap());
+
+    // Update idle timeout via EnQueue to dispatcher threads
+    net_server_.SetConnectionTimeout(
+        std::chrono::seconds(new_config.idle_timeout_sec));
+
+    // Update HTTP/2 settings for new connections (under conn_mtx_)
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        h2_settings_.max_concurrent_streams = new_config.http2.max_concurrent_streams;
+        h2_settings_.initial_window_size    = new_config.http2.initial_window_size;
+        h2_settings_.max_frame_size         = new_config.http2.max_frame_size;
+        h2_settings_.max_header_list_size   = new_config.http2.max_header_list_size;
+    }
+}
+
+HttpServer::ServerStats HttpServer::GetStats() const {
+    ServerStats stats;
+    auto now = std::chrono::steady_clock::now();
+    stats.uptime_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+        now - start_time_).count();
+    stats.active_connections      = active_connections_.load(std::memory_order_relaxed);
+    stats.active_http1_connections = active_http1_connections_.load(std::memory_order_relaxed);
+    stats.active_http2_connections = active_http2_connections_.load(std::memory_order_relaxed);
+    stats.active_h2_streams       = active_h2_streams_.load(std::memory_order_relaxed);
+    stats.total_accepted          = total_accepted_.load(std::memory_order_relaxed);
+    stats.total_requests          = total_requests_.load(std::memory_order_relaxed);
+    stats.active_requests         = active_requests_.load(std::memory_order_relaxed);
+    stats.max_connections     = net_server_.GetMaxConnections();
+    stats.idle_timeout_sec    = static_cast<int>(net_server_.GetConnectionTimeout().count());
+    stats.request_timeout_sec = request_timeout_sec_.load(std::memory_order_relaxed);
+    return stats;
 }

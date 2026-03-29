@@ -56,6 +56,7 @@ static std::string ValidateLogLevel(const char* str) {
 static CliCommand ParseCommand(const char* str) {
     if (std::strcmp(str, "start") == 0)    return CliCommand::START;
     if (std::strcmp(str, "stop") == 0)     return CliCommand::STOP;
+    if (std::strcmp(str, "reload") == 0)   return CliCommand::RELOAD;
     if (std::strcmp(str, "status") == 0)   return CliCommand::STATUS;
     if (std::strcmp(str, "validate") == 0) return CliCommand::VALIDATE;
     if (std::strcmp(str, "config") == 0)   return CliCommand::CONFIG;
@@ -225,8 +226,9 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
     // Per-command option validation: reject flags that don't apply.
     auto cmd = options.command;
 
-    // stop/status only accept -P
-    if (cmd == CliCommand::STOP || cmd == CliCommand::STATUS) {
+    // stop/status/reload only accept -P
+    if (cmd == CliCommand::STOP || cmd == CliCommand::STATUS ||
+        cmd == CliCommand::RELOAD) {
         if (options.config_path_explicit || options.port >= 0 ||
             !options.host.empty() || !options.log_level.empty() ||
             options.workers >= 0 || !options.health_endpoint ||
@@ -273,6 +275,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "Commands:\n"
         << "  start       Start the server (foreground, or -d for daemon)\n"
         << "  stop        Stop a running server\n"
+        << "  reload      Reload configuration (send SIGHUP to running server)\n"
         << "  status      Check server status\n"
         << "  validate    Validate configuration\n"
         << "  config      Show effective configuration\n"
@@ -290,7 +293,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "  -d, --daemonize             Run as a background daemon\n"
         << "  --no-health-endpoint       Disable the /health endpoint\n"
         << "\n"
-        << "Stop/status options:\n"
+        << "Stop/status/reload options:\n"
         << "  -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)\n"
         << "\n"
         << "Validate/config options:\n"
@@ -320,6 +323,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "  " << program_name << " start -p 9090 -l debug\n"
         << "  " << program_name << " start -c config/server.example.json\n"
         << "  " << program_name << " stop\n"
+        << "  " << program_name << " reload\n"
         << "  " << program_name << " status\n"
         << "  " << program_name << " validate -c config/server.example.json\n"
         << "  " << program_name << " config -p 9090 -l debug\n"
@@ -335,5 +339,5 @@ void CliParser::PrintVersionVerbose() {
               << "  Compiler:  " << __VERSION__ << " (C++17)\n"
               << "  OpenSSL:   " << OpenSSL_version(OPENSSL_VERSION) << "\n"
               << "  Platform:  " << REACTOR_PLATFORM << "\n"
-              << "  Features:  HTTP/1.1, WebSocket (RFC 6455), TLS/SSL\n";
+              << "  Features:  HTTP/1.1, HTTP/2 (RFC 9113), WebSocket (RFC 6455), TLS/SSL\n";
 }

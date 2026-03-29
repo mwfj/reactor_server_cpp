@@ -11,6 +11,7 @@ enum class CliCommand {
     NONE,       // no command given → print usage
     START,      // start the server
     STOP,       // stop a running server
+    RELOAD,     // reload configuration (send SIGHUP)
     STATUS,     // check if server is running
     VALIDATE,   // validate configuration
     CONFIG,     // dump effective configuration

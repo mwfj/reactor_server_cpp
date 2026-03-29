@@ -29,6 +29,7 @@ Usage: reactor_server <command> [options]
 Commands:
   start       Start the server (foreground, or -d for daemon)
   stop        Stop a running server
+  reload      Reload configuration (send SIGHUP to running server)
   status      Check server status
   validate    Validate configuration
   config      Show effective configuration
@@ -46,7 +47,7 @@ Start options:
   -d, --daemonize             Run as a background daemon
   --no-health-endpoint       Disable the /health endpoint
 
-Stop/status options:
+Stop/status/reload options:
   -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)
 
 Validate/config options:
@@ -147,10 +148,29 @@ REACTOR_LOG_FILE=/var/log/reactor.log ./reactor_server start -d
 # Sent SIGTERM to reactor_server (PID 12345)
 ```
 
-You can also send signals directly:
+### Configuration Reload
+
+Reload the configuration of a running daemon without restarting:
 
 ```bash
-kill -TERM $(cat /tmp/reactor_server.pid)
+./reactor_server reload
+# Sent SIGHUP to reactor_server (PID 12345)
+```
+
+**Reload-safe fields** (applied immediately or to new connections):
+- `log.level`, `log.file`, `log.max_file_size`, `log.max_files`
+- `idle_timeout_sec`, `request_timeout_sec`
+- `max_connections`, `max_body_size`, `max_header_size`, `max_ws_message_size`
+- `shutdown_drain_timeout_sec`
+- `http2.max_concurrent_streams`, `http2.initial_window_size`, `http2.max_frame_size`, `http2.max_header_list_size`
+
+**Restart-required fields** (logged as skipped on reload):
+- `bind_host`, `bind_port`, `tls.*`, `worker_threads`, `http2.enabled`
+
+You can also send SIGHUP directly:
+
+```bash
+kill -HUP $(cat /tmp/reactor_server.pid)
 ```
 
 ## Signal Handling
@@ -159,10 +179,10 @@ kill -TERM $(cat /tmp/reactor_server.pid)
 |--------|----------|
 | `SIGTERM` | Graceful shutdown (sends WS Close 1001, drains connections, exits) |
 | `SIGINT` | Same as SIGTERM (Ctrl+C in foreground) |
-| `SIGHUP` | Daemon: reopen log files for rotation. Foreground: graceful shutdown (terminal hangup) |
+| `SIGHUP` | Daemon: reload configuration + reopen log files. Foreground: graceful shutdown (terminal hangup) |
 | `SIGPIPE` | Ignored (handled by MSG_NOSIGNAL) |
 
-Signal handling uses `sigwait()` (POSIX synchronous signal wait). Signals are blocked in all threads via `pthread_sigmask`; the main thread loops on `sigwait()`. In daemon mode, SIGHUP triggers log file rotation; in foreground mode, SIGHUP causes graceful shutdown (standard Unix terminal hangup behavior). SIGTERM/SIGINT always trigger shutdown.
+Signal handling uses `sigwait()` (POSIX synchronous signal wait). Signals are blocked in all threads via `pthread_sigmask`; the main thread loops on `sigwait()`. In daemon mode, SIGHUP triggers a full configuration reload (re-reads config file, validates, applies reload-safe fields, reopens log files); in foreground mode, SIGHUP causes graceful shutdown (standard Unix terminal hangup behavior). SIGTERM/SIGINT always trigger shutdown.
 
 ### Log Rotation
 
@@ -201,16 +221,38 @@ Run multiple instances with different PID files and ports:
 ./reactor_server start -p 8081 -P /tmp/reactor_8081.pid &
 ```
 
-## Health Endpoint
+## Health & Stats Endpoints
 
-By default, the server registers a `/health` endpoint:
+By default, the server registers `/health` and `/stats` endpoints:
 
 ```bash
 curl http://127.0.0.1:8080/health
 # {"status":"ok","pid":12345,"uptime_seconds":3600}
+
+curl http://127.0.0.1:8080/stats
+# {
+#   "uptime_seconds": 3600,
+#   "connections": {
+#     "active": 42, "active_http1": 30, "active_http2": 12,
+#     "active_h2_streams": 58, "total_accepted": 10234
+#   },
+#   "requests": { "total": 50000, "active": 15 },
+#   "config": {
+#     "bind_host": "127.0.0.1", "bind_port": 8080,
+#     "worker_threads": 3, "max_connections": 10000,
+#     "idle_timeout_sec": 300, "request_timeout_sec": 30,
+#     "tls_enabled": false, "http2_enabled": true
+#   }
+# }
 ```
 
-Disable it with `--no-health-endpoint`.
+- `/health` — lightweight liveness check with PID and uptime
+- `/stats` — runtime metrics with connection/request counters and current config
+- The `config` section in `/stats` reflects live values for reload-safe fields (`max_connections`, `idle_timeout_sec`, `request_timeout_sec`) and startup values for restart-required fields
+- No PID, file paths, or TLS details are exposed in `/stats`
+- If the server is internet-facing, restrict access to these endpoints via firewall or reverse proxy
+
+Disable both with `--no-health-endpoint`.
 
 ## Version Info
 
@@ -223,7 +265,7 @@ Disable it with `--no-health-endpoint`.
 #   Compiler:  13.3.0 (C++17)
 #   OpenSSL:   OpenSSL 3.0.13 30 Jan 2024
 #   Platform:  Linux
-#   Features:  HTTP/1.1, WebSocket (RFC 6455), TLS/SSL
+#   Features:  HTTP/1.1, HTTP/2 (RFC 9113), WebSocket (RFC 6455), TLS/SSL
 ```
 
 ## Exit Codes

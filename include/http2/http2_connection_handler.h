@@ -15,9 +15,11 @@ public:
     // Type aliases for callbacks (set by HttpServer)
     using RequestCallback     = HTTP2_CALLBACKS_NAMESPACE::Http2RequestCallback;
     using StreamCloseCallback = HTTP2_CALLBACKS_NAMESPACE::Http2StreamCloseCallback;
+    using StreamOpenCallback  = HTTP2_CALLBACKS_NAMESPACE::Http2StreamOpenCallback;
 
     void SetRequestCallback(RequestCallback callback);
     void SetStreamCloseCallback(StreamCloseCallback callback);
+    void SetStreamOpenCallback(StreamOpenCallback callback);
 
     // Set request limits (applied per-stream)
     void SetMaxBodySize(size_t max);
@@ -92,4 +94,5 @@ private:
     // Stored callbacks for deferred initialization
     RequestCallback pending_request_cb_;
     StreamCloseCallback pending_stream_close_cb_;
+    StreamOpenCallback pending_stream_open_cb_;
 };

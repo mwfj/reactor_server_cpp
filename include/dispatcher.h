@@ -85,4 +85,8 @@ public:
     void SetTimerCB(CALLBACKS_NAMESPACE::DispatcherTimerCallback);
     void SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCallback);
     void TimerHandler();
+
+    // Update idle timeout duration at runtime. Must be called on the
+    // dispatcher thread (via EnQueue) to avoid racing with TimerHandler.
+    void SetTimeout(std::chrono::seconds timeout) { timeout_ = timeout; }
 };

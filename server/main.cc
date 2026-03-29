@@ -79,7 +79,8 @@ static int HandleStatus(const CliOptions& options) {
     return EXIT_ERROR;
 }
 
-static int HandleStop(const CliOptions& options) {
+static int SendSignalToServer(const CliOptions& options, int sig,
+                              const char* sig_name) {
     pid_t pid = PidFile::CheckRunning(options.pid_file);
     if (pid < 0) {
         std::cout << REACTOR_SERVER_NAME << " is not running\n";
@@ -90,14 +91,22 @@ static int HandleStop(const CliOptions& options) {
                   << " is running but PID is unreadable — cannot send signal\n";
         return EXIT_ERROR;
     }
-    if (kill(pid, SIGTERM) == 0) {
-        std::cout << "Sent SIGTERM to " << REACTOR_SERVER_NAME
+    if (kill(pid, sig) == 0) {
+        std::cout << "Sent " << sig_name << " to " << REACTOR_SERVER_NAME
                   << " (PID " << pid << ")\n";
         return EXIT_OK;
     }
     std::cerr << "Failed to send signal to PID " << pid
               << ": " << std::strerror(errno) << "\n";
     return EXIT_ERROR;
+}
+
+static int HandleStop(const CliOptions& options) {
+    return SendSignalToServer(options, SIGTERM, "SIGTERM");
+}
+
+static int HandleReload(const CliOptions& options) {
+    return SendSignalToServer(options, SIGHUP, "SIGHUP");
 }
 
 // ── Health endpoint handler ──────────────────────────────────────
@@ -114,6 +123,139 @@ MakeHealthHandler(std::chrono::steady_clock::time_point start_time) {
             static_cast<int>(getpid()), static_cast<long long>(uptime));
         res.Status(200).Json(buf);
     };
+}
+
+// ── Stats endpoint handler ──────────────────────────────────────
+static std::function<void(const HttpRequest&, HttpResponse&)>
+MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
+    // Capture config by value so /stats always reflects the startup-time
+    // configuration for restart-required fields (bind_host, bind_port, etc.).
+    // This avoids a data race: ReloadConfig() mutates the caller's ServerConfig
+    // on the main thread while dispatcher threads serve /stats requests.
+    //
+    // Safety: bind_host is validated as a numeric IPv4 address by
+    // ConfigLoader::Validate() before reaching here, so no JSON escaping
+    // is needed for the %s substitution.
+    return [server, config](const HttpRequest& /*req*/, HttpResponse& res) {
+        auto stats = server->GetStats();
+
+        // Build JSON manually — avoid pulling in nlohmann/json for a simple response.
+        // Config section shows only operational parameters — no file paths, no TLS details.
+        static constexpr size_t STATS_BUF_SIZE = 1024;
+        char buf[STATS_BUF_SIZE];
+        int written = std::snprintf(buf, sizeof(buf),
+            R"({"uptime_seconds":%lld,)"
+            R"("connections":{"active":%lld,"active_http1":%lld,"active_http2":%lld,)"
+            R"("active_h2_streams":%lld,"total_accepted":%lld},)"
+            R"("requests":{"total":%lld,"active":%lld},)"
+            R"("config":{"bind_host":"%s","bind_port":%d,"worker_threads":%d,)"
+            R"("max_connections":%d,"idle_timeout_sec":%d,"request_timeout_sec":%d,)"
+            R"("tls_enabled":%s,"http2_enabled":%s}})",
+            static_cast<long long>(stats.uptime_seconds),
+            static_cast<long long>(stats.active_connections),
+            static_cast<long long>(stats.active_http1_connections),
+            static_cast<long long>(stats.active_http2_connections),
+            static_cast<long long>(stats.active_h2_streams),
+            static_cast<long long>(stats.total_accepted),
+            static_cast<long long>(stats.total_requests),
+            static_cast<long long>(stats.active_requests),
+            config.bind_host.c_str(), config.bind_port, config.worker_threads,
+            stats.max_connections, stats.idle_timeout_sec,
+            stats.request_timeout_sec,
+            config.tls.enabled ? "true" : "false",
+            config.http2.enabled ? "true" : "false");
+        if (written < 0 || static_cast<size_t>(written) >= sizeof(buf)) {
+            res.Status(500).Json(R"({"error":"stats buffer overflow"})");
+            return;
+        }
+        res.Status(200).Json(buf);
+    };
+}
+
+// ── Config reload helper (SIGHUP in daemon mode) ────────────────
+// Re-reads config file, validates, applies reload-safe fields.
+// Returns true on success, false on error (current config kept).
+static bool ReloadConfig(const CliOptions& options,
+                         HttpServer& server,
+                         ServerConfig& current_config) {
+    ServerConfig new_config;
+    try {
+        new_config = ConfigLoader::LoadFromFile(options.config_path);
+        ConfigLoader::ApplyEnvOverrides(new_config);
+        ApplyCliOverrides(new_config, options);
+    } catch (const std::exception& e) {
+        logging::Get()->error("Config reload failed: {}", e.what());
+        return false;
+    }
+    try {
+        ConfigLoader::Validate(new_config);
+    } catch (const std::invalid_argument& e) {
+        logging::Get()->error("Config reload validation failed: {}", e.what());
+        return false;
+    }
+
+    // Log restart-required field changes at warn level
+    if (new_config.bind_host != current_config.bind_host)
+        logging::Get()->warn("bind_host changed ({} -> {}) — requires restart, ignored",
+                             current_config.bind_host, new_config.bind_host);
+    if (new_config.bind_port != current_config.bind_port)
+        logging::Get()->warn("bind_port changed ({} -> {}) — requires restart, ignored",
+                             current_config.bind_port, new_config.bind_port);
+    if (new_config.worker_threads != current_config.worker_threads)
+        logging::Get()->warn("worker_threads changed ({} -> {}) — requires restart, ignored",
+                             current_config.worker_threads, new_config.worker_threads);
+    if (new_config.tls.enabled != current_config.tls.enabled ||
+        new_config.tls.cert_file != current_config.tls.cert_file ||
+        new_config.tls.key_file != current_config.tls.key_file ||
+        new_config.tls.min_version != current_config.tls.min_version)
+        logging::Get()->warn("tls.* changed — requires restart, ignored");
+    if (new_config.http2.enabled != current_config.http2.enabled)
+        logging::Get()->warn("http2.enabled changed — requires restart, ignored");
+
+    // Apply log changes: only reopen if file config actually changed
+    bool log_file_changed =
+        new_config.log.file != current_config.log.file ||
+        new_config.log.max_file_size != current_config.log.max_file_size ||
+        new_config.log.max_files != current_config.log.max_files;
+    if (log_file_changed) {
+        logging::UpdateFileConfig(new_config.log.file, new_config.log.max_file_size,
+                                  new_config.log.max_files);
+        if (logging::Reopen()) {
+            logging::Get()->info("Log files reopened");
+        } else {
+            logging::Get()->warn("Log file reopen failed, continuing with old file");
+        }
+    }
+    if (new_config.log.level != current_config.log.level) {
+        logging::SetLevel(logging::ParseLevel(new_config.log.level));
+        logging::Get()->info("Log level changed to {}", new_config.log.level);
+    }
+
+    // Apply reload-safe fields via HttpServer::Reload()
+    server.Reload(new_config);
+
+    // Log reload-safe changes at info level
+    if (new_config.idle_timeout_sec != current_config.idle_timeout_sec)
+        logging::Get()->info("idle_timeout_sec: {} -> {}",
+                             current_config.idle_timeout_sec, new_config.idle_timeout_sec);
+    if (new_config.request_timeout_sec != current_config.request_timeout_sec)
+        logging::Get()->info("request_timeout_sec: {} -> {}",
+                             current_config.request_timeout_sec, new_config.request_timeout_sec);
+    if (new_config.max_connections != current_config.max_connections)
+        logging::Get()->info("max_connections: {} -> {}",
+                             current_config.max_connections, new_config.max_connections);
+    if (new_config.max_body_size != current_config.max_body_size)
+        logging::Get()->info("max_body_size: {} -> {}",
+                             current_config.max_body_size, new_config.max_body_size);
+    if (new_config.max_header_size != current_config.max_header_size)
+        logging::Get()->info("max_header_size: {} -> {}",
+                             current_config.max_header_size, new_config.max_header_size);
+    if (new_config.max_ws_message_size != current_config.max_ws_message_size)
+        logging::Get()->info("max_ws_message_size: {} -> {}",
+                             current_config.max_ws_message_size, new_config.max_ws_message_size);
+
+    current_config = new_config;
+    return true;
 }
 
 // ── Daemon path helper: reject relative paths (CWD changes to "/") ──
@@ -256,7 +398,9 @@ static int HandleStart(const CliOptions& options) {
     if (options.health_endpoint) {
         auto start_time = std::chrono::steady_clock::now();
         server->Get("/health", MakeHealthHandler(start_time));
+        server->Get("/stats", MakeStatsHandler(server.get(), config));
         logging::Get()->info("  Health:  /health");
+        logging::Get()->info("  Stats:   /stats");
     }
 
     // ── Wire daemon readiness to fire after init, before event loop ──
@@ -299,12 +443,12 @@ static int HandleStart(const CliOptions& options) {
         if (sig == SignalResult::SHUTDOWN) break;
         // SIGHUP received
         if (options.daemonize) {
-            // Daemon mode: reopen log files for rotation
-            logging::Get()->info("Received SIGHUP, reopening log files");
-            if (logging::Reopen()) {
-                logging::Get()->info("Log files reopened");
+            // Daemon mode: reload configuration
+            logging::Get()->info("Received SIGHUP, reloading configuration");
+            if (ReloadConfig(options, *server, config)) {
+                logging::Get()->info("Configuration reloaded successfully");
             } else {
-                logging::Get()->warn("Log file reopen failed, continuing with old file");
+                logging::Get()->warn("Configuration reload failed, keeping current config");
             }
         } else {
             // Foreground mode: treat SIGHUP as shutdown (terminal hangup).
@@ -368,6 +512,9 @@ int main(int argc, char* argv[]) {
 
         case CliCommand::STOP:
             return HandleStop(options);
+
+        case CliCommand::RELOAD:
+            return HandleReload(options);
 
         case CliCommand::VALIDATE: {
             ServerConfig config;
