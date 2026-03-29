@@ -171,10 +171,13 @@ void ConnectionHandler::OnMessage(){
     }
 
     // After reading all available data, call the application callback if data was received.
-    // For TLS handshake completion without data: rely on the next read event to
-    // trigger the callback — avoids arming HTTP/1.x request timeout prematurely.
+    // Also fire on TLS handshake completion without data ONLY when ALPN negotiated h2,
+    // so the upper layer can send the server SETTINGS preface immediately.
+    // For HTTP/1.x, skip the empty callback to avoid arming request timeout prematurely.
+    bool alpn_h2_ready = tls_just_ready && input_bf_.Size() == 0 &&
+                         tls_ && GetAlpnProtocol() == "h2";
     bool callback_ran = false;
-    if(input_bf_.Size() > 0 && callbacks_.on_message_callback){
+    if((input_bf_.Size() > 0 || alpn_h2_ready) && callbacks_.on_message_callback){
         std::string message(input_bf_.Data(), input_bf_.Size());
         callbacks_.on_message_callback(shared_from_this(), message);
         // Update timestamp

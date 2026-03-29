@@ -113,9 +113,16 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
             }
 
             // If we just reset expired streams, keep the connection alive.
-            // The timed-out streams were RST'd; the connection remains valid
-            // for new requests. Idle timeout will reclaim if no activity.
+            // If no streams remain (deadline cleared), re-arm a safety
+            // deadline equal to request_timeout_sec so the connection doesn't
+            // stay open indefinitely when idle_timeout_sec is 0.
             if (reset > 0) {
+                if (!self->deadline_armed_ && self->request_timeout_sec_ > 0) {
+                    self->conn_->SetDeadline(
+                        std::chrono::steady_clock::now() +
+                        std::chrono::seconds(self->request_timeout_sec_));
+                    self->deadline_armed_ = true;
+                }
                 return true;
             }
 
