@@ -155,9 +155,6 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
             return;
         }
 
-        // Dispatch any complete requests from initial data
-        DispatchPendingRequests();
-
         // Send any pending frames (SETTINGS ACK, responses, etc.)
         session_->SendPendingFrames();
 
@@ -212,9 +209,6 @@ void Http2ConnectionHandler::OnRawData(
         conn_->CloseAfterWrite();
         return;
     }
-
-    // Dispatch any complete requests
-    DispatchPendingRequests();
 
     // Send pending frames (responses, WINDOW_UPDATEs, etc.)
     session_->SendPendingFrames();
@@ -293,7 +287,12 @@ void Http2ConnectionHandler::NotifyDrainComplete() {
     conn_->CloseAfterWrite();
     if (drain_complete_cb_) {
         try { drain_complete_cb_(); }
-        catch (...) {}
+        catch (const std::exception& e) {
+            logging::Get()->error("Exception in H2 drain-complete callback: {}", e.what());
+        }
+        catch (...) {
+            logging::Get()->error("Unknown exception in H2 drain-complete callback");
+        }
     }
 }
 
@@ -357,12 +356,6 @@ void Http2ConnectionHandler::OnWriteProgress(size_t remaining_bytes) {
     }
 }
 
-void Http2ConnectionHandler::DispatchPendingRequests() {
-    // No-op: request dispatch happens synchronously during ReceiveData via
-    // nghttp2's on_frame_recv_callback, which invokes the request_callback
-    // and queues the response through SubmitResponse. SendPendingFrames()
-    // called after ReceiveData flushes the queued frames.
-}
 
 void Http2ConnectionHandler::UpdateDeadline() {
     if (request_timeout_sec_ <= 0 || !session_) return;

@@ -83,10 +83,6 @@ private:
     bool resume_scheduled_ = false;  // dispatcher-thread only
     std::chrono::steady_clock::time_point last_deadline_;  // avoids redundant SetDeadline calls
 
-    // Internal: called after ReceiveData; a no-op since dispatch is
-    // synchronous inside nghttp2 callbacks.
-    void DispatchPendingRequests();
-
     // Internal: set connection deadline based on oldest incomplete stream.
     void UpdateDeadline();
 

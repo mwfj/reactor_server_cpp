@@ -349,6 +349,8 @@ static int OnFrameRecvCallback(
                                            nva_100, 1, nullptr);
                 } else {
                     // Unsupported Expect value — reject with 417.
+                    logging::Get()->warn("HTTP/2 stream {} unsupported Expect: {}",
+                                         frame->hd.stream_id, expect);
                     // submit_response2 queues the HTTP response (END_STREAM).
                     nghttp2_nv nva_417[] = {
                         {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
