@@ -438,6 +438,7 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
     if (http2_enabled_) {
         // Guard against accept/data race: if HandleMessage already ran and
         // created a handler for THIS connection, skip everything below.
+        std::shared_ptr<HttpConnectionHandler> stale_h1;
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
             auto h2_it = h2_connections_.find(conn->fd());
@@ -453,8 +454,8 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                 if (h1_it->second->GetConnection() == conn) {
                     return;  // Already initialized by HandleMessage
                 }
-                // Stale handler from fd reuse — evict
-                h1_it->second = nullptr;  // prevent WS notify on stale handler
+                // Stale handler from fd reuse — save for WS close, then evict
+                stale_h1 = std::move(h1_it->second);
                 http_connections_.erase(h1_it);
             }
             // Also clean up stale pending detection
@@ -463,6 +464,9 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                 pending_detection_.erase(pd_it);
             }
         }
+        // Notify stale WS handler outside the lock (avoids deadlock with
+        // CallCloseCb → conn_mtx_ and preserves the close notification).
+        SafeNotifyWsClose(stale_h1);
 
         // Note: TLS ALPN h2 detection cannot happen here — HandleNewConnection
         // runs before TLS handshake completes (tls_state_ == HANDSHAKE, not READY).

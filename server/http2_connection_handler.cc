@@ -290,12 +290,14 @@ void Http2ConnectionHandler::OnSendComplete() {
             auto self = weak_self.lock();
             if (!self) return;
             self->resume_scheduled_ = false;
-            if (self->session_) {
-                self->session_->ResumeOutput();
+            if (!self->session_) return;
+            self->session_->ResumeOutput();
+            // If ResumeOutput added bytes, the next OnSendComplete (buffer
+            // empty) will re-check. But if it was a no-op (mem_send2==0 and
+            // buffer already empty), no write event will fire, so check now.
+            if (self->conn_->OutputBufferSize() == 0) {
+                self->OnSendComplete();  // re-enter — resume_scheduled_ is false
             }
-            // ResumeOutput may have added bytes to output_bf_.
-            // Don't declare drain here — wait for the NEXT OnSendComplete
-            // (when those bytes actually drain to the wire).
         });
         return;
     }
