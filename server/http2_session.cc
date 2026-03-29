@@ -583,6 +583,10 @@ bool Http2Session::SendPendingFrames() {
         conn_->SendRaw(reinterpret_cast<const char*>(data),
                         static_cast<size_t>(len));
         sent_any = true;
+
+        // Stop serializing if the transport is closing — remaining frames
+        // would just be discarded, wasting CPU on aborted downloads.
+        if (conn_->IsClosing()) break;
     }
 
     // Flush deferred stream removals. OnStreamCloseCallback can fire during
