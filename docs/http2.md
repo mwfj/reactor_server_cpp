@@ -182,8 +182,13 @@ RFC 9113 constraints enforced by `ConfigLoader::Validate()`:
 
 Per RFC 9113 Section 8.2.2:
 - **Forbidden headers** rejected: `connection`, `keep-alive`, `proxy-connection`, `transfer-encoding`, `upgrade`
-- **TE header**: only `te: trailers` allowed
-- **Required pseudo-headers**: `:method` and `:path` must be present
+- **TE header**: only `te: trailers` allowed (OWS-trimmed, case-insensitive)
+- **Required pseudo-headers (non-CONNECT)**: `:method`, `:path`, and `:scheme` must be present
+- **CONNECT pseudo-headers**: `:method` + `:authority` required; `:path` and `:scheme` must NOT be present (checked by presence, not value — an explicit empty `:path` is rejected)
+- **`:authority` vs `host`**: case-insensitive hostname comparison (RFC 3986 Section 3.2.2), exact port match, IPv6 bracket-aware
+- **Trailer validation**: pseudo-headers forbidden; `content-length`, `host`, `authorization`, `content-type`, `content-encoding`, `content-range`, and connection-specific headers rejected per RFC 9110 Section 6.5.1
+- **1xx responses**: all `status < 200` rejected from app-facing `SubmitResponse()` with RST_STREAM(INTERNAL_ERROR); internal 100-continue uses `nghttp2_submit_headers` directly
+- **Unsupported Expect**: rejected with 417 response + RST_STREAM(NO_ERROR) when client side is still open (no END_STREAM on request); clean 417 without RST when request already ended
 - **Body size limits** enforced per-stream via RST_STREAM(CANCEL)
 
 ### TLS Requirements
@@ -198,19 +203,28 @@ For h2 over TLS:
 ```
 HttpServer::Stop()
   1. Existing HTTP/1.x + WS shutdown (WS Close 1001)
-  2. For each HTTP/2 connection:
-     → Install DrainCompleteCallback
+  2. StopAccepting() — close listen socket, barrier for in-flight accepts
+  3. For each HTTP/2 connection:
+     → Install DrainCompleteCallback (under drain_mtx_)
      → RequestShutdown() → enqueues dispatcher-thread task via RunOnDispatcher
      → On dispatcher: sends GOAWAY(NO_ERROR) via nghttp2
-     → New streams refused, existing streams drain with full flow control
-     → NotifyDrainComplete() when ActiveStreamCount() == 0
-  3. NetServer skips draining H2 connections in its CloseAfterWrite sweep
-  4. WaitForH2Drain() blocks until all drain or shutdown_drain_timeout_sec expires
-  5. Timeout: ForceClose remaining connections
-  6. Second drain barrier covers final H2 CloseAfterWrite tasks
+     → If deferred output (backpressure), ResumeOutput() before CloseAfterWrite
+     → New streams refused (IsGoawaySent || owner shutdown), existing drain
+     → NotifyDrainComplete() when ActiveStreamCount() == 0 AND
+       output buffer empty AND no deferred nghttp2 frames AND !WantWrite()
+     → Re-check after RequestShutdown: if connection closed during setup,
+       OnH2DrainComplete removes stale entry from drain set
+  4. NetServer skips draining H2 connections in its CloseAfterWrite sweep
+  5. WaitForH2Drain() blocks until all drain or shutdown_drain_timeout_sec expires
+  6. Timeout: ForceClose remaining connections
+  7. Second drain barrier covers final H2 CloseAfterWrite tasks
 ```
 
 The shutdown is fully graceful: GOAWAY carries `last_stream_id` so clients know which requests to retry, active streams drain with full flow control (WINDOW_UPDATE still processed), and the nghttp2 session is only touched on its dispatcher thread (no cross-thread mutation). A configurable `shutdown_drain_timeout_sec` (default 30s) bounds the wait.
+
+**Drain-complete is transport-level:** `NotifyDrainComplete()` only fires from `OnSendComplete()` when the transport output buffer is empty (bytes on the wire), not just when nghttp2 has serialized the frames. If `ResumeOutput()` adds bytes but the buffer was already empty and no write event follows, `OnSendComplete` re-enters to check drain eligibility.
+
+**Shutdown vs peer half-close:** `IsCloseDeferred()` (set on both server shutdown and peer EOF) is NOT used to reject new streams or skip H2 initialization. Only `IsGoawaySent()` and the owner's `IsShutdownRequested()` flag (with `!IsInitializing()` guard) reject new streams. This ensures requests arriving with a peer FIN in the same read batch are still serviced.
 
 If `Stop()` is called from a dispatcher thread (e.g., a request handler calling `HttpServer::Stop()`), the H2 drain wait is skipped to avoid deadlock. A warning is logged. This matches the existing `ThreadPool::Stop()` self-stop safety pattern.
 
@@ -235,13 +249,25 @@ HTTP/2 request timeouts are enforced per-stream via `request_timeout_sec`:
 
 - Each stream's creation time is tracked. The connection deadline is set to `oldest_incomplete_start + request_timeout_sec`.
 - When the deadline fires, only the expired stream(s) are RST'd (`RST_STREAM(CANCEL)`). Healthy streams on the same connection are unaffected.
-- The `DeadlineTimeoutCb` returns `true` (keep connection alive) after RST'ing expired streams and re-arming the deadline for remaining ones.
-- Once all incomplete streams are resolved, the deadline is cleared and `idle_timeout` governs.
+- The `DeadlineTimeoutCb` returns `true` (keep connection alive) after RST'ing expired streams.
+- **Safety deadline for idle_timeout_sec=0:** After resetting all streams, if no active streams remain and `idle_timeout_sec` is disabled, a safety deadline of `request_timeout_sec` is armed to prevent the connection from staying open forever. This only fires when the connection is truly idle (no active streams) — it never tears down healthy sibling streams.
+- Rejected streams (e.g. 417 half-open) are included in both deadline calculation and `ResetExpiredStreams`, ensuring they don't escape timeout enforcement or consume `max_concurrent_streams` slots indefinitely.
+- Once all incomplete/rejected streams are resolved, the deadline is cleared and `idle_timeout` governs.
 - New streams cannot extend the deadline for older stalled streams (the deadline always reflects the oldest incomplete stream).
+
+### Handshake + Request Timeout
+
+For TLS connections, the total timeout exposure is up to `2 x request_timeout_sec`: one window for the TLS handshake + protocol detection, and a separate window for the first HTTP request. This is intentional — separating handshake and request timeouts is standard (cf. nginx `ssl_handshake_timeout` vs `client_header_timeout`). The handshake deadline is set in `HandleNewConnection` and reset by the protocol handler once it takes over.
 
 ## Output Backpressure
 
-`SendPendingFrames()` stops pulling frames from nghttp2 when the transport output buffer exceeds a high watermark (`max(128KB, max_frame_size)`). At least one frame is always pulled per call so control frames (SETTINGS ACK, GOAWAY) are never blocked. When the buffer drains to zero, `OnSendComplete()` schedules async resume via `RunOnDispatcher()`. This bounds per-connection output buffering and prevents slow peers from causing unbounded memory growth.
+`SendPendingFrames()` stops pulling frames from nghttp2 when the transport output buffer exceeds a high watermark (`max(128KB, max_frame_size)`). At least one frame is always pulled per call so control frames (SETTINGS ACK, GOAWAY) from the current `ReceiveData` call are delivered. Once `output_deferred_` is set, subsequent calls return immediately until `ResumeOutput()` clears the flag. This bounds per-connection output buffering and prevents slow peers from causing unbounded memory growth.
+
+Resume happens at two points:
+- **`OnSendComplete()`** (buffer drains to zero): schedules async resume via `RunOnDispatcher()`.
+- **`OnWriteProgress()`** (partial write, buffer below watermark): resumes deferred output at the low watermark so multiplexed streams make progress without waiting for full drain. Uses a `write_progress_callback` fired from `ConnectionHandler::CallWriteCb()` after each successful partial write.
+
+If the connection is closing (`IsClosing()`), `SendPendingFrames` breaks the loop early to avoid wasting CPU serializing frames for a disconnected peer.
 
 ## Limitations
 
@@ -249,6 +275,8 @@ HTTP/2 request timeouts are enforced per-stream via `request_timeout_sec`:
 - No WebSocket-over-HTTP/2 (Extended CONNECT, RFC 8441)
 - No HTTP/2 priority tree optimization (nghttp2 handles basic priority)
 - No manual flow control (nghttp2 automatic mode)
+- No non-final 1xx API for app handlers (103 Early Hints requires internal submit_headers; SubmitResponse rejects all `status < 200`)
+- Default-port authority normalization deferred (e.g. `example.com` vs `example.com:80` treated as different)
 
 ## Third-Party Dependency
 
