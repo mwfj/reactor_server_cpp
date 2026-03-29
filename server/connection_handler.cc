@@ -655,7 +655,12 @@ void ConnectionHandler::CallWriteCb(){
         // Only refresh when close_after_write_ is set (close-drain deadline),
         // NOT for request deadlines (Slowloris protection) which should be absolute.
         if (has_deadline_ && close_after_write_.load(std::memory_order_acquire)) {
-            deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            // Extend the drain deadline to prevent force-close mid-transfer,
+            // but never shorten a tighter deadline (e.g. WS 5s close timeout).
+            auto new_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            if (new_deadline > deadline_) {
+                deadline_ = new_deadline;
+            }
         }
     }
 

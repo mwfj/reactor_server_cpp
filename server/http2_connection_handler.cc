@@ -230,11 +230,18 @@ void Http2ConnectionHandler::OnRawData(
     }
 
     // During shutdown drain: when all streams complete, start flushing.
-    // NotifyDrainComplete is deferred to OnSendComplete (buffer drained
-    // to zero) so the drain set isn't released until bytes are on the wire.
+    // If deferred output exists, resume it first — CloseAfterWrite skips
+    // complete_callback so OnSendComplete would never fire to pull remaining
+    // frames. Only close once nghttp2 has no more deferred output.
     if (shutdown_requested_.load(std::memory_order_acquire) &&
         session_->ActiveStreamCount() == 0 && !drain_notified_) {
-        conn_->CloseAfterWrite();
+        if (session_->HasDeferredOutput()) {
+            session_->ResumeOutput();
+        }
+        if (!session_->HasDeferredOutput()) {
+            conn_->CloseAfterWrite();
+        }
+        // else: still deferred — OnSendComplete/OnWriteProgress will retry
     }
 }
 

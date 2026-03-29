@@ -59,9 +59,15 @@ static int OnBeginHeadersCallback(
         // Also check owner's shutdown_requested_ for the race window where
         // the atomic flag is set but GOAWAY hasn't been submitted yet.
         auto owner = self->Owner();
+        // During Initialize (initializing_), don't reject streams based on
+        // owner's shutdown flag — the initial_data contains pre-shutdown
+        // requests that should be processed. The shutdown replay at the end
+        // of Initialize sends GOAWAY after those requests are dispatched.
+        bool owner_shutting_down = owner && owner->IsShutdownRequested()
+                                   && !owner->IsInitializing();
         bool shutdown_in_progress = self->IsGoawaySent() ||
             self->GetConnection()->IsCloseDeferred() ||
-            (owner && owner->IsShutdownRequested());
+            owner_shutting_down;
         if (shutdown_in_progress) {
             nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                       frame->hd.stream_id, NGHTTP2_REFUSED_STREAM);

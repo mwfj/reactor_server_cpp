@@ -57,6 +57,9 @@ public:
     // Check if session is still active
     bool IsAlive() const { return session_ && session_->IsAlive(); }
 
+    // True during Initialize() — suppresses premature shutdown rejection
+    bool IsInitializing() const { return initializing_; }
+
     // Check if shutdown was requested (atomic, safe from any thread)
     bool IsShutdownRequested() const {
         return shutdown_requested_.load(std::memory_order_acquire);
