@@ -112,6 +112,11 @@ public:
     // streams. Returns time_point::max() if no incomplete streams exist.
     std::chrono::steady_clock::time_point OldestIncompleteStreamStart() const;
 
+    // Returns true if any rejected (e.g. 417) streams are still open (not yet
+    // RST'd by ResetExpiredStreams). Used to decide whether the timeout callback
+    // should let idle timeout proceed rather than keeping the connection alive.
+    bool HasRejectedOpenStreams() const;
+
     // RST_STREAM all incomplete streams that have exceeded the given timeout.
     // Returns the number of streams reset. Caller should call SendPendingFrames()
     // and UpdateDeadline() after this.

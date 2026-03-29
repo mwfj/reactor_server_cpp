@@ -112,12 +112,18 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
                 return true;
             }
 
-            // If we just reset expired streams, keep the connection alive —
-            // this was a request-timeout (not idle timeout). The timed-out
-            // stream was RST'd; the connection remains usable for new requests
-            // or has draining responses. idle_timeout will reclaim if needed.
+            // If we just reset expired streams and truly incomplete streams
+            // remain, keep alive (connection is still processing requests).
+            // But if only rejected streams were reset (no incomplete left),
+            // return false to let idle timeout proceed — rejected half-open
+            // streams should not suppress a shorter idle timeout.
             if (reset > 0) {
-                return true;
+                if (self->session_->IncompleteStreamCount() > 0 ||
+                    self->session_->ActiveStreamCount() > 0) {
+                    return true;
+                }
+                // Only rejected streams were reset — let idle timeout proceed
+                return false;
             }
 
             // deadline_armed_ reflects whether incomplete streams exist.
@@ -357,8 +363,14 @@ void Http2ConnectionHandler::UpdateDeadline() {
             deadline_armed_ = true;
             last_deadline_ = deadline;
         }
+    } else if (session_->HasRejectedOpenStreams()) {
+        // No truly incomplete streams, but rejected half-open streams exist
+        // (e.g. 417). Keep deadline armed so ResetExpiredStreams can RST them.
+        // Don't update the deadline value — let the existing one fire.
+        // The timeout callback returns false for these, allowing idle timeout
+        // to proceed if it's shorter than request_timeout_sec.
     } else if (deadline_armed_ && session_->LastStreamId() > 0) {
-        // No incomplete streams and streams were seen — idle keep-alive
+        // No incomplete or rejected streams and streams were seen — idle keep-alive
         conn_->ClearDeadline();
         deadline_armed_ = false;
     }
