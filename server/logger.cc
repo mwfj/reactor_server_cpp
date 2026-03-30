@@ -29,6 +29,7 @@ static std::string g_log_dir;        // Directory (e.g., "logs")
 static std::string g_log_prefix;     // Filename prefix (e.g., "reactor")
 static std::string g_log_extension;  // Extension including dot (e.g., ".log")
 static std::string g_current_file_path;  // Currently open file path with date+seq
+static std::string g_current_log_date;  // Date string ("YYYY-MM-DD") of the current log file
 
 static constexpr const char* LOG_PATTERN = "[%Y-%m-%d %H:%M:%S.%e] [%n] [%^%l%$] %v";
 static constexpr size_t DATE_BUF_SIZE = 16;
@@ -153,21 +154,42 @@ static std::string ResolveLogPath(const std::string& dir, const std::string& pre
 
 // ── File pruning ────────────────────────────────────────────────────
 
-// Prune old log files for today's date if count exceeds g_max_files.
+// Prune old log files across ALL dates if total count exceeds g_max_files.
+// Scans for {prefix}-*{ext} to find all rotated files, sorts by name
+// (date+seq lexicographic order), and deletes the oldest.
 // Caller must hold g_logger_mtx.
 static void PruneOldFiles() {
     if (g_max_files <= 0 || g_log_dir.empty() || g_log_prefix.empty()) return;
 
-    std::string today = TodayDateString();
-    auto files = ScanDateFiles(g_log_dir, g_log_prefix, today, g_log_extension);
+    std::string name_prefix = g_log_prefix + "-";
 
-    // Delete oldest files (lowest seq) if count exceeds max_files.
+    // Collect all files matching {prefix}-*{ext} (any date)
+    std::vector<std::string> files;
+    DIR* d = opendir(g_log_dir.c_str());
+    if (!d) return;
+    struct dirent* entry;
+    while ((entry = readdir(d)) != nullptr) {
+        std::string name(entry->d_name);
+        if (name.find(name_prefix) != 0) continue;
+        if (!g_log_extension.empty()) {
+            if (name.size() < g_log_extension.size()) continue;
+            if (name.substr(name.size() - g_log_extension.size()) != g_log_extension) continue;
+        }
+        files.push_back(g_log_dir + "/" + name);
+    }
+    closedir(d);
+
+    // Sort lexicographically — date-based naming ensures chronological order
+    // ("reactor-2026-03-29.log" < "reactor-2026-03-30.log" < "reactor-2026-03-30-1.log")
+    std::sort(files.begin(), files.end());
+
+    // Delete oldest files if total count exceeds max_files.
     // Skip the current file — compensate by deleting the next oldest instead.
     int to_delete = static_cast<int>(files.size()) - g_max_files;
     size_t idx = 0;
     while (to_delete > 0 && idx < files.size()) {
-        if (files[idx].second != g_current_file_path) {
-            std::remove(files[idx].second.c_str());
+        if (files[idx] != g_current_file_path) {
+            std::remove(files[idx].c_str());
             --to_delete;
         }
         ++idx;
@@ -193,8 +215,10 @@ static std::vector<spdlog::sink_ptr> BuildSinksAndPrune(spdlog::level::level_enu
             // external logrotate. logrotate renames the file, SIGHUP triggers
             // Reopen() which creates a fresh sink at the original path.
             g_current_file_path = g_log_file;
+            g_current_log_date.clear();
         } else {
             // Date-based rotation mode: resolve today's date-based path
+            g_current_log_date = TodayDateString();
             g_current_file_path = ResolveLogPath(g_log_dir, g_log_prefix,
                                                   g_log_extension, g_max_size);
         }
@@ -241,9 +265,15 @@ void Init(const std::string& name,
     g_max_size = max_size;
     g_max_files = max_files;
 
-    // Decompose log path for date-based naming
+    // Decompose log path for date-based naming and ensure directory exists
     if (!g_log_file.empty()) {
         ParseLogPath(g_log_file, g_log_dir, g_log_prefix, g_log_extension);
+        if (!g_log_dir.empty() && g_log_dir != ".") {
+            // EnsureLogDir is a pure utility (no global state) — safe under lock.
+            // This ensures HttpServer and other direct Init() callers don't fail
+            // on a missing log directory.
+            EnsureLogDir(g_log_dir);
+        }
     } else {
         g_log_dir.clear();
         g_log_prefix.clear();
@@ -298,6 +328,7 @@ void Shutdown() {
     g_log_prefix.clear();
     g_log_extension.clear();
     g_current_file_path.clear();
+    g_current_log_date.clear();
 }
 
 spdlog::level::level_enum ParseLevel(const std::string& level) {
@@ -339,10 +370,10 @@ void CheckRotation() {
 
     bool needs_rotate = false;
 
-    // Check date rollover: if today's date differs from the date in the
-    // current file path, rotate to a new day's file regardless of size.
+    // Check date rollover: if today's date differs from the tracked log
+    // date, rotate to a new day's file regardless of size.
     std::string today = TodayDateString();
-    if (g_current_file_path.find(today) == std::string::npos) {
+    if (today != g_current_log_date) {
         needs_rotate = true;
     }
 

@@ -1739,7 +1739,7 @@ void TestValidateDaemonRejectsRelativePidPath() {
 //   EnsureLogDir  — creates missing log directories, rejects path-is-file
 //   Date-based naming — Init() creates {prefix}-{YYYY-MM-DD}.log
 //   CheckRotation — rotates to a new seq file when size limit is exceeded
-//   WriteMarker   — writes a visual "==== TEXT [timestamp] ====" marker
+//   WriteMarker   — writes a visual "==== TEXT ====" marker
 //   SanitizePath  — strips query params and fragment from URL paths
 //   Append-on-restart — re-Init with the same path appends, not truncates
 //
@@ -1972,13 +1972,11 @@ void TestCheckRotation() {
 }
 
 // Test 53: WriteMarker() writes a line containing the standard visual separator
-// pattern "================================ TEXT [timestamp] ================================".
+// pattern "================================ TEXT ================================".
+// (spdlog's log pattern prepends its own timestamp to each line.)
 //
 // Validates:
-//   - The marker line contains the "===…" prefix
-//   - The marker line contains the provided text
-//   - The marker line contains a timestamp in brackets ("]")
-//   - The marker line contains the "===…" suffix
+//   - The full marker pattern "==== TEXT ====" appears in the log file
 void TestWriteMarker() {
     std::cout << "\n[TEST] Logger: WriteMarker writes visual separator to log file..." << std::endl;
 

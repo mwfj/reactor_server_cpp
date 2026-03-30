@@ -313,7 +313,7 @@ static int HandleStart(const CliOptions& options) {
     while (true) {
         SignalResult sig = SignalHandler::WaitForSignal();
         if (sig == SignalResult::SHUTDOWN) break;
-        // Check log file size rotation on each signal
+        // Belt-and-suspenders rotation check (primary is Dispatcher::TimerHandler)
         logging::CheckRotation();
         // SIGHUP received
         if (options.daemonize) {
