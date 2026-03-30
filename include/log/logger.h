@@ -17,7 +17,9 @@ namespace logging {
 //                   {dir}/{prefix}-{YYYY-MM-DD}[-{seq}].log
 //                 When max_files <= 1: the path is used as-is (no date suffix),
 //                   compatible with external logrotate + SIGHUP → Reopen().
-// @param max_size Maximum size of each log file in bytes (default: 10MB)
+// @param max_size Approximate maximum size per log file in bytes (default: 10MB).
+//                 Checked periodically by CheckRotation(), not on every write.
+//                 Files may briefly exceed this between checks.
 // @param max_files Maximum total log files to keep (default: 3).
 //                 Oldest files (across all dates) are pruned when exceeded.
 //                 Set to 1 for external logrotate compatibility (no auto-rotation).
