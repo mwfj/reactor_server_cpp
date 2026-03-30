@@ -15,6 +15,76 @@ struct RequestGuard {
     RequestGuard& operator=(const RequestGuard&) = delete;
 };
 
+int HttpServer::ComputeTimerInterval(int idle_timeout_sec, int request_timeout_sec) {
+    int idle_iv = idle_timeout_sec > 0
+        ? std::max(idle_timeout_sec / 6, 1) : 0;
+    int req_iv = request_timeout_sec > 0
+        ? std::max(request_timeout_sec / 3, 1) : 0;
+    // Both user timeouts disabled, but protocol-level deadlines (WS close
+    // handshake 5s, HTTP close-drain 30s) still need the timer scan.
+    if (idle_iv == 0 && req_iv == 0) return 5;
+    if (idle_iv == 0) return req_iv;
+    if (req_iv == 0) return idle_iv;
+    return std::min(idle_iv, req_iv);
+}
+
+void HttpServer::MarkServerReady() {
+    start_time_ = std::chrono::steady_clock::now();
+    server_ready_.store(true, std::memory_order_release);
+}
+
+void HttpServer::CompensateH2Streams(
+    const std::shared_ptr<Http2ConnectionHandler>& h2) {
+    if (!h2) return;
+    int64_t unclosed = h2->LocalStreamCount();
+    if (unclosed > 0) {
+        active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
+    }
+}
+
+void HttpServer::RemoveConnection(std::shared_ptr<ConnectionHandler> conn) {
+    std::shared_ptr<HttpConnectionHandler> http_conn;
+    std::shared_ptr<Http2ConnectionHandler> h2_handler;
+    bool was_h2 = false;
+    bool was_tracked = false;
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        auto pd_it = pending_detection_.find(conn->fd());
+        if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
+            pending_detection_.erase(pd_it);
+            was_tracked = true;
+        }
+        auto h2_it = h2_connections_.find(conn->fd());
+        if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
+            h2_handler = h2_it->second;
+            h2_connections_.erase(h2_it);
+            was_h2 = true;
+            was_tracked = true;
+        }
+        if (!was_h2) {
+            auto it = http_connections_.find(conn->fd());
+            if (it != http_connections_.end() && it->second->GetConnection() == conn) {
+                http_conn = it->second;
+                http_connections_.erase(it);
+                was_tracked = true;
+            }
+        }
+    }
+    if (was_tracked) {
+        active_connections_.fetch_sub(1, std::memory_order_relaxed);
+    }
+    if (was_h2) {
+        active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
+        CompensateH2Streams(h2_handler);
+        OnH2DrainComplete(conn.get());
+        return;
+    }
+    if (http_conn) {
+        active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+    }
+    SafeNotifyWsClose(http_conn);
+}
+
 void HttpServer::WireNetServerCallbacks() {
     net_server_.SetNewConnectionCb(
         [this](std::shared_ptr<ConnectionHandler> conn) { HandleNewConnection(conn); });
@@ -95,12 +165,7 @@ HttpServer::HttpServer(const std::string& ip, int port)
 {
     WireNetServerCallbacks();
     resolved_worker_threads_ = net_server_.GetWorkerCount();
-    // Default ready callback — sets server_ready_ and start_time_.
-    // SetReadyCallback() wraps any user callback on top of this.
-    net_server_.SetReadyCallback([this]() {
-        start_time_ = std::chrono::steady_clock::now();
-        server_ready_.store(true, std::memory_order_release);
-    });
+    net_server_.SetReadyCallback([this]() { MarkServerReady(); });
     // Apply the same defaults as the config constructor — must match ServerConfig defaults.
     net_server_.SetMaxConnections(ServerConfig{}.max_connections);
     net_server_.SetMaxInputSize(ComputeInputCap());
@@ -114,23 +179,8 @@ static const ServerConfig& ValidateConfig(const ServerConfig& config) {
 
 HttpServer::HttpServer(const ServerConfig& config)
     : net_server_(ValidateConfig(config).bind_host, static_cast<size_t>(config.bind_port),
-                  // Timer scan interval: must be frequent enough to enforce BOTH timeouts.
-                  // Use the smaller of (idle/6) and (request/3), with 1s floor.
-                  // If either timeout is 0 (disabled), use the other for the calculation.
-                  [&]() -> int {
-                      int idle_interval = config.idle_timeout_sec > 0
-                          ? std::max(config.idle_timeout_sec / 6, 1) : 0;
-                      int req_interval = config.request_timeout_sec > 0
-                          ? std::max(config.request_timeout_sec / 3, 1) : 0;
-                      // Both user timeouts disabled, but protocol-level deadlines
-                      // (WS close handshake 5s, HTTP close-drain 30s) still need
-                      // the timer scan to enforce them. Use 5s to match the
-                      // shortest protocol deadline.
-                      if (idle_interval == 0 && req_interval == 0) return 5;
-                      if (idle_interval == 0) return req_interval;
-                      if (req_interval == 0) return idle_interval;
-                      return std::min(idle_interval, req_interval);
-                  }(),
+                  ComputeTimerInterval(config.idle_timeout_sec,
+                                       config.request_timeout_sec),
                   // Pass idle_timeout_sec directly — 0 means disabled.
                   // ConnectionHandler::IsTimeOut handles duration==0 by skipping idle check.
                   std::chrono::seconds(config.idle_timeout_sec),
@@ -138,12 +188,7 @@ HttpServer::HttpServer(const ServerConfig& config)
 {
     WireNetServerCallbacks();
     resolved_worker_threads_ = net_server_.GetWorkerCount();
-    // Default ready callback — sets server_ready_ and start_time_.
-    // SetReadyCallback() wraps any user callback on top of this.
-    net_server_.SetReadyCallback([this]() {
-        start_time_ = std::chrono::steady_clock::now();
-        server_ready_.store(true, std::memory_order_release);
-    });
+    net_server_.SetReadyCallback([this]() { MarkServerReady(); });
 
     // Initialize logging from config
     logging::Init("reactor", logging::ParseLevel(config.log.level),
@@ -241,8 +286,7 @@ void HttpServer::Start() {
 
 void HttpServer::SetReadyCallback(std::function<void()> cb) {
     net_server_.SetReadyCallback([this, user_cb = std::move(cb)]() {
-        start_time_ = std::chrono::steady_clock::now();
-        server_ready_.store(true, std::memory_order_release);
+        MarkServerReady();
         if (user_cb) user_cb();
     });
 }
@@ -540,13 +584,7 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         if (stale_h2) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
             active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
-            // Compensate for open streams on the evicted session.
-            // Uses the handler's atomic local_stream_count_ (thread-safe)
-            // instead of reading session containers from the wrong thread.
-            int64_t unclosed = stale_h2->LocalStreamCount();
-            if (unclosed > 0) {
-                active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
-            }
+            CompensateH2Streams(stale_h2);
         }
         if (stale_h1) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
@@ -610,111 +648,12 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
 
 void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->debug("HTTP connection closed fd={}", conn->fd());
-
-    // Single lock: check pending_detection_, H2, and HTTP/1.x maps.
-    // Only decrement active_connections_ if found in a map — prevents underflow
-    // when HandleCloseConnection fires for connections that HandleNewConnection
-    // never counted (e.g., RegisterCallbacks failure, IsClosing early return).
-    std::shared_ptr<HttpConnectionHandler> http_conn;
-    std::shared_ptr<Http2ConnectionHandler> h2_handler;
-    bool was_h2 = false;
-    bool was_tracked = false;
-    {
-        std::lock_guard<std::mutex> lck(conn_mtx_);
-        auto pd_it = pending_detection_.find(conn->fd());
-        if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
-            pending_detection_.erase(pd_it);
-            was_tracked = true;
-        }
-        auto h2_it = h2_connections_.find(conn->fd());
-        if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
-            h2_handler = h2_it->second;  // save for stream count compensation
-            h2_connections_.erase(h2_it);
-            was_h2 = true;
-            was_tracked = true;
-        }
-        if (!was_h2) {
-            auto it = http_connections_.find(conn->fd());
-            if (it != http_connections_.end() && it->second->GetConnection() == conn) {
-                http_conn = it->second;
-                http_connections_.erase(it);
-                was_tracked = true;
-            }
-        }
-    }
-    if (was_tracked) {
-        active_connections_.fetch_sub(1, std::memory_order_relaxed);
-    }
-    // Outside lock: notify drain set and WS close handler
-    if (was_h2) {
-        active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
-        // Compensate active_h2_streams_ for streams whose close callback has
-        // NOT yet fired. Uses the handler's atomic local_stream_count_ which
-        // is always safe to read from any thread.
-        if (h2_handler) {
-            int64_t unclosed = h2_handler->LocalStreamCount();
-            if (unclosed > 0) {
-                active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
-            }
-        }
-        OnH2DrainComplete(conn.get());
-        return;
-    }
-    if (http_conn) {
-        active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
-    }
-    SafeNotifyWsClose(http_conn);
+    RemoveConnection(conn);
 }
 
 void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->error("HTTP connection error fd={}", conn->fd());
-
-    // Same map-based tracking as HandleCloseConnection — see comment there.
-    std::shared_ptr<HttpConnectionHandler> http_conn;
-    std::shared_ptr<Http2ConnectionHandler> h2_handler;
-    bool was_h2 = false;
-    bool was_tracked = false;
-    {
-        std::lock_guard<std::mutex> lck(conn_mtx_);
-        auto pd_it = pending_detection_.find(conn->fd());
-        if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
-            pending_detection_.erase(pd_it);
-            was_tracked = true;
-        }
-        auto h2_it = h2_connections_.find(conn->fd());
-        if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
-            h2_handler = h2_it->second;
-            h2_connections_.erase(h2_it);
-            was_h2 = true;
-            was_tracked = true;
-        }
-        if (!was_h2) {
-            auto it = http_connections_.find(conn->fd());
-            if (it != http_connections_.end() && it->second->GetConnection() == conn) {
-                http_conn = it->second;
-                http_connections_.erase(it);
-                was_tracked = true;
-            }
-        }
-    }
-    if (was_tracked) {
-        active_connections_.fetch_sub(1, std::memory_order_relaxed);
-    }
-    if (was_h2) {
-        active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
-        if (h2_handler) {
-            int64_t unclosed = h2_handler->LocalStreamCount();
-            if (unclosed > 0) {
-                active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
-            }
-        }
-        OnH2DrainComplete(conn.get());
-        return;
-    }
-    if (http_conn) {
-        active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
-    }
-    SafeNotifyWsClose(http_conn);
+    RemoveConnection(conn);
 }
 
 void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message) {
@@ -751,10 +690,7 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
     if (evicted_stale_h2) {
         active_connections_.fetch_sub(1, std::memory_order_relaxed);
         active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
-        int64_t unclosed = evicted_stale_h2->LocalStreamCount();
-        if (unclosed > 0) {
-            active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
-        }
+        CompensateH2Streams(evicted_stale_h2);
     }
 
     if (h2_conn) {
@@ -1006,20 +942,10 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
 
     // Recompute timer scan interval. Only shorten, never lengthen — existing
     // connections keep their old per-connection deadlines and must be scanned
-    // at least as frequently as before. Without this floor, reloading
-    // request_timeout upward (30s→300s) would stretch the scan from 10s to
-    // 100s, letting pre-reload 30s deadlines overshoot.
+    // at least as frequently as before.
     {
-        int idle_iv = new_config.idle_timeout_sec > 0
-            ? std::max(new_config.idle_timeout_sec / 6, 1) : 0;
-        int req_iv = new_config.request_timeout_sec > 0
-            ? std::max(new_config.request_timeout_sec / 3, 1) : 0;
-        int new_scan;
-        if (idle_iv == 0 && req_iv == 0) new_scan = 5;
-        else if (idle_iv == 0) new_scan = req_iv;
-        else if (req_iv == 0) new_scan = idle_iv;
-        else new_scan = std::min(idle_iv, req_iv);
-        // Never lengthen past current cadence
+        int new_scan = ComputeTimerInterval(new_config.idle_timeout_sec,
+                                            new_config.request_timeout_sec);
         int cur_scan = net_server_.GetTimerInterval();
         net_server_.SetTimerInterval(
             cur_scan > 0 ? std::min(new_scan, cur_scan) : new_scan);
@@ -1050,7 +976,9 @@ HttpServer::ServerStats HttpServer::GetStats() const {
     stats.active_connections      = active_connections_.load(std::memory_order_relaxed);
     stats.active_http1_connections = active_http1_connections_.load(std::memory_order_relaxed);
     stats.active_http2_connections = active_http2_connections_.load(std::memory_order_relaxed);
-    stats.active_h2_streams       = active_h2_streams_.load(std::memory_order_relaxed);
+    // Clamp to 0 — compensation/close-callback races can briefly drive negative
+    stats.active_h2_streams       = std::max<int64_t>(0,
+        active_h2_streams_.load(std::memory_order_relaxed));
     stats.total_accepted          = total_accepted_.load(std::memory_order_relaxed);
     stats.total_requests          = total_requests_.load(std::memory_order_relaxed);
     stats.active_requests         = active_requests_.load(std::memory_order_relaxed);

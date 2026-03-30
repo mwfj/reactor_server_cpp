@@ -74,6 +74,9 @@ public:
     // Used by daemon mode to signal readiness to the parent process.
     void SetReadyCallback(std::function<void()> cb);
 
+    // True after Start() finishes building dispatchers and ready callback fires.
+    bool IsReady() const { return server_ready_.load(std::memory_order_acquire); }
+
 private:
     NetServer net_server_;
     HttpRouter router_;
@@ -94,6 +97,20 @@ private:
     // Safe WS transport-close notification: null-check, exception-safe, log errors.
     // Must be called OUTSIDE conn_mtx_ to prevent deadlock.
     void SafeNotifyWsClose(const std::shared_ptr<HttpConnectionHandler>& http_conn);
+
+    // Compute timer scan interval from timeout values.
+    static int ComputeTimerInterval(int idle_timeout_sec, int request_timeout_sec);
+
+    // Set start_time_ and server_ready_ flag. Called by the ready callback.
+    void MarkServerReady();
+
+    // Subtract remaining stream count from active_h2_streams_.
+    void CompensateH2Streams(const std::shared_ptr<Http2ConnectionHandler>& h2);
+
+    // Shared implementation for HandleCloseConnection/HandleErrorConnection.
+    // Removes the connection from all maps, decrements counters, and notifies
+    // drain/WS handlers. Must be called with conn_mtx_ NOT held.
+    void RemoveConnection(std::shared_ptr<ConnectionHandler> conn);
 
     std::shared_ptr<TlsContext> tls_ctx_;  // Shared with NetServer for safe lifetime
 

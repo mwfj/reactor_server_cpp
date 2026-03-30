@@ -944,39 +944,8 @@ void TestConfigUnsetCliDoesNotRevertEnv() {
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Signal test helper ────────────────────────────────────────────────────────
 
-// Drain any pending signals and safely restore default dispositions.
-// Must be called AFTER Cleanup() (which sets SIG_IGN + unblocks) and
-// AFTER the waiter thread is joined. Without this, a late safety-kill()
-// could arrive after SIG_DFL is restored, terminating the test process.
-static void DrainAndRestoreSignals() {
-    sigset_t drain_set;
-    sigemptyset(&drain_set);
-    sigaddset(&drain_set, SIGTERM);
-    sigaddset(&drain_set, SIGINT);
-    sigaddset(&drain_set, SIGHUP);
-    pthread_sigmask(SIG_BLOCK, &drain_set, nullptr);
-
-#if defined(__linux__)
-    struct timespec zero_timeout = {0, 0};
-    while (sigtimedwait(&drain_set, nullptr, &zero_timeout) > 0) {}
-#else
-    // macOS/BSD: sigtimedwait doesn't exist. Use sigpending + sigwait loop.
-    sigset_t pending;
-    while (sigpending(&pending) == 0) {
-        bool any = sigismember(&pending, SIGTERM) ||
-                   sigismember(&pending, SIGINT) ||
-                   sigismember(&pending, SIGHUP);
-        if (!any) break;
-        int sig;
-        sigwait(&drain_set, &sig);
-    }
-#endif
-
-    signal(SIGTERM, SIG_DFL);
-    signal(SIGINT, SIG_DFL);
-    signal(SIGHUP, SIG_DFL);
-    pthread_sigmask(SIG_UNBLOCK, &drain_set, nullptr);
-}
+// DrainAndRestoreSignals() removed — its logic is now inside
+// SignalHandler::Cleanup(CleanupMode::RESTORE).
 
 // SECTION 4: SignalHandler Tests (30–31)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -987,7 +956,7 @@ void TestSignalHandlerInstallAndCleanup() {
     std::cout << "\n[TEST] SignalHandler: Install and Cleanup succeeds..." << std::endl;
     try {
         SignalHandler::Install();
-        SignalHandler::Cleanup();
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
 
         // Restore default disposition — Cleanup() sets SIG_IGN before unblocking.
         // Without this, subsequent sigwait()-based tests hang on macOS/BSD
@@ -1056,14 +1025,14 @@ void TestSignalHandlerSigwaitUnblock() {
         std::string err = pass ? "" : "WaitForShutdown did not unblock within 500ms after SIGTERM";
 
         // Always cleanup (safe to call again: guards against double-close)
-        SignalHandler::Cleanup();
-        DrainAndRestoreSignals();
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+        // Drain+restore now handled by Cleanup(RESTORE) above
 
         TestFramework::RecordTest("SignalHandler: SIGTERM unblocks WaitForShutdown",
                                   pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
-        SignalHandler::Cleanup();
-        DrainAndRestoreSignals();
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+        // Drain+restore now handled by Cleanup(RESTORE) above
         TestFramework::RecordTest("SignalHandler: SIGTERM unblocks WaitForShutdown",
                                   false, e.what(), CLI_CATEGORY);
     }
@@ -1355,14 +1324,14 @@ void TestWaitForSignalSIGTERM() {
                 err = "Expected SHUTDOWN, got RELOAD";
         }
 
-        SignalHandler::Cleanup();
-        DrainAndRestoreSignals();
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+        // Drain+restore now handled by Cleanup(RESTORE) above
 
         TestFramework::RecordTest("SignalHandler: WaitForSignal returns SHUTDOWN on SIGTERM",
                                   pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
-        SignalHandler::Cleanup();
-        DrainAndRestoreSignals();
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+        // Drain+restore now handled by Cleanup(RESTORE) above
         TestFramework::RecordTest("SignalHandler: WaitForSignal returns SHUTDOWN on SIGTERM",
                                   false, e.what(), CLI_CATEGORY);
     }
@@ -1415,14 +1384,14 @@ void TestWaitForSignalSIGHUP() {
                 err = "Expected RELOAD, got SHUTDOWN";
         }
 
-        SignalHandler::Cleanup();
-        DrainAndRestoreSignals();
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+        // Drain+restore now handled by Cleanup(RESTORE) above
 
         TestFramework::RecordTest("SignalHandler: WaitForSignal returns RELOAD on SIGHUP",
                                   pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
-        SignalHandler::Cleanup();
-        DrainAndRestoreSignals();
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+        // Drain+restore now handled by Cleanup(RESTORE) above
         TestFramework::RecordTest("SignalHandler: WaitForSignal returns RELOAD on SIGHUP",
                                   false, e.what(), CLI_CATEGORY);
     }
@@ -1479,15 +1448,15 @@ void TestWaitForShutdownIgnoresSIGHUP() {
         if (!returned_after_term)
             err += "WaitForShutdown did not return within 500ms after SIGTERM; ";
 
-        SignalHandler::Cleanup();
-        DrainAndRestoreSignals();
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+        // Drain+restore now handled by Cleanup(RESTORE) above
 
         TestFramework::RecordTest(
             "SignalHandler: WaitForShutdown ignores SIGHUP returns on SIGTERM",
             pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
-        SignalHandler::Cleanup();
-        DrainAndRestoreSignals();
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+        // Drain+restore now handled by Cleanup(RESTORE) above
         TestFramework::RecordTest(
             "SignalHandler: WaitForShutdown ignores SIGHUP returns on SIGTERM",
             false, e.what(), CLI_CATEGORY);
@@ -2721,15 +2690,15 @@ void TestSighupFollowedBySigterm() {
         if (!shutdown_seen.load())
             err += "Did not get SHUTDOWN after SIGTERM; ";
 
-        SignalHandler::Cleanup();
-        DrainAndRestoreSignals();
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+        // Drain+restore now handled by Cleanup(RESTORE) above
 
         TestFramework::RecordTest(
             "SIGHUP integration: SIGHUP then SIGTERM returns RELOAD then SHUTDOWN",
             pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
-        SignalHandler::Cleanup();
-        DrainAndRestoreSignals();
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+        // Drain+restore now handled by Cleanup(RESTORE) above
         TestFramework::RecordTest(
             "SIGHUP integration: SIGHUP then SIGTERM returns RELOAD then SHUTDOWN",
             false, e.what(), CLI_CATEGORY);
@@ -2843,8 +2812,8 @@ void TestForegroundSighupStopsServer() {
         // a main.cc policy, not a SignalHandler policy; here we just verify RELOAD)
         bool got_reload = (received.load() == SignalResult::RELOAD);
 
-        SignalHandler::Cleanup();
-        DrainAndRestoreSignals();
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+        // Drain+restore now handled by Cleanup(RESTORE) above
 
         TestFramework::RecordTest(
             "SIGHUP integration: WaitForSignal returns RELOAD on SIGHUP (foreground also sees RELOAD)",
@@ -2853,10 +2822,140 @@ void TestForegroundSighupStopsServer() {
                 (!done.load() ? "WaitForSignal did not unblock" : "Expected RELOAD, got SHUTDOWN"),
             CLI_CATEGORY);
     } catch (const std::exception& e) {
-        SignalHandler::Cleanup();
-        DrainAndRestoreSignals();
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+        // Drain+restore now handled by Cleanup(RESTORE) above
         TestFramework::RecordTest(
             "SIGHUP integration: WaitForSignal returns RELOAD on SIGHUP (foreground also sees RELOAD)",
+            false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 13: Cleanup(RESTORE) Tests (69–71)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Test 69: Cleanup(RESTORE) restores prior signal dispositions.
+// Set SIGHUP to SIG_IGN before Install, then verify it's restored after Cleanup.
+void TestCleanupRestoreDisposition() {
+    try {
+        // Set a known prior disposition: SIGHUP = SIG_IGN
+        struct sigaction sa_ign{};
+        sa_ign.sa_handler = SIG_IGN;
+        sigemptyset(&sa_ign.sa_mask);
+        sigaction(SIGHUP, &sa_ign, nullptr);
+
+        SignalHandler::Install(/* daemon_mode= */ false);
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+
+        // Verify SIGHUP disposition was restored to SIG_IGN (not SIG_DFL)
+        struct sigaction current{};
+        sigaction(SIGHUP, nullptr, &current);
+        bool restored = (current.sa_handler == SIG_IGN);
+
+        // Clean up: restore SIG_DFL for subsequent tests
+        struct sigaction sa_dfl{};
+        sa_dfl.sa_handler = SIG_DFL;
+        sigemptyset(&sa_dfl.sa_mask);
+        sigaction(SIGHUP, &sa_dfl, nullptr);
+
+        TestFramework::RecordTest(
+            "Cleanup(RESTORE): prior SIGHUP disposition restored",
+            restored, "", CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Cleanup(RESTORE): prior SIGHUP disposition restored",
+            false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 70: Reinstall after Cleanup(RESTORE) preserves signal pipeline.
+// Set SIGHUP = SIG_DFL, Install → Cleanup(RESTORE) → Install again →
+// send SIGHUP → verify WaitForSignal returns RELOAD.
+void TestCleanupRestoreReinstall() {
+    try {
+        // Start with known SIGHUP = SIG_DFL
+        struct sigaction sa_dfl{};
+        sa_dfl.sa_handler = SIG_DFL;
+        sigemptyset(&sa_dfl.sa_mask);
+        sigaction(SIGHUP, &sa_dfl, nullptr);
+
+        SignalHandler::Install(/* daemon_mode= */ false);
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+
+        // Reinstall and verify signal pipeline works
+        SignalHandler::Install(/* daemon_mode= */ false);
+
+        std::atomic<bool> got_reload{false};
+        std::thread waiter([&]() {
+            SignalResult result = SignalHandler::WaitForSignal();
+            if (result == SignalResult::RELOAD) {
+                got_reload.store(true);
+            }
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        kill(getpid(), SIGHUP);
+        waiter.join();
+
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+
+        TestFramework::RecordTest(
+            "Cleanup(RESTORE): reinstall + SIGHUP returns RELOAD",
+            got_reload.load(), "", CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+        TestFramework::RecordTest(
+            "Cleanup(RESTORE): reinstall + SIGHUP returns RELOAD",
+            false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 71: Cleanup(RESTORE) restores prior thread signal mask.
+// Block SIGUSR1 before Install, verify it stays blocked after Cleanup(RESTORE).
+// Also verify SIGTERM/SIGINT/SIGHUP are restored to their pre-Install mask state.
+void TestCleanupRestoreMask() {
+    try {
+        // Block SIGUSR1 before Install
+        sigset_t usr1_set;
+        sigemptyset(&usr1_set);
+        sigaddset(&usr1_set, SIGUSR1);
+        pthread_sigmask(SIG_BLOCK, &usr1_set, nullptr);
+
+        // Save the pre-Install mask (includes SIGUSR1 blocked)
+        sigset_t pre_install_mask;
+        pthread_sigmask(SIG_SETMASK, nullptr, &pre_install_mask);
+
+        SignalHandler::Install(/* daemon_mode= */ false);
+        SignalHandler::Cleanup(CleanupMode::RESTORE);
+
+        // Verify SIGUSR1 is still blocked
+        sigset_t post_restore_mask;
+        pthread_sigmask(SIG_SETMASK, nullptr, &post_restore_mask);
+        bool usr1_blocked = sigismember(&post_restore_mask, SIGUSR1);
+
+        // Verify handled signals match pre-Install state
+        bool sigterm_match = (sigismember(&post_restore_mask, SIGTERM) ==
+                              sigismember(&pre_install_mask, SIGTERM));
+        bool sigint_match  = (sigismember(&post_restore_mask, SIGINT) ==
+                              sigismember(&pre_install_mask, SIGINT));
+        bool sighup_match  = (sigismember(&post_restore_mask, SIGHUP) ==
+                              sigismember(&pre_install_mask, SIGHUP));
+
+        // Clean up: unblock SIGUSR1
+        pthread_sigmask(SIG_UNBLOCK, &usr1_set, nullptr);
+
+        bool all_ok = usr1_blocked && sigterm_match && sigint_match && sighup_match;
+        TestFramework::RecordTest(
+            "Cleanup(RESTORE): prior thread signal mask restored",
+            all_ok, "", CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        // Clean up SIGUSR1 block
+        sigset_t usr1_set;
+        sigemptyset(&usr1_set);
+        sigaddset(&usr1_set, SIGUSR1);
+        pthread_sigmask(SIG_UNBLOCK, &usr1_set, nullptr);
+        TestFramework::RecordTest(
+            "Cleanup(RESTORE): prior thread signal mask restored",
             false, e.what(), CLI_CATEGORY);
     }
 }
@@ -2972,6 +3071,11 @@ void RunAllTests() {
     TestInvalidConfigOnReloadNoServerCrash();
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     TestForegroundSighupStopsServer();
+
+    // ── Section 13: Cleanup(RESTORE) ─────────────────────────────
+    TestCleanupRestoreDisposition();
+    TestCleanupRestoreReinstall();
+    TestCleanupRestoreMask();
 }
 
 }  // namespace CliTests

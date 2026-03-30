@@ -16,10 +16,26 @@ enum class SignalResult {
     RELOAD,     // SIGHUP — caller decides: daemon reopens logs, foreground shuts down
 };
 
+// Cleanup mode determines how signal state is restored.
+enum class CleanupMode {
+    // Set SIG_IGN + unblock. Safe for process exit — prevents pending signals
+    // from killing the process between Cleanup and exit(). Terminal: do NOT
+    // expect a later RESTORE call to recover the original pre-Install() state.
+    FOR_EXIT,
+
+    // Restore prior signal dispositions and thread signal mask saved by
+    // Install(). Clean state for tests, embedders, and library-style reuse.
+    // Must be called on the same thread that called Install(), after all
+    // waiter/worker threads are joined.
+    RESTORE,
+};
+
 class SignalHandler {
 public:
     // Block SIGTERM, SIGINT, SIGPIPE, SIGHUP in all threads via pthread_sigmask.
+    // Saves prior signal dispositions and thread mask for Cleanup(RESTORE).
     // Must be called from the main thread before spawning any threads.
+    // No-op if already installed (prevents overwriting saved prior state).
     // @param daemon_mode  If true, SIGHUP is always reset to SIG_DFL even if
     //                     inherited as SIG_IGN (nohup). A daemon has no terminal,
     //                     so inherited SIG_IGN is meaningless and would silently
@@ -36,9 +52,14 @@ public:
     // Kept for backward compatibility with tests and legacy callers.
     static void WaitForShutdown();
 
-    // Ignore and unblock all handled signals for clean teardown.
-    // Safe to call multiple times.
-    static void Cleanup();
+    // Restore signal state based on the cleanup mode.
+    // @param mode  FOR_EXIT: set SIG_IGN + unblock (safe for process exit).
+    //              RESTORE: drain pending signals, restore prior dispositions
+    //              and thread signal mask saved by Install(). Must be called
+    //              on the same thread that called Install(), after all
+    //              waiter/worker threads are joined.
+    // Safe to call multiple times. No-op if not installed.
+    static void Cleanup(CleanupMode mode);
 
     // Returns true if a shutdown signal has been received.
     static bool ShutdownRequested();

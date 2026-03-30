@@ -111,16 +111,14 @@ static int HandleReload(const CliOptions& options) {
 
 // ── Health endpoint handler ──────────────────────────────────────
 static std::function<void(const HttpRequest&, HttpResponse&)>
-MakeHealthHandler(std::chrono::steady_clock::time_point start_time) {
-    return [start_time](const HttpRequest& /*req*/, HttpResponse& res) {
-        auto now = std::chrono::steady_clock::now();
-        auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-            now - start_time).count();
-
+MakeHealthHandler(HttpServer* server) {
+    return [server](const HttpRequest& /*req*/, HttpResponse& res) {
+        auto stats = server->GetStats();
         char buf[HEALTH_BUF_SIZE];
         std::snprintf(buf, sizeof(buf),
             R"({"status":"ok","pid":%d,"uptime_seconds":%lld})",
-            static_cast<int>(getpid()), static_cast<long long>(uptime));
+            static_cast<int>(getpid()),
+            static_cast<long long>(stats.uptime_seconds));
         res.Status(200).Json(buf);
     };
 }
@@ -207,12 +205,21 @@ static bool ReloadConfig(const std::string& config_path,
     }
 
     // Daemon-specific validation: reject relative/empty log paths that would
-    // break after chdir("/"). Same checks as startup (ValidateDaemonConfig).
+    // break after chdir("/"). ValidateDaemonConfig outputs to stderr (which is
+    // /dev/null in daemon mode), so also log specific failures via spdlog.
     if (options.daemonize) {
         int drc = ValidateDaemonConfig(new_config, options);
         if (drc != EXIT_OK) {
-            logging::Get()->error("Config reload rejected: daemon path validation failed");
-            reopen_existing_logs();  // still reopen for logrotate
+            // Log the specific reason via spdlog (stderr is /dev/null in daemon)
+            if (new_config.log.file.empty())
+                logging::Get()->error("Config reload rejected: daemon mode requires a log file");
+            else if (!new_config.log.file.empty() && new_config.log.file[0] != '/')
+                logging::Get()->error("Config reload rejected: log file path must be absolute");
+            else if (!options.pid_file.empty() && options.pid_file[0] != '/')
+                logging::Get()->error("Config reload rejected: PID file path must be absolute");
+            else
+                logging::Get()->error("Config reload rejected: daemon path validation failed");
+            reopen_existing_logs();
             return false;
         }
     }
@@ -267,6 +274,10 @@ static bool ReloadConfig(const std::string& config_path,
             new_config.log.max_file_size = current_config.log.max_file_size;
             new_config.log.max_files = current_config.log.max_files;
         } else {
+            // Same path, rotation settings changed but reopen failed — preserve
+            // old rotation settings so current_config matches the live logger.
+            new_config.log.max_file_size = current_config.log.max_file_size;
+            new_config.log.max_files = current_config.log.max_files;
             logging::Get()->warn("Log file reopen failed, continuing with old file");
         }
     }
@@ -464,7 +475,7 @@ static int HandleStart(const CliOptions& options) {
     } catch (const std::exception& e) {
         logging::Get()->error("Fatal error: {}", e.what());
         daemon_fail();
-        SignalHandler::Cleanup();
+        SignalHandler::Cleanup(CleanupMode::FOR_EXIT);
         logging::Shutdown();
         return EXIT_ERROR;
     }
@@ -483,32 +494,19 @@ static int HandleStart(const CliOptions& options) {
     }
 
     if (options.health_endpoint) {
-        auto start_time = std::chrono::steady_clock::now();
-        server->Get("/health", MakeHealthHandler(start_time));
+        server->Get("/health", MakeHealthHandler(server.get()));
         server->Get("/stats", MakeStatsHandler(server.get(), config));
         logging::Get()->info("  Health:  /health");
         logging::Get()->info("  Stats:   /stats");
     }
 
-    // ── Wire readiness callback to fire after init, before event loop ──
-    // Used by daemon mode to signal parent, and by the signal loop to gate
-    // reloads until socket_dispatchers_ is fully built (prevents races).
-    std::atomic<bool> server_ready{false};
+    // ── Wire daemon readiness to fire after init, before event loop ──
 #if !defined(_WIN32)
     if (options.daemonize) {
-        server->SetReadyCallback([&server_ready]() {
-            server_ready.store(true, std::memory_order_release);
+        server->SetReadyCallback([]() {
             Daemonizer::NotifyReady();
         });
-    } else {
-        server->SetReadyCallback([&server_ready]() {
-            server_ready.store(true, std::memory_order_release);
-        });
     }
-#else
-    server->SetReadyCallback([&server_ready]() {
-        server_ready.store(true, std::memory_order_release);
-    });
 #endif
 
     // ── Server thread ───────────────────────────────────────
@@ -543,10 +541,9 @@ static int HandleStart(const CliOptions& options) {
         // SIGHUP received
         if (options.daemonize) {
             // Daemon mode: reload configuration.
-            // Gate on server_ready to prevent racing with Start() building
-            // socket_dispatchers_ — SetConnectionTimeout/SetTimerInterval
-            // walk the vector without synchronization.
-            if (!server_ready.load(std::memory_order_acquire)) {
+            // Gate on server readiness to prevent racing with Start() building
+            // socket_dispatchers_. HttpServer::Reload() also checks internally.
+            if (!server->IsReady()) {
                 logging::Get()->warn("Received SIGHUP before server is ready, ignoring");
                 continue;
             }
@@ -584,7 +581,7 @@ static int HandleStart(const CliOptions& options) {
     logging::Get()->info("{} stopped", REACTOR_SERVER_NAME);
     server.reset();
 
-    SignalHandler::Cleanup();
+    SignalHandler::Cleanup(CleanupMode::FOR_EXIT);
     logging::Shutdown();
     return exit_code;
 }
