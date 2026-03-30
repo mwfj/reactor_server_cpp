@@ -480,21 +480,23 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                 stale_h1 = std::move(h1_it->second);
                 http_connections_.erase(h1_it);
             }
-            // Also clean up stale pending detection
+            // Track in pending_detection_ for counter symmetry: if the
+            // connection closes before HandleMessage runs (no map entry yet),
+            // HandleCloseConnection needs to find it here to decrement.
             auto pd_it = pending_detection_.find(conn->fd());
-            if (pd_it != pending_detection_.end() && pd_it->second.conn != conn) {
-                pending_detection_.erase(pd_it);
+            if (pd_it != pending_detection_.end()) {
+                if (pd_it->second.conn != conn) {
+                    // Stale entry — replace with current conn tracking
+                    pd_it->second = {conn, ""};
+                }
+                // else: same conn already tracked (partial preface) — keep data
+            } else {
+                pending_detection_[conn->fd()] = {conn, ""};
             }
         }
         // Notify stale WS handler outside the lock (avoids deadlock with
         // CallCloseCb → conn_mtx_ and preserves the close notification).
         SafeNotifyWsClose(stale_h1);
-
-        // Note: TLS ALPN h2 detection cannot happen here — HandleNewConnection
-        // runs before TLS handshake completes (tls_state_ == HANDSHAKE, not READY).
-        // GetAlpnProtocol() returns empty until handshake finishes.
-        // ALPN detection happens in HandleMessage → DetectAndRouteProtocol after
-        // the first OnMessage fires (which is post-handshake).
     } else {
         // HTTP/2 disabled — always create HTTP/1.x handler immediately.
         std::shared_ptr<HttpConnectionHandler> old_handler;
@@ -510,11 +512,13 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
                     SetupHandlers(http_conn);
                     http_connections_[conn->fd()] = http_conn;
+                    active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
                 }
             } else {
                 auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
                 SetupHandlers(http_conn);
                 http_connections_[conn->fd()] = http_conn;
+                active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
             }
         }
         SafeNotifyWsClose(old_handler);
@@ -536,29 +540,37 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
 void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->debug("HTTP connection closed fd={}", conn->fd());
 
-    active_connections_.fetch_sub(1, std::memory_order_relaxed);
-
-    // Single lock: check both H2 and HTTP/1.x maps
+    // Single lock: check pending_detection_, H2, and HTTP/1.x maps.
+    // Only decrement active_connections_ if found in a map — prevents underflow
+    // when HandleCloseConnection fires for connections that HandleNewConnection
+    // never counted (e.g., RegisterCallbacks failure, IsClosing early return).
     std::shared_ptr<HttpConnectionHandler> http_conn;
     bool was_h2 = false;
+    bool was_tracked = false;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         auto pd_it = pending_detection_.find(conn->fd());
         if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
             pending_detection_.erase(pd_it);
+            was_tracked = true;
         }
         auto h2_it = h2_connections_.find(conn->fd());
         if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
             h2_connections_.erase(h2_it);
             was_h2 = true;
+            was_tracked = true;
         }
         if (!was_h2) {
             auto it = http_connections_.find(conn->fd());
             if (it != http_connections_.end() && it->second->GetConnection() == conn) {
                 http_conn = it->second;
                 http_connections_.erase(it);
+                was_tracked = true;
             }
         }
+    }
+    if (was_tracked) {
+        active_connections_.fetch_sub(1, std::memory_order_relaxed);
     }
     // Outside lock: notify drain set and WS close handler
     if (was_h2) {
@@ -575,29 +587,34 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
 void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->error("HTTP connection error fd={}", conn->fd());
 
-    active_connections_.fetch_sub(1, std::memory_order_relaxed);
-
-    // Single lock: check both H2 and HTTP/1.x maps
+    // Same map-based tracking as HandleCloseConnection — see comment there.
     std::shared_ptr<HttpConnectionHandler> http_conn;
     bool was_h2 = false;
+    bool was_tracked = false;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         auto pd_it = pending_detection_.find(conn->fd());
         if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
             pending_detection_.erase(pd_it);
+            was_tracked = true;
         }
         auto h2_it = h2_connections_.find(conn->fd());
         if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
             h2_connections_.erase(h2_it);
             was_h2 = true;
+            was_tracked = true;
         }
         if (!was_h2) {
             auto it = http_connections_.find(conn->fd());
             if (it != http_connections_.end() && it->second->GetConnection() == conn) {
                 http_conn = it->second;
                 http_connections_.erase(it);
+                was_tracked = true;
             }
         }
+    }
+    if (was_tracked) {
+        active_connections_.fetch_sub(1, std::memory_order_relaxed);
     }
     if (was_h2) {
         active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
@@ -812,6 +829,20 @@ void HttpServer::Reload(const ServerConfig& new_config) {
     // Update idle timeout via EnQueue to dispatcher threads
     net_server_.SetConnectionTimeout(
         std::chrono::seconds(new_config.idle_timeout_sec));
+
+    // Recompute timer scan interval to match the new timeout values.
+    // Same formula as the constructor — scan must be frequent enough to
+    // enforce both idle and request timeouts at the new cadence.
+    int idle_interval = new_config.idle_timeout_sec > 0
+        ? std::max(new_config.idle_timeout_sec / 6, 1) : 0;
+    int req_interval = new_config.request_timeout_sec > 0
+        ? std::max(new_config.request_timeout_sec / 3, 1) : 0;
+    int scan_interval;
+    if (idle_interval == 0 && req_interval == 0) scan_interval = 5;
+    else if (idle_interval == 0) scan_interval = req_interval;
+    else if (req_interval == 0) scan_interval = idle_interval;
+    else scan_interval = std::min(idle_interval, req_interval);
+    net_server_.SetTimerInterval(scan_interval);
 
     // Update HTTP/2 settings for new connections (under conn_mtx_)
     {

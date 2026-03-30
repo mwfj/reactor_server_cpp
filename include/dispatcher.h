@@ -89,4 +89,8 @@ public:
     // Update idle timeout duration at runtime. Must be called on the
     // dispatcher thread (via EnQueue) to avoid racing with TimerHandler.
     void SetTimeout(std::chrono::seconds timeout) { timeout_ = timeout; }
+
+    // Update timer scan interval at runtime. Takes effect on the NEXT
+    // TimerHandler fire. Must be called on the dispatcher thread (via EnQueue).
+    void SetTimerInterval(int interval) { end_t_ = interval; }
 };

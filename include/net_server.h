@@ -111,6 +111,10 @@ public:
     // EnQueues the update to each dispatcher thread to avoid racing with TimerHandler.
     void SetConnectionTimeout(std::chrono::seconds timeout);
 
+    // Update timer scan interval on all socket dispatchers at runtime.
+    // EnQueues the update to each dispatcher thread.
+    void SetTimerInterval(int seconds);
+
     // Connections exempt from CloseAfterWrite during Stop().
     // Set by HttpServer before Stop() for HTTP/2 graceful drain.
     void SetDrainingConns(std::set<ConnectionHandler*> conns) {

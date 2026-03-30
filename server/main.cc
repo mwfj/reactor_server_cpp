@@ -172,6 +172,10 @@ MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
     };
 }
 
+// Forward declaration — defined below, after RequireAbsolutePath.
+static int ValidateDaemonConfig(const ServerConfig& config,
+                                const CliOptions& options);
+
 // ── Config reload helper (SIGHUP in daemon mode) ────────────────
 // Re-reads config file, validates, applies reload-safe fields.
 // Returns true on success, false on error (current config kept).
@@ -194,6 +198,16 @@ static bool ReloadConfig(const CliOptions& options,
         logging::Get()->error("Config reload validation failed ({}): {}",
                               options.config_path, e.what());
         return false;
+    }
+
+    // Daemon-specific validation: reject relative/empty log paths that would
+    // break after chdir("/"). Same checks as startup (ValidateDaemonConfig).
+    if (options.daemonize) {
+        int drc = ValidateDaemonConfig(new_config, options);
+        if (drc != EXIT_OK) {
+            logging::Get()->error("Config reload rejected: daemon path validation failed");
+            return false;
+        }
     }
 
     // Log restart-required field changes at warn level
