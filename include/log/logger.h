@@ -59,9 +59,9 @@ void CheckRotation();
 // Throws std::runtime_error on failure.
 void EnsureLogDir(const std::string& dir);
 
-// Write a visual start/stop marker to the log file.
+// Write a visual start/stop marker via the normal spdlog logger at info level.
 // Format: "================================ {text} ================================"
-// The spdlog pattern prepends its own timestamp to each line.
+// Filtered at warn+ levels (same as any other info message).
 void WriteMarker(const std::string& text);
 
 // Flush all sinks and shut down the logging system.

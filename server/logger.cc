@@ -502,23 +502,14 @@ void EnsureLogDir(const std::string& dir) {
 }
 
 void WriteMarker(const std::string& text) {
-    std::lock_guard<std::mutex> lock(g_logger_mtx);
-    std::string line = "================================ " + text +
-                       " ================================\n";
-    // Write directly to the log file, bypassing spdlog entirely.
-    // This avoids level-filtering issues and is thread-safe because
-    // we hold g_logger_mtx (no concurrent logger rebuilds or rotations).
-    if (!g_current_file_path.empty()) {
-        std::FILE* f = std::fopen(g_current_file_path.c_str(), "a");
-        if (f) {
-            std::fwrite(line.data(), 1, line.size(), f);
-            std::fclose(f);
-        }
-    }
-    // Also write to console if enabled
-    if (g_console_enabled) {
-        std::fwrite(line.data(), 1, line.size(), stderr);
-    }
+    auto logger = Get();
+    if (!logger) return;
+    // Log at info level through the normal spdlog path. This ensures markers
+    // go through the same sink/fd as other log messages (no file splitting
+    // during logrotate) and get the standard timestamp/logger formatting.
+    // Markers are filtered at warn+ levels — this is acceptable because
+    // operators using higher levels have chosen to suppress info output.
+    logger->info("================================ {} ================================", text);
 }
 
 } // namespace logging
