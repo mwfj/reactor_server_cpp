@@ -115,6 +115,9 @@ public:
     // EnQueues the update to each dispatcher thread.
     void SetTimerInterval(int seconds);
 
+    // Get the current timer scan interval (seconds).
+    int GetTimerInterval() const { return timer_interval_; }
+
     // Connections exempt from CloseAfterWrite during Stop().
     // Set by HttpServer before Stop() for HTTP/2 graceful drain.
     void SetDrainingConns(std::set<ConnectionHandler*> conns) {

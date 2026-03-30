@@ -584,6 +584,7 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
     // when HandleCloseConnection fires for connections that HandleNewConnection
     // never counted (e.g., RegisterCallbacks failure, IsClosing early return).
     std::shared_ptr<HttpConnectionHandler> http_conn;
+    std::shared_ptr<Http2ConnectionHandler> h2_handler;
     bool was_h2 = false;
     bool was_tracked = false;
     {
@@ -595,6 +596,7 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
         }
         auto h2_it = h2_connections_.find(conn->fd());
         if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
+            h2_handler = h2_it->second;  // save for stream count compensation
             h2_connections_.erase(h2_it);
             was_h2 = true;
             was_tracked = true;
@@ -614,6 +616,16 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
     // Outside lock: notify drain set and WS close handler
     if (was_h2) {
         active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
+        // Compensate active_h2_streams_ for streams still open when the
+        // transport closes abruptly. nghttp2_session_del() frees remaining
+        // streams without firing the stream-close callback.
+        if (h2_handler && h2_handler->GetSession()) {
+            int64_t remaining = static_cast<int64_t>(
+                h2_handler->GetSession()->ActiveStreamCount());
+            if (remaining > 0) {
+                active_h2_streams_.fetch_sub(remaining, std::memory_order_relaxed);
+            }
+        }
         OnH2DrainComplete(conn.get());
         return;
     }
@@ -628,6 +640,7 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
 
     // Same map-based tracking as HandleCloseConnection — see comment there.
     std::shared_ptr<HttpConnectionHandler> http_conn;
+    std::shared_ptr<Http2ConnectionHandler> h2_handler;
     bool was_h2 = false;
     bool was_tracked = false;
     {
@@ -639,6 +652,7 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
         }
         auto h2_it = h2_connections_.find(conn->fd());
         if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
+            h2_handler = h2_it->second;
             h2_connections_.erase(h2_it);
             was_h2 = true;
             was_tracked = true;
@@ -657,6 +671,13 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
     }
     if (was_h2) {
         active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
+        if (h2_handler && h2_handler->GetSession()) {
+            int64_t remaining = static_cast<int64_t>(
+                h2_handler->GetSession()->ActiveStreamCount());
+            if (remaining > 0) {
+                active_h2_streams_.fetch_sub(remaining, std::memory_order_relaxed);
+            }
+        }
         OnH2DrainComplete(conn.get());
         return;
     }
@@ -786,14 +807,23 @@ bool HttpServer::DetectAndRouteProtocol(
             if (proto == ProtocolDetector::Protocol::UNKNOWN) {
                 // Not enough data to classify — buffer and wait for more bytes.
                 // This handles h2c clients that send the 24-byte preface split
-                // across multiple TCP segments. Store connection identity to
-                // guard against fd-reuse races.
+                // across multiple TCP segments.
                 std::lock_guard<std::mutex> lck(conn_mtx_);
                 auto& pd = pending_detection_[conn->fd()];
                 if (pd.conn == conn) {
+                    // Same conn — append additional preface bytes
                     pd.data += message;
                 } else {
+                    // First insertion for this connection. If not already_counted
+                    // (accept/data race: HandleMessage before HandleNewConnection),
+                    // increment now so the counter is set before the entry exists
+                    // in the map. HandleNewConnection will see the same-conn entry
+                    // and skip its own increment.
                     pd = {conn, message};
+                    if (!already_counted) {
+                        total_accepted_.fetch_add(1, std::memory_order_relaxed);
+                        active_connections_.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
                 return true;
             }
@@ -903,19 +933,26 @@ void HttpServer::Reload(const ServerConfig& new_config) {
     net_server_.SetConnectionTimeout(
         std::chrono::seconds(new_config.idle_timeout_sec));
 
-    // Recompute timer scan interval to match the new timeout values.
-    // Same formula as the constructor — scan must be frequent enough to
-    // enforce both idle and request timeouts at the new cadence.
-    int idle_interval = new_config.idle_timeout_sec > 0
-        ? std::max(new_config.idle_timeout_sec / 6, 1) : 0;
-    int req_interval = new_config.request_timeout_sec > 0
-        ? std::max(new_config.request_timeout_sec / 3, 1) : 0;
-    int scan_interval;
-    if (idle_interval == 0 && req_interval == 0) scan_interval = 5;
-    else if (idle_interval == 0) scan_interval = req_interval;
-    else if (req_interval == 0) scan_interval = idle_interval;
-    else scan_interval = std::min(idle_interval, req_interval);
-    net_server_.SetTimerInterval(scan_interval);
+    // Recompute timer scan interval. Only shorten, never lengthen — existing
+    // connections keep their old per-connection deadlines and must be scanned
+    // at least as frequently as before. Without this floor, reloading
+    // request_timeout upward (30s→300s) would stretch the scan from 10s to
+    // 100s, letting pre-reload 30s deadlines overshoot.
+    {
+        int idle_iv = new_config.idle_timeout_sec > 0
+            ? std::max(new_config.idle_timeout_sec / 6, 1) : 0;
+        int req_iv = new_config.request_timeout_sec > 0
+            ? std::max(new_config.request_timeout_sec / 3, 1) : 0;
+        int new_scan;
+        if (idle_iv == 0 && req_iv == 0) new_scan = 5;
+        else if (idle_iv == 0) new_scan = req_iv;
+        else if (req_iv == 0) new_scan = idle_iv;
+        else new_scan = std::min(idle_iv, req_iv);
+        // Never lengthen past current cadence
+        int cur_scan = net_server_.GetTimerInterval();
+        net_server_.SetTimerInterval(
+            cur_scan > 0 ? std::min(new_scan, cur_scan) : new_scan);
+    }
 
     // Update HTTP/2 settings for NEW connections only (under conn_mtx_).
     // Existing sessions keep their negotiated SETTINGS values — submitting

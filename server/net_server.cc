@@ -431,6 +431,7 @@ void NetServer::SetConnectionTimeout(std::chrono::seconds timeout) {
 }
 
 void NetServer::SetTimerInterval(int seconds) {
+    timer_interval_ = seconds;
     for (auto& disp : socket_dispatchers_) {
         disp->EnQueue([d = disp, seconds]() {
             d->SetTimerInterval(seconds);
