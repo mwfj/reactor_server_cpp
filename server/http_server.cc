@@ -95,9 +95,10 @@ HttpServer::HttpServer(const std::string& ip, int port)
 {
     WireNetServerCallbacks();
     resolved_worker_threads_ = net_server_.GetWorkerCount();
-    // Default ready callback — sets server_ready_ so Reload() is safe.
+    // Default ready callback — sets server_ready_ and start_time_.
     // SetReadyCallback() wraps any user callback on top of this.
     net_server_.SetReadyCallback([this]() {
+        start_time_ = std::chrono::steady_clock::now();
         server_ready_.store(true, std::memory_order_release);
     });
     // Apply the same defaults as the config constructor — must match ServerConfig defaults.
@@ -952,13 +953,22 @@ void HttpServer::Reload(const ServerConfig& new_config) {
         return;
     }
 
-    // Validate before applying — reject invalid configs (e.g., negative
-    // timeouts) that would disrupt live traffic.
-    try {
-        ConfigLoader::Validate(new_config);
-    } catch (const std::invalid_argument& e) {
-        logging::Get()->error("Reload() rejected invalid config: {}", e.what());
-        return;
+    // Validate reload-safe fields only — restart-only fields (bind_host,
+    // bind_port, tls.*, worker_threads, http2.enabled) are ignored by Reload()
+    // so they must not block validation. Build a copy with restart-only fields
+    // set to the known-valid construction values that pass Validate().
+    {
+        ServerConfig validation_copy = new_config;
+        validation_copy.bind_host = "127.0.0.1";  // always valid
+        validation_copy.bind_port = 8080;          // always valid
+        validation_copy.worker_threads = 1;        // always valid
+        validation_copy.tls.enabled = false;       // skip TLS path checks
+        try {
+            ConfigLoader::Validate(validation_copy);
+        } catch (const std::invalid_argument& e) {
+            logging::Get()->error("Reload() rejected invalid config: {}", e.what());
+            return;
+        }
     }
 
     // Update reload-safe limit fields (atomic stores)

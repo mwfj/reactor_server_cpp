@@ -131,9 +131,9 @@ private:
     std::atomic<int64_t> total_requests_{0};
     std::atomic<int64_t> active_requests_{0};
 
-    // Server start time for uptime calculation
-    std::chrono::steady_clock::time_point start_time_ =
-        std::chrono::steady_clock::now();
+    // Server start time for uptime calculation. Set by the ready callback
+    // when the server actually starts accepting connections, not at construction.
+    std::chrono::steady_clock::time_point start_time_;
 
     // Resolved worker count (set at construction, never changes).
     // Needed because auto mode (worker_threads=0) resolves inside ThreadPool.
