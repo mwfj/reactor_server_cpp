@@ -179,24 +179,34 @@ static int ValidateDaemonConfig(const ServerConfig& config,
 // ── Config reload helper (SIGHUP in daemon mode) ────────────────
 // Re-reads config file, validates, applies reload-safe fields.
 // Returns true on success, false on error (current config kept).
-static bool ReloadConfig(const CliOptions& options,
+static bool ReloadConfig(const std::string& config_path,
+                         const CliOptions& options,
                          HttpServer& server,
                          ServerConfig& current_config) {
     ServerConfig new_config;
     try {
-        new_config = ConfigLoader::LoadFromFile(options.config_path);
+        // Mirror LoadConfig's fallback: if the config file doesn't exist and the
+        // path wasn't explicitly set, use defaults (same as startup without a file).
+        if (access(config_path.c_str(), F_OK) == 0) {
+            new_config = ConfigLoader::LoadFromFile(config_path);
+        } else if (!options.config_path_explicit) {
+            new_config = ConfigLoader::Default();
+        } else {
+            logging::Get()->error("Config reload failed: {} not found", config_path);
+            return false;
+        }
         ConfigLoader::ApplyEnvOverrides(new_config);
         ApplyCliOverrides(new_config, options);
     } catch (const std::exception& e) {
         logging::Get()->error("Config reload failed ({}): {}",
-                              options.config_path, e.what());
+                              config_path, e.what());
         return false;
     }
     try {
         ConfigLoader::Validate(new_config);
     } catch (const std::invalid_argument& e) {
         logging::Get()->error("Config reload validation failed ({}): {}",
-                              options.config_path, e.what());
+                              config_path, e.what());
         return false;
     }
 
@@ -247,27 +257,46 @@ static bool ReloadConfig(const CliOptions& options,
     // Apply reload-safe fields via HttpServer::Reload()
     server.Reload(new_config);
 
-    // Log reload-safe changes at info level
+    // Log reload-safe changes at info level.
+    // idle_timeout and max_connections take effect immediately for all connections.
+    // Size limits and request_timeout are cached per-connection — only new
+    // connections pick up the updated values.
     if (new_config.idle_timeout_sec != current_config.idle_timeout_sec)
-        logging::Get()->info("idle_timeout_sec: {} -> {}",
+        logging::Get()->info("idle_timeout_sec: {} -> {} (immediate)",
                              current_config.idle_timeout_sec, new_config.idle_timeout_sec);
     if (new_config.request_timeout_sec != current_config.request_timeout_sec)
-        logging::Get()->info("request_timeout_sec: {} -> {}",
+        logging::Get()->info("request_timeout_sec: {} -> {} (new connections)",
                              current_config.request_timeout_sec, new_config.request_timeout_sec);
     if (new_config.max_connections != current_config.max_connections)
-        logging::Get()->info("max_connections: {} -> {}",
+        logging::Get()->info("max_connections: {} -> {} (immediate)",
                              current_config.max_connections, new_config.max_connections);
     if (new_config.max_body_size != current_config.max_body_size)
-        logging::Get()->info("max_body_size: {} -> {}",
+        logging::Get()->info("max_body_size: {} -> {} (new connections)",
                              current_config.max_body_size, new_config.max_body_size);
     if (new_config.max_header_size != current_config.max_header_size)
-        logging::Get()->info("max_header_size: {} -> {}",
+        logging::Get()->info("max_header_size: {} -> {} (new connections)",
                              current_config.max_header_size, new_config.max_header_size);
     if (new_config.max_ws_message_size != current_config.max_ws_message_size)
-        logging::Get()->info("max_ws_message_size: {} -> {}",
+        logging::Get()->info("max_ws_message_size: {} -> {} (new connections)",
                              current_config.max_ws_message_size, new_config.max_ws_message_size);
 
+    // Update current_config with new values, but preserve restart-required
+    // fields at their actual running values. Without this, the next reload's
+    // diff comparison would be against phantom state (e.g., bind_port shows
+    // 9090 even though the server is still listening on 8080).
+    auto saved_host = current_config.bind_host;
+    auto saved_port = current_config.bind_port;
+    auto saved_tls = current_config.tls;
+    auto saved_workers = current_config.worker_threads;
+    auto saved_h2_enabled = current_config.http2.enabled;
+
     current_config = new_config;
+
+    current_config.bind_host = saved_host;
+    current_config.bind_port = saved_port;
+    current_config.tls = saved_tls;
+    current_config.worker_threads = saved_workers;
+    current_config.http2.enabled = saved_h2_enabled;
     return true;
 }
 
@@ -314,6 +343,21 @@ static int HandleStart(const CliOptions& options) {
     if (options.daemonize) {
         rc = ValidateDaemonConfig(config, options);
         if (rc != EXIT_OK) return rc;
+    }
+
+    // Resolve config path to absolute BEFORE daemonizing (chdir changes to "/").
+    // After chdir("/"), relative paths like "config/server.json" resolve to
+    // "/config/server.json" which breaks SIGHUP reload. realpath() returns
+    // nullptr if the file doesn't exist, which is fine — ReloadConfig handles
+    // the "no file" case by falling back to ConfigLoader::Default().
+    std::string resolved_config_path = options.config_path;
+    if (options.daemonize && !options.config_path.empty() &&
+        options.config_path[0] != '/') {
+        char* abs = realpath(options.config_path.c_str(), nullptr);
+        if (abs) {
+            resolved_config_path = abs;
+            free(abs);
+        }
     }
 
     // ── Daemonize (if requested) ────────────────────────────
@@ -458,7 +502,7 @@ static int HandleStart(const CliOptions& options) {
         if (options.daemonize) {
             // Daemon mode: reload configuration
             logging::Get()->info("Received SIGHUP, reloading configuration");
-            if (ReloadConfig(options, *server, config)) {
+            if (ReloadConfig(resolved_config_path, options, *server, config)) {
                 logging::Get()->info("Configuration reloaded successfully");
             } else {
                 logging::Get()->warn("Configuration reload failed, keeping current config");

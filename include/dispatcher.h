@@ -90,7 +90,8 @@ public:
     // dispatcher thread (via EnQueue) to avoid racing with TimerHandler.
     void SetTimeout(std::chrono::seconds timeout) { timeout_ = timeout; }
 
-    // Update timer scan interval at runtime. Takes effect on the NEXT
-    // TimerHandler fire. Must be called on the dispatcher thread (via EnQueue).
-    void SetTimerInterval(int interval) { end_t_ = interval; }
+    // Update timer scan interval at runtime and re-arm the timerfd so the
+    // new cadence takes effect immediately (not deferred to the next fire).
+    // Must be called on the dispatcher thread (via EnQueue).
+    void SetTimerInterval(int interval);
 };

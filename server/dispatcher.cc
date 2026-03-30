@@ -330,6 +330,15 @@ void Dispatcher::SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCal
     callbacks_.timeout_trigger_callback = std::move(fn);
 }
 
+void Dispatcher::SetTimerInterval(int interval) {
+    end_t_ = interval;
+    // Re-arm the timerfd immediately so a downward reload takes effect
+    // without waiting for the old (potentially much longer) interval to fire.
+    if (timer_fd_ >= 0 && interval > 0) {
+        TimeStamp::ResetTimerFd(timer_fd_, interval);
+    }
+}
+
 void Dispatcher::TimerHandler(){
     // Drain the timerfd expiration count before re-arming.
     // On Linux, timerfd stays readable until read(); without draining,

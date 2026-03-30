@@ -29,7 +29,7 @@ Usage: reactor_server <command> [options]
 Commands:
   start       Start the server (foreground, or -d for daemon)
   stop        Stop a running server
-  reload      Reload configuration (send SIGHUP to running server)
+  reload      Reload configuration (daemon mode; shuts down foreground)
   status      Check server status
   validate    Validate configuration
   config      Show effective configuration

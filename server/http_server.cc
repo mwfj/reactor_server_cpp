@@ -388,8 +388,6 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
 
     // Set request handler: dispatch through router.
-    // request_timeout_sec_ is loaded from the atomic at dispatch time (not
-    // cached per-connection) so keep-alive connections use updated timeout.
     http_conn->SetRequestCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
                const HttpRequest& request,

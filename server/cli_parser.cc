@@ -275,7 +275,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "Commands:\n"
         << "  start       Start the server (foreground, or -d for daemon)\n"
         << "  stop        Stop a running server\n"
-        << "  reload      Reload configuration (send SIGHUP to running server)\n"
+        << "  reload      Reload configuration (daemon mode; shuts down foreground)\n"
         << "  status      Check server status\n"
         << "  validate    Validate configuration\n"
         << "  config      Show effective configuration\n"
