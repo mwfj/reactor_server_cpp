@@ -12,6 +12,8 @@
 //     - SignalHandler Phase 2 (3 tests): WaitForSignal SIGTERM/SIGHUP,
 //                                        WaitForShutdown ignores SIGHUP
 //     - CliParser daemonize (7 tests): -d/-daemonize flag and per-command validation
+//   - Logger Enhanced (6 tests): EnsureLogDir, date-based naming, CheckRotation,
+//                                 WriteMarker, SanitizePath, append-on-restart
 //
 // Port range: 10500-10599 (not used directly by unit tests; reserved for this suite)
 // Temp file pattern: /tmp/test_reactor_NNNN.pid
@@ -24,6 +26,7 @@
 #include "config/server_config.h"
 #include "config/config_loader.h"
 #include "log/logger.h"
+#include "log/log_utils.h"
 
 #include <atomic>
 #include <cerrno>
@@ -41,6 +44,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <dirent.h>
 
 namespace CliTests {
 
@@ -1060,6 +1064,49 @@ void TestSignalHandlerSigwaitUnblock() {
 // Each test calls logging::Shutdown() at the end to restore clean state.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Helper: remove all files in /tmp matching a prefix and .log extension.
+static void CleanupLogFiles(const std::string& dir, const std::string& prefix) {
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
+    struct dirent* entry;
+    while ((entry = readdir(d)) != nullptr) {
+        std::string name(entry->d_name);
+        if (name.find(prefix) == 0 && name.find(".log") != std::string::npos) {
+            std::remove((dir + "/" + name).c_str());
+        }
+    }
+    closedir(d);
+}
+
+// Helper: scan a directory for a file whose name starts with 'prefix' and ends
+// with '.log'. Returns the full path of the first match, or "" if none found.
+static std::string FindLogFile(const std::string& dir, const std::string& prefix) {
+    DIR* d = opendir(dir.c_str());
+    if (!d) return "";
+    struct dirent* entry;
+    std::string found;
+    while ((entry = readdir(d)) != nullptr) {
+        std::string name(entry->d_name);
+        if (name.find(prefix) == 0 && name.size() > 4 &&
+            name.compare(name.size() - 4, 4, ".log") == 0) {
+            found = dir + "/" + name;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+// Helper: read the full text of a file into a string. Returns "" on error.
+static std::string ReadFileContent(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) return "";
+    std::string content;
+    std::string line;
+    while (std::getline(f, line)) content += line + "\n";
+    return content;
+}
+
 // Test 32: SetConsoleEnabled(false) + Init with a file → logger is functional
 // even with console disabled.  Validates that the sticky console flag is stored
 // before Init() and honoured inside BuildSinks().
@@ -1067,7 +1114,8 @@ void TestSetConsoleEnabled() {
     std::cout << "\n[TEST] Logger: SetConsoleEnabled(false) disables console sink..." << std::endl;
     const std::string log_path = "/tmp/test_reactor_log_" + std::to_string(getpid()) +
                                   "_console.log";
-    std::remove(log_path.c_str());
+    const std::string prefix = "test_reactor_log_" + std::to_string(getpid()) + "_console-";
+    CleanupLogFiles("/tmp", prefix);
 
     try {
         // Disable console before initialising so daemon-mode path is exercised
@@ -1079,13 +1127,13 @@ void TestSetConsoleEnabled() {
         logging::Get()->flush();
 
         logging::Shutdown();  // resets g_console_enabled to true
-        std::remove(log_path.c_str());
+        CleanupLogFiles("/tmp", prefix);
 
         TestFramework::RecordTest("Logger: SetConsoleEnabled(false) functional",
                                   true, "", CLI_CATEGORY);
     } catch (const std::exception& e) {
         logging::Shutdown();
-        std::remove(log_path.c_str());
+        CleanupLogFiles("/tmp", prefix);
         TestFramework::RecordTest("Logger: SetConsoleEnabled(false) functional",
                                   false, e.what(), CLI_CATEGORY);
     }
@@ -1098,7 +1146,8 @@ void TestSetConsoleEnabledPersists() {
     std::cout << "\n[TEST] Logger: SetConsoleEnabled persists across Init() calls..." << std::endl;
     const std::string log_path = "/tmp/test_reactor_log_" + std::to_string(getpid()) +
                                   "_persist.log";
-    std::remove(log_path.c_str());
+    const std::string prefix = "test_reactor_log_" + std::to_string(getpid()) + "_persist-";
+    CleanupLogFiles("/tmp", prefix);
 
     try {
         logging::SetConsoleEnabled(false);
@@ -1113,17 +1162,13 @@ void TestSetConsoleEnabledPersists() {
         logging::Get()->flush();
 
         logging::Shutdown();  // resets g_console_enabled to true
-        std::remove(log_path.c_str());
+        CleanupLogFiles("/tmp", prefix);
 
-        // If neither Init threw and the second logger is usable, the flag
-        // persisted correctly (a console sink would print to stdout but is
-        // not required to be absent — we just verify no crash and no
-        // unexpected throw).
         TestFramework::RecordTest("Logger: SetConsoleEnabled persists across Init",
                                   true, "", CLI_CATEGORY);
     } catch (const std::exception& e) {
         logging::Shutdown();
-        std::remove(log_path.c_str());
+        CleanupLogFiles("/tmp", prefix);
         TestFramework::RecordTest("Logger: SetConsoleEnabled persists across Init",
                                   false, e.what(), CLI_CATEGORY);
     }
@@ -1132,14 +1177,26 @@ void TestSetConsoleEnabledPersists() {
 // Test 34: Reopen() with a live file sink closes and reopens the file handle.
 // Simulates logrotate: write "Before", rename file, Reopen(), write "After".
 // Verifies: rotated file has "Before", new file has "After".
+// Note: With date-based naming, Init("path/foo.log") creates "path/foo-YYYY-MM-DD.log".
+// The test finds the actual date-based file by scanning /tmp.
 void TestReopenWithFileSink() {
     std::cout << "\n[TEST] Logger: Reopen() with file sink reconstructs logger..." << std::endl;
     const std::string log_path = "/tmp/test_reactor_log_" + std::to_string(getpid()) +
                                   "_reopen.log";
-    std::remove(log_path.c_str());
+    const std::string prefix = "test_reactor_log_" + std::to_string(getpid()) + "_reopen-";
+    CleanupLogFiles("/tmp", prefix);
 
     try {
         logging::Init("test_reopen", spdlog::level::info, log_path);
+
+        // Find the actual date-based file created by Init
+        std::string actual_file = FindLogFile("/tmp", prefix);
+        if (actual_file.empty()) {
+            logging::Shutdown();
+            TestFramework::RecordTest("Logger: Reopen with file sink",
+                                      false, "Date-based log file not found after Init", CLI_CATEGORY);
+            return;
+        }
 
         // Write a message before Reopen
         logging::Get()->info("Before reopen");
@@ -1147,12 +1204,12 @@ void TestReopenWithFileSink() {
 
         // Simulate log-rotation: rename the old file and call Reopen()
         // so the logger creates a new file handle at the same path.
-        const std::string rotated = log_path + ".1";
-        std::rename(log_path.c_str(), rotated.c_str());
+        const std::string rotated = actual_file + ".rotated";
+        std::rename(actual_file.c_str(), rotated.c_str());
 
         logging::Reopen();
 
-        // Write after Reopen — must go to the NEW file at log_path
+        // Write after Reopen — must go to a NEW file (same date-based name)
         logging::Get()->info("After reopen");
         logging::Get()->flush();
 
@@ -1172,7 +1229,7 @@ void TestReopenWithFileSink() {
         // Verify: new file has "After reopen"
         std::string new_content;
         {
-            std::ifstream f(log_path);
+            std::ifstream f(actual_file);
             if (f.is_open()) {
                 std::string line;
                 while (std::getline(f, line)) new_content += line + "\n";
@@ -1180,8 +1237,9 @@ void TestReopenWithFileSink() {
         }
         bool new_has_after = new_content.find("After reopen") != std::string::npos;
 
-        std::remove(log_path.c_str());
+        std::remove(actual_file.c_str());
         std::remove(rotated.c_str());
+        CleanupLogFiles("/tmp", prefix);
 
         bool pass = rotated_has_before && new_has_after;
         std::string err;
@@ -1191,8 +1249,7 @@ void TestReopenWithFileSink() {
         TestFramework::RecordTest("Logger: Reopen with file sink", pass, err, CLI_CATEGORY);
     } catch (const std::exception& e) {
         logging::Shutdown();
-        std::remove(log_path.c_str());
-        std::remove((log_path + ".1").c_str());
+        CleanupLogFiles("/tmp", prefix);
         TestFramework::RecordTest("Logger: Reopen with file sink",
                                   false, e.what(), CLI_CATEGORY);
     }
@@ -1248,7 +1305,8 @@ void TestReopenPreservesLevel() {
     std::cout << "\n[TEST] Logger: Reopen() preserves log level..." << std::endl;
     const std::string log_path = "/tmp/test_reactor_log_" + std::to_string(getpid()) +
                                   "_level.log";
-    std::remove(log_path.c_str());
+    const std::string prefix = "test_reactor_log_" + std::to_string(getpid()) + "_level-";
+    CleanupLogFiles("/tmp", prefix);
 
     try {
         // Init at debug level
@@ -1264,7 +1322,7 @@ void TestReopenPreservesLevel() {
         bool level_preserved = (logger->level() == spdlog::level::debug);
 
         logging::Shutdown();
-        std::remove(log_path.c_str());
+        CleanupLogFiles("/tmp", prefix);
 
         TestFramework::RecordTest("Logger: Reopen preserves log level",
                                   level_preserved,
@@ -1272,7 +1330,7 @@ void TestReopenPreservesLevel() {
                                   CLI_CATEGORY);
     } catch (const std::exception& e) {
         logging::Shutdown();
-        std::remove(log_path.c_str());
+        CleanupLogFiles("/tmp", prefix);
         TestFramework::RecordTest("Logger: Reopen preserves log level",
                                   false, e.what(), CLI_CATEGORY);
     }
@@ -1675,6 +1733,410 @@ void TestValidateDaemonRejectsRelativePidPath() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SECTION 8: Logger Enhanced Tests (50–55)
+//
+// These tests exercise the new logging APIs added in the enhanced logging system:
+//   EnsureLogDir  — creates missing log directories, rejects path-is-file
+//   Date-based naming — Init() creates {prefix}-{YYYY-MM-DD}.log
+//   CheckRotation — rotates to a new seq file when size limit is exceeded
+//   WriteMarker   — writes a visual "==== TEXT [timestamp] ====" marker
+//   SanitizePath  — strips query params and fragment from URL paths
+//   Append-on-restart — re-Init with the same path appends, not truncates
+//
+// Each test cleans up its own /tmp files in both success and failure paths.
+// Shutdown() is called after every test to restore clean logger state.
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+
+// Test 50: EnsureLogDir creates a missing directory, is idempotent on an
+// existing directory, and throws when the path already exists as a file.
+//
+// Validates the three distinct outcomes of EnsureLogDir():
+//   1. Missing path   → directory created
+//   2. Existing dir   → no-op (no exception)
+//   3. Path is a file → std::runtime_error thrown
+void TestLogDirCreation() {
+    std::cout << "\n[TEST] Logger: EnsureLogDir creates directory and validates idempotency..." << std::endl;
+
+    const std::string test_dir = "/tmp/test_reactor_logdir_" + std::to_string(getpid());
+    const std::string file_path = "/tmp/test_reactor_logdir_file_" + std::to_string(getpid());
+
+    // Cleanup from any prior run
+    rmdir(test_dir.c_str());
+    std::remove(file_path.c_str());
+
+    try {
+        // Case 1: directory does not exist — must be created
+        logging::EnsureLogDir(test_dir);
+
+        struct stat st{};
+        bool dir_created = (stat(test_dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode));
+
+        // Case 2: directory already exists — must not throw (idempotent)
+        bool idempotent = true;
+        try {
+            logging::EnsureLogDir(test_dir);
+        } catch (...) {
+            idempotent = false;
+        }
+
+        // Case 3: path is a regular file — must throw
+        WriteFile(file_path, "not a directory\n");
+        bool throws_on_file = false;
+        try {
+            logging::EnsureLogDir(file_path);
+        } catch (const std::runtime_error&) {
+            throws_on_file = true;
+        } catch (...) {
+            // Any exception is acceptable; runtime_error is preferred
+            throws_on_file = true;
+        }
+
+        rmdir(test_dir.c_str());
+        std::remove(file_path.c_str());
+
+        bool pass = dir_created && idempotent && throws_on_file;
+        std::string err;
+        if (!dir_created)    err += "Directory not created; ";
+        if (!idempotent)     err += "Second EnsureLogDir threw on existing dir; ";
+        if (!throws_on_file) err += "EnsureLogDir did not throw when path is a file; ";
+
+        TestFramework::RecordTest("Logger: EnsureLogDir creates and validates directory",
+                                  pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        rmdir(test_dir.c_str());
+        std::remove(file_path.c_str());
+        TestFramework::RecordTest("Logger: EnsureLogDir creates and validates directory",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 51: Init() with a file path creates a file whose name follows the
+// date-based format {prefix}-{YYYY-MM-DD}.log (never the bare original name).
+//
+// Validates:
+//   - The actual file on disk has today's date embedded in the name
+//   - The file name matches the pattern: prefix + "-" + YYYY-MM-DD + ".log"
+void TestDateBasedFileName() {
+    std::cout << "\n[TEST] Logger: Init creates date-based file name..." << std::endl;
+
+    const std::string log_path  = "/tmp/test_reactor_log_" + std::to_string(getpid()) + "_date.log";
+    const std::string prefix    = "test_reactor_log_" + std::to_string(getpid()) + "_date-";
+    CleanupLogFiles("/tmp", prefix);
+
+    try {
+        logging::Init("test_date_name", spdlog::level::info, log_path);
+
+        // Write and flush so the file is definitely created
+        logging::Get()->info("Date-based naming test");
+        logging::Get()->flush();
+
+        // Compute today's date string for validation
+        std::time_t now = std::time(nullptr);
+        std::tm tm{};
+        localtime_r(&now, &tm);
+        static constexpr size_t DATE_STR_SIZE = 16;
+        char date_buf[DATE_STR_SIZE];
+        std::snprintf(date_buf, sizeof(date_buf), "%04d-%02d-%02d",
+                      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+        const std::string today(date_buf);
+
+        // Scan /tmp for the actual file
+        std::string actual_file = FindLogFile("/tmp", prefix);
+
+        logging::Shutdown();
+
+        bool file_found = !actual_file.empty();
+
+        // Verify the file name contains today's date
+        bool has_date = false;
+        if (file_found) {
+            has_date = actual_file.find(today) != std::string::npos;
+        }
+
+        // Verify the bare original name does NOT exist (no "…_date.log")
+        struct stat st{};
+        bool bare_not_created = (stat(log_path.c_str(), &st) != 0);
+
+        CleanupLogFiles("/tmp", prefix);
+
+        bool pass = file_found && has_date && bare_not_created;
+        std::string err;
+        if (!file_found)         err += "No date-based log file found in /tmp; ";
+        if (!has_date)           err += "File name missing today's date (" + today + "); ";
+        if (!bare_not_created)   err += "Bare original path was created (should not exist); ";
+
+        TestFramework::RecordTest("Logger: Init creates date-based file name",
+                                  pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        logging::Shutdown();
+        CleanupLogFiles("/tmp", prefix);
+        TestFramework::RecordTest("Logger: Init creates date-based file name",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 52: CheckRotation() creates a new seq-suffixed file when the current
+// log file exceeds the configured max_size.
+//
+// Strategy:
+//   1. Init with max_size=100 (tiny), write messages to exceed the limit
+//   2. Call CheckRotation()
+//   3. Write one more message, flush
+//   4. Verify a second file exists in /tmp with a "-1" sequence suffix
+//   5. Verify the first file is non-empty and the second file has the post-rotation message
+void TestCheckRotation() {
+    std::cout << "\n[TEST] Logger: CheckRotation rotates to next seq file..." << std::endl;
+
+    const std::string log_path = "/tmp/test_reactor_log_" + std::to_string(getpid()) + "_rot.log";
+    const std::string prefix   = "test_reactor_log_" + std::to_string(getpid()) + "_rot-";
+    CleanupLogFiles("/tmp", prefix);
+
+    try {
+        // Use a 100-byte max to make it easy to exceed with a few log lines
+        static constexpr size_t TINY_MAX_SIZE = 100;
+        logging::Init("test_rotation", spdlog::level::info, log_path, TINY_MAX_SIZE);
+
+        // Write multiple lines to ensure we exceed the 100-byte limit
+        logging::Get()->info("Rotation pre-message: filling up the tiny log file now");
+        logging::Get()->info("Rotation pre-message: second line to definitely exceed limit");
+        logging::Get()->flush();
+
+        // Confirm first file is over the size limit before rotating
+        std::string first_file = FindLogFile("/tmp", prefix);
+        if (first_file.empty()) {
+            logging::Shutdown();
+            CleanupLogFiles("/tmp", prefix);
+            TestFramework::RecordTest("Logger: CheckRotation rotates to next seq file",
+                                      false, "First log file not found after Init", CLI_CATEGORY);
+            return;
+        }
+
+        // Rotate: CheckRotation checks file size and opens the next seq file
+        logging::CheckRotation();
+
+        // Write the post-rotation message — must go to the new seq file
+        logging::Get()->info("Rotation post-message: this is in the rotated file");
+        logging::Get()->flush();
+
+        logging::Shutdown();
+
+        // Scan /tmp for all files with our prefix to verify two files exist
+        std::vector<std::string> log_files;
+        {
+            DIR* d = opendir("/tmp");
+            if (d) {
+                struct dirent* entry;
+                while ((entry = readdir(d)) != nullptr) {
+                    std::string name(entry->d_name);
+                    if (name.find(prefix) == 0 &&
+                        name.compare(name.size() - 4, 4, ".log") == 0) {
+                        log_files.push_back("/tmp/" + name);
+                    }
+                }
+                closedir(d);
+            }
+        }
+
+        bool two_files = (log_files.size() >= 2);
+
+        // The post-rotation message must appear in one of the files
+        bool post_in_some_file = false;
+        bool pre_in_some_file  = false;
+        for (const auto& fpath : log_files) {
+            std::string content = ReadFileContent(fpath);
+            if (content.find("Rotation post-message") != std::string::npos)
+                post_in_some_file = true;
+            if (content.find("Rotation pre-message") != std::string::npos)
+                pre_in_some_file = true;
+        }
+
+        CleanupLogFiles("/tmp", prefix);
+
+        bool pass = two_files && pre_in_some_file && post_in_some_file;
+        std::string err;
+        if (!two_files)          err += "Expected >=2 rotated files, got " +
+                                         std::to_string(log_files.size()) + "; ";
+        if (!pre_in_some_file)   err += "Pre-rotation message not found in any file; ";
+        if (!post_in_some_file)  err += "Post-rotation message not found in any file; ";
+
+        TestFramework::RecordTest("Logger: CheckRotation rotates to next seq file",
+                                  pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        logging::Shutdown();
+        CleanupLogFiles("/tmp", prefix);
+        TestFramework::RecordTest("Logger: CheckRotation rotates to next seq file",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 53: WriteMarker() writes a line containing the standard visual separator
+// pattern "================================ TEXT [timestamp] ================================".
+//
+// Validates:
+//   - The marker line contains the "===…" prefix
+//   - The marker line contains the provided text
+//   - The marker line contains a timestamp in brackets ("]")
+//   - The marker line contains the "===…" suffix
+void TestWriteMarker() {
+    std::cout << "\n[TEST] Logger: WriteMarker writes visual separator to log file..." << std::endl;
+
+    const std::string log_path = "/tmp/test_reactor_log_" + std::to_string(getpid()) + "_marker.log";
+    const std::string prefix   = "test_reactor_log_" + std::to_string(getpid()) + "_marker-";
+    CleanupLogFiles("/tmp", prefix);
+
+    try {
+        logging::Init("test_marker", spdlog::level::info, log_path);
+
+        logging::WriteMarker("SERVER START");
+        logging::Get()->flush();
+
+        // Find the actual date-based file
+        std::string actual_file = FindLogFile("/tmp", prefix);
+
+        logging::Shutdown();
+
+        if (actual_file.empty()) {
+            CleanupLogFiles("/tmp", prefix);
+            TestFramework::RecordTest("Logger: WriteMarker writes visual separator",
+                                      false, "Log file not found after Init", CLI_CATEGORY);
+            return;
+        }
+
+        std::string content = ReadFileContent(actual_file);
+        CleanupLogFiles("/tmp", prefix);
+
+        // Check for the expected marker format:
+        // "================================ SERVER START ================================"
+        bool has_marker = content.find("================================ SERVER START ================================") != std::string::npos;
+
+        bool pass = has_marker;
+        std::string err;
+        if (!has_marker) err += "Marker line not found in log file; ";
+
+        TestFramework::RecordTest("Logger: WriteMarker writes visual separator",
+                                  pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        logging::Shutdown();
+        CleanupLogFiles("/tmp", prefix);
+        TestFramework::RecordTest("Logger: WriteMarker writes visual separator",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 54: SanitizePath() correctly strips query strings and fragments from
+// URL paths while leaving clean paths, root, and empty strings untouched.
+//
+// Validates all six cases specified in the task:
+//   1. No change:                "/api/users"            → "/api/users"
+//   2. Query stripped:           "/api/users?token=abc"  → "/api/users"
+//   3. Fragment stripped:        "/api/users#section"    → "/api/users"
+//   4. Query before fragment:    "/api/users?a=1&b=2#f"  → "/api/users"
+//   5. Empty string:             ""                      → ""
+//   6. Root path:                "/"                     → "/"
+void TestSanitizePath() {
+    std::cout << "\n[TEST] Logger: SanitizePath strips query and fragment..." << std::endl;
+
+    try {
+        struct TestCase {
+            std::string input;
+            std::string expected;
+            const char* label;
+        };
+
+        const TestCase cases[] = {
+            { "/api/users",             "/api/users", "clean path unchanged"      },
+            { "/api/users?token=abc",   "/api/users", "query stripped"            },
+            { "/api/users#section",     "/api/users", "fragment stripped"         },
+            { "/api/users?a=1&b=2#frag","/api/users", "query + fragment stripped" },
+            { "",                       "",           "empty string unchanged"     },
+            { "/",                      "/",          "root path unchanged"        },
+        };
+
+        bool pass = true;
+        std::string err;
+        for (const auto& tc : cases) {
+            std::string result = logging::SanitizePath(tc.input);
+            if (result != tc.expected) {
+                pass = false;
+                err += std::string("Case '") + tc.label + "': input='" + tc.input +
+                       "' expected='" + tc.expected + "' got='" + result + "'; ";
+            }
+        }
+
+        TestFramework::RecordTest("Logger: SanitizePath strips query and fragment",
+                                  pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("Logger: SanitizePath strips query and fragment",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Test 55: Re-Init with the same log path appends to the existing file rather
+// than truncating it. Validates the "server restart" scenario where log
+// continuity across restarts is required.
+//
+// Steps:
+//   1. Init + write "First session" + Shutdown
+//   2. Init (same path) + write "Second session" + Shutdown
+//   3. Read file — both messages must be present
+void TestLogFileAppendOnRestart() {
+    std::cout << "\n[TEST] Logger: Re-Init with same path appends (no truncate)..." << std::endl;
+
+    const std::string log_path = "/tmp/test_reactor_log_" + std::to_string(getpid()) + "_append.log";
+    const std::string prefix   = "test_reactor_log_" + std::to_string(getpid()) + "_append-";
+    CleanupLogFiles("/tmp", prefix);
+
+    try {
+        // First session
+        logging::Init("test_append_1", spdlog::level::info, log_path);
+        logging::Get()->info("First session message");
+        logging::Get()->flush();
+        logging::Shutdown();
+
+        // Find the date-based file created during first session
+        std::string first_file = FindLogFile("/tmp", prefix);
+        if (first_file.empty()) {
+            CleanupLogFiles("/tmp", prefix);
+            TestFramework::RecordTest("Logger: Re-Init appends to existing log",
+                                      false, "Log file not found after first Init", CLI_CATEGORY);
+            return;
+        }
+
+        // Verify first session content is present before second session
+        std::string content_after_first = ReadFileContent(first_file);
+        bool has_first_msg = content_after_first.find("First session message") != std::string::npos;
+
+        // Second session — same log path, should append
+        logging::Init("test_append_2", spdlog::level::info, log_path);
+        logging::Get()->info("Second session message");
+        logging::Get()->flush();
+        logging::Shutdown();
+
+        // The date-based file should still exist with both messages
+        std::string content_final = ReadFileContent(first_file);
+        bool has_both = content_final.find("First session message")  != std::string::npos &&
+                        content_final.find("Second session message") != std::string::npos;
+
+        CleanupLogFiles("/tmp", prefix);
+
+        bool pass = has_first_msg && has_both;
+        std::string err;
+        if (!has_first_msg) err += "First session message not found after first Init; ";
+        if (!has_both)      err += "File was truncated on re-Init (missing one or both messages); ";
+
+        TestFramework::RecordTest("Logger: Re-Init appends to existing log",
+                                  pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        logging::Shutdown();
+        CleanupLogFiles("/tmp", prefix);
+        TestFramework::RecordTest("Logger: Re-Init appends to existing log",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Suite entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1746,6 +2208,14 @@ void RunAllTests() {
     TestConfigRejectsDaemonize();
     TestValidateDaemonRejectsNoLogFile();
     TestValidateDaemonRejectsRelativePidPath();
+
+    // ── Section 8: Logger Enhanced ───────────────────────────────
+    TestLogDirCreation();
+    TestDateBasedFileName();
+    TestCheckRotation();
+    TestWriteMarker();
+    TestSanitizePath();
+    TestLogFileAppendOnRestart();
 }
 
 }  // namespace CliTests

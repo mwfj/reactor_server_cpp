@@ -360,6 +360,7 @@ void Dispatcher::TimerHandler(){
 
         // Close timed-out connections.
         for(auto& conn : timed_out_conns){
+            logging::Get()->debug("Connection timed out fd={}", conn->fd());
             if (conn->IsClosing() || conn->IsCloseDeferred()) {
                 // Already closing (previous timeout triggered CloseAfterWrite but flush stalled).
                 // Force close now — the buffered response will never drain.

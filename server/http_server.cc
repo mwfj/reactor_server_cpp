@@ -360,6 +360,7 @@ void HttpServer::WaitForH2Drain() {
     });
 
     if (!h2_draining_.empty()) {
+        logging::Get()->warn("H2 drain timeout, force-closing remaining connections");
         // Timeout: force-close remaining. Move to local to avoid holding
         // drain_mtx_ during ForceClose (prevents lock coupling with late callbacks).
         auto remaining = std::move(h2_draining_);
@@ -433,7 +434,10 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
     // RegisterCallbacks enabling epoll and new_conn_callback running here),
     // skip entirely. Inserting a handler for a closed connection would leave
     // stale state in http_connections_ (potentially under fd -1 after ReleaseFd).
-    if (conn->IsClosing()) return;
+    if (conn->IsClosing()) {
+        logging::Get()->debug("New connection already closing fd={}, skipping", conn->fd());
+        return;
+    }
 
     if (http2_enabled_) {
         // Guard against accept/data race: if HandleMessage already ran and
@@ -447,6 +451,7 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                     return;  // Already initialized by HandleMessage
                 }
                 // Stale handler from fd reuse — evict
+                logging::Get()->debug("Evicted stale H2 handler fd={}", conn->fd());
                 h2_connections_.erase(h2_it);
             }
             auto h1_it = http_connections_.find(conn->fd());
@@ -455,6 +460,7 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                     return;  // Already initialized by HandleMessage
                 }
                 // Stale handler from fd reuse — save for WS close, then evict
+                logging::Get()->debug("Evicted stale handler fd={}", conn->fd());
                 stale_h1 = std::move(h1_it->second);
                 http_connections_.erase(h1_it);
             }
@@ -689,6 +695,7 @@ bool HttpServer::DetectAndRouteProtocol(
     if (proto == ProtocolDetector::Protocol::HTTP2) {
         // Skip if connection is fully closing (not just peer half-close)
         if (conn->IsClosing()) return true;
+        logging::Get()->debug("Protocol detected: HTTP/2 fd={}", conn->fd());
         // Create HTTP/2 handler
         auto h2_conn = std::make_shared<Http2ConnectionHandler>(conn, h2_settings_);
         SetupH2Handlers(h2_conn);
@@ -705,6 +712,7 @@ bool HttpServer::DetectAndRouteProtocol(
     }
 
     // HTTP/1.x — create handler (existing path)
+    logging::Get()->debug("Protocol detected: HTTP/1.x fd={}", conn->fd());
     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
     SetupHandlers(http_conn);
     {

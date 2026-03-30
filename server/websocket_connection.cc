@@ -1,5 +1,6 @@
 #include "ws/websocket_connection.h"
 #include "ws/utf8_validate.h"
+#include "log/logger.h"
 
 WebSocketConnection::WebSocketConnection(std::shared_ptr<ConnectionHandler> conn)
     : conn_(std::move(conn)) {}
@@ -16,6 +17,7 @@ void WebSocketConnection::SendText(const std::string& message) {
     // Validate outbound text to prevent emitting protocol-invalid frames
     // that would cause compliant clients to close with 1007.
     if (!IsValidUtf8(message)) {
+        logging::Get()->warn("WS outbound text not valid UTF-8 fd={}", fd());
         if (callbacks_.error_callback) callbacks_.error_callback(*this, "Outbound text message is not valid UTF-8");
         return;
     }
@@ -37,6 +39,7 @@ void WebSocketConnection::SendClose(uint16_t code, const std::string& reason) {
     close_sent_ = true;
     sent_close_code_ = code;
     sent_close_reason_ = reason;
+    logging::Get()->debug("WS close sent fd={} code={}", fd(), code);
     SendFrame(WebSocketFrame::CloseFrame(code, reason));
     // Keep is_open_ true so OnRawData can receive the peer's Close reply.
     // Arm a deadline — if the peer doesn't reply within this window, the
@@ -69,6 +72,7 @@ int WebSocketConnection::fd() const {
 void WebSocketConnection::NotifyTransportClose() {
     if (!is_open_) return;
     is_open_ = false;
+    logging::Get()->debug("WS transport close fd={}", fd());
     // Always report 1006 (Abnormal Closure) for transport-level disconnects.
     // Even if we sent a Close frame, the peer never completed the handshake
     // (no Close reply received), so RFC 6455 classifies this as abnormal.
@@ -90,16 +94,17 @@ void WebSocketConnection::OnRawData(const std::string& data) {
 
     if (parser_.HasError() && is_open_) {
         if (!close_sent_) {
+            std::string error_message = parser_.GetError();
+            logging::Get()->warn("WS parser error fd={}: {}", fd(), error_message);
             if (callbacks_.error_callback) {
-                callbacks_.error_callback(*this, parser_.GetError());
+                callbacks_.error_callback(*this, error_message);
             }
             // Use the correct close code based on the error type
-            std::string err_msg = parser_.GetError();
             uint16_t close_code = 1002;  // Default: protocol error
-            if (err_msg.find("exceeds maximum size") != std::string::npos) {
+            if (error_message.find("exceeds maximum size") != std::string::npos) {
                 close_code = 1009;  // Message Too Big
             }
-            SendClose(close_code, err_msg.substr(0, 123));
+            SendClose(close_code, error_message.substr(0, 123));
         }
         // Reset the parser to prevent unbounded buffer growth.
         // Parse() appends to buffer_ before checking has_error_, so without
@@ -129,6 +134,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             // IMPORTANT: Receiving a new Text/Binary frame while in_fragment_ is true
             // is a protocol error per RFC 6455 -- send Close(1002) and return
             if (in_fragment_) {
+                logging::Get()->warn("WS protocol error fd={}: interleaved data frames", fd());
                 if (callbacks_.error_callback) {
                     callbacks_.error_callback(*this, "New data frame received during fragmented message");
                 }
@@ -140,6 +146,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 // Complete single-frame message
                 // RFC 6455 §5.6: text frames must contain valid UTF-8
                 if (frame.opcode == WebSocketOpcode::Text && !IsValidUtf8(frame.payload)) {
+                    logging::Get()->warn("WS invalid UTF-8 in text frame fd={}", fd());
                     if (callbacks_.error_callback) callbacks_.error_callback(*this, "Invalid UTF-8 in text message");
                     SendClose(1007, "Invalid UTF-8");
                     return;
@@ -151,6 +158,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             } else {
                 // First fragment
                 if (max_message_size_ > 0 && frame.payload.size() > max_message_size_) {
+                    logging::Get()->warn("WS message too big fd={}", fd());
                     if (callbacks_.error_callback) callbacks_.error_callback(*this, "Message exceeds maximum size");
                     SendClose(1009, "Message too big");
                     in_fragment_ = false;
@@ -172,6 +180,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             }
             if (max_message_size_ > 0 &&
                 fragment_buffer_.size() + frame.payload.size() > max_message_size_) {
+                logging::Get()->warn("WS message too big fd={}", fd());
                 if (callbacks_.error_callback) callbacks_.error_callback(*this, "Message exceeds maximum size");
                 SendClose(1009, "Message too big");
                 in_fragment_ = false;
@@ -182,6 +191,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             if (frame.fin) {
                 // RFC 6455 §5.6: validate reassembled text messages
                 if (fragment_opcode_ == WebSocketOpcode::Text && !IsValidUtf8(fragment_buffer_)) {
+                    logging::Get()->warn("WS invalid UTF-8 in text frame fd={}", fd());
                     if (callbacks_.error_callback) callbacks_.error_callback(*this, "Invalid UTF-8 in text message");
                     SendClose(1007, "Invalid UTF-8");
                     in_fragment_ = false;
@@ -201,6 +211,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
         case WebSocketOpcode::Close: {
             // RFC 6455 §7.1.5: close body must be 0 bytes or >= 2 bytes
             if (frame.payload.size() == 1) {
+                logging::Get()->warn("WS invalid close frame fd={}: 1-byte payload", fd());
                 if (callbacks_.error_callback) callbacks_.error_callback(*this, "Invalid close frame: 1-byte payload");
                 // Set is_open_ = false BEFORE SendClose so that if the send
                 // fails synchronously (→ CallCloseCb → NotifyTransportClose),
@@ -242,6 +253,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
             }
             // RFC 6455 §7.1.6: close reason must be valid UTF-8
             if (!reason.empty() && !IsValidUtf8(reason)) {
+                logging::Get()->warn("WS invalid UTF-8 in close reason fd={}", fd());
                 if (callbacks_.error_callback) callbacks_.error_callback(*this, "Close reason is not valid UTF-8");
                 is_open_ = false;
                 SendClose(1007, "Invalid UTF-8 in close reason");
@@ -256,6 +268,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                 code = 1002;
                 reason = "Invalid close code";
             }
+            logging::Get()->debug("WS close received fd={} code={}", fd(), code);
             // Set is_open_ = false BEFORE sending the reply so that a
             // synchronous send failure (→ NotifyTransportClose) is a no-op,
             // preventing duplicate close callbacks.

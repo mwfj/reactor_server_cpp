@@ -155,6 +155,28 @@ static int HandleStart(const CliOptions& options) {
     int rc = LoadConfig(config, options);
     if (rc != EXIT_OK) return rc;
 
+    // Default log file for production server when not explicitly configured
+    if (config.log.file.empty()) {
+        config.log.file = "logs/reactor.log";
+    }
+
+    // Ensure log directory exists before any logging::Init call
+    {
+        std::string log_dir;
+        auto last_slash = config.log.file.rfind('/');
+        if (last_slash != std::string::npos) {
+            log_dir = config.log.file.substr(0, last_slash);
+        }
+        if (!log_dir.empty()) {
+            try {
+                logging::EnsureLogDir(log_dir);
+            } catch (const std::exception& e) {
+                std::cerr << "Error: " << e.what() << "\n";
+                return EXIT_ERROR;
+            }
+        }
+    }
+
     // ── Daemon pre-validation ───────────────────────────────
     if (options.daemonize) {
         rc = ValidateDaemonConfig(config, options);
@@ -294,9 +316,12 @@ static int HandleStart(const CliOptions& options) {
 
     // ── Signal loop ─────────────────────────────────────────
     logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
+    logging::WriteMarker("SERVER START");
     while (true) {
         SignalResult sig = SignalHandler::WaitForSignal();
         if (sig == SignalResult::SHUTDOWN) break;
+        // Check log file size rotation on each signal
+        logging::CheckRotation();
         // SIGHUP received
         if (options.daemonize) {
             // Daemon mode: reopen log files for rotation
@@ -317,6 +342,7 @@ static int HandleStart(const CliOptions& options) {
     }
 
     // ── Shutdown ────────────────────────────────────────────
+    logging::WriteMarker("SERVER STOP");
     logging::Get()->info("{} shutting down...", REACTOR_SERVER_NAME);
     server->Stop();
 

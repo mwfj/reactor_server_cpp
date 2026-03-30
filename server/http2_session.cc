@@ -70,6 +70,8 @@ static int OnBeginHeadersCallback(
         bool shutdown_in_progress = self->IsGoawaySent() ||
             owner_shutting_down;
         if (shutdown_in_progress) {
+            logging::Get()->debug("H2 stream {} rejected during shutdown fd={}",
+                                  frame->hd.stream_id, self->GetConnection()->fd());
             nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                       frame->hd.stream_id, NGHTTP2_REFUSED_STREAM);
             return 0;
@@ -79,6 +81,8 @@ static int OnBeginHeadersCallback(
         int32_t stream_id = frame->hd.stream_id;
         auto* stream = self->CreateStream(stream_id);
         if (!stream) {
+            logging::Get()->error("H2 failed to create stream {} fd={}",
+                                  stream_id, self->GetConnection()->fd());
             return NGHTTP2_ERR_CALLBACK_FAILURE;
         }
         stream->SetState(Http2Stream::State::OPEN);
@@ -113,7 +117,11 @@ static int OnHeaderCallback(
     // Skip remaining headers if this stream was already rejected (RST queued).
     // Without this, a malformed HEADERS block continues accumulating strings
     // past the configured limit until the block ends.
-    if (stream->IsRejected()) return 0;
+    if (stream->IsRejected()) {
+        logging::Get()->debug("H2 stream {} rejected, skipping header fd={}",
+                              frame->hd.stream_id, self->GetConnection()->fd());
+        return 0;
+    }
 
     // Enforce max_header_list_size on ALL header frames (request + trailers).
     // RFC 7541 Section 4.1: entry size = name + value + 32.
@@ -404,6 +412,9 @@ static int OnFrameRecvCallback(
         }
         break;
     }
+    case NGHTTP2_GOAWAY:
+        logging::Get()->info("H2 received GOAWAY fd={}", self->GetConnection()->fd());
+        break;
     default:
         break;
     }
@@ -803,6 +814,7 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
 void Http2Session::SendGoaway(uint32_t error_code) {
     if (goaway_sent_) return;
     goaway_sent_ = true;
+    logging::Get()->info("H2 sending GOAWAY fd={}", conn_->fd());
 
     nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
                           last_stream_id_, error_code,

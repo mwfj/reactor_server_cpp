@@ -1,4 +1,5 @@
 #include "http2/http2_stream.h"
+#include "log/logger.h"
 #include <algorithm>
 
 // Case-insensitive hostname comparison for :authority vs host.
@@ -57,15 +58,22 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
         // regular header fields. A pseudo-header after a regular header
         // is malformed.
         if (seen_regular_header_) {
+            logging::Get()->debug("H2 stream {} late pseudo-header: {}", stream_id_, name);
             return -1;  // Late pseudo-header
         }
 
         if (name == ":method") {
-            if (has_method_) return -1;  // Duplicate
+            if (has_method_) {
+                logging::Get()->debug("H2 stream {} duplicate pseudo-header: {}", stream_id_, name);
+                return -1;  // Duplicate
+            }
             has_method_ = true;
             request_.method = value;
         } else if (name == ":path") {
-            if (has_path_) return -1;  // Duplicate
+            if (has_path_) {
+                logging::Get()->debug("H2 stream {} duplicate pseudo-header: {}", stream_id_, name);
+                return -1;  // Duplicate
+            }
             has_path_ = true;
             request_.url = value;
             // Split path and query
@@ -78,16 +86,23 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
                 request_.query.clear();
             }
         } else if (name == ":authority") {
-            if (has_authority_) return -1;  // Duplicate
+            if (has_authority_) {
+                logging::Get()->debug("H2 stream {} duplicate pseudo-header: {}", stream_id_, name);
+                return -1;  // Duplicate
+            }
             has_authority_ = true;
             authority_ = value;
             request_.headers["host"] = value;
         } else if (name == ":scheme") {
-            if (has_scheme_) return -1;  // Duplicate
+            if (has_scheme_) {
+                logging::Get()->debug("H2 stream {} duplicate pseudo-header: {}", stream_id_, name);
+                return -1;  // Duplicate
+            }
             has_scheme_ = true;
             scheme_ = value;
         } else {
             // Unknown pseudo-header — malformed per RFC 9113 Section 8.3
+            logging::Get()->debug("H2 stream {} unknown pseudo-header: {}", stream_id_, name);
             return -1;
         }
         return 0;
@@ -118,6 +133,7 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
     // - Duplicate host headers (without :authority) rejected below as singleton
     if (lower_name == "host" && has_authority_) {
         if (!AuthorityMatch(authority_, value)) {
+            logging::Get()->debug("H2 stream {} conflicting :authority and host", stream_id_);
             return -1;  // Malformed: conflicting :authority and host
         }
         return 0;  // Matches :authority — already set, skip
@@ -134,6 +150,8 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
         if (lower_name == "host" || lower_name == "authorization" ||
             lower_name == "content-type" ||
             lower_name == "content-range" || lower_name == "content-disposition") {
+            logging::Get()->debug("H2 stream {} duplicate singleton header: {}",
+                                  stream_id_, name);
             return -1;
         }
         // content-length: don't reject here — reconciliation below allows
@@ -159,11 +177,13 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
         try {
             size_t new_cl = std::stoull(value);
             if (has_content_length_ && request_.content_length != new_cl) {
+                logging::Get()->debug("H2 stream {} invalid content-length", stream_id_);
                 return -1;  // Conflicting content-length values
             }
             request_.content_length = new_cl;
             has_content_length_ = true;
         } catch (...) {
+            logging::Get()->debug("H2 stream {} invalid content-length", stream_id_);
             return -1;  // Overflow or other parse error
         }
     }

@@ -2,7 +2,6 @@
 
 #include "spdlog/spdlog.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
-#include "spdlog/sinks/rotating_file_sink.h"
 #include "spdlog/sinks/basic_file_sink.h"
 
 #include <string>
@@ -13,9 +12,11 @@ namespace logging {
 // Initialize the logging system.
 // @param name     Logger name (appears in log output)
 // @param level    Minimum log level (default: info)
-// @param log_file Optional log file path for rotating file sink
+// @param log_file Log file path. Uses date-based naming:
+//                 {dir}/{prefix}-{YYYY-MM-DD}[-{seq}].log
+//                 Empty string = console only.
 // @param max_size Maximum size of each log file in bytes (default: 10MB)
-// @param max_files Maximum number of rotated log files (default: 3)
+// @param max_files Maximum number of rotated files per day (default: 3)
 void Init(const std::string& name = "reactor",
           spdlog::level::level_enum level = spdlog::level::info,
           const std::string& log_file = "",
@@ -42,6 +43,18 @@ void SetConsoleEnabled(bool enabled);
 // sink is configured or Init() has not been called.
 // Returns true on success, false on failure (old logger kept active).
 bool Reopen();
+
+// Check if the current log file exceeds max_file_size and rotate if needed.
+// Thread-safe. No-op if no file sink is configured.
+void CheckRotation();
+
+// Ensure the directory exists (creates it with 0755 if missing).
+// Throws std::runtime_error on failure.
+void EnsureLogDir(const std::string& dir);
+
+// Write a visual start/stop marker to the log file.
+// Format: "================================ {text} [timestamp] ================================"
+void WriteMarker(const std::string& text);
 
 // Flush all sinks and shut down the logging system.
 void Shutdown();
