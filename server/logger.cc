@@ -291,7 +291,7 @@ static void RebuildLogger() {
     new_logger->flush_on(spdlog::level::info);
 
     spdlog::set_default_logger(new_logger);
-    g_logger = new_logger;
+    std::atomic_store(&g_logger, new_logger);
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -347,8 +347,8 @@ void Init(const std::string& name,
         new_logger->flush_on(spdlog::level::info);
 
         // All succeeded — commit
-        g_logger = new_logger;
-        spdlog::set_default_logger(g_logger);
+        std::atomic_store(&g_logger, new_logger);
+        spdlog::set_default_logger(new_logger);
     } catch (...) {
         // Restore previous config so Reopen/CheckRotation use the live config
         g_logger_name = std::move(saved_name);
@@ -364,10 +364,15 @@ void Init(const std::string& name,
 }
 
 std::shared_ptr<spdlog::logger> Get() {
+    // Fast path: read g_logger without the mutex. std::atomic_load on
+    // shared_ptr is lock-free on most implementations and avoids mutex
+    // contention on hot paths (debug-level log calls that get filtered).
+    auto logger = std::atomic_load(&g_logger);
+    if (logger) return logger;
+
+    // Slow path: logger not yet initialized or after Shutdown().
     std::lock_guard<std::mutex> lock(g_logger_mtx);
-    if (g_logger) {
-        return g_logger;
-    }
+    if (g_logger) return g_logger;  // re-check under lock
     auto fallback = spdlog::default_logger();
     if (fallback) return fallback;
     // After Shutdown(), spdlog's default logger is null. Create a minimal
@@ -380,11 +385,12 @@ std::shared_ptr<spdlog::logger> Get() {
 
 void Shutdown() {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
-    if (g_logger) {
-        g_logger->flush();
+    auto logger = std::atomic_load(&g_logger);
+    if (logger) {
+        logger->flush();
     }
     spdlog::shutdown();
-    g_logger.reset();
+    std::atomic_store(&g_logger, std::shared_ptr<spdlog::logger>{});
 
     // Reset all config to defaults so Reopen()/Init() after Shutdown()
     // starts from a clean slate.
@@ -500,7 +506,9 @@ void EnsureLogDir(const std::string& dir) {
 void WriteMarker(const std::string& text) {
     auto logger = Get();
     if (!logger) return;
-    logger->info("================================ {} ================================", text);
+    // Use critical level so markers are visible regardless of configured
+    // log level (only filtered by level::off which disables all output).
+    logger->critical("================================ {} ================================", text);
 }
 
 } // namespace logging

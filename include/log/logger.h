@@ -12,9 +12,11 @@ namespace logging {
 // Initialize the logging system.
 // @param name     Logger name (appears in log output)
 // @param level    Minimum log level (default: info)
-// @param log_file Log file path. Uses date-based naming:
-//                 {dir}/{prefix}-{YYYY-MM-DD}[-{seq}].log
-//                 Empty string = console only.
+// @param log_file Log file path. Empty string = console only.
+//                 When max_files > 1: date-based naming is used:
+//                   {dir}/{prefix}-{YYYY-MM-DD}[-{seq}].log
+//                 When max_files <= 1: the path is used as-is (no date suffix),
+//                   compatible with external logrotate + SIGHUP → Reopen().
 // @param max_size Maximum size of each log file in bytes (default: 10MB)
 // @param max_files Maximum total log files to keep (default: 3).
 //                 Oldest files (across all dates) are pruned when exceeded.
