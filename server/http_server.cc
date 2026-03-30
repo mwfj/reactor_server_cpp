@@ -952,6 +952,15 @@ void HttpServer::Reload(const ServerConfig& new_config) {
         return;
     }
 
+    // Validate before applying — reject invalid configs (e.g., negative
+    // timeouts) that would disrupt live traffic.
+    try {
+        ConfigLoader::Validate(new_config);
+    } catch (const std::invalid_argument& e) {
+        logging::Get()->error("Reload() rejected invalid config: {}", e.what());
+        return;
+    }
+
     // Update reload-safe limit fields (atomic stores)
     max_body_size_.store(new_config.max_body_size, std::memory_order_relaxed);
     max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);

@@ -364,23 +364,29 @@ static int HandleStart(const CliOptions& options) {
     }
 
     // Resolve config path to absolute BEFORE daemonizing (chdir changes to "/").
-    // Use $PWD (the shell's logical working directory) to preserve symlinks —
-    // operators use symlinked deployment dirs (e.g., /opt/app → /opt/releases/v1)
-    // and repoint the link between reloads. getcwd() and /proc/self/cwd both
-    // resolve to the physical path, which would pin reloads to the old tree.
-    // $PWD is set by the shell at launch time and reflects the logical path.
-    // Fall back to getcwd() if $PWD is unset or not absolute.
+    // Prefer $PWD (shell's logical cwd) to preserve symlinked deployment dirs.
+    // Verify $PWD actually points to the same directory as getcwd() (same
+    // device+inode) — stale/overridden $PWD from wrappers or service managers
+    // would pin reloads to the wrong file.
     std::string resolved_config_path = options.config_path;
     if (options.daemonize && !options.config_path.empty() &&
         options.config_path[0] != '/') {
+        char cwd_buf[PATH_MAX];
+        const char* base_dir = nullptr;
         const char* pwd = std::getenv("PWD");
-        if (pwd && pwd[0] == '/') {
-            resolved_config_path = std::string(pwd) + "/" + options.config_path;
-        } else {
-            char cwd_buf[PATH_MAX];
-            if (getcwd(cwd_buf, sizeof(cwd_buf))) {
-                resolved_config_path = std::string(cwd_buf) + "/" + options.config_path;
+        if (pwd && pwd[0] == '/' && getcwd(cwd_buf, sizeof(cwd_buf))) {
+            // Verify $PWD is the same directory as real cwd (stat device+inode)
+            struct stat pwd_st, cwd_st;
+            if (stat(pwd, &pwd_st) == 0 && stat(cwd_buf, &cwd_st) == 0 &&
+                pwd_st.st_dev == cwd_st.st_dev && pwd_st.st_ino == cwd_st.st_ino) {
+                base_dir = pwd;  // $PWD is valid and matches — use logical path
             }
+        }
+        if (!base_dir && getcwd(cwd_buf, sizeof(cwd_buf))) {
+            base_dir = cwd_buf;
+        }
+        if (base_dir) {
+            resolved_config_path = std::string(base_dir) + "/" + options.config_path;
         }
     }
 
