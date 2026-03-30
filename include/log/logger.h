@@ -44,8 +44,9 @@ void SetConsoleEnabled(bool enabled);
 // Returns true on success, false on failure (old logger kept active).
 bool Reopen();
 
-// Check if the current log file exceeds max_file_size and rotate if needed.
-// Thread-safe. No-op if no file sink is configured.
+// Check if the current log file exceeds max_file_size or the date has
+// rolled over, and rotate if needed. Called periodically from the
+// Dispatcher timer handler. Thread-safe. No-op if no file sink is configured.
 void CheckRotation();
 
 // Ensure the directory exists (creates it with 0755 if missing).
@@ -53,7 +54,8 @@ void CheckRotation();
 void EnsureLogDir(const std::string& dir);
 
 // Write a visual start/stop marker to the log file.
-// Format: "================================ {text} [timestamp] ================================"
+// Format: "================================ {text} ================================"
+// The spdlog pattern prepends its own timestamp to each line.
 void WriteMarker(const std::string& text);
 
 // Flush all sinks and shut down the logging system.

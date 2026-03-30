@@ -107,7 +107,8 @@ void Acceptor::NewConnection(){
             // that fires a fresh edge, retrying the entire backlog. Existing backlog
             // entries are delayed until memory pressure resolves, which is acceptable
             // since the server cannot handle more connections under memory pressure.
-            logging::Get()->warn("Accept: memory pressure ({}), deferring", std::strerror(errno));
+            int saved_errno = errno;
+            logging::Get()->warn("Accept: memory pressure ({}), deferring", std::strerror(saved_errno));
             return;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));

@@ -11,6 +11,7 @@
 #include "http/http_request.h"
 #include "http/http_response.h"
 #include "log/logger.h"
+#include "log/log_utils.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -162,11 +163,7 @@ static int HandleStart(const CliOptions& options) {
 
     // Ensure log directory exists before any logging::Init call
     {
-        std::string log_dir;
-        auto last_slash = config.log.file.rfind('/');
-        if (last_slash != std::string::npos) {
-            log_dir = config.log.file.substr(0, last_slash);
-        }
+        std::string log_dir = logging::ExtractDir(config.log.file);
         if (!log_dir.empty()) {
             try {
                 logging::EnsureLogDir(log_dir);

@@ -111,7 +111,11 @@ ScanDateFiles(const std::string& dir, const std::string& prefix,
         if (middle.empty()) {
             seq = 0;
         } else if (middle[0] == '-') {
-            try { seq = std::stoi(middle.substr(1)); } catch (...) { continue; }
+            try {
+                size_t pos = 0;
+                seq = std::stoi(middle.substr(1), &pos);
+                if (pos != middle.size() - 1) continue;  // trailing garbage
+            } catch (...) { continue; }
         } else {
             continue;
         }
@@ -157,19 +161,24 @@ static void PruneOldFiles() {
     std::string today = TodayDateString();
     auto files = ScanDateFiles(g_log_dir, g_log_prefix, today, g_log_extension);
 
-    // Delete oldest files (lowest seq) if count exceeds max_files
-    int excess = static_cast<int>(files.size()) - g_max_files;
-    for (int i = 0; i < excess; ++i) {
-        if (files[static_cast<size_t>(i)].second != g_current_file_path) {
-            std::remove(files[static_cast<size_t>(i)].second.c_str());
+    // Delete oldest files (lowest seq) if count exceeds max_files.
+    // Skip the current file — compensate by deleting the next oldest instead.
+    int to_delete = static_cast<int>(files.size()) - g_max_files;
+    size_t idx = 0;
+    while (to_delete > 0 && idx < files.size()) {
+        if (files[idx].second != g_current_file_path) {
+            std::remove(files[idx].second.c_str());
+            --to_delete;
         }
+        ++idx;
     }
 }
 
 // ── Sink construction ───────────────────────────────────────────────
 
-// Build sinks vector from current config. Caller must hold g_logger_mtx.
-static std::vector<spdlog::sink_ptr> BuildSinks(spdlog::level::level_enum level) {
+// Build sinks vector from current config, resolve date-based path, and
+// prune old log files. Caller must hold g_logger_mtx.
+static std::vector<spdlog::sink_ptr> BuildSinksAndPrune(spdlog::level::level_enum level) {
     std::vector<spdlog::sink_ptr> sinks;
 
     if (g_console_enabled) {
@@ -195,7 +204,7 @@ static std::vector<spdlog::sink_ptr> BuildSinks(spdlog::level::level_enum level)
 static void RebuildLogger() {
     if (g_logger) g_logger->flush();
 
-    auto sinks = BuildSinks(g_log_level);
+    auto sinks = BuildSinksAndPrune(g_log_level);
     auto new_logger = std::make_shared<spdlog::logger>(
         g_logger_name, sinks.begin(), sinks.end());
     new_logger->set_level(g_log_level);
@@ -232,7 +241,7 @@ void Init(const std::string& name,
         g_current_file_path.clear();
     }
 
-    auto sinks = BuildSinks(level);
+    auto sinks = BuildSinksAndPrune(level);
 
     // Create logger with all sinks
     g_logger = std::make_shared<spdlog::logger>(name, sinks.begin(), sinks.end());
@@ -314,11 +323,26 @@ void CheckRotation() {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
     if (!g_logger || g_log_file.empty() || g_current_file_path.empty()) return;
 
-    struct stat st{};
-    if (stat(g_current_file_path.c_str(), &st) != 0) return;
-    if (static_cast<size_t>(st.st_size) < g_max_size) return;
+    bool needs_rotate = false;
 
-    // Size limit exceeded — rotate to next file
+    // Check date rollover: if today's date differs from the date in the
+    // current file path, rotate to a new day's file regardless of size.
+    std::string today = TodayDateString();
+    if (g_current_file_path.find(today) == std::string::npos) {
+        needs_rotate = true;
+    }
+
+    // Check size limit
+    if (!needs_rotate) {
+        struct stat st{};
+        if (stat(g_current_file_path.c_str(), &st) != 0) return;
+        if (static_cast<size_t>(st.st_size) >= g_max_size) {
+            needs_rotate = true;
+        }
+    }
+
+    if (!needs_rotate) return;
+
     try {
         RebuildLogger();
     } catch (const std::exception& e) {
@@ -328,22 +352,27 @@ void CheckRotation() {
 
 void EnsureLogDir(const std::string& dir) {
     if (dir.empty()) return;
+    // Strip trailing slashes to normalize the path
+    std::string normalized = dir;
+    while (normalized.size() > 1 && normalized.back() == '/') {
+        normalized.pop_back();
+    }
     // Create intermediate directories
     std::string path;
-    for (size_t i = 0; i < dir.size(); ++i) {
-        path += dir[i];
-        if (dir[i] == '/' && path.size() > 1) {
+    for (size_t i = 0; i < normalized.size(); ++i) {
+        path += normalized[i];
+        if (normalized[i] == '/' && path.size() > 1) {
             mkdir(path.c_str(), 0755);  // ignore errors for intermediate dirs
         }
     }
     // Final directory
     struct stat st{};
-    if (stat(dir.c_str(), &st) == 0) {
+    if (stat(normalized.c_str(), &st) == 0) {
         if (S_ISDIR(st.st_mode)) return;
-        throw std::runtime_error("Log path exists but is not a directory: " + dir);
+        throw std::runtime_error("Log path exists but is not a directory: " + normalized);
     }
-    if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) {
-        throw std::runtime_error("Failed to create log directory '" + dir + "': " +
+    if (mkdir(normalized.c_str(), 0755) != 0 && errno != EEXIST) {
+        throw std::runtime_error("Failed to create log directory '" + normalized + "': " +
                                   std::strerror(errno));
     }
 }

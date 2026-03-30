@@ -1065,7 +1065,7 @@ void TestSignalHandlerSigwaitUnblock() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Helper: remove all files in /tmp matching a prefix and .log extension.
-static void CleanupLogFiles(const std::string& dir, const std::string& prefix) {
+inline void CleanupLogFiles(const std::string& dir, const std::string& prefix) {
     DIR* d = opendir(dir.c_str());
     if (!d) return;
     struct dirent* entry;
@@ -1080,7 +1080,7 @@ static void CleanupLogFiles(const std::string& dir, const std::string& prefix) {
 
 // Helper: scan a directory for a file whose name starts with 'prefix' and ends
 // with '.log'. Returns the full path of the first match, or "" if none found.
-static std::string FindLogFile(const std::string& dir, const std::string& prefix) {
+inline std::string FindLogFile(const std::string& dir, const std::string& prefix) {
     DIR* d = opendir(dir.c_str());
     if (!d) return "";
     struct dirent* entry;
@@ -1098,7 +1098,7 @@ static std::string FindLogFile(const std::string& dir, const std::string& prefix
 }
 
 // Helper: read the full text of a file into a string. Returns "" on error.
-static std::string ReadFileContent(const std::string& path) {
+inline std::string ReadFileContent(const std::string& path) {
     std::ifstream f(path);
     if (!f.is_open()) return "";
     std::string content;

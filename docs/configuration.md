@@ -209,6 +209,7 @@ On restart, the logger appends to the latest non-full file for today's date. The
 
 | Level | Use Case |
 |-------|----------|
+| `trace` | Detailed debugging (frame bytes, buffer contents, timer ticks) |
 | `debug` | Construction, internal invocations, state transitions |
 | `info` | Server lifecycle, key trajectory stages, request received |
 | `warn` | Limits exceeded, timeouts, non-fatal operational errors |

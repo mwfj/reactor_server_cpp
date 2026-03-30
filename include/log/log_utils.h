@@ -14,4 +14,14 @@ inline std::string SanitizePath(const std::string& path) {
     return path;
 }
 
+// Extract the directory component from a file path.
+// "logs/reactor.log" -> "logs"
+// "reactor.log" -> "" (empty = current directory)
+// "/var/log/server.log" -> "/var/log"
+inline std::string ExtractDir(const std::string& path) {
+    auto pos = path.rfind('/');
+    if (pos != std::string::npos) return path.substr(0, pos);
+    return "";
+}
+
 } // namespace logging
