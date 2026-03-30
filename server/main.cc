@@ -11,7 +11,6 @@
 #include "http/http_request.h"
 #include "http/http_response.h"
 #include "log/logger.h"
-#include "log/log_utils.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -156,25 +155,14 @@ static int HandleStart(const CliOptions& options) {
     int rc = LoadConfig(config, options);
     if (rc != EXIT_OK) return rc;
 
-    // Ensure log directory exists before any logging::Init call.
-    // If log.file is empty, the server runs console-only (no file logging).
-    if (!config.log.file.empty()) {
-        std::string log_dir = logging::ExtractDir(config.log.file);
-        if (!log_dir.empty()) {
-            try {
-                logging::EnsureLogDir(log_dir);
-            } catch (const std::exception& e) {
-                std::cerr << "Error: " << e.what() << "\n";
-                return EXIT_ERROR;
-            }
-        }
-    }
-
     // ── Daemon pre-validation ───────────────────────────────
+    // Must run before any filesystem side effects (EnsureLogDir).
     if (options.daemonize) {
         rc = ValidateDaemonConfig(config, options);
         if (rc != EXIT_OK) return rc;
     }
+    // Note: logging::Init() calls EnsureLogDir internally when log.file
+    // has a directory component, so no explicit mkdir is needed here.
 
     // ── Daemonize (if requested) ────────────────────────────
     // MUST happen: after config validation, before PidFile/signals/logging

@@ -155,16 +155,25 @@ static std::string ResolveLogPath(const std::string& dir, const std::string& pre
 // ── File pruning ────────────────────────────────────────────────────
 
 // Prune old log files across ALL dates if total count exceeds g_max_files.
-// Scans for {prefix}-*{ext} to find all rotated files, sorts by name
-// (date+seq lexicographic order), and deletes the oldest.
+// Parses (date, seq) from each filename for correct chronological sorting.
 // Caller must hold g_logger_mtx.
 static void PruneOldFiles() {
     if (g_max_files <= 0 || g_log_dir.empty() || g_log_prefix.empty()) return;
 
     std::string name_prefix = g_log_prefix + "-";
 
-    // Collect all files matching {prefix}-*{ext} (any date)
-    std::vector<std::string> files;
+    // {date, seq, path} — date string sorts chronologically, seq is numeric
+    struct LogFileEntry {
+        std::string date;
+        int seq;
+        std::string path;
+        bool operator<(const LogFileEntry& o) const {
+            if (date != o.date) return date < o.date;
+            return seq < o.seq;
+        }
+    };
+
+    std::vector<LogFileEntry> files;
     DIR* d = opendir(g_log_dir.c_str());
     if (!d) return;
     struct dirent* entry;
@@ -175,12 +184,26 @@ static void PruneOldFiles() {
             if (name.size() < g_log_extension.size()) continue;
             if (name.substr(name.size() - g_log_extension.size()) != g_log_extension) continue;
         }
-        files.push_back(g_log_dir + "/" + name);
+        // Extract middle part between prefix and extension: "YYYY-MM-DD" or "YYYY-MM-DD-N"
+        std::string middle = name.substr(name_prefix.size(),
+            name.size() - name_prefix.size() - g_log_extension.size());
+
+        // Parse date (first 10 chars: YYYY-MM-DD) and optional seq
+        if (middle.size() < 10) continue;  // too short for a date
+        std::string date = middle.substr(0, 10);
+        int seq = 0;
+        if (middle.size() > 10) {
+            if (middle[10] != '-') continue;  // unexpected format
+            try {
+                size_t pos = 0;
+                seq = std::stoi(middle.substr(11), &pos);
+                if (pos != middle.size() - 11) continue;  // trailing garbage
+            } catch (...) { continue; }
+        }
+        files.push_back({date, seq, g_log_dir + "/" + name});
     }
     closedir(d);
 
-    // Sort lexicographically — date-based naming ensures chronological order
-    // ("reactor-2026-03-29.log" < "reactor-2026-03-30.log" < "reactor-2026-03-30-1.log")
     std::sort(files.begin(), files.end());
 
     // Delete oldest files if total count exceeds max_files.
@@ -188,8 +211,8 @@ static void PruneOldFiles() {
     int to_delete = static_cast<int>(files.size()) - g_max_files;
     size_t idx = 0;
     while (to_delete > 0 && idx < files.size()) {
-        if (files[idx] != g_current_file_path) {
-            std::remove(files[idx].c_str());
+        if (files[idx].path != g_current_file_path) {
+            std::remove(files[idx].path.c_str());
             --to_delete;
         }
         ++idx;

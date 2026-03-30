@@ -355,6 +355,19 @@ void ConfigLoader::Validate(const ServerConfig& config) {
     // spdlog::rotating_file_sink_mt throws on max_size == 0, and negative
     // max_files converts to a huge size_t causing resource exhaustion.
     if (!config.log.file.empty()) {
+        // Reject paths with empty basename (e.g., "/tmp/logs/" or just "/")
+        // which would produce malformed date-based filenames.
+        {
+            auto last_slash = config.log.file.rfind('/');
+            std::string basename = (last_slash != std::string::npos)
+                ? config.log.file.substr(last_slash + 1)
+                : config.log.file;
+            if (basename.empty()) {
+                throw std::invalid_argument(
+                    "Invalid log.file: '" + config.log.file +
+                    "' (must include a filename, not just a directory path)");
+            }
+        }
         if (config.log.max_file_size == 0) {
             throw std::invalid_argument(
                 "Invalid log.max_file_size: 0 (must be > 0 when log.file is set)");

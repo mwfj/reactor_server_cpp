@@ -16,7 +16,9 @@ namespace logging {
 //                 {dir}/{prefix}-{YYYY-MM-DD}[-{seq}].log
 //                 Empty string = console only.
 // @param max_size Maximum size of each log file in bytes (default: 10MB)
-// @param max_files Maximum number of rotated files per day (default: 3)
+// @param max_files Maximum total log files to keep (default: 3).
+//                 Oldest files (across all dates) are pruned when exceeded.
+//                 Set to 1 for external logrotate compatibility (no auto-rotation).
 void Init(const std::string& name = "reactor",
           spdlog::level::level_enum level = spdlog::level::info,
           const std::string& log_file = "",
