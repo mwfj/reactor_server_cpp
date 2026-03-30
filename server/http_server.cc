@@ -573,11 +573,12 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                 pending_detection_[conn->fd()] = {conn, ""};
                 new_conn_tracked = true;
             }
-        }
-        // Increment counters for the newly tracked connection
-        if (new_conn_tracked) {
-            total_accepted_.fetch_add(1, std::memory_order_relaxed);
-            active_connections_.fetch_add(1, std::memory_order_relaxed);
+            // Increment inside the lock — RemoveConnection holds the same lock
+            // when decrementing, so the counter is always >= 0.
+            if (new_conn_tracked) {
+                total_accepted_.fetch_add(1, std::memory_order_relaxed);
+                active_connections_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         // Compensating decrements for evicted stale entries — their close
         // callbacks can no longer find the map entries we just removed.
@@ -803,17 +804,16 @@ bool HttpServer::DetectAndRouteProtocol(
     if (proto == ProtocolDetector::Protocol::HTTP2) {
         // Skip if connection is fully closing (not just peer half-close)
         if (conn->IsClosing()) return true;
-        if (!already_counted) {
-            total_accepted_.fetch_add(1, std::memory_order_relaxed);
-            active_connections_.fetch_add(1, std::memory_order_relaxed);
-        }
-        active_http2_connections_.fetch_add(1, std::memory_order_relaxed);
-        // Snapshot h2_settings_ and publish handler under a single lock to
-        // prevent race with Reload() and to avoid double mutex acquisition.
         Http2Session::Settings settings_snapshot;
         std::shared_ptr<Http2ConnectionHandler> h2_conn;
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
+            // Counters inside lock — symmetric with RemoveConnection's decrement
+            if (!already_counted) {
+                total_accepted_.fetch_add(1, std::memory_order_relaxed);
+                active_connections_.fetch_add(1, std::memory_order_relaxed);
+            }
+            active_http2_connections_.fetch_add(1, std::memory_order_relaxed);
             settings_snapshot = h2_settings_;
             h2_conn = std::make_shared<Http2ConnectionHandler>(conn, settings_snapshot);
             SetupH2Handlers(h2_conn);
@@ -827,15 +827,16 @@ bool HttpServer::DetectAndRouteProtocol(
     }
 
     // HTTP/1.x — create handler (existing path)
-    if (!already_counted) {
-        total_accepted_.fetch_add(1, std::memory_order_relaxed);
-        active_connections_.fetch_add(1, std::memory_order_relaxed);
-    }
-    active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
     SetupHandlers(http_conn);
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
+        // Counters inside lock — symmetric with RemoveConnection's decrement
+        if (!already_counted) {
+            total_accepted_.fetch_add(1, std::memory_order_relaxed);
+            active_connections_.fetch_add(1, std::memory_order_relaxed);
+        }
+        active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
         // Identity check: don't overwrite a handler for a different connection
         // on the same fd (fd-reuse race with HandleNewConnection).
         auto existing = http_connections_.find(conn->fd());

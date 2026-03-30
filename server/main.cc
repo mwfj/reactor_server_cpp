@@ -34,10 +34,15 @@ static void ApplyCliOverrides(ServerConfig& config, const CliOptions& options) {
 
 // ── Load and resolve config ──────────────────────────────────────
 // Returns EXIT_OK on success, EXIT_ERROR on failure.
-static int LoadConfig(ServerConfig& config, const CliOptions& options) {
+// @param loaded_file  Set to true if config was loaded from a file, false if
+//                     defaults were used (no file on disk, implicit path).
+static int LoadConfig(ServerConfig& config, const CliOptions& options,
+                      bool& loaded_file) {
+    loaded_file = false;
     try {
         if (access(options.config_path.c_str(), F_OK) == 0) {
             config = ConfigLoader::LoadFromFile(options.config_path);
+            loaded_file = true;
         } else if (!options.config_path_explicit && errno == ENOENT) {
             config = ConfigLoader::Default();
         } else {
@@ -180,7 +185,8 @@ static int ValidateDaemonConfig(const ServerConfig& config,
 static bool ReloadConfig(const std::string& config_path,
                          const CliOptions& options,
                          HttpServer& server,
-                         ServerConfig& current_config) {
+                         ServerConfig& current_config,
+                         bool config_loaded_from_file) {
     // Always reopen log files on SIGHUP, even if config load fails — logrotate
     // sends SIGHUP with unchanged config to force FD reopen after file rename.
     // Without this, a temporarily missing config file blocks log rotation.
@@ -194,15 +200,19 @@ static bool ReloadConfig(const std::string& config_path,
 
     ServerConfig new_config;
     try {
-        // Mirror startup: if the implicit config file doesn't exist, start from
-        // the current running config (not defaults) + env + CLI. This supports
-        // daemons started with "defaults + env only" (no config file on disk).
-        // Explicit -c paths always fail if missing.
+        // If the config file exists, load it. If not:
+        // - If startup never had a file (defaults + env only): use current_config
+        //   as base + re-apply env/CLI. This supports the documented "no config
+        //   file" deployment mode.
+        // - If startup DID load a file and it's now missing: that's a broken
+        //   deploy — fail the reload so the operator notices.
         if (access(config_path.c_str(), F_OK) == 0) {
             new_config = ConfigLoader::LoadFromFile(config_path);
-        } else if (!options.config_path_explicit && errno == ENOENT) {
+        } else if (!config_loaded_from_file && !options.config_path_explicit
+                   && errno == ENOENT) {
             new_config = current_config;
-            logging::Get()->info("Config file not found, reloading from env/CLI overrides");
+            logging::Get()->info("No config file (startup used defaults), "
+                                 "reloading from env/CLI overrides");
         } else {
             logging::Get()->error("Config reload failed: {}: {}",
                                   config_path, std::strerror(errno));
@@ -377,7 +387,8 @@ static int ValidateDaemonConfig(const ServerConfig& config,
 // ── Handle start command ─────────────────────────────────────────
 static int HandleStart(const CliOptions& options) {
     ServerConfig config;
-    int rc = LoadConfig(config, options);
+    bool config_loaded_from_file = false;
+    int rc = LoadConfig(config, options, config_loaded_from_file);
     if (rc != EXIT_OK) return rc;
 
     // ── Daemon pre-validation ───────────────────────────────
@@ -571,7 +582,8 @@ static int HandleStart(const CliOptions& options) {
                 continue;
             }
             logging::Get()->info("Received SIGHUP, reloading configuration");
-            if (ReloadConfig(resolved_config_path, options, *server, config)) {
+            if (ReloadConfig(resolved_config_path, options, *server, config,
+                            config_loaded_from_file)) {
                 logging::Get()->info("Configuration reloaded successfully");
             } else {
                 logging::Get()->warn("Configuration reload failed, keeping current config");
@@ -644,7 +656,8 @@ int main(int argc, char* argv[]) {
 
         case CliCommand::VALIDATE: {
             ServerConfig config;
-            int rc = LoadConfig(config, options);
+            bool unused_flag;
+            int rc = LoadConfig(config, options, unused_flag);
             if (rc != EXIT_OK) return rc;
             if (options.daemonize) {
 #if defined(_WIN32)
@@ -661,7 +674,8 @@ int main(int argc, char* argv[]) {
 
         case CliCommand::CONFIG: {
             ServerConfig config;
-            int rc = LoadConfig(config, options);
+            bool unused_flag;
+            int rc = LoadConfig(config, options, unused_flag);
             if (rc != EXIT_OK) return rc;
             std::cout << ConfigLoader::ToJson(config) << "\n";
             return EXIT_OK;

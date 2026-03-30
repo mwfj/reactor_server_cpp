@@ -219,7 +219,15 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     if (val) {
         std::string s(val);
         std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-        config.tls.enabled = (s == "1" || s == "true" || s == "yes");
+        if (s == "1" || s == "true" || s == "yes") {
+            config.tls.enabled = true;
+        } else if (s == "0" || s == "false" || s == "no") {
+            config.tls.enabled = false;
+        } else {
+            throw std::invalid_argument(
+                "Invalid REACTOR_TLS_ENABLED: '" + std::string(val) +
+                "' (must be true/false/yes/no/1/0)");
+        }
     }
 
     val = std::getenv("REACTOR_TLS_CERT");
@@ -254,7 +262,15 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     if (val) {
         std::string s(val);
         std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-        config.http2.enabled = (s == "1" || s == "true" || s == "yes");
+        if (s == "1" || s == "true" || s == "yes") {
+            config.http2.enabled = true;
+        } else if (s == "0" || s == "false" || s == "no") {
+            config.http2.enabled = false;
+        } else {
+            throw std::invalid_argument(
+                "Invalid REACTOR_HTTP2_ENABLED: '" + std::string(val) +
+                "' (must be true/false/yes/no/1/0)");
+        }
     }
     val = std::getenv("REACTOR_HTTP2_MAX_CONCURRENT_STREAMS");
     if (val) {
