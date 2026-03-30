@@ -124,6 +124,25 @@ void SetConsoleEnabled(bool enabled) {
     g_console_enabled = enabled;
 }
 
+void SetLevel(spdlog::level::level_enum level) {
+    std::lock_guard<std::mutex> lock(g_logger_mtx);
+    g_log_level = level;
+    if (g_logger) {
+        g_logger->set_level(level);
+        // Update sink levels to match
+        for (auto& sink : g_logger->sinks()) {
+            sink->set_level(level);
+        }
+    }
+}
+
+void UpdateFileConfig(const std::string& file, size_t max_size, int max_files) {
+    std::lock_guard<std::mutex> lock(g_logger_mtx);
+    g_log_file = file;
+    g_max_size = max_size;
+    g_max_files = max_files;
+}
+
 bool Reopen() {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
     if (!g_logger || g_log_file.empty()) return true;  // no-op is success

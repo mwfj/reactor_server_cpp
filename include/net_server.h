@@ -53,11 +53,13 @@ private:
 
     // Timer configuration
     int timer_interval_;  // How often to check for timeouts (seconds)
-    std::chrono::seconds connection_timeout_;  // Connection idle timeout duration
+    // Atomic: written by SetConnectionTimeout (main thread via Reload),
+    // read by GetConnectionTimeout (dispatcher threads via /stats).
+    std::atomic<int> connection_timeout_sec_;  // Connection idle timeout (seconds)
 
     std::shared_ptr<TlsContext> tls_ctx_;  // Shared with HttpServer for safe lifetime
-    int max_connections_ = 0;         // 0 = unlimited
-    size_t max_input_size_ = 0;       // 0 = unlimited, set before RegisterCallbacks
+    std::atomic<int> max_connections_{0};       // 0 = unlimited
+    std::atomic<size_t> max_input_size_{0};    // 0 = unlimited, set before RegisterCallbacks
     std::function<void()> ready_callback_ = nullptr;  // Fires after init, before event loop
     std::set<ConnectionHandler*> draining_conns_;       // H2 connections exempt from force-close
     std::function<void()> pre_stop_drain_cb_;           // H2 drain wait callback
@@ -98,8 +100,26 @@ public:
     void SetTimerCb(CALLBACKS_NAMESPACE::NetSrvTimerCallback);
 
     void SetTlsContext(std::shared_ptr<TlsContext> ctx) { tls_ctx_ = std::move(ctx); }
-    void SetMaxConnections(int max) { max_connections_ = max; }
-    void SetMaxInputSize(size_t max) { max_input_size_ = max; }
+    void SetMaxConnections(int max) { max_connections_.store(max, std::memory_order_relaxed); }
+    int GetMaxConnections() const { return max_connections_.load(std::memory_order_relaxed); }
+    void SetMaxInputSize(size_t max) { max_input_size_.store(max, std::memory_order_relaxed); }
+    std::chrono::seconds GetConnectionTimeout() const {
+        return std::chrono::seconds(connection_timeout_sec_.load(std::memory_order_relaxed));
+    }
+
+    // Update idle timeout on all socket dispatchers at runtime.
+    // EnQueues the update to each dispatcher thread to avoid racing with TimerHandler.
+    void SetConnectionTimeout(std::chrono::seconds timeout);
+
+    // Update timer scan interval on all socket dispatchers at runtime.
+    // EnQueues the update to each dispatcher thread.
+    void SetTimerInterval(int seconds);
+
+    // Get the current timer scan interval (seconds).
+    int GetTimerInterval() const { return timer_interval_; }
+
+    // Get the actual worker thread count (resolved from auto mode).
+    int GetWorkerCount() { return sock_workers_.GetThreadWorkerNum(); }
 
     // Connections exempt from CloseAfterWrite during Stop().
     // Set by HttpServer before Stop() for HTTP/2 graceful drain.

@@ -6,6 +6,15 @@
 #include <algorithm>
 #include <set>
 
+// RAII guard: decrements an atomic counter on scope exit. Used in request
+// dispatch callbacks to ensure active_requests_ is decremented even on throw.
+struct RequestGuard {
+    std::atomic<int64_t>& counter;
+    ~RequestGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
+    RequestGuard(const RequestGuard&) = delete;
+    RequestGuard& operator=(const RequestGuard&) = delete;
+};
+
 void HttpServer::WireNetServerCallbacks() {
     net_server_.SetNewConnectionCb(
         [this](std::shared_ptr<ConnectionHandler> conn) { HandleNewConnection(conn); });
@@ -85,6 +94,7 @@ HttpServer::HttpServer(const std::string& ip, int port)
                   ServerConfig{}.worker_threads)
 {
     WireNetServerCallbacks();
+    resolved_worker_threads_ = net_server_.GetWorkerCount();
     // Apply the same defaults as the config constructor — must match ServerConfig defaults.
     net_server_.SetMaxConnections(ServerConfig{}.max_connections);
     net_server_.SetMaxInputSize(ComputeInputCap());
@@ -121,16 +131,17 @@ HttpServer::HttpServer(const ServerConfig& config)
                   config.worker_threads)
 {
     WireNetServerCallbacks();
+    resolved_worker_threads_ = net_server_.GetWorkerCount();
 
     // Initialize logging from config
     logging::Init("reactor", logging::ParseLevel(config.log.level),
                   config.log.file, config.log.max_file_size, config.log.max_files);
 
-    max_body_size_ = config.max_body_size;
-    max_header_size_ = config.max_header_size;
-    max_ws_message_size_ = config.max_ws_message_size;
-    request_timeout_sec_ = config.request_timeout_sec;
-    shutdown_drain_timeout_sec_ = config.shutdown_drain_timeout_sec;
+    max_body_size_.store(config.max_body_size, std::memory_order_relaxed);
+    max_header_size_.store(config.max_header_size, std::memory_order_relaxed);
+    max_ws_message_size_.store(config.max_ws_message_size, std::memory_order_relaxed);
+    request_timeout_sec_.store(config.request_timeout_sec, std::memory_order_relaxed);
+    shutdown_drain_timeout_sec_.store(config.shutdown_drain_timeout_sec, std::memory_order_relaxed);
     net_server_.SetMaxConnections(config.max_connections);
 
     // Set input buffer cap on NetServer — applied BEFORE epoll registration
@@ -171,30 +182,29 @@ HttpServer::HttpServer(const ServerConfig& config)
 }
 
 size_t HttpServer::ComputeInputCap() const {
+    // Snapshot all three size-limit atomics locally before computing to
+    // prevent mixed-generation buffer caps during concurrent Reload().
+    size_t body_sz = max_body_size_.load(std::memory_order_relaxed);
+    size_t hdr_sz = max_header_size_.load(std::memory_order_relaxed);
+    size_t ws_sz = max_ws_message_size_.load(std::memory_order_relaxed);
+
     // Cap per-cycle input buffer allocation. When the cap is hit, the read
     // loop stops (data stays in kernel buffer) and schedules another read
     // after the parser processes what it has. No data is discarded.
-    // No multiplier needed — the parser processes data incrementally across
-    // cycles. Wire overhead (chunked framing etc.) is handled naturally.
     size_t http_cap = 0;
-    if (max_header_size_ > 0 && max_body_size_ > 0) {
-        size_t sum = max_header_size_ + max_body_size_;
-        if (sum >= max_header_size_) http_cap = sum;  // overflow guard
-    } else if (max_header_size_ > 0) {
-        http_cap = max_header_size_;
-    } else if (max_body_size_ > 0) {
-        http_cap = max_body_size_;
+    if (hdr_sz > 0 && body_sz > 0) {
+        size_t sum = hdr_sz + body_sz;
+        if (sum >= hdr_sz) http_cap = sum;  // overflow guard
+    } else if (hdr_sz > 0) {
+        http_cap = hdr_sz;
+    } else if (body_sz > 0) {
+        http_cap = body_sz;
     }
 
-    // Also bound by WS message size. A client can coalesce an HTTP upgrade
-    // request with a large first WS frame in one read. Without this, the
-    // pre-upgrade cap (based on HTTP limits) allows more data than
-    // max_ws_message_size_ to be buffered before the cap switches post-upgrade.
-    // The HTTP parser processes incrementally, so a smaller cap is fine —
-    // it just means more read cycles for large HTTP bodies.
-    if (max_ws_message_size_ > 0) {
-        if (http_cap == 0) return max_ws_message_size_;
-        return std::min(http_cap, max_ws_message_size_);
+    // Also bound by WS message size.
+    if (ws_sz > 0) {
+        if (http_cap == 0) return ws_sz;
+        return std::min(http_cap, ws_sz);
     }
     return http_cap;
 }
@@ -354,7 +364,8 @@ void HttpServer::OnH2DrainComplete(ConnectionHandler* conn_ptr) {
 void HttpServer::WaitForH2Drain() {
     std::unique_lock<std::mutex> lck(drain_mtx_);
     auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::seconds(shutdown_drain_timeout_sec_);
+                    std::chrono::seconds(
+                        shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
     drain_cv_.wait_until(lck, deadline, [this]() {
         return h2_draining_.empty();
     });
@@ -372,20 +383,22 @@ void HttpServer::WaitForH2Drain() {
 }
 
 void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn) {
-    // Apply request size limits
-    http_conn->SetMaxBodySize(max_body_size_);
-    http_conn->SetMaxHeaderSize(max_header_size_);
-    http_conn->SetMaxWsMessageSize(max_ws_message_size_);
-    http_conn->SetRequestTimeout(request_timeout_sec_);
+    // Apply request size limits (snapshot from atomics — cached per-connection)
+    http_conn->SetMaxBodySize(max_body_size_.load(std::memory_order_relaxed));
+    http_conn->SetMaxHeaderSize(max_header_size_.load(std::memory_order_relaxed));
+    http_conn->SetMaxWsMessageSize(max_ws_message_size_.load(std::memory_order_relaxed));
+    http_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
 
-    // Set request handler: dispatch through router
+    // Set request handler: dispatch through router.
     http_conn->SetRequestCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
                const HttpRequest& request,
                HttpResponse& response) {
+            total_requests_.fetch_add(1, std::memory_order_relaxed);
+            active_requests_.fetch_add(1, std::memory_order_relaxed);
+            RequestGuard guard{active_requests_};
+
             if (!router_.Dispatch(request, response)) {
-                // Set 404 on the existing response to preserve any headers
-                // that middleware already added (CORS, request-id, etc.)
                 response.Status(404).Text("Not Found");
             }
         }
@@ -435,10 +448,22 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
     // stale state in http_connections_ (potentially under fd -1 after ReleaseFd).
     if (conn->IsClosing()) return;
 
+    // NOTE: total_accepted_ and active_connections_ are NOT incremented here.
+    // They are incremented at map-insertion points (pending_detection_ in this
+    // method, http_connections_ in the http2_disabled path, or h2_connections_/
+    // http_connections_ in DetectAndRouteProtocol). This ties counters to map
+    // membership, which is always symmetric with the was_tracked decrement in
+    // HandleCloseConnection/HandleErrorConnection. This eliminates the accept/
+    // data race where HandleMessage and HandleCloseConnection run before this
+    // method — the counter is incremented by whoever inserts into the map first.
+
     if (http2_enabled_) {
         // Guard against accept/data race: if HandleMessage already ran and
         // created a handler for THIS connection, skip everything below.
         std::shared_ptr<HttpConnectionHandler> stale_h1;
+        std::shared_ptr<Http2ConnectionHandler> stale_h2;
+        bool evicted_pd = false;
+        bool new_conn_tracked = false;
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
             auto h2_it = h2_connections_.find(conn->fd());
@@ -446,7 +471,10 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                 if (h2_it->second->GetConnection() == conn) {
                     return;  // Already initialized by HandleMessage
                 }
-                // Stale handler from fd reuse — evict
+                // Stale handler from fd reuse — save for stream compensation,
+                // then evict. The old connection's close callback can no longer
+                // find this entry, so we must decrement here.
+                stale_h2 = h2_it->second;
                 h2_connections_.erase(h2_it);
             }
             auto h1_it = http_connections_.find(conn->fd());
@@ -458,21 +486,56 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                 stale_h1 = std::move(h1_it->second);
                 http_connections_.erase(h1_it);
             }
-            // Also clean up stale pending detection
+            // Track in pending_detection_ for counter symmetry: if the
+            // connection closes before HandleMessage runs (no map entry yet),
+            // HandleCloseConnection needs to find it here to decrement.
+            // Track in pending_detection_ and count the connection.
+            // Counter is tied to map membership — symmetric with was_tracked
+            // decrement in HandleCloseConnection/HandleErrorConnection.
             auto pd_it = pending_detection_.find(conn->fd());
-            if (pd_it != pending_detection_.end() && pd_it->second.conn != conn) {
-                pending_detection_.erase(pd_it);
+            if (pd_it != pending_detection_.end()) {
+                if (pd_it->second.conn != conn) {
+                    // Stale entry — replace with current conn tracking.
+                    // Compensating decrement for old entry handled below.
+                    pd_it->second = {conn, ""};
+                    evicted_pd = true;
+                    new_conn_tracked = true;
+                }
+                // else: same conn already tracked (partial preface + race
+                // with HandleMessage) — already counted, keep data
+            } else {
+                pending_detection_[conn->fd()] = {conn, ""};
+                new_conn_tracked = true;
             }
         }
-        // Notify stale WS handler outside the lock (avoids deadlock with
-        // CallCloseCb → conn_mtx_ and preserves the close notification).
+        // Increment counters for the newly tracked connection
+        if (new_conn_tracked) {
+            total_accepted_.fetch_add(1, std::memory_order_relaxed);
+            active_connections_.fetch_add(1, std::memory_order_relaxed);
+        }
+        // Compensating decrements for evicted stale entries — their close
+        // callbacks can no longer find the map entries we just removed.
+        if (stale_h2) {
+            active_connections_.fetch_sub(1, std::memory_order_relaxed);
+            active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
+            // Compensate for open streams on the evicted session
+            if (stale_h2->GetSession()) {
+                int64_t unclosed = static_cast<int64_t>(
+                    stale_h2->GetSession()->UnclosedStreamCount());
+                if (unclosed > 0) {
+                    active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (stale_h1) {
+            active_connections_.fetch_sub(1, std::memory_order_relaxed);
+            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+        }
+        if (evicted_pd && !stale_h2 && !stale_h1) {
+            active_connections_.fetch_sub(1, std::memory_order_relaxed);
+        }
+        // Notify stale WS handler outside the lock.
         SafeNotifyWsClose(stale_h1);
-
-        // Note: TLS ALPN h2 detection cannot happen here — HandleNewConnection
-        // runs before TLS handshake completes (tls_state_ == HANDSHAKE, not READY).
-        // GetAlpnProtocol() returns empty until handshake finishes.
-        // ALPN detection happens in HandleMessage → DetectAndRouteProtocol after
-        // the first OnMessage fires (which is post-handshake).
     } else {
         // HTTP/2 disabled — always create HTTP/1.x handler immediately.
         std::shared_ptr<HttpConnectionHandler> old_handler;
@@ -488,25 +551,36 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
                     SetupHandlers(http_conn);
                     http_connections_[conn->fd()] = http_conn;
+                    // Counter tied to map insertion
+                    total_accepted_.fetch_add(1, std::memory_order_relaxed);
+                    active_connections_.fetch_add(1, std::memory_order_relaxed);
+                    active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
                 }
             } else {
                 auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
                 SetupHandlers(http_conn);
                 http_connections_[conn->fd()] = http_conn;
+                // Counter tied to map insertion
+                total_accepted_.fetch_add(1, std::memory_order_relaxed);
+                active_connections_.fetch_add(1, std::memory_order_relaxed);
+                active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        // Compensating decrement for evicted stale handler (fd reuse)
+        if (old_handler) {
+            active_connections_.fetch_sub(1, std::memory_order_relaxed);
+            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
         SafeNotifyWsClose(old_handler);
         if (already_initialized) return;
     }
 
     // Arm a connection-level deadline for the TLS handshake + protocol detection
-    // window. The protocol handler resets this once it takes over, so the total
-    // exposure is up to 2× request_timeout_sec (handshake + first request).
-    // This is intentional: separating handshake and request timeouts is standard
-    // (cf. nginx ssl_handshake_timeout vs client_header_timeout).
-    if (request_timeout_sec_ > 0) {
+    // window. Load from atomic at use time — not cached per-connection.
+    int req_timeout = request_timeout_sec_.load(std::memory_order_relaxed);
+    if (req_timeout > 0) {
         conn->SetDeadline(std::chrono::steady_clock::now() +
-                          std::chrono::seconds(request_timeout_sec_));
+                          std::chrono::seconds(req_timeout));
     }
 
     logging::Get()->debug("New HTTP connection fd={} from {}:{}",
@@ -516,32 +590,59 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
 void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->debug("HTTP connection closed fd={}", conn->fd());
 
-    // Single lock: check both H2 and HTTP/1.x maps
+    // Single lock: check pending_detection_, H2, and HTTP/1.x maps.
+    // Only decrement active_connections_ if found in a map — prevents underflow
+    // when HandleCloseConnection fires for connections that HandleNewConnection
+    // never counted (e.g., RegisterCallbacks failure, IsClosing early return).
     std::shared_ptr<HttpConnectionHandler> http_conn;
+    std::shared_ptr<Http2ConnectionHandler> h2_handler;
     bool was_h2 = false;
+    bool was_tracked = false;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         auto pd_it = pending_detection_.find(conn->fd());
         if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
             pending_detection_.erase(pd_it);
+            was_tracked = true;
         }
         auto h2_it = h2_connections_.find(conn->fd());
         if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
+            h2_handler = h2_it->second;  // save for stream count compensation
             h2_connections_.erase(h2_it);
             was_h2 = true;
+            was_tracked = true;
         }
         if (!was_h2) {
             auto it = http_connections_.find(conn->fd());
             if (it != http_connections_.end() && it->second->GetConnection() == conn) {
                 http_conn = it->second;
                 http_connections_.erase(it);
+                was_tracked = true;
             }
         }
     }
+    if (was_tracked) {
+        active_connections_.fetch_sub(1, std::memory_order_relaxed);
+    }
     // Outside lock: notify drain set and WS close handler
     if (was_h2) {
+        active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
+        // Compensate active_h2_streams_ for streams whose close callback has
+        // NOT yet fired. UnclosedStreamCount() excludes streams already marked
+        // for deferred removal (close callback fired, counter already decremented)
+        // to avoid double-subtraction.
+        if (h2_handler && h2_handler->GetSession()) {
+            int64_t unclosed = static_cast<int64_t>(
+                h2_handler->GetSession()->UnclosedStreamCount());
+            if (unclosed > 0) {
+                active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
+            }
+        }
         OnH2DrainComplete(conn.get());
         return;
+    }
+    if (http_conn) {
+        active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
     }
     SafeNotifyWsClose(http_conn);
 }
@@ -549,31 +650,51 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
 void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) {
     logging::Get()->error("HTTP connection error fd={}", conn->fd());
 
-    // Single lock: check both H2 and HTTP/1.x maps
+    // Same map-based tracking as HandleCloseConnection — see comment there.
     std::shared_ptr<HttpConnectionHandler> http_conn;
+    std::shared_ptr<Http2ConnectionHandler> h2_handler;
     bool was_h2 = false;
+    bool was_tracked = false;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         auto pd_it = pending_detection_.find(conn->fd());
         if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
             pending_detection_.erase(pd_it);
+            was_tracked = true;
         }
         auto h2_it = h2_connections_.find(conn->fd());
         if (h2_it != h2_connections_.end() && h2_it->second->GetConnection() == conn) {
+            h2_handler = h2_it->second;
             h2_connections_.erase(h2_it);
             was_h2 = true;
+            was_tracked = true;
         }
         if (!was_h2) {
             auto it = http_connections_.find(conn->fd());
             if (it != http_connections_.end() && it->second->GetConnection() == conn) {
                 http_conn = it->second;
                 http_connections_.erase(it);
+                was_tracked = true;
             }
         }
     }
+    if (was_tracked) {
+        active_connections_.fetch_sub(1, std::memory_order_relaxed);
+    }
     if (was_h2) {
+        active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
+        if (h2_handler && h2_handler->GetSession()) {
+            int64_t unclosed = static_cast<int64_t>(
+                h2_handler->GetSession()->UnclosedStreamCount());
+            if (unclosed > 0) {
+                active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
+            }
+        }
         OnH2DrainComplete(conn.get());
         return;
+    }
+    if (http_conn) {
+        active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
     }
     SafeNotifyWsClose(http_conn);
 }
@@ -583,6 +704,7 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
     // Copy shared_ptrs under the lock, then call OnRawData outside it:
     // OnRawData can trigger callbacks that acquire conn_mtx_ — deadlock.
     std::shared_ptr<Http2ConnectionHandler> h2_conn;
+    std::shared_ptr<Http2ConnectionHandler> evicted_stale_h2;
     std::shared_ptr<HttpConnectionHandler> http_conn;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
@@ -593,7 +715,8 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             if (h2_it->second->GetConnection() == conn) {
                 h2_conn = h2_it->second;
             } else {
-                // fd reused — remove stale entry (will fall through to detection)
+                // fd reused — save for stream compensation, then evict
+                evicted_stale_h2 = h2_it->second;
                 h2_connections_.erase(h2_it);
             }
         }
@@ -603,6 +726,18 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             auto it = http_connections_.find(conn->fd());
             if (it != http_connections_.end()) {
                 http_conn = it->second;
+            }
+        }
+    }
+    // Compensating decrement for evicted stale H2 entry
+    if (evicted_stale_h2) {
+        active_connections_.fetch_sub(1, std::memory_order_relaxed);
+        active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
+        if (evicted_stale_h2->GetSession()) {
+            int64_t unclosed = static_cast<int64_t>(
+                evicted_stale_h2->GetSession()->UnclosedStreamCount());
+            if (unclosed > 0) {
+                active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
             }
         }
     }
@@ -618,14 +753,19 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         if (http_conn->GetConnection() != conn) {
             SafeNotifyWsClose(http_conn);
             http_conn = nullptr;
+            bool evicted_stale_h1 = false;
             {
                 std::lock_guard<std::mutex> lck(conn_mtx_);
-                // Identity check: only erase if the entry still wraps the stale conn
                 auto it = http_connections_.find(conn->fd());
                 if (it != http_connections_.end() &&
                     it->second->GetConnection() != conn) {
                     http_connections_.erase(it);
+                    evicted_stale_h1 = true;
                 }
+            }
+            if (evicted_stale_h1) {
+                active_connections_.fetch_sub(1, std::memory_order_relaxed);
+                active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
             }
             // Fall through to DetectAndRouteProtocol below
         } else {
@@ -637,23 +777,37 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
     // No handler exists yet (or stale fd-reuse removed above) — detect protocol and create one.
     // Prepend any buffered partial-preface bytes accumulated from a prior call.
     // Verify connection identity to guard against fd-reuse races.
+    // Check if pending_detection_ has a tracking entry for this connection.
+    // If found with matching identity, counters were already incremented
+    // by HandleNewConnection. If not found, this is the accept/data race
+    // path (HandleMessage ran before HandleNewConnection) — DetectAndRoute
+    // must handle the counter increment.
+    bool already_counted = false;
     {
+        bool evicted_stale_pd = false;
         std::lock_guard<std::mutex> lck(conn_mtx_);
         auto pd_it = pending_detection_.find(conn->fd());
         if (pd_it != pending_detection_.end()) {
             if (pd_it->second.conn == conn) {
                 pd_it->second.data += message;
                 message = std::move(pd_it->second.data);
+                already_counted = true;
+            } else {
+                // Stale entry (fd reused) — compensating decrement
+                evicted_stale_pd = true;
             }
-            // If conn doesn't match, discard stale entry (fd reused)
             pending_detection_.erase(pd_it);
         }
+        if (evicted_stale_pd) {
+            active_connections_.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
-    DetectAndRouteProtocol(conn, message);
+    DetectAndRouteProtocol(conn, message, already_counted);
 }
 
 bool HttpServer::DetectAndRouteProtocol(
-    std::shared_ptr<ConnectionHandler> conn, std::string& message) {
+    std::shared_ptr<ConnectionHandler> conn, std::string& message,
+    bool already_counted) {
 
     ProtocolDetector::Protocol proto = ProtocolDetector::Protocol::HTTP1;
 
@@ -672,14 +826,23 @@ bool HttpServer::DetectAndRouteProtocol(
             if (proto == ProtocolDetector::Protocol::UNKNOWN) {
                 // Not enough data to classify — buffer and wait for more bytes.
                 // This handles h2c clients that send the 24-byte preface split
-                // across multiple TCP segments. Store connection identity to
-                // guard against fd-reuse races.
+                // across multiple TCP segments.
                 std::lock_guard<std::mutex> lck(conn_mtx_);
                 auto& pd = pending_detection_[conn->fd()];
                 if (pd.conn == conn) {
+                    // Same conn — append additional preface bytes
                     pd.data += message;
                 } else {
+                    // First insertion for this connection. If not already_counted
+                    // (accept/data race: HandleMessage before HandleNewConnection),
+                    // increment now so the counter is set before the entry exists
+                    // in the map. HandleNewConnection will see the same-conn entry
+                    // and skip its own increment.
                     pd = {conn, message};
+                    if (!already_counted) {
+                        total_accepted_.fetch_add(1, std::memory_order_relaxed);
+                        active_connections_.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
                 return true;
             }
@@ -689,15 +852,23 @@ bool HttpServer::DetectAndRouteProtocol(
     if (proto == ProtocolDetector::Protocol::HTTP2) {
         // Skip if connection is fully closing (not just peer half-close)
         if (conn->IsClosing()) return true;
-        // Create HTTP/2 handler
-        auto h2_conn = std::make_shared<Http2ConnectionHandler>(conn, h2_settings_);
-        SetupH2Handlers(h2_conn);
-        // Publish BEFORE Initialize so HandleCloseConnection can find and
-        // remove the handler if Initialize's SendRaw triggers a synchronous
-        // close (peer already disconnected). RequestShutdown safely handles
-        // uninitialized sessions (checks !session_ and returns early).
+        if (!already_counted) {
+            total_accepted_.fetch_add(1, std::memory_order_relaxed);
+            active_connections_.fetch_add(1, std::memory_order_relaxed);
+        }
+        active_http2_connections_.fetch_add(1, std::memory_order_relaxed);
+        // Snapshot h2_settings_ and publish handler under a single lock to
+        // prevent race with Reload() and to avoid double mutex acquisition.
+        Http2Session::Settings settings_snapshot;
+        std::shared_ptr<Http2ConnectionHandler> h2_conn;
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
+            settings_snapshot = h2_settings_;
+            h2_conn = std::make_shared<Http2ConnectionHandler>(conn, settings_snapshot);
+            SetupH2Handlers(h2_conn);
+            // Publish BEFORE Initialize so HandleCloseConnection can find and
+            // remove the handler if Initialize's SendRaw triggers a synchronous
+            // close. RequestShutdown safely handles uninitialized sessions.
             h2_connections_[conn->fd()] = h2_conn;
         }
         h2_conn->Initialize(message);
@@ -705,6 +876,11 @@ bool HttpServer::DetectAndRouteProtocol(
     }
 
     // HTTP/1.x — create handler (existing path)
+    if (!already_counted) {
+        total_accepted_.fetch_add(1, std::memory_order_relaxed);
+        active_connections_.fetch_add(1, std::memory_order_relaxed);
+    }
+    active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
     SetupHandlers(http_conn);
     {
@@ -723,12 +899,11 @@ bool HttpServer::DetectAndRouteProtocol(
 }
 
 void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn) {
-    h2_conn->SetMaxBodySize(max_body_size_);
+    h2_conn->SetMaxBodySize(max_body_size_.load(std::memory_order_relaxed));
     // Note: NOT calling SetMaxHeaderSize here. HTTP/2 header limits come from
     // h2_settings_.max_header_list_size (Http2Config, default 64KB), which is
     // already baked into the session settings and advertised via SETTINGS frame.
-    // Calling SetMaxHeaderSize would overwrite it with the HTTP/1.x limit (8KB).
-    h2_conn->SetRequestTimeout(request_timeout_sec_);
+    h2_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
 
     // Set request callback: dispatch through HttpRouter (same as HTTP/1.x)
     h2_conn->SetRequestCallback(
@@ -736,9 +911,95 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                int32_t /*stream_id*/,
                const HttpRequest& request,
                HttpResponse& response) {
+            total_requests_.fetch_add(1, std::memory_order_relaxed);
+            active_requests_.fetch_add(1, std::memory_order_relaxed);
+            RequestGuard guard{active_requests_};
+
             if (!router_.Dispatch(request, response)) {
                 response.Status(404).Text("Not Found");
             }
         }
     );
+
+    // Stream open/close counter callbacks
+    h2_conn->SetStreamOpenCallback(
+        [this](std::shared_ptr<Http2ConnectionHandler> /*self*/, int32_t /*stream_id*/) {
+            active_h2_streams_.fetch_add(1, std::memory_order_relaxed);
+        }
+    );
+    h2_conn->SetStreamCloseCallback(
+        [this](std::shared_ptr<Http2ConnectionHandler> /*self*/,
+               int32_t /*stream_id*/, uint32_t /*error_code*/) {
+            active_h2_streams_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    );
+}
+
+void HttpServer::Reload(const ServerConfig& new_config) {
+    // Update reload-safe limit fields (atomic stores)
+    max_body_size_.store(new_config.max_body_size, std::memory_order_relaxed);
+    max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);
+    max_ws_message_size_.store(new_config.max_ws_message_size, std::memory_order_relaxed);
+    request_timeout_sec_.store(new_config.request_timeout_sec, std::memory_order_relaxed);
+    shutdown_drain_timeout_sec_.store(new_config.shutdown_drain_timeout_sec,
+                                     std::memory_order_relaxed);
+
+    // Update max_connections and input buffer cap
+    net_server_.SetMaxConnections(new_config.max_connections);
+    net_server_.SetMaxInputSize(ComputeInputCap());
+
+    // Update idle timeout via EnQueue to dispatcher threads
+    net_server_.SetConnectionTimeout(
+        std::chrono::seconds(new_config.idle_timeout_sec));
+
+    // Recompute timer scan interval. Only shorten, never lengthen — existing
+    // connections keep their old per-connection deadlines and must be scanned
+    // at least as frequently as before. Without this floor, reloading
+    // request_timeout upward (30s→300s) would stretch the scan from 10s to
+    // 100s, letting pre-reload 30s deadlines overshoot.
+    {
+        int idle_iv = new_config.idle_timeout_sec > 0
+            ? std::max(new_config.idle_timeout_sec / 6, 1) : 0;
+        int req_iv = new_config.request_timeout_sec > 0
+            ? std::max(new_config.request_timeout_sec / 3, 1) : 0;
+        int new_scan;
+        if (idle_iv == 0 && req_iv == 0) new_scan = 5;
+        else if (idle_iv == 0) new_scan = req_iv;
+        else if (req_iv == 0) new_scan = idle_iv;
+        else new_scan = std::min(idle_iv, req_iv);
+        // Never lengthen past current cadence
+        int cur_scan = net_server_.GetTimerInterval();
+        net_server_.SetTimerInterval(
+            cur_scan > 0 ? std::min(new_scan, cur_scan) : new_scan);
+    }
+
+    // Update HTTP/2 settings for NEW connections only (under conn_mtx_).
+    // Existing sessions keep their negotiated SETTINGS values — submitting
+    // a new SETTINGS frame to live sessions mid-stream is not supported.
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        h2_settings_.max_concurrent_streams = new_config.http2.max_concurrent_streams;
+        h2_settings_.initial_window_size    = new_config.http2.initial_window_size;
+        h2_settings_.max_frame_size         = new_config.http2.max_frame_size;
+        h2_settings_.max_header_list_size   = new_config.http2.max_header_list_size;
+    }
+}
+
+HttpServer::ServerStats HttpServer::GetStats() const {
+    ServerStats stats;
+    auto now = std::chrono::steady_clock::now();
+    stats.uptime_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+        now - start_time_).count();
+    stats.active_connections      = active_connections_.load(std::memory_order_relaxed);
+    stats.active_http1_connections = active_http1_connections_.load(std::memory_order_relaxed);
+    stats.active_http2_connections = active_http2_connections_.load(std::memory_order_relaxed);
+    stats.active_h2_streams       = active_h2_streams_.load(std::memory_order_relaxed);
+    stats.total_accepted          = total_accepted_.load(std::memory_order_relaxed);
+    stats.total_requests          = total_requests_.load(std::memory_order_relaxed);
+    stats.active_requests         = active_requests_.load(std::memory_order_relaxed);
+    stats.max_connections     = net_server_.GetMaxConnections();
+    stats.idle_timeout_sec    = static_cast<int>(net_server_.GetConnectionTimeout().count());
+    stats.request_timeout_sec = request_timeout_sec_.load(std::memory_order_relaxed);
+    stats.worker_threads      = resolved_worker_threads_;
+    return stats;
 }

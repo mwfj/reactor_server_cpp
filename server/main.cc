@@ -79,7 +79,8 @@ static int HandleStatus(const CliOptions& options) {
     return EXIT_ERROR;
 }
 
-static int HandleStop(const CliOptions& options) {
+static int SendSignalToServer(const CliOptions& options, int sig,
+                              const char* sig_name) {
     pid_t pid = PidFile::CheckRunning(options.pid_file);
     if (pid < 0) {
         std::cout << REACTOR_SERVER_NAME << " is not running\n";
@@ -90,14 +91,22 @@ static int HandleStop(const CliOptions& options) {
                   << " is running but PID is unreadable — cannot send signal\n";
         return EXIT_ERROR;
     }
-    if (kill(pid, SIGTERM) == 0) {
-        std::cout << "Sent SIGTERM to " << REACTOR_SERVER_NAME
+    if (kill(pid, sig) == 0) {
+        std::cout << "Sent " << sig_name << " to " << REACTOR_SERVER_NAME
                   << " (PID " << pid << ")\n";
         return EXIT_OK;
     }
     std::cerr << "Failed to send signal to PID " << pid
               << ": " << std::strerror(errno) << "\n";
     return EXIT_ERROR;
+}
+
+static int HandleStop(const CliOptions& options) {
+    return SendSignalToServer(options, SIGTERM, "SIGTERM");
+}
+
+static int HandleReload(const CliOptions& options) {
+    return SendSignalToServer(options, SIGHUP, "SIGHUP");
 }
 
 // ── Health endpoint handler ──────────────────────────────────────
@@ -114,6 +123,199 @@ MakeHealthHandler(std::chrono::steady_clock::time_point start_time) {
             static_cast<int>(getpid()), static_cast<long long>(uptime));
         res.Status(200).Json(buf);
     };
+}
+
+// ── Stats endpoint handler ──────────────────────────────────────
+static std::function<void(const HttpRequest&, HttpResponse&)>
+MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
+    // Capture config by value so /stats always reflects the startup-time
+    // configuration for restart-required fields (bind_host, bind_port, etc.).
+    // This avoids a data race: ReloadConfig() mutates the caller's ServerConfig
+    // on the main thread while dispatcher threads serve /stats requests.
+    //
+    // Safety: bind_host is validated as a numeric IPv4 address by
+    // ConfigLoader::Validate() before reaching here, so no JSON escaping
+    // is needed for the %s substitution.
+    return [server, config](const HttpRequest& /*req*/, HttpResponse& res) {
+        auto stats = server->GetStats();
+
+        // Build JSON manually — avoid pulling in nlohmann/json for a simple response.
+        // Config section shows only operational parameters — no file paths, no TLS details.
+        static constexpr size_t STATS_BUF_SIZE = 1024;
+        char buf[STATS_BUF_SIZE];
+        int written = std::snprintf(buf, sizeof(buf),
+            R"({"uptime_seconds":%lld,)"
+            R"("connections":{"active":%lld,"active_http1":%lld,"active_http2":%lld,)"
+            R"("active_h2_streams":%lld,"total_accepted":%lld},)"
+            R"("requests":{"total":%lld,"active":%lld},)"
+            R"("config":{"bind_host":"%s","bind_port":%d,"worker_threads":%d,)"
+            R"("max_connections":%d,"idle_timeout_sec":%d,"request_timeout_sec":%d,)"
+            R"("tls_enabled":%s,"http2_enabled":%s}})",
+            static_cast<long long>(stats.uptime_seconds),
+            static_cast<long long>(stats.active_connections),
+            static_cast<long long>(stats.active_http1_connections),
+            static_cast<long long>(stats.active_http2_connections),
+            static_cast<long long>(stats.active_h2_streams),
+            static_cast<long long>(stats.total_accepted),
+            static_cast<long long>(stats.total_requests),
+            static_cast<long long>(stats.active_requests),
+            config.bind_host.c_str(), config.bind_port, stats.worker_threads,
+            stats.max_connections, stats.idle_timeout_sec,
+            stats.request_timeout_sec,
+            config.tls.enabled ? "true" : "false",
+            config.http2.enabled ? "true" : "false");
+        if (written < 0 || static_cast<size_t>(written) >= sizeof(buf)) {
+            res.Status(500).Json(R"({"error":"stats buffer overflow"})");
+            return;
+        }
+        res.Status(200).Json(buf);
+    };
+}
+
+// Forward declaration — defined below, after RequireAbsolutePath.
+static int ValidateDaemonConfig(const ServerConfig& config,
+                                const CliOptions& options);
+
+// ── Config reload helper (SIGHUP in daemon mode) ────────────────
+// Re-reads config file, validates, applies reload-safe fields.
+// Returns true on success, false on error (current config kept).
+static bool ReloadConfig(const std::string& config_path,
+                         const CliOptions& options,
+                         HttpServer& server,
+                         ServerConfig& current_config) {
+    ServerConfig new_config;
+    try {
+        // Mirror LoadConfig's fallback: only fall back to defaults if the config
+        // file does not exist (ENOENT) AND the path wasn't explicitly set.
+        // Transient errors (EACCES, EIO) must reject the reload, not silently
+        // replace config with defaults.
+        if (access(config_path.c_str(), F_OK) == 0) {
+            new_config = ConfigLoader::LoadFromFile(config_path);
+        } else if (!options.config_path_explicit && errno == ENOENT) {
+            new_config = ConfigLoader::Default();
+        } else {
+            logging::Get()->error("Config reload failed: {}: {}",
+                                  config_path, std::strerror(errno));
+            return false;
+        }
+        ConfigLoader::ApplyEnvOverrides(new_config);
+        ApplyCliOverrides(new_config, options);
+    } catch (const std::exception& e) {
+        logging::Get()->error("Config reload failed ({}): {}",
+                              config_path, e.what());
+        return false;
+    }
+    try {
+        ConfigLoader::Validate(new_config);
+    } catch (const std::invalid_argument& e) {
+        logging::Get()->error("Config reload validation failed ({}): {}",
+                              config_path, e.what());
+        return false;
+    }
+
+    // Daemon-specific validation: reject relative/empty log paths that would
+    // break after chdir("/"). Same checks as startup (ValidateDaemonConfig).
+    if (options.daemonize) {
+        int drc = ValidateDaemonConfig(new_config, options);
+        if (drc != EXIT_OK) {
+            logging::Get()->error("Config reload rejected: daemon path validation failed");
+            return false;
+        }
+    }
+
+    // Log restart-required field changes at warn level
+    if (new_config.bind_host != current_config.bind_host)
+        logging::Get()->warn("bind_host changed ({} -> {}) — requires restart, ignored",
+                             current_config.bind_host, new_config.bind_host);
+    if (new_config.bind_port != current_config.bind_port)
+        logging::Get()->warn("bind_port changed ({} -> {}) — requires restart, ignored",
+                             current_config.bind_port, new_config.bind_port);
+    if (new_config.worker_threads != current_config.worker_threads)
+        logging::Get()->warn("worker_threads changed ({} -> {}) — requires restart, ignored",
+                             current_config.worker_threads, new_config.worker_threads);
+    if (new_config.tls.enabled != current_config.tls.enabled ||
+        new_config.tls.cert_file != current_config.tls.cert_file ||
+        new_config.tls.key_file != current_config.tls.key_file ||
+        new_config.tls.min_version != current_config.tls.min_version)
+        logging::Get()->warn("tls.* changed — requires restart, ignored");
+    if (new_config.http2.enabled != current_config.http2.enabled)
+        logging::Get()->warn("http2.enabled changed — requires restart, ignored");
+
+    // Apply log changes: always update file config and reopen, even if config
+    // is unchanged. External logrotate sends SIGHUP with unchanged config to
+    // force descriptor reopen after file rename. Gating on config changes would
+    // break standard postrotate `kill -HUP` workflows.
+    //
+    // Save old config before updating so we can roll back on failure.
+    std::string old_log_file = current_config.log.file;
+    size_t old_max_size = current_config.log.max_file_size;
+    int old_max_files = current_config.log.max_files;
+
+    logging::UpdateFileConfig(new_config.log.file, new_config.log.max_file_size,
+                              new_config.log.max_files);
+    if (logging::Reopen()) {
+        logging::Get()->info("Log files reopened");
+    } else {
+        // Roll back stored sink config so subsequent SIGHUPs don't retry
+        // the broken file/sink parameters.
+        logging::UpdateFileConfig(old_log_file, old_max_size, old_max_files);
+        if (new_config.log.file != current_config.log.file) {
+            logging::Get()->error("Log file reopen failed for new path: {}",
+                                  new_config.log.file);
+            return false;
+        }
+        // Same path, reopen failed (e.g. logrotate timing) — warn but continue.
+        logging::Get()->warn("Log file reopen failed, continuing with old file");
+    }
+    if (new_config.log.level != current_config.log.level) {
+        logging::SetLevel(logging::ParseLevel(new_config.log.level));
+        logging::Get()->info("Log level changed to {}", new_config.log.level);
+    }
+
+    // Apply reload-safe fields via HttpServer::Reload()
+    server.Reload(new_config);
+
+    // Log reload-safe changes at info level.
+    // idle_timeout and max_connections take effect immediately for all connections.
+    // Size limits and request_timeout are cached per-connection — only new
+    // connections pick up the updated values.
+    if (new_config.idle_timeout_sec != current_config.idle_timeout_sec)
+        logging::Get()->info("idle_timeout_sec: {} -> {} (immediate)",
+                             current_config.idle_timeout_sec, new_config.idle_timeout_sec);
+    if (new_config.request_timeout_sec != current_config.request_timeout_sec)
+        logging::Get()->info("request_timeout_sec: {} -> {} (new connections)",
+                             current_config.request_timeout_sec, new_config.request_timeout_sec);
+    if (new_config.max_connections != current_config.max_connections)
+        logging::Get()->info("max_connections: {} -> {} (immediate)",
+                             current_config.max_connections, new_config.max_connections);
+    if (new_config.max_body_size != current_config.max_body_size)
+        logging::Get()->info("max_body_size: {} -> {} (new connections)",
+                             current_config.max_body_size, new_config.max_body_size);
+    if (new_config.max_header_size != current_config.max_header_size)
+        logging::Get()->info("max_header_size: {} -> {} (new connections)",
+                             current_config.max_header_size, new_config.max_header_size);
+    if (new_config.max_ws_message_size != current_config.max_ws_message_size)
+        logging::Get()->info("max_ws_message_size: {} -> {} (new connections)",
+                             current_config.max_ws_message_size, new_config.max_ws_message_size);
+
+    // Update current_config with new values, but preserve restart-required
+    // fields at their actual running values. Without this, the next reload's
+    // diff comparison would be against phantom state (e.g., bind_port shows
+    // 9090 even though the server is still listening on 8080).
+    auto saved_host = current_config.bind_host;
+    auto saved_port = current_config.bind_port;
+    auto saved_tls = current_config.tls;
+    auto saved_workers = current_config.worker_threads;
+    auto saved_h2_enabled = current_config.http2.enabled;
+
+    current_config = new_config;
+
+    current_config.bind_host = saved_host;
+    current_config.bind_port = saved_port;
+    current_config.tls = saved_tls;
+    current_config.worker_threads = saved_workers;
+    current_config.http2.enabled = saved_h2_enabled;
+    return true;
 }
 
 // ── Daemon path helper: reject relative paths (CWD changes to "/") ──
@@ -159,6 +361,19 @@ static int HandleStart(const CliOptions& options) {
     if (options.daemonize) {
         rc = ValidateDaemonConfig(config, options);
         if (rc != EXIT_OK) return rc;
+    }
+
+    // Resolve config path to absolute BEFORE daemonizing (chdir changes to "/").
+    // Use getcwd + "/" + relative_path (not realpath) to preserve symlinks —
+    // operators often use symlinked configs (config/current.json → config/v2.json)
+    // and swap the link target between reloads.
+    std::string resolved_config_path = options.config_path;
+    if (options.daemonize && !options.config_path.empty() &&
+        options.config_path[0] != '/') {
+        char cwd_buf[PATH_MAX];
+        if (getcwd(cwd_buf, sizeof(cwd_buf))) {
+            resolved_config_path = std::string(cwd_buf) + "/" + options.config_path;
+        }
     }
 
     // ── Daemonize (if requested) ────────────────────────────
@@ -256,16 +471,30 @@ static int HandleStart(const CliOptions& options) {
     if (options.health_endpoint) {
         auto start_time = std::chrono::steady_clock::now();
         server->Get("/health", MakeHealthHandler(start_time));
+        server->Get("/stats", MakeStatsHandler(server.get(), config));
         logging::Get()->info("  Health:  /health");
+        logging::Get()->info("  Stats:   /stats");
     }
 
-    // ── Wire daemon readiness to fire after init, before event loop ──
+    // ── Wire readiness callback to fire after init, before event loop ──
+    // Used by daemon mode to signal parent, and by the signal loop to gate
+    // reloads until socket_dispatchers_ is fully built (prevents races).
+    std::atomic<bool> server_ready{false};
 #if !defined(_WIN32)
     if (options.daemonize) {
-        server->SetReadyCallback([]() {
+        server->SetReadyCallback([&server_ready]() {
+            server_ready.store(true, std::memory_order_release);
             Daemonizer::NotifyReady();
         });
+    } else {
+        server->SetReadyCallback([&server_ready]() {
+            server_ready.store(true, std::memory_order_release);
+        });
     }
+#else
+    server->SetReadyCallback([&server_ready]() {
+        server_ready.store(true, std::memory_order_release);
+    });
 #endif
 
     // ── Server thread ───────────────────────────────────────
@@ -299,12 +528,19 @@ static int HandleStart(const CliOptions& options) {
         if (sig == SignalResult::SHUTDOWN) break;
         // SIGHUP received
         if (options.daemonize) {
-            // Daemon mode: reopen log files for rotation
-            logging::Get()->info("Received SIGHUP, reopening log files");
-            if (logging::Reopen()) {
-                logging::Get()->info("Log files reopened");
+            // Daemon mode: reload configuration.
+            // Gate on server_ready to prevent racing with Start() building
+            // socket_dispatchers_ — SetConnectionTimeout/SetTimerInterval
+            // walk the vector without synchronization.
+            if (!server_ready.load(std::memory_order_acquire)) {
+                logging::Get()->warn("Received SIGHUP before server is ready, ignoring");
+                continue;
+            }
+            logging::Get()->info("Received SIGHUP, reloading configuration");
+            if (ReloadConfig(resolved_config_path, options, *server, config)) {
+                logging::Get()->info("Configuration reloaded successfully");
             } else {
-                logging::Get()->warn("Log file reopen failed, continuing with old file");
+                logging::Get()->warn("Configuration reload failed, keeping current config");
             }
         } else {
             // Foreground mode: treat SIGHUP as shutdown (terminal hangup).
@@ -368,6 +604,9 @@ int main(int argc, char* argv[]) {
 
         case CliCommand::STOP:
             return HandleStop(options);
+
+        case CliCommand::RELOAD:
+            return HandleReload(options);
 
         case CliCommand::VALIDATE: {
             ServerConfig config;

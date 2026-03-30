@@ -85,4 +85,13 @@ public:
     void SetTimerCB(CALLBACKS_NAMESPACE::DispatcherTimerCallback);
     void SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCallback);
     void TimerHandler();
+
+    // Update idle timeout duration at runtime. Must be called on the
+    // dispatcher thread (via EnQueue) to avoid racing with TimerHandler.
+    void SetTimeout(std::chrono::seconds timeout) { timeout_ = timeout; }
+
+    // Update timer scan interval at runtime and re-arm the timerfd so the
+    // new cadence takes effect immediately (not deferred to the next fire).
+    // Must be called on the dispatcher thread (via EnQueue).
+    void SetTimerInterval(int interval);
 };

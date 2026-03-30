@@ -80,11 +80,19 @@ public:
     Http2Stream* CreateStream(int32_t stream_id);
     void MarkStreamForRemoval(int32_t stream_id);
     size_t ActiveStreamCount() const;
+    // Streams whose close callback has NOT yet fired. Used for counter
+    // compensation when the transport closes abruptly — avoids double-
+    // subtracting streams already decremented by the close callback.
+    size_t UnclosedStreamCount() const;
 
     // --- Callbacks (set by Http2ConnectionHandler) ---
 
     void SetRequestCallback(HTTP2_CALLBACKS_NAMESPACE::Http2RequestCallback cb);
     void SetStreamCloseCallback(HTTP2_CALLBACKS_NAMESPACE::Http2StreamCloseCallback cb);
+    // SetStreamOpenCallback: callback fires during nghttp2 frame processing
+    // (inside ReceiveData). Callers MUST NOT submit nghttp2 frames from
+    // within this callback — doing so is reentrant into nghttp2 and unsafe.
+    void SetStreamOpenCallback(HTTP2_CALLBACKS_NAMESPACE::Http2StreamOpenCallback cb);
 
     // --- Flood protection ---
 

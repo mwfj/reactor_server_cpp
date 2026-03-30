@@ -13,7 +13,7 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
     : conn_dispatcher_(std::make_shared<Dispatcher>()),
       acceptor_(nullptr),
       timer_interval_(timer_interval),
-      connection_timeout_(connection_timeout)
+      connection_timeout_sec_(static_cast<int>(connection_timeout.count()))
 {
     // Suppress SIGPIPE if the current handler is the default (which kills
     // the process). OpenSSL's SSL_write/SSL_shutdown use the underlying
@@ -54,7 +54,9 @@ void NetServer::Start(){
     socket_dispatchers_.reserve(sock_workers_.GetThreadWorkerNum());
     for(int idx = 0; idx < sock_workers_.GetThreadWorkerNum(); idx ++){
         // Use configurable timer parameters
-        std::shared_ptr<Dispatcher> task = std::make_shared<Dispatcher>(true, timer_interval_, connection_timeout_);
+        std::shared_ptr<Dispatcher> task = std::make_shared<Dispatcher>(
+            true, timer_interval_,
+            std::chrono::seconds(connection_timeout_sec_.load(std::memory_order_relaxed)));
         // Initialize each socket dispatcher (required for eventfd setup)
         task->Init();
         socket_dispatchers_.emplace_back(task);
@@ -206,11 +208,12 @@ void NetServer::Stop(){
 
 void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
     // Enforce max_connections limit
-    if (max_connections_ > 0) {
+    int max_conns = max_connections_.load(std::memory_order_relaxed);
+    if (max_conns > 0) {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        if (static_cast<int>(connections_.size()) >= max_connections_) {
+        if (static_cast<int>(connections_.size()) >= max_conns) {
             logging::Get()->warn("Max connections ({}) reached, rejecting fd {}",
-                                max_connections_, cilent_sock->fd());
+                                max_conns, cilent_sock->fd());
             return;  // SocketHandler destructor closes the fd
         }
     }
@@ -247,8 +250,9 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
 
     // Set input buffer cap BEFORE epoll registration to eliminate the race where
     // the first read arrives uncapped before HttpServer::HandleNewConnection runs.
-    if (max_input_size_ > 0) {
-        conn->SetMaxInputSize(max_input_size_);
+    size_t max_input = max_input_size_.load(std::memory_order_relaxed);
+    if (max_input > 0) {
+        conn->SetMaxInputSize(max_input);
     }
 
     AddConnection(conn);
@@ -414,4 +418,23 @@ bool NetServer::IsOnDispatcherThread() const {
         if (disp->is_on_loop_thread()) return true;
     }
     return false;
+}
+
+void NetServer::SetConnectionTimeout(std::chrono::seconds timeout) {
+    connection_timeout_sec_.store(static_cast<int>(timeout.count()),
+                                 std::memory_order_relaxed);
+    for (auto& disp : socket_dispatchers_) {
+        disp->EnQueue([d = disp, timeout]() {
+            d->SetTimeout(timeout);
+        });
+    }
+}
+
+void NetServer::SetTimerInterval(int seconds) {
+    timer_interval_ = seconds;
+    for (auto& disp : socket_dispatchers_) {
+        disp->EnQueue([d = disp, seconds]() {
+            d->SetTimerInterval(seconds);
+        });
+    }
 }
