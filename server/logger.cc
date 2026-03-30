@@ -221,14 +221,28 @@ static void PruneOldFiles() {
 
     std::sort(files.begin(), files.end());
 
-    // Delete oldest files if total count exceeds max_files.
+    // Count only non-empty files toward the limit. Empty files (created
+    // eagerly by spdlog on rotation/date rollover but not yet written to)
+    // should not cause deletion of older files with real content.
+    int non_empty = 0;
+    for (auto& f : files) {
+        struct stat st{};
+        if (stat(f.path.c_str(), &st) == 0 && st.st_size > 0) {
+            ++non_empty;
+        }
+    }
+
+    // Delete oldest non-empty files if count exceeds max_files.
     // Skip the current file — compensate by deleting the next oldest instead.
-    int to_delete = static_cast<int>(files.size()) - g_max_files;
+    int to_delete = non_empty - g_max_files;
     size_t idx = 0;
     while (to_delete > 0 && idx < files.size()) {
         if (files[idx].path != g_current_file_path) {
-            std::remove(files[idx].path.c_str());
-            --to_delete;
+            struct stat st{};
+            if (stat(files[idx].path.c_str(), &st) == 0 && st.st_size > 0) {
+                std::remove(files[idx].path.c_str());
+                --to_delete;
+            }
         }
         ++idx;
     }

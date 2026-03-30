@@ -53,17 +53,17 @@ void HttpServer::WireNetServerCallbacks() {
         });
 }
 
-// Validate host is a numeric IPv4 address — inet_addr() silently returns
-// INADDR_NONE for hostnames like "localhost" or IPv6 literals, causing
-// a confusing bind failure much later.
+// Validate host is a strict dotted-quad IPv4 address. Uses inet_pton (not
+// inet_addr) to reject legacy shorthand forms like "1" or octal "0127.0.0.1".
 static const std::string& ValidateHost(const std::string& host) {
     if (host.empty()) {
         throw std::invalid_argument("bind host must not be empty");
     }
-    if (inet_addr(host.c_str()) == INADDR_NONE && host != "255.255.255.255") {
+    struct in_addr addr{};
+    if (inet_pton(AF_INET, host.c_str(), &addr) != 1) {
         throw std::invalid_argument(
             "Invalid bind host: '" + host +
-            "' (must be a numeric IPv4 address, e.g. '0.0.0.0' or '127.0.0.1')");
+            "' (must be a dotted-quad IPv4 address, e.g. '0.0.0.0' or '127.0.0.1')");
     }
     return host;
 }
