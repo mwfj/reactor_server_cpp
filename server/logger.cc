@@ -145,7 +145,7 @@ void UpdateFileConfig(const std::string& file, size_t max_size, int max_files) {
 
 bool Reopen() {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
-    if (!g_logger || g_log_file.empty()) return true;  // no-op is success
+    if (!g_logger) return true;  // no logger → no-op is success
 
     try {
         g_logger->flush();

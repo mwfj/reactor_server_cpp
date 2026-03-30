@@ -138,6 +138,10 @@ private:
     // Resolved worker count (set at construction, never changes).
     // Needed because auto mode (worker_threads=0) resolves inside ThreadPool.
     int resolved_worker_threads_ = 0;
+
+    // Set by the ready callback after Start() finishes building dispatchers.
+    // Reload() checks this to avoid walking socket_dispatchers_ during startup.
+    std::atomic<bool> server_ready_{false};
     struct DrainingH2Conn {
         std::shared_ptr<Http2ConnectionHandler> handler;
         std::shared_ptr<ConnectionHandler> conn;

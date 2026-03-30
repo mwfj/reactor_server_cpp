@@ -95,6 +95,11 @@ HttpServer::HttpServer(const std::string& ip, int port)
 {
     WireNetServerCallbacks();
     resolved_worker_threads_ = net_server_.GetWorkerCount();
+    // Default ready callback — sets server_ready_ so Reload() is safe.
+    // SetReadyCallback() wraps any user callback on top of this.
+    net_server_.SetReadyCallback([this]() {
+        server_ready_.store(true, std::memory_order_release);
+    });
     // Apply the same defaults as the config constructor — must match ServerConfig defaults.
     net_server_.SetMaxConnections(ServerConfig{}.max_connections);
     net_server_.SetMaxInputSize(ComputeInputCap());
@@ -132,6 +137,9 @@ HttpServer::HttpServer(const ServerConfig& config)
 {
     WireNetServerCallbacks();
     resolved_worker_threads_ = net_server_.GetWorkerCount();
+    net_server_.SetReadyCallback([this]() {
+        server_ready_.store(true, std::memory_order_release);
+    });
 
     // Initialize logging from config
     logging::Init("reactor", logging::ParseLevel(config.log.level),
@@ -228,7 +236,10 @@ void HttpServer::Start() {
 }
 
 void HttpServer::SetReadyCallback(std::function<void()> cb) {
-    net_server_.SetReadyCallback(std::move(cb));
+    net_server_.SetReadyCallback([this, user_cb = std::move(cb)]() {
+        server_ready_.store(true, std::memory_order_release);
+        if (user_cb) user_cb();
+    });
 }
 
 void HttpServer::Stop() {
@@ -934,6 +945,13 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
 }
 
 void HttpServer::Reload(const ServerConfig& new_config) {
+    // Gate on server readiness — socket_dispatchers_ is built during Start()
+    // and must not be walked until construction is complete.
+    if (!server_ready_.load(std::memory_order_acquire)) {
+        logging::Get()->warn("Reload() called before server is ready, ignored");
+        return;
+    }
+
     // Update reload-safe limit fields (atomic stores)
     max_body_size_.store(new_config.max_body_size, std::memory_order_relaxed);
     max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);

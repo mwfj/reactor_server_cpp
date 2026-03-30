@@ -364,34 +364,24 @@ static int HandleStart(const CliOptions& options) {
     }
 
     // Resolve config path to absolute BEFORE daemonizing (chdir changes to "/").
-    // Preserve symlinks so operators can swap deployment symlinks between
-    // reloads (e.g., /opt/app → /opt/releases/v2, then repoint to v3).
-    // On Linux, /proc/self/cwd is a symlink to the logical cwd (preserves
-    // symlinked parent directories). getcwd() resolves the physical path,
-    // which would pin reloads to the old release tree.
+    // Use $PWD (the shell's logical working directory) to preserve symlinks —
+    // operators use symlinked deployment dirs (e.g., /opt/app → /opt/releases/v1)
+    // and repoint the link between reloads. getcwd() and /proc/self/cwd both
+    // resolve to the physical path, which would pin reloads to the old tree.
+    // $PWD is set by the shell at launch time and reflects the logical path.
+    // Fall back to getcwd() if $PWD is unset or not absolute.
     std::string resolved_config_path = options.config_path;
     if (options.daemonize && !options.config_path.empty() &&
         options.config_path[0] != '/') {
-#if defined(__linux__)
-        char link_buf[PATH_MAX];
-        ssize_t len = readlink("/proc/self/cwd", link_buf, sizeof(link_buf) - 1);
-        if (len > 0) {
-            link_buf[len] = '\0';
-            resolved_config_path = std::string(link_buf) + "/" + options.config_path;
+        const char* pwd = std::getenv("PWD");
+        if (pwd && pwd[0] == '/') {
+            resolved_config_path = std::string(pwd) + "/" + options.config_path;
         } else {
-            // Fallback if /proc not mounted
             char cwd_buf[PATH_MAX];
             if (getcwd(cwd_buf, sizeof(cwd_buf))) {
                 resolved_config_path = std::string(cwd_buf) + "/" + options.config_path;
             }
         }
-#else
-        // macOS/BSD: getcwd() is the only portable option
-        char cwd_buf[PATH_MAX];
-        if (getcwd(cwd_buf, sizeof(cwd_buf))) {
-            resolved_config_path = std::string(cwd_buf) + "/" + options.config_path;
-        }
-#endif
     }
 
     // ── Daemonize (if requested) ────────────────────────────
