@@ -185,14 +185,17 @@ static bool ReloadConfig(const std::string& config_path,
                          ServerConfig& current_config) {
     ServerConfig new_config;
     try {
-        // Mirror LoadConfig's fallback: if the config file doesn't exist and the
-        // path wasn't explicitly set, use defaults (same as startup without a file).
+        // Mirror LoadConfig's fallback: only fall back to defaults if the config
+        // file does not exist (ENOENT) AND the path wasn't explicitly set.
+        // Transient errors (EACCES, EIO) must reject the reload, not silently
+        // replace config with defaults.
         if (access(config_path.c_str(), F_OK) == 0) {
             new_config = ConfigLoader::LoadFromFile(config_path);
-        } else if (!options.config_path_explicit) {
+        } else if (!options.config_path_explicit && errno == ENOENT) {
             new_config = ConfigLoader::Default();
         } else {
-            logging::Get()->error("Config reload failed: {} not found", config_path);
+            logging::Get()->error("Config reload failed: {}: {}",
+                                  config_path, std::strerror(errno));
             return false;
         }
         ConfigLoader::ApplyEnvOverrides(new_config);
@@ -346,17 +349,15 @@ static int HandleStart(const CliOptions& options) {
     }
 
     // Resolve config path to absolute BEFORE daemonizing (chdir changes to "/").
-    // After chdir("/"), relative paths like "config/server.json" resolve to
-    // "/config/server.json" which breaks SIGHUP reload. realpath() returns
-    // nullptr if the file doesn't exist, which is fine — ReloadConfig handles
-    // the "no file" case by falling back to ConfigLoader::Default().
+    // Use getcwd + "/" + relative_path (not realpath) to preserve symlinks —
+    // operators often use symlinked configs (config/current.json → config/v2.json)
+    // and swap the link target between reloads.
     std::string resolved_config_path = options.config_path;
     if (options.daemonize && !options.config_path.empty() &&
         options.config_path[0] != '/') {
-        char* abs = realpath(options.config_path.c_str(), nullptr);
-        if (abs) {
-            resolved_config_path = abs;
-            free(abs);
+        char cwd_buf[PATH_MAX];
+        if (getcwd(cwd_buf, sizeof(cwd_buf))) {
+            resolved_config_path = std::string(cwd_buf) + "/" + options.config_path;
         }
     }
 

@@ -291,7 +291,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "  -w, --workers <N>           Override worker thread count (0 = auto)\n"
         << "  -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)\n"
         << "  -d, --daemonize             Run as a background daemon\n"
-        << "  --no-health-endpoint       Disable the /health endpoint\n"
+        << "  --no-health-endpoint       Disable /health and /stats endpoints\n"
         << "\n"
         << "Stop/status/reload options:\n"
         << "  -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)\n"

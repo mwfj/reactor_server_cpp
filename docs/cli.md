@@ -45,7 +45,7 @@ Start options:
   -w, --workers <N>           Override worker thread count (0 = auto)
   -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)
   -d, --daemonize             Run as a background daemon
-  --no-health-endpoint       Disable the /health endpoint
+  --no-health-endpoint       Disable /health and /stats endpoints
 
 Stop/status/reload options:
   -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)

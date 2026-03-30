@@ -459,6 +459,8 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         // Guard against accept/data race: if HandleMessage already ran and
         // created a handler for THIS connection, skip everything below.
         std::shared_ptr<HttpConnectionHandler> stale_h1;
+        bool evicted_h2 = false;
+        bool evicted_pd = false;
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
             auto h2_it = h2_connections_.find(conn->fd());
@@ -466,8 +468,10 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                 if (h2_it->second->GetConnection() == conn) {
                     return;  // Already initialized by HandleMessage
                 }
-                // Stale handler from fd reuse — evict
+                // Stale handler from fd reuse — evict. Decrement here because
+                // the old connection's close callback can no longer find this entry.
                 h2_connections_.erase(h2_it);
+                evicted_h2 = true;
             }
             auto h1_it = http_connections_.find(conn->fd());
             if (h1_it != http_connections_.end()) {
@@ -486,11 +490,27 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                 if (pd_it->second.conn != conn) {
                     // Stale entry — replace with current conn tracking
                     pd_it->second = {conn, ""};
+                    evicted_pd = true;
                 }
                 // else: same conn already tracked (partial preface) — keep data
             } else {
                 pending_detection_[conn->fd()] = {conn, ""};
             }
+        }
+        // Compensating decrements for evicted stale entries — their close
+        // callbacks can no longer find the map entries we just removed.
+        if (evicted_h2) {
+            active_connections_.fetch_sub(1, std::memory_order_relaxed);
+            active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
+        }
+        if (stale_h1) {
+            active_connections_.fetch_sub(1, std::memory_order_relaxed);
+            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+        }
+        if (evicted_pd && !evicted_h2 && !stale_h1) {
+            // Stale pending_detection entry (protocol not yet determined) —
+            // only decrement active_connections_ (no protocol counter was set).
+            active_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
         // Notify stale WS handler outside the lock (avoids deadlock with
         // CallCloseCb → conn_mtx_ and preserves the close notification).
@@ -518,6 +538,11 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                 http_connections_[conn->fd()] = http_conn;
                 active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        // Compensating decrement for evicted stale handler (fd reuse)
+        if (old_handler) {
+            active_connections_.fetch_sub(1, std::memory_order_relaxed);
+            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
         SafeNotifyWsClose(old_handler);
         if (already_initialized) return;
@@ -631,6 +656,7 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
     // OnRawData can trigger callbacks that acquire conn_mtx_ — deadlock.
     std::shared_ptr<Http2ConnectionHandler> h2_conn;
     std::shared_ptr<HttpConnectionHandler> http_conn;
+    bool evicted_stale_h2 = false;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
 
@@ -642,6 +668,7 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             } else {
                 // fd reused — remove stale entry (will fall through to detection)
                 h2_connections_.erase(h2_it);
+                evicted_stale_h2 = true;
             }
         }
 
@@ -652,6 +679,11 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
                 http_conn = it->second;
             }
         }
+    }
+    // Compensating decrement for evicted stale H2 entry
+    if (evicted_stale_h2) {
+        active_connections_.fetch_sub(1, std::memory_order_relaxed);
+        active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
     }
 
     if (h2_conn) {
@@ -665,14 +697,19 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         if (http_conn->GetConnection() != conn) {
             SafeNotifyWsClose(http_conn);
             http_conn = nullptr;
+            bool evicted_stale_h1 = false;
             {
                 std::lock_guard<std::mutex> lck(conn_mtx_);
-                // Identity check: only erase if the entry still wraps the stale conn
                 auto it = http_connections_.find(conn->fd());
                 if (it != http_connections_.end() &&
                     it->second->GetConnection() != conn) {
                     http_connections_.erase(it);
+                    evicted_stale_h1 = true;
                 }
+            }
+            if (evicted_stale_h1) {
+                active_connections_.fetch_sub(1, std::memory_order_relaxed);
+                active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
             }
             // Fall through to DetectAndRouteProtocol below
         } else {
@@ -685,15 +722,21 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
     // Prepend any buffered partial-preface bytes accumulated from a prior call.
     // Verify connection identity to guard against fd-reuse races.
     {
+        bool evicted_stale_pd = false;
         std::lock_guard<std::mutex> lck(conn_mtx_);
         auto pd_it = pending_detection_.find(conn->fd());
         if (pd_it != pending_detection_.end()) {
             if (pd_it->second.conn == conn) {
                 pd_it->second.data += message;
                 message = std::move(pd_it->second.data);
+            } else {
+                // Stale entry (fd reused) — compensating decrement
+                evicted_stale_pd = true;
             }
-            // If conn doesn't match, discard stale entry (fd reused)
             pending_detection_.erase(pd_it);
+        }
+        if (evicted_stale_pd) {
+            active_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
     }
     DetectAndRouteProtocol(conn, message);
