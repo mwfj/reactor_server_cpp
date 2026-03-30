@@ -364,16 +364,34 @@ static int HandleStart(const CliOptions& options) {
     }
 
     // Resolve config path to absolute BEFORE daemonizing (chdir changes to "/").
-    // Use getcwd + "/" + relative_path (not realpath) to preserve symlinks —
-    // operators often use symlinked configs (config/current.json → config/v2.json)
-    // and swap the link target between reloads.
+    // Preserve symlinks so operators can swap deployment symlinks between
+    // reloads (e.g., /opt/app → /opt/releases/v2, then repoint to v3).
+    // On Linux, /proc/self/cwd is a symlink to the logical cwd (preserves
+    // symlinked parent directories). getcwd() resolves the physical path,
+    // which would pin reloads to the old release tree.
     std::string resolved_config_path = options.config_path;
     if (options.daemonize && !options.config_path.empty() &&
         options.config_path[0] != '/') {
+#if defined(__linux__)
+        char link_buf[PATH_MAX];
+        ssize_t len = readlink("/proc/self/cwd", link_buf, sizeof(link_buf) - 1);
+        if (len > 0) {
+            link_buf[len] = '\0';
+            resolved_config_path = std::string(link_buf) + "/" + options.config_path;
+        } else {
+            // Fallback if /proc not mounted
+            char cwd_buf[PATH_MAX];
+            if (getcwd(cwd_buf, sizeof(cwd_buf))) {
+                resolved_config_path = std::string(cwd_buf) + "/" + options.config_path;
+            }
+        }
+#else
+        // macOS/BSD: getcwd() is the only portable option
         char cwd_buf[PATH_MAX];
         if (getcwd(cwd_buf, sizeof(cwd_buf))) {
             resolved_config_path = std::string(cwd_buf) + "/" + options.config_path;
         }
+#endif
     }
 
     // ── Daemonize (if requested) ────────────────────────────

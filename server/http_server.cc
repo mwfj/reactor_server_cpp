@@ -518,13 +518,12 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         if (stale_h2) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
             active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
-            // Compensate for open streams on the evicted session
-            if (stale_h2->GetSession()) {
-                int64_t unclosed = static_cast<int64_t>(
-                    stale_h2->GetSession()->UnclosedStreamCount());
-                if (unclosed > 0) {
-                    active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
-                }
+            // Compensate for open streams on the evicted session.
+            // Uses the handler's atomic local_stream_count_ (thread-safe)
+            // instead of reading session containers from the wrong thread.
+            int64_t unclosed = stale_h2->LocalStreamCount();
+            if (unclosed > 0) {
+                active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
             }
         }
         if (stale_h1) {
@@ -628,12 +627,10 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
     if (was_h2) {
         active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
         // Compensate active_h2_streams_ for streams whose close callback has
-        // NOT yet fired. UnclosedStreamCount() excludes streams already marked
-        // for deferred removal (close callback fired, counter already decremented)
-        // to avoid double-subtraction.
-        if (h2_handler && h2_handler->GetSession()) {
-            int64_t unclosed = static_cast<int64_t>(
-                h2_handler->GetSession()->UnclosedStreamCount());
+        // NOT yet fired. Uses the handler's atomic local_stream_count_ which
+        // is always safe to read from any thread.
+        if (h2_handler) {
+            int64_t unclosed = h2_handler->LocalStreamCount();
             if (unclosed > 0) {
                 active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
             }
@@ -683,9 +680,8 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
     }
     if (was_h2) {
         active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
-        if (h2_handler && h2_handler->GetSession()) {
-            int64_t unclosed = static_cast<int64_t>(
-                h2_handler->GetSession()->UnclosedStreamCount());
+        if (h2_handler) {
+            int64_t unclosed = h2_handler->LocalStreamCount();
             if (unclosed > 0) {
                 active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
             }
@@ -733,12 +729,9 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
     if (evicted_stale_h2) {
         active_connections_.fetch_sub(1, std::memory_order_relaxed);
         active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
-        if (evicted_stale_h2->GetSession()) {
-            int64_t unclosed = static_cast<int64_t>(
-                evicted_stale_h2->GetSession()->UnclosedStreamCount());
-            if (unclosed > 0) {
-                active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
-            }
+        int64_t unclosed = evicted_stale_h2->LocalStreamCount();
+        if (unclosed > 0) {
+            active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
         }
     }
 
@@ -921,16 +914,21 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
         }
     );
 
-    // Stream open/close counter callbacks
+    // Stream open/close counter callbacks.
+    // Also maintain per-connection local_stream_count_ for thread-safe
+    // compensation on abrupt close (avoids reading session containers
+    // from the wrong thread).
     h2_conn->SetStreamOpenCallback(
-        [this](std::shared_ptr<Http2ConnectionHandler> /*self*/, int32_t /*stream_id*/) {
+        [this](std::shared_ptr<Http2ConnectionHandler> self, int32_t /*stream_id*/) {
             active_h2_streams_.fetch_add(1, std::memory_order_relaxed);
+            self->IncrementLocalStreamCount();
         }
     );
     h2_conn->SetStreamCloseCallback(
-        [this](std::shared_ptr<Http2ConnectionHandler> /*self*/,
+        [this](std::shared_ptr<Http2ConnectionHandler> self,
                int32_t /*stream_id*/, uint32_t /*error_code*/) {
             active_h2_streams_.fetch_sub(1, std::memory_order_relaxed);
+            self->DecrementLocalStreamCount();
         }
     );
 }
