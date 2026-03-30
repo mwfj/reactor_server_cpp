@@ -303,7 +303,7 @@ static void RebuildLogger() {
         g_logger_name, sinks.begin(), sinks.end());
     new_logger->set_level(g_log_level);
     new_logger->set_pattern(LOG_PATTERN);
-    new_logger->flush_on(spdlog::level::info);
+    new_logger->flush_on(g_log_level);
 
     spdlog::set_default_logger(new_logger);
     g_logger = new_logger;
@@ -372,7 +372,7 @@ void Init(const std::string& name,
         auto new_logger = std::make_shared<spdlog::logger>(name, sinks.begin(), sinks.end());
         new_logger->set_level(level);
         new_logger->set_pattern(LOG_PATTERN);
-        new_logger->flush_on(spdlog::level::info);
+        new_logger->flush_on(g_log_level);
 
         // All succeeded — commit
         g_logger = new_logger;

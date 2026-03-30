@@ -1,28 +1,15 @@
 #pragma once
 
 #include <string>
-#include <cstring>
+#include <system_error>
 
 namespace logging {
 
-// Thread-safe errno-to-string using the XSI-compliant strerror_r.
-// Returns the error message for the given errno value without
-// sharing a static buffer across threads.
+// Thread-safe errno-to-string. Uses std::system_category().message()
+// which is guaranteed thread-safe by the C++ standard (since C++11)
+// and works on all platforms (Linux glibc/musl, macOS, BSD).
 inline std::string SafeStrerror(int errnum) {
-    char buf[256];
-#if (_POSIX_C_SOURCE >= 200112L || _XOPEN_SOURCE >= 600) && !_GNU_SOURCE
-    // XSI-compliant: returns int, writes to buf
-    if (strerror_r(errnum, buf, sizeof(buf)) == 0) return std::string(buf);
-    return "errno " + std::to_string(errnum);
-#elif defined(__APPLE__) || defined(__FreeBSD__)
-    // macOS/BSD: XSI-compliant strerror_r
-    if (strerror_r(errnum, buf, sizeof(buf)) == 0) return std::string(buf);
-    return "errno " + std::to_string(errnum);
-#else
-    // GNU strerror_r: returns char* (may or may not use buf)
-    const char* msg = strerror_r(errnum, buf, sizeof(buf));
-    return std::string(msg ? msg : buf);
-#endif
+    return std::system_category().message(errnum);
 }
 
 // Sanitize a URL path for logging: strip query string and fragment.
