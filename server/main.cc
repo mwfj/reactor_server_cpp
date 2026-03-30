@@ -183,24 +183,28 @@ static bool ReloadConfig(const std::string& config_path,
                          const CliOptions& options,
                          HttpServer& server,
                          ServerConfig& current_config) {
+    // Always reopen log files on SIGHUP, even if config load fails — logrotate
+    // sends SIGHUP with unchanged config to force FD reopen after file rename.
+    // Without this, a temporarily missing config file blocks log rotation.
+    auto reopen_existing_logs = [&]() {
+        if (logging::Reopen()) {
+            logging::Get()->info("Log files reopened");
+        } else {
+            logging::Get()->warn("Log file reopen failed, continuing with old file");
+        }
+    };
+
     ServerConfig new_config;
     try {
-        // On reload, always require the config file — never fall back to
-        // defaults. At startup, a missing implicit config is fine (server starts
-        // with defaults), but on reload, silently replacing live settings with
-        // defaults would be surprising and destructive. If the file disappeared
-        // (deploy, rename mistake), the operator should notice via the error log.
         new_config = ConfigLoader::LoadFromFile(config_path);
         ConfigLoader::ApplyEnvOverrides(new_config);
         ApplyCliOverrides(new_config, options);
     } catch (const std::exception& e) {
         logging::Get()->error("Config reload failed ({}): {}",
                               config_path, e.what());
+        reopen_existing_logs();  // still reopen for logrotate
         return false;
     }
-    // NOTE: Full ConfigLoader::Validate() is NOT called here — it would reject
-    // restart-only fields (bind_port, tls.*, etc.) that Reload() ignores anyway.
-    // HttpServer::Reload() validates only reload-safe fields internally.
 
     // Daemon-specific validation: reject relative/empty log paths that would
     // break after chdir("/"). Same checks as startup (ValidateDaemonConfig).
@@ -208,6 +212,7 @@ static bool ReloadConfig(const std::string& config_path,
         int drc = ValidateDaemonConfig(new_config, options);
         if (drc != EXIT_OK) {
             logging::Get()->error("Config reload rejected: daemon path validation failed");
+            reopen_existing_logs();  // still reopen for logrotate
             return false;
         }
     }
@@ -234,6 +239,7 @@ static bool ReloadConfig(const std::string& config_path,
     // config (e.g., invalid H2 settings), we must not mutate the logger state.
     if (!server.Reload(new_config)) {
         logging::Get()->error("HttpServer::Reload() rejected the config");
+        reopen_existing_logs();  // still reopen for logrotate
         return false;
     }
 
@@ -250,13 +256,19 @@ static bool ReloadConfig(const std::string& config_path,
                                   current_config.log.max_file_size,
                                   current_config.log.max_files);
         if (new_config.log.file != current_config.log.file) {
-            logging::Get()->error("Log file reopen failed for new path: {}",
+            // Log path change failed, but server limits are already applied and
+            // valid — don't roll them back. Partial success: server config is
+            // updated, log path is not. Operator can fix on next SIGHUP.
+            logging::Get()->error("Log file reopen failed for new path: {} "
+                                  "(server limits updated, log path unchanged)",
                                   new_config.log.file);
-            // Roll back the already-applied server limits to match current_config
-            server.Reload(current_config);
-            return false;
+            // Keep the new config for server limits, but preserve old log config
+            new_config.log.file = current_config.log.file;
+            new_config.log.max_file_size = current_config.log.max_file_size;
+            new_config.log.max_files = current_config.log.max_files;
+        } else {
+            logging::Get()->warn("Log file reopen failed, continuing with old file");
         }
-        logging::Get()->warn("Log file reopen failed, continuing with old file");
     }
     if (new_config.log.level != current_config.log.level) {
         logging::SetLevel(logging::ParseLevel(new_config.log.level));
