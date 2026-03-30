@@ -802,17 +802,28 @@ bool HttpServer::DetectAndRouteProtocol(
     }
 
     if (proto == ProtocolDetector::Protocol::HTTP2) {
-        // Check BEFORE incrementing counters — if already closing, returning
-        // early after incrementing would leak the counter (no map entry for
-        // RemoveConnection to find and decrement).
-        if (conn->IsClosing()) return true;
+        // If already closing, don't increment new counters. But if this
+        // connection was already counted (pending_detection_ entry consumed by
+        // HandleMessage), we must undo that count since we won't publish a
+        // map entry for RemoveConnection to find.
+        if (conn->IsClosing()) {
+            if (already_counted) {
+                active_connections_.fetch_sub(1, std::memory_order_relaxed);
+            }
+            return true;
+        }
         Http2Session::Settings settings_snapshot;
         std::shared_ptr<Http2ConnectionHandler> h2_conn;
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
             // Re-check under lock — close could have raced between check above
-            // and lock acquisition. If closing now, skip without incrementing.
-            if (conn->IsClosing()) return true;
+            // and lock acquisition.
+            if (conn->IsClosing()) {
+                if (already_counted) {
+                    active_connections_.fetch_sub(1, std::memory_order_relaxed);
+                }
+                return true;
+            }
             if (!already_counted) {
                 total_accepted_.fetch_add(1, std::memory_order_relaxed);
                 active_connections_.fetch_add(1, std::memory_order_relaxed);
@@ -831,26 +842,40 @@ bool HttpServer::DetectAndRouteProtocol(
     }
 
     // HTTP/1.x — create handler (existing path)
-    if (conn->IsClosing()) return true;
+    if (conn->IsClosing()) {
+        if (already_counted) {
+            active_connections_.fetch_sub(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
     SetupHandlers(http_conn);
+    std::shared_ptr<HttpConnectionHandler> stale_existing;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        if (conn->IsClosing()) return true;  // re-check under lock
+        if (conn->IsClosing()) {
+            if (already_counted) {
+                active_connections_.fetch_sub(1, std::memory_order_relaxed);
+            }
+            return true;
+        }
         if (!already_counted) {
             total_accepted_.fetch_add(1, std::memory_order_relaxed);
             active_connections_.fetch_add(1, std::memory_order_relaxed);
         }
         active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
-        // Identity check: don't overwrite a handler for a different connection
-        // on the same fd (fd-reuse race with HandleNewConnection).
+        // Fd-reuse: if a stale handler exists for a different connection,
+        // save it for WS close notification and compensate its counters.
         auto existing = http_connections_.find(conn->fd());
         if (existing != http_connections_.end() &&
             existing->second->GetConnection() != conn) {
-            // Stale entry — safe to overwrite
+            stale_existing = existing->second;
+            active_connections_.fetch_sub(1, std::memory_order_relaxed);
+            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
         http_connections_[conn->fd()] = http_conn;
     }
+    SafeNotifyWsClose(stale_existing);
     http_conn->OnRawData(conn, message);
     return true;
 }

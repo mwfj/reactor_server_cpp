@@ -186,7 +186,7 @@ static bool ReloadConfig(const std::string& config_path,
                          const CliOptions& options,
                          HttpServer& server,
                          ServerConfig& current_config,
-                         bool config_loaded_from_file) {
+                         bool& config_loaded_from_file) {
     // Always reopen log files on SIGHUP, even if config load fails — logrotate
     // sends SIGHUP with unchanged config to force FD reopen after file rename.
     // Without this, a temporarily missing config file blocks log rotation.
@@ -208,6 +208,7 @@ static bool ReloadConfig(const std::string& config_path,
         //   deploy — fail the reload so the operator notices.
         if (access(config_path.c_str(), F_OK) == 0) {
             new_config = ConfigLoader::LoadFromFile(config_path);
+            config_loaded_from_file = true;  // track for future reloads
         } else if (!config_loaded_from_file && !options.config_path_explicit
                    && errno == ENOENT) {
             // Start from defaults, not current_config — env vars may have been
