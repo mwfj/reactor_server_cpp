@@ -184,13 +184,15 @@ static bool ReloadConfig(const CliOptions& options,
         ConfigLoader::ApplyEnvOverrides(new_config);
         ApplyCliOverrides(new_config, options);
     } catch (const std::exception& e) {
-        logging::Get()->error("Config reload failed: {}", e.what());
+        logging::Get()->error("Config reload failed ({}): {}",
+                              options.config_path, e.what());
         return false;
     }
     try {
         ConfigLoader::Validate(new_config);
     } catch (const std::invalid_argument& e) {
-        logging::Get()->error("Config reload validation failed: {}", e.what());
+        logging::Get()->error("Config reload validation failed ({}): {}",
+                              options.config_path, e.what());
         return false;
     }
 
@@ -212,19 +214,16 @@ static bool ReloadConfig(const CliOptions& options,
     if (new_config.http2.enabled != current_config.http2.enabled)
         logging::Get()->warn("http2.enabled changed — requires restart, ignored");
 
-    // Apply log changes: only reopen if file config actually changed
-    bool log_file_changed =
-        new_config.log.file != current_config.log.file ||
-        new_config.log.max_file_size != current_config.log.max_file_size ||
-        new_config.log.max_files != current_config.log.max_files;
-    if (log_file_changed) {
-        logging::UpdateFileConfig(new_config.log.file, new_config.log.max_file_size,
-                                  new_config.log.max_files);
-        if (logging::Reopen()) {
-            logging::Get()->info("Log files reopened");
-        } else {
-            logging::Get()->warn("Log file reopen failed, continuing with old file");
-        }
+    // Apply log changes: always update file config and reopen, even if config
+    // is unchanged. External logrotate sends SIGHUP with unchanged config to
+    // force descriptor reopen after file rename. Gating on config changes would
+    // break standard postrotate `kill -HUP` workflows.
+    logging::UpdateFileConfig(new_config.log.file, new_config.log.max_file_size,
+                              new_config.log.max_files);
+    if (logging::Reopen()) {
+        logging::Get()->info("Log files reopened");
+    } else {
+        logging::Get()->warn("Log file reopen failed, continuing with old file");
     }
     if (new_config.log.level != current_config.log.level) {
         logging::SetLevel(logging::ParseLevel(new_config.log.level));

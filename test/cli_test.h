@@ -2160,9 +2160,10 @@ void TestHelpIncludesReload() {
 // Helper: register /stats on a server the same way main.cc does.
 // Re-implemented here because MakeStatsHandler() is a static function in main.cc.
 static void RegisterStatsRoute(HttpServer& server, const ServerConfig& config) {
-    // Capture config by value (mirrors main.cc semantics: startup-time snapshot)
-    server.Get("/stats", [&server, config](const HttpRequest& /*req*/, HttpResponse& res) {
-        auto stats = server.GetStats();
+    // Capture server by pointer and config by value (mirrors main.cc semantics)
+    HttpServer* srv = &server;
+    server.Get("/stats", [srv, config](const HttpRequest& /*req*/, HttpResponse& res) {
+        auto stats = srv->GetStats();
         static constexpr size_t STATS_BUF_SIZE = 1024;
         char buf[STATS_BUF_SIZE];
         int written = std::snprintf(buf, sizeof(buf),
@@ -2182,8 +2183,8 @@ static void RegisterStatsRoute(HttpServer& server, const ServerConfig& config) {
             static_cast<long long>(stats.total_requests),
             static_cast<long long>(stats.active_requests),
             config.bind_host.c_str(), config.bind_port, config.worker_threads,
-            config.max_connections, config.idle_timeout_sec,
-            config.request_timeout_sec,
+            stats.max_connections, stats.idle_timeout_sec,
+            stats.request_timeout_sec,
             config.tls.enabled  ? "true" : "false",
             config.http2.enabled ? "true" : "false");
         if (written < 0 || static_cast<size_t>(written) >= sizeof(buf)) {

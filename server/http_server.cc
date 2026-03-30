@@ -11,6 +11,8 @@
 struct RequestGuard {
     std::atomic<int64_t>& counter;
     ~RequestGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
+    RequestGuard(const RequestGuard&) = delete;
+    RequestGuard& operator=(const RequestGuard&) = delete;
 };
 
 void HttpServer::WireNetServerCallbacks() {
@@ -446,6 +448,15 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
     // stale state in http_connections_ (potentially under fd -1 after ReleaseFd).
     if (conn->IsClosing()) return;
 
+    // Counters: incremented unconditionally for every new connection because
+    // HandleCloseConnection/HandleErrorConnection decrement unconditionally.
+    // NetServer guarantees HandleNewConnection is called exactly once per fd.
+    // On the accept/data race (HandleMessage initializes first), the early-return
+    // guards below skip handler setup but the connection IS still counted — the
+    // matching decrement fires when the connection eventually closes.
+    total_accepted_.fetch_add(1, std::memory_order_relaxed);
+    active_connections_.fetch_add(1, std::memory_order_relaxed);
+
     if (http2_enabled_) {
         // Guard against accept/data race: if HandleMessage already ran and
         // created a handler for THIS connection, skip everything below.
@@ -509,11 +520,6 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         SafeNotifyWsClose(old_handler);
         if (already_initialized) return;
     }
-
-    // Counters: placed after all early-return guards to avoid double-counting
-    // connections already initialized by HandleMessage (accept/data race).
-    total_accepted_.fetch_add(1, std::memory_order_relaxed);
-    active_connections_.fetch_add(1, std::memory_order_relaxed);
 
     // Arm a connection-level deadline for the TLS handshake + protocol detection
     // window. Load from atomic at use time — not cached per-connection.

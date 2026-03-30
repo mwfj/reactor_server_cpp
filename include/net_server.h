@@ -53,7 +53,9 @@ private:
 
     // Timer configuration
     int timer_interval_;  // How often to check for timeouts (seconds)
-    std::chrono::seconds connection_timeout_;  // Connection idle timeout duration
+    // Atomic: written by SetConnectionTimeout (main thread via Reload),
+    // read by GetConnectionTimeout (dispatcher threads via /stats).
+    std::atomic<int> connection_timeout_sec_;  // Connection idle timeout (seconds)
 
     std::shared_ptr<TlsContext> tls_ctx_;  // Shared with HttpServer for safe lifetime
     std::atomic<int> max_connections_{0};       // 0 = unlimited
@@ -101,7 +103,9 @@ public:
     void SetMaxConnections(int max) { max_connections_.store(max, std::memory_order_relaxed); }
     int GetMaxConnections() const { return max_connections_.load(std::memory_order_relaxed); }
     void SetMaxInputSize(size_t max) { max_input_size_.store(max, std::memory_order_relaxed); }
-    std::chrono::seconds GetConnectionTimeout() const { return connection_timeout_; }
+    std::chrono::seconds GetConnectionTimeout() const {
+        return std::chrono::seconds(connection_timeout_sec_.load(std::memory_order_relaxed));
+    }
 
     // Update idle timeout on all socket dispatchers at runtime.
     // EnQueues the update to each dispatcher thread to avoid racing with TimerHandler.

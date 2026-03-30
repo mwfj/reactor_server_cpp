@@ -13,7 +13,7 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
     : conn_dispatcher_(std::make_shared<Dispatcher>()),
       acceptor_(nullptr),
       timer_interval_(timer_interval),
-      connection_timeout_(connection_timeout)
+      connection_timeout_sec_(static_cast<int>(connection_timeout.count()))
 {
     // Suppress SIGPIPE if the current handler is the default (which kills
     // the process). OpenSSL's SSL_write/SSL_shutdown use the underlying
@@ -54,7 +54,9 @@ void NetServer::Start(){
     socket_dispatchers_.reserve(sock_workers_.GetThreadWorkerNum());
     for(int idx = 0; idx < sock_workers_.GetThreadWorkerNum(); idx ++){
         // Use configurable timer parameters
-        std::shared_ptr<Dispatcher> task = std::make_shared<Dispatcher>(true, timer_interval_, connection_timeout_);
+        std::shared_ptr<Dispatcher> task = std::make_shared<Dispatcher>(
+            true, timer_interval_,
+            std::chrono::seconds(connection_timeout_sec_.load(std::memory_order_relaxed)));
         // Initialize each socket dispatcher (required for eventfd setup)
         task->Init();
         socket_dispatchers_.emplace_back(task);
@@ -419,7 +421,8 @@ bool NetServer::IsOnDispatcherThread() const {
 }
 
 void NetServer::SetConnectionTimeout(std::chrono::seconds timeout) {
-    connection_timeout_ = timeout;
+    connection_timeout_sec_.store(static_cast<int>(timeout.count()),
+                                 std::memory_order_relaxed);
     for (auto& disp : socket_dispatchers_) {
         disp->EnQueue([d = disp, timeout]() {
             d->SetTimeout(timeout);
