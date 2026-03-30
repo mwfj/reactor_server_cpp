@@ -198,13 +198,9 @@ static bool ReloadConfig(const std::string& config_path,
                               config_path, e.what());
         return false;
     }
-    try {
-        ConfigLoader::Validate(new_config);
-    } catch (const std::invalid_argument& e) {
-        logging::Get()->error("Config reload validation failed ({}): {}",
-                              config_path, e.what());
-        return false;
-    }
+    // NOTE: Full ConfigLoader::Validate() is NOT called here — it would reject
+    // restart-only fields (bind_port, tls.*, etc.) that Reload() ignores anyway.
+    // HttpServer::Reload() validates only reload-safe fields internally.
 
     // Daemon-specific validation: reject relative/empty log paths that would
     // break after chdir("/"). Same checks as startup (ValidateDaemonConfig).
@@ -256,6 +252,8 @@ static bool ReloadConfig(const std::string& config_path,
         if (new_config.log.file != current_config.log.file) {
             logging::Get()->error("Log file reopen failed for new path: {}",
                                   new_config.log.file);
+            // Roll back the already-applied server limits to match current_config
+            server.Reload(current_config);
             return false;
         }
         logging::Get()->warn("Log file reopen failed, continuing with old file");
