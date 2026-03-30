@@ -503,28 +503,21 @@ void EnsureLogDir(const std::string& dir) {
 
 void WriteMarker(const std::string& text) {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
-    if (!g_logger) return;
-    // Temporarily lower each sink's level to trace so the marker bypasses
-    // both logger-level and sink-level filtering. This ensures markers
-    // always appear regardless of configured log level, without misusing
-    // critical (which would trigger severity-based alerting pipelines).
-    auto& sinks = g_logger->sinks();
-    std::vector<spdlog::level::level_enum> saved_levels;
-    saved_levels.reserve(sinks.size());
-    for (auto& sink : sinks) {
-        saved_levels.push_back(sink->level());
-        sink->set_level(spdlog::level::trace);
+    std::string line = "================================ " + text +
+                       " ================================\n";
+    // Write directly to the log file, bypassing spdlog entirely.
+    // This avoids level-filtering issues and is thread-safe because
+    // we hold g_logger_mtx (no concurrent logger rebuilds or rotations).
+    if (!g_current_file_path.empty()) {
+        std::FILE* f = std::fopen(g_current_file_path.c_str(), "a");
+        if (f) {
+            std::fwrite(line.data(), 1, line.size(), f);
+            std::fclose(f);
+        }
     }
-    auto saved_logger_level = g_logger->level();
-    g_logger->set_level(spdlog::level::trace);
-
-    g_logger->info("================================ {} ================================", text);
-    g_logger->flush();
-
-    // Restore levels
-    g_logger->set_level(saved_logger_level);
-    for (size_t i = 0; i < sinks.size(); ++i) {
-        sinks[i]->set_level(saved_levels[i]);
+    // Also write to console if enabled
+    if (g_console_enabled) {
+        std::fwrite(line.data(), 1, line.size(), stderr);
     }
 }
 
