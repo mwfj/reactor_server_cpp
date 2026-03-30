@@ -393,15 +393,21 @@ void Init(const std::string& name,
 }
 
 std::shared_ptr<spdlog::logger> Get() {
-    std::lock_guard<std::mutex> lock(g_logger_mtx);
-    if (g_logger) {
+    // Use try_lock so log callers never block behind rotation/rebuild I/O.
+    // If the mutex is held (rotation in progress), fall back to spdlog's
+    // default logger which was set by the last successful Init/Rebuild and
+    // remains valid and thread-safe throughout the rotation.
+    std::unique_lock<std::mutex> lock(g_logger_mtx, std::try_to_lock);
+    if (lock.owns_lock() && g_logger) {
         return g_logger;
     }
+    // Mutex contended or g_logger is null — use spdlog's default logger.
+    // Init/RebuildLogger always calls spdlog::set_default_logger(), so this
+    // points to the same logger as g_logger in steady state.
     auto fallback = spdlog::default_logger();
     if (fallback) return fallback;
     // After Shutdown(), spdlog's default logger is null. Create a minimal
-    // stderr fallback so callers never dereference null. Not registered with
-    // spdlog — immune to future Shutdown() calls.
+    // stderr fallback so callers never dereference null.
     static auto stderr_sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
     static auto stderr_fallback = std::make_shared<spdlog::logger>("fallback", stderr_sink);
     return stderr_fallback;

@@ -2134,6 +2134,65 @@ void TestLogFileAppendOnRestart() {
     }
 }
 
+// Test 56: max_files=1 logrotate-compatible mode — Reopen creates a fresh
+// handle at the original path (no date suffix), compatible with external
+// logrotate rename + SIGHUP workflow.
+void TestMaxFilesOneReopenMode() {
+    std::cout << "\n[TEST] Logger: max_files=1 Reopen uses raw path (logrotate mode)..." << std::endl;
+    const std::string log_path = "/tmp/test_reactor_log_" + std::to_string(getpid()) +
+                                  "_logrotate.log";
+    std::remove(log_path.c_str());
+
+    try {
+        // max_files=1 → non-rotating mode, raw path
+        logging::Init("test_logrotate", spdlog::level::info, log_path, 10485760, 1);
+
+        logging::Get()->info("Before rotate");
+        logging::Get()->flush();
+
+        // Verify the file was created at the exact raw path (no date suffix)
+        struct stat st{};
+        bool raw_exists = (stat(log_path.c_str(), &st) == 0 && st.st_size > 0);
+
+        // Simulate logrotate: rename, then Reopen
+        std::string rotated = log_path + ".1";
+        std::rename(log_path.c_str(), rotated.c_str());
+
+        logging::Reopen();
+
+        logging::Get()->info("After rotate");
+        logging::Get()->flush();
+
+        logging::Shutdown();
+
+        // Verify: rotated file has "Before rotate"
+        std::string rot_content = ReadFileContent(rotated);
+        bool rot_has_before = rot_content.find("Before rotate") != std::string::npos;
+
+        // Verify: new file at raw path has "After rotate"
+        std::string new_content = ReadFileContent(log_path);
+        bool new_has_after = new_content.find("After rotate") != std::string::npos;
+
+        std::remove(log_path.c_str());
+        std::remove(rotated.c_str());
+
+        bool pass = raw_exists && rot_has_before && new_has_after;
+        std::string err;
+        if (!raw_exists) err += "Raw path not created (got date-suffixed?); ";
+        if (!rot_has_before) err += "Rotated file missing 'Before rotate'; ";
+        if (!new_has_after) err += "New file missing 'After rotate'; ";
+
+        TestFramework::RecordTest("Logger: max_files=1 Reopen (logrotate mode)",
+                                  pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        logging::Shutdown();
+        std::remove(log_path.c_str());
+        std::remove((log_path + ".1").c_str());
+        TestFramework::RecordTest("Logger: max_files=1 Reopen (logrotate mode)",
+                                  false, e.what(), CLI_CATEGORY);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Suite entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2214,6 +2273,7 @@ void RunAllTests() {
     TestWriteMarker();
     TestSanitizePath();
     TestLogFileAppendOnRestart();
+    TestMaxFilesOneReopenMode();
 }
 
 }  // namespace CliTests
