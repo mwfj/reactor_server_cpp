@@ -405,12 +405,17 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetMaxWsMessageSize(max_ws_message_size_.load(std::memory_order_relaxed));
     http_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
 
+    // Count every completed HTTP parse — dispatched, rejected (400/413/etc), or
+    // upgraded. Fires from HandleCompleteRequest before dispatch or rejection.
+    http_conn->SetRequestCountCallback([this]() {
+        total_requests_.fetch_add(1, std::memory_order_relaxed);
+    });
+
     // Set request handler: dispatch through router.
     http_conn->SetRequestCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
                const HttpRequest& request,
                HttpResponse& response) {
-            total_requests_.fetch_add(1, std::memory_order_relaxed);
             active_requests_.fetch_add(1, std::memory_order_relaxed);
             RequestGuard guard{active_requests_};
 
@@ -438,9 +443,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetUpgradeCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
                const HttpRequest& request) {
-            // Count the WS upgrade handshake as a request — upgrade requests
-            // bypass the normal request_callback path where counters live.
-            total_requests_.fetch_add(1, std::memory_order_relaxed);
+            // total_requests_ already counted by request_count_callback
             auto ws_handler = router_.GetWebSocketHandler(request.path);
             if (ws_handler && self->GetWebSocket()) {
                 ws_handler(*self->GetWebSocket());

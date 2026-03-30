@@ -28,11 +28,16 @@ namespace HTTP_CALLBACKS_NAMESPACE {
         const HttpRequest& request
     )>;
 
+    // Fires for every completed HTTP parse (dispatched, rejected, or upgraded).
+    // Used by HttpServer to count all requests, not just successfully dispatched ones.
+    using HttpConnRequestCountCallback = std::function<void()>;
+
     struct HttpConnCallbacks {
-        HttpConnRequestCallback    request_callback    = nullptr;
-        HttpConnRouteCheckCallback route_check_callback = nullptr;
-        HttpConnMiddlewareCallback middleware_callback  = nullptr;
-        HttpConnUpgradeCallback    upgrade_callback    = nullptr;
+        HttpConnRequestCallback       request_callback       = nullptr;
+        HttpConnRouteCheckCallback    route_check_callback    = nullptr;
+        HttpConnMiddlewareCallback    middleware_callback     = nullptr;
+        HttpConnUpgradeCallback       upgrade_callback       = nullptr;
+        HttpConnRequestCountCallback  request_count_callback  = nullptr;
     };
 
     // ---- WebSocketConnection callbacks --------------------------------------

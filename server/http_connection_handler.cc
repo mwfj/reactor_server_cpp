@@ -21,6 +21,11 @@ void HttpConnectionHandler::SetUpgradeCallback(UpgradeCallback callback) {
     callbacks_.upgrade_callback = std::move(callback);
 }
 
+void HttpConnectionHandler::SetRequestCountCallback(
+    HTTP_CALLBACKS_NAMESPACE::HttpConnRequestCountCallback callback) {
+    callbacks_.request_count_callback = std::move(callback);
+}
+
 void HttpConnectionHandler::SetMaxBodySize(size_t max) {
     max_body_size_ = max;
     parser_.SetMaxBodySize(max);
@@ -95,6 +100,11 @@ void HttpConnectionHandler::HandleParseError() {
 
 bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& remaining, size_t consumed) {
     const HttpRequest& req = parser_.GetRequest();
+
+    // Count every completed request parse — dispatched, rejected, or upgraded.
+    if (callbacks_.request_count_callback) {
+        callbacks_.request_count_callback();
+    }
 
     // Reject unsupported HTTP versions — only HTTP/1.0 and HTTP/1.1 supported.
     // llhttp will parse any major.minor (e.g. HTTP/2.0, HTTP/0.9), but this

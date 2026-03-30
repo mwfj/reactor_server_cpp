@@ -234,16 +234,15 @@ static bool ReloadConfig(const std::string& config_path,
     if (new_config.http2.enabled != current_config.http2.enabled)
         logging::Get()->warn("http2.enabled changed — requires restart, ignored");
 
-    // Apply log changes: always update file config and reopen, even if config
-    // is unchanged. External logrotate sends SIGHUP with unchanged config to
-    // force descriptor reopen after file rename. Gating on config changes would
-    // break standard postrotate `kill -HUP` workflows.
-    //
-    // Save old config before updating so we can roll back on failure.
-    std::string old_log_file = current_config.log.file;
-    size_t old_max_size = current_config.log.max_file_size;
-    int old_max_files = current_config.log.max_files;
+    // Apply HttpServer reload BEFORE logger changes — if Reload() rejects the
+    // config (e.g., invalid H2 settings), we must not mutate the logger state.
+    if (!server.Reload(new_config)) {
+        logging::Get()->error("HttpServer::Reload() rejected the config");
+        return false;
+    }
 
+    // Apply log changes: always reopen (logrotate sends SIGHUP with unchanged
+    // config to force descriptor reopen after file rename).
     logging::UpdateFileConfig(new_config.log.file, new_config.log.max_file_size,
                               new_config.log.max_files);
     if (logging::Reopen()) {
@@ -251,24 +250,19 @@ static bool ReloadConfig(const std::string& config_path,
     } else {
         // Roll back stored sink config so subsequent SIGHUPs don't retry
         // the broken file/sink parameters.
-        logging::UpdateFileConfig(old_log_file, old_max_size, old_max_files);
+        logging::UpdateFileConfig(current_config.log.file,
+                                  current_config.log.max_file_size,
+                                  current_config.log.max_files);
         if (new_config.log.file != current_config.log.file) {
             logging::Get()->error("Log file reopen failed for new path: {}",
                                   new_config.log.file);
             return false;
         }
-        // Same path, reopen failed (e.g. logrotate timing) — warn but continue.
         logging::Get()->warn("Log file reopen failed, continuing with old file");
     }
     if (new_config.log.level != current_config.log.level) {
         logging::SetLevel(logging::ParseLevel(new_config.log.level));
         logging::Get()->info("Log level changed to {}", new_config.log.level);
-    }
-
-    // Apply reload-safe fields via HttpServer::Reload()
-    if (!server.Reload(new_config)) {
-        logging::Get()->error("HttpServer::Reload() rejected the config");
-        return false;
     }
 
     // Log reload-safe changes at info level.
