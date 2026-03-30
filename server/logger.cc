@@ -75,7 +75,10 @@ static std::string TodayDateString() {
 static std::string BuildFilePath(const std::string& dir, const std::string& prefix,
                                   const std::string& date, int seq,
                                   const std::string& ext) {
-    std::string path = dir + "/" + prefix + "-" + date;
+    // Avoid "//prefix-..." when dir is "/" (POSIX: leading // is implementation-defined)
+    std::string path = dir;
+    if (!dir.empty() && dir.back() != '/') path += '/';
+    path += prefix + "-" + date;
     if (seq > 0) {
         path += "-" + std::to_string(seq);
     }
@@ -295,40 +298,64 @@ void Init(const std::string& name,
           int max_files) {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
 
-    // Store config for Reopen() reconstruction
+    // Work with new config in locals first. Only commit to globals after
+    // all failable operations (EnsureLogDir, sink creation) succeed.
+    // This prevents a failed re-init from corrupting the live config.
+    std::string new_dir, new_prefix, new_ext;
+    if (!log_file.empty()) {
+        ParseLogPath(log_file, new_dir, new_prefix, new_ext);
+        if (!new_dir.empty() && new_dir != ".") {
+            EnsureLogDir(new_dir);  // can throw
+        }
+    }
+
+    // Temporarily install new config for BuildSinksAndPrune (it reads globals)
+    auto saved_name = g_logger_name;
+    auto saved_level = g_log_level;
+    auto saved_file = g_log_file;
+    auto saved_size = g_max_size;
+    auto saved_files = g_max_files;
+    auto saved_dir = g_log_dir;
+    auto saved_prefix = g_log_prefix;
+    auto saved_ext = g_log_extension;
+
     g_logger_name = name;
     g_log_level = level;
     g_log_file = log_file;
     g_max_size = max_size;
     g_max_files = max_files;
-
-    // Decompose log path for date-based naming and ensure directory exists
-    if (!g_log_file.empty()) {
-        ParseLogPath(g_log_file, g_log_dir, g_log_prefix, g_log_extension);
-        if (!g_log_dir.empty() && g_log_dir != ".") {
-            // EnsureLogDir is a pure utility (no global state) — safe under lock.
-            // This ensures HttpServer and other direct Init() callers don't fail
-            // on a missing log directory.
-            EnsureLogDir(g_log_dir);
-        }
-    } else {
-        g_log_dir.clear();
-        g_log_prefix.clear();
-        g_log_extension.clear();
+    g_log_dir = std::move(new_dir);
+    g_log_prefix = std::move(new_prefix);
+    g_log_extension = std::move(new_ext);
+    if (log_file.empty()) {
         g_current_file_path.clear();
         g_current_log_date.clear();
     }
 
-    auto sinks = BuildSinksAndPrune(level);
+    try {
+        auto sinks = BuildSinksAndPrune(level);
 
-    // Create logger with all sinks
-    g_logger = std::make_shared<spdlog::logger>(name, sinks.begin(), sinks.end());
-    g_logger->set_level(level);
-    g_logger->set_pattern(LOG_PATTERN);
-    g_logger->flush_on(spdlog::level::info);
+        // Create logger with all sinks
+        auto new_logger = std::make_shared<spdlog::logger>(name, sinks.begin(), sinks.end());
+        new_logger->set_level(level);
+        new_logger->set_pattern(LOG_PATTERN);
+        new_logger->flush_on(spdlog::level::info);
 
-    // Register as default logger
-    spdlog::set_default_logger(g_logger);
+        // All succeeded — commit
+        g_logger = new_logger;
+        spdlog::set_default_logger(g_logger);
+    } catch (...) {
+        // Restore previous config so Reopen/CheckRotation use the live config
+        g_logger_name = std::move(saved_name);
+        g_log_level = saved_level;
+        g_log_file = std::move(saved_file);
+        g_max_size = saved_size;
+        g_max_files = saved_files;
+        g_log_dir = std::move(saved_dir);
+        g_log_prefix = std::move(saved_prefix);
+        g_log_extension = std::move(saved_ext);
+        throw;  // re-throw so caller knows Init failed
+    }
 }
 
 std::shared_ptr<spdlog::logger> Get() {
