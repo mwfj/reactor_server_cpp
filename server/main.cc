@@ -194,7 +194,21 @@ static bool ReloadConfig(const std::string& config_path,
 
     ServerConfig new_config;
     try {
-        new_config = ConfigLoader::LoadFromFile(config_path);
+        // Mirror startup: if the implicit config file doesn't exist, start from
+        // the current running config (not defaults) + env + CLI. This supports
+        // daemons started with "defaults + env only" (no config file on disk).
+        // Explicit -c paths always fail if missing.
+        if (access(config_path.c_str(), F_OK) == 0) {
+            new_config = ConfigLoader::LoadFromFile(config_path);
+        } else if (!options.config_path_explicit && errno == ENOENT) {
+            new_config = current_config;
+            logging::Get()->info("Config file not found, reloading from env/CLI overrides");
+        } else {
+            logging::Get()->error("Config reload failed: {}: {}",
+                                  config_path, std::strerror(errno));
+            reopen_existing_logs();
+            return false;
+        }
         ConfigLoader::ApplyEnvOverrides(new_config);
         ApplyCliOverrides(new_config, options);
     } catch (const std::exception& e) {
@@ -204,21 +218,19 @@ static bool ReloadConfig(const std::string& config_path,
         return false;
     }
 
-    // Daemon-specific validation: reject relative/empty log paths that would
-    // break after chdir("/"). ValidateDaemonConfig outputs to stderr (which is
-    // /dev/null in daemon mode), so also log specific failures via spdlog.
+    // Daemon-specific validation: only check reload-relevant paths.
+    // TLS paths are restart-only (ignored on reload), so don't validate them
+    // here — ValidateDaemonConfig checks TLS too and would reject changes to
+    // restart-only fields. PID file comes from CLI, not config, so it's stable.
     if (options.daemonize) {
-        int drc = ValidateDaemonConfig(new_config, options);
-        if (drc != EXIT_OK) {
-            // Log the specific reason via spdlog (stderr is /dev/null in daemon)
-            if (new_config.log.file.empty())
-                logging::Get()->error("Config reload rejected: daemon mode requires a log file");
-            else if (!new_config.log.file.empty() && new_config.log.file[0] != '/')
-                logging::Get()->error("Config reload rejected: log file path must be absolute");
-            else if (!options.pid_file.empty() && options.pid_file[0] != '/')
-                logging::Get()->error("Config reload rejected: PID file path must be absolute");
-            else
-                logging::Get()->error("Config reload rejected: daemon path validation failed");
+        if (new_config.log.file.empty()) {
+            logging::Get()->error("Config reload rejected: daemon mode requires a log file");
+            reopen_existing_logs();
+            return false;
+        }
+        if (new_config.log.file[0] != '/') {
+            logging::Get()->error("Config reload rejected: log file path must be absolute ({})",
+                                  new_config.log.file);
             reopen_existing_logs();
             return false;
         }
@@ -500,13 +512,25 @@ static int HandleStart(const CliOptions& options) {
         logging::Get()->info("  Stats:   /stats");
     }
 
-    // ── Wire daemon readiness to fire after init, before event loop ──
+    // ── Wire readiness callback to fire after init, before event loop ──
 #if !defined(_WIN32)
     if (options.daemonize) {
         server->SetReadyCallback([]() {
+            logging::Get()->info("{} ready, accepting connections",
+                                REACTOR_SERVER_NAME);
             Daemonizer::NotifyReady();
         });
+    } else {
+        server->SetReadyCallback([]() {
+            logging::Get()->info("{} ready, accepting connections",
+                                REACTOR_SERVER_NAME);
+        });
     }
+#else
+    server->SetReadyCallback([]() {
+        logging::Get()->info("{} ready, accepting connections",
+                            REACTOR_SERVER_NAME);
+    });
 #endif
 
     // ── Server thread ───────────────────────────────────────
@@ -534,7 +558,6 @@ static int HandleStart(const CliOptions& options) {
     });
 
     // ── Signal loop ─────────────────────────────────────────
-    logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
     while (true) {
         SignalResult sig = SignalHandler::WaitForSignal();
         if (sig == SignalResult::SHUTDOWN) break;
