@@ -118,6 +118,9 @@ public:
     // Get the current timer scan interval (seconds).
     int GetTimerInterval() const { return timer_interval_; }
 
+    // Get the actual worker thread count (resolved from auto mode).
+    int GetWorkerCount() { return sock_workers_.GetThreadWorkerNum(); }
+
     // Connections exempt from CloseAfterWrite during Stop().
     // Set by HttpServer before Stop() for HTTP/2 graceful drain.
     void SetDrainingConns(std::set<ConnectionHandler*> conns) {

@@ -80,6 +80,10 @@ public:
     Http2Stream* CreateStream(int32_t stream_id);
     void MarkStreamForRemoval(int32_t stream_id);
     size_t ActiveStreamCount() const;
+    // Streams whose close callback has NOT yet fired. Used for counter
+    // compensation when the transport closes abruptly — avoids double-
+    // subtracting streams already decremented by the close callback.
+    size_t UnclosedStreamCount() const;
 
     // --- Callbacks (set by Http2ConnectionHandler) ---
 

@@ -32,6 +32,7 @@ public:
         int max_connections = 0;
         int idle_timeout_sec = 0;
         int request_timeout_sec = 0;
+        int worker_threads = 0;  // resolved from auto mode
     };
 
     // Construct with explicit host/port
@@ -133,6 +134,10 @@ private:
     // Server start time for uptime calculation
     std::chrono::steady_clock::time_point start_time_ =
         std::chrono::steady_clock::now();
+
+    // Resolved worker count (set at construction, never changes).
+    // Needed because auto mode (worker_threads=0) resolves inside ThreadPool.
+    int resolved_worker_threads_ = 0;
     struct DrainingH2Conn {
         std::shared_ptr<Http2ConnectionHandler> handler;
         std::shared_ptr<ConnectionHandler> conn;

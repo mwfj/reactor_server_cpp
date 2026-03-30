@@ -856,6 +856,12 @@ size_t Http2Session::ActiveStreamCount() const {
     return streams_.size();
 }
 
+size_t Http2Session::UnclosedStreamCount() const {
+    size_t total = streams_.size();
+    size_t closing = streams_to_remove_.size();
+    return total > closing ? total - closing : 0;
+}
+
 std::chrono::steady_clock::time_point Http2Session::OldestIncompleteStreamStart() const {
     // streams_ is std::map<int32_t, ...> sorted by stream ID.
     // HTTP/2 stream IDs are monotonically increasing, so the first

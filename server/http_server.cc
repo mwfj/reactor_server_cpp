@@ -94,6 +94,7 @@ HttpServer::HttpServer(const std::string& ip, int port)
                   ServerConfig{}.worker_threads)
 {
     WireNetServerCallbacks();
+    resolved_worker_threads_ = net_server_.GetWorkerCount();
     // Apply the same defaults as the config constructor — must match ServerConfig defaults.
     net_server_.SetMaxConnections(ServerConfig{}.max_connections);
     net_server_.SetMaxInputSize(ComputeInputCap());
@@ -130,6 +131,7 @@ HttpServer::HttpServer(const ServerConfig& config)
                   config.worker_threads)
 {
     WireNetServerCallbacks();
+    resolved_worker_threads_ = net_server_.GetWorkerCount();
 
     // Initialize logging from config
     logging::Init("reactor", logging::ParseLevel(config.log.level),
@@ -616,14 +618,15 @@ void HttpServer::HandleCloseConnection(std::shared_ptr<ConnectionHandler> conn) 
     // Outside lock: notify drain set and WS close handler
     if (was_h2) {
         active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
-        // Compensate active_h2_streams_ for streams still open when the
-        // transport closes abruptly. nghttp2_session_del() frees remaining
-        // streams without firing the stream-close callback.
+        // Compensate active_h2_streams_ for streams whose close callback has
+        // NOT yet fired. UnclosedStreamCount() excludes streams already marked
+        // for deferred removal (close callback fired, counter already decremented)
+        // to avoid double-subtraction.
         if (h2_handler && h2_handler->GetSession()) {
-            int64_t remaining = static_cast<int64_t>(
-                h2_handler->GetSession()->ActiveStreamCount());
-            if (remaining > 0) {
-                active_h2_streams_.fetch_sub(remaining, std::memory_order_relaxed);
+            int64_t unclosed = static_cast<int64_t>(
+                h2_handler->GetSession()->UnclosedStreamCount());
+            if (unclosed > 0) {
+                active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
             }
         }
         OnH2DrainComplete(conn.get());
@@ -981,5 +984,6 @@ HttpServer::ServerStats HttpServer::GetStats() const {
     stats.max_connections     = net_server_.GetMaxConnections();
     stats.idle_timeout_sec    = static_cast<int>(net_server_.GetConnectionTimeout().count());
     stats.request_timeout_sec = request_timeout_sec_.load(std::memory_order_relaxed);
+    stats.worker_threads      = resolved_worker_threads_;
     return stats;
 }

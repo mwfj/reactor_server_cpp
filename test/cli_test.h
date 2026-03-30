@@ -2182,7 +2182,7 @@ static void RegisterStatsRoute(HttpServer& server, const ServerConfig& config) {
             static_cast<long long>(stats.total_accepted),
             static_cast<long long>(stats.total_requests),
             static_cast<long long>(stats.active_requests),
-            config.bind_host.c_str(), config.bind_port, config.worker_threads,
+            config.bind_host.c_str(), config.bind_port, stats.worker_threads,
             stats.max_connections, stats.idle_timeout_sec,
             stats.request_timeout_sec,
             config.tls.enabled  ? "true" : "false",

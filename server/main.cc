@@ -159,7 +159,7 @@ MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
             static_cast<long long>(stats.total_accepted),
             static_cast<long long>(stats.total_requests),
             static_cast<long long>(stats.active_requests),
-            config.bind_host.c_str(), config.bind_port, config.worker_threads,
+            config.bind_host.c_str(), config.bind_port, stats.worker_threads,
             stats.max_connections, stats.idle_timeout_sec,
             stats.request_timeout_sec,
             config.tls.enabled ? "true" : "false",
@@ -250,6 +250,15 @@ static bool ReloadConfig(const std::string& config_path,
     if (logging::Reopen()) {
         logging::Get()->info("Log files reopened");
     } else {
+        // If the log file path changed and reopen failed, the new destination
+        // is not in effect — treat as a failed reload to avoid a misleading
+        // "Configuration reloaded successfully" while still writing to the old file.
+        if (new_config.log.file != current_config.log.file) {
+            logging::Get()->error("Log file reopen failed for new path: {}",
+                                  new_config.log.file);
+            return false;
+        }
+        // Same path, reopen failed (e.g. logrotate timing) — warn but continue.
         logging::Get()->warn("Log file reopen failed, continuing with old file");
     }
     if (new_config.log.level != current_config.log.level) {
@@ -461,13 +470,25 @@ static int HandleStart(const CliOptions& options) {
         logging::Get()->info("  Stats:   /stats");
     }
 
-    // ── Wire daemon readiness to fire after init, before event loop ──
+    // ── Wire readiness callback to fire after init, before event loop ──
+    // Used by daemon mode to signal parent, and by the signal loop to gate
+    // reloads until socket_dispatchers_ is fully built (prevents races).
+    std::atomic<bool> server_ready{false};
 #if !defined(_WIN32)
     if (options.daemonize) {
-        server->SetReadyCallback([]() {
+        server->SetReadyCallback([&server_ready]() {
+            server_ready.store(true, std::memory_order_release);
             Daemonizer::NotifyReady();
         });
+    } else {
+        server->SetReadyCallback([&server_ready]() {
+            server_ready.store(true, std::memory_order_release);
+        });
     }
+#else
+    server->SetReadyCallback([&server_ready]() {
+        server_ready.store(true, std::memory_order_release);
+    });
 #endif
 
     // ── Server thread ───────────────────────────────────────
@@ -501,7 +522,14 @@ static int HandleStart(const CliOptions& options) {
         if (sig == SignalResult::SHUTDOWN) break;
         // SIGHUP received
         if (options.daemonize) {
-            // Daemon mode: reload configuration
+            // Daemon mode: reload configuration.
+            // Gate on server_ready to prevent racing with Start() building
+            // socket_dispatchers_ — SetConnectionTimeout/SetTimerInterval
+            // walk the vector without synchronization.
+            if (!server_ready.load(std::memory_order_acquire)) {
+                logging::Get()->warn("Received SIGHUP before server is ready, ignoring");
+                continue;
+            }
             logging::Get()->info("Received SIGHUP, reloading configuration");
             if (ReloadConfig(resolved_config_path, options, *server, config)) {
                 logging::Get()->info("Configuration reloaded successfully");
