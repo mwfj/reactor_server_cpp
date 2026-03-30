@@ -159,7 +159,7 @@ $(SERVER_TARGET): $(LIB_SRCS) $(MAIN_SRC) $(HEADERS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ
 
 # Clean build artifacts
 clean:
-	rm -rf $(TARGET)* $(SERVER_TARGET) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) *.dSYM logs/
+	rm -rf $(TARGET)* $(SERVER_TARGET) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) *.dSYM
 
 # Run all tests
 test: $(TARGET) $(SERVER_TARGET)

@@ -69,21 +69,26 @@ static std::string TodayDateString() {
     return std::string(buf);
 }
 
+// Join directory and filename, avoiding "//" when dir is "/" (POSIX: leading
+// "//" is implementation-defined and may resolve differently from "/").
+static std::string JoinPath(const std::string& dir, const std::string& name) {
+    if (dir.empty()) return name;
+    if (dir.back() == '/') return dir + name;
+    return dir + "/" + name;
+}
+
 // Build a file path from components.
 // seq=0 -> "logs/reactor-2026-03-30.log"
 // seq=1 -> "logs/reactor-2026-03-30-1.log"
 static std::string BuildFilePath(const std::string& dir, const std::string& prefix,
                                   const std::string& date, int seq,
                                   const std::string& ext) {
-    // Avoid "//prefix-..." when dir is "/" (POSIX: leading // is implementation-defined)
-    std::string path = dir;
-    if (!dir.empty() && dir.back() != '/') path += '/';
-    path += prefix + "-" + date;
+    std::string filename = prefix + "-" + date;
     if (seq > 0) {
-        path += "-" + std::to_string(seq);
+        filename += "-" + std::to_string(seq);
     }
-    path += ext;
-    return path;
+    filename += ext;
+    return JoinPath(dir, filename);
 }
 
 // Scan directory for files matching {prefix}-{date}*{ext}.
@@ -124,7 +129,7 @@ ScanDateFiles(const std::string& dir, const std::string& prefix,
             continue;
         }
 
-        files.emplace_back(seq, dir + "/" + name);
+        files.emplace_back(seq, JoinPath(dir, name));
     }
     closedir(d);
 
@@ -210,7 +215,7 @@ static void PruneOldFiles() {
                 if (pos != middle.size() - 11) continue;  // trailing garbage
             } catch (...) { continue; }
         }
-        files.push_back({date, seq, g_log_dir + "/" + name});
+        files.push_back({date, seq, JoinPath(g_log_dir, name)});
     }
     closedir(d);
 

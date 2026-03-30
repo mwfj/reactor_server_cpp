@@ -203,7 +203,7 @@ logs/reactor-2026-03-30-1.log     (after first size rotation)
 logs/reactor-2026-03-30-2.log     (after second rotation)
 ```
 
-On restart, the logger appends to the latest non-full file for today's date. The `logs/` directory is created automatically when the production server starts. `make clean` removes the `logs/` directory.
+On restart, the logger appends to the latest non-full file for today's date. The `logs/` directory is created automatically when the server starts (if `log.file` has a directory component).
 
 ### Log Levels
 
