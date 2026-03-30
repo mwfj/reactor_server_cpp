@@ -170,7 +170,7 @@ logging::Init(
     spdlog::level::info,          // Minimum level
     "logs/reactor.log",           // Log file path (empty = stdout only)
     10485760,                     // Max file size per log file (10 MB)
-    3                             // Max rotated files per day
+    3                             // Max total log files to keep
 );
 
 // System markers for visual separation

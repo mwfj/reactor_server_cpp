@@ -42,7 +42,7 @@ static void ParseLogPath(const std::string& path,
     auto last_slash = path.rfind('/');
     std::string filename;
     if (last_slash != std::string::npos) {
-        dir = path.substr(0, last_slash);
+        dir = (last_slash == 0) ? "/" : path.substr(0, last_slash);
         filename = path.substr(last_slash + 1);
     } else {
         dir = ".";
@@ -302,6 +302,7 @@ void Init(const std::string& name,
         g_log_prefix.clear();
         g_log_extension.clear();
         g_current_file_path.clear();
+        g_current_log_date.clear();
     }
 
     auto sinks = BuildSinksAndPrune(level);
@@ -400,8 +401,10 @@ void CheckRotation() {
         needs_rotate = true;
     }
 
-    // Check size limit
+    // Check size limit. Flush first so buffered debug/trace writes are
+    // reflected in the on-disk size (flush_on is set to info level).
     if (!needs_rotate) {
+        g_logger->flush();
         struct stat st{};
         if (stat(g_current_file_path.c_str(), &st) != 0) return;
         if (static_cast<size_t>(st.st_size) >= g_max_size) {
