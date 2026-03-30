@@ -340,9 +340,8 @@ void Dispatcher::TimerHandler(){
 #endif
     TimeStamp::ResetTimerFd(timer_fd_, end_t_);
 
-    // Periodic log rotation check — runs on every timer fire across all
-    // dispatchers. Steady-state cost: mutex lock, date string compare,
-    // flush, stat. Serialized by g_logger_mtx across dispatchers.
+    // Periodic log rotation check. Steady-state cost: mutex lock, date
+    // string compare, stat (no flush). Serialized by g_logger_mtx.
     logging::CheckRotation();
 
     if(is_sock_dispatcher()){

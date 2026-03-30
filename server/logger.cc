@@ -188,9 +188,16 @@ static void PruneOldFiles() {
         std::string middle = name.substr(name_prefix.size(),
             name.size() - name_prefix.size() - g_log_extension.size());
 
-        // Parse date (first 10 chars: YYYY-MM-DD) and optional seq
-        if (middle.size() < 10) continue;  // too short for a date
+        // Parse date (first 10 chars must be YYYY-MM-DD format)
+        if (middle.size() < 10) continue;
         std::string date = middle.substr(0, 10);
+        // Validate date shape: digits at 0-3, dash at 4, digits at 5-6, dash at 7, digits at 8-9
+        if (date[4] != '-' || date[7] != '-') continue;
+        bool valid_date = true;
+        for (int di : {0,1,2,3,5,6,8,9}) {
+            if (!std::isdigit(static_cast<unsigned char>(date[di]))) { valid_date = false; break; }
+        }
+        if (!valid_date) continue;
         int seq = 0;
         if (middle.size() > 10) {
             if (middle[10] != '-') continue;  // unexpected format
@@ -408,10 +415,10 @@ void CheckRotation() {
         needs_rotate = true;
     }
 
-    // Check size limit. Flush first so buffered debug/trace writes are
-    // reflected in the on-disk size (flush_on is set to info level).
+    // Check size limit using stat (no flush — avoids I/O on every timer tick).
+    // Buffered debug/trace writes may not be reflected yet, so rotation could
+    // be delayed by one timer cycle. Acceptable for a 10MB default threshold.
     if (!needs_rotate) {
-        g_logger->flush();
         struct stat st{};
         if (stat(g_current_file_path.c_str(), &st) != 0) return;
         if (static_cast<size_t>(st.st_size) >= g_max_size) {
@@ -420,6 +427,9 @@ void CheckRotation() {
     }
 
     if (!needs_rotate) return;
+
+    // Flush before rotation so buffered data goes to the old file.
+    g_logger->flush();
 
     try {
         RebuildLogger();
