@@ -138,7 +138,10 @@ HttpServer::HttpServer(const ServerConfig& config)
 {
     WireNetServerCallbacks();
     resolved_worker_threads_ = net_server_.GetWorkerCount();
+    // Default ready callback — sets server_ready_ and start_time_.
+    // SetReadyCallback() wraps any user callback on top of this.
     net_server_.SetReadyCallback([this]() {
+        start_time_ = std::chrono::steady_clock::now();
         server_ready_.store(true, std::memory_order_release);
     });
 
@@ -238,6 +241,7 @@ void HttpServer::Start() {
 
 void HttpServer::SetReadyCallback(std::function<void()> cb) {
     net_server_.SetReadyCallback([this, user_cb = std::move(cb)]() {
+        start_time_ = std::chrono::steady_clock::now();
         server_ready_.store(true, std::memory_order_release);
         if (user_cb) user_cb();
     });
@@ -963,6 +967,9 @@ void HttpServer::Reload(const ServerConfig& new_config) {
         validation_copy.bind_port = 8080;          // always valid
         validation_copy.worker_threads = 1;        // always valid
         validation_copy.tls.enabled = false;       // skip TLS path checks
+        // Force http2.enabled = true so H2 sub-settings are always validated.
+        // Reload() copies them to h2_settings_ regardless of the enabled flag.
+        validation_copy.http2.enabled = true;
         try {
             ConfigLoader::Validate(validation_copy);
         } catch (const std::invalid_argument& e) {
