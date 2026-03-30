@@ -221,30 +221,31 @@ static void PruneOldFiles() {
 
     std::sort(files.begin(), files.end());
 
-    // Count only non-empty files toward the limit. Empty files (created
-    // eagerly by spdlog on rotation/date rollover but not yet written to)
-    // should not cause deletion of older files with real content.
-    int non_empty = 0;
-    for (auto& f : files) {
+    // Delete oldest files if total count exceeds max_files.
+    // Prefer deleting empty files first, then oldest non-empty files.
+    // Skip the current file in all cases.
+    int to_delete = static_cast<int>(files.size()) - g_max_files;
+    if (to_delete <= 0) return;
+
+    // Pass 1: delete empty files (oldest first) — free to discard
+    for (size_t i = 0; i < files.size() && to_delete > 0; ++i) {
+        if (files[i].path == g_current_file_path) continue;
         struct stat st{};
-        if (stat(f.path.c_str(), &st) == 0 && st.st_size > 0) {
-            ++non_empty;
+        if (stat(files[i].path.c_str(), &st) == 0 && st.st_size == 0) {
+            std::remove(files[i].path.c_str());
+            --to_delete;
         }
     }
 
-    // Delete oldest non-empty files if count exceeds max_files.
-    // Skip the current file — compensate by deleting the next oldest instead.
-    int to_delete = non_empty - g_max_files;
-    size_t idx = 0;
-    while (to_delete > 0 && idx < files.size()) {
-        if (files[idx].path != g_current_file_path) {
-            struct stat st{};
-            if (stat(files[idx].path.c_str(), &st) == 0 && st.st_size > 0) {
-                std::remove(files[idx].path.c_str());
-                --to_delete;
-            }
+    // Pass 2: delete oldest non-empty files if still over the limit
+    for (size_t i = 0; i < files.size() && to_delete > 0; ++i) {
+        if (files[i].path == g_current_file_path) continue;
+        // File may have been deleted in pass 1 — check existence
+        struct stat st{};
+        if (stat(files[i].path.c_str(), &st) == 0) {
+            std::remove(files[i].path.c_str());
+            --to_delete;
         }
-        ++idx;
     }
 }
 
@@ -342,6 +343,8 @@ void Init(const std::string& name,
     auto saved_dir = g_log_dir;
     auto saved_prefix = g_log_prefix;
     auto saved_ext = g_log_extension;
+    auto saved_path = g_current_file_path;
+    auto saved_date = g_current_log_date;
 
     g_logger_name = name;
     g_log_level = level;
@@ -383,6 +386,8 @@ void Init(const std::string& name,
         g_log_dir = std::move(saved_dir);
         g_log_prefix = std::move(saved_prefix);
         g_log_extension = std::move(saved_ext);
+        g_current_file_path = std::move(saved_path);
+        g_current_log_date = std::move(saved_date);
         throw;  // re-throw so caller knows Init failed
     }
 }
@@ -475,13 +480,18 @@ void CheckRotation() {
         needs_rotate = true;
     }
 
-    // Check size limit using stat (no flush — avoids I/O on every timer tick).
-    // Buffered debug/trace writes may not be reflected yet, so rotation could
-    // be delayed by one timer cycle. Acceptable for a 10MB default threshold.
+    // Check size limit and file existence.
     if (!needs_rotate) {
         struct stat st{};
-        if (stat(g_current_file_path.c_str(), &st) != 0) return;
-        if (static_cast<size_t>(st.st_size) >= g_max_size) {
+        if (stat(g_current_file_path.c_str(), &st) != 0) {
+            // File was renamed or deleted (e.g., external logrotate without
+            // SIGHUP, or manual removal). Rebuild to recreate the file.
+            if (errno == ENOENT) {
+                needs_rotate = true;
+            } else {
+                return;  // Transient error — retry next tick
+            }
+        } else if (static_cast<size_t>(st.st_size) >= g_max_size) {
             needs_rotate = true;
         }
     }
