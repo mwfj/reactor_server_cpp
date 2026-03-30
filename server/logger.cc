@@ -1,4 +1,5 @@
 #include "log/logger.h"
+#include "log/log_utils.h"
 
 #include <vector>
 #include <mutex>
@@ -537,10 +538,8 @@ void EnsureLogDir(const std::string& dir) {
     }
     if (mkdir(normalized.c_str(), 0755) != 0 && errno != EEXIST) {
         int saved_errno = errno;
-        char errbuf[256];
-        strerror_r(saved_errno, errbuf, sizeof(errbuf));
         throw std::runtime_error("Failed to create log directory '" + normalized + "': " +
-                                  std::string(errbuf));
+                                  SafeStrerror(saved_errno));
     }
 }
 
