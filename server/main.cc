@@ -245,14 +245,20 @@ static bool ReloadConfig(const std::string& config_path,
     // is unchanged. External logrotate sends SIGHUP with unchanged config to
     // force descriptor reopen after file rename. Gating on config changes would
     // break standard postrotate `kill -HUP` workflows.
+    //
+    // Save old config before updating so we can roll back on failure.
+    std::string old_log_file = current_config.log.file;
+    size_t old_max_size = current_config.log.max_file_size;
+    int old_max_files = current_config.log.max_files;
+
     logging::UpdateFileConfig(new_config.log.file, new_config.log.max_file_size,
                               new_config.log.max_files);
     if (logging::Reopen()) {
         logging::Get()->info("Log files reopened");
     } else {
-        // If the log file path changed and reopen failed, the new destination
-        // is not in effect — treat as a failed reload to avoid a misleading
-        // "Configuration reloaded successfully" while still writing to the old file.
+        // Roll back stored sink config so subsequent SIGHUPs don't retry
+        // the broken file/sink parameters.
+        logging::UpdateFileConfig(old_log_file, old_max_size, old_max_files);
         if (new_config.log.file != current_config.log.file) {
             logging::Get()->error("Log file reopen failed for new path: {}",
                                   new_config.log.file);

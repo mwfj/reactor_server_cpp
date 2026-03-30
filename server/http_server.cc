@@ -461,7 +461,7 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         // Guard against accept/data race: if HandleMessage already ran and
         // created a handler for THIS connection, skip everything below.
         std::shared_ptr<HttpConnectionHandler> stale_h1;
-        bool evicted_h2 = false;
+        std::shared_ptr<Http2ConnectionHandler> stale_h2;
         bool evicted_pd = false;
         bool new_conn_tracked = false;
         {
@@ -471,10 +471,11 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                 if (h2_it->second->GetConnection() == conn) {
                     return;  // Already initialized by HandleMessage
                 }
-                // Stale handler from fd reuse — evict. Decrement here because
-                // the old connection's close callback can no longer find this entry.
+                // Stale handler from fd reuse — save for stream compensation,
+                // then evict. The old connection's close callback can no longer
+                // find this entry, so we must decrement here.
+                stale_h2 = h2_it->second;
                 h2_connections_.erase(h2_it);
-                evicted_h2 = true;
             }
             auto h1_it = http_connections_.find(conn->fd());
             if (h1_it != http_connections_.end()) {
@@ -514,15 +515,23 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         }
         // Compensating decrements for evicted stale entries — their close
         // callbacks can no longer find the map entries we just removed.
-        if (evicted_h2) {
+        if (stale_h2) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
             active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
+            // Compensate for open streams on the evicted session
+            if (stale_h2->GetSession()) {
+                int64_t unclosed = static_cast<int64_t>(
+                    stale_h2->GetSession()->UnclosedStreamCount());
+                if (unclosed > 0) {
+                    active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
+                }
+            }
         }
         if (stale_h1) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
             active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
-        if (evicted_pd && !evicted_h2 && !stale_h1) {
+        if (evicted_pd && !stale_h2 && !stale_h1) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
         // Notify stale WS handler outside the lock.
@@ -675,10 +684,10 @@ void HttpServer::HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn) 
     if (was_h2) {
         active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
         if (h2_handler && h2_handler->GetSession()) {
-            int64_t remaining = static_cast<int64_t>(
-                h2_handler->GetSession()->ActiveStreamCount());
-            if (remaining > 0) {
-                active_h2_streams_.fetch_sub(remaining, std::memory_order_relaxed);
+            int64_t unclosed = static_cast<int64_t>(
+                h2_handler->GetSession()->UnclosedStreamCount());
+            if (unclosed > 0) {
+                active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
             }
         }
         OnH2DrainComplete(conn.get());
@@ -695,8 +704,8 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
     // Copy shared_ptrs under the lock, then call OnRawData outside it:
     // OnRawData can trigger callbacks that acquire conn_mtx_ — deadlock.
     std::shared_ptr<Http2ConnectionHandler> h2_conn;
+    std::shared_ptr<Http2ConnectionHandler> evicted_stale_h2;
     std::shared_ptr<HttpConnectionHandler> http_conn;
-    bool evicted_stale_h2 = false;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
 
@@ -706,9 +715,9 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             if (h2_it->second->GetConnection() == conn) {
                 h2_conn = h2_it->second;
             } else {
-                // fd reused — remove stale entry (will fall through to detection)
+                // fd reused — save for stream compensation, then evict
+                evicted_stale_h2 = h2_it->second;
                 h2_connections_.erase(h2_it);
-                evicted_stale_h2 = true;
             }
         }
 
@@ -724,6 +733,13 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
     if (evicted_stale_h2) {
         active_connections_.fetch_sub(1, std::memory_order_relaxed);
         active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
+        if (evicted_stale_h2->GetSession()) {
+            int64_t unclosed = static_cast<int64_t>(
+                evicted_stale_h2->GetSession()->UnclosedStreamCount());
+            if (unclosed > 0) {
+                active_h2_streams_.fetch_sub(unclosed, std::memory_order_relaxed);
+            }
+        }
     }
 
     if (h2_conn) {
