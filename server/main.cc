@@ -156,13 +156,9 @@ static int HandleStart(const CliOptions& options) {
     int rc = LoadConfig(config, options);
     if (rc != EXIT_OK) return rc;
 
-    // Default log file for production server when not explicitly configured
-    if (config.log.file.empty()) {
-        config.log.file = "logs/reactor.log";
-    }
-
-    // Ensure log directory exists before any logging::Init call
-    {
+    // Ensure log directory exists before any logging::Init call.
+    // If log.file is empty, the server runs console-only (no file logging).
+    if (!config.log.file.empty()) {
         std::string log_dir = logging::ExtractDir(config.log.file);
         if (!log_dir.empty()) {
             try {

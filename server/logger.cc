@@ -188,13 +188,23 @@ static std::vector<spdlog::sink_ptr> BuildSinksAndPrune(spdlog::level::level_enu
     }
 
     if (!g_log_file.empty()) {
-        g_current_file_path = ResolveLogPath(g_log_dir, g_log_prefix,
-                                              g_log_extension, g_max_size);
+        if (g_max_files <= 1) {
+            // Non-rotating mode: use the original path as-is, compatible with
+            // external logrotate. logrotate renames the file, SIGHUP triggers
+            // Reopen() which creates a fresh sink at the original path.
+            g_current_file_path = g_log_file;
+        } else {
+            // Date-based rotation mode: resolve today's date-based path
+            g_current_file_path = ResolveLogPath(g_log_dir, g_log_prefix,
+                                                  g_log_extension, g_max_size);
+        }
         auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
             g_current_file_path, /*truncate=*/false);
         file_sink->set_level(level);
         sinks.push_back(file_sink);
-        PruneOldFiles();
+        if (g_max_files > 1) {
+            PruneOldFiles();
+        }
     }
 
     return sinks;
@@ -322,6 +332,10 @@ bool Reopen() {
 void CheckRotation() {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
     if (!g_logger || g_log_file.empty() || g_current_file_path.empty()) return;
+
+    // Non-rotating mode (max_files <= 1): external logrotate handles rotation
+    // via rename + SIGHUP → Reopen(). No automatic size/date rotation.
+    if (g_max_files <= 1) return;
 
     bool needs_rotate = false;
 

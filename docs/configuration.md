@@ -102,14 +102,14 @@ Reference config at `config/server.example.json`:
     },
     "log": {
         "level": "info",
-        "file": "logs/reactor.log",
+        "file": "",
         "max_file_size": 10485760,
         "max_files": 3
     }
 }
 ```
 
-Missing fields in the JSON file retain their default values. When `log.file` is empty, the production server defaults to `logs/reactor.log`.
+Missing fields in the JSON file retain their default values. When `log.file` is empty (default), the server logs to console only. Set to a path (e.g., `"logs/reactor.log"`) to enable file logging with date-based rotation. Set `max_files` to `1` for external logrotate compatibility (no automatic rotation).
 
 ### Environment Variable Overrides
 
@@ -219,7 +219,7 @@ On restart, the logger appends to the latest non-full file for today's date. The
 ### Output Format
 
 ```
-[2026-03-30 12:34:56.789] [reactor] [info] ================================ SERVER START [2026-03-30 12:34:56] ================================
+[2026-03-30 12:34:56.789] [reactor] [info] ================================ SERVER START ================================
 [2026-03-30 12:34:56.790] [reactor] [info] reactor_server version 0.1.0 starting
 [2026-03-30 12:34:56.791] [reactor] [debug] New connection fd=5
 [2026-03-30 12:34:57.001] [reactor] [warn] Request timeout fd=5
