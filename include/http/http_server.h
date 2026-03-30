@@ -64,7 +64,8 @@ public:
     // fields and EnQueue for dispatcher-thread-affine updates.
     // Restart-required fields (bind_host, bind_port, tls.*, worker_threads,
     // http2.enabled) are silently ignored — the caller logs them.
-    void Reload(const ServerConfig& new_config);
+    // Returns false if the config was rejected (validation failure, not ready).
+    bool Reload(const ServerConfig& new_config);
 
     // Return a snapshot of server runtime statistics.
     ServerStats GetStats() const;

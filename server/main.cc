@@ -185,19 +185,12 @@ static bool ReloadConfig(const std::string& config_path,
                          ServerConfig& current_config) {
     ServerConfig new_config;
     try {
-        // Mirror LoadConfig's fallback: only fall back to defaults if the config
-        // file does not exist (ENOENT) AND the path wasn't explicitly set.
-        // Transient errors (EACCES, EIO) must reject the reload, not silently
-        // replace config with defaults.
-        if (access(config_path.c_str(), F_OK) == 0) {
-            new_config = ConfigLoader::LoadFromFile(config_path);
-        } else if (!options.config_path_explicit && errno == ENOENT) {
-            new_config = ConfigLoader::Default();
-        } else {
-            logging::Get()->error("Config reload failed: {}: {}",
-                                  config_path, std::strerror(errno));
-            return false;
-        }
+        // On reload, always require the config file — never fall back to
+        // defaults. At startup, a missing implicit config is fine (server starts
+        // with defaults), but on reload, silently replacing live settings with
+        // defaults would be surprising and destructive. If the file disappeared
+        // (deploy, rename mistake), the operator should notice via the error log.
+        new_config = ConfigLoader::LoadFromFile(config_path);
         ConfigLoader::ApplyEnvOverrides(new_config);
         ApplyCliOverrides(new_config, options);
     } catch (const std::exception& e) {
@@ -273,7 +266,10 @@ static bool ReloadConfig(const std::string& config_path,
     }
 
     // Apply reload-safe fields via HttpServer::Reload()
-    server.Reload(new_config);
+    if (!server.Reload(new_config)) {
+        logging::Get()->error("HttpServer::Reload() rejected the config");
+        return false;
+    }
 
     // Log reload-safe changes at info level.
     // idle_timeout and max_connections take effect immediately for all connections.

@@ -949,12 +949,12 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     );
 }
 
-void HttpServer::Reload(const ServerConfig& new_config) {
+bool HttpServer::Reload(const ServerConfig& new_config) {
     // Gate on server readiness — socket_dispatchers_ is built during Start()
     // and must not be walked until construction is complete.
     if (!server_ready_.load(std::memory_order_acquire)) {
         logging::Get()->warn("Reload() called before server is ready, ignored");
-        return;
+        return false;
     }
 
     // Validate reload-safe fields only — restart-only fields (bind_host,
@@ -974,7 +974,7 @@ void HttpServer::Reload(const ServerConfig& new_config) {
             ConfigLoader::Validate(validation_copy);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Reload() rejected invalid config: {}", e.what());
-            return;
+            return false;
         }
     }
 
@@ -1025,13 +1025,18 @@ void HttpServer::Reload(const ServerConfig& new_config) {
         h2_settings_.max_frame_size         = new_config.http2.max_frame_size;
         h2_settings_.max_header_list_size   = new_config.http2.max_header_list_size;
     }
+    return true;
 }
 
 HttpServer::ServerStats HttpServer::GetStats() const {
     ServerStats stats;
-    auto now = std::chrono::steady_clock::now();
-    stats.uptime_seconds = std::chrono::duration_cast<std::chrono::seconds>(
-        now - start_time_).count();
+    // Return 0 uptime before the ready callback sets start_time_ — avoids
+    // bogus values from default-constructed time_point{}.
+    if (server_ready_.load(std::memory_order_acquire)) {
+        auto now = std::chrono::steady_clock::now();
+        stats.uptime_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+            now - start_time_).count();
+    }
     stats.active_connections      = active_connections_.load(std::memory_order_relaxed);
     stats.active_http1_connections = active_http1_connections_.load(std::memory_order_relaxed);
     stats.active_http2_connections = active_http2_connections_.load(std::memory_order_relaxed);
