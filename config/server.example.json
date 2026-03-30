@@ -16,7 +16,7 @@
     },
     "log": {
         "level": "info",
-        "file": "logs/reactor.log",
+        "file": "",
         "max_file_size": 10485760,
         "max_files": 3
     }
