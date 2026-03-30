@@ -446,14 +446,14 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
     // stale state in http_connections_ (potentially under fd -1 after ReleaseFd).
     if (conn->IsClosing()) return;
 
-    // Counters: incremented unconditionally for every new connection because
-    // HandleCloseConnection/HandleErrorConnection decrement unconditionally.
-    // NetServer guarantees HandleNewConnection is called exactly once per fd.
-    // On the accept/data race (HandleMessage initializes first), the early-return
-    // guards below skip handler setup but the connection IS still counted — the
-    // matching decrement fires when the connection eventually closes.
-    total_accepted_.fetch_add(1, std::memory_order_relaxed);
-    active_connections_.fetch_add(1, std::memory_order_relaxed);
+    // NOTE: total_accepted_ and active_connections_ are NOT incremented here.
+    // They are incremented at map-insertion points (pending_detection_ in this
+    // method, http_connections_ in the http2_disabled path, or h2_connections_/
+    // http_connections_ in DetectAndRouteProtocol). This ties counters to map
+    // membership, which is always symmetric with the was_tracked decrement in
+    // HandleCloseConnection/HandleErrorConnection. This eliminates the accept/
+    // data race where HandleMessage and HandleCloseConnection run before this
+    // method — the counter is incremented by whoever inserts into the map first.
 
     if (http2_enabled_) {
         // Guard against accept/data race: if HandleMessage already ran and
@@ -461,6 +461,7 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         std::shared_ptr<HttpConnectionHandler> stale_h1;
         bool evicted_h2 = false;
         bool evicted_pd = false;
+        bool new_conn_tracked = false;
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
             auto h2_it = h2_connections_.find(conn->fd());
@@ -485,17 +486,29 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
             // Track in pending_detection_ for counter symmetry: if the
             // connection closes before HandleMessage runs (no map entry yet),
             // HandleCloseConnection needs to find it here to decrement.
+            // Track in pending_detection_ and count the connection.
+            // Counter is tied to map membership — symmetric with was_tracked
+            // decrement in HandleCloseConnection/HandleErrorConnection.
             auto pd_it = pending_detection_.find(conn->fd());
             if (pd_it != pending_detection_.end()) {
                 if (pd_it->second.conn != conn) {
-                    // Stale entry — replace with current conn tracking
+                    // Stale entry — replace with current conn tracking.
+                    // Compensating decrement for old entry handled below.
                     pd_it->second = {conn, ""};
                     evicted_pd = true;
+                    new_conn_tracked = true;
                 }
-                // else: same conn already tracked (partial preface) — keep data
+                // else: same conn already tracked (partial preface + race
+                // with HandleMessage) — already counted, keep data
             } else {
                 pending_detection_[conn->fd()] = {conn, ""};
+                new_conn_tracked = true;
             }
+        }
+        // Increment counters for the newly tracked connection
+        if (new_conn_tracked) {
+            total_accepted_.fetch_add(1, std::memory_order_relaxed);
+            active_connections_.fetch_add(1, std::memory_order_relaxed);
         }
         // Compensating decrements for evicted stale entries — their close
         // callbacks can no longer find the map entries we just removed.
@@ -508,12 +521,9 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
             active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
         if (evicted_pd && !evicted_h2 && !stale_h1) {
-            // Stale pending_detection entry (protocol not yet determined) —
-            // only decrement active_connections_ (no protocol counter was set).
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
-        // Notify stale WS handler outside the lock (avoids deadlock with
-        // CallCloseCb → conn_mtx_ and preserves the close notification).
+        // Notify stale WS handler outside the lock.
         SafeNotifyWsClose(stale_h1);
     } else {
         // HTTP/2 disabled — always create HTTP/1.x handler immediately.
@@ -530,12 +540,18 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
                     SetupHandlers(http_conn);
                     http_connections_[conn->fd()] = http_conn;
+                    // Counter tied to map insertion
+                    total_accepted_.fetch_add(1, std::memory_order_relaxed);
+                    active_connections_.fetch_add(1, std::memory_order_relaxed);
                     active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
                 }
             } else {
                 auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
                 SetupHandlers(http_conn);
                 http_connections_[conn->fd()] = http_conn;
+                // Counter tied to map insertion
+                total_accepted_.fetch_add(1, std::memory_order_relaxed);
+                active_connections_.fetch_add(1, std::memory_order_relaxed);
                 active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -721,6 +737,12 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
     // No handler exists yet (or stale fd-reuse removed above) — detect protocol and create one.
     // Prepend any buffered partial-preface bytes accumulated from a prior call.
     // Verify connection identity to guard against fd-reuse races.
+    // Check if pending_detection_ has a tracking entry for this connection.
+    // If found with matching identity, counters were already incremented
+    // by HandleNewConnection. If not found, this is the accept/data race
+    // path (HandleMessage ran before HandleNewConnection) — DetectAndRoute
+    // must handle the counter increment.
+    bool already_counted = false;
     {
         bool evicted_stale_pd = false;
         std::lock_guard<std::mutex> lck(conn_mtx_);
@@ -729,6 +751,7 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             if (pd_it->second.conn == conn) {
                 pd_it->second.data += message;
                 message = std::move(pd_it->second.data);
+                already_counted = true;
             } else {
                 // Stale entry (fd reused) — compensating decrement
                 evicted_stale_pd = true;
@@ -739,11 +762,12 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
     }
-    DetectAndRouteProtocol(conn, message);
+    DetectAndRouteProtocol(conn, message, already_counted);
 }
 
 bool HttpServer::DetectAndRouteProtocol(
-    std::shared_ptr<ConnectionHandler> conn, std::string& message) {
+    std::shared_ptr<ConnectionHandler> conn, std::string& message,
+    bool already_counted) {
 
     ProtocolDetector::Protocol proto = ProtocolDetector::Protocol::HTTP1;
 
@@ -779,6 +803,10 @@ bool HttpServer::DetectAndRouteProtocol(
     if (proto == ProtocolDetector::Protocol::HTTP2) {
         // Skip if connection is fully closing (not just peer half-close)
         if (conn->IsClosing()) return true;
+        if (!already_counted) {
+            total_accepted_.fetch_add(1, std::memory_order_relaxed);
+            active_connections_.fetch_add(1, std::memory_order_relaxed);
+        }
         active_http2_connections_.fetch_add(1, std::memory_order_relaxed);
         // Snapshot h2_settings_ and publish handler under a single lock to
         // prevent race with Reload() and to avoid double mutex acquisition.
@@ -799,6 +827,10 @@ bool HttpServer::DetectAndRouteProtocol(
     }
 
     // HTTP/1.x — create handler (existing path)
+    if (!already_counted) {
+        total_accepted_.fetch_add(1, std::memory_order_relaxed);
+        active_connections_.fetch_add(1, std::memory_order_relaxed);
+    }
     active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
     SetupHandlers(http_conn);
@@ -885,7 +917,9 @@ void HttpServer::Reload(const ServerConfig& new_config) {
     else scan_interval = std::min(idle_interval, req_interval);
     net_server_.SetTimerInterval(scan_interval);
 
-    // Update HTTP/2 settings for new connections (under conn_mtx_)
+    // Update HTTP/2 settings for NEW connections only (under conn_mtx_).
+    // Existing sessions keep their negotiated SETTINGS values — submitting
+    // a new SETTINGS frame to live sessions mid-stream is not supported.
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         h2_settings_.max_concurrent_streams = new_config.http2.max_concurrent_streams;

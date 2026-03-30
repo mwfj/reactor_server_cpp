@@ -148,6 +148,9 @@ private:
 
     // Detect protocol and create the appropriate handler (HTTP/1.x or HTTP/2).
     // Returns true if handler was created and data was routed.
+    // already_counted: true if total_accepted_/active_connections_ were already
+    // incremented by HandleNewConnection (normal path); false on the accept/data
+    // race path where HandleMessage runs before HandleNewConnection.
     bool DetectAndRouteProtocol(std::shared_ptr<ConnectionHandler> conn,
-                                std::string& message);
+                                std::string& message, bool already_counted);
 };
