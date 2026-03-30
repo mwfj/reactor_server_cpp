@@ -1,5 +1,6 @@
 #include "http/http_connection_handler.h"
 #include "log/logger.h"
+#include "log/log_utils.h"
 #include <sstream>
 
 HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn)
@@ -74,6 +75,7 @@ void HttpConnectionHandler::HandleUpgradedData(const std::string& data) {
 }
 
 void HttpConnectionHandler::HandleParseError() {
+    logging::Get()->warn("HTTP parse error fd={}: {}", conn_->fd(), parser_.GetError());
     // Determine appropriate error response based on parser error type
     HttpResponse err_resp;
     switch (parser_.GetErrorType()) {
@@ -100,6 +102,8 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
     // llhttp will parse any major.minor (e.g. HTTP/2.0, HTTP/0.9), but this
     // server only speaks HTTP/1.x, so dispatch would produce wrong responses.
     if (req.http_major != 1 || (req.http_minor != 0 && req.http_minor != 1)) {
+        logging::Get()->warn("Unsupported HTTP version fd={}: {}.{}",
+                             conn_->fd(), req.http_major, req.http_minor);
         HttpResponse ver_resp = HttpResponse::HttpVersionNotSupported();
         ver_resp.Header("Connection", "close");
         SendResponse(ver_resp);
@@ -113,6 +117,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
 
     // RFC 7230 §5.4: HTTP/1.1 requests MUST include Host header
     if (req.http_minor >= 1 && !req.HasHeader("host")) {
+        logging::Get()->debug("Missing Host header fd={}", conn_->fd());
         HttpResponse bad_req = HttpResponse::BadRequest("Missing Host header");
         bad_req.Header("Connection", "close");
         SendResponse(bad_req);
@@ -131,6 +136,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
             expect.pop_back();
         if (expect != "100-continue") {
+            logging::Get()->debug("Unsupported Expect value fd={}", conn_->fd());
             HttpResponse err;
             err.Status(417, "Expectation Failed");
             err.Header("Connection", "close");
@@ -172,6 +178,8 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         // Validate WebSocket handshake per RFC 6455
         std::string ws_error;
         if (!WebSocketHandshake::Validate(req, ws_error)) {
+            logging::Get()->debug("WebSocket handshake rejected fd={}: {}",
+                                  conn_->fd(), ws_error);
             int reject_code = 400;
             // RFC 6455 §4.4: wrong version → 426 + Sec-WebSocket-Version
             if (ws_error.find("version") != std::string::npos ||
@@ -190,6 +198,8 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
 
         // Check route existence BEFORE sending 101
         if (!callbacks_.route_check_callback(req.path)) {
+            logging::Get()->debug("WebSocket route not found fd={} path={}",
+                                  conn_->fd(), logging::SanitizePath(req.path));
             auto not_found = HttpResponse::NotFound();
             not_found.Header("Connection", "close");
             SendResponse(not_found);
@@ -230,6 +240,8 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         // If the send failed (client disconnected), don't proceed with upgrade.
         // SendRaw may have triggered CallCloseCb via EPIPE/ECONNRESET.
         if (conn_->IsClosing()) {
+            logging::Get()->debug("WS upgrade: connection closed during 101 send fd={}",
+                                  conn_->fd());
             return false;
         }
 
@@ -420,6 +432,8 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
     // will arrive — the request can never complete. Close immediately
     // instead of leaking the connection slot until timeout.
     if (conn_->IsCloseDeferred()) {
+        logging::Get()->debug("Incomplete request, peer EOF fd={}, force-closing",
+                              conn_->fd());
         conn_->ForceClose();
         return;
     }
@@ -431,6 +445,8 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
         // Early reject: unsupported HTTP version
         if (partial.http_major != 1 ||
             (partial.http_minor != 0 && partial.http_minor != 1)) {
+            logging::Get()->warn("Early reject: unsupported HTTP version fd={}",
+                                 conn_->fd());
             HttpResponse ver_resp = HttpResponse::HttpVersionNotSupported();
             ver_resp.Header("Connection", "close");
             SendResponse(ver_resp);
@@ -440,6 +456,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
 
         // Early reject: HTTP/1.1 missing Host
         if (partial.http_minor >= 1 && !partial.HasHeader("host")) {
+            logging::Get()->debug("Early reject: missing Host fd={}", conn_->fd());
             HttpResponse bad_req = HttpResponse::BadRequest("Missing Host header");
             bad_req.Header("Connection", "close");
             SendResponse(bad_req);
@@ -452,6 +469,8 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
         // and no body, occupying a connection slot until request timeout.
         if (max_body_size_ > 0 &&
             partial.content_length > max_body_size_) {
+            logging::Get()->warn("Early reject: Content-Length exceeds limit fd={}",
+                                 conn_->fd());
             HttpResponse err = HttpResponse::PayloadTooLarge();
             err.Header("Connection", "close");
             SendResponse(err);
@@ -484,8 +503,10 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
                 cont.Status(100, "Continue");
                 SendResponse(cont);
                 sent_100_continue_ = true;
+                logging::Get()->debug("Sent 100 Continue fd={}", conn_->fd());
             } else {
                 // Unrecognized Expect value — RFC 7231 §5.1.1: 417
+                logging::Get()->debug("Early reject: unsupported Expect fd={}", conn_->fd());
                 HttpResponse err;
                 err.Status(417, "Expectation Failed");
                 err.Header("Connection", "close");
@@ -508,6 +529,7 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
     // WebSocket connections must NOT be blocked here — the peer's Close
     // reply must reach ProcessFrame for a clean close handshake.
     if (conn->IsCloseDeferred() && !upgraded_) {
+        logging::Get()->debug("Skipping data for close-deferred fd={}", conn->fd());
         return;
     }
 
@@ -547,6 +569,7 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             // Request still in progress — check elapsed time
             auto elapsed = std::chrono::steady_clock::now() - request_start_;
             if (elapsed > std::chrono::seconds(request_timeout_sec_)) {
+                logging::Get()->warn("Request timeout fd={}", conn_->fd());
                 HttpResponse timeout_resp = HttpResponse::RequestTimeout();
                 timeout_resp.Header("Connection", "close");
                 SendResponse(timeout_resp);

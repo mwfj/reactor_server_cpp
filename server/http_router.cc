@@ -1,4 +1,6 @@
 #include "http/http_router.h"
+#include "log/logger.h"
+#include "log/log_utils.h"
 
 void HttpRouter::Get(const std::string& path, Handler handler) {
     Route("GET", path, std::move(handler));
@@ -40,6 +42,8 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
                 response.GetHeaders().empty()) {
                 response.Status(403).Text("Forbidden");
             }
+            logging::Get()->debug("Middleware rejected request: {} {}",
+                                  request.method, logging::SanitizePath(request.path));
             return true;
         }
     }
@@ -85,11 +89,15 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
         allowed += ", HEAD";
     }
     if (!allowed.empty()) {
+        logging::Get()->debug("Method not allowed: {} {}",
+                              request.method, logging::SanitizePath(request.path));
         response = HttpResponse::MethodNotAllowed();
         response.Header("Allow", allowed);
         return true;
     }
 
+    logging::Get()->debug("No route found: {} {}",
+                          request.method, logging::SanitizePath(request.path));
     return false;  // No route found -- caller sends 404
 }
 
