@@ -287,16 +287,19 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
 }
 
 void ConfigLoader::Validate(const ServerConfig& config) {
-    // Validate bind_host is a numeric IPv4 address (inet_addr is used
-    // internally — hostnames like "localhost" and IPv6 literals won't bind).
+    // Validate bind_host is a strict dotted-quad IPv4 address.
+    // Use inet_pton (not inet_addr) to reject legacy shorthand forms
+    // like "1" (→ 0.0.0.1) or octal "0127.0.0.1" (→ 87.0.0.1).
     if (config.bind_host.empty()) {
         throw std::invalid_argument("bind_host must not be empty");
     }
-    if (inet_addr(config.bind_host.c_str()) == INADDR_NONE &&
-        config.bind_host != "255.255.255.255") {
-        throw std::invalid_argument(
-            "Invalid bind_host: '" + config.bind_host +
-            "' (must be a numeric IPv4 address, e.g. '0.0.0.0' or '127.0.0.1')");
+    {
+        struct in_addr addr{};
+        if (inet_pton(AF_INET, config.bind_host.c_str(), &addr) != 1) {
+            throw std::invalid_argument(
+                "Invalid bind_host: '" + config.bind_host +
+                "' (must be a dotted-quad IPv4 address, e.g. '0.0.0.0' or '127.0.0.1')");
+        }
     }
 
     if (config.bind_port < 1 || config.bind_port > 65535) {
@@ -362,10 +365,10 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             std::string basename = (last_slash != std::string::npos)
                 ? config.log.file.substr(last_slash + 1)
                 : config.log.file;
-            if (basename.empty()) {
+            if (basename.empty() || basename == "." || basename == "..") {
                 throw std::invalid_argument(
                     "Invalid log.file: '" + config.log.file +
-                    "' (must include a filename, not just a directory path)");
+                    "' (must include a valid filename, not a directory path)");
             }
         }
         if (config.log.max_file_size == 0) {

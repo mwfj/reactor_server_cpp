@@ -236,9 +236,11 @@ static void PruneOldFiles() {
 
 // ── Sink construction ───────────────────────────────────────────────
 
-// Build sinks vector from current config, resolve date-based path, and
-// prune old log files. Caller must hold g_logger_mtx.
-static std::vector<spdlog::sink_ptr> BuildSinksAndPrune(spdlog::level::level_enum level) {
+// Build sinks vector from current config and resolve date-based path.
+// Caller must hold g_logger_mtx. Does NOT prune — caller must prune
+// after the new logger is fully committed (to avoid irreversible side effects
+// before the rebuild is confirmed successful).
+static std::vector<spdlog::sink_ptr> BuildSinks(spdlog::level::level_enum level) {
     std::vector<spdlog::sink_ptr> sinks;
 
     if (g_console_enabled) {
@@ -271,9 +273,6 @@ static std::vector<spdlog::sink_ptr> BuildSinksAndPrune(spdlog::level::level_enu
         g_current_log_date = std::move(new_date);
         file_sink->set_level(level);
         sinks.push_back(file_sink);
-        if (g_max_files > 1) {
-            PruneOldFiles();
-        }
     }
 
     return sinks;
@@ -283,7 +282,7 @@ static std::vector<spdlog::sink_ptr> BuildSinksAndPrune(spdlog::level::level_enu
 static void RebuildLogger() {
     if (g_logger) g_logger->flush();
 
-    auto sinks = BuildSinksAndPrune(g_log_level);
+    auto sinks = BuildSinks(g_log_level);
     auto new_logger = std::make_shared<spdlog::logger>(
         g_logger_name, sinks.begin(), sinks.end());
     new_logger->set_level(g_log_level);
@@ -292,6 +291,12 @@ static void RebuildLogger() {
 
     spdlog::set_default_logger(new_logger);
     g_logger = new_logger;
+
+    // Prune after full commit — file deletion is irreversible, so only
+    // do it after the new logger is successfully constructed and installed.
+    if (g_max_files > 1) {
+        PruneOldFiles();
+    }
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -314,7 +319,7 @@ void Init(const std::string& name,
         }
     }
 
-    // Temporarily install new config for BuildSinksAndPrune (it reads globals)
+    // Temporarily install new config for BuildSinks (it reads globals)
     auto saved_name = g_logger_name;
     auto saved_level = g_log_level;
     auto saved_file = g_log_file;
@@ -338,7 +343,7 @@ void Init(const std::string& name,
     }
 
     try {
-        auto sinks = BuildSinksAndPrune(level);
+        auto sinks = BuildSinks(level);
 
         // Create logger with all sinks
         auto new_logger = std::make_shared<spdlog::logger>(name, sinks.begin(), sinks.end());
@@ -349,6 +354,11 @@ void Init(const std::string& name,
         // All succeeded — commit
         g_logger = new_logger;
         spdlog::set_default_logger(new_logger);
+
+        // Prune after full commit — file deletion is irreversible
+        if (g_max_files > 1) {
+            PruneOldFiles();
+        }
     } catch (...) {
         // Restore previous config so Reopen/CheckRotation use the live config
         g_logger_name = std::move(saved_name);
