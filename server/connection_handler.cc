@@ -2,6 +2,7 @@
 #include "channel.h"
 #include "tls/tls_connection.h"
 #include "log/logger.h"
+#include "log/log_utils.h"
 
 ConnectionHandler::ConnectionHandler(std::shared_ptr<Dispatcher> _dispatcher, std::unique_ptr<SocketHandler> _sock)
     : event_dispatcher_(_dispatcher), sock_(std::move(_sock))
@@ -158,7 +159,7 @@ void ConnectionHandler::OnMessage(){
             }
             // Read error — use CallCloseCb for proper server map cleanup
             int saved_errno = errno;
-            logging::Get()->warn("Read error fd={}: {} (errno={})", fd(), std::strerror(saved_errno), saved_errno);
+            logging::Get()->warn("Read error fd={}: {} (errno={})", fd(), logging::SafeStrerror(saved_errno), saved_errno);
             CallCloseCb();
             return;
         } else {
@@ -309,7 +310,7 @@ void ConnectionHandler::DoSend(const char *data, size_t size){
                 }
             } else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                 int saved_errno = errno;
-                logging::Get()->warn("Write error fd={}: {} (errno={})", fd(), std::strerror(saved_errno), saved_errno);
+                logging::Get()->warn("Write error fd={}: {} (errno={})", fd(), logging::SafeStrerror(saved_errno), saved_errno);
                 CallCloseCb();
                 return;
             }
@@ -650,7 +651,7 @@ void ConnectionHandler::CallWriteCb(){
         if (write_sz < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             // Send failed (EPIPE, ECONNRESET, etc.) — ForceClose bypasses defer
             int saved_errno = errno;
-            logging::Get()->warn("Write callback send error fd={}: {} (errno={})", fd(), std::strerror(saved_errno), saved_errno);
+            logging::Get()->warn("Write callback send error fd={}: {} (errno={})", fd(), logging::SafeStrerror(saved_errno), saved_errno);
             ForceClose();
             return;
         }

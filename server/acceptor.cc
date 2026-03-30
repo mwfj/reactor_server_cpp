@@ -1,6 +1,7 @@
 #include "acceptor.h"
 #include "channel.h"
 #include "log/logger.h"
+#include "log/log_utils.h"
 
 #include <fcntl.h>
 
@@ -108,7 +109,7 @@ void Acceptor::NewConnection(){
             // entries are delayed until memory pressure resolves, which is acceptable
             // since the server cannot handle more connections under memory pressure.
             int saved_errno = errno;
-            logging::Get()->warn("Accept: memory pressure ({}), deferring", std::strerror(saved_errno));
+            logging::Get()->warn("Accept: memory pressure ({}), deferring", logging::SafeStrerror(saved_errno));
             return;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));

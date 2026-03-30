@@ -536,8 +536,11 @@ void EnsureLogDir(const std::string& dir) {
         throw std::runtime_error("Log path exists but is not a directory: " + normalized);
     }
     if (mkdir(normalized.c_str(), 0755) != 0 && errno != EEXIST) {
+        int saved_errno = errno;
+        char errbuf[256];
+        strerror_r(saved_errno, errbuf, sizeof(errbuf));
         throw std::runtime_error("Failed to create log directory '" + normalized + "': " +
-                                  std::strerror(errno));
+                                  std::string(errbuf));
     }
 }
 
