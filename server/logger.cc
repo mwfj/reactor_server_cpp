@@ -291,7 +291,7 @@ static void RebuildLogger() {
     new_logger->flush_on(spdlog::level::info);
 
     spdlog::set_default_logger(new_logger);
-    std::atomic_store(&g_logger, new_logger);
+    g_logger = new_logger;
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -347,7 +347,7 @@ void Init(const std::string& name,
         new_logger->flush_on(spdlog::level::info);
 
         // All succeeded — commit
-        std::atomic_store(&g_logger, new_logger);
+        g_logger = new_logger;
         spdlog::set_default_logger(new_logger);
     } catch (...) {
         // Restore previous config so Reopen/CheckRotation use the live config
@@ -364,15 +364,10 @@ void Init(const std::string& name,
 }
 
 std::shared_ptr<spdlog::logger> Get() {
-    // Fast path: read g_logger without the mutex. std::atomic_load on
-    // shared_ptr is lock-free on most implementations and avoids mutex
-    // contention on hot paths (debug-level log calls that get filtered).
-    auto logger = std::atomic_load(&g_logger);
-    if (logger) return logger;
-
-    // Slow path: logger not yet initialized or after Shutdown().
     std::lock_guard<std::mutex> lock(g_logger_mtx);
-    if (g_logger) return g_logger;  // re-check under lock
+    if (g_logger) {
+        return g_logger;
+    }
     auto fallback = spdlog::default_logger();
     if (fallback) return fallback;
     // After Shutdown(), spdlog's default logger is null. Create a minimal
@@ -385,12 +380,11 @@ std::shared_ptr<spdlog::logger> Get() {
 
 void Shutdown() {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
-    auto logger = std::atomic_load(&g_logger);
-    if (logger) {
-        logger->flush();
+    if (g_logger) {
+        g_logger->flush();
     }
     spdlog::shutdown();
-    std::atomic_store(&g_logger, std::shared_ptr<spdlog::logger>{});
+    g_logger.reset();
 
     // Reset all config to defaults so Reopen()/Init() after Shutdown()
     // starts from a clean slate.
@@ -437,7 +431,11 @@ bool Reopen() {
 }
 
 void CheckRotation() {
-    std::lock_guard<std::mutex> lock(g_logger_mtx);
+    // Use try_lock to avoid contention when multiple dispatchers call this
+    // concurrently on their timer ticks. If another thread is already
+    // checking, skip — it will handle rotation if needed.
+    std::unique_lock<std::mutex> lock(g_logger_mtx, std::try_to_lock);
+    if (!lock.owns_lock()) return;
     if (!g_logger || g_log_file.empty() || g_current_file_path.empty()) return;
 
     // Non-rotating mode (max_files <= 1): external logrotate handles rotation

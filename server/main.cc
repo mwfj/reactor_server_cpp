@@ -262,14 +262,14 @@ static int HandleStart(const CliOptions& options) {
         logging::Get()->info("  Health:  /health");
     }
 
-    // ── Wire daemon readiness to fire after init, before event loop ──
+    // ── Wire readiness callback — fires after bind/listen, before event loop ──
+    server->SetReadyCallback([&options]() {
+        logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
+        logging::WriteMarker("SERVER START");
 #if !defined(_WIN32)
-    if (options.daemonize) {
-        server->SetReadyCallback([]() {
-            Daemonizer::NotifyReady();
-        });
-    }
+        if (options.daemonize) Daemonizer::NotifyReady();
 #endif
+    });
 
     // ── Server thread ───────────────────────────────────────
     std::exception_ptr server_error;
@@ -296,8 +296,6 @@ static int HandleStart(const CliOptions& options) {
     });
 
     // ── Signal loop ─────────────────────────────────────────
-    logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
-    logging::WriteMarker("SERVER START");
     while (true) {
         SignalResult sig = SignalHandler::WaitForSignal();
         if (sig == SignalResult::SHUTDOWN) break;

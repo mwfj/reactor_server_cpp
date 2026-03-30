@@ -340,8 +340,8 @@ void Dispatcher::TimerHandler(){
 #endif
     TimeStamp::ResetTimerFd(timer_fd_, end_t_);
 
-    // Periodic log rotation check. Steady-state cost: mutex lock, date
-    // string compare, stat (no flush). Serialized by g_logger_mtx.
+    // Periodic log rotation check. Uses try_lock — skips if another
+    // dispatcher is already checking. No contention in steady state.
     logging::CheckRotation();
 
     if(is_sock_dispatcher()){
