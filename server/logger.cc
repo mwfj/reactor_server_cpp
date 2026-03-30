@@ -233,20 +233,27 @@ static std::vector<spdlog::sink_ptr> BuildSinksAndPrune(spdlog::level::level_enu
     }
 
     if (!g_log_file.empty()) {
+        // Resolve the target path into locals first. Only commit to globals
+        // after the file sink is successfully opened — prevents stale state
+        // if the open throws (permissions, disk full, etc.).
+        std::string new_path;
+        std::string new_date;
         if (g_max_files <= 1) {
             // Non-rotating mode: use the original path as-is, compatible with
-            // external logrotate. logrotate renames the file, SIGHUP triggers
-            // Reopen() which creates a fresh sink at the original path.
-            g_current_file_path = g_log_file;
-            g_current_log_date.clear();
+            // external logrotate.
+            new_path = g_log_file;
         } else {
             // Date-based rotation mode: resolve today's date-based path
-            g_current_log_date = TodayDateString();
-            g_current_file_path = ResolveLogPath(g_log_dir, g_log_prefix,
-                                                  g_log_extension, g_max_size);
+            new_date = TodayDateString();
+            new_path = ResolveLogPath(g_log_dir, g_log_prefix,
+                                      g_log_extension, g_max_size);
         }
+        // This can throw (e.g., permission denied) — globals are still intact.
         auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
-            g_current_file_path, /*truncate=*/false);
+            new_path, /*truncate=*/false);
+        // Sink opened successfully — now commit to globals.
+        g_current_file_path = std::move(new_path);
+        g_current_log_date = std::move(new_date);
         file_sink->set_level(level);
         sinks.push_back(file_sink);
         if (g_max_files > 1) {
