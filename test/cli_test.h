@@ -1955,25 +1955,32 @@ void TestCheckRotation() {
 
         bool two_files = (log_files.size() >= 2);
 
-        // The post-rotation message must appear in one of the files
-        bool post_in_some_file = false;
-        bool pre_in_some_file  = false;
+        // Verify pre-rotation messages are in the FIRST file (the original)
+        // and post-rotation message is in a DIFFERENT file (the rotated one).
+        std::string first_content = ReadFileContent(first_file);
+        bool pre_in_first = first_content.find("Rotation pre-message") != std::string::npos;
+        bool post_not_in_first = first_content.find("Rotation post-message") == std::string::npos;
+
+        // Find the post-rotation message in a different file
+        bool post_in_other = false;
         for (const auto& fpath : log_files) {
+            if (fpath == first_file) continue;
             std::string content = ReadFileContent(fpath);
-            if (content.find("Rotation post-message") != std::string::npos)
-                post_in_some_file = true;
-            if (content.find("Rotation pre-message") != std::string::npos)
-                pre_in_some_file = true;
+            if (content.find("Rotation post-message") != std::string::npos) {
+                post_in_other = true;
+                break;
+            }
         }
 
         CleanupLogFiles("/tmp", prefix);
 
-        bool pass = two_files && pre_in_some_file && post_in_some_file;
+        bool pass = two_files && pre_in_first && post_not_in_first && post_in_other;
         std::string err;
         if (!two_files)          err += "Expected >=2 rotated files, got " +
                                          std::to_string(log_files.size()) + "; ";
-        if (!pre_in_some_file)   err += "Pre-rotation message not found in any file; ";
-        if (!post_in_some_file)  err += "Post-rotation message not found in any file; ";
+        if (!pre_in_first)       err += "Pre-rotation message not in first file; ";
+        if (!post_not_in_first)  err += "Post-rotation message still in first file (not rotated); ";
+        if (!post_in_other)      err += "Post-rotation message not found in rotated file; ";
 
         TestFramework::RecordTest("Logger: CheckRotation rotates to next seq file",
                                   pass, err, CLI_CATEGORY);

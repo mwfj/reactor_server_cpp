@@ -111,9 +111,13 @@ HttpServer::HttpServer(const ServerConfig& config)
                       // the timer scan to enforce them. Use 5s to match the
                       // shortest protocol deadline.
                       if (idle_interval == 0 && req_interval == 0) return 5;
-                      if (idle_interval == 0) return req_interval;
-                      if (req_interval == 0) return idle_interval;
-                      return std::min(idle_interval, req_interval);
+                      int interval = 0;
+                      if (idle_interval == 0) interval = req_interval;
+                      else if (req_interval == 0) interval = idle_interval;
+                      else interval = std::min(idle_interval, req_interval);
+                      // Cap at 30s to ensure log rotation checks run at a
+                      // reasonable frequency regardless of timeout configuration.
+                      return std::min(interval, 30);
                   }(),
                   // Pass idle_timeout_sec directly — 0 means disabled.
                   // ConnectionHandler::IsTimeOut handles duration==0 by skipping idle check.

@@ -324,6 +324,11 @@ void Init(const std::string& name,
           int max_files) {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
 
+    // Guard against invalid max_size — 0 would cause rotation on every check
+    if (!log_file.empty() && max_size == 0) {
+        throw std::invalid_argument("max_size must be > 0 when log_file is set");
+    }
+
     // Work with new config in locals first. Only commit to globals after
     // all failable operations (EnsureLogDir, sink creation) succeed.
     // This prevents a failed re-init from corrupting the live config.
