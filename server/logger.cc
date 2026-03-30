@@ -147,6 +147,21 @@ bool Reopen() {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
     if (!g_logger) return true;  // no logger → no-op is success
 
+    // No-op if no file sink is configured AND the current logger has no file
+    // sink to remove. This prevents rebuilding into an empty sink list when
+    // console logging is also disabled (daemon mode).
+    if (g_log_file.empty()) {
+        bool has_file_sink = false;
+        for (const auto& sink : g_logger->sinks()) {
+            if (dynamic_cast<spdlog::sinks::basic_file_sink_mt*>(sink.get()) ||
+                dynamic_cast<spdlog::sinks::rotating_file_sink_mt*>(sink.get())) {
+                has_file_sink = true;
+                break;
+            }
+        }
+        if (!has_file_sink) return true;  // no file sink to reopen or remove
+    }
+
     try {
         g_logger->flush();
 

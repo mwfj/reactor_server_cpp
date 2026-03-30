@@ -438,6 +438,9 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetUpgradeCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
                const HttpRequest& request) {
+            // Count the WS upgrade handshake as a request — upgrade requests
+            // bypass the normal request_callback path where counters live.
+            total_requests_.fetch_add(1, std::memory_order_relaxed);
             auto ws_handler = router_.GetWebSocketHandler(request.path);
             if (ws_handler && self->GetWebSocket()) {
                 ws_handler(*self->GetWebSocket());
@@ -967,9 +970,10 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         validation_copy.bind_port = 8080;          // always valid
         validation_copy.worker_threads = 1;        // always valid
         validation_copy.tls.enabled = false;       // skip TLS path checks
-        // Force http2.enabled = true so H2 sub-settings are always validated.
-        // Reload() copies them to h2_settings_ regardless of the enabled flag.
-        validation_copy.http2.enabled = true;
+        // Validate H2 sub-settings only when the running server has H2 enabled.
+        // When H2 is disabled, Reload() still copies them to h2_settings_ but
+        // they're never used, so placeholder/out-of-range values are harmless.
+        validation_copy.http2.enabled = http2_enabled_;
         try {
             ConfigLoader::Validate(validation_copy);
         } catch (const std::invalid_argument& e) {
