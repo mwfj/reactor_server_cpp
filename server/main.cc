@@ -210,9 +210,12 @@ static bool ReloadConfig(const std::string& config_path,
             new_config = ConfigLoader::LoadFromFile(config_path);
         } else if (!config_loaded_from_file && !options.config_path_explicit
                    && errno == ENOENT) {
-            new_config = current_config;
+            // Start from defaults, not current_config — env vars may have been
+            // added/removed since startup. Re-applying env + CLI on top of
+            // defaults matches the original startup sequence.
+            new_config = ConfigLoader::Default();
             logging::Get()->info("No config file (startup used defaults), "
-                                 "reloading from env/CLI overrides");
+                                 "reloading from defaults + env/CLI overrides");
         } else {
             logging::Get()->error("Config reload failed: {}: {}",
                                   config_path, std::strerror(errno));

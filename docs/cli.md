@@ -173,6 +173,8 @@ You can also send SIGHUP directly:
 kill -HUP $(cat /tmp/reactor_server.pid)
 ```
 
+**Note:** If a foreground server was started under `nohup`, SIGHUP is inherited as `SIG_IGN` and the `reload` command will be silently ignored. Use daemon mode (`-d`) for reliable SIGHUP-based reload.
+
 ## Signal Handling
 
 | Signal | Behavior |

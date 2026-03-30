@@ -802,13 +802,17 @@ bool HttpServer::DetectAndRouteProtocol(
     }
 
     if (proto == ProtocolDetector::Protocol::HTTP2) {
-        // Skip if connection is fully closing (not just peer half-close)
+        // Check BEFORE incrementing counters — if already closing, returning
+        // early after incrementing would leak the counter (no map entry for
+        // RemoveConnection to find and decrement).
         if (conn->IsClosing()) return true;
         Http2Session::Settings settings_snapshot;
         std::shared_ptr<Http2ConnectionHandler> h2_conn;
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
-            // Counters inside lock — symmetric with RemoveConnection's decrement
+            // Re-check under lock — close could have raced between check above
+            // and lock acquisition. If closing now, skip without incrementing.
+            if (conn->IsClosing()) return true;
             if (!already_counted) {
                 total_accepted_.fetch_add(1, std::memory_order_relaxed);
                 active_connections_.fetch_add(1, std::memory_order_relaxed);
@@ -827,11 +831,12 @@ bool HttpServer::DetectAndRouteProtocol(
     }
 
     // HTTP/1.x — create handler (existing path)
+    if (conn->IsClosing()) return true;
     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
     SetupHandlers(http_conn);
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        // Counters inside lock — symmetric with RemoveConnection's decrement
+        if (conn->IsClosing()) return true;  // re-check under lock
         if (!already_counted) {
             total_accepted_.fetch_add(1, std::memory_order_relaxed);
             active_connections_.fetch_add(1, std::memory_order_relaxed);
