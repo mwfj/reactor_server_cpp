@@ -93,6 +93,7 @@ public:
     // (inside ReceiveData). Callers MUST NOT submit nghttp2 frames from
     // within this callback — doing so is reentrant into nghttp2 and unsafe.
     void SetStreamOpenCallback(HTTP2_CALLBACKS_NAMESPACE::Http2StreamOpenCallback cb);
+    void SetRequestCountCallback(HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback cb);
 
     // --- Flood protection ---
 

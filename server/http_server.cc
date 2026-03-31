@@ -294,6 +294,11 @@ void HttpServer::SetReadyCallback(std::function<void()> cb) {
 void HttpServer::Stop() {
     logging::Get()->info("HttpServer stopping");
 
+    // Stop accepting FIRST — prevents new connections from being accepted
+    // between the WS snapshot and the H2 drain snapshot. Without this, a WS
+    // accepted in the gap would miss the 1001 "Going Away" close frame.
+    net_server_.StopAccepting();
+
     // Collect WS connections while holding the lock, then send close frames
     // AFTER releasing. Sending under the lock would deadlock: a failed inline
     // write in DoSendRaw → CallCloseCb → HandleCloseConnection → conn_mtx_.
@@ -314,19 +319,11 @@ void HttpServer::Stop() {
         if (ws && ws->IsOpen()) {
             try {
                 ws->SendClose(1001, "Going Away");
-                // During shutdown, close transport after the close frame drains.
-                // SendClose() normally avoids CloseAfterWrite to wait 5s for the
-                // peer's reply, but during shutdown that wait is unnecessary —
-                // the 1001 code in the frame tells the client why we're closing.
                 if (conn) conn->CloseAfterWrite();
             }
             catch (...) {}
         }
     }
-
-    // Stop accepting new connections before building the H2 drain snapshot.
-    // Prevents new connections from bypassing the graceful shutdown path.
-    net_server_.StopAccepting();
 
     // Graceful HTTP/2 shutdown: request GOAWAY + drain on the dispatcher thread.
     // Collect H2 connections under conn_mtx_ first, then release before
@@ -586,6 +583,8 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
             active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
             CompensateH2Streams(stale_h2);
+            // Notify drain set so WaitForH2Drain doesn't block on this dead entry
+            OnH2DrainComplete(stale_h2->GetConnection().get());
         }
         if (stale_h1) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
@@ -692,6 +691,7 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         active_connections_.fetch_sub(1, std::memory_order_relaxed);
         active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
         CompensateH2Streams(evicted_stale_h2);
+        OnH2DrainComplete(evicted_stale_h2->GetConnection().get());
     }
 
     if (h2_conn) {
@@ -889,15 +889,18 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
 
     // Set request callback: dispatch through HttpRouter (same as HTTP/1.x).
     // total_requests_ is counted in stream_open_callback (below), which fires
-    // Count H2 requests at dispatch time (DispatchStreamRequest), not stream
-    // creation. This matches HTTP/1's request_count_callback which fires after
-    // a completed parse — malformed/reset streams don't inflate the count.
+    // Count every dispatched H2 request — including those rejected by
+    // content-length checks in DispatchStreamRequest. Matches HTTP/1's
+    // request_count_callback which fires at HandleCompleteRequest entry.
+    h2_conn->SetRequestCountCallback([this]() {
+        total_requests_.fetch_add(1, std::memory_order_relaxed);
+    });
+
     h2_conn->SetRequestCallback(
         [this](std::shared_ptr<Http2ConnectionHandler> /*self*/,
                int32_t /*stream_id*/,
                const HttpRequest& request,
                HttpResponse& response) {
-            total_requests_.fetch_add(1, std::memory_order_relaxed);
             active_requests_.fetch_add(1, std::memory_order_relaxed);
             RequestGuard guard{active_requests_};
 

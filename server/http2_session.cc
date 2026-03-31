@@ -760,6 +760,13 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
 }
 
 void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id) {
+    // Count every dispatched request — including those rejected below by
+    // content-length checks. Matches HTTP/1's request_count_callback which
+    // fires at HandleCompleteRequest entry before any rejection.
+    if (callbacks_.request_count_callback) {
+        callbacks_.request_count_callback();
+    }
+
     // Request is complete — no longer incomplete for timeout purposes.
     OnStreamNoLongerIncomplete();
     stream->MarkCounterDecremented();
@@ -917,6 +924,11 @@ void Http2Session::SetStreamCloseCallback(
 void Http2Session::SetStreamOpenCallback(
     HTTP2_CALLBACKS_NAMESPACE::Http2StreamOpenCallback cb) {
     callbacks_.stream_open_callback = std::move(cb);
+}
+
+void Http2Session::SetRequestCountCallback(
+    HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback cb) {
+    callbacks_.request_count_callback = std::move(cb);
 }
 
 // --- Flood protection ---

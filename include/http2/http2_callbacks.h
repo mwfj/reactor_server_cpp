@@ -33,10 +33,16 @@ namespace HTTP2_CALLBACKS_NAMESPACE {
         int32_t stream_id
     )>;
 
+    // Fires at DispatchStreamRequest entry — before content-length rejection
+    // but after a complete request parse. Used to count all dispatched requests
+    // including those rejected by the session (consistent with HTTP/1).
+    using Http2RequestCountCallback = std::function<void()>;
+
     struct Http2SessionCallbacks {
-        Http2RequestCallback     request_callback     = nullptr;
-        Http2StreamCloseCallback stream_close_callback = nullptr;
-        Http2StreamOpenCallback  stream_open_callback  = nullptr;
+        Http2RequestCallback      request_callback       = nullptr;
+        Http2StreamCloseCallback  stream_close_callback  = nullptr;
+        Http2StreamOpenCallback   stream_open_callback   = nullptr;
+        Http2RequestCountCallback request_count_callback = nullptr;
     };
 
 } // namespace HTTP2_CALLBACKS_NAMESPACE

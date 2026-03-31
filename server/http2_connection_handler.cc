@@ -31,6 +31,14 @@ void Http2ConnectionHandler::SetStreamOpenCallback(StreamOpenCallback callback) 
     }
 }
 
+void Http2ConnectionHandler::SetRequestCountCallback(
+    HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback callback) {
+    pending_request_count_cb_ = callback;
+    if (session_) {
+        session_->SetRequestCountCallback(std::move(callback));
+    }
+}
+
 void Http2ConnectionHandler::SetMaxBodySize(size_t max) {
     max_body_size_ = max;
     if (session_) {
@@ -66,6 +74,10 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
     if (pending_stream_open_cb_) {
         session_->SetStreamOpenCallback(std::move(pending_stream_open_cb_));
         pending_stream_open_cb_ = nullptr;
+    }
+    if (pending_request_count_cb_) {
+        session_->SetRequestCountCallback(std::move(pending_request_count_cb_));
+        pending_request_count_cb_ = nullptr;
     }
 
     // Apply body size limit. Header list size comes from h2_settings_

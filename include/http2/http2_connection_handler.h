@@ -20,6 +20,7 @@ public:
     void SetRequestCallback(RequestCallback callback);
     void SetStreamCloseCallback(StreamCloseCallback callback);
     void SetStreamOpenCallback(StreamOpenCallback callback);
+    void SetRequestCountCallback(HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback callback);
 
     // Set request limits (applied per-stream)
     void SetMaxBodySize(size_t max);
@@ -113,4 +114,5 @@ private:
     RequestCallback pending_request_cb_;
     StreamCloseCallback pending_stream_close_cb_;
     StreamOpenCallback pending_stream_open_cb_;
+    HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback pending_request_count_cb_;
 };
