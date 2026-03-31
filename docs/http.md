@@ -86,16 +86,16 @@ server.Get("/users/:user_id/posts/:post_id", [](const HttpRequest& req, HttpResp
 });
 ```
 
-#### Regex constraints (`:name{regex}`)
+#### Regex constraints (`:name(regex)`)
 
-Restrict a parameter to values matching a regex pattern. Non-matching values fall through to other routes or 404.
+Restrict a parameter to values matching a regex pattern. The regex is placed in parentheses after the parameter name. Non-matching values fall through to other routes or 404.
 
 ```cpp
 // Only match numeric IDs
-server.Get("/users/:id{[0-9]+}", handler);
+server.Get("/users/:id([0-9]+)", handler);
 
 // Only match UUIDs
-server.Get("/items/:uuid{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}}", handler);
+server.Get("/items/:uuid([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", handler);
 ```
 
 #### Catch-all wildcards (`*name`)
@@ -125,7 +125,7 @@ This means `/users/admin` (static) takes precedence over `/users/:id` (param) wh
 The router rejects conflicting routes at registration time (throws `std::invalid_argument`):
 
 - Duplicate exact routes: `Get("/users", h1)` then `Get("/users", h2)`
-- Conflicting parameter constraints at the same position: `/:id{[0-9]+}` vs `/:id{[a-z]+}`
+- Conflicting parameter constraints at the same position: `/:id([0-9]+)` vs `/:id([a-z]+)`
 - Duplicate catch-all routes at the same level
 
 ## Middleware

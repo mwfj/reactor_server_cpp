@@ -18,6 +18,7 @@
 #include <memory>
 #include <functional>
 #include <map>
+#include <unordered_map>
 #include <atomic>
 
 // Support cross-platform (current support Linux & macOS)

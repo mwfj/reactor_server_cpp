@@ -3,7 +3,7 @@
 #include "common.h"
 // <string>, <vector>, <memory>, <functional>, <algorithm>, <stdexcept> from common.h
 
-#include <unordered_map>
+// <unordered_map> provided by common.h
 // <regex> is NOT included here — it is one of the heaviest standard headers
 // and would propagate compile cost to all HTTP translation units. Instead,
 // RegexConstraint is an opaque type whose definition lives in route_trie.cc.
@@ -97,6 +97,16 @@ public:
             if (root_->is_leaf) {
                 result.handler = &root_->handler;
                 result.matched_pattern = root_->pattern;
+                return result;
+            }
+            // Root is not a leaf — check for catch-all child (e.g., /*rest)
+            // that should match "/" with an empty captured tail.
+            const HandlerType* found_handler = nullptr;
+            std::string matched;
+            if (SearchChildren(root_.get(), "", 0, params,
+                               found_handler, matched, true)) {
+                result.handler = found_handler;
+                result.matched_pattern = std::move(matched);
             }
             return result;
         }
@@ -115,10 +125,17 @@ public:
     }
 
     // Check if any route matches this path (for HasWebSocketRoute / 405 detection).
+    // Lightweight: no param extraction, no map allocation.
     bool HasMatch(const std::string& path) const {
-        std::unordered_map<std::string, std::string> params;
-        auto result = Search(path, params);
-        return result.handler != nullptr;
+        if (!root_) return false;
+        if (path.empty() || path[0] != '/') return false;
+
+        if (path.size() == 1) {
+            if (root_->is_leaf) return true;
+            return HasMatchChildren(root_.get(), "", 0, true);
+        }
+
+        return HasMatchChildren(root_.get(), path.data() + 1, path.size() - 1, true);
     }
 
     bool Empty() const { return !root_; }
@@ -138,6 +155,9 @@ private:
 
     std::unique_ptr<Node> root_;
 
+    // Maximum segment length for regex constraint evaluation (ReDoS defense).
+    static constexpr size_t MAX_CONSTRAINT_SEGMENT_LEN = 256;
+
     // Sort children by type priority: STATIC first, then PARAM, then CATCH_ALL.
     // Within STATIC children, sort by first character of prefix for fast lookup.
     static void SortChildren(Node* node) {
@@ -146,9 +166,15 @@ private:
                 if (a->type != b->type) {
                     return static_cast<uint8_t>(a->type) < static_cast<uint8_t>(b->type);
                 }
-                if (a->type == route_trie::NodeType::STATIC &&
-                    !a->prefix.empty() && !b->prefix.empty()) {
-                    return a->prefix[0] < b->prefix[0];
+                // Within STATIC nodes: empty prefix (trailing-slash sentinel)
+                // sorts before non-empty prefixes, then by first character.
+                if (a->type == route_trie::NodeType::STATIC) {
+                    if (a->prefix.empty() != b->prefix.empty()) {
+                        return a->prefix.empty();
+                    }
+                    if (!a->prefix.empty()) {
+                        return a->prefix[0] < b->prefix[0];
+                    }
                 }
                 return false;
             });
@@ -191,9 +217,13 @@ private:
     }
 
     // Recursive insertion of parsed segments into the trie.
+    // static_remaining: non-empty when descending into a child whose prefix
+    // matched only part of the current STATIC segment's value. Avoids copying
+    // the entire segments vector just to modify one element.
     void InsertSegments(Node* node, const std::vector<route_trie::Segment>& segments,
                         size_t seg_idx, HandlerType handler,
-                        const std::string& full_pattern) {
+                        const std::string& full_pattern,
+                        const std::string& static_remaining = "") {
         if (seg_idx == segments.size()) {
             if (node->is_leaf) {
                 throw std::invalid_argument(
@@ -207,16 +237,21 @@ private:
         }
 
         const auto& seg = segments[seg_idx];
+        // Effective value for STATIC segments: use static_remaining if provided,
+        // otherwise use the segment's value directly.
+        const std::string& seg_value =
+            (!static_remaining.empty() && seg.type == route_trie::NodeType::STATIC)
+            ? static_remaining : seg.value;
 
         if (seg.type == route_trie::NodeType::STATIC) {
             // Try to find a child with a matching prefix
             for (auto& child_ptr : node->children) {
                 if (child_ptr->type != route_trie::NodeType::STATIC) continue;
 
-                size_t common = CommonPrefixLen(child_ptr->prefix, seg.value);
+                size_t common = CommonPrefixLen(child_ptr->prefix, seg_value);
                 if (common == 0) continue;
 
-                if (common == child_ptr->prefix.size() && common == seg.value.size()) {
+                if (common == child_ptr->prefix.size() && common == seg_value.size()) {
                     // Exact match — continue with next segment
                     InsertSegments(child_ptr.get(), segments, seg_idx + 1,
                                    std::move(handler), full_pattern);
@@ -225,16 +260,13 @@ private:
 
                 if (common == child_ptr->prefix.size()) {
                     // Child prefix is a prefix of segment — descend with remaining text
-                    std::string remaining = seg.value.substr(common);
-                    // Create a temporary modified segments list with the remaining text
-                    std::vector<route_trie::Segment> new_segs = segments;
-                    new_segs[seg_idx].value = remaining;
-                    InsertSegments(child_ptr.get(), new_segs, seg_idx,
-                                   std::move(handler), full_pattern);
+                    InsertSegments(child_ptr.get(), segments, seg_idx,
+                                   std::move(handler), full_pattern,
+                                   seg_value.substr(common));
                     return;
                 }
 
-                if (common == seg.value.size()) {
+                if (common == seg_value.size()) {
                     // Segment is a prefix of child — split child
                     SplitNode(child_ptr.get(), common);
                     InsertSegments(child_ptr.get(), segments, seg_idx + 1,
@@ -245,7 +277,7 @@ private:
                 // Partial overlap — split child, create sibling
                 SplitNode(child_ptr.get(), common);
                 auto new_child = std::make_unique<Node>();
-                new_child->prefix = seg.value.substr(common);
+                new_child->prefix = seg_value.substr(common);
                 new_child->type = route_trie::NodeType::STATIC;
                 Node* new_child_ptr = new_child.get();
                 child_ptr->children.push_back(std::move(new_child));
@@ -257,7 +289,7 @@ private:
 
             // No matching child — create a new one
             auto new_child = std::make_unique<Node>();
-            new_child->prefix = seg.value;
+            new_child->prefix = seg_value;
             new_child->type = route_trie::NodeType::STATIC;
             Node* new_child_ptr = new_child.get();
             node->children.push_back(std::move(new_child));
@@ -339,14 +371,17 @@ private:
     // Recursive search through children of a node.
     // at_segment_start: true when we're at a '/' boundary (param/catch-all eligible),
     //                   false when we're mid-segment after a static node split.
+    // Stack depth is bounded by route depth (number of '/' segments + split nodes),
+    // which is controlled by the developer at registration time, not by clients.
     bool SearchChildren(const Node* node, const char* path, size_t path_len,
                         std::unordered_map<std::string, std::string>& params,
                         const HandlerType*& out_handler,
                         std::string& matched_pattern,
                         bool at_segment_start) const {
-        // Try STATIC children first (highest priority)
+        // Try STATIC children first (highest priority).
+        // Children are sorted: STATIC first, then PARAM, then CATCH_ALL.
         for (const auto& child : node->children) {
-            if (child->type != route_trie::NodeType::STATIC) continue;
+            if (child->type != route_trie::NodeType::STATIC) break;
 
             if (child->prefix.empty()) {
                 // Empty-string sentinel (trailing-slash node)
@@ -370,11 +405,9 @@ private:
                     matched_pattern = child->pattern;
                     return true;
                 }
-                // Check for trailing-slash sentinel child
-                if (SearchChildren(child.get(), path + consumed, 0,
-                                   params, out_handler, matched_pattern, true)) {
-                    return true;
-                }
+                // Do NOT recurse into children here — that would allow
+                // "/users" to match the trailing-slash sentinel for "/users/",
+                // breaking the documented distinction between the two paths.
             } else if (path[consumed] == '/') {
                 // Segment boundary — consume '/' and recurse
                 if (SearchChildren(child.get(), path + consumed + 1,
@@ -416,9 +449,8 @@ private:
             // already bounds total path length, but a single segment could
             // still consume excessive CPU with a pathological pattern.
             // 256 bytes is a generous upper bound for any legitimate segment.
-            static constexpr size_t kMaxConstraintSegmentLen = 256;
             if (child->constraint) {
-                if (seg_end > kMaxConstraintSegmentLen) {
+                if (seg_end > MAX_CONSTRAINT_SEGMENT_LEN) {
                     // Segment too long to safely evaluate the regex — non-match.
                     continue;
                 }
@@ -470,6 +502,68 @@ private:
             }
             out_handler = &child->handler;
             matched_pattern = child->pattern;
+            return true;
+        }
+
+        return false;
+    }
+
+    // Lightweight match check — no param extraction, no map allocation.
+    // Used by HasMatch() for 405 detection where only a bool is needed.
+    bool HasMatchChildren(const Node* node, const char* path, size_t path_len,
+                          bool at_segment_start) const {
+        for (const auto& child : node->children) {
+            if (child->type != route_trie::NodeType::STATIC) break;
+
+            if (child->prefix.empty()) {
+                if (path_len == 0 && child->is_leaf) return true;
+                continue;
+            }
+
+            if (path_len < child->prefix.size()) continue;
+            if (std::memcmp(path, child->prefix.data(), child->prefix.size()) != 0) continue;
+
+            size_t consumed = child->prefix.size();
+            if (consumed == path_len) {
+                if (child->is_leaf) return true;
+            } else if (path[consumed] == '/') {
+                if (HasMatchChildren(child.get(), path + consumed + 1,
+                                     path_len - consumed - 1, true))
+                    return true;
+            } else {
+                if (HasMatchChildren(child.get(), path + consumed,
+                                     path_len - consumed, false))
+                    return true;
+            }
+        }
+
+        if (!at_segment_start) return false;
+
+        for (const auto& child : node->children) {
+            if (child->type != route_trie::NodeType::PARAM) continue;
+
+            size_t seg_end = 0;
+            while (seg_end < path_len && path[seg_end] != '/') seg_end++;
+            if (seg_end == 0) continue;
+
+            if (child->constraint) {
+                if (seg_end > MAX_CONSTRAINT_SEGMENT_LEN) continue;
+                std::string segment(path, seg_end);
+                if (!route_trie::MatchRegex(child->constraint.get(), segment))
+                    continue;
+            }
+
+            if (seg_end == path_len) {
+                if (child->is_leaf) return true;
+            } else {
+                if (HasMatchChildren(child.get(), path + seg_end + 1,
+                                     path_len - seg_end - 1, true))
+                    return true;
+            }
+        }
+
+        for (const auto& child : node->children) {
+            if (child->type != route_trie::NodeType::CATCH_ALL) continue;
             return true;
         }
 

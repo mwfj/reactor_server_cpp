@@ -1,8 +1,7 @@
 #pragma once
 
 #include "common.h"
-
-#include <unordered_map>
+// <unordered_map> provided by common.h
 
 struct HttpRequest {
     std::string method;           // "GET", "POST", "PUT", "DELETE", etc.

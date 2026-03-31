@@ -45,6 +45,10 @@ static std::string ExtractConstraint(const std::string& pattern, size_t& pos) {
     int depth = 1;
     size_t start = pos;
     while (pos < pattern.size() && depth > 0) {
+        if (pattern[pos] == '\\' && pos + 1 < pattern.size()) {
+            pos += 2;  // skip escaped character (e.g., \( or \))
+            continue;
+        }
         if (pattern[pos] == '(') depth++;
         else if (pattern[pos] == ')') depth--;
         if (depth > 0) pos++;
