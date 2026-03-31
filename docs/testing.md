@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all tests (133 tests across 11 suites)
+make test               # Build and run all tests (145 tests across 11 suites)
 ./run                   # Run all tests directly (after building)
 
 # Individual test suites
