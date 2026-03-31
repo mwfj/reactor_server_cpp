@@ -543,6 +543,9 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         bool new_conn_tracked = false;
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
+            // Recheck under lock — peer may have disconnected between the
+            // pre-lock check and lock acquisition.
+            if (conn->IsClosing()) return;
             auto h2_it = h2_connections_.find(conn->fd());
             if (h2_it != h2_connections_.end()) {
                 if (h2_it->second->GetConnection() == conn) {

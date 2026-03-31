@@ -248,7 +248,13 @@ static void PruneOldFiles() {
 // Caller must hold g_logger_mtx. Does NOT prune — caller must prune
 // after the new logger is fully committed (to avoid irreversible side effects
 // before the rebuild is confirmed successful).
+// Staging area for BuildSinks — committed by RebuildLogger after success.
+static std::string sinks_new_path;
+static std::string sinks_new_date;
+
 static std::vector<spdlog::sink_ptr> BuildSinks(spdlog::level::level_enum level) {
+    sinks_new_path.clear();
+    sinks_new_date.clear();
     std::vector<spdlog::sink_ptr> sinks;
 
     if (g_console_enabled) {
@@ -277,11 +283,14 @@ static std::vector<spdlog::sink_ptr> BuildSinks(spdlog::level::level_enum level)
         // This can throw (e.g., permission denied) — globals are still intact.
         auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
             new_path, /*truncate=*/false);
-        // Sink opened successfully — now commit to globals.
-        g_current_file_path = std::move(new_path);
-        g_current_log_date = std::move(new_date);
         file_sink->set_level(level);
         sinks.push_back(file_sink);
+        // Store resolved path/date for commit AFTER the full logger rebuild
+        // succeeds. Don't commit here — if RebuildLogger fails after
+        // BuildSinks returns, these would describe a file the live logger
+        // never adopted.
+        sinks_new_path = std::move(new_path);
+        sinks_new_date = std::move(new_date);
     }
 
     return sinks;
@@ -303,6 +312,16 @@ static void RebuildLogger() {
 
     spdlog::set_default_logger(new_logger);
     g_logger = new_logger;
+
+    // Commit file path/date only after the logger is fully installed.
+    // BuildSinks staged these — if we threw before this point, they're
+    // not committed and rotation/reopen state stays consistent.
+    if (!sinks_new_path.empty()) {
+        g_current_file_path = std::move(sinks_new_path);
+    }
+    if (!sinks_new_date.empty()) {
+        g_current_log_date = std::move(sinks_new_date);
+    }
 
     // Prune after full commit — file deletion is irreversible, so only
     // do it after the new logger is successfully constructed and installed.
@@ -374,6 +393,14 @@ void Init(const std::string& name,
         // All succeeded — commit
         g_logger = new_logger;
         spdlog::set_default_logger(new_logger);
+
+        // Commit staged file path/date from BuildSinks
+        if (!sinks_new_path.empty()) {
+            g_current_file_path = std::move(sinks_new_path);
+        }
+        if (!sinks_new_date.empty()) {
+            g_current_log_date = std::move(sinks_new_date);
+        }
 
         // Prune after full commit — file deletion is irreversible
         if (g_max_files > 1) {

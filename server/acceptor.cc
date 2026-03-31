@@ -99,17 +99,17 @@ void Acceptor::NewConnection(){
             continue;
         }
         if(client_fd == SocketHandler::ACCEPT_MEMORY_PRESSURE){
-            // Memory/buffer pressure (ENOBUFS/ENOMEM).
-            // The idle fd trick doesn't help — closing fds frees fd slots, not memory.
-            // Cannot drain the queue (accept keeps failing).
-            // Do NOT rely on EPOLL_CTL_MOD to re-trigger the ET edge — the epoll
-            // spec does not guarantee a new edge when the fd is already readable.
-            // Return and wait: the next new connection creates a readiness transition
-            // that fires a fresh edge, retrying the entire backlog. Existing backlog
-            // entries are delayed until memory pressure resolves, which is acceptable
-            // since the server cannot handle more connections under memory pressure.
+            // Memory/buffer pressure (ENOBUFS/ENOMEM). Schedule a deferred
+            // retry via EnQueue — returning without draining the backlog in
+            // ET mode would leave accept stuck (no new edge to wake epoll).
+            // EnQueue lets the event loop process pending closes/frees first,
+            // then retries accept. No sleep — non-blocking event loop.
             int saved_errno = errno;
-            logging::Get()->warn("Accept: memory pressure ({}), deferring", logging::SafeStrerror(saved_errno));
+            logging::Get()->warn("Accept: memory pressure ({}), scheduling retry",
+                                 logging::SafeStrerror(saved_errno));
+            event_dispatcher_->EnQueue([this]() {
+                NewConnection();
+            });
             return;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));
