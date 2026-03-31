@@ -485,6 +485,47 @@ void UpdateFileConfig(const std::string& file, size_t max_size, int max_files) {
     }
 }
 
+bool UpdateAndReopen(const std::string& file, size_t max_size, int max_files) {
+    std::lock_guard<std::mutex> lock(g_logger_mtx);
+    if (!g_logger) return true;
+
+    // Save old config for rollback
+    auto old_file = g_log_file;
+    auto old_dir = g_log_dir;
+    auto old_prefix = g_log_prefix;
+    auto old_ext = g_log_extension;
+    auto old_size = g_max_size;
+    auto old_max = g_max_files;
+
+    // Apply new config
+    g_log_file = file;
+    g_max_size = max_size;
+    g_max_files = max_files;
+    if (!file.empty()) {
+        ParseLogPath(file, g_log_dir, g_log_prefix, g_log_extension);
+    } else {
+        g_log_dir.clear();
+        g_log_prefix.clear();
+        g_log_extension.clear();
+    }
+
+    // Rebuild under the same lock — CheckRotation can't observe partial state
+    try {
+        RebuildLogger();
+        return true;
+    } catch (const std::exception& e) {
+        // Roll back to old config
+        g_log_file = std::move(old_file);
+        g_log_dir = std::move(old_dir);
+        g_log_prefix = std::move(old_prefix);
+        g_log_extension = std::move(old_ext);
+        g_max_size = old_size;
+        g_max_files = old_max;
+        g_logger->error("Failed to reopen log file: {}", e.what());
+        return false;
+    }
+}
+
 bool Reopen() {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
     if (!g_logger) return true;  // no logger → no-op is success

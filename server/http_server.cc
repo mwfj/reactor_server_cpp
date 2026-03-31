@@ -321,12 +321,15 @@ void HttpServer::Stop() {
         }
     }
     // Send 1001 Going Away close frames outside the lock.
+    // Do NOT call CloseAfterWrite here — SendClose arms a 5s deadline for
+    // the peer's Close reply. CloseAfterWrite would force-close as soon as
+    // the frame drains, cutting the handshake short (resulting in 1006).
+    // NetServer::Stop() handles draining and eventual force-close.
     for (auto& [http_conn, conn] : ws_conns) {
         auto* ws = http_conn->GetWebSocket();
         if (ws && ws->IsOpen()) {
             try {
                 ws->SendClose(1001, "Going Away");
-                if (conn) conn->CloseAfterWrite();
             }
             catch (...) {}
         }

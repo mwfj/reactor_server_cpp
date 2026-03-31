@@ -309,18 +309,13 @@ static bool ReloadConfig(const std::string& config_path,
         }
     }
 
-    // Apply log changes: always reopen (logrotate sends SIGHUP with unchanged
-    // config to force descriptor reopen after file rename).
-    logging::UpdateFileConfig(new_config.log.file, new_config.log.max_file_size,
-                              new_config.log.max_files);
-    if (logging::Reopen()) {
+    // Apply log changes atomically: update config + reopen under one lock.
+    // Prevents CheckRotation from observing partial state between update and
+    // reopen. On failure, UpdateAndReopen rolls back internally.
+    if (logging::UpdateAndReopen(new_config.log.file, new_config.log.max_file_size,
+                                 new_config.log.max_files)) {
         logging::Get()->info("Log files reopened");
     } else {
-        // Roll back stored sink config so subsequent SIGHUPs don't retry
-        // the broken file/sink parameters.
-        logging::UpdateFileConfig(current_config.log.file,
-                                  current_config.log.max_file_size,
-                                  current_config.log.max_files);
         if (new_config.log.file != current_config.log.file) {
             // Log path change failed, but server limits are already applied and
             // valid — don't roll them back. Partial success: server config is

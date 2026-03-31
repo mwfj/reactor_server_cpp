@@ -58,6 +58,12 @@ void SetLevel(spdlog::level::level_enum level);
 // Takes effect on next Reopen(). Thread-safe. Does NOT reopen immediately.
 void UpdateFileConfig(const std::string& file, size_t max_size, int max_files);
 
+// Atomically update file config AND reopen under a single lock.
+// Prevents CheckRotation from observing partial state between update and reopen.
+// On failure, rolls back config globals to the previous values.
+// Returns true on success, false on failure (old logger kept active).
+bool UpdateAndReopen(const std::string& file, size_t max_size, int max_files);
+
 // Check if the current log file exceeds max_file_size or the date has
 // rolled over, and rotate if needed. Called periodically from the
 // Dispatcher timer handler. Thread-safe. No-op if no file sink is configured.
