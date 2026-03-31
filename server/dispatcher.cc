@@ -115,9 +115,13 @@ void Dispatcher::RunEventLoop(){
                 callbacks_.timeout_trigger_callback(shared_from_this());
             }
             // Fallback timer for platforms without timerfd (macOS):
-            // Must also run here so idle connections are caught even with no traffic.
+            // Throttled by end_t_ to match the configured scan interval.
             if (is_sock_dispatcher_ && timer_fd_ < 0 && end_t_ > 0) {
-                TimerHandler();
+                auto now = std::chrono::steady_clock::now();
+                if (now - last_fallback_timer_ >= std::chrono::seconds(end_t_)) {
+                    last_fallback_timer_ = now;
+                    TimerHandler();
+                }
             }
             continue;
         }

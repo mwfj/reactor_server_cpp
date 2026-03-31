@@ -553,8 +553,10 @@ static int HandleStart(const CliOptions& options) {
 
     if (options.health_endpoint) {
         server->Get("/health", MakeHealthHandler(server.get()));
-        server->Get("/stats", MakeStatsHandler(server.get(), config));
         logging::Get()->info("  Health:  /health");
+    }
+    if (options.stats_endpoint) {
+        server->Get("/stats", MakeStatsHandler(server.get(), config));
         logging::Get()->info("  Stats:   /stats");
     }
 

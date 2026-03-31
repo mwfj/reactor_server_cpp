@@ -36,8 +36,9 @@ struct CliOptions {
     std::string pid_file = "/tmp/reactor_server.pid";
     bool pid_file_explicit = false;  // true if user passed -P/--pid-file
 
-    // Health endpoint
+    // Health/stats endpoints
     bool health_endpoint = true;
+    bool stats_endpoint = true;
 
     // Daemon mode
     bool daemonize = false;

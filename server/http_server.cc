@@ -977,17 +977,20 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         }
     }
 
-    // Update reload-safe limit fields (atomic stores)
+    // Update input cap FIRST from the new config values, before changing the
+    // per-request limits. This closes the window where a connection accepted
+    // mid-reload gets the old cap but the new (possibly lower) parser limits.
+    // ComputeInputCap reads from atomics, so store the new values first.
     max_body_size_.store(new_config.max_body_size, std::memory_order_relaxed);
     max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);
     max_ws_message_size_.store(new_config.max_ws_message_size, std::memory_order_relaxed);
+    net_server_.SetMaxInputSize(ComputeInputCap());
+
+    // Now update the remaining reload-safe fields
     request_timeout_sec_.store(new_config.request_timeout_sec, std::memory_order_relaxed);
     shutdown_drain_timeout_sec_.store(new_config.shutdown_drain_timeout_sec,
                                      std::memory_order_relaxed);
-
-    // Update max_connections and input buffer cap
     net_server_.SetMaxConnections(new_config.max_connections);
-    net_server_.SetMaxInputSize(ComputeInputCap());
 
     // Update idle timeout via EnQueue to dispatcher threads
     net_server_.SetConnectionTimeout(

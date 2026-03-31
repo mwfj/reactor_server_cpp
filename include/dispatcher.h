@@ -40,6 +40,8 @@ private:
     int timer_fd_;
     int end_t_; // the time that timer should triggered
     std::chrono::seconds timeout_; // Timeout duration for connection handler
+    // macOS fallback: throttle TimerHandler to run every end_t_ seconds
+    std::chrono::steady_clock::time_point last_fallback_timer_{};
 
     std::shared_ptr<Channel> timer_channel_;  // Must be shared_ptr because Channel uses shared_from_this()
     
