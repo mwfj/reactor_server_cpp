@@ -977,16 +977,32 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         }
     }
 
-    // Update input cap FIRST from the new config values, before changing the
-    // per-request limits. This closes the window where a connection accepted
-    // mid-reload gets the old cap but the new (possibly lower) parser limits.
-    // ComputeInputCap reads from atomics, so store the new values first.
+    // Compute the new input cap from the new config values BEFORE updating
+    // any atomics. Then set the cap first, then the per-request limits.
+    // This ensures a connection accepted mid-reload gets at most the new cap
+    // (which matches the new limits), not the old cap with new lower limits.
+    {
+        size_t body = new_config.max_body_size;
+        size_t hdr = new_config.max_header_size;
+        size_t ws = new_config.max_ws_message_size;
+        size_t http_cap = 0;
+        if (hdr > 0 && body > 0) {
+            size_t sum = hdr + body;
+            if (sum >= hdr) http_cap = sum;
+        } else if (hdr > 0) {
+            http_cap = hdr;
+        } else if (body > 0) {
+            http_cap = body;
+        }
+        size_t cap = (ws > 0) ? (http_cap == 0 ? ws : std::min(http_cap, ws))
+                              : http_cap;
+        net_server_.SetMaxInputSize(cap);
+    }
     max_body_size_.store(new_config.max_body_size, std::memory_order_relaxed);
     max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);
     max_ws_message_size_.store(new_config.max_ws_message_size, std::memory_order_relaxed);
-    net_server_.SetMaxInputSize(ComputeInputCap());
 
-    // Now update the remaining reload-safe fields
+    // Update the remaining reload-safe fields
     request_timeout_sec_.store(new_config.request_timeout_sec, std::memory_order_relaxed);
     shutdown_drain_timeout_sec_.store(new_config.shutdown_drain_timeout_sec,
                                      std::memory_order_relaxed);
