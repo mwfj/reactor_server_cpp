@@ -1,5 +1,7 @@
 #include "acceptor.h"
 #include "channel.h"
+#include "log/logger.h"
+#include "log/log_utils.h"
 
 #include <fcntl.h>
 
@@ -30,6 +32,8 @@ Acceptor::~Acceptor() {
 }
 
 void Acceptor::CloseListenSocket() {
+    int listen_fd = servsock_ ? servsock_->fd() : -1;
+    logging::Get()->debug("Closing listen socket fd={}", listen_fd);
     if (acceptor_channel_ && !acceptor_channel_->is_channel_closed()) {
         acceptor_channel_->CloseChannel();
     }
@@ -56,7 +60,10 @@ void Acceptor::NewConnection(){
     // don't accept. This prevents accepting new connections after Stop()
     // has started, even if the accept event and the close task are in the
     // same epoll batch and the accept fires first.
-    if (!acceptor_channel_ || acceptor_channel_->is_channel_closed()) return;
+    if (!acceptor_channel_ || acceptor_channel_->is_channel_closed()) {
+        logging::Get()->debug("Accept: listen socket closed, skipping");
+        return;
+    }
 
     while(true){
         InetAddr client_addr;
@@ -75,6 +82,7 @@ void Acceptor::NewConnection(){
             // connection from the listen queue, preventing ET mode starvation
             // where the server permanently stops accepting after a transient
             // fd exhaustion event.
+            logging::Get()->warn("Accept: fd exhaustion detected, using idle-fd trick");
             if (idle_fd_ >= 0) {
                 ::close(idle_fd_);
                 idle_fd_ = -1;
@@ -100,6 +108,8 @@ void Acceptor::NewConnection(){
             // that fires a fresh edge, retrying the entire backlog. Existing backlog
             // entries are delayed until memory pressure resolves, which is acceptable
             // since the server cannot handle more connections under memory pressure.
+            int saved_errno = errno;
+            logging::Get()->warn("Accept: memory pressure ({}), deferring", logging::SafeStrerror(saved_errno));
             return;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));

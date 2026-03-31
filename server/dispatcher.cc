@@ -2,6 +2,7 @@
 #include "channel.h"
 #include "connection_handler.h"
 #include "log/logger.h"
+#include "log/log_utils.h"
 
 Dispatcher::Dispatcher() :
     ep_(std::unique_ptr<EventHandler>(new EventHandler())),
@@ -13,11 +14,11 @@ Dispatcher::Dispatcher() :
 #if defined(__linux__)
     eventfd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (eventfd_ == -1) {
-        throw std::runtime_error(std::string("eventfd creation failed: ") + strerror(errno));
+        throw std::runtime_error(std::string("eventfd creation failed: ") + logging::SafeStrerror(errno));
     }
 #elif defined(__APPLE__) || defined(__MACH__)
     if (::pipe(wakeup_pipe_) == -1) {
-        throw std::runtime_error(std::string("pipe creation failed: ") + strerror(errno));
+        throw std::runtime_error(std::string("pipe creation failed: ") + logging::SafeStrerror(errno));
     }
     // Set both ends to non-blocking
     ::fcntl(wakeup_pipe_[0], F_SETFL, O_NONBLOCK);
@@ -36,11 +37,11 @@ Dispatcher::Dispatcher(bool _is_sock,  int _end_t, std::chrono::seconds _timeout
 #if defined(__linux__)
     eventfd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (eventfd_ == -1) {
-        throw std::runtime_error(std::string("eventfd creation failed: ") + strerror(errno));
+        throw std::runtime_error(std::string("eventfd creation failed: ") + logging::SafeStrerror(errno));
     }
 #elif defined(__APPLE__) || defined(__MACH__)
     if (::pipe(wakeup_pipe_) == -1) {
-        throw std::runtime_error(std::string("pipe creation failed: ") + strerror(errno));
+        throw std::runtime_error(std::string("pipe creation failed: ") + logging::SafeStrerror(errno));
     }
     // Set both ends to non-blocking
     ::fcntl(wakeup_pipe_[0], F_SETFL, O_NONBLOCK);
@@ -244,13 +245,15 @@ void Dispatcher::WakeUp(){
     uint64_t val = 1;
     ssize_t n = ::write(eventfd_, &val, sizeof val);
     if (n != sizeof val) {
-        logging::Get()->error("eventfd write failed: {}", strerror(errno));
+        int saved_errno = errno;
+        logging::Get()->error("eventfd write failed: {}", logging::SafeStrerror(saved_errno));
     }
 #elif defined(__APPLE__) || defined(__MACH__)
     char buf = 1;
     ssize_t n = ::write(wakeup_pipe_[1], &buf, sizeof buf);  // Write to pipe[1]
     if (n != sizeof buf) {
-        logging::Get()->error("pipe write failed: {}", strerror(errno));
+        int saved_errno = errno;
+        logging::Get()->error("pipe write failed: {}", logging::SafeStrerror(saved_errno));
     }
 #endif
 }
@@ -340,6 +343,10 @@ void Dispatcher::TimerHandler(){
 #endif
     TimeStamp::ResetTimerFd(timer_fd_, end_t_);
 
+    // Periodic log rotation check. Uses try_lock — skips if another
+    // dispatcher is already checking. No contention in steady state.
+    logging::CheckRotation();
+
     if(is_sock_dispatcher()){
         logging::Get()->trace("Dispatcher: reset timer");
 
@@ -360,6 +367,7 @@ void Dispatcher::TimerHandler(){
 
         // Close timed-out connections.
         for(auto& conn : timed_out_conns){
+            logging::Get()->debug("Connection timed out fd={}", conn->fd());
             if (conn->IsClosing() || conn->IsCloseDeferred()) {
                 // Already closing (previous timeout triggered CloseAfterWrite but flush stalled).
                 // Force close now — the buffered response will never drain.

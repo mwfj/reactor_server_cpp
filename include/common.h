@@ -3,6 +3,8 @@
 // Common C++ headers (available on all platforms)
 #include <cstdint>
 #include <cstring>
+#include <ctime>
+#include <cstdio>
 #include <string.h>
 #include <stdexcept>
 #include <iostream>
@@ -18,13 +20,15 @@
 #include <map>
 #include <atomic>
 
-// Supoort cross-platform(current support Linux & MacOS)
+// Support cross-platform (current support Linux & macOS)
 // Common system-level library
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <dirent.h>
 #include <unistd.h>
 #include <signal.h>
-#include <sys/wait.h>
-#include <sys/types.h>
 #include <errno.h>
 #include <fcntl.h>
 

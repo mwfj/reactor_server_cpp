@@ -1,6 +1,8 @@
 #include "connection_handler.h"
 #include "channel.h"
 #include "tls/tls_connection.h"
+#include "log/logger.h"
+#include "log/log_utils.h"
 
 ConnectionHandler::ConnectionHandler(std::shared_ptr<Dispatcher> _dispatcher, std::unique_ptr<SocketHandler> _sock)
     : event_dispatcher_(_dispatcher), sock_(std::move(_sock))
@@ -71,6 +73,7 @@ void ConnectionHandler::OnMessage(){
             return;
         } else {
             // Handshake failed — use CallCloseCb for proper cleanup
+            logging::Get()->warn("TLS handshake failed fd={}", fd());
             CallCloseCb();
             return;
         }
@@ -147,6 +150,7 @@ void ConnectionHandler::OnMessage(){
         } else if (nread < 0) {
             if (tls_state_ == TlsState::READY) {
                 // TLS read error — use CallCloseCb for proper cleanup
+                logging::Get()->warn("TLS read error fd={}, closing", fd());
                 CallCloseCb();
                 return;
             }
@@ -154,6 +158,8 @@ void ConnectionHandler::OnMessage(){
                 break;
             }
             // Read error — use CallCloseCb for proper server map cleanup
+            int saved_errno = errno;
+            logging::Get()->warn("Read error fd={}: {} (errno={})", fd(), logging::SafeStrerror(saved_errno), saved_errno);
             CallCloseCb();
             return;
         } else {
@@ -303,6 +309,8 @@ void ConnectionHandler::DoSend(const char *data, size_t size){
                     return;
                 }
             } else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                int saved_errno = errno;
+                logging::Get()->warn("Write error fd={}: {} (errno={})", fd(), logging::SafeStrerror(saved_errno), saved_errno);
                 CallCloseCb();
                 return;
             }
@@ -432,6 +440,7 @@ void ConnectionHandler::CloseAfterWrite(){
 void ConnectionHandler::ForceClose(){
     // Skip the close_after_write defer — used when a deferred close stalls
     // and the timer needs to reclaim the connection.
+    logging::Get()->debug("Force-closing fd={}", fd());
     close_after_write_.store(false, std::memory_order_release);
     CallCloseCb();
 }
@@ -448,6 +457,7 @@ void ConnectionHandler::CallCloseCb(){
     // Prevent duplicate close callbacks with atomic compare-exchange
     bool expected = false;
     if (!is_closing_.compare_exchange_strong(expected, true)) {
+        logging::Get()->debug("Duplicate close prevented fd={}", fd());
         return;
     }
 
@@ -632,6 +642,7 @@ void ConnectionHandler::CallWriteCb(){
         }
         if (write_sz < 0) {
             // TLS write error — ForceClose bypasses close_after_write defer
+            logging::Get()->warn("TLS write error fd={}, force-closing", fd());
             ForceClose();
             return;
         }
@@ -639,6 +650,8 @@ void ConnectionHandler::CallWriteCb(){
         write_sz = ::send(fd(), output_bf_.Data(), output_bf_.Size(), SEND_FLAGS);
         if (write_sz < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             // Send failed (EPIPE, ECONNRESET, etc.) — ForceClose bypasses defer
+            int saved_errno = errno;
+            logging::Get()->warn("Write callback send error fd={}: {} (errno={})", fd(), logging::SafeStrerror(saved_errno), saved_errno);
             ForceClose();
             return;
         }

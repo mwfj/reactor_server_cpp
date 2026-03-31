@@ -182,7 +182,7 @@ kill -HUP $(cat /tmp/reactor_server.pid)
 # }
 ```
 
-**Note:** By default, the server uses spdlog's rotating file sink with size-based rotation (`.1`, `.2`, `.3` suffixes). When using external `logrotate`, set `log.max_files` to `1` in the config to switch to a non-rotating file sink that is fully compatible with external rotation. With `max_files > 1`, spdlog's built-in rotation naming can conflict with logrotate's file renaming.
+**Note:** By default (`max_files > 1`), the server uses date-based log file naming (`reactor-YYYY-MM-DD[-N].log`) with automatic size-based rotation. When using external `logrotate`, set `log.max_files` to `1` in the config to use the raw file path with no automatic rotation — fully compatible with logrotate's rename + SIGHUP workflow.
 
 ## PID File
 

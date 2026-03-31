@@ -53,17 +53,17 @@ void HttpServer::WireNetServerCallbacks() {
         });
 }
 
-// Validate host is a numeric IPv4 address — inet_addr() silently returns
-// INADDR_NONE for hostnames like "localhost" or IPv6 literals, causing
-// a confusing bind failure much later.
+// Validate host is a strict dotted-quad IPv4 address. Uses inet_pton (not
+// inet_addr) to reject legacy shorthand forms like "1" or octal "0127.0.0.1".
 static const std::string& ValidateHost(const std::string& host) {
     if (host.empty()) {
         throw std::invalid_argument("bind host must not be empty");
     }
-    if (inet_addr(host.c_str()) == INADDR_NONE && host != "255.255.255.255") {
+    struct in_addr addr{};
+    if (inet_pton(AF_INET, host.c_str(), &addr) != 1) {
         throw std::invalid_argument(
             "Invalid bind host: '" + host +
-            "' (must be a numeric IPv4 address, e.g. '0.0.0.0' or '127.0.0.1')");
+            "' (must be a dotted-quad IPv4 address, e.g. '0.0.0.0' or '127.0.0.1')");
     }
     return host;
 }
@@ -111,9 +111,13 @@ HttpServer::HttpServer(const ServerConfig& config)
                       // the timer scan to enforce them. Use 5s to match the
                       // shortest protocol deadline.
                       if (idle_interval == 0 && req_interval == 0) return 5;
-                      if (idle_interval == 0) return req_interval;
-                      if (req_interval == 0) return idle_interval;
-                      return std::min(idle_interval, req_interval);
+                      int interval = 0;
+                      if (idle_interval == 0) interval = req_interval;
+                      else if (req_interval == 0) interval = idle_interval;
+                      else interval = std::min(idle_interval, req_interval);
+                      // Cap at 30s to ensure log rotation checks run at a
+                      // reasonable frequency regardless of timeout configuration.
+                      return std::min(interval, 30);
                   }(),
                   // Pass idle_timeout_sec directly — 0 means disabled.
                   // ConnectionHandler::IsTimeOut handles duration==0 by skipping idle check.
@@ -360,6 +364,7 @@ void HttpServer::WaitForH2Drain() {
     });
 
     if (!h2_draining_.empty()) {
+        logging::Get()->warn("H2 drain timeout, force-closing remaining connections");
         // Timeout: force-close remaining. Move to local to avoid holding
         // drain_mtx_ during ForceClose (prevents lock coupling with late callbacks).
         auto remaining = std::move(h2_draining_);
@@ -433,7 +438,10 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
     // RegisterCallbacks enabling epoll and new_conn_callback running here),
     // skip entirely. Inserting a handler for a closed connection would leave
     // stale state in http_connections_ (potentially under fd -1 after ReleaseFd).
-    if (conn->IsClosing()) return;
+    if (conn->IsClosing()) {
+        logging::Get()->debug("New connection already closing fd={}, skipping", conn->fd());
+        return;
+    }
 
     if (http2_enabled_) {
         // Guard against accept/data race: if HandleMessage already ran and
@@ -447,6 +455,7 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                     return;  // Already initialized by HandleMessage
                 }
                 // Stale handler from fd reuse — evict
+                logging::Get()->debug("Evicted stale H2 handler fd={}", conn->fd());
                 h2_connections_.erase(h2_it);
             }
             auto h1_it = http_connections_.find(conn->fd());
@@ -455,6 +464,7 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                     return;  // Already initialized by HandleMessage
                 }
                 // Stale handler from fd reuse — save for WS close, then evict
+                logging::Get()->debug("Evicted stale handler fd={}", conn->fd());
                 stale_h1 = std::move(h1_it->second);
                 http_connections_.erase(h1_it);
             }
@@ -689,6 +699,7 @@ bool HttpServer::DetectAndRouteProtocol(
     if (proto == ProtocolDetector::Protocol::HTTP2) {
         // Skip if connection is fully closing (not just peer half-close)
         if (conn->IsClosing()) return true;
+        logging::Get()->debug("Protocol detected: HTTP/2 fd={}", conn->fd());
         // Create HTTP/2 handler
         auto h2_conn = std::make_shared<Http2ConnectionHandler>(conn, h2_settings_);
         SetupH2Handlers(h2_conn);
@@ -705,6 +716,7 @@ bool HttpServer::DetectAndRouteProtocol(
     }
 
     // HTTP/1.x — create handler (existing path)
+    logging::Get()->debug("Protocol detected: HTTP/1.x fd={}", conn->fd());
     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
     SetupHandlers(http_conn);
     {
