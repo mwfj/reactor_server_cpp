@@ -593,19 +593,27 @@ void EnsureLogDir(const std::string& dir) {
 void WriteMarker(const std::string& text) {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
     if (!g_logger) return;
-    // Force-log the marker regardless of current log level. Markers are
-    // lifecycle delimiters (SERVER START/STOP) that must always appear per
-    // LOGGING_STANDARDS.md, even when log level is warn+. Temporarily lower
-    // logger + sink levels under the mutex (no other thread can interleave).
+    // Force-log the marker regardless of current log level by temporarily
+    // lowering sink levels. spdlog sink levels are std::atomic, so the
+    // set/restore is thread-safe at the memory level. Other threads using
+    // Get()'s try_lock fallback may briefly see info-level sink thresholds,
+    // but the window is microseconds and only occurs at SERVER START/STOP.
+    std::vector<spdlog::level::level_enum> saved_sink_levels;
+    saved_sink_levels.reserve(g_logger->sinks().size());
+    for (auto& sink : g_logger->sinks()) {
+        saved_sink_levels.push_back(sink->level());
+        sink->set_level(spdlog::level::info);
+    }
     auto saved_level = g_logger->level();
     g_logger->set_level(spdlog::level::info);
-    for (auto& sink : g_logger->sinks()) sink->set_level(spdlog::level::info);
 
     g_logger->info("================================ {} ================================", text);
     g_logger->flush();
 
     g_logger->set_level(saved_level);
-    for (auto& sink : g_logger->sinks()) sink->set_level(saved_level);
+    for (size_t i = 0; i < g_logger->sinks().size(); ++i) {
+        g_logger->sinks()[i]->set_level(saved_sink_levels[i]);
+    }
 }
 
 } // namespace logging

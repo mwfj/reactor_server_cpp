@@ -613,6 +613,9 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         bool already_initialized = false;
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
+            // Guard: if connection already closed (accept/close race),
+            // skip insert to avoid leaking a stale handler + counters.
+            if (conn->IsClosing()) return;
             auto it = http_connections_.find(conn->fd());
             if (it != http_connections_.end()) {
                 if (it->second->GetConnection() == conn) {
@@ -622,7 +625,6 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
                     SetupHandlers(http_conn);
                     http_connections_[conn->fd()] = http_conn;
-                    // Counter tied to map insertion
                     total_accepted_.fetch_add(1, std::memory_order_relaxed);
                     active_connections_.fetch_add(1, std::memory_order_relaxed);
                     active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
@@ -631,7 +633,6 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                 auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
                 SetupHandlers(http_conn);
                 http_connections_[conn->fd()] = http_conn;
-                // Counter tied to map insertion
                 total_accepted_.fetch_add(1, std::memory_order_relaxed);
                 active_connections_.fetch_add(1, std::memory_order_relaxed);
                 active_http1_connections_.fetch_add(1, std::memory_order_relaxed);

@@ -449,6 +449,13 @@ static int HandleStart(const CliOptions& options) {
         }
         if (base_dir) {
             resolved_config_path = std::string(base_dir) + "/" + options.config_path;
+        } else {
+            // Both $PWD and getcwd() failed — config path stays relative.
+            // After daemonization (chdir "/"), relative paths resolve to
+            // /config/server.json which is wrong. Fail fast.
+            std::cerr << "Error: cannot resolve working directory for daemon "
+                      << "config path: " << options.config_path << "\n";
+            return EXIT_ERROR;
         }
     }
 
