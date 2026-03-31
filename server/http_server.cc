@@ -819,6 +819,7 @@ bool HttpServer::DetectAndRouteProtocol(
         // HandleMessage), we must undo that count since we won't publish a
         // map entry for RemoveConnection to find.
         if (conn->IsClosing()) {
+            logging::Get()->debug("H2 detection skipped, conn already closing fd={}", conn->fd());
             if (already_counted) {
                 active_connections_.fetch_sub(1, std::memory_order_relaxed);
             }
@@ -856,6 +857,7 @@ bool HttpServer::DetectAndRouteProtocol(
 
     // HTTP/1.x — create handler (existing path)
     if (conn->IsClosing()) {
+        logging::Get()->debug("H1 detection skipped, conn already closing fd={}", conn->fd());
         if (already_counted) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
