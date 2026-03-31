@@ -516,6 +516,9 @@ static int HandleStart(const CliOptions& options) {
     if (!PidFile::Acquire(options.pid_file)) {
         if (options.daemonize) {
             logging::Get()->error("Failed to acquire PID file: {}", options.pid_file);
+        } else {
+            std::cerr << "Error: failed to acquire PID file: " << options.pid_file
+                      << " (server may already be running)\n";
         }
         daemon_fail();
         return EXIT_ERROR;

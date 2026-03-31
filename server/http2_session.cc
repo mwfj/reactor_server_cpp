@@ -457,10 +457,12 @@ static int OnStreamCloseCallback(
     // Defer removal — never delete during nghttp2 callback
     self->MarkStreamForRemoval(stream_id);
 
-    // Notify the connection handler. It is safe to invoke std::function
-    // callbacks from within nghttp2 callbacks as long as we do not modify
-    // nghttp2 state (e.g., submit frames) inside the callback.
-    if (self->Callbacks().stream_close_callback) {
+    // Only notify if the stream was actually created (found in our map).
+    // Refused shutdown streams (RST_STREAM in OnBeginHeadersCallback)
+    // never call CreateStream(), so stream_open_callback never fired and
+    // counters were never incremented. Firing close_callback here would
+    // drive counters negative.
+    if (stream && self->Callbacks().stream_close_callback) {
         try {
             self->Callbacks().stream_close_callback(self->Owner(), stream_id, error_code);
         } catch (const std::exception& e) {
