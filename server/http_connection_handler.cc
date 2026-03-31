@@ -454,11 +454,20 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
     if (!sent_100_continue_ && parser_.GetRequest().headers_complete) {
         const auto& partial = parser_.GetRequest();
 
+        // Count early-rejected requests for stats consistency — these are
+        // valid request attempts rejected based on header content, before the
+        // body arrives. Matches HandleCompleteRequest + HandleParseError counting.
+        auto count_request = [this]() {
+            if (callbacks_.request_count_callback)
+                callbacks_.request_count_callback();
+        };
+
         // Early reject: unsupported HTTP version
         if (partial.http_major != 1 ||
             (partial.http_minor != 0 && partial.http_minor != 1)) {
             logging::Get()->warn("Early reject: unsupported HTTP version fd={}",
                                  conn_->fd());
+            count_request();
             HttpResponse ver_resp = HttpResponse::HttpVersionNotSupported();
             ver_resp.Header("Connection", "close");
             SendResponse(ver_resp);
@@ -469,6 +478,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
         // Early reject: HTTP/1.1 missing Host
         if (partial.http_minor >= 1 && !partial.HasHeader("host")) {
             logging::Get()->debug("Early reject: missing Host fd={}", conn_->fd());
+            count_request();
             HttpResponse bad_req = HttpResponse::BadRequest("Missing Host header");
             bad_req.Header("Connection", "close");
             SendResponse(bad_req);
@@ -483,6 +493,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
             partial.content_length > max_body_size_) {
             logging::Get()->warn("Early reject: Content-Length exceeds limit fd={}",
                                  conn_->fd());
+            count_request();
             HttpResponse err = HttpResponse::PayloadTooLarge();
             err.Header("Connection", "close");
             SendResponse(err);
@@ -504,6 +515,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
                 // WebSocketHandshake::Validate() rejects body-bearing
                 // upgrades, so acknowledging the body is contradictory.
                 if (partial.upgrade) {
+                    count_request();
                     HttpResponse bad_req = HttpResponse::BadRequest(
                         "WebSocket upgrade must not have a request body");
                     bad_req.Header("Connection", "close");
@@ -519,6 +531,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
             } else {
                 // Unrecognized Expect value — RFC 7231 §5.1.1: 417
                 logging::Get()->debug("Early reject: unsupported Expect fd={}", conn_->fd());
+                count_request();
                 HttpResponse err;
                 err.Status(417, "Expectation Failed");
                 err.Header("Connection", "close");
