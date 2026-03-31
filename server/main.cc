@@ -291,6 +291,16 @@ static bool ReloadConfig(const std::string& config_path,
         return false;
     }
 
+    // Warn if the FULL config (including restart-required fields) is invalid.
+    // Reload() only validates reload-safe fields. A broken bind_host/TLS/etc.
+    // would pass reload but explode on next restart. Don't reject — just warn.
+    try {
+        ConfigLoader::Validate(new_config);
+    } catch (const std::invalid_argument& e) {
+        logging::Get()->warn("Config has restart-required field issues that will "
+                             "fail on next restart: {}", e.what());
+    }
+
     // Apply log changes: always reopen (logrotate sends SIGHUP with unchanged
     // config to force descriptor reopen after file rename).
     logging::UpdateFileConfig(new_config.log.file, new_config.log.max_file_size,

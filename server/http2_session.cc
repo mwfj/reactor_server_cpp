@@ -295,6 +295,9 @@ static int OnFrameRecvCallback(
     case NGHTTP2_HEADERS: {
         auto* stream = self->FindStream(frame->hd.stream_id);
         if (!stream) break;
+        // Short-circuit: stream already rejected in OnHeaderCallback
+        // (header-list overflow, forbidden headers, bad TE, etc.)
+        if (stream->IsRejected()) break;
 
         if (frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
             // Initial request headers

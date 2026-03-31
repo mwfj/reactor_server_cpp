@@ -228,8 +228,15 @@ void Http2ConnectionHandler::OnRawData(
         // ReceiveData failures are almost always caused by malformed peer
         // frames (bad preface, protocol violations, etc.). Use PROTOCOL_ERROR
         // so clients get the correct retry/diagnostic signal.
-        logging::Get()->error("HTTP/2 session recv error, closing connection");
-        session_->ClearDeferredOutput();  // prevent stale resume
+        logging::Get()->error("HTTP/2 session recv error fd={}, closing connection",
+                              conn_ ? conn_->fd() : -1);
+        // Flush any deferred response frames BEFORE GOAWAY so partially-written
+        // responses for already-processed streams are delivered to the peer.
+        // Without this, ClearDeferredOutput drops in-flight responses and the
+        // peer sees truncated data followed by GOAWAY.
+        if (session_->HasDeferredOutput()) {
+            session_->ResumeOutput();
+        }
         resume_scheduled_ = false;
         session_->SendGoaway(HTTP2_CONSTANTS::ERROR_PROTOCOL_ERROR);
         session_->SendPendingFrames();
