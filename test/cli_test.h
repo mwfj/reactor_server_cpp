@@ -1981,7 +1981,7 @@ void TestDateBasedFileName() {
         std::time_t now = std::time(nullptr);
         std::tm tm{};
         localtime_r(&now, &tm);
-        static constexpr size_t DATE_STR_SIZE = 16;
+        static constexpr size_t DATE_STR_SIZE = 36;
         char date_buf[DATE_STR_SIZE];
         std::snprintf(date_buf, sizeof(date_buf), "%04d-%02d-%02d",
                       tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);

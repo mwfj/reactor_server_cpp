@@ -25,7 +25,7 @@ static std::string g_current_file_path;  // Currently open file path with date+s
 static std::string g_current_log_date;  // Date string ("YYYY-MM-DD") of the current log file
 
 static constexpr const char* LOG_PATTERN = "[%Y-%m-%d %H:%M:%S.%e] [%n] [%^%l%$] %v";
-static constexpr size_t DATE_BUF_SIZE = 16;
+static constexpr size_t DATE_BUF_SIZE = 36;
 
 // ── Path decomposition helpers ──────────────────────────────────────
 
