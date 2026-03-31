@@ -1,4 +1,5 @@
 #include "cli/signal_handler.h"
+#include "log/logger.h"
 
 #include <atomic>
 #include <cerrno>
@@ -84,7 +85,12 @@ SignalResult SignalHandler::WaitForSignal() {
     int sig = 0;
     int rc = sigwait(&g_wait_mask, &sig);
     if (rc != 0) {
-        // sigwait failed — treat as shutdown for safety
+        // sigwait failed — treat as shutdown for safety.
+        // Log is best-effort (logger may not be initialized in edge cases).
+        try {
+            logging::Get()->error("sigwait failed (rc={}), treating as shutdown",
+                                  rc);
+        } catch (...) {}
         g_shutdown_requested.store(true, std::memory_order_release);
         return SignalResult::SHUTDOWN;
     }

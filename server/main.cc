@@ -168,6 +168,7 @@ MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
             config.tls.enabled ? "true" : "false",
             config.http2.enabled ? "true" : "false");
         if (written < 0 || static_cast<size_t>(written) >= sizeof(buf)) {
+            logging::Get()->error("Stats JSON buffer overflow (written={})", written);
             res.Status(500).Json(R"({"error":"stats buffer overflow"})");
             return;
         }
@@ -281,6 +282,20 @@ static bool ReloadConfig(const std::string& config_path,
     // config to force descriptor reopen after file rename).
     logging::UpdateFileConfig(new_config.log.file, new_config.log.max_file_size,
                               new_config.log.max_files);
+    // Ensure log directory exists for the new path (may have changed on reload)
+    if (!new_config.log.file.empty()) {
+        try {
+            std::string dir = new_config.log.file.substr(
+                0, new_config.log.file.rfind('/'));
+            if (!dir.empty()) logging::EnsureLogDir(dir);
+        } catch (const std::exception& e) {
+            logging::Get()->error("Failed to create log directory: {}", e.what());
+            logging::UpdateFileConfig(current_config.log.file,
+                                      current_config.log.max_file_size,
+                                      current_config.log.max_files);
+            return false;
+        }
+    }
     if (logging::Reopen()) {
         logging::Get()->info("Log files reopened");
     } else {

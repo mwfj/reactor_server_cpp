@@ -169,15 +169,13 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         if (callbacks_.middleware_callback) {
             if (!callbacks_.middleware_callback(req, mw_response)) {
                 // Middleware rejected — default to 403 if nothing was set.
-                // Only apply when the response is completely untouched
-                // (default status + no body + no headers). This allows
-                // middleware to intentionally short-circuit with 200 OK
-                // plus custom headers (e.g., CORS preflight, Set-Cookie).
                 if (mw_response.GetStatusCode() == 200 &&
                     mw_response.GetBody().empty() &&
                     mw_response.GetHeaders().empty()) {
                     mw_response.Status(403).Text("Forbidden");
                 }
+                logging::Get()->debug("WebSocket upgrade rejected by middleware fd={} path={}",
+                                      conn_->fd(), req.path);
                 mw_response.Header("Connection", "close");
                 SendResponse(mw_response);
                 CloseConnection();

@@ -976,7 +976,8 @@ bool Http2Session::CheckFloodProtection(
         if (!(flags & NGHTTP2_FLAG_ACK)) {
             ++settings_count_;
             if (settings_count_ > HTTP2_CONSTANTS::MAX_SETTINGS_PER_INTERVAL) {
-                logging::Get()->warn("HTTP/2 SETTINGS flood detected");
+                logging::Get()->warn("HTTP/2 SETTINGS flood detected fd={}",
+                                     conn_ ? conn_->fd() : -1);
                 // Queue GOAWAY only — do NOT call SendPendingFrames() here.
                 // This callback runs inside nghttp2_session_mem_recv2; flushing
                 // output now (via mem_send2) while mem_recv2 is on the call stack
@@ -999,7 +1000,8 @@ bool Http2Session::CheckFloodProtection(
         if (!(flags & NGHTTP2_FLAG_ACK)) {
             ++ping_count_;
             if (ping_count_ > HTTP2_CONSTANTS::MAX_PING_PER_INTERVAL) {
-                logging::Get()->warn("HTTP/2 PING flood detected");
+                logging::Get()->warn("HTTP/2 PING flood detected fd={}",
+                                     conn_ ? conn_->fd() : -1);
                 if (!goaway_sent_) {
                     goaway_sent_ = true;
                     int32_t live_last = nghttp2_session_get_last_proc_stream_id(
@@ -1015,7 +1017,8 @@ bool Http2Session::CheckFloodProtection(
     case NGHTTP2_RST_STREAM:
         ++rst_stream_count_;
         if (rst_stream_count_ > HTTP2_CONSTANTS::MAX_RST_STREAM_PER_INTERVAL) {
-            logging::Get()->warn("HTTP/2 RST_STREAM flood detected (rapid reset)");
+            logging::Get()->warn("HTTP/2 RST_STREAM flood detected (rapid reset) fd={}",
+                                 conn_ ? conn_->fd() : -1);
             if (!goaway_sent_) {
                 goaway_sent_ = true;
                 int32_t live_last = nghttp2_session_get_last_proc_stream_id(

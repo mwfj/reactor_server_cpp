@@ -471,6 +471,15 @@ void UpdateFileConfig(const std::string& file, size_t max_size, int max_files) {
     g_log_file = file;
     g_max_size = max_size;
     g_max_files = max_files;
+    // Re-parse decomposed path components so BuildSinks() resolves
+    // rotated paths from the new file, not the old Init() path.
+    if (!file.empty()) {
+        ParseLogPath(file, g_log_dir, g_log_prefix, g_log_extension);
+    } else {
+        g_log_dir.clear();
+        g_log_prefix.clear();
+        g_log_extension.clear();
+    }
 }
 
 bool Reopen() {
@@ -579,14 +588,21 @@ void EnsureLogDir(const std::string& dir) {
 }
 
 void WriteMarker(const std::string& text) {
-    auto logger = Get();
-    if (!logger) return;
-    // Log at info level through the normal spdlog path. This ensures markers
-    // go through the same sink/fd as other log messages (no file splitting
-    // during logrotate) and get the standard timestamp/logger formatting.
-    // Markers are filtered at warn+ levels — this is acceptable because
-    // operators using higher levels have chosen to suppress info output.
-    logger->info("================================ {} ================================", text);
+    std::lock_guard<std::mutex> lock(g_logger_mtx);
+    if (!g_logger) return;
+    // Force-log the marker regardless of current log level. Markers are
+    // lifecycle delimiters (SERVER START/STOP) that must always appear per
+    // LOGGING_STANDARDS.md, even when log level is warn+. Temporarily lower
+    // logger + sink levels under the mutex (no other thread can interleave).
+    auto saved_level = g_logger->level();
+    g_logger->set_level(spdlog::level::info);
+    for (auto& sink : g_logger->sinks()) sink->set_level(spdlog::level::info);
+
+    g_logger->info("================================ {} ================================", text);
+    g_logger->flush();
+
+    g_logger->set_level(saved_level);
+    for (auto& sink : g_logger->sinks()) sink->set_level(saved_level);
 }
 
 } // namespace logging
