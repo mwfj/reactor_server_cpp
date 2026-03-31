@@ -109,7 +109,7 @@ Reference config at `config/server.example.json`:
 }
 ```
 
-Missing fields in the JSON file retain their default values.
+Missing fields in the JSON file retain their default values. When `log.file` is empty (default), the server logs to console only. Set to a path (e.g., `"logs/reactor.log"`) to enable file logging with date-based rotation. Set `max_files` to `1` for external logrotate compatibility (no automatic rotation).
 
 ### Environment Variable Overrides
 
@@ -157,56 +157,99 @@ Throws `std::invalid_argument` on validation failure.
 
 ```cpp
 #include "log/logger.h"
+#include "log/log_utils.h"  // SanitizePath helper
+
+// Create log directory if needed
+logging::EnsureLogDir("logs");
 
 // Initialize (call once, before spawning threads)
+// File path uses date-based naming: "logs/reactor.log" →
+//   "logs/reactor-2026-03-30.log" (actual file)
 logging::Init(
-    "myserver",                    // Logger name
+    "reactor",                     // Logger name
     spdlog::level::info,          // Minimum level
-    "/var/log/server.log",        // Optional file path (empty = stdout only)
-    10485760,                     // Max file size (10 MB)
-    3                             // Max rotated files
+    "logs/reactor.log",           // Log file path (empty = stdout only)
+    10485760,                     // Max file size per log file (10 MB)
+    3                             // Max total log files to keep
 );
+
+// System markers for visual separation
+logging::WriteMarker("SERVER START");
 
 // Use throughout the application
 logging::Get()->info("Server starting on {}:{}", host, port);
 logging::Get()->debug("New connection fd={}", fd);
 logging::Get()->warn("Connection limit reached: {}", max_connections);
-logging::Get()->error("TLS handshake failed: {}", error);
+logging::Get()->error("TLS handshake failed fd={}", fd);
 
-// Shutdown (flush and cleanup)
+// Periodic size-based rotation check
+logging::CheckRotation();
+
+// Log file reopen (e.g., on SIGHUP)
+logging::Reopen();
+
+// Shutdown
+logging::WriteMarker("SERVER STOP");
 logging::Shutdown();
 ```
+
+### Date-Based File Naming
+
+Log files use the naming pattern `{prefix}-{YYYY-MM-DD}[-{seq}].log`:
+
+```
+logs/reactor-2026-03-30.log       (first file of the day)
+logs/reactor-2026-03-30-1.log     (after first size rotation)
+logs/reactor-2026-03-30-2.log     (after second rotation)
+```
+
+On restart, the logger appends to the latest non-full file for today's date. The `logs/` directory is created automatically when the server starts (if `log.file` has a directory component).
 
 ### Log Levels
 
 | Level | Use Case |
 |-------|----------|
-| `trace` | Detailed debugging (frame bytes, buffer contents) |
-| `debug` | Connection events, state transitions |
-| `info` | Server lifecycle, configuration summary |
-| `warn` | Recoverable issues, approaching limits |
-| `error` | Failures requiring attention |
-| `critical` | Fatal conditions |
+| `trace` | Detailed debugging (frame bytes, buffer contents, timer ticks) |
+| `debug` | Construction, internal invocations, state transitions |
+| `info` | Server lifecycle, key trajectory stages, request received |
+| `warn` | Limits exceeded, timeouts, non-fatal operational errors |
+| `error` | Logic failures that don't crash the system |
+| `critical` | System or critical-component crash |
 
 ### Output Format
 
 ```
-[2026-03-19 12:34:56.789] [reactor] [info] Server starting on 0.0.0.0:8080
-[2026-03-19 12:34:56.790] [reactor] [debug] New connection fd=5
-[2026-03-19 12:34:57.001] [reactor] [error] TLS handshake failed: certificate verify failed
+[2026-03-30 12:34:56.789] [reactor] [info] ================================ SERVER START ================================
+[2026-03-30 12:34:56.790] [reactor] [info] reactor_server version 0.1.0 starting
+[2026-03-30 12:34:56.791] [reactor] [debug] New connection fd=5
+[2026-03-30 12:34:57.001] [reactor] [warn] Request timeout fd=5
+[2026-03-30 12:34:57.002] [reactor] [error] TLS handshake failed fd=5
 ```
+
+### Trace Correlation
+
+All log entries include contextual identifiers for correlation:
+- **Connection**: `fd=N` (file descriptor)
+- **HTTP/2 streams**: `stream=N`
+- **Requests**: method + sanitized path (no query params)
+
+### Sensitive Data Protection
+
+Use `logging::SanitizePath(path)` to strip query parameters and fragments from URLs before logging. Never log API keys, authorization headers, cookie values, message content, or full URLs with query parameters.
 
 ### Sinks
 
-- **Console sink**: Always active, with color output
-- **Rotating file sink**: Optional, configured via `log.file` in ServerConfig
-  - Rotates when file reaches `max_file_size` (default 10 MB)
-  - Keeps `max_files` rotated files (default 3)
+- **Console sink**: Active by default, with color output (disabled in daemon mode)
+- **File sink**: Configured via `log.file` in ServerConfig
+  - Uses `basic_file_sink_mt` with date-based path resolution
+  - Size-based rotation via `CheckRotation()` (called periodically)
+  - Default file: `logs/reactor.log` → `logs/reactor-{date}.log`
 
 ### Thread Safety
 
 - `Init()` must be called before spawning threads (sets up spdlog registry)
 - `Get()` is thread-safe after initialization
+- `CheckRotation()` is thread-safe (acquires internal mutex)
 - If `Init()` not called, `Get()` returns spdlog's default logger
 
 ## Third-Party Dependencies

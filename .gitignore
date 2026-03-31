@@ -9,3 +9,4 @@ run
 .vscode
 *.dSYM
 *.plist
+logs/

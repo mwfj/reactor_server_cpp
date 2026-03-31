@@ -2,7 +2,6 @@
 
 #include "spdlog/spdlog.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
-#include "spdlog/sinks/rotating_file_sink.h"
 #include "spdlog/sinks/basic_file_sink.h"
 
 #include <string>
@@ -13,9 +12,17 @@ namespace logging {
 // Initialize the logging system.
 // @param name     Logger name (appears in log output)
 // @param level    Minimum log level (default: info)
-// @param log_file Optional log file path for rotating file sink
-// @param max_size Maximum size of each log file in bytes (default: 10MB)
-// @param max_files Maximum number of rotated log files (default: 3)
+// @param log_file Log file path. Empty string = console only.
+//                 When max_files > 1: date-based naming is used:
+//                   {dir}/{prefix}-{YYYY-MM-DD}[-{seq}].log
+//                 When max_files <= 1: the path is used as-is (no date suffix),
+//                   compatible with external logrotate + SIGHUP → Reopen().
+// @param max_size Approximate maximum size per log file in bytes (default: 10MB).
+//                 Checked periodically by CheckRotation(), not on every write.
+//                 Files may briefly exceed this between checks.
+// @param max_files Maximum total log files to keep (default: 3).
+//                 Oldest files (across all dates) are pruned when exceeded.
+//                 Set to 1 for external logrotate compatibility (no auto-rotation).
 void Init(const std::string& name = "reactor",
           spdlog::level::level_enum level = spdlog::level::info,
           const std::string& log_file = "",
@@ -50,6 +57,20 @@ void SetLevel(spdlog::level::level_enum level);
 // Update the stored file sink config (file path, max size, max files).
 // Takes effect on next Reopen(). Thread-safe. Does NOT reopen immediately.
 void UpdateFileConfig(const std::string& file, size_t max_size, int max_files);
+
+// Check if the current log file exceeds max_file_size or the date has
+// rolled over, and rotate if needed. Called periodically from the
+// Dispatcher timer handler. Thread-safe. No-op if no file sink is configured.
+void CheckRotation();
+
+// Ensure the directory exists (creates it with 0755 if missing).
+// Throws std::runtime_error on failure.
+void EnsureLogDir(const std::string& dir);
+
+// Write a visual start/stop marker via the normal spdlog logger at info level.
+// Format: "================================ {text} ================================"
+// Filtered at warn+ levels (same as any other info message).
+void WriteMarker(const std::string& text);
 
 // Flush all sinks and shut down the logging system.
 void Shutdown();

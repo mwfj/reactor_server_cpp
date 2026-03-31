@@ -12,7 +12,7 @@
 #include "http/http_response.h"
 #include "log/logger.h"
 
-#include <cstdio>
+// <cstdio> provided by common.h (via http_server.h)
 #include <cstdlib>
 #include <exception>
 #if !defined(_WIN32)
@@ -403,10 +403,13 @@ static int HandleStart(const CliOptions& options) {
     if (rc != EXIT_OK) return rc;
 
     // ── Daemon pre-validation ───────────────────────────────
+    // Must run before any filesystem side effects (EnsureLogDir).
     if (options.daemonize) {
         rc = ValidateDaemonConfig(config, options);
         if (rc != EXIT_OK) return rc;
     }
+    // Note: logging::Init() calls EnsureLogDir internally when log.file
+    // has a directory component, so no explicit mkdir is needed here.
 
     // Resolve config path to absolute BEFORE daemonizing (chdir changes to "/").
     // Prefer $PWD (shell's logical cwd) to preserve symlinked deployment dirs.
@@ -534,26 +537,14 @@ static int HandleStart(const CliOptions& options) {
         logging::Get()->info("  Stats:   /stats");
     }
 
-    // ── Wire readiness callback to fire after init, before event loop ──
+    // ── Wire readiness callback — fires after bind/listen, before event loop ──
+    server->SetReadyCallback([&options]() {
+        logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
+        logging::WriteMarker("SERVER START");
 #if !defined(_WIN32)
-    if (options.daemonize) {
-        server->SetReadyCallback([]() {
-            logging::Get()->info("{} ready, accepting connections",
-                                REACTOR_SERVER_NAME);
-            Daemonizer::NotifyReady();
-        });
-    } else {
-        server->SetReadyCallback([]() {
-            logging::Get()->info("{} ready, accepting connections",
-                                REACTOR_SERVER_NAME);
-        });
-    }
-#else
-    server->SetReadyCallback([]() {
-        logging::Get()->info("{} ready, accepting connections",
-                            REACTOR_SERVER_NAME);
-    });
+        if (options.daemonize) Daemonizer::NotifyReady();
 #endif
+    });
 
     // ── Server thread ───────────────────────────────────────
     std::exception_ptr server_error;
@@ -583,6 +574,8 @@ static int HandleStart(const CliOptions& options) {
     while (true) {
         SignalResult sig = SignalHandler::WaitForSignal();
         if (sig == SignalResult::SHUTDOWN) break;
+        // Belt-and-suspenders rotation check (primary is Dispatcher::TimerHandler)
+        logging::CheckRotation();
         // SIGHUP received
         if (options.daemonize) {
             // Daemon mode: reload configuration.
@@ -610,6 +603,7 @@ static int HandleStart(const CliOptions& options) {
     }
 
     // ── Shutdown ────────────────────────────────────────────
+    logging::WriteMarker("SERVER STOP");
     logging::Get()->info("{} shutting down...", REACTOR_SERVER_NAME);
     server->Stop();
 

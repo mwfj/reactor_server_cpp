@@ -1,5 +1,6 @@
 #include "socket_handler.h"
 #include "log/logger.h"
+#include "log/log_utils.h"
 
 
 SocketHandler::SocketHandler() : fd_(CreateSocket()), port_(0) {}
@@ -40,8 +41,8 @@ void SocketHandler::Bind(const InetAddr& _servAddr){
     if(::bind(fd_, _servAddr.Addr(), sizeof(sockaddr_in)) < 0){
         int saved_errno = errno;  // Save errno before any other calls
         Close();
-        logging::Get()->error("Bind failed: {} (errno={})", strerror(saved_errno), saved_errno);
-        throw std::runtime_error(std::string("Error binding port: ") + strerror(saved_errno));
+        logging::Get()->error("Bind failed: {} (errno={})", logging::SafeStrerror(saved_errno), saved_errno);
+        throw std::runtime_error(std::string("Error binding port: ") + logging::SafeStrerror(saved_errno));
     }
 }
 
@@ -63,23 +64,24 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
     int clientfd = accept(fd_, reinterpret_cast<sockaddr*>(&acceptAddr), &len);
 #endif
     if(clientfd == -1){
+        int saved_errno = errno;
         // Don't close listening socket on accept error
-        if(errno == EAGAIN || errno == EWOULDBLOCK) {
+        if(saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
             return ACCEPT_QUEUE_DRAINED;
         }
-        if(errno == ECONNABORTED) {
+        if(saved_errno == ECONNABORTED) {
             return ACCEPT_CONN_ABORTED;
         }
-        if(errno == EMFILE || errno == ENFILE) {
-            logging::Get()->error("Accept failed (fd exhaustion): {}", strerror(errno));
+        if(saved_errno == EMFILE || saved_errno == ENFILE) {
+            logging::Get()->error("Accept failed (fd exhaustion): {}", logging::SafeStrerror(saved_errno));
             return ACCEPT_FD_EXHAUSTION;
         }
-        if(errno == ENOBUFS || errno == ENOMEM) {
-            logging::Get()->error("Accept failed (memory pressure): {}", strerror(errno));
+        if(saved_errno == ENOBUFS || saved_errno == ENOMEM) {
+            logging::Get()->error("Accept failed (memory pressure): {}", logging::SafeStrerror(saved_errno));
             return ACCEPT_MEMORY_PRESSURE;
         }
-        logging::Get()->error("Accept failed: {}", strerror(errno));
-        throw std::runtime_error(std::string("Error accepting connection: ") + strerror(errno));
+        logging::Get()->error("Accept failed: {}", logging::SafeStrerror(saved_errno));
+        throw std::runtime_error(std::string("Error accepting connection: ") + logging::SafeStrerror(saved_errno));
     }
 #if defined(__APPLE__) || defined(__MACH__)
     // Set non-blocking after successful accept on macOS.
@@ -124,35 +126,38 @@ void SocketHandler::SetNonBlocking(int fd) {
 
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1) {
+        int saved_errno = errno;
         // fd is likely already closed by peer (EBADF)
         // This is not an error - just a race condition we need to handle
-        if (errno == EBADF) {
+        if (saved_errno == EBADF) {
             // File descriptor already closed - this is expected in rapid close scenarios
             // No need to log as it's a normal race condition, not an error
             return;
         }
         // Other errors are unexpected - log them
         logging::Get()->error("Unexpected error getting socket flags: {} (errno={})",
-                              strerror(errno), errno);
-        throw std::runtime_error(std::string("Failed to get socket flags: ") + strerror(errno));
+                              logging::SafeStrerror(saved_errno), saved_errno);
+        throw std::runtime_error(std::string("Failed to get socket flags: ") + logging::SafeStrerror(saved_errno));
     }
 
     if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        int saved_errno = errno;
         // Same logic - fd might have been closed between the two fcntl calls
-        if (errno == EBADF) {
+        if (saved_errno == EBADF) {
             // File descriptor closed between F_GETFL and F_SETFL
             return;
         }
         logging::Get()->error("Unexpected error setting non-blocking mode: {} (errno={})",
-                              strerror(errno), errno);
-        throw std::runtime_error(std::string("Failed to set non-blocking mode: ") + strerror(errno));
+                              logging::SafeStrerror(saved_errno), saved_errno);
+        throw std::runtime_error(std::string("Failed to set non-blocking mode: ") + logging::SafeStrerror(saved_errno));
     }
 
     // macOS: suppress SIGPIPE per-socket since MSG_NOSIGNAL is not available
 #ifdef SO_NOSIGPIPE
     int set = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set)) < 0) {
-        logging::Get()->warn("Failed to set SO_NOSIGPIPE: {}", strerror(errno));
+        int saved_errno = errno;
+        logging::Get()->warn("Failed to set SO_NOSIGPIPE: {}", logging::SafeStrerror(saved_errno));
     }
 #endif
 }

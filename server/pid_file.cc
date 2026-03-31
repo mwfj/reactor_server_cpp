@@ -1,15 +1,14 @@
 #include "cli/pid_file.h"
 #include "cli/version.h"
 #include "common.h"
-// <cstring>, <iostream>, <fcntl.h>, <unistd.h> provided by common.h
+// <cstring>, <cstdio>, <iostream>, <fcntl.h>, <unistd.h>, <sys/stat.h>
+// provided by common.h
 
 #include <cerrno>
 #include <climits>
-#include <cstdio>
 #include <cstdlib>
 
 #include <sys/file.h>
-#include <sys/stat.h>
 
 // ── File-scope static state ──────────────────────────────────────
 

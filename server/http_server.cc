@@ -22,10 +22,14 @@ int HttpServer::ComputeTimerInterval(int idle_timeout_sec, int request_timeout_s
         ? std::max(request_timeout_sec / 3, 1) : 0;
     // Both user timeouts disabled, but protocol-level deadlines (WS close
     // handshake 5s, HTTP close-drain 30s) still need the timer scan.
-    if (idle_iv == 0 && req_iv == 0) return 5;
-    if (idle_iv == 0) return req_iv;
-    if (req_iv == 0) return idle_iv;
-    return std::min(idle_iv, req_iv);
+    int interval;
+    if (idle_iv == 0 && req_iv == 0) interval = 5;
+    else if (idle_iv == 0) interval = req_iv;
+    else if (req_iv == 0) interval = idle_iv;
+    else interval = std::min(idle_iv, req_iv);
+    // Cap at 30s to ensure log rotation checks run at a reasonable
+    // frequency regardless of timeout configuration.
+    return std::min(interval, 30);
 }
 
 void HttpServer::MarkServerReady() {
@@ -132,17 +136,17 @@ void HttpServer::WireNetServerCallbacks() {
         });
 }
 
-// Validate host is a numeric IPv4 address — inet_addr() silently returns
-// INADDR_NONE for hostnames like "localhost" or IPv6 literals, causing
-// a confusing bind failure much later.
+// Validate host is a strict dotted-quad IPv4 address. Uses inet_pton (not
+// inet_addr) to reject legacy shorthand forms like "1" or octal "0127.0.0.1".
 static const std::string& ValidateHost(const std::string& host) {
     if (host.empty()) {
         throw std::invalid_argument("bind host must not be empty");
     }
-    if (inet_addr(host.c_str()) == INADDR_NONE && host != "255.255.255.255") {
+    struct in_addr addr{};
+    if (inet_pton(AF_INET, host.c_str(), &addr) != 1) {
         throw std::invalid_argument(
             "Invalid bind host: '" + host +
-            "' (must be a numeric IPv4 address, e.g. '0.0.0.0' or '127.0.0.1')");
+            "' (must be a dotted-quad IPv4 address, e.g. '0.0.0.0' or '127.0.0.1')");
     }
     return host;
 }
@@ -431,6 +435,7 @@ void HttpServer::WaitForH2Drain() {
     });
 
     if (!h2_draining_.empty()) {
+        logging::Get()->warn("H2 drain timeout, force-closing remaining connections");
         // Timeout: force-close remaining. Move to local to avoid holding
         // drain_mtx_ during ForceClose (prevents lock coupling with late callbacks).
         auto remaining = std::move(h2_draining_);
@@ -512,7 +517,10 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
     // RegisterCallbacks enabling epoll and new_conn_callback running here),
     // skip entirely. Inserting a handler for a closed connection would leave
     // stale state in http_connections_ (potentially under fd -1 after ReleaseFd).
-    if (conn->IsClosing()) return;
+    if (conn->IsClosing()) {
+        logging::Get()->debug("New connection already closing fd={}, skipping", conn->fd());
+        return;
+    }
 
     // NOTE: total_accepted_ and active_connections_ are NOT incremented here.
     // They are incremented at map-insertion points (pending_detection_ in this
@@ -538,8 +546,8 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                     return;  // Already initialized by HandleMessage
                 }
                 // Stale handler from fd reuse — save for stream compensation,
-                // then evict. The old connection's close callback can no longer
-                // find this entry, so we must decrement here.
+                // then evict.
+                logging::Get()->debug("Evicted stale H2 handler fd={}", conn->fd());
                 stale_h2 = h2_it->second;
                 h2_connections_.erase(h2_it);
             }
@@ -549,6 +557,7 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
                     return;  // Already initialized by HandleMessage
                 }
                 // Stale handler from fd reuse — save for WS close, then evict
+                logging::Get()->debug("Evicted stale handler fd={}", conn->fd());
                 stale_h1 = std::move(h1_it->second);
                 http_connections_.erase(h1_it);
             }
@@ -815,6 +824,7 @@ bool HttpServer::DetectAndRouteProtocol(
             }
             return true;
         }
+        logging::Get()->debug("Protocol detected: HTTP/2 fd={}", conn->fd());
         Http2Session::Settings settings_snapshot;
         std::shared_ptr<Http2ConnectionHandler> h2_conn;
         {
@@ -851,6 +861,7 @@ bool HttpServer::DetectAndRouteProtocol(
         }
         return true;
     }
+    logging::Get()->debug("Protocol detected: HTTP/1.x fd={}", conn->fd());
     auto http_conn = std::make_shared<HttpConnectionHandler>(conn);
     SetupHandlers(http_conn);
     std::shared_ptr<HttpConnectionHandler> stale_existing;

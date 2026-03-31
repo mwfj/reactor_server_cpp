@@ -54,7 +54,10 @@ void Http2ConnectionHandler::SetMaxHeaderSize(size_t max) {
 }
 
 void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
-    if (initialized_) return;
+    if (initialized_) {
+        logging::Get()->debug("H2 Initialize called twice fd={}", conn_ ? conn_->fd() : -1);
+        return;
+    }
     initialized_ = true;
     initializing_ = true;  // suppress OnSendComplete drain during init
 
@@ -188,6 +191,7 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
     // replay the shutdown now. Done AFTER initial_data processing so any
     // buffered request is dispatched before GOAWAY closes the session.
     if (shutdown_requested_.load(std::memory_order_acquire)) {
+        logging::Get()->debug("H2 shutdown replay: sending GOAWAY fd={}", conn_ ? conn_->fd() : -1);
         if (!session_->IsGoawaySent()) {
             session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
             session_->SendPendingFrames();
@@ -244,6 +248,7 @@ void Http2ConnectionHandler::OnRawData(
 
     // Check if session wants to close
     if (!session_->IsAlive()) {
+        logging::Get()->debug("H2 session not alive fd={}, closing", conn_ ? conn_->fd() : -1);
         conn_->CloseAfterWrite();
         return;
     }
@@ -267,6 +272,7 @@ void Http2ConnectionHandler::OnRawData(
 void Http2ConnectionHandler::RequestShutdown() {
     if (shutdown_requested_.exchange(true)) return;  // already requested
     if (!conn_) return;
+    logging::Get()->debug("H2 shutdown requested fd={}", conn_->fd());
 
     // Enqueue GOAWAY + drain check on the dispatcher thread.
     // RunOnDispatcher uses EnQueue — runs on the next event loop iteration.
@@ -306,6 +312,7 @@ void Http2ConnectionHandler::SetDrainCompleteCallback(DrainCompleteCallback cb) 
 void Http2ConnectionHandler::NotifyDrainComplete() {
     if (drain_notified_) return;
     drain_notified_ = true;
+    logging::Get()->debug("H2 drain complete fd={}", conn_ ? conn_->fd() : -1);
     resume_scheduled_ = false;  // no more resumes needed
     conn_->CloseAfterWrite();
     if (drain_complete_cb_) {

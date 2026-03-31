@@ -5,7 +5,6 @@ WebSocketParser::WebSocketParser() {}
 
 size_t WebSocketParser::Parse(const char* data, size_t len) {
     buffer_.append(data, len);
-    size_t total_consumed = 0;
     size_t offset = 0;  // track position within buffer_ to avoid O(N^2) erase
 
     auto buf_remaining = [&]() -> size_t { return buffer_.size() - offset; };
@@ -25,7 +24,7 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
 
                 uint8_t len7 = byte2 & 0x7F;
                 offset += 2;
-                total_consumed += 2;
+
 
                 // RFC 6455 §5.2: RSV bits must be 0 unless extension negotiated
                 if ((byte1 & 0x70) != 0) {
@@ -92,7 +91,7 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                 }
                 current_.payload_length = len16;
                 offset += 2;
-                total_consumed += 2;
+
                 if (max_payload_size_ > 0 && current_.payload_length > max_payload_size_) {
                     has_error_ = true;
                     error_message_ = "Frame payload exceeds maximum size";
@@ -122,7 +121,6 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                 }
                 current_.payload_length = len64;
                 offset += 8;
-                total_consumed += 8;
                 if (max_payload_size_ > 0 && current_.payload_length > max_payload_size_) {
                     has_error_ = true;
                     error_message_ = "Frame payload exceeds maximum size";
@@ -136,7 +134,6 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
                 if (buf_remaining() < 4) goto done;
                 std::memcpy(current_.masking_key, buffer_.data() + offset, 4);
                 offset += 4;
-                total_consumed += 4;
                 state_ = State::ReadPayload;
                 payload_read_ = 0;
                 break;
@@ -157,7 +154,6 @@ size_t WebSocketParser::Parse(const char* data, size_t len) {
 
                 current_.payload.append(buffer_.data() + offset, available);
                 offset += available;
-                total_consumed += available;
                 payload_read_ += available;
 
                 if (payload_read_ == current_.payload_length) {
@@ -181,11 +177,7 @@ done:
     }
 
     // Return `len` — the parser always consumes all input into its internal
-    // buffer. The previous return of `total_consumed` counted bytes processed
-    // from the internal buffer (which includes previously buffered data),
-    // not from the current data,len chunk. That broke the API contract:
-    // e.g., feeding an 8-byte frame as 1+7 bytes would return 0 then 8,
-    // even though the second chunk was only 7 bytes.
+    // buffer and processes what it can from offset.
     return len;
 }
 

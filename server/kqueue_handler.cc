@@ -2,10 +2,12 @@
 #include "kqueue_handler.h"
 #include "channel.h"
 #include "log/logger.h"
+#include "log/log_utils.h"
 
 KqueueHandler::KqueueHandler(){
     if((kqueuefd_ = ::kqueue()) == -1){
-        logging::Get()->error("kqueue() failed: {}", strerror(errno));
+        int saved_errno = errno;
+        logging::Get()->error("kqueue() failed: {}", logging::SafeStrerror(saved_errno));
         throw std::runtime_error("kqueue() failed");
     }
 }
@@ -65,11 +67,12 @@ void KqueueHandler::UpdateEvent(std::shared_ptr<Channel> ch){
     // Apply changes to kqueue
     if(numChanges > 0){
         if(::kevent(kqueuefd_, evSet, numChanges, nullptr, 0, nullptr) == -1){
+            int saved_errno = errno;
             // If fd is invalid or not in kqueue, it might be closing - don't throw
-            if (errno == EBADF || errno == ENOENT) {
+            if (saved_errno == EBADF || saved_errno == ENOENT) {
                 return;  // Gracefully handle race condition
             }
-            logging::Get()->error("kevent failed (fd={}): {}", fd, strerror(errno));
+            logging::Get()->error("kevent failed (fd={}): {}", fd, logging::SafeStrerror(saved_errno));
             // Don't throw - just log and continue
             return;
         }
@@ -97,11 +100,12 @@ void KqueueHandler::RemoveChannel(std::shared_ptr<Channel> ch){
         EV_SET(&evSets[0], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
         EV_SET(&evSets[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
         if(::kevent(kqueuefd_, evSets, 2, nullptr, 0, nullptr) == -1){
+            int saved_errno = errno;
             // ENOENT means it wasn't in kqueue (already removed or never added)
             // EBADF means fd is invalid (already closed)
             // Both are ok - we just want to ensure it's not in kqueue
-            if(errno != ENOENT && errno != EBADF){
-                logging::Get()->warn("kevent DEL warning fd={}: {}", fd, strerror(errno));
+            if(saved_errno != ENOENT && saved_errno != EBADF){
+                logging::Get()->warn("kevent DEL warning fd={}: {}", fd, logging::SafeStrerror(saved_errno));
             }
         }
     }
@@ -134,12 +138,13 @@ std::vector<std::shared_ptr<Channel>> KqueueHandler::WaitForEvent(int timeout){
     int nevents = kevent(kqueuefd_, nullptr, 0,  events_, MAX_EVETN_NUMS, timeout_ptr);
 
     if(nevents < 0){
+        int saved_errno = errno;
         // interrupted by other signal
-        if(errno == EINTR){
+        if(saved_errno == EINTR){
              logging::Get()->debug("kevent() interrupted by signal");
              return {};
         }
-        logging::Get()->error("kevent() failed: {}", strerror(errno));
+        logging::Get()->error("kevent() failed: {}", logging::SafeStrerror(saved_errno));
         throw std::runtime_error("kevent() failed");
     }
 
