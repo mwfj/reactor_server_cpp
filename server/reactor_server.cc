@@ -23,8 +23,11 @@ void ReactorServer::Start(){
 }
 
 void ReactorServer::Stop(){
-    task_workers_.Stop();
+    // Stop net_server_ FIRST — drains connections and stops dispatching
+    // callbacks. Then stop task_workers_ safely (no more AddTask calls
+    // from ProcessMessage since all dispatchers have stopped).
     net_server_.Stop();
+    task_workers_.Stop();
 }
 
 void ReactorServer::NewConnection(std::shared_ptr<ConnectionHandler> conn){

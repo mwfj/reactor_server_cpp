@@ -950,11 +950,11 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         validation_copy.bind_port = 8080;          // always valid
         validation_copy.worker_threads = 1;        // always valid
         validation_copy.tls.enabled = false;       // skip TLS path checks
-        // Always validate H2 sub-settings: Reload() copies them to h2_settings_
-        // regardless of http2.enabled (which is restart-only). The enabled flag
-        // itself is ignored — only the sub-settings (max_concurrent_streams,
-        // initial_window_size, etc.) matter for new connections.
-        validation_copy.http2.enabled = true;
+        // Validate H2 sub-settings only when the running server uses H2.
+        // When H2 is disabled at startup, Reload() copies sub-settings to
+        // h2_settings_ but they're never used (no H2 sessions are created),
+        // so invalid placeholder values are harmless and should not block reload.
+        validation_copy.http2.enabled = http2_enabled_;
         try {
             ConfigLoader::Validate(validation_copy);
         } catch (const std::invalid_argument& e) {

@@ -221,6 +221,8 @@ static int OnDataChunkRecvCallback(
         stream->AccumulatedBodySize() + len > self->MaxBodySize()) {
         logging::Get()->warn("HTTP/2 stream {} body exceeds max size ({})",
                              stream_id, self->MaxBodySize());
+        if (self->Callbacks().request_count_callback)
+            self->Callbacks().request_count_callback();
         stream->MarkRejected();
         int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                            stream_id, NGHTTP2_CANCEL);
@@ -249,6 +251,8 @@ static int OnDataChunkRecvCallback(
     if (cl_violated) {
         logging::Get()->warn("HTTP/2 stream {} DATA exceeds declared content-length {}",
                              stream_id, req.content_length);
+        if (self->Callbacks().request_count_callback)
+            self->Callbacks().request_count_callback();
         stream->MarkRejected();
         int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                            stream_id, NGHTTP2_PROTOCOL_ERROR);
@@ -305,6 +309,8 @@ static int OnFrameRecvCallback(
             if (!valid) {
                 logging::Get()->warn("HTTP/2 stream {} invalid pseudo-headers for {} request",
                                      frame->hd.stream_id, req.method);
+                if (self->Callbacks().request_count_callback)
+                    self->Callbacks().request_count_callback();
                 int rst_rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                                        frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
                 if (rst_rv < 0) {
@@ -321,6 +327,8 @@ static int OnFrameRecvCallback(
             if (self->MaxBodySize() > 0 && req.content_length > self->MaxBodySize()) {
                 logging::Get()->warn("HTTP/2 stream {} content-length {} exceeds max body size {}",
                                      frame->hd.stream_id, req.content_length, self->MaxBodySize());
+                if (self->Callbacks().request_count_callback)
+                    self->Callbacks().request_count_callback();
                 nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                           frame->hd.stream_id, NGHTTP2_CANCEL);
                 stream->MarkRejected();
@@ -351,6 +359,8 @@ static int OnFrameRecvCallback(
                     // Unsupported Expect value — reject with 417.
                     logging::Get()->warn("HTTP/2 stream {} unsupported Expect: {}",
                                          frame->hd.stream_id, expect);
+                    if (self->Callbacks().request_count_callback)
+                        self->Callbacks().request_count_callback();
                     // submit_response2 queues the HTTP response (END_STREAM).
                     nghttp2_nv nva_417[] = {
                         {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
