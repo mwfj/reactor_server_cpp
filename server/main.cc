@@ -12,7 +12,7 @@
 #include "http/http_response.h"
 #include "log/logger.h"
 
-#include <cstdio>
+// <cstdio> provided by common.h (via http_server.h)
 #include <cstdlib>
 #include <exception>
 #if !defined(_WIN32)

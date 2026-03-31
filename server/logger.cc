@@ -1,16 +1,8 @@
 #include "log/logger.h"
 #include "log/log_utils.h"
-
-#include <vector>
-#include <mutex>
-#include <ctime>
-#include <cstdio>
-#include <cstring>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <chrono>
-#include <algorithm>
+#include "common.h"
+// <vector>, <mutex>, <cstring>, <ctime>, <cstdio>, <chrono>, <algorithm>,
+// <sys/types.h>, <sys/stat.h>, <dirent.h> provided by common.h
 
 namespace logging {
 
