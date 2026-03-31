@@ -125,7 +125,11 @@ std::vector<Segment> ParsePattern(const std::string& pattern) {
             continue;
         }
 
-        if (pattern[pos] == ':') {
+        // ':' and '*' are only special at segment start (after '/' or at pos=1).
+        // Mid-segment ':' or '*' (e.g., /v:version, /file*name) are static text.
+        bool at_seg_start = current_static.empty() || current_static.back() == '/';
+
+        if (at_seg_start && pattern[pos] == ':') {
             // PARAM — flush accumulated static (which includes trailing '/')
             if (!current_static.empty()) {
                 Segment seg;
@@ -154,7 +158,7 @@ std::vector<Segment> ParsePattern(const std::string& pattern) {
             seg.constraint = std::move(constraint);
             segments.push_back(std::move(seg));
 
-        } else if (pattern[pos] == '*') {
+        } else if (at_seg_start && pattern[pos] == '*') {
             // CATCH_ALL — flush accumulated static
             if (!current_static.empty()) {
                 Segment seg;

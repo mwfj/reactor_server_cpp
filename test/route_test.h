@@ -366,45 +366,45 @@ void TestTrieConflictDuplicateCatchAll() {
     }
 }
 
-// Test 15: different param names at same position share the node (first name wins)
+// Test 15: different param names at same position — each route gets its own names
 void TestTrieParamNameSharesNode() {
     try {
         IntTrie trie;
-        // Insert /users/:id first — node records param_name = "id"
         trie.Insert("/users/:id", 1);
-        // Insert /users/:user_id/orders — allowed, warnings expected, first name "id" wins
         trie.Insert("/users/:user_id/orders", 2);
 
         bool pass = true;
         std::string err;
 
-        // /users/42 should still match first route
+        // /users/42 should match first route with param key "id"
         {
             std::unordered_map<std::string, std::string> params;
             auto result = trie.Search("/users/42", params);
             if (!result.handler || *result.handler != 1) {
                 pass = false; err += "/users/42 handler wrong; ";
             }
-            // params key uses the first-registered name "id"
-            if (params.count("id") == 0) {
-                pass = false; err += "param key 'id' not found; ";
+            if (params.count("id") == 0 || params["id"] != "42") {
+                pass = false; err += "param key 'id' not found or wrong value; ";
             }
         }
 
-        // /users/42/orders should match second route
+        // /users/42/orders should match second route with param key "user_id"
         {
             std::unordered_map<std::string, std::string> params;
             auto result = trie.Search("/users/42/orders", params);
             if (!result.handler || *result.handler != 2) {
                 pass = false; err += "/users/42/orders handler wrong; ";
             }
+            if (params.count("user_id") == 0 || params["user_id"] != "42") {
+                pass = false; err += "param key 'user_id' not found or wrong value; ";
+            }
         }
 
         TestFramework::RecordTest(
-            "RouteTrie: different param names at same position allowed (first wins)",
+            "RouteTrie: different param names — each route uses its own names",
             pass, err, TestFramework::TestCategory::ROUTE);
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("RouteTrie: different param names at same position allowed (first wins)",
+        TestFramework::RecordTest("RouteTrie: different param names — each route uses its own names",
             false, e.what(), TestFramework::TestCategory::ROUTE);
     }
 }
@@ -1250,6 +1250,36 @@ void TestRouterParamsClearedOnMiss() {
     }
 }
 
+// Regression: mid-segment : and * are static text, not dynamic tokens
+void TestTrieMidSegmentColonStar() {
+    try {
+        IntTrie trie;
+        trie.Insert("/v:version/docs", 1);   // "v:version" is static text
+        trie.Insert("/file*name", 2);          // "file*name" is static text
+
+        std::unordered_map<std::string, std::string> params;
+        auto r1 = trie.Search("/v:version/docs", params);
+        auto r2 = trie.Search("/file*name", params);
+        // These should NOT match as params
+        auto r3 = trie.Search("/v1/docs", params);
+
+        bool pass = (r1.handler && *r1.handler == 1) &&
+                    (r2.handler && *r2.handler == 2) &&
+                    (r3.handler == nullptr);
+        std::string err;
+        if (!r1.handler) err = "/v:version/docs did not match as static";
+        else if (!r2.handler) err = "/file*name did not match as static";
+        else if (r3.handler) err = "/v1/docs should not match (: is mid-segment static)";
+        TestFramework::RecordTest(
+            "RouteTrie: mid-segment : and * treated as static text",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "RouteTrie: mid-segment : and * treated as static text",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RunAllTests
 // ---------------------------------------------------------------------------
@@ -1308,6 +1338,7 @@ void RunAllTests() {
     TestTrieParamTrailingSlashDistinct();
     TestTrieRegexCharacterClass();
     TestRouterParamsClearedOnMiss();
+    TestTrieMidSegmentColonStar();
 }
 
 }  // namespace RouteTests
