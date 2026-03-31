@@ -19,11 +19,11 @@ void HttpRouter::Delete(const std::string& path, Handler handler) {
 }
 
 void HttpRouter::Route(const std::string& method, const std::string& path, Handler handler) {
-    routes_.push_back({method, path, std::move(handler)});
+    method_tries_[method].Insert(path, std::move(handler));
 }
 
 void HttpRouter::WebSocket(const std::string& path, WsUpgradeHandler handler) {
-    ws_routes_.push_back({path, std::move(handler)});
+    ws_trie_.Insert(path, std::move(handler));
 }
 
 void HttpRouter::Use(Middleware middleware) {
@@ -48,10 +48,14 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
         }
     }
 
-    // Find matching route — exact method match first
-    for (const auto& route : routes_) {
-        if (route.path == request.path && route.method == request.method) {
-            route.handler(request, response);
+    // Find matching route in the method's trie
+    auto it = method_tries_.find(request.method);
+    if (it != method_tries_.end()) {
+        std::unordered_map<std::string, std::string> params;
+        auto result = it->second.Search(request.path, params);
+        if (result.handler) {
+            request.params = std::move(params);
+            (*result.handler)(request, response);
             return true;
         }
     }
@@ -61,11 +65,15 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     // req.method see "GET" and behave correctly (body stripping happens later
     // in HttpConnectionHandler).
     if (request.method == "HEAD") {
-        for (const auto& route : routes_) {
-            if (route.path == request.path && route.method == "GET") {
+        auto git = method_tries_.find("GET");
+        if (git != method_tries_.end()) {
+            std::unordered_map<std::string, std::string> params;
+            auto result = git->second.Search(request.path, params);
+            if (result.handler) {
                 HttpRequest get_req = request;
                 get_req.method = "GET";
-                route.handler(get_req, response);
+                get_req.params = std::move(params);
+                (*result.handler)(get_req, response);
                 return true;
             }
         }
@@ -76,12 +84,13 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     std::string allowed;
     bool has_get = false;
     bool has_head = false;
-    for (const auto& route : routes_) {
-        if (route.path == request.path) {
+    for (const auto& [method, trie] : method_tries_) {
+        if (method == request.method) continue;  // already checked
+        if (trie.HasMatch(request.path)) {
             if (!allowed.empty()) allowed += ", ";
-            allowed += route.method;
-            if (route.method == "GET") has_get = true;
-            if (route.method == "HEAD") has_head = true;
+            allowed += method;
+            if (method == "GET") has_get = true;
+            if (method == "HEAD") has_head = true;
         }
     }
     // Implicit HEAD support for GET routes (RFC 7231 §4.3.2)
@@ -111,15 +120,15 @@ bool HttpRouter::RunMiddleware(const HttpRequest& request, HttpResponse& respons
 }
 
 bool HttpRouter::HasWebSocketRoute(const std::string& path) const {
-    for (const auto& ws : ws_routes_) {
-        if (ws.path == path) return true;
-    }
-    return false;
+    return ws_trie_.HasMatch(path);
 }
 
-HttpRouter::WsUpgradeHandler HttpRouter::GetWebSocketHandler(const std::string& path) const {
-    for (const auto& ws : ws_routes_) {
-        if (ws.path == path) return ws.handler;
+HttpRouter::WsUpgradeHandler HttpRouter::GetWebSocketHandler(const HttpRequest& request) const {
+    std::unordered_map<std::string, std::string> params;
+    auto result = ws_trie_.Search(request.path, params);
+    if (result.handler) {
+        request.params = std::move(params);
+        return *result.handler;
     }
     return nullptr;
 }

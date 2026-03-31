@@ -59,7 +59,7 @@ THREAD_POOL_SRCS = $(THREAD_POOL_DIR)/src/threadpool.cc $(THREAD_POOL_DIR)/src/t
 FOUNDATION_SRCS = $(SERVER_DIR)/logger.cc $(SERVER_DIR)/config_loader.cc
 
 # HTTP layer sources
-HTTP_SRCS = $(SERVER_DIR)/http_response.cc $(SERVER_DIR)/http_parser.cc $(SERVER_DIR)/http_router.cc $(SERVER_DIR)/http_connection_handler.cc $(SERVER_DIR)/http_server.cc
+HTTP_SRCS = $(SERVER_DIR)/http_response.cc $(SERVER_DIR)/http_parser.cc $(SERVER_DIR)/route_trie.cc $(SERVER_DIR)/http_router.cc $(SERVER_DIR)/http_connection_handler.cc $(SERVER_DIR)/http_server.cc
 
 # WebSocket layer sources
 WS_SRCS = $(SERVER_DIR)/websocket_frame.cc $(SERVER_DIR)/websocket_handshake.cc $(SERVER_DIR)/websocket_parser.cc $(SERVER_DIR)/websocket_connection.cc

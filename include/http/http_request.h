@@ -2,6 +2,8 @@
 
 #include "common.h"
 
+#include <unordered_map>
+
 struct HttpRequest {
     std::string method;           // "GET", "POST", "PUT", "DELETE", etc.
     std::string url;              // Full URL as received ("/path?query=value")
@@ -16,6 +18,10 @@ struct HttpRequest {
     size_t content_length = 0;
     bool headers_complete = false; // True when headers are parsed (body may still be pending)
     bool complete = false;        // True when full request has been parsed
+
+    // Route parameters populated by HttpRouter during dispatch.
+    // Mutable because routing is an output of dispatch, not parser input.
+    mutable std::unordered_map<std::string, std::string> params;
 
     // Case-insensitive header lookup
     std::string GetHeader(const std::string& name) const {
@@ -46,5 +52,6 @@ struct HttpRequest {
         content_length = 0;
         headers_complete = false;
         complete = false;
+        params.clear();
     }
 };

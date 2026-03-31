@@ -414,8 +414,9 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetUpgradeCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
                const HttpRequest& request) {
-            auto ws_handler = router_.GetWebSocketHandler(request.path);
+            auto ws_handler = router_.GetWebSocketHandler(request);
             if (ws_handler && self->GetWebSocket()) {
+                self->GetWebSocket()->SetParams(request.params);
                 ws_handler(*self->GetWebSocket());
             }
         }

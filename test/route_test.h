@@ -1,0 +1,1071 @@
+#pragma once
+
+#include "test_framework.h"
+#include "http/route_trie.h"
+#include "http/http_router.h"
+#include "http/http_request.h"
+#include "http/http_response.h"
+#include "http/http_server.h"
+
+#include <string>
+#include <unordered_map>
+#include <stdexcept>
+
+// =============================================================================
+// RouteTests — comprehensive tests for RouteTrie and HttpRouter pattern matching
+//
+// Port range: 10600-10650 (reserved for this suite; no live server used here)
+//
+// Dimensions covered:
+//   1. RouteTrie unit tests  — direct trie API (no HTTP server)
+//   2. HttpRouter integration — router dispatch, params, 405, HEAD fallback,
+//                               middleware interaction, and params reset
+// =============================================================================
+
+namespace RouteTests {
+
+// ---------------------------------------------------------------------------
+// Convenience alias: trie keyed on simple int handlers
+// ---------------------------------------------------------------------------
+using IntTrie = RouteTrie<int>;
+
+// ---------------------------------------------------------------------------
+// RouteTrie Unit Tests
+// ---------------------------------------------------------------------------
+
+// Test 1: static route matches exactly
+void TestTrieExactMatch() {
+    try {
+        IntTrie trie;
+        trie.Insert("/health", 42);
+
+        std::unordered_map<std::string, std::string> params;
+        auto result = trie.Search("/health", params);
+
+        bool pass = (result.handler != nullptr) &&
+                    (*result.handler == 42) &&
+                    params.empty();
+        TestFramework::RecordTest(
+            "RouteTrie: exact static match /health",
+            pass, pass ? "" : "handler not found or wrong value",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: exact static match /health",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 2: single :id parameter extraction
+void TestTrieParameterMatch() {
+    try {
+        IntTrie trie;
+        trie.Insert("/users/:id", 1);
+
+        std::unordered_map<std::string, std::string> params;
+        auto result = trie.Search("/users/42", params);
+
+        bool pass = (result.handler != nullptr) &&
+                    (params.count("id") == 1) &&
+                    (params.at("id") == "42");
+        TestFramework::RecordTest(
+            "RouteTrie: parameter :id extraction",
+            pass, pass ? "" : "handler null or params wrong",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: parameter :id extraction",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 3: two parameters in one route
+void TestTrieMultipleParameters() {
+    try {
+        IntTrie trie;
+        trie.Insert("/users/:id/orders/:oid", 2);
+
+        std::unordered_map<std::string, std::string> params;
+        auto result = trie.Search("/users/99/orders/7", params);
+
+        bool pass = (result.handler != nullptr) &&
+                    (params.count("id") == 1) && (params.at("id") == "99") &&
+                    (params.count("oid") == 1) && (params.at("oid") == "7");
+        TestFramework::RecordTest(
+            "RouteTrie: multiple parameters :id and :oid",
+            pass, pass ? "" : "params mismatch",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: multiple parameters :id and :oid",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 4: /users/:id must NOT match /users/ (empty segment)
+void TestTrieParameterNoMatch() {
+    try {
+        IntTrie trie;
+        trie.Insert("/users/:id", 1);
+
+        std::unordered_map<std::string, std::string> params;
+        auto result = trie.Search("/users/", params);
+
+        // /users/ has an empty segment after the slash — params require non-empty
+        bool pass = (result.handler == nullptr);
+        TestFramework::RecordTest(
+            "RouteTrie: param does not match empty segment /users/",
+            pass, pass ? "" : "handler should be null for empty segment",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: param does not match empty segment /users/",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 5: constrained param (\d+) matches digits
+void TestTrieConstrainedParameter() {
+    try {
+        IntTrie trie;
+        trie.Insert("/users/:id(\\d+)", 5);
+
+        std::unordered_map<std::string, std::string> params;
+        auto result = trie.Search("/users/42", params);
+
+        bool pass = (result.handler != nullptr) &&
+                    (params.count("id") == 1) && (params.at("id") == "42");
+        TestFramework::RecordTest(
+            "RouteTrie: constrained param :id(\\d+) matches digits",
+            pass, pass ? "" : "constrained param did not match digits",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: constrained param :id(\\d+) matches digits",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 6: constrained param (\d+) rejects alphabetic value
+void TestTrieConstrainedParameterFail() {
+    try {
+        IntTrie trie;
+        trie.Insert("/users/:id(\\d+)", 5);
+
+        std::unordered_map<std::string, std::string> params;
+        auto result = trie.Search("/users/abc", params);
+
+        bool pass = (result.handler == nullptr);
+        TestFramework::RecordTest(
+            "RouteTrie: constrained param :id(\\d+) rejects alpha",
+            pass, pass ? "" : "should not match alphabetic segment",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: constrained param :id(\\d+) rejects alpha",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 7: catch-all *filepath captures tail without leading slash
+void TestTrieCatchAll() {
+    try {
+        IntTrie trie;
+        trie.Insert("/static/*filepath", 7);
+
+        std::unordered_map<std::string, std::string> params;
+        auto result = trie.Search("/static/css/a.css", params);
+
+        // Per trie convention: captured tail does NOT include the leading '/'
+        bool pass = (result.handler != nullptr) &&
+                    (params.count("filepath") == 1) &&
+                    (params.at("filepath") == "css/a.css");
+        TestFramework::RecordTest(
+            "RouteTrie: catch-all *filepath captures tail without leading /",
+            pass, pass ? "" :
+                "handler null or filepath='" + params["filepath"] + "' (expected 'css/a.css')",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: catch-all *filepath captures tail without leading /",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 8: catch-all matches path with empty tail (/static/)
+void TestTrieCatchAllEmpty() {
+    try {
+        IntTrie trie;
+        trie.Insert("/static/*filepath", 7);
+
+        std::unordered_map<std::string, std::string> params;
+        auto result = trie.Search("/static/", params);
+
+        // After consuming "/static/" the remaining path is empty string
+        bool pass = (result.handler != nullptr) &&
+                    (params.count("filepath") == 1) &&
+                    (params.at("filepath").empty());
+        TestFramework::RecordTest(
+            "RouteTrie: catch-all *filepath captures empty tail /static/",
+            pass, pass ? "" :
+                "handler null or unexpected filepath value",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: catch-all *filepath captures empty tail /static/",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 9: unnamed catch-all /api/* still matches
+void TestTrieCatchAllUnnamed() {
+    try {
+        IntTrie trie;
+        trie.Insert("/api/*", 9);
+
+        std::unordered_map<std::string, std::string> params;
+        auto result = trie.Search("/api/v1/users", params);
+
+        // Unnamed catch-all: no param_name, so no entry in params
+        bool pass = (result.handler != nullptr) && params.empty();
+        TestFramework::RecordTest(
+            "RouteTrie: unnamed catch-all /api/* matches any tail",
+            pass, pass ? "" : "handler null or unexpected params",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: unnamed catch-all /api/* matches any tail",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 10: static child beats param child at same level
+void TestTriePriorityStaticOverParam() {
+    try {
+        IntTrie trie;
+        trie.Insert("/users/admin", 10);
+        trie.Insert("/users/:id", 11);
+
+        std::unordered_map<std::string, std::string> params;
+        auto result = trie.Search("/users/admin", params);
+
+        bool pass = (result.handler != nullptr) &&
+                    (*result.handler == 10) &&
+                    params.empty();
+        TestFramework::RecordTest(
+            "RouteTrie: static /users/admin beats param /users/:id",
+            pass, pass ? "" :
+                "wrong handler=" + (result.handler ? std::to_string(*result.handler) : "null"),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: static /users/admin beats param /users/:id",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 11: param beats catch-all; catch-all used when param can't match deeper path
+void TestTriePriorityParamOverCatchAll() {
+    try {
+        IntTrie trie;
+        trie.Insert("/api/:version", 20);
+        trie.Insert("/api/*rest", 21);
+
+        bool pass = true;
+        std::string err;
+
+        // /api/v1 — single segment, should hit param
+        {
+            std::unordered_map<std::string, std::string> params;
+            auto result = trie.Search("/api/v1", params);
+            if (!result.handler || *result.handler != 20) {
+                pass = false;
+                err += "/api/v1 should hit param handler (20); ";
+            }
+            if (params.count("version") == 0 || params.at("version") != "v1") {
+                pass = false;
+                err += "version param missing or wrong; ";
+            }
+        }
+
+        // /api/v1/docs — two segments, param can't match (param is leaf after one segment)
+        // so catch-all takes over
+        {
+            std::unordered_map<std::string, std::string> params;
+            auto result = trie.Search("/api/v1/docs", params);
+            if (!result.handler || *result.handler != 21) {
+                pass = false;
+                err += "/api/v1/docs should fall back to catch-all (21); ";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "RouteTrie: param beats catch-all; catch-all on deeper path",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: param beats catch-all; catch-all on deeper path",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 12: registering the same pattern twice throws
+void TestTrieConflictDuplicateRoute() {
+    try {
+        IntTrie trie;
+        trie.Insert("/users/:id", 1);
+
+        bool threw = false;
+        try {
+            trie.Insert("/users/:id", 2);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+
+        TestFramework::RecordTest(
+            "RouteTrie: duplicate route /users/:id throws",
+            threw, threw ? "" : "expected std::invalid_argument",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: duplicate route /users/:id throws",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 13: same param position with different constraints throws
+void TestTrieConflictConstraintClash() {
+    try {
+        IntTrie trie;
+        trie.Insert("/users/:id(\\d+)", 1);
+
+        bool threw = false;
+        try {
+            trie.Insert("/users/:id([a-z]+)", 2);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+
+        TestFramework::RecordTest(
+            "RouteTrie: different constraints at same position throws",
+            threw, threw ? "" : "expected std::invalid_argument for constraint clash",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: different constraints at same position throws",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 14: two catch-alls at the same level throw
+void TestTrieConflictDuplicateCatchAll() {
+    try {
+        IntTrie trie;
+        trie.Insert("/static/*filepath", 1);
+
+        bool threw = false;
+        try {
+            trie.Insert("/static/*rest", 2);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+
+        TestFramework::RecordTest(
+            "RouteTrie: duplicate catch-all at same level throws",
+            threw, threw ? "" : "expected std::invalid_argument for duplicate catch-all",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: duplicate catch-all at same level throws",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 15: different param names at same position share the node (first name wins)
+void TestTrieParamNameSharesNode() {
+    try {
+        IntTrie trie;
+        // Insert /users/:id first — node records param_name = "id"
+        trie.Insert("/users/:id", 1);
+        // Insert /users/:user_id/orders — allowed, warnings expected, first name "id" wins
+        trie.Insert("/users/:user_id/orders", 2);
+
+        bool pass = true;
+        std::string err;
+
+        // /users/42 should still match first route
+        {
+            std::unordered_map<std::string, std::string> params;
+            auto result = trie.Search("/users/42", params);
+            if (!result.handler || *result.handler != 1) {
+                pass = false; err += "/users/42 handler wrong; ";
+            }
+            // params key uses the first-registered name "id"
+            if (params.count("id") == 0) {
+                pass = false; err += "param key 'id' not found; ";
+            }
+        }
+
+        // /users/42/orders should match second route
+        {
+            std::unordered_map<std::string, std::string> params;
+            auto result = trie.Search("/users/42/orders", params);
+            if (!result.handler || *result.handler != 2) {
+                pass = false; err += "/users/42/orders handler wrong; ";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "RouteTrie: different param names at same position allowed (first wins)",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: different param names at same position allowed (first wins)",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 16: pattern not starting with '/' throws
+void TestTrieInvalidPatternNoSlash() {
+    try {
+        IntTrie trie;
+        bool threw = false;
+        try {
+            trie.Insert("users/:id", 1);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TestFramework::RecordTest(
+            "RouteTrie: pattern without leading / throws",
+            threw, threw ? "" : "expected std::invalid_argument",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: pattern without leading / throws",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 17: empty param name /: throws
+void TestTrieInvalidPatternEmptyParam() {
+    try {
+        IntTrie trie;
+        bool threw = false;
+        try {
+            trie.Insert("/:", 1);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TestFramework::RecordTest(
+            "RouteTrie: empty param name /: throws",
+            threw, threw ? "" : "expected std::invalid_argument for /:  ",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: empty param name /: throws",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 18: catch-all in non-terminal position throws
+void TestTrieInvalidPatternCatchAllNotLast() {
+    try {
+        IntTrie trie;
+        bool threw = false;
+        try {
+            trie.Insert("/*/rest", 1);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TestFramework::RecordTest(
+            "RouteTrie: catch-all not last throws /*/rest",
+            threw, threw ? "" : "expected std::invalid_argument",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: catch-all not last throws /*/rest",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 19: invalid regex constraint throws on Insert
+void TestTrieInvalidRegex() {
+    try {
+        IntTrie trie;
+        bool threw = false;
+        try {
+            // "(++)" is an invalid regex (quantifier on quantifier)
+            trie.Insert("/users/:id(++)", 1);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TestFramework::RecordTest(
+            "RouteTrie: invalid regex constraint throws",
+            threw, threw ? "" : "expected std::invalid_argument for bad regex",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: invalid regex constraint throws",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 20: non-matching path returns null handler
+void TestTrieNoMatch404() {
+    try {
+        IntTrie trie;
+        trie.Insert("/users/:id", 1);
+
+        std::unordered_map<std::string, std::string> params;
+        auto result = trie.Search("/products/99", params);
+
+        bool pass = (result.handler == nullptr);
+        TestFramework::RecordTest(
+            "RouteTrie: non-matching path returns nullptr",
+            pass, pass ? "" : "expected no match for /products/99",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: non-matching path returns nullptr",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 21: /users and /users/ are distinct routes
+void TestTrieTrailingSlash() {
+    try {
+        IntTrie trie;
+        trie.Insert("/users", 100);
+        trie.Insert("/users/", 200);
+
+        bool pass = true;
+        std::string err;
+
+        {
+            std::unordered_map<std::string, std::string> p;
+            auto r = trie.Search("/users", p);
+            if (!r.handler || *r.handler != 100) {
+                pass = false; err += "/users got wrong handler; ";
+            }
+        }
+        {
+            std::unordered_map<std::string, std::string> p;
+            auto r = trie.Search("/users/", p);
+            if (!r.handler || *r.handler != 200) {
+                pass = false; err += "/users/ got wrong handler; ";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "RouteTrie: /users and /users/ are distinct routes",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: /users and /users/ are distinct routes",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 22: root route "/" matches exactly
+void TestTrieRootRoute() {
+    try {
+        IntTrie trie;
+        trie.Insert("/", 0);
+
+        std::unordered_map<std::string, std::string> params;
+        auto result = trie.Search("/", params);
+
+        bool pass = (result.handler != nullptr) && (*result.handler == 0);
+        TestFramework::RecordTest(
+            "RouteTrie: root route / matches",
+            pass, pass ? "" : "root handler not found",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: root route / matches",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 23: /health and /healthcheck coexist (split static segment)
+void TestTrieSplitStaticSameSegment() {
+    try {
+        IntTrie trie;
+        trie.Insert("/health", 30);
+        trie.Insert("/healthcheck", 31);
+
+        bool pass = true;
+        std::string err;
+
+        {
+            std::unordered_map<std::string, std::string> p;
+            auto r = trie.Search("/health", p);
+            if (!r.handler || *r.handler != 30) {
+                pass = false; err += "/health wrong handler; ";
+            }
+        }
+        {
+            std::unordered_map<std::string, std::string> p;
+            auto r = trie.Search("/healthcheck", p);
+            if (!r.handler || *r.handler != 31) {
+                pass = false; err += "/healthcheck wrong handler; ";
+            }
+        }
+        // /healthc should not match either
+        {
+            std::unordered_map<std::string, std::string> p;
+            auto r = trie.Search("/healthc", p);
+            if (r.handler) {
+                pass = false; err += "/healthc should not match; ";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "RouteTrie: /health and /healthcheck coexist after split",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: /health and /healthcheck coexist after split",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 24: percent-encoded path is matched as-is (no decoding by trie)
+void TestTrieRawPercentEncoded() {
+    try {
+        IntTrie trie;
+        trie.Insert("/foo%20bar", 24);
+
+        std::unordered_map<std::string, std::string> params;
+        auto result = trie.Search("/foo%20bar", params);
+
+        bool pass = (result.handler != nullptr) && (*result.handler == 24);
+        TestFramework::RecordTest(
+            "RouteTrie: percent-encoded path /foo%20bar matched as-is",
+            pass, pass ? "" : "handler not found for percent-encoded path",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RouteTrie: percent-encoded path /foo%20bar matched as-is",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HttpRouter Integration Tests
+// ---------------------------------------------------------------------------
+
+// Test 25: router dispatches param route and handler receives extracted params
+void TestRouterPatternParam() {
+    try {
+        HttpRouter router;
+        std::string captured_id;
+
+        router.Get("/users/:id", [&](const HttpRequest& req, HttpResponse& res) {
+            captured_id = req.params.count("id") ? req.params.at("id") : "";
+            res.Status(200).Text("ok");
+        });
+
+        HttpRequest req;
+        req.method = "GET";
+        req.path = "/users/42";
+        HttpResponse res;
+
+        bool found = router.Dispatch(req, res);
+        bool pass = found &&
+                    (res.GetStatusCode() == 200) &&
+                    (captured_id == "42");
+        TestFramework::RecordTest(
+            "HttpRouter: pattern param /users/:id dispatch",
+            pass, pass ? "" : "handler not called or param wrong (id='" + captured_id + "')",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("HttpRouter: pattern param /users/:id dispatch",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 26: two path parameters both extracted
+void TestRouterPatternMultiParam() {
+    try {
+        HttpRouter router;
+        std::string got_id, got_oid;
+
+        router.Get("/users/:id/orders/:oid", [&](const HttpRequest& req, HttpResponse& res) {
+            got_id  = req.params.count("id")  ? req.params.at("id")  : "";
+            got_oid = req.params.count("oid") ? req.params.at("oid") : "";
+            res.Status(200).Text("ok");
+        });
+
+        HttpRequest req;
+        req.method = "GET";
+        req.path = "/users/5/orders/99";
+        HttpResponse res;
+
+        bool found = router.Dispatch(req, res);
+        bool pass = found && (got_id == "5") && (got_oid == "99");
+        TestFramework::RecordTest(
+            "HttpRouter: two params /users/:id/orders/:oid",
+            pass, pass ? "" : "id='" + got_id + "' oid='" + got_oid + "'",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("HttpRouter: two params /users/:id/orders/:oid",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 27: catch-all route captures tail
+void TestRouterPatternCatchAll() {
+    try {
+        HttpRouter router;
+        std::string captured_filepath;
+
+        router.Get("/static/*filepath", [&](const HttpRequest& req, HttpResponse& res) {
+            captured_filepath = req.params.count("filepath") ?
+                req.params.at("filepath") : "";
+            res.Status(200).Text("ok");
+        });
+
+        HttpRequest req;
+        req.method = "GET";
+        req.path = "/static/css/main.css";
+        HttpResponse res;
+
+        bool found = router.Dispatch(req, res);
+        bool pass = found && (captured_filepath == "css/main.css");
+        TestFramework::RecordTest(
+            "HttpRouter: catch-all /static/*filepath captures tail",
+            pass, pass ? "" :
+                "filepath='" + captured_filepath + "' (expected 'css/main.css')",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("HttpRouter: catch-all /static/*filepath captures tail",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 28: constrained param accepts digit, rejects alpha
+void TestRouterPatternConstraint() {
+    try {
+        HttpRouter router;
+        bool digit_handler_called = false;
+
+        router.Get("/users/:id(\\d+)", [&](const HttpRequest& req, HttpResponse& res) {
+            digit_handler_called = true;
+            res.Status(200).Text("digit");
+        });
+
+        bool pass = true;
+        std::string err;
+
+        // Should match digit segment
+        {
+            HttpRequest req; req.method = "GET"; req.path = "/users/123";
+            HttpResponse res;
+            bool found = router.Dispatch(req, res);
+            if (!found || !digit_handler_called) {
+                pass = false; err += "digit segment not matched; ";
+            }
+        }
+
+        // Should NOT match alpha segment (returns false — 404)
+        {
+            digit_handler_called = false;
+            HttpRequest req; req.method = "GET"; req.path = "/users/abc";
+            HttpResponse res;
+            bool found = router.Dispatch(req, res);
+            if (found && digit_handler_called) {
+                pass = false; err += "alpha segment should not match digit constraint; ";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "HttpRouter: constrained param :id(\\d+) accepts digits, rejects alpha",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("HttpRouter: constrained param :id(\\d+) accepts digits, rejects alpha",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 29: static /users/admin beats param /users/:id in router
+void TestRouterPatternPriorityStaticParam() {
+    try {
+        HttpRouter router;
+        int which = 0;
+
+        router.Get("/users/admin", [&](const HttpRequest&, HttpResponse& res) {
+            which = 1;
+            res.Status(200).Text("admin");
+        });
+        router.Get("/users/:id", [&](const HttpRequest&, HttpResponse& res) {
+            which = 2;
+            res.Status(200).Text("user");
+        });
+
+        HttpRequest req; req.method = "GET"; req.path = "/users/admin";
+        HttpResponse res;
+        router.Dispatch(req, res);
+
+        bool pass = (which == 1);
+        TestFramework::RecordTest(
+            "HttpRouter: static /users/admin beats param /users/:id",
+            pass, pass ? "" : "wrong handler called (which=" + std::to_string(which) + ")",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("HttpRouter: static /users/admin beats param /users/:id",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 30: param beats catch-all for single segment; catch-all wins on deeper path
+void TestRouterPatternPriorityParamCatchAll() {
+    try {
+        HttpRouter router;
+        int which = 0;
+
+        router.Get("/api/:version", [&](const HttpRequest&, HttpResponse& res) {
+            which = 1;
+            res.Status(200).Text("version");
+        });
+        router.Get("/api/*rest", [&](const HttpRequest&, HttpResponse& res) {
+            which = 2;
+            res.Status(200).Text("rest");
+        });
+
+        bool pass = true;
+        std::string err;
+
+        // Single segment — param should win
+        {
+            which = 0;
+            HttpRequest req; req.method = "GET"; req.path = "/api/v2";
+            HttpResponse res;
+            router.Dispatch(req, res);
+            if (which != 1) { pass = false; err += "/api/v2 should hit param (1), got " + std::to_string(which) + "; "; }
+        }
+
+        // Deeper path — catch-all should win
+        {
+            which = 0;
+            HttpRequest req; req.method = "GET"; req.path = "/api/v2/users";
+            HttpResponse res;
+            router.Dispatch(req, res);
+            if (which != 2) { pass = false; err += "/api/v2/users should hit catch-all (2), got " + std::to_string(which) + "; "; }
+        }
+
+        TestFramework::RecordTest(
+            "HttpRouter: param beats catch-all; catch-all on deeper path",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("HttpRouter: param beats catch-all; catch-all on deeper path",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 31: pattern route with wrong method returns 405 with Allow header
+void TestRouterPattern405() {
+    try {
+        HttpRouter router;
+        router.Get("/users/:id", [](const HttpRequest&, HttpResponse& res) {
+            res.Status(200).Text("ok");
+        });
+
+        HttpRequest req;
+        req.method = "DELETE";
+        req.path = "/users/42";
+        HttpResponse res;
+
+        bool found = router.Dispatch(req, res);
+
+        // Find Allow header in response headers (vector of pairs, case-sensitive key)
+        std::string allow_value;
+        for (const auto& hdr : res.GetHeaders()) {
+            if (hdr.first == "Allow") {
+                allow_value = hdr.second;
+                break;
+            }
+        }
+
+        bool pass = found &&
+                    (res.GetStatusCode() == 405) &&
+                    (!allow_value.empty());
+        TestFramework::RecordTest(
+            "HttpRouter: pattern route wrong method returns 405 + Allow header",
+            pass, pass ? "" :
+                "found=" + std::string(found ? "true" : "false") +
+                " status=" + std::to_string(res.GetStatusCode()) +
+                " Allow='" + allow_value + "'",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("HttpRouter: pattern route wrong method returns 405 + Allow header",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 32: HEAD on pattern route falls back to GET handler
+void TestRouterPatternHEADFallback() {
+    try {
+        HttpRouter router;
+        bool get_handler_called = false;
+
+        router.Get("/users/:id", [&](const HttpRequest& req, HttpResponse& res) {
+            // HEAD fallback clones request with method="GET"
+            get_handler_called = (req.method == "GET");
+            res.Status(200).Text("body");
+        });
+
+        HttpRequest req;
+        req.method = "HEAD";
+        req.path = "/users/7";
+        HttpResponse res;
+
+        bool found = router.Dispatch(req, res);
+
+        bool pass = found && get_handler_called && (res.GetStatusCode() == 200);
+        TestFramework::RecordTest(
+            "HttpRouter: HEAD fallback to GET on pattern route",
+            pass, pass ? "" : "HEAD fallback failed",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("HttpRouter: HEAD fallback to GET on pattern route",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 33: middleware runs before pattern route handler
+void TestRouterPatternMiddleware() {
+    try {
+        HttpRouter router;
+        bool mw_ran = false;
+        bool handler_ran = false;
+
+        router.Use([&](const HttpRequest&, HttpResponse&) {
+            mw_ran = true;
+            return true;
+        });
+
+        router.Get("/users/:id", [&](const HttpRequest&, HttpResponse& res) {
+            handler_ran = true;
+            res.Status(200).Text("ok");
+        });
+
+        HttpRequest req;
+        req.method = "GET";
+        req.path = "/users/1";
+        HttpResponse res;
+
+        router.Dispatch(req, res);
+
+        bool pass = mw_ran && handler_ran;
+        TestFramework::RecordTest(
+            "HttpRouter: middleware runs before pattern route handler",
+            pass, pass ? "" : "mw_ran=" + std::string(mw_ran ? "true" : "false") +
+                " handler_ran=" + std::string(handler_ran ? "true" : "false"),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("HttpRouter: middleware runs before pattern route handler",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 34: exact (non-pattern) routes still work alongside pattern routes
+void TestRouterPatternExactStillWorks() {
+    try {
+        HttpRouter router;
+        bool exact_called = false;
+
+        router.Get("/health", [&](const HttpRequest&, HttpResponse& res) {
+            exact_called = true;
+            res.Status(200).Text("ok");
+        });
+        router.Get("/users/:id", [](const HttpRequest&, HttpResponse& res) {
+            res.Status(200).Text("user");
+        });
+
+        HttpRequest req;
+        req.method = "GET";
+        req.path = "/health";
+        HttpResponse res;
+
+        bool found = router.Dispatch(req, res);
+        bool pass = found && exact_called && (res.GetStatusCode() == 200);
+        TestFramework::RecordTest(
+            "HttpRouter: exact routes work alongside pattern routes",
+            pass, pass ? "" : "exact route not matched",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("HttpRouter: exact routes work alongside pattern routes",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Test 35: params are cleared between dispatches (HttpRequest::Reset)
+void TestRouterPatternParamsCleared() {
+    try {
+        HttpRouter router;
+
+        router.Get("/users/:id", [](const HttpRequest& req, HttpResponse& res) {
+            res.Status(200).Text(req.params.count("id") ? req.params.at("id") : "");
+        });
+
+        bool pass = true;
+        std::string err;
+
+        for (int i = 1; i <= 3; i++) {
+            HttpRequest req;
+            req.method = "GET";
+            req.path = "/users/" + std::to_string(i);
+            // Simulate a stale params map from a previous request
+            req.params["id"] = "stale";
+            req.params["extra"] = "garbage";
+            HttpResponse res;
+
+            router.Dispatch(req, res);
+
+            // After dispatch, params should hold only this request's params
+            if (req.params.count("id") == 0 ||
+                req.params.at("id") != std::to_string(i)) {
+                pass = false;
+                err += "req " + std::to_string(i) + ": id='" +
+                       (req.params.count("id") ? req.params.at("id") : "(missing)") + "'; ";
+            }
+            if (req.params.count("extra") != 0) {
+                pass = false; err += "stale key 'extra' still present on req " + std::to_string(i) + "; ";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "HttpRouter: params cleared/replaced between dispatches",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("HttpRouter: params cleared/replaced between dispatches",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RunAllTests
+// ---------------------------------------------------------------------------
+void RunAllTests() {
+    std::cout << "\n" << std::string(60, '=') << std::endl;
+    std::cout << "ROUTE TRIE & HTTP ROUTER - UNIT TESTS" << std::endl;
+    std::cout << std::string(60, '=') << std::endl;
+
+    // RouteTrie unit tests (direct API, no server)
+    TestTrieExactMatch();
+    TestTrieParameterMatch();
+    TestTrieMultipleParameters();
+    TestTrieParameterNoMatch();
+    TestTrieConstrainedParameter();
+    TestTrieConstrainedParameterFail();
+    TestTrieCatchAll();
+    TestTrieCatchAllEmpty();
+    TestTrieCatchAllUnnamed();
+    TestTriePriorityStaticOverParam();
+    TestTriePriorityParamOverCatchAll();
+    TestTrieConflictDuplicateRoute();
+    TestTrieConflictConstraintClash();
+    TestTrieConflictDuplicateCatchAll();
+    TestTrieParamNameSharesNode();
+    TestTrieInvalidPatternNoSlash();
+    TestTrieInvalidPatternEmptyParam();
+    TestTrieInvalidPatternCatchAllNotLast();
+    TestTrieInvalidRegex();
+    TestTrieNoMatch404();
+    TestTrieTrailingSlash();
+    TestTrieRootRoute();
+    TestTrieSplitStaticSameSegment();
+    TestTrieRawPercentEncoded();
+
+    // HttpRouter integration tests
+    TestRouterPatternParam();
+    TestRouterPatternMultiParam();
+    TestRouterPatternCatchAll();
+    TestRouterPatternConstraint();
+    TestRouterPatternPriorityStaticParam();
+    TestRouterPatternPriorityParamCatchAll();
+    TestRouterPattern405();
+    TestRouterPatternHEADFallback();
+    TestRouterPatternMiddleware();
+    TestRouterPatternExactStillWorks();
+    TestRouterPatternParamsCleared();
+}
+
+}  // namespace RouteTests
