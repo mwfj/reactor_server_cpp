@@ -889,13 +889,15 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
 
     // Set request callback: dispatch through HttpRouter (same as HTTP/1.x).
     // total_requests_ is counted in stream_open_callback (below), which fires
-    // for every stream including those rejected before dispatch — consistent
-    // with HTTP/1's request_count_callback that counts all parsed requests.
+    // Count H2 requests at dispatch time (DispatchStreamRequest), not stream
+    // creation. This matches HTTP/1's request_count_callback which fires after
+    // a completed parse — malformed/reset streams don't inflate the count.
     h2_conn->SetRequestCallback(
         [this](std::shared_ptr<Http2ConnectionHandler> /*self*/,
                int32_t /*stream_id*/,
                const HttpRequest& request,
                HttpResponse& response) {
+            total_requests_.fetch_add(1, std::memory_order_relaxed);
             active_requests_.fetch_add(1, std::memory_order_relaxed);
             RequestGuard guard{active_requests_};
 
@@ -912,7 +914,6 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     h2_conn->SetStreamOpenCallback(
         [this](std::shared_ptr<Http2ConnectionHandler> self, int32_t /*stream_id*/) {
             active_h2_streams_.fetch_add(1, std::memory_order_relaxed);
-            total_requests_.fetch_add(1, std::memory_order_relaxed);
             self->IncrementLocalStreamCount();
         }
     );

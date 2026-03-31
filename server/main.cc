@@ -199,6 +199,7 @@ static bool ReloadConfig(const std::string& config_path,
     };
 
     ServerConfig new_config;
+    bool loaded_from_file = false;
     try {
         // If the config file exists, load it. If not:
         // - If startup never had a file (defaults + env only): use current_config
@@ -208,7 +209,7 @@ static bool ReloadConfig(const std::string& config_path,
         //   deploy — fail the reload so the operator notices.
         if (access(config_path.c_str(), F_OK) == 0) {
             new_config = ConfigLoader::LoadFromFile(config_path);
-            config_loaded_from_file = true;  // track for future reloads
+            loaded_from_file = true;
         } else if (!config_loaded_from_file && !options.config_path_explicit
                    && errno == ENOENT) {
             // Start from defaults, not current_config — env vars may have been
@@ -352,6 +353,12 @@ static bool ReloadConfig(const std::string& config_path,
     current_config.tls = saved_tls;
     current_config.worker_threads = saved_workers;
     current_config.http2.enabled = saved_h2_enabled;
+
+    // Commit file-backed state only after full success — a failed reload
+    // must not flip this flag or future reloads lose the defaults+env fallback.
+    if (loaded_from_file) {
+        config_loaded_from_file = true;
+    }
     return true;
 }
 
