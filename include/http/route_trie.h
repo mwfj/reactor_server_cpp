@@ -328,7 +328,7 @@ private:
             // ReDoS warning: std::regex_match on untrusted path segments can
             // exhibit catastrophic backtracking with certain patterns (e.g.
             // "(a+)+" on long input). Mitigated at search time by the
-            // kMaxConstraintSegmentLen guard, and at the network boundary by
+            // MAX_CONSTRAINT_SEGMENT_LEN guard, and at the network boundary by
             // max_header_size_. Avoid user-supplied regexes in production routes.
             auto new_child = std::make_unique<Node>();
             new_child->type = route_trie::NodeType::PARAM;
@@ -469,11 +469,10 @@ private:
                     matched_pattern = child->pattern;
                     return true;
                 }
-                // Check trailing-slash sentinel
-                if (SearchChildren(child.get(), path + seg_end, 0,
-                                   params, out_handler, matched_pattern, true)) {
-                    return true;
-                }
+                // Do NOT recurse into children here — that would allow
+                // "/users/42" to match the trailing-slash sentinel for
+                // "/users/:id/", breaking the documented distinction.
+                // Same discipline as the STATIC node case above.
             } else {
                 // path[seg_end] == '/' — more segments follow
                 if (SearchChildren(child.get(), path + seg_end + 1,

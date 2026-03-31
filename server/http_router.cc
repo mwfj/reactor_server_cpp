@@ -1,8 +1,7 @@
 #include "http/http_router.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
-
-#include <algorithm>
+// <algorithm> provided by common.h (via http_request.h)
 
 void HttpRouter::Get(const std::string& path, Handler handler) {
     Route("GET", path, std::move(handler));
@@ -33,6 +32,10 @@ void HttpRouter::Use(Middleware middleware) {
 }
 
 bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
+    // Clear params from any previous dispatch on this request object.
+    // params is mutable router-owned output; callers should not have to clear it.
+    request.params.clear();
+
     // Run middleware chain first
     for (const auto& mw : middlewares_) {
         if (!mw(request, response)) {
@@ -141,12 +144,19 @@ HttpRouter::WsUpgradeHandler HttpRouter::GetWebSocketHandler(const std::string& 
     std::unordered_map<std::string, std::string> params;
     auto result = ws_trie_.Search(path, params);
     if (result.handler) {
+        if (!params.empty()) {
+            logging::Get()->warn(
+                "GetWebSocketHandler(string) discards {} extracted route params "
+                "for path {}; use the HttpRequest overload to preserve them",
+                params.size(), logging::SanitizePath(path));
+        }
         return *result.handler;
     }
     return nullptr;
 }
 
 HttpRouter::WsUpgradeHandler HttpRouter::GetWebSocketHandler(const HttpRequest& request) const {
+    request.params.clear();
     std::unordered_map<std::string, std::string> params;
     auto result = ws_trie_.Search(request.path, params);
     if (result.handler) {
