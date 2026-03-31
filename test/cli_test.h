@@ -1655,9 +1655,9 @@ void TestValidateDaemonRejectsNoLogFile() {
     std::cout << "\n[TEST] CliParser: 'validate -d' catches missing log file..." << std::endl;
 
     // Skip if reactor_server binary not found (CWD-dependent)
-    if (access("./reactor_server", X_OK) != 0) {
+    if (access("./server_runner", X_OK) != 0) {
         TestFramework::RecordTest("CliParser: validate -d catches missing log file",
-                                  true, "SKIPPED: ./reactor_server not found in CWD", CLI_CATEGORY);
+                                  true, "SKIPPED: ./server_runner not found in CWD", CLI_CATEGORY);
         return;
     }
 
@@ -1666,7 +1666,7 @@ void TestValidateDaemonRejectsNoLogFile() {
     WriteFile(cfg_path, R"({"bind_port": 8080})");
 
     // Run the actual binary with validate -d to check daemon constraints
-    std::string cmd = "./reactor_server validate -d -c " + cfg_path + " 2>&1";
+    std::string cmd = "./server_runner validate -d -c " + cfg_path + " 2>&1";
     FILE* fp = popen(cmd.c_str(), "r");
     std::string output;
     int exit_code = -1;
@@ -1696,9 +1696,9 @@ void TestValidateDaemonRejectsRelativePidPath() {
     std::cout << "\n[TEST] CliParser: 'validate -d -P relative' catches relative PID path..." << std::endl;
 
     // Skip if reactor_server binary not found (CWD-dependent)
-    if (access("./reactor_server", X_OK) != 0) {
+    if (access("./server_runner", X_OK) != 0) {
         TestFramework::RecordTest("CliParser: validate -d -P catches relative PID path",
-                                  true, "SKIPPED: ./reactor_server not found in CWD", CLI_CATEGORY);
+                                  true, "SKIPPED: ./server_runner not found in CWD", CLI_CATEGORY);
         return;
     }
 
@@ -1706,7 +1706,7 @@ void TestValidateDaemonRejectsRelativePidPath() {
     const std::string cfg_path = "/tmp/test_reactor_cfg_" + std::to_string(getpid()) + "_relpid.json";
     WriteFile(cfg_path, R"({"log":{"file":"/tmp/test.log"}})");
 
-    std::string cmd = "./reactor_server validate -d -c " + cfg_path + " -P relative.pid 2>&1";
+    std::string cmd = "./server_runner validate -d -c " + cfg_path + " -P relative.pid 2>&1";
     FILE* fp = popen(cmd.c_str(), "r");
     std::string output;
     int exit_code = -1;

@@ -133,7 +133,7 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
                 default:
                     throw std::runtime_error(
                         std::string("A command is required. Try '") +
-                        REACTOR_SERVER_NAME + " help' for usage.");
+                        argv[0] + " help' for usage.");
             }
         }
         // Reject trailing positional args (e.g., "-V foo")
@@ -149,7 +149,7 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
     if (options.command == CliCommand::NONE) {
         throw std::runtime_error(
             std::string("Unknown command: '") + argv[1] +
-            "'. Try '" + REACTOR_SERVER_NAME + " help' for usage.");
+            "'. Try '" + argv[0] + " help' for usage.");
     }
 
     // Commands that take no options (except version accepts -V).

@@ -43,9 +43,6 @@ private:
     std::shared_ptr<Dispatcher> conn_dispatcher_;
     // Sub-events looks for
     std::vector<std::shared_ptr<Dispatcher>> socket_dispatchers_;
-    // Saved SIGPIPE disposition for restore in destructor
-    struct sigaction saved_sigpipe_{};
-    bool sigpipe_overridden_ = false;
     std::map<int, std::shared_ptr<ConnectionHandler>> connections_;
     std::mutex conn_mtx_;  // Protects connections_ map from concurrent access
     std::unique_ptr<Acceptor> acceptor_;  // Sole owner of Acceptor

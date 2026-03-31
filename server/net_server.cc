@@ -6,6 +6,36 @@
 #include <csignal>
 #include <future>
 
+// Process-global SIGPIPE suppression with refcount. First NetServer
+// instance saves the original disposition and sets SIG_IGN; last
+// instance's destructor restores it. Safe for multiple concurrent instances.
+static std::mutex s_sigpipe_mtx;
+static int s_sigpipe_refcount = 0;
+static struct sigaction s_saved_sigpipe{};
+
+static void SigpipeGuardAcquire() {
+    std::lock_guard<std::mutex> lk(s_sigpipe_mtx);
+    if (s_sigpipe_refcount == 0) {
+        struct sigaction sa_cur{};
+        sigaction(SIGPIPE, nullptr, &sa_cur);
+        if (sa_cur.sa_handler == SIG_DFL) {
+            s_saved_sigpipe = sa_cur;
+            struct sigaction sa_ign{};
+            sa_ign.sa_handler = SIG_IGN;
+            sigemptyset(&sa_ign.sa_mask);
+            sigaction(SIGPIPE, &sa_ign, nullptr);
+        }
+    }
+    ++s_sigpipe_refcount;
+}
+
+static void SigpipeGuardRelease() {
+    std::lock_guard<std::mutex> lk(s_sigpipe_mtx);
+    if (--s_sigpipe_refcount == 0) {
+        sigaction(SIGPIPE, &s_saved_sigpipe, nullptr);
+    }
+}
+
 NetServer::NetServer(const std::string& _ip, const size_t _port,
                      int timer_interval,
                      std::chrono::seconds connection_timeout,
@@ -21,18 +51,7 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
     // a single peer reset on a TLS connection kills the entire process.
     // Only override SIG_DFL — if the embedder has installed their own
     // handler, leave it alone to avoid breaking their signal handling.
-    {
-        struct sigaction sa_cur{};
-        sigaction(SIGPIPE, nullptr, &sa_cur);
-        if (sa_cur.sa_handler == SIG_DFL) {
-            saved_sigpipe_ = sa_cur;
-            sigpipe_overridden_ = true;
-            struct sigaction sa_ign{};
-            sa_ign.sa_handler = SIG_IGN;
-            sigemptyset(&sa_ign.sa_mask);
-            sigaction(SIGPIPE, &sa_ign, nullptr);
-        }
-    }
+    SigpipeGuardAcquire();
     // Initialize conn_dispatcher_ after shared_ptr is constructed (required for eventfd setup)
     conn_dispatcher_->Init();
     conn_dispatcher_->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
@@ -50,11 +69,7 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
 
 NetServer::~NetServer(){
     Stop();
-    // Restore SIGPIPE disposition if we overrode it
-    if (sigpipe_overridden_) {
-        sigaction(SIGPIPE, &saved_sigpipe_, nullptr);
-        sigpipe_overridden_ = false;
-    }
+    SigpipeGuardRelease();
     socket_dispatchers_.clear();
     connections_.clear();
 }
