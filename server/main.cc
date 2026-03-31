@@ -555,7 +555,10 @@ static int HandleStart(const CliOptions& options) {
         server->Get("/health", MakeHealthHandler(server.get()));
         logging::Get()->info("  Health:  /health");
     }
-    if (options.stats_endpoint) {
+    // /stats requires health_endpoint for backwards compatibility:
+    // --no-health-endpoint disables both endpoints.
+    // --no-stats-endpoint independently disables only /stats.
+    if (options.stats_endpoint && options.health_endpoint) {
         server->Get("/stats", MakeStatsHandler(server.get(), config));
         logging::Get()->info("  Stats:   /stats");
     }
