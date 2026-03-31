@@ -294,6 +294,9 @@ void HttpServer::SetReadyCallback(std::function<void()> cb) {
 void HttpServer::Stop() {
     logging::Get()->info("HttpServer stopping");
 
+    // Prevent Reload() from mutating dead state after Stop().
+    server_ready_.store(false, std::memory_order_release);
+
     // Stop accepting FIRST — prevents new connections from being accepted
     // between the WS snapshot and the H2 drain snapshot. Without this, a WS
     // accepted in the gap would miss the 1001 "Going Away" close frame.
@@ -947,10 +950,11 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         validation_copy.bind_port = 8080;          // always valid
         validation_copy.worker_threads = 1;        // always valid
         validation_copy.tls.enabled = false;       // skip TLS path checks
-        // Validate H2 sub-settings only when the running server has H2 enabled.
-        // When H2 is disabled, Reload() still copies them to h2_settings_ but
-        // they're never used, so placeholder/out-of-range values are harmless.
-        validation_copy.http2.enabled = http2_enabled_;
+        // Always validate H2 sub-settings: Reload() copies them to h2_settings_
+        // regardless of http2.enabled (which is restart-only). The enabled flag
+        // itself is ignored — only the sub-settings (max_concurrent_streams,
+        // initial_window_size, etc.) matter for new connections.
+        validation_copy.http2.enabled = true;
         try {
             ConfigLoader::Validate(validation_copy);
         } catch (const std::invalid_argument& e) {

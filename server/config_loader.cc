@@ -355,6 +355,26 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             " (must be >= 0, 0 = disabled)");
     }
 
+    // Bound size limits to prevent overflow in ComputeInputCap() where
+    // max_header_size + max_body_size must not wrap size_t. 4 GB is a
+    // reasonable upper bound — larger values are almost certainly mistakes.
+    static constexpr size_t MAX_SIZE_LIMIT = 4ULL * 1024 * 1024 * 1024;  // 4 GB
+    if (config.max_body_size > MAX_SIZE_LIMIT) {
+        throw std::invalid_argument(
+            "Invalid max_body_size: " + std::to_string(config.max_body_size) +
+            " (must be <= 4 GB)");
+    }
+    if (config.max_header_size > MAX_SIZE_LIMIT) {
+        throw std::invalid_argument(
+            "Invalid max_header_size: " + std::to_string(config.max_header_size) +
+            " (must be <= 4 GB)");
+    }
+    if (config.max_ws_message_size > MAX_SIZE_LIMIT) {
+        throw std::invalid_argument(
+            "Invalid max_ws_message_size: " + std::to_string(config.max_ws_message_size) +
+            " (must be <= 4 GB)");
+    }
+
     // Validate log level against the set recognized by logging::ParseLevel().
     // ParseLevel returns info for unrecognized strings — if the input isn't
     // literally "info" but maps to info, it's unrecognized (including empty).
