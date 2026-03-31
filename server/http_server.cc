@@ -831,12 +831,31 @@ bool HttpServer::DetectAndRouteProtocol(
         std::shared_ptr<Http2ConnectionHandler> h2_conn;
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
-            // Re-check under lock — close could have raced between check above
-            // and lock acquisition.
             if (conn->IsClosing()) {
                 if (already_counted) {
                     active_connections_.fetch_sub(1, std::memory_order_relaxed);
                 }
+                return true;
+            }
+            // Re-check: HandleNewConnection may have inserted tracking between
+            // our earlier snapshot and this lock acquisition.
+            if (!already_counted) {
+                auto pd_it = pending_detection_.find(conn->fd());
+                if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
+                    // HandleNewConnection already counted this connection
+                    already_counted = true;
+                    // Consume any buffered data
+                    if (!pd_it->second.data.empty()) {
+                        message = pd_it->second.data + message;
+                    }
+                    pending_detection_.erase(pd_it);
+                }
+            }
+            // Also check if a handler was already published for this conn
+            auto h2_existing = h2_connections_.find(conn->fd());
+            if (h2_existing != h2_connections_.end() &&
+                h2_existing->second->GetConnection() == conn) {
+                // HandleNewConnection already set up via a parallel path — skip
                 return true;
             }
             if (!already_counted) {
@@ -847,9 +866,6 @@ bool HttpServer::DetectAndRouteProtocol(
             settings_snapshot = h2_settings_;
             h2_conn = std::make_shared<Http2ConnectionHandler>(conn, settings_snapshot);
             SetupH2Handlers(h2_conn);
-            // Publish BEFORE Initialize so HandleCloseConnection can find and
-            // remove the handler if Initialize's SendRaw triggers a synchronous
-            // close. RequestShutdown safely handles uninitialized sessions.
             h2_connections_[conn->fd()] = h2_conn;
         }
         h2_conn->Initialize(message);
@@ -876,17 +892,30 @@ bool HttpServer::DetectAndRouteProtocol(
             }
             return true;
         }
+        // Re-check: HandleNewConnection may have inserted tracking or a
+        // handler between our earlier snapshot and this lock acquisition.
+        if (!already_counted) {
+            auto pd_it = pending_detection_.find(conn->fd());
+            if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
+                already_counted = true;
+                pending_detection_.erase(pd_it);
+            }
+        }
+        auto h1_existing = http_connections_.find(conn->fd());
+        if (h1_existing != http_connections_.end() &&
+            h1_existing->second->GetConnection() == conn) {
+            // Already published by HandleNewConnection — skip
+            return true;
+        }
         if (!already_counted) {
             total_accepted_.fetch_add(1, std::memory_order_relaxed);
             active_connections_.fetch_add(1, std::memory_order_relaxed);
         }
         active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
-        // Fd-reuse: if a stale handler exists for a different connection,
-        // save it for WS close notification and compensate its counters.
-        auto existing = http_connections_.find(conn->fd());
-        if (existing != http_connections_.end() &&
-            existing->second->GetConnection() != conn) {
-            stale_existing = existing->second;
+        // Fd-reuse: stale handler for a different connection
+        if (h1_existing != http_connections_.end() &&
+            h1_existing->second->GetConnection() != conn) {
+            stale_existing = h1_existing->second;
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
             active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
         }

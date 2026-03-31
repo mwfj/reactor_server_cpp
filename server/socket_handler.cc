@@ -33,7 +33,12 @@ int SocketHandler::CreateSocket() {
         throw std::runtime_error(
             std::string("Failed to create socket: ") + std::strerror(saved_errno));
     }
-    SetNonBlocking(listenfd);
+    try {
+        SetNonBlocking(listenfd);
+    } catch (...) {
+        ::close(listenfd);
+        throw;
+    }
     return listenfd;
 }
 
