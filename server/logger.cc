@@ -138,11 +138,11 @@ ScanDateFiles(const std::string& dir, const std::string& prefix,
     return files;
 }
 
-// Resolve the log file path for today. Returns the latest non-full file,
-// or the next sequence number if all existing files are full.
+// Resolve the log file path for the given date. Returns the latest non-full
+// file, or the next sequence number if all existing files are full.
 static std::string ResolveLogPath(const std::string& dir, const std::string& prefix,
-                                   const std::string& ext, size_t max_size) {
-    std::string today = TodayDateString();
+                                   const std::string& ext, size_t max_size,
+                                   const std::string& today) {
     auto files = ScanDateFiles(dir, prefix, today, ext);
 
     if (files.empty()) {
@@ -276,10 +276,11 @@ static std::vector<spdlog::sink_ptr> BuildSinks(spdlog::level::level_enum level)
             // external logrotate.
             new_path = g_log_file;
         } else {
-            // Date-based rotation mode: resolve today's date-based path
+            // Date-based rotation mode: compute date once to avoid midnight
+            // race between setting g_current_log_date and resolving the path.
             new_date = TodayDateString();
             new_path = ResolveLogPath(g_log_dir, g_log_prefix,
-                                      g_log_extension, g_max_size);
+                                      g_log_extension, g_max_size, new_date);
         }
         // This can throw (e.g., permission denied) — globals are still intact.
         auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
@@ -303,7 +304,10 @@ static void RebuildLogger() {
         g_logger_name, sinks.begin(), sinks.end());
     new_logger->set_level(g_log_level);
     new_logger->set_pattern(LOG_PATTERN);
-    new_logger->flush_on(g_log_level);
+    // Flush on info or above. Never flush on every debug/trace message —
+    // that would turn verbose troubleshooting into synchronous I/O on
+    // nearly every socket event.
+    new_logger->flush_on(std::max(g_log_level, spdlog::level::info));
 
     spdlog::set_default_logger(new_logger);
     g_logger = new_logger;
@@ -372,7 +376,10 @@ void Init(const std::string& name,
         auto new_logger = std::make_shared<spdlog::logger>(name, sinks.begin(), sinks.end());
         new_logger->set_level(level);
         new_logger->set_pattern(LOG_PATTERN);
-        new_logger->flush_on(g_log_level);
+        // Flush on info or above. Never flush on every debug/trace message —
+    // that would turn verbose troubleshooting into synchronous I/O on
+    // nearly every socket event.
+    new_logger->flush_on(std::max(g_log_level, spdlog::level::info));
 
         // All succeeded — commit
         g_logger = new_logger;
