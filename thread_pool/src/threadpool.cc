@@ -1,4 +1,5 @@
 #include "../include/threadpool.h"
+#include "log/logger.h"
 
 ThreadPool::~ThreadPool() {
     // RAII: Ensure threads are properly stopped and joined during destruction
@@ -16,7 +17,7 @@ void ThreadPool::JoinPendingSelfStop() {
 inline void ThreadPool::SetThreadWorkerNum(int nums, bool set_by_init){
     thread_nums = nums;
     if(!set_by_init)
-        std::cout << "Set Max Worker Number to: " << nums << std::endl;
+        logging::Get()->debug("Set max worker number to: {}", nums);
 }
 
 inline int ThreadPool::GetThreadWorkerNum(){
@@ -26,7 +27,7 @@ inline int ThreadPool::GetThreadWorkerNum(){
 void ThreadPool::Init(int worker_nums){
     std::lock_guard<std::mutex> lck(mtx_);
     SetThreadWorkerNum(worker_nums, true);
-    std::cout << "[" << std::this_thread::get_id() << "]: Thread Pool Init, worker number: " << GetThreadWorkerNum() << std::endl;
+    logging::Get()->debug("Thread pool init, worker number: {}", GetThreadWorkerNum());
 }
 
 void ThreadPool::Init(){
@@ -34,11 +35,11 @@ void ThreadPool::Init(){
     // init the number of thread worker same as the CPU core number
     unsigned int suggested_workers = std::thread::hardware_concurrency() >> 1;
     if(suggested_workers == 0) {
-        std::cout << "Invalid core numbers, set to default number: "<< DEFAULT_THREAD_NUMS << "\n";
+        logging::Get()->warn("Invalid core numbers, set to default: {}", DEFAULT_THREAD_NUMS);
         suggested_workers = DEFAULT_THREAD_NUMS;
     }
     SetThreadWorkerNum(static_cast<int>(suggested_workers), true);
-    std::cout << "[" << std::this_thread::get_id() << "]: Thread Pool Init, worker number: " << GetThreadWorkerNum() << std::endl;
+    logging::Get()->debug("Thread pool init, worker number: {}", GetThreadWorkerNum());
 }
 
 
@@ -51,12 +52,12 @@ void ThreadPool::Start(){
     std::lock_guard<std::mutex> lck(mtx_);
 
     if(GetThreadWorkerNum() <= 0) {
-        std::cerr << "Thread Pool Start failed: thread count <= 0" << std::endl;
+        logging::Get()->error("Thread pool start failed: thread count <= 0");
         throw std::runtime_error("Thread Pool Start failed: thread count <= 0");
     }
 
     if(!workers_.empty()){
-        std::cerr << "Thread Pool already started" << std::endl;
+        logging::Get()->error("Thread pool already started");
         throw std::runtime_error("Thread Pool already started");
     }
 
@@ -66,7 +67,7 @@ void ThreadPool::Start(){
     for(int idx = 0; idx < GetThreadWorkerNum(); idx ++){
         workers_.emplace_back(&ThreadPool::Run, this);
     }
-    std::cout << "[" << std::this_thread::get_id() << "]: ThreadPool Start" << std::endl;
+    logging::Get()->debug("Thread pool started");
 }
 
 void ThreadPool::Stop(){
@@ -115,11 +116,11 @@ void ThreadPool::Stop(){
         workers_.clear();
     }
 
-    std::cout << "[" << std::this_thread::get_id() << "]: ThreadPool Stopped" << std::endl;
+    logging::Get()->debug("Thread pool stopped");
 }
 
 void ThreadPool::Run() {
-    std::cout << "[" << std::this_thread::get_id() << "]: ThreadPool Begin Running" << "\n";
+    logging::Get()->debug("Thread pool worker started");
 
     while(is_running()){
         std::shared_ptr<ThreadTaskInterface> task = GetTask();
@@ -147,9 +148,9 @@ void ThreadPool::Run() {
             try {
                 task->SetValue(res);
             } catch(const std::exception& e) {
-                std::cerr << "[ThreadPool] SetValue() failed: " << e.what() << std::endl;
+                logging::Get()->error("ThreadPool SetValue() failed: {}", e.what());
             } catch(...) {
-                std::cerr << "[ThreadPool] SetValue() failed with unknown exception" << std::endl;
+                logging::Get()->error("ThreadPool SetValue() failed with unknown exception");
             }
         } catch(...) {
             // Task execution failed - capture exception
@@ -159,23 +160,23 @@ void ThreadPool::Run() {
                     std::rethrow_exception(ex);
                 }
             } catch (const std::exception& e){
-                std::cerr << "[ThreadPool] Task failed: " << e.what() << std::endl;
+                logging::Get()->error("ThreadPool task failed: {}", e.what());
             } catch(...) {
-                std::cerr << "[ThreadPool] Task failed with unknown exception" << std::endl;
+                logging::Get()->error("ThreadPool task failed with unknown exception");
             }
 
             // Set exception - wrap in try-catch to prevent thread termination
             try {
                 task->SetException(std::move(ex));
             } catch(const std::exception& e) {
-                std::cerr << "[ThreadPool] SetException() failed: " << e.what() << std::endl;
+                logging::Get()->error("ThreadPool SetException() failed: {}", e.what());
             } catch(...) {
-                std::cerr << "[ThreadPool] SetException() failed with unknown exception" << std::endl;
+                logging::Get()->error("ThreadPool SetException() failed with unknown exception");
             }
         }
         // running_threads_ automatically decremented by RunningGuard destructor
     }
-    std::cout << "[" << std::this_thread::get_id() << "]: End Run" << std::endl;
+    logging::Get()->debug("Thread pool worker exited");
 }
 
 void ThreadPool::AddTask(std::shared_ptr<ThreadTaskInterface> task) {
