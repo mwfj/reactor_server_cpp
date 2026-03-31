@@ -230,14 +230,20 @@ void Http2ConnectionHandler::OnRawData(
         // so clients get the correct retry/diagnostic signal.
         logging::Get()->error("HTTP/2 session recv error fd={}, closing connection",
                               conn_ ? conn_->fd() : -1);
-        // Flush any deferred response frames BEFORE GOAWAY so partially-written
-        // responses for already-processed streams are delivered to the peer.
-        // Without this, ClearDeferredOutput drops in-flight responses and the
-        // peer sees truncated data followed by GOAWAY.
-        if (session_->HasDeferredOutput()) {
+        // Flush ALL deferred response frames before GOAWAY. A single
+        // ResumeOutput may not drain everything under backpressure (nghttp2
+        // defers when the output buffer is full). Loop until empty so
+        // CloseAfterWrite (which suppresses complete_callback) doesn't
+        // strand remaining frames.
+        resume_scheduled_ = false;
+        static constexpr int MAX_RESUME_ROUNDS = 64;  // prevent infinite loop
+        for (int i = 0; i < MAX_RESUME_ROUNDS && session_->HasDeferredOutput(); ++i) {
             session_->ResumeOutput();
         }
-        resume_scheduled_ = false;
+        if (session_->HasDeferredOutput()) {
+            // Still deferred after max rounds — drop remaining to avoid hang
+            session_->ClearDeferredOutput();
+        }
         session_->SendGoaway(HTTP2_CONSTANTS::ERROR_PROTOCOL_ERROR);
         session_->SendPendingFrames();
         conn_->CloseAfterWrite();

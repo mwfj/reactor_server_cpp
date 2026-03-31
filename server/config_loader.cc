@@ -359,23 +359,23 @@ void ConfigLoader::Validate(const ServerConfig& config) {
     }
 
     // Bound size limits to prevent overflow in ComputeInputCap() where
-    // max_header_size + max_body_size must not wrap size_t. 4 GB is a
-    // reasonable upper bound — larger values are almost certainly mistakes.
-    static constexpr size_t MAX_SIZE_LIMIT = 4ULL * 1024 * 1024 * 1024;  // 4 GB
+    // max_header_size + max_body_size must not wrap size_t. Use 2 GB to
+    // safely fit 32-bit size_t (max ~4 GB, but two limits can be summed).
+    static constexpr size_t MAX_SIZE_LIMIT = 2ULL * 1024 * 1024 * 1024;  // 2 GB
     if (config.max_body_size > MAX_SIZE_LIMIT) {
         throw std::invalid_argument(
             "Invalid max_body_size: " + std::to_string(config.max_body_size) +
-            " (must be <= 4 GB)");
+            " (must be <= 2 GB)");
     }
     if (config.max_header_size > MAX_SIZE_LIMIT) {
         throw std::invalid_argument(
             "Invalid max_header_size: " + std::to_string(config.max_header_size) +
-            " (must be <= 4 GB)");
+            " (must be <= 2 GB)");
     }
     if (config.max_ws_message_size > MAX_SIZE_LIMIT) {
         throw std::invalid_argument(
             "Invalid max_ws_message_size: " + std::to_string(config.max_ws_message_size) +
-            " (must be <= 4 GB)");
+            " (must be <= 2 GB)");
     }
 
     // Validate log level against the set recognized by logging::ParseLevel().
@@ -448,6 +448,18 @@ void ConfigLoader::Validate(const ServerConfig& config) {
         if (config.tls.key_file.empty()) {
             throw std::invalid_argument(
                 "TLS is enabled but key_file is empty");
+        }
+        // Verify cert/key files exist — catches typos and missing files at
+        // startup/validate time instead of failing later in TlsContext.
+        if (access(config.tls.cert_file.c_str(), R_OK) != 0) {
+            throw std::invalid_argument(
+                "TLS cert_file not readable: '" + config.tls.cert_file +
+                "' (" + std::strerror(errno) + ")");
+        }
+        if (access(config.tls.key_file.c_str(), R_OK) != 0) {
+            throw std::invalid_argument(
+                "TLS key_file not readable: '" + config.tls.key_file +
+                "' (" + std::strerror(errno) + ")");
         }
         if (config.tls.min_version != "1.2" && config.tls.min_version != "1.3") {
             throw std::invalid_argument(
