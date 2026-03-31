@@ -144,7 +144,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
     // Any other value must be rejected with 417.
     if (req.HasHeader("expect")) {
         std::string expect = req.GetHeader("expect");
-        std::transform(expect.begin(), expect.end(), expect.begin(), ::tolower);
+        std::transform(expect.begin(), expect.end(), expect.begin(), [](unsigned char c){ return std::tolower(c); });
         while (!expect.empty() && (expect.front() == ' ' || expect.front() == '\t'))
             expect.erase(expect.begin());
         while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
@@ -231,7 +231,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         HttpResponse upgrade_resp = WebSocketHandshake::Accept(req);
         for (const auto& hdr : mw_response.GetHeaders()) {
             std::string key = hdr.first;
-            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c); });
             // Skip 101 mandatory headers, framing headers, and WS
             // negotiation headers. This server doesn't implement WS
             // extensions or subprotocol negotiation, so allowing
@@ -340,10 +340,10 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         bool resp_close = false;
         for (const auto& hdr : response.GetHeaders()) {
             std::string key = hdr.first;
-            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c); });
             if (key == "connection") {
                 std::string val = hdr.second;
-                std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+                std::transform(val.begin(), val.end(), val.begin(), [](unsigned char c){ return std::tolower(c); });
                 std::istringstream ss(val);
                 std::string token;
                 while (std::getline(ss, token, ',')) {
@@ -504,7 +504,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
         // RFC 7231 §5.1.1: handle Expect header
         if (partial.HasHeader("expect")) {
             std::string expect = partial.GetHeader("expect");
-            std::transform(expect.begin(), expect.end(), expect.begin(), ::tolower);
+            std::transform(expect.begin(), expect.end(), expect.begin(), [](unsigned char c){ return std::tolower(c); });
             // Trim OWS (SP/HTAB per RFC 7230 §3.2.3)
             while (!expect.empty() && (expect.front() == ' ' || expect.front() == '\t'))
                 expect.erase(expect.begin());

@@ -72,7 +72,7 @@ static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
             self->current_header_value_.clear();
         } else {
             std::string key = self->current_header_field_;
-            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c); });
             auto it = self->request_.headers.find(key);
             if (it != self->request_.headers.end()) {
                 // Reject duplicates of non-list headers — comma-folding these
@@ -133,7 +133,7 @@ static int on_headers_complete(llhttp_t* parser) {
     // Flush last header
     if (!self->current_header_field_.empty()) {
         std::string key = self->current_header_field_;
-        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c); });
         auto it = self->request_.headers.find(key);
         if (it != self->request_.headers.end()) {
             // Reject duplicates of non-list headers
@@ -173,7 +173,7 @@ static int on_headers_complete(llhttp_t* parser) {
     std::string target = self->request_.url;
     // Case-insensitive scheme check (RFC 3986 §3.1: scheme is case-insensitive)
     std::string scheme_check = target.substr(0, 8);
-    std::transform(scheme_check.begin(), scheme_check.end(), scheme_check.begin(), ::tolower);
+    std::transform(scheme_check.begin(), scheme_check.end(), scheme_check.begin(), [](unsigned char c){ return std::tolower(c); });
     if (scheme_check.compare(0, 7, "http://") == 0 ||
         scheme_check.compare(0, 8, "https://") == 0) {
         auto scheme_end = target.find("://");

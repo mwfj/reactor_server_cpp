@@ -44,7 +44,7 @@ bool WebSocketHandshake::Validate(const HttpRequest& request, std::string& error
     // RFC 7230 §6.7: Upgrade is a comma-separated list of protocols.
     // Valid examples: "websocket", "WebSocket", "websocket, foo"
     std::string upgrade = request.GetHeader("upgrade");
-    std::transform(upgrade.begin(), upgrade.end(), upgrade.begin(), ::tolower);
+    std::transform(upgrade.begin(), upgrade.end(), upgrade.begin(), [](unsigned char c){ return std::tolower(c); });
     {
         bool found_websocket = false;
         std::string token;
@@ -67,7 +67,7 @@ bool WebSocketHandshake::Validate(const HttpRequest& request, std::string& error
     // 6. Connection header must contain "upgrade" as a token (not substring).
     // Connection can be a comma-separated list like "keep-alive, Upgrade"
     std::string connection = request.GetHeader("connection");
-    std::transform(connection.begin(), connection.end(), connection.begin(), ::tolower);
+    std::transform(connection.begin(), connection.end(), connection.begin(), [](unsigned char c){ return std::tolower(c); });
     {
         bool found_upgrade = false;
         std::string token;

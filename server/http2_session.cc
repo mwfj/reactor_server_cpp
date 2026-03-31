@@ -203,7 +203,7 @@ static int OnHeaderCallback(
         if (start != std::string::npos) {
             te_lower = te_lower.substr(start, end - start + 1);
         }
-        std::transform(te_lower.begin(), te_lower.end(), te_lower.begin(), ::tolower);
+        std::transform(te_lower.begin(), te_lower.end(), te_lower.begin(), [](unsigned char c){ return std::tolower(c); });
         if (te_lower != "trailers") {
             logging::Get()->warn("HTTP/2 stream {} received invalid TE value: {}",
                                  frame->hd.stream_id, hdr_value);
@@ -356,7 +356,7 @@ static int OnFrameRecvCallback(
             // Must respond before END_STREAM to avoid stalling the upload.
             if (req.HasHeader("expect")) {
                 std::string expect = req.GetHeader("expect");
-                std::transform(expect.begin(), expect.end(), expect.begin(), ::tolower);
+                std::transform(expect.begin(), expect.end(), expect.begin(), [](unsigned char c){ return std::tolower(c); });
                 while (!expect.empty() && (expect.front() == ' ' || expect.front() == '\t'))
                     expect.erase(expect.begin());
                 while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
@@ -702,7 +702,7 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     lowered_names.reserve(headers.size());
     for (const auto& hdr : headers) {
         std::string key = hdr.first;
-        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c); });
         // Skip HTTP/1.x connection-level headers (RFC 9113 Section 8.2.2)
         if (key == "connection" || key == "keep-alive" ||
             key == "proxy-connection" || key == "te" ||

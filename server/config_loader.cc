@@ -218,7 +218,7 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     val = std::getenv("REACTOR_TLS_ENABLED");
     if (val) {
         std::string s(val);
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
         if (s == "1" || s == "true" || s == "yes") {
             config.tls.enabled = true;
         } else if (s == "0" || s == "false" || s == "no") {
@@ -261,7 +261,7 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     val = std::getenv("REACTOR_HTTP2_ENABLED");
     if (val) {
         std::string s(val);
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
         if (s == "1" || s == "true" || s == "yes") {
             config.http2.enabled = true;
         } else if (s == "0" || s == "false" || s == "no") {

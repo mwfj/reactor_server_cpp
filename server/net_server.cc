@@ -22,10 +22,15 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
     // Only override SIG_DFL — if the embedder has installed their own
     // handler, leave it alone to avoid breaking their signal handling.
     {
-        struct sigaction sa_cur;
+        struct sigaction sa_cur{};
         sigaction(SIGPIPE, nullptr, &sa_cur);
         if (sa_cur.sa_handler == SIG_DFL) {
-            signal(SIGPIPE, SIG_IGN);
+            saved_sigpipe_ = sa_cur;
+            sigpipe_overridden_ = true;
+            struct sigaction sa_ign{};
+            sa_ign.sa_handler = SIG_IGN;
+            sigemptyset(&sa_ign.sa_mask);
+            sigaction(SIGPIPE, &sa_ign, nullptr);
         }
     }
     // Initialize conn_dispatcher_ after shared_ptr is constructed (required for eventfd setup)
@@ -45,6 +50,11 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
 
 NetServer::~NetServer(){
     Stop();
+    // Restore SIGPIPE disposition if we overrode it
+    if (sigpipe_overridden_) {
+        sigaction(SIGPIPE, &saved_sigpipe_, nullptr);
+        sigpipe_overridden_ = false;
+    }
     socket_dispatchers_.clear();
     connections_.clear();
 }

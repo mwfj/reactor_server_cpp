@@ -503,11 +503,34 @@ bool Reopen() {
         if (!has_file_sink) return true;  // no file sink to reopen or remove
     }
 
+    // Save current config so we can roll back if RebuildLogger fails.
+    // UpdateFileConfig() already committed the new globals, but if the
+    // rebuild throws (bad path, permissions), the live logger still uses
+    // the old sinks. Without rollback, CheckRotation would use the new
+    // globals pointing to a file the live logger never adopted.
+    auto saved_file = g_log_file;
+    auto saved_dir = g_log_dir;
+    auto saved_prefix = g_log_prefix;
+    auto saved_ext = g_log_extension;
+    auto saved_size = g_max_size;
+    auto saved_max = g_max_files;
+    auto saved_path = g_current_file_path;
+    auto saved_date = g_current_log_date;
+
     try {
         RebuildLogger();
         return true;
     } catch (const std::exception& e) {
-        // Keep old logger active — never fail open
+        // Roll back config globals so CheckRotation stays consistent
+        // with the still-active old logger.
+        g_log_file = std::move(saved_file);
+        g_log_dir = std::move(saved_dir);
+        g_log_prefix = std::move(saved_prefix);
+        g_log_extension = std::move(saved_ext);
+        g_max_size = saved_size;
+        g_max_files = saved_max;
+        g_current_file_path = std::move(saved_path);
+        g_current_log_date = std::move(saved_date);
         g_logger->error("Failed to reopen log file: {}", e.what());
         return false;
     }
