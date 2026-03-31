@@ -459,7 +459,10 @@ void SetLevel(spdlog::level::level_enum level) {
     g_log_level = level;
     if (g_logger) {
         g_logger->set_level(level);
-        // Update sink levels to match
+        // Update flush threshold: flush at info or above, never per-message
+        // at debug/trace. Must track level changes so reloading from
+        // critical→debug doesn't leave flush stuck at the old threshold.
+        g_logger->flush_on(std::max(level, spdlog::level::info));
         for (auto& sink : g_logger->sinks()) {
             sink->set_level(level);
         }

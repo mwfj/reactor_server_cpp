@@ -229,7 +229,8 @@ static int OnDataChunkRecvCallback(
         stream->AccumulatedBodySize() + len > self->MaxBodySize()) {
         logging::Get()->warn("HTTP/2 stream {} body exceeds max size ({})",
                              stream_id, self->MaxBodySize());
-        if (self->Callbacks().request_count_callback)
+        // Only count if not already counted/rejected in the HEADERS path
+        if (!stream->IsRejected() && self->Callbacks().request_count_callback)
             self->Callbacks().request_count_callback();
         stream->MarkRejected();
         int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
@@ -259,7 +260,7 @@ static int OnDataChunkRecvCallback(
     if (cl_violated) {
         logging::Get()->warn("HTTP/2 stream {} DATA exceeds declared content-length {}",
                              stream_id, req.content_length);
-        if (self->Callbacks().request_count_callback)
+        if (!stream->IsRejected() && self->Callbacks().request_count_callback)
             self->Callbacks().request_count_callback();
         stream->MarkRejected();
         int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,

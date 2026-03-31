@@ -270,19 +270,8 @@ static bool ReloadConfig(const std::string& config_path,
     if (new_config.http2.enabled != current_config.http2.enabled)
         logging::Get()->warn("http2.enabled changed — requires restart, ignored");
 
-    // Apply HttpServer reload BEFORE logger changes — if Reload() rejects the
-    // config (e.g., invalid H2 settings), we must not mutate the logger state.
-    if (!server.Reload(new_config)) {
-        logging::Get()->error("HttpServer::Reload() rejected the config");
-        reopen_existing_logs();  // still reopen for logrotate
-        return false;
-    }
-
-    // Apply log changes: always reopen (logrotate sends SIGHUP with unchanged
-    // config to force descriptor reopen after file rename).
-    logging::UpdateFileConfig(new_config.log.file, new_config.log.max_file_size,
-                              new_config.log.max_files);
-    // Ensure log directory exists for the new path (may have changed on reload)
+    // Validate log directory BEFORE applying any changes — if this fails,
+    // nothing is mutated (no partial state).
     if (!new_config.log.file.empty()) {
         try {
             std::string dir = new_config.log.file.substr(
@@ -290,12 +279,22 @@ static bool ReloadConfig(const std::string& config_path,
             if (!dir.empty()) logging::EnsureLogDir(dir);
         } catch (const std::exception& e) {
             logging::Get()->error("Failed to create log directory: {}", e.what());
-            logging::UpdateFileConfig(current_config.log.file,
-                                      current_config.log.max_file_size,
-                                      current_config.log.max_files);
+            reopen_existing_logs();
             return false;
         }
     }
+
+    // Apply server limits — if Reload() rejects, nothing else is mutated.
+    if (!server.Reload(new_config)) {
+        logging::Get()->error("HttpServer::Reload() rejected the config");
+        reopen_existing_logs();
+        return false;
+    }
+
+    // Apply log changes: always reopen (logrotate sends SIGHUP with unchanged
+    // config to force descriptor reopen after file rename).
+    logging::UpdateFileConfig(new_config.log.file, new_config.log.max_file_size,
+                              new_config.log.max_files);
     if (logging::Reopen()) {
         logging::Get()->info("Log files reopened");
     } else {

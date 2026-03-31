@@ -81,6 +81,10 @@ void HttpConnectionHandler::HandleUpgradedData(const std::string& data) {
 
 void HttpConnectionHandler::HandleParseError() {
     logging::Get()->warn("HTTP parse error fd={}: {}", conn_->fd(), parser_.GetError());
+    // Count parse errors as requests for stats consistency with HTTP/2
+    if (callbacks_.request_count_callback) {
+        callbacks_.request_count_callback();
+    }
     // Determine appropriate error response based on parser error type
     HttpResponse err_resp;
     switch (parser_.GetErrorType()) {
