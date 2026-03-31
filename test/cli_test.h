@@ -2637,7 +2637,7 @@ void TestHelpIncludesReload() {
 
     // Run reactor_server --help (or help subcommand) and capture output.
     // We redirect stdout to a pipe so we can inspect it.
-    std::string cmd = "./reactor_server help 2>&1";
+    std::string cmd = "./server_runner help 2>&1";
     FILE* fp = popen(cmd.c_str(), "r");
     std::string output;
     if (fp) {

@@ -4,7 +4,8 @@ AGENT.md
 CLAUDE.md
 
 *.o
-run
+test_runner
+server_runner
 
 .vscode
 *.dSYM

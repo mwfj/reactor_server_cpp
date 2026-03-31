@@ -39,8 +39,8 @@ UTIL_DIR = util
 THIRD_PARTY_DIR = third_party
 
 # Target executables
-TARGET = run
-SERVER_TARGET = reactor_server
+TARGET = test_runner
+SERVER_TARGET = server_runner
 
 # Source files (organized by component)
 # Core reactor components
