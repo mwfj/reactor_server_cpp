@@ -300,6 +300,14 @@ static bool ReloadConfig(const std::string& config_path,
         logging::Get()->warn("Config has restart-required field issues that will "
                              "fail on next restart: {}", e.what());
     }
+    // Also check daemon-specific constraints (absolute paths for log/TLS/PID)
+    if (options.daemonize) {
+        int drc = ValidateDaemonConfig(new_config, options);
+        if (drc != EXIT_OK) {
+            logging::Get()->warn("Config has daemon path issues that will "
+                                 "fail on next daemon restart");
+        }
+    }
 
     // Apply log changes: always reopen (logrotate sends SIGHUP with unchanged
     // config to force descriptor reopen after file rename).

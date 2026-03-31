@@ -16,15 +16,16 @@ static struct sigaction s_saved_sigpipe{};
 static void SigpipeGuardAcquire() {
     std::lock_guard<std::mutex> lk(s_sigpipe_mtx);
     if (s_sigpipe_refcount == 0) {
-        struct sigaction sa_cur{};
-        sigaction(SIGPIPE, nullptr, &sa_cur);
-        if (sa_cur.sa_handler == SIG_DFL) {
-            s_saved_sigpipe = sa_cur;
+        // Always save current disposition — even if non-default (SIG_IGN,
+        // custom handler). Restore on final release regardless.
+        sigaction(SIGPIPE, nullptr, &s_saved_sigpipe);
+        if (s_saved_sigpipe.sa_handler == SIG_DFL) {
             struct sigaction sa_ign{};
             sa_ign.sa_handler = SIG_IGN;
             sigemptyset(&sa_ign.sa_mask);
             sigaction(SIGPIPE, &sa_ign, nullptr);
         }
+        // If already SIG_IGN or custom — leave as-is, just refcount.
     }
     ++s_sigpipe_refcount;
 }
@@ -52,19 +53,22 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
     // Only override SIG_DFL — if the embedder has installed their own
     // handler, leave it alone to avoid breaking their signal handling.
     SigpipeGuardAcquire();
-    // Initialize conn_dispatcher_ after shared_ptr is constructed (required for eventfd setup)
-    conn_dispatcher_->Init();
-    conn_dispatcher_->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
-
-    // Now create acceptor with initialized dispatcher
-    acceptor_ = std::unique_ptr<Acceptor>(new Acceptor(conn_dispatcher_, _ip, _port));
-    acceptor_->SetNewConnCb(std::bind(&NetServer::HandleNewConnection, this, std::placeholders::_1));
-    if (worker_threads > 0) {
-        sock_workers_.Init(worker_threads);
-    } else {
-        sock_workers_.Init();
+    try {
+        conn_dispatcher_->Init();
+        conn_dispatcher_->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
+        acceptor_ = std::unique_ptr<Acceptor>(new Acceptor(conn_dispatcher_, _ip, _port));
+        acceptor_->SetNewConnCb(std::bind(&NetServer::HandleNewConnection, this, std::placeholders::_1));
+        if (worker_threads > 0) {
+            sock_workers_.Init(worker_threads);
+        } else {
+            sock_workers_.Init();
+        }
+        sock_workers_.Start();
+    } catch (...) {
+        // Constructor body threw — destructor won't run, so release manually
+        SigpipeGuardRelease();
+        throw;
     }
-    sock_workers_.Start();
 }
 
 NetServer::~NetServer(){
