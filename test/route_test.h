@@ -1108,6 +1108,148 @@ void TestRouterWsPatternRoute() {
     }
 }
 
+// Regression: /foobar and /foo/bar must not collide (slash boundary in split)
+void TestTrieSlashBoundarySplit() {
+    try {
+        IntTrie trie;
+        trie.Insert("/foobar", 1);
+        trie.Insert("/foo/bar", 2);  // must not throw
+
+        std::unordered_map<std::string, std::string> params;
+        auto r1 = trie.Search("/foobar", params);
+        auto r2 = trie.Search("/foo/bar", params);
+        auto r3 = trie.Search("/foo", params);
+        auto r4 = trie.Search("/foob", params);
+
+        bool pass = (r1.handler && *r1.handler == 1) &&
+                    (r2.handler && *r2.handler == 2) &&
+                    (r3.handler == nullptr) &&
+                    (r4.handler == nullptr);
+        std::string err;
+        if (!r1.handler || *r1.handler != 1) err = "/foobar did not match handler 1";
+        else if (!r2.handler || *r2.handler != 2) err = "/foo/bar did not match handler 2";
+        else if (r3.handler) err = "/foo should not match";
+        else if (r4.handler) err = "/foob should not match";
+        TestFramework::RecordTest(
+            "RouteTrie: /foobar and /foo/bar coexist (slash boundary in split)",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "RouteTrie: /foobar and /foo/bar coexist (slash boundary in split)",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// Regression: /baz must NOT match route /b/a/z (collapsed path)
+void TestTrieNoCollapsedPathMatch() {
+    try {
+        IntTrie trie;
+        trie.Insert("/b/a/z", 1);
+
+        std::unordered_map<std::string, std::string> params;
+        auto r1 = trie.Search("/b/a/z", params);
+        auto r2 = trie.Search("/baz", params);
+
+        bool pass = (r1.handler && *r1.handler == 1) &&
+                    (r2.handler == nullptr);
+        std::string err;
+        if (!r1.handler) err = "/b/a/z did not match";
+        else if (r2.handler) err = "/baz incorrectly matched /b/a/z route";
+        TestFramework::RecordTest(
+            "RouteTrie: /baz does NOT match route /b/a/z (no collapsed path)",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "RouteTrie: /baz does NOT match route /b/a/z (no collapsed path)",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// Regression: /users/:id/ must NOT match /users/42 (param trailing-slash)
+void TestTrieParamTrailingSlashDistinct() {
+    try {
+        IntTrie trie;
+        trie.Insert("/users/:id/", 1);
+        trie.Insert("/users/:id", 2);
+
+        std::unordered_map<std::string, std::string> params;
+        auto r1 = trie.Search("/users/42/", params);
+        bool r1_ok = (r1.handler && *r1.handler == 1 && params["id"] == "42");
+
+        params.clear();
+        auto r2 = trie.Search("/users/42", params);
+        bool r2_ok = (r2.handler && *r2.handler == 2 && params["id"] == "42");
+
+        bool pass = r1_ok && r2_ok;
+        std::string err;
+        if (!r1_ok) err = "/users/42/ did not match trailing-slash route";
+        else if (!r2_ok) err = "/users/42 did not match non-trailing-slash route";
+        TestFramework::RecordTest(
+            "RouteTrie: /users/:id/ and /users/:id are distinct routes",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "RouteTrie: /users/:id/ and /users/:id are distinct routes",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// Regression: regex character class with parentheses
+void TestTrieRegexCharacterClass() {
+    try {
+        IntTrie trie;
+        // [0-9] is a character class — parens inside [] should not confuse parser
+        trie.Insert("/items/:id([0-9]+)", 1);
+
+        std::unordered_map<std::string, std::string> params;
+        auto r1 = trie.Search("/items/42", params);
+        bool pass = (r1.handler && *r1.handler == 1);
+        TestFramework::RecordTest(
+            "RouteTrie: regex with character class [0-9] parses correctly",
+            pass, pass ? "" : "constraint with [] failed",
+            TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "RouteTrie: regex with character class [0-9] parses correctly",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// Regression: stale params cleared on dispatch miss
+void TestRouterParamsClearedOnMiss() {
+    try {
+        HttpRouter router;
+        router.Get("/users/:id", [](const HttpRequest&, HttpResponse& res) {
+            res.Status(200);
+        });
+
+        HttpRequest req;
+        HttpResponse res;
+
+        // First dispatch — match
+        req.method = "GET"; req.path = "/users/42";
+        router.Dispatch(req, res);
+        bool first_ok = (req.params["id"] == "42");
+
+        // Second dispatch — miss (404)
+        req.method = "GET"; req.path = "/missing";
+        router.Dispatch(req, res);
+        bool second_ok = req.params.empty();
+
+        bool pass = first_ok && second_ok;
+        std::string err;
+        if (!first_ok) err = "first dispatch did not set params";
+        else if (!second_ok) err = "params not cleared on 404 miss";
+        TestFramework::RecordTest(
+            "HttpRouter: params cleared on dispatch miss (no stale state)",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "HttpRouter: params cleared on dispatch miss (no stale state)",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RunAllTests
 // ---------------------------------------------------------------------------
@@ -1159,6 +1301,13 @@ void RunAllTests() {
     TestTrieRootCatchAll();
     TestTrieCatchAllNoTrailingSlash();
     TestRouterWsPatternRoute();
+
+    // Regression tests (from PR review rounds)
+    TestTrieSlashBoundarySplit();
+    TestTrieNoCollapsedPathMatch();
+    TestTrieParamTrailingSlashDistinct();
+    TestTrieRegexCharacterClass();
+    TestRouterParamsClearedOnMiss();
 }
 
 }  // namespace RouteTests

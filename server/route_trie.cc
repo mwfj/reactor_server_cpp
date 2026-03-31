@@ -37,16 +37,28 @@ static void ValidateName(const std::string& name, const std::string& pattern) {
 
 // Extract balanced parentheses content starting at pos (which points at '(').
 // Returns the regex string (without outer parens) and advances pos past ')'.
+// Handles: backslash escapes (\( \)), character classes ([...]), and nesting.
 static std::string ExtractConstraint(const std::string& pattern, size_t& pos) {
     if (pos >= pattern.size() || pattern[pos] != '(') {
         return "";
     }
     pos++;  // skip '('
     int depth = 1;
+    bool in_char_class = false;
     size_t start = pos;
     while (pos < pattern.size() && depth > 0) {
         if (pattern[pos] == '\\' && pos + 1 < pattern.size()) {
-            pos += 2;  // skip escaped character (e.g., \( or \))
+            pos += 2;  // skip escaped character (e.g., \( \) \[ \])
+            continue;
+        }
+        if (in_char_class) {
+            if (pattern[pos] == ']') in_char_class = false;
+            pos++;
+            continue;
+        }
+        if (pattern[pos] == '[') {
+            in_char_class = true;
+            pos++;
             continue;
         }
         if (pattern[pos] == '(') depth++;
@@ -66,10 +78,30 @@ static std::string ExtractConstraint(const std::string& pattern, size_t& pos) {
     return constraint;
 }
 
+// ParsePattern produces segments where STATIC values include '/' separators.
+// This preserves slash boundaries through node splitting, preventing
+// /foobar and /foo/bar from colliding in the trie.
+//
+// Examples:
+//   /health         → [STATIC "health"]
+//   /foo/bar        → [STATIC "foo/bar"]
+//   /users/:id      → [STATIC "users/", PARAM "id"]
+//   /users/:id/ord  → [STATIC "users/", PARAM "id", STATIC "/ord"]
+//   /:id            → [PARAM "id"]
+//   /:id/bar        → [PARAM "id", STATIC "/bar"]
+//   /static/*fp     → [STATIC "static/", CATCH_ALL "fp"]
+//   /users/         → [STATIC "users/"]
+//   /               → []
 std::vector<Segment> ParsePattern(const std::string& pattern) {
     if (pattern.empty() || pattern[0] != '/') {
         throw std::invalid_argument(
             "Pattern must start with '/': " + pattern);
+    }
+
+    // Reject double slashes early
+    if (pattern.find("//") != std::string::npos) {
+        throw std::invalid_argument(
+            "Empty path segment (double slash) in pattern: " + pattern);
     }
 
     // Root path "/" — zero segments, route terminates at root node
@@ -79,15 +111,30 @@ std::vector<Segment> ParsePattern(const std::string& pattern) {
 
     std::vector<Segment> segments;
     size_t pos = 1;  // skip leading '/'
+    std::string current_static;  // accumulates static text including '/' separators
 
     while (pos < pattern.size()) {
         if (pattern[pos] == '/') {
-            throw std::invalid_argument(
-                "Empty path segment (double slash) in pattern: " + pattern);
+            // Slash separator — include it in the accumulated static text
+            current_static += '/';
+            pos++;
+            if (pos >= pattern.size()) {
+                // Trailing slash — the '/' is part of current_static
+                break;
+            }
+            continue;
         }
 
         if (pattern[pos] == ':') {
-            // Parameter segment
+            // PARAM — flush accumulated static (which includes trailing '/')
+            if (!current_static.empty()) {
+                Segment seg;
+                seg.type = NodeType::STATIC;
+                seg.value = std::move(current_static);
+                segments.push_back(std::move(seg));
+                current_static.clear();
+            }
+
             pos++;  // skip ':'
             size_t name_start = pos;
             while (pos < pattern.size() && pattern[pos] != '/' && pattern[pos] != '(') {
@@ -108,7 +155,15 @@ std::vector<Segment> ParsePattern(const std::string& pattern) {
             segments.push_back(std::move(seg));
 
         } else if (pattern[pos] == '*') {
-            // Catch-all segment
+            // CATCH_ALL — flush accumulated static
+            if (!current_static.empty()) {
+                Segment seg;
+                seg.type = NodeType::STATIC;
+                seg.value = std::move(current_static);
+                segments.push_back(std::move(seg));
+                current_static.clear();
+            }
+
             pos++;  // skip '*'
             size_t name_start = pos;
             while (pos < pattern.size() && pattern[pos] != '/') {
@@ -130,32 +185,20 @@ std::vector<Segment> ParsePattern(const std::string& pattern) {
             segments.push_back(std::move(seg));
 
         } else {
-            // Static segment — text between slashes (no leading slash stored)
-            size_t start = pos;
+            // Static text — accumulate (including any preceding '/' already added)
             while (pos < pattern.size() && pattern[pos] != '/') {
+                current_static += pattern[pos];
                 pos++;
             }
-            Segment seg;
-            seg.type = NodeType::STATIC;
-            seg.value = pattern.substr(start, pos - start);
-            segments.push_back(std::move(seg));
         }
+    }
 
-        // After a segment, expect '/' + more, or end of pattern.
-        if (pos < pattern.size()) {
-            if (pattern[pos] != '/') {
-                throw std::invalid_argument(
-                    "Expected '/' after segment in pattern: " + pattern);
-            }
-            pos++;  // consume '/'
-            if (pos >= pattern.size()) {
-                // Trailing slash — push sentinel empty STATIC so /users and /users/ are distinct
-                Segment seg;
-                seg.type = NodeType::STATIC;
-                // seg.value is empty string
-                segments.push_back(std::move(seg));
-            }
-        }
+    // Flush remaining static text
+    if (!current_static.empty()) {
+        Segment seg;
+        seg.type = NodeType::STATIC;
+        seg.value = std::move(current_static);
+        segments.push_back(std::move(seg));
     }
 
     return segments;
@@ -166,7 +209,7 @@ std::shared_ptr<void> CompileRegex(const std::string& pattern,
     try {
         auto re = std::make_shared<std::regex>(
             pattern, std::regex_constants::ECMAScript);
-        return re;  // shared_ptr<std::regex> implicitly converts to shared_ptr<void>
+        return re;
     } catch (const std::regex_error& e) {
         throw std::invalid_argument(
             "Invalid regex constraint '(" + pattern +

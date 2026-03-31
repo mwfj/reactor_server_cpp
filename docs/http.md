@@ -77,7 +77,7 @@ Capture a single path segment (everything between `/` separators). Accessed via 
 
 ```cpp
 server.Get("/users/:id", [](const HttpRequest& req, HttpResponse& res) {
-    std::string user_id = req.params.at("id");
+    std::string user_id = req.params["id"];  // guaranteed present when handler runs
     res.Status(200).Json(R"({"id":")" + user_id + R"("})");
 });
 
