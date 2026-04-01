@@ -71,15 +71,18 @@ void NetServer::Start(){
             }));
         sock_workers_.AddTask(work_task);
     }
-    // Init complete — fire ready callback before entering the blocking accept loop.
-    // Timing: the listen socket is bound and the OS is queuing incoming connections
-    // in the backlog. Socket dispatchers are already running their event loops in
-    // worker threads. The conn_dispatcher accept loop starts immediately after this
-    // callback returns. There is a brief window where connections queue but aren't
-    // accepted yet — this is acceptable (kernel backlog handles it).
+    // Enqueue the ready callback into the conn_dispatcher's task queue so it
+    // fires from within the first event loop iteration — after the accept loop
+    // is running and processing events. This eliminates the startup race where
+    // the old inline callback fired before RunEventLoop(), leaving a window
+    // where the listen socket was live but the accept loop wasn't draining it.
+    //
+    // EnQueue works here because conn_dispatcher_->Init() (called in constructor)
+    // registered the wake channel. The enqueued task + WakeUp() causes the first
+    // WaitForEvent() to return immediately, executing the callback.
     if (ready_callback_) {
-        ready_callback_();
-        ready_callback_ = nullptr;  // one-shot
+        conn_dispatcher_->EnQueue(std::move(ready_callback_));
+        ready_callback_ = nullptr;  // moved
     }
 
     conn_dispatcher_->RunEventLoop();

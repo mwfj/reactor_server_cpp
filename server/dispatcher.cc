@@ -101,6 +101,13 @@ void Dispatcher::set_running_state(bool status){
 }
 
 void Dispatcher::RunEventLoop(){
+    // Guard: if StopEventLoop() was called before we entered the loop
+    // (e.g., TestServerRunner timeout calling Stop() while the server thread
+    // is still setting up), return immediately so the thread can be joined.
+    // Without this, set_running_state(true) would override the stop and the
+    // loop would run forever, hanging the join().
+    if (was_stopped()) return;
+
     set_running_state(true);
 
     thread_id_.store(std::this_thread::get_id(), std::memory_order_release);

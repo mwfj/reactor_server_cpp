@@ -230,17 +230,17 @@ void TestParseInvalidPortNegative() {
         pass = false; err += std::string("port 0 threw: ") + e.what() + "; ";
     }
 
-    // Negative port must still throw (getopt treats -1 as end-of-options,
-    // so we test the boundary via an out-of-range value)
+    // Negative port via --port=-1 (= form bypasses getopt's end-of-options
+    // interpretation of bare -1)
     try {
-        const char* args[] = {"reactor_server", "start", "--port", "99999"};
-        int argc = 4;
+        const char* args[] = {"reactor_server", "start", "--port=-1"};
+        int argc = 3;
         CliParser::Parse(argc, const_cast<char**>(args));
-        pass = false; err += "port 99999 did not throw; ";
+        pass = false; err += "port -1 did not throw; ";
     } catch (const std::runtime_error&) {
         // Expected
     } catch (const std::exception& e) {
-        pass = false; err += std::string("port 99999 wrong exception: ") + e.what() + "; ";
+        pass = false; err += std::string("port -1 wrong exception: ") + e.what() + "; ";
     }
 
     TestFramework::RecordTest("CliParser: Port 0 accepted, out-of-range throws",
