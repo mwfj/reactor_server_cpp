@@ -311,28 +311,30 @@ void HttpServer::Stop() {
     // write in DoSendRaw → CallCloseCb → HandleCloseConnection → conn_mtx_.
     std::vector<std::pair<std::shared_ptr<HttpConnectionHandler>,
                           std::shared_ptr<ConnectionHandler>>> ws_conns;
+    std::set<ConnectionHandler*> ws_draining;
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         for (auto& pair : http_connections_) {
             auto* ws = pair.second->GetWebSocket();
-            if (ws && ws->IsOpen()) {
-                ws_conns.emplace_back(pair.second, pair.second->GetConnection());
+            if (!ws) continue;
+            auto conn = pair.second->GetConnection();
+            if (ws->IsOpen()) {
+                // Active WS — will send close frame below
+                ws_conns.emplace_back(pair.second, conn);
+            } else if (ws->IsClosing()) {
+                // Already in close handshake (sent close, waiting for reply).
+                // Must exempt from the generic close sweep so the peer has
+                // time to reply before the transport is torn down.
+                if (conn) ws_draining.insert(conn.get());
             }
         }
     }
     // Send 1001 Going Away close frames outside the lock.
-    // Do NOT call CloseAfterWrite here — SendClose arms a 5s deadline for
-    // the peer's Close reply. CloseAfterWrite would force-close as soon as
-    // the frame drains, cutting the handshake short (resulting in 1006).
-    // NetServer::Stop() handles draining and eventual force-close.
-    std::set<ConnectionHandler*> ws_draining;
     for (auto& [http_conn, conn] : ws_conns) {
         auto* ws = http_conn->GetWebSocket();
         if (ws && ws->IsOpen()) {
             try {
                 ws->SendClose(1001, "Going Away");
-                // Mark for exemption from NetServer's generic close sweep.
-                // SendClose arms a 5s deadline — the peer needs time to reply.
                 if (conn) ws_draining.insert(conn.get());
             }
             catch (...) {}
@@ -1063,10 +1065,15 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         }
         size_t final_cap = (ws > 0) ? (http_cap == 0 ? ws : std::min(http_cap, ws))
                                     : http_cap;
-        // Phase 1: set cap to the smaller of old and new
+        // Phase 1: set cap to the more restrictive of old and new.
+        // 0 means unlimited — never use it as the transitional cap.
         size_t old_cap = ComputeInputCap();
-        net_server_.SetMaxInputSize(
-            (old_cap > 0 && final_cap > 0) ? std::min(old_cap, final_cap) : final_cap);
+        size_t transition_cap;
+        if (old_cap == 0 && final_cap == 0) transition_cap = 0;
+        else if (old_cap == 0) transition_cap = final_cap;
+        else if (final_cap == 0) transition_cap = old_cap;
+        else transition_cap = std::min(old_cap, final_cap);
+        net_server_.SetMaxInputSize(transition_cap);
         // Phase 2: update limit atomics
         max_body_size_.store(new_config.max_body_size, std::memory_order_relaxed);
         max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);
