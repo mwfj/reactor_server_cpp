@@ -341,15 +341,15 @@ void HttpServer::Stop() {
         if (ws && ws->IsOpen()) {
             try {
                 ws->SendClose(1001, "Going Away");
-                // If the connection has buffered output (backpressure),
-                // arm CloseAfterWrite so the drain path extends the write
-                // window. Without this, backpressured clients never get
-                // the close frame written and see 1006 on force-close.
-                // For idle connections (empty buffer), SendClose's 5s
-                // deadline handles the close handshake normally.
-                if (conn && conn->OutputBufferSize() > 0) {
-                    conn->CloseAfterWrite();
-                } else if (conn) {
+                if (conn) {
+                    // Backpressured: arm CloseAfterWrite so the drain path
+                    // extends the write window until the close frame flushes.
+                    // Idle: SendClose's 5s deadline handles the handshake.
+                    // Both cases: track in ws_draining so the pre-stop wait
+                    // knows when all WS connections have actually closed.
+                    if (conn->OutputBufferSize() > 0) {
+                        conn->CloseAfterWrite();
+                    }
                     ws_draining.insert(conn.get());
                 }
             }
