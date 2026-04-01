@@ -100,7 +100,23 @@ public:
         SearchResult result;
         params.clear();  // Output parameter — clear stale keys from prior searches
         if (!root_) return result;
-        if (path.empty() || path[0] != '/') return result;
+        if (path.empty()) return result;
+
+        // Non-origin-form paths (CONNECT authority-form, OPTIONS *) don't start
+        // with '/'. Search them as exact-match static children of root.
+        if (path[0] != '/') {
+            std::vector<std::string> values;
+            const HandlerType* found = nullptr;
+            std::string matched;
+            const std::vector<std::string>* leaf_names = nullptr;
+            if (SearchChildren(root_.get(), path.data(), path.size(), values,
+                               found, matched, leaf_names, false)) {
+                result.handler = found;
+                result.matched_pattern = std::move(matched);
+                PopulateParams(params, leaf_names, values);
+            }
+            return result;
+        }
 
         // Collect param values in encounter order during traversal
         std::vector<std::string> values;
@@ -139,7 +155,11 @@ public:
 
     bool HasMatch(const std::string& path) const {
         if (!root_) return false;
-        if (path.empty() || path[0] != '/') return false;
+        if (path.empty()) return false;
+        // Non-origin-form: exact-match static children only
+        if (path[0] != '/') {
+            return HasMatchChildren(root_.get(), path.data(), path.size(), false);
+        }
         if (path.size() == 1) {
             if (root_->is_leaf) return true;
             return HasMatchChildren(root_.get(), "", 0, true);

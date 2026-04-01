@@ -93,9 +93,19 @@ static std::string ExtractConstraint(const std::string& pattern, size_t& pos) {
 //   /users/         → [STATIC "users/"]
 //   /               → []
 std::vector<Segment> ParsePattern(const std::string& pattern) {
-    if (pattern.empty() || pattern[0] != '/') {
-        throw std::invalid_argument(
-            "Pattern must start with '/': " + pattern);
+    if (pattern.empty()) {
+        throw std::invalid_argument("Pattern must not be empty");
+    }
+
+    // Non-origin-form request targets: authority-form CONNECT (e.g.,
+    // "example.com:443") and asterisk-form OPTIONS ("*") don't start with '/'.
+    // Treat the entire pattern as a single exact-match static segment.
+    // No param/catch-all support for these forms — they are always exact.
+    if (pattern[0] != '/') {
+        Segment seg;
+        seg.type = NodeType::STATIC;
+        seg.value = pattern;
+        return {seg};
     }
 
     // Reject double slashes early

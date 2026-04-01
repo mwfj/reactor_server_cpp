@@ -409,22 +409,37 @@ void TestTrieParamNameSharesNode() {
     }
 }
 
-// Test 16: pattern not starting with '/' throws
-void TestTrieInvalidPatternNoSlash() {
+// Test 16: non-origin-form patterns (CONNECT authority, OPTIONS *) work as exact match
+void TestTrieNonOriginForm() {
     try {
         IntTrie trie;
-        bool threw = false;
-        try {
-            trie.Insert("users/:id", 1);
-        } catch (const std::invalid_argument&) {
-            threw = true;
-        }
+        trie.Insert("example.com:443", 1);  // CONNECT authority-form
+        trie.Insert("*", 2);                 // OPTIONS asterisk-form
+
+        std::unordered_map<std::string, std::string> params;
+        auto r1 = trie.Search("example.com:443", params);
+        auto r2 = trie.Search("*", params);
+        auto r3 = trie.Search("other.com:443", params);
+
+        bool pass = (r1.handler && *r1.handler == 1) &&
+                    (r2.handler && *r2.handler == 2) &&
+                    (r3.handler == nullptr);
+        std::string err;
+        if (!r1.handler) err = "CONNECT authority-form not matched";
+        else if (!r2.handler) err = "OPTIONS asterisk-form not matched";
+        else if (r3.handler) err = "unregistered authority should not match";
+
+        // Empty pattern still throws
+        bool empty_threw = false;
+        try { trie.Insert("", 3); } catch (const std::invalid_argument&) { empty_threw = true; }
+        if (!empty_threw) { pass = false; err += "empty pattern should throw; "; }
+
         TestFramework::RecordTest(
-            "RouteTrie: pattern without leading / throws",
-            threw, threw ? "" : "expected std::invalid_argument",
-            TestFramework::TestCategory::ROUTE);
+            "RouteTrie: non-origin-form patterns (CONNECT, OPTIONS *) as exact match",
+            pass, err, TestFramework::TestCategory::ROUTE);
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("RouteTrie: pattern without leading / throws",
+        TestFramework::RecordTest(
+            "RouteTrie: non-origin-form patterns (CONNECT, OPTIONS *) as exact match",
             false, e.what(), TestFramework::TestCategory::ROUTE);
     }
 }
@@ -1304,7 +1319,7 @@ void RunAllTests() {
     TestTrieConflictConstraintClash();
     TestTrieConflictDuplicateCatchAll();
     TestTrieParamNameSharesNode();
-    TestTrieInvalidPatternNoSlash();
+    TestTrieNonOriginForm();
     TestTrieInvalidPatternEmptyParam();
     TestTrieInvalidPatternCatchAllNotLast();
     TestTrieInvalidRegex();
