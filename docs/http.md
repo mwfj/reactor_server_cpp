@@ -108,7 +108,7 @@ server.Get("/static/*filepath", [](const HttpRequest& req, HttpResponse& res) {
 });
 ```
 
-The captured value does not include a leading `/`. Prepend `/` yourself if you need the full sub-path.
+The captured value is the raw remaining path after the prefix. For normal paths, it does not include a leading `/` because the prefix consumed the separator (e.g., `"css/style.css"` for `/static/css/style.css`). Paths with `//` are passed through as-is.
 
 ### Priority Rules
 

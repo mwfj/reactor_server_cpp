@@ -461,20 +461,15 @@ private:
         }
 
         // CATCH_ALL children.
-        // Convention: captured tail does NOT include a leading '/'.
-        // Strip it if present (can occur with // in request path or when
-        // the preceding static prefix consumed up to the separator).
+        // The captured tail is the raw remaining path. With slashes-in-prefixes,
+        // the preceding static prefix already consumed the '/' separator, so
+        // normal paths never have a leading '/'. Paths with '//' are passed
+        // through as-is (no normalization — consistent with raw path handling).
         for (const auto& child : node->children) {
             if (child->type != route_trie::NodeType::CATCH_ALL) continue;
 
             if (!child->param_name.empty()) {
-                const char* tail = path;
-                size_t tail_len = path_len;
-                if (tail_len > 0 && tail[0] == '/') {
-                    tail++;
-                    tail_len--;
-                }
-                values.push_back(std::string(tail, tail_len));
+                values.push_back(std::string(path, path_len));
             }
             out_handler = &child->handler;
             matched_pattern = child->pattern;

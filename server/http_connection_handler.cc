@@ -153,9 +153,9 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
     if (req.upgrade && req.method == "GET" && callbacks_.route_check_callback) {
         try {
         // Probe route existence to populate request.params for pattern routes
-        // (e.g., /ws/:room → req.params["room"]). The result is checked AFTER
-        // middleware so that auth/logging/CORS middleware always runs — even
-        // for unknown upgrade paths (security auditing, rate limiting).
+        // (e.g., /ws/:room → req.params["room"]). The bool result is checked
+        // AFTER handshake validation and middleware to avoid leaking route
+        // existence through different error codes (404 vs 400/426).
         bool ws_route_found = callbacks_.route_check_callback(req);
 
         // Run middleware — always, regardless of route match.
@@ -178,18 +178,10 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             }
         }
 
-        // Now check route existence (after middleware had a chance to run)
-        if (!ws_route_found) {
-            logging::Get()->debug("WebSocket route not found fd={} path={}",
-                                  conn_->fd(), logging::SanitizePath(req.path));
-            auto not_found = HttpResponse::NotFound();
-            not_found.Header("Connection", "close");
-            SendResponse(not_found);
-            CloseConnection();
-            return false;
-        }
-
-        // Validate WebSocket handshake per RFC 6455
+        // Validate WebSocket handshake per RFC 6455.
+        // Must happen BEFORE the route-miss check so that malformed upgrades
+        // always get 400/426 regardless of whether the route exists — prevents
+        // leaking route existence through different error codes.
         std::string ws_error;
         if (!WebSocketHandshake::Validate(req, ws_error)) {
             logging::Get()->debug("WebSocket handshake rejected fd={}: {}",
@@ -206,6 +198,17 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             }
             reject.Header("Connection", "close");
             SendResponse(reject);
+            CloseConnection();
+            return false;
+        }
+
+        // Now check route existence (after middleware and validation)
+        if (!ws_route_found) {
+            logging::Get()->debug("WebSocket route not found fd={} path={}",
+                                  conn_->fd(), logging::SanitizePath(req.path));
+            auto not_found = HttpResponse::NotFound();
+            not_found.Header("Connection", "close");
+            SendResponse(not_found);
             CloseConnection();
             return false;
         }

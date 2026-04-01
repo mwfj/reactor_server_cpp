@@ -124,7 +124,9 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
         }
         logging::Get()->debug("Method not allowed: {} {}",
                               request.method, logging::SanitizePath(request.path));
-        response = HttpResponse::MethodNotAllowed();
+        // Set status on the existing response to preserve any headers that
+        // middleware already added (CORS, request-id, auth tokens, etc.).
+        response.Status(405).Text("Method Not Allowed");
         response.Header("Allow", allowed);
         return true;
     }
