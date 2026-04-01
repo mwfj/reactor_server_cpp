@@ -152,6 +152,16 @@ std::vector<Segment> ParsePattern(const std::string& pattern) {
                 constraint = ExtractConstraint(pattern, pos);
             }
 
+            // After param name (and optional constraint), the next char must be
+            // '/' or end-of-pattern. Trailing text like /:id.json or /:id([0-9]+).txt
+            // would be unreachable because the PARAM node consumes the entire segment.
+            if (pos < pattern.size() && pattern[pos] != '/') {
+                throw std::invalid_argument(
+                    "Trailing text after parameter ':" + name +
+                    "' in pattern: " + pattern +
+                    " (parameter must be the entire segment between '/' separators)");
+            }
+
             Segment seg;
             seg.type = NodeType::PARAM;
             seg.param_name = std::move(name);
