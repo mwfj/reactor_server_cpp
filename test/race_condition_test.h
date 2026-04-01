@@ -63,7 +63,7 @@ namespace RaceConditionTests {
 
         try {
             ReactorServer server(TEST_IP, 0);
-            ::TestServerRunner<ReactorServer> runner(server);
+            TestServerRunner<ReactorServer> runner(server);
             const int port = runner.GetPort();
 
             // EnQueue multiple tasks that themselves call EnQueue
@@ -142,7 +142,7 @@ namespace RaceConditionTests {
 
         try {
             ReactorServer server(TEST_IP, 0);
-            ::TestServerRunner<ReactorServer> runner(server);
+            TestServerRunner<ReactorServer> runner(server);
             const int port = runner.GetPort();
 
             std::atomic<int> successful_closes{0};
@@ -198,7 +198,7 @@ namespace RaceConditionTests {
 
         try {
             ReactorServer server(TEST_IP, 0);
-            ::TestServerRunner<ReactorServer> runner(server);
+            TestServerRunner<ReactorServer> runner(server);
             const int port = runner.GetPort();
 
             std::atomic<int> successful_ops{0};
@@ -255,7 +255,7 @@ namespace RaceConditionTests {
 
         try {
             ReactorServer server(TEST_IP, 0);
-            ::TestServerRunner<ReactorServer> runner(server);
+            TestServerRunner<ReactorServer> runner(server);
             const int port = runner.GetPort();
 
             // This test specifically targets the segfault from Issue 4
@@ -347,7 +347,7 @@ namespace RaceConditionTests {
 
         try {
             ReactorServer server(TEST_IP, 0);
-            ::TestServerRunner<ReactorServer> runner(server);
+            TestServerRunner<ReactorServer> runner(server);
             const int port = runner.GetPort();
 
             // Create connections that send data then close very rapidly
@@ -409,7 +409,7 @@ namespace RaceConditionTests {
 
         try {
             ReactorServer server(TEST_IP, 0);
-            ::TestServerRunner<ReactorServer> runner(server);
+            TestServerRunner<ReactorServer> runner(server);
             const int port = runner.GetPort();
 
             // Multiple threads try to close same connection simultaneously

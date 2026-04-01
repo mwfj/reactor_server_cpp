@@ -162,6 +162,9 @@ void SocketHandler::SetNonBlocking(int fd) {
 
 int SocketHandler::GetBoundPort() const {
     if (fd_ == -1) return 0;
+    // IPv4 only — matches the project's current AF_INET-only stack.
+    // If IPv6 is added (sockaddr_in6 is 28 bytes vs sockaddr_in's 16),
+    // this must change to sockaddr_storage to avoid buffer overflow.
     struct sockaddr_in addr;
     socklen_t len = sizeof(addr);
     if (getsockname(fd_, reinterpret_cast<struct sockaddr*>(&addr), &len) < 0) {

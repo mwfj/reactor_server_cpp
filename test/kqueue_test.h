@@ -111,6 +111,7 @@ void TestEvEofOnWriteFilter() {
 
         // Close the peer end — should trigger EV_EOF on EVFILT_WRITE
         ::close(fds[1]);
+        fds[1] = -1;  // Mark closed for exception-path cleanup
 
         // Run event loop briefly in a thread
         std::thread loop_thread([&dispatcher]() {
@@ -206,6 +207,7 @@ void TestPipeWakeupUnderLoad() {
 void TestFilterConsolidation() {
     std::cout << "\n[TEST] KQ-TEST-4: Filter consolidation..." << std::endl;
     int fds[2] = {-1, -1};
+    std::shared_ptr<Channel> channel;
     try {
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
             throw std::runtime_error("socketpair failed");
@@ -216,7 +218,7 @@ void TestFilterConsolidation() {
         auto dispatcher = std::make_shared<Dispatcher>();
         dispatcher->Init();
 
-        auto channel = std::make_shared<Channel>(dispatcher, fds[0]);
+        channel = std::make_shared<Channel>(dispatcher, fds[0]);
         std::string event_log;
         std::mutex log_mutex;
 
@@ -277,7 +279,8 @@ void TestFilterConsolidation() {
         TestFramework::RecordTest("KQ: Filter consolidation R+W",
             pass, err, TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
-        if (fds[0] >= 0) ::close(fds[0]);
+        // Channel owns fds[0] after construction — only close if not yet created
+        if (!channel && fds[0] >= 0) ::close(fds[0]);
         if (fds[1] >= 0) ::close(fds[1]);
         TestFramework::RecordTest("KQ: Filter consolidation R+W",
             false, e.what(), TestFramework::TestCategory::OTHER);
@@ -340,7 +343,7 @@ void TestChurnStability() {
             pass, err, TestFramework::TestCategory::STRESS);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("KQ: Churn stability after rapid connects",
-            false, e.what(), TestFramework::TestCategory::BASIC);
+            false, e.what(), TestFramework::TestCategory::STRESS);
     }
 }
 
