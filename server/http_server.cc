@@ -325,11 +325,15 @@ void HttpServer::Stop() {
     // the peer's Close reply. CloseAfterWrite would force-close as soon as
     // the frame drains, cutting the handshake short (resulting in 1006).
     // NetServer::Stop() handles draining and eventual force-close.
+    std::set<ConnectionHandler*> ws_draining;
     for (auto& [http_conn, conn] : ws_conns) {
         auto* ws = http_conn->GetWebSocket();
         if (ws && ws->IsOpen()) {
             try {
                 ws->SendClose(1001, "Going Away");
+                // Mark for exemption from NetServer's generic close sweep.
+                // SendClose arms a 5s deadline — the peer needs time to reply.
+                if (conn) ws_draining.insert(conn.get());
             }
             catch (...) {}
         }
@@ -391,10 +395,14 @@ void HttpServer::Stop() {
         std::lock_guard<std::mutex> dlck(drain_mtx_);
         has_draining = !h2_draining_.empty();
     }
-    if (has_draining && !net_server_.IsOnDispatcherThread()) {
+    // Merge WS draining set into H2 draining set — both are exempt from
+    // the generic close sweep in NetServer::Stop().
+    draining_conn_ptrs.insert(ws_draining.begin(), ws_draining.end());
+
+    if (!draining_conn_ptrs.empty() && !net_server_.IsOnDispatcherThread()) {
         net_server_.SetDrainingConns(std::move(draining_conn_ptrs));
         net_server_.SetPreStopDrainCallback([this]() { WaitForH2Drain(); });
-    } else if (has_draining) {
+    } else if (!draining_conn_ptrs.empty()) {
         logging::Get()->warn("HttpServer::Stop() called from dispatcher thread — "
                              "HTTP/2 graceful drain skipped to avoid deadlock");
         // Don't exempt H2 connections — let normal close sweep handle them
@@ -1023,6 +1031,13 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     // any atomics. Then set the cap first, then the per-request limits.
     // This ensures a connection accepted mid-reload gets at most the new cap
     // (which matches the new limits), not the old cap with new lower limits.
+    // Store per-connection limits FIRST, then set input cap. A connection
+    // accepted mid-reload reads limits in SetupHandlers and cap in
+    // HandleNewConnection. Storing limits first ensures the connection never
+    // sees a larger cap with smaller limits (which would allow over-buffering).
+    max_body_size_.store(new_config.max_body_size, std::memory_order_relaxed);
+    max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);
+    max_ws_message_size_.store(new_config.max_ws_message_size, std::memory_order_relaxed);
     {
         size_t body = new_config.max_body_size;
         size_t hdr = new_config.max_header_size;
@@ -1040,9 +1055,6 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
                               : http_cap;
         net_server_.SetMaxInputSize(cap);
     }
-    max_body_size_.store(new_config.max_body_size, std::memory_order_relaxed);
-    max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);
-    max_ws_message_size_.store(new_config.max_ws_message_size, std::memory_order_relaxed);
 
     // Update the remaining reload-safe fields
     request_timeout_sec_.store(new_config.request_timeout_sec, std::memory_order_relaxed);

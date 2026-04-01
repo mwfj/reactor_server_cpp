@@ -289,23 +289,13 @@ static bool ReloadConfig(const std::string& config_path,
         }
     }
 
-    // Apply server limits — if Reload() rejects, nothing else is mutated.
-    if (!server.Reload(new_config)) {
-        logging::Get()->error("HttpServer::Reload() rejected the config");
-        reopen_existing_logs();
-        return false;
-    }
-
     // Warn if the FULL config (including restart-required fields) is invalid.
-    // Reload() only validates reload-safe fields. A broken bind_host/TLS/etc.
-    // would pass reload but explode on next restart. Don't reject — just warn.
     try {
         ConfigLoader::Validate(new_config);
     } catch (const std::invalid_argument& e) {
         logging::Get()->warn("Config has restart-required field issues that will "
                              "fail on next restart: {}", e.what());
     }
-    // Also check daemon-specific constraints (absolute paths for log/TLS/PID)
     if (options.daemonize) {
         int drc = ValidateDaemonConfig(new_config, options);
         if (drc != EXIT_OK) {
@@ -314,17 +304,15 @@ static bool ReloadConfig(const std::string& config_path,
         }
     }
 
-    // Apply log changes atomically: update config + reopen under one lock.
-    // Prevents CheckRotation from observing partial state between update and
-    // reopen. On failure, UpdateAndReopen rolls back internally.
+    // Apply log changes FIRST — if reopen fails on a changed path, nothing
+    // else is mutated. This prevents partial reload where server limits are
+    // applied but the log destination is wrong.
     if (logging::UpdateAndReopen(new_config.log.file, new_config.log.max_file_size,
                                  new_config.log.max_files)) {
         logging::Get()->info("Log files reopened");
     } else {
         if (new_config.log.file != current_config.log.file) {
-            // Log path change failed — report as failed reload. Server limits
-            // were already applied by Reload(), but we can't claim success when
-            // the requested log destination is not in effect.
+            // Log path change failed — no server limits were applied yet.
             logging::Get()->error("Log file reopen failed for new path: {}",
                                   new_config.log.file);
             return false;
@@ -341,10 +329,13 @@ static bool ReloadConfig(const std::string& config_path,
         logging::Get()->info("Log level changed to {}", new_config.log.level);
     }
 
+    // Apply server limits AFTER log changes succeed — ensures no partial reload.
+    if (!server.Reload(new_config)) {
+        logging::Get()->error("HttpServer::Reload() rejected the config");
+        return false;
+    }
+
     // Log reload-safe changes at info level.
-    // idle_timeout and max_connections take effect immediately for all connections.
-    // Size limits and request_timeout are cached per-connection — only new
-    // connections pick up the updated values.
     if (new_config.idle_timeout_sec != current_config.idle_timeout_sec)
         logging::Get()->info("idle_timeout_sec: {} -> {} (immediate)",
                              current_config.idle_timeout_sec, new_config.idle_timeout_sec);
