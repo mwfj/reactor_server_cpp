@@ -32,6 +32,8 @@ private:
     std::thread pending_self_stop_;
     void Run();
     void JoinPendingSelfStop();
+    void LogError(const std::string& msg);
+    std::function<void(const std::string&)> error_logger_;
 public:
     ThreadPool() = default;
 
@@ -56,6 +58,12 @@ public:
 
     void SetThreadWorkerNum(int, bool);
     int GetThreadWorkerNum();
+
+    // Set a custom error logger. Default: std::cerr. Set this to route
+    // errors through spdlog when running in daemon mode (stderr is /dev/null).
+    void SetErrorLogger(std::function<void(const std::string&)> logger) {
+        error_logger_ = std::move(logger);
+    }
 
     bool is_running() const { return is_running_; }
     int running_threads() const { return running_threads_.load(); }
