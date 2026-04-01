@@ -30,6 +30,8 @@ private:
     struct SharedState {
         std::atomic_int running_threads{0};
         std::atomic_bool is_running{false};
+        std::mutex logger_mtx;
+        std::function<void(const std::string&)> error_logger;
     };
     std::shared_ptr<SharedState> state_ = std::make_shared<SharedState>();
     // When Stop() is called from a worker thread, the self-thread can't be
@@ -39,7 +41,6 @@ private:
     void Run();
     void JoinPendingSelfStop();
     void LogError(const std::string& msg);
-    std::function<void(const std::string&)> error_logger_;
 public:
     ThreadPool() = default;
 
@@ -68,7 +69,8 @@ public:
     // Set a custom error logger. Default: std::cerr. Set this to route
     // errors through spdlog when running in daemon mode (stderr is /dev/null).
     void SetErrorLogger(std::function<void(const std::string&)> logger) {
-        error_logger_ = std::move(logger);
+        std::lock_guard<std::mutex> lk(state_->logger_mtx);
+        state_->error_logger = std::move(logger);
     }
 
     bool is_running() const { return state_->is_running.load(); }

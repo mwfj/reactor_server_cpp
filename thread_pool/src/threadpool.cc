@@ -49,8 +49,9 @@ void ThreadPool::JoinPendingSelfStop() {
 }
 
 void ThreadPool::LogError(const std::string& msg) {
-    if (error_logger_) {
-        error_logger_(msg);
+    std::lock_guard<std::mutex> lk(state_->logger_mtx);
+    if (state_->error_logger) {
+        state_->error_logger(msg);
     } else {
         std::cerr << msg << std::endl;
     }
@@ -160,10 +161,18 @@ void ThreadPool::Stop(){
 }
 
 void ThreadPool::Run() {
-    // Capture shared state locally so it survives pool destruction.
-    // If a task destroys the pool, this->state_ becomes dangling, but
-    // local_state keeps the atomics alive for the loop-exit unwind.
+    // Capture shared state and error logger locally so they survive pool
+    // destruction. If a task destroys the pool, this-> becomes dangling,
+    // but these locals keep the needed state alive for the unwind path.
     auto local_state = state_;
+    auto log_error = [local_state](const std::string& msg) {
+        std::lock_guard<std::mutex> lk(local_state->logger_mtx);
+        if (local_state->error_logger) {
+            local_state->error_logger(msg);
+        } else {
+            std::cerr << msg << std::endl;
+        }
+    };
 
     while(local_state->is_running.load()){
         std::shared_ptr<ThreadTaskInterface> task = GetTask();
@@ -189,9 +198,9 @@ void ThreadPool::Run() {
             try {
                 task->SetValue(res);
             } catch(const std::exception& e) {
-                LogError(std::string("[ThreadPool] SetValue() failed: ") + e.what());
+                log_error(std::string("[ThreadPool] SetValue() failed: ") + e.what());
             } catch(...) {
-                LogError("[ThreadPool] SetValue() failed with unknown exception");
+                log_error("[ThreadPool] SetValue() failed with unknown exception");
             }
         } catch(...) {
             // Task execution failed - capture exception
@@ -201,18 +210,18 @@ void ThreadPool::Run() {
                     std::rethrow_exception(ex);
                 }
             } catch (const std::exception& e){
-                LogError(std::string("[ThreadPool] Task failed: ") + e.what());
+                log_error(std::string("[ThreadPool] Task failed: ") + e.what());
             } catch(...) {
-                LogError("[ThreadPool] Task failed with unknown exception");
+                log_error("[ThreadPool] Task failed with unknown exception");
             }
 
             // Set exception - wrap in try-catch to prevent thread termination
             try {
                 task->SetException(std::move(ex));
             } catch(const std::exception& e) {
-                LogError(std::string("[ThreadPool] SetException() failed: ") + e.what());
+                log_error(std::string("[ThreadPool] SetException() failed: ") + e.what());
             } catch(...) {
-                LogError("[ThreadPool] SetException() failed with unknown exception");
+                log_error("[ThreadPool] SetException() failed with unknown exception");
             }
         }
         // running_threads_ automatically decremented by RunningGuard destructor
@@ -224,7 +233,10 @@ void ThreadPool::AddTask(std::shared_ptr<ThreadTaskInterface> task) {
         std::lock_guard<std::mutex> lck(mtx_);
         if(!is_running())
             throw std::runtime_error("ThreadPool has been stopped");
-        task -> SetRunningChecker([this] {return is_running();});
+        // Capture state_ (shared_ptr) instead of this — the task's running
+        // checker must survive pool destruction (self-stop scenario).
+        auto s = state_;
+        task -> SetRunningChecker([s] {return s->is_running.load();});
         tasks_.push_back(std::move(task));
     }
     cv_.notify_one();
