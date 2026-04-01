@@ -110,12 +110,23 @@ void Dispatcher::RunEventLoop(){
         // If no events, just continue loop (don't shutdown!)
         // The timeout is for periodic checking, not termination
         if(channels.size() == 0){
-            // Call timeout callback if set
+            // Drain queued tasks on timeout — if WakeUp's write failed
+            // (EAGAIN on full pipe/eventfd), tasks would be stranded until
+            // the next real I/O event without this opportunistic drain.
+            {
+                std::deque<std::function<void()>> tasks;
+                {
+                    std::lock_guard<std::mutex> lck(mtx_);
+                    if (!task_que_.empty()) tasks.swap(task_que_);
+                }
+                for (auto& fn : tasks) {
+                    try { fn(); } catch (...) {}
+                }
+            }
             if(callbacks_.timeout_trigger_callback){
                 callbacks_.timeout_trigger_callback(shared_from_this());
             }
             // Fallback timer for platforms without timerfd (macOS):
-            // Throttled by end_t_ to match the configured scan interval.
             if (is_sock_dispatcher_ && timer_fd_ < 0 && end_t_ > 0) {
                 auto now = std::chrono::steady_clock::now();
                 if (now - last_fallback_timer_ >= std::chrono::seconds(end_t_)) {

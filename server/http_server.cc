@@ -418,13 +418,25 @@ void HttpServer::Stop() {
             }
         });
     } else if (!draining_conn_ptrs.empty()) {
-        // On a dispatcher thread: can't block for drain (deadlock), but still
-        // exempt H2/WS from the generic close sweep so they get a chance to
-        // finish via the timer deadline. Without this, CloseAfterWrite
-        // truncates active H2 streams and WS close handshakes.
+        // On a dispatcher thread: can't do a full blocking wait (deadlock
+        // on self-dispatcher barrier), but still exempt H2/WS from the
+        // close sweep and keep OTHER dispatchers alive briefly so their
+        // timer deadlines can fire and close connections gracefully.
         logging::Get()->warn("HttpServer::Stop() called from dispatcher thread — "
-                             "blocking drain skipped, connections exempt from sweep");
+                             "using abbreviated drain");
+        bool has_ws = !ws_draining.empty();
         net_server_.SetDrainingConns(std::move(draining_conn_ptrs));
+        net_server_.SetPreStopDrainCallback([this, has_ws]() {
+            // Abbreviated drain: give other dispatchers time to process
+            // timer deadlines for H2 GOAWAY drain and WS close handshakes.
+            // Self-dispatcher connections are handled inline by the barrier
+            // mechanism (HandleEventId in wait_for_dispatcher_barrier).
+            if (has_ws) {
+                net_server_.SetTimerInterval(1);
+                // Shorter wait than normal path — best-effort on handler thread
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+            }
+        });
     }
 
     net_server_.Stop();
