@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: brew install openssl@3
+        run: brew install --quiet openssl@3 || true
       - name: Build
         run: make -j$(sysctl -n hw.ncpu)
       - name: Run tests
