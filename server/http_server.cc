@@ -410,10 +410,11 @@ void HttpServer::Stop() {
         net_server_.SetPreStopDrainCallback([this, has_ws]() {
             WaitForH2Drain();
             if (has_ws) {
-                // Give WS connections up to 5s to complete close handshake.
-                // The dispatcher timer enforces the SendClose deadline and
-                // will CloseAfterWrite/ForceClose when it expires.
-                std::this_thread::sleep_for(std::chrono::seconds(5));
+                // Shorten the timer scan interval to 1s so the 5s WS close
+                // deadline is enforced promptly (default scan can be 10s+).
+                net_server_.SetTimerInterval(1);
+                // Wait for WS close handshakes (5s deadline from SendClose).
+                std::this_thread::sleep_for(std::chrono::seconds(6));
             }
         });
     } else if (!draining_conn_ptrs.empty()) {

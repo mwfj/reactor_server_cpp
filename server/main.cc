@@ -111,7 +111,12 @@ static int HandleStop(const CliOptions& options) {
 }
 
 static int HandleReload(const CliOptions& options) {
-    return SendSignalToServer(options, SIGHUP, "SIGHUP");
+    int rc = SendSignalToServer(options, SIGHUP, "SIGHUP");
+    if (rc == EXIT_OK) {
+        std::cout << "Note: SIGHUP triggers config reload in daemon mode, "
+                  << "but shuts down foreground servers.\n";
+    }
+    return rc;
 }
 
 // ── Health endpoint handler ──────────────────────────────────────
