@@ -113,6 +113,11 @@ void Acceptor::NewConnection(){
                                  logging::SafeStrerror(saved_errno), accept_backoff_ms_);
             int delay = accept_backoff_ms_;
             event_dispatcher_->EnQueue([this, delay]() {
+                // If shutdown started (CloseListenSocket ran), don't retry —
+                // accepting after Stop()'s drain snapshots would bypass
+                // graceful shutdown.
+                if (!acceptor_channel_ || acceptor_channel_->is_channel_closed())
+                    return;
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay));
                 NewConnection();
             });

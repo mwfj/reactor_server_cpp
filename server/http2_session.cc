@@ -132,7 +132,11 @@ static int OnHeaderCallback(
         logging::Get()->warn("HTTP/2 stream {} header list size ({}) exceeds limit ({})",
                              frame->hd.stream_id, stream->AccumulatedHeaderSize(),
                              self->MaxHeaderListSize());
-        if (!stream->IsRejected() && self->Callbacks().request_count_callback)
+        // Only count as a request if this is the initial header block, not
+        // trailers. Trailers arrive after MarkHeadersComplete, so the stream
+        // was already counted/dispatched.
+        if (!stream->IsRejected() && !stream->GetRequest().headers_complete
+            && self->Callbacks().request_count_callback)
             self->Callbacks().request_count_callback();
         stream->MarkRejected();
         nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
@@ -149,7 +153,9 @@ static int OnHeaderCallback(
     // client protocol violations as server faults. MarkRejected() prevents
     // OnFrameRecvCallback from dispatching the malformed request.
     auto reject_protocol_error = [&]() -> int {
-        if (!stream->IsRejected() && self->Callbacks().request_count_callback)
+        // Only count as a request for initial headers, not trailers
+        if (!stream->IsRejected() && !stream->GetRequest().headers_complete
+            && self->Callbacks().request_count_callback)
             self->Callbacks().request_count_callback();
         stream->MarkRejected();
         nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
