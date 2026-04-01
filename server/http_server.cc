@@ -335,7 +335,17 @@ void HttpServer::Stop() {
         if (ws && ws->IsOpen()) {
             try {
                 ws->SendClose(1001, "Going Away");
-                if (conn) ws_draining.insert(conn.get());
+                // If the connection has buffered output (backpressure),
+                // arm CloseAfterWrite so the drain path extends the write
+                // window. Without this, backpressured clients never get
+                // the close frame written and see 1006 on force-close.
+                // For idle connections (empty buffer), SendClose's 5s
+                // deadline handles the close handshake normally.
+                if (conn && conn->OutputBufferSize() > 0) {
+                    conn->CloseAfterWrite();
+                } else if (conn) {
+                    ws_draining.insert(conn.get());
+                }
             }
             catch (...) {}
         }
@@ -796,6 +806,11 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
     // by HandleNewConnection. If not found, this is the accept/data race
     // path (HandleMessage ran before HandleNewConnection) — DetectAndRoute
     // must handle the counter increment.
+    // Consume buffered data from pending_detection_ but DON'T determine
+    // already_counted here — HandleNewConnection can race between our lock
+    // release and DetectAndRouteProtocol's lock acquisition, re-inserting
+    // the entry. DetectAndRouteProtocol's recheck under its own lock is
+    // the authoritative source for already_counted.
     bool already_counted = false;
     {
         bool evicted_stale_pd = false;
@@ -803,11 +818,14 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         auto pd_it = pending_detection_.find(conn->fd());
         if (pd_it != pending_detection_.end()) {
             if (pd_it->second.conn == conn) {
+                // Consume buffered data, erase, and mark counted.
+                // DetectAndRouteProtocol rechecks under its own lock —
+                // if HandleNewConnection re-inserts between here and there,
+                // the recheck correctly handles the new entry.
                 pd_it->second.data += message;
                 message = std::move(pd_it->second.data);
                 already_counted = true;
             } else {
-                // Stale entry (fd reused) — compensating decrement
                 evicted_stale_pd = true;
             }
             pending_detection_.erase(pd_it);
@@ -888,21 +906,24 @@ bool HttpServer::DetectAndRouteProtocol(
                 }
                 return true;
             }
-            // Re-check: HandleNewConnection may have inserted tracking between
-            // our earlier snapshot and this lock acquisition.
-            if (!already_counted) {
+            // Re-check: HandleNewConnection may have re-inserted a tracking
+            // entry between HandleMessage's consumption and this lock. Always
+            // check (not just when !already_counted) because the race can
+            // produce a duplicate entry even when we already consumed one.
+            {
                 auto pd_it = pending_detection_.find(conn->fd());
                 if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
-                    // HandleNewConnection already counted this connection
-                    already_counted = true;
-                    // Consume any buffered data
+                    if (!already_counted) {
+                        already_counted = true;
+                    }
+                    // Consume any buffered data from the re-inserted entry
                     if (!pd_it->second.data.empty()) {
                         message = pd_it->second.data + message;
                     }
                     pending_detection_.erase(pd_it);
+                    // DON'T increment again — HandleNewConnection already did
                 }
             }
-            // Also check if a handler was already published for this conn
             auto h2_existing = h2_connections_.find(conn->fd());
             if (h2_existing != h2_connections_.end() &&
                 h2_existing->second->GetConnection() == conn) {
@@ -943,12 +964,11 @@ bool HttpServer::DetectAndRouteProtocol(
             }
             return true;
         }
-        // Re-check: HandleNewConnection may have inserted tracking or a
-        // handler between our earlier snapshot and this lock acquisition.
-        if (!already_counted) {
+        // Always recheck — HandleNewConnection can race and re-insert
+        {
             auto pd_it = pending_detection_.find(conn->fd());
             if (pd_it != pending_detection_.end() && pd_it->second.conn == conn) {
-                already_counted = true;
+                if (!already_counted) already_counted = true;
                 pending_detection_.erase(pd_it);
             }
         }

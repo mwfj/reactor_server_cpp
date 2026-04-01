@@ -23,11 +23,14 @@ void ReactorServer::Start(){
 }
 
 void ReactorServer::Stop(){
-    // Stop net_server_ FIRST — drains connections and stops dispatching
-    // callbacks. Then stop task_workers_ safely (no more AddTask calls
-    // from ProcessMessage since all dispatchers have stopped).
-    net_server_.Stop();
+    // Stop task_workers_ FIRST — waits for in-flight tasks to complete their
+    // SendData() calls while dispatchers are still running. Stopping
+    // net_server_ first would drop sends from in-flight tasks (dispatchers
+    // stopped → EnQueue drops). New tasks may still be enqueued by
+    // ProcessMessage during this window, but task_workers_.Stop() rejects
+    // them with exceptions via SetException after setting is_running=false.
     task_workers_.Stop();
+    net_server_.Stop();
 }
 
 void ReactorServer::NewConnection(std::shared_ptr<ConnectionHandler> conn){
