@@ -5,7 +5,7 @@
 #include "ws/websocket_frame.h"
 #include "connection_handler.h"
 
-// <memory>, <functional>, <string> provided by common.h (via connection_handler.h)
+// <memory>, <functional>, <string>, <unordered_map> provided by common.h (via connection_handler.h)
 
 class WebSocketConnection {
 public:
@@ -39,6 +39,10 @@ public:
     // Set maximum reassembled message size (0 = unlimited)
     void SetMaxMessageSize(size_t max) { max_message_size_ = max; }
 
+    // Route parameters (populated during upgrade from pattern routes)
+    const std::unordered_map<std::string, std::string>& GetParams() const { return params_; }
+    void SetParams(std::unordered_map<std::string, std::string> params) { params_ = std::move(params); }
+
     // Feed raw data from the reactor
     void OnRawData(const std::string& data);
 
@@ -66,6 +70,9 @@ private:
     WebSocketOpcode fragment_opcode_ = WebSocketOpcode::Text;
     bool in_fragment_ = false;
     size_t max_message_size_ = 0;  // 0 = unlimited
+
+    // Route parameters extracted during WebSocket upgrade
+    std::unordered_map<std::string, std::string> params_;
 
     void ProcessFrame(const WebSocketFrame& frame);
     void SendFrame(const WebSocketFrame& frame);

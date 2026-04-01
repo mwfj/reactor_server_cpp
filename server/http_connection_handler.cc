@@ -152,17 +152,20 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
     // is unreachable — CONNECT enters the WS path and fails validation.
     if (req.upgrade && req.method == "GET" && callbacks_.route_check_callback) {
         try {
-        // Run middleware before upgrade (auth, CORS, rate limiting, etc.)
+        // Probe route existence to populate request.params for pattern routes
+        // (e.g., /ws/:room → req.params["room"]). The bool result is checked
+        // AFTER handshake validation and middleware to avoid leaking route
+        // existence through different error codes (404 vs 400/426).
+        bool ws_route_found = callbacks_.route_check_callback(req);
+
+        // Run middleware — always, regardless of route match.
+        // request.params is populated for matched routes; empty for misses.
         // Hoist mw_response so successful middleware headers can be merged
         // into the 101 response (e.g., Set-Cookie, auth tokens).
         HttpResponse mw_response;
         if (callbacks_.middleware_callback) {
             if (!callbacks_.middleware_callback(req, mw_response)) {
                 // Middleware rejected — default to 403 if nothing was set.
-                // Only apply when the response is completely untouched
-                // (default status + no body + no headers). This allows
-                // middleware to intentionally short-circuit with 200 OK
-                // plus custom headers (e.g., CORS preflight, Set-Cookie).
                 if (mw_response.GetStatusCode() == 200 &&
                     mw_response.GetBody().empty() &&
                     mw_response.GetHeaders().empty()) {
@@ -175,7 +178,10 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             }
         }
 
-        // Validate WebSocket handshake per RFC 6455
+        // Validate WebSocket handshake per RFC 6455.
+        // Must happen BEFORE the route-miss check so that malformed upgrades
+        // always get 400/426 regardless of whether the route exists — prevents
+        // leaking route existence through different error codes.
         std::string ws_error;
         if (!WebSocketHandshake::Validate(req, ws_error)) {
             logging::Get()->debug("WebSocket handshake rejected fd={}: {}",
@@ -196,8 +202,8 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             return false;
         }
 
-        // Check route existence BEFORE sending 101
-        if (!callbacks_.route_check_callback(req.path)) {
+        // Now check route existence (after middleware and validation)
+        if (!ws_route_found) {
             logging::Get()->debug("WebSocket route not found fd={} path={}",
                                   conn_->fd(), logging::SanitizePath(req.path));
             auto not_found = HttpResponse::NotFound();

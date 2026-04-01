@@ -32,6 +32,7 @@ namespace TestFramework {
             case TestCategory::BASIC: return "Basic Tests";
             case TestCategory::STRESS: return "Stress Tests";
             case TestCategory::RACE_CONDITION: return "Race Condition Tests";
+            case TestCategory::ROUTE: return "Route Tests";
             default: return "Other Tests";
         }
     }
@@ -75,6 +76,7 @@ namespace TestFramework {
             TestCategory::BASIC,
             TestCategory::STRESS,
             TestCategory::RACE_CONDITION,
+            TestCategory::ROUTE,
             TestCategory::OTHER
         };
 

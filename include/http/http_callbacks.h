@@ -18,7 +18,7 @@ namespace HTTP_CALLBACKS_NAMESPACE {
         const HttpRequest& request,
         HttpResponse& response
     )>;
-    using HttpConnRouteCheckCallback = std::function<bool(const std::string& path)>;
+    using HttpConnRouteCheckCallback = std::function<bool(const HttpRequest& request)>;
     using HttpConnMiddlewareCallback = std::function<bool(
         const HttpRequest& request,
         HttpResponse& response
