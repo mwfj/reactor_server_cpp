@@ -4,7 +4,7 @@
 #include <regex>
 #include <unordered_set>
 
-namespace route_trie {
+namespace ROUTE_TRIE {
 
 static bool IsValidNameChar(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -276,4 +276,4 @@ void ValidatePattern(const std::string& pattern,
     }
 }
 
-}  // namespace route_trie
+}  // namespace ROUTE_TRIE
