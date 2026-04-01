@@ -25,7 +25,7 @@ namespace KqueueTests {
 // Wait for the server to close a connection. Returns true if recv() == 0
 // (clean EOF) within timeout_ms. Uses poll() + recv() — the deterministic
 // TCP close detection pattern (no send-buffer races).
-static bool WaitForServerClose(int fd, int timeout_ms) {
+inline bool WaitForServerClose(int fd, int timeout_ms) {
     struct pollfd pfd;
     pfd.fd = fd;
     pfd.events = POLLIN;
@@ -84,8 +84,8 @@ void TestTimerDrivesIdleTimeout() {
 // ---------------------------------------------------------------------------
 void TestEvEofOnWriteFilter() {
     std::cout << "\n[TEST] KQ-TEST-2: EV_EOF on write filter..." << std::endl;
+    int fds[2] = {-1, -1};
     try {
-        int fds[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
             throw std::runtime_error("socketpair failed");
         }
@@ -133,10 +133,14 @@ void TestEvEofOnWriteFilter() {
         bool pass = close_fired.load();
         TestFramework::RecordTest("KQ: EV_EOF detected on write filter",
             pass, pass ? "" : "close callback not fired within 2s",
-            TestFramework::TestCategory::BASIC);
+            TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
+        // Clean up fds that may not have been closed in the happy path.
+        // fds[0] is owned by Channel after construction; fds[1] is closed
+        // at line 113 in the happy path but may still be open on early throw.
+        if (fds[1] >= 0) ::close(fds[1]);
         TestFramework::RecordTest("KQ: EV_EOF detected on write filter",
-            false, e.what(), TestFramework::TestCategory::BASIC);
+            false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
 
@@ -189,10 +193,10 @@ void TestPipeWakeupUnderLoad() {
             std::to_string(NUM_THREADS * TASKS_PER_THREAD);
 
         TestFramework::RecordTest("KQ: Pipe wakeup under concurrent load",
-            pass, err, TestFramework::TestCategory::BASIC);
+            pass, err, TestFramework::TestCategory::STRESS);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("KQ: Pipe wakeup under concurrent load",
-            false, e.what(), TestFramework::TestCategory::BASIC);
+            false, e.what(), TestFramework::TestCategory::STRESS);
     }
 }
 
@@ -201,8 +205,8 @@ void TestPipeWakeupUnderLoad() {
 // ---------------------------------------------------------------------------
 void TestFilterConsolidation() {
     std::cout << "\n[TEST] KQ-TEST-4: Filter consolidation..." << std::endl;
+    int fds[2] = {-1, -1};
     try {
-        int fds[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
             throw std::runtime_error("socketpair failed");
         }
@@ -260,7 +264,9 @@ void TestFilterConsolidation() {
         std::lock_guard<std::mutex> lk(log_mutex);
         bool has_both = event_log.find('R') != std::string::npos &&
                         event_log.find('W') != std::string::npos;
-        // Channel::HandleEvent processes read before write (channel.cc:86-99)
+        // Tests Channel::HandleEvent ordering (channel.cc:86-99): read before write.
+        // kqueue may return filters in any order, but consolidation merges them
+        // into one Channel, and HandleEvent enforces read-before-write dispatch.
         bool correct_order = !event_log.empty() && event_log[0] == 'R';
 
         bool pass = has_both && correct_order;
@@ -269,10 +275,12 @@ void TestFilterConsolidation() {
         if (!correct_order) err += "read should come before write, got '" + event_log + "'; ";
 
         TestFramework::RecordTest("KQ: Filter consolidation R+W",
-            pass, err, TestFramework::TestCategory::BASIC);
+            pass, err, TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
+        if (fds[0] >= 0) ::close(fds[0]);
+        if (fds[1] >= 0) ::close(fds[1]);
         TestFramework::RecordTest("KQ: Filter consolidation R+W",
-            false, e.what(), TestFramework::TestCategory::BASIC);
+            false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
 
@@ -287,6 +295,7 @@ void TestChurnStability() {
         int port = runner.GetPort();
 
         // Rapidly connect and disconnect 100 clients
+        int connect_count = 0;
         for (int i = 0; i < 100; ++i) {
             int sock = socket(AF_INET, SOCK_STREAM, 0);
             if (sock < 0) continue;
@@ -296,7 +305,7 @@ void TestChurnStability() {
             addr.sin_port = htons(port);
             inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
             if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-                // Send partial data and close immediately
+                ++connect_count;
                 ::write(sock, "X", 1);
             }
             ::close(sock);
@@ -324,12 +333,13 @@ void TestChurnStability() {
 
         bool pass = (success_count == 5);
         std::string err = pass ? "" :
-            "only " + std::to_string(success_count) + "/5 post-churn requests succeeded";
+            "only " + std::to_string(success_count) + "/5 post-churn requests succeeded"
+            " (" + std::to_string(connect_count) + "/100 churn connects succeeded)";
 
-        TestFramework::RecordTest("KQ: Churn stability after 100 rapid connects",
-            pass, err, TestFramework::TestCategory::BASIC);
+        TestFramework::RecordTest("KQ: Churn stability after rapid connects",
+            pass, err, TestFramework::TestCategory::STRESS);
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("KQ: Churn stability after 100 rapid connects",
+        TestFramework::RecordTest("KQ: Churn stability after rapid connects",
             false, e.what(), TestFramework::TestCategory::BASIC);
     }
 }
@@ -481,9 +491,11 @@ void TestSoNosigpipe() {
             }
         }
 
+        // Both parent and child close their copies of client_fd and accepted_fd.
+        // After fork(), each process has independent fd table entries — closing
+        // in both is correct and required. (Would be a double-close bug with threads.)
         ::close(client_fd);
         if (accept_ok) ::close(accepted_fd);
-        // listener closed by SocketHandler destructor
 
         bool pass = listener_has_opt && accept_ok && accepted_has_opt && write_test_pass;
         std::string err;

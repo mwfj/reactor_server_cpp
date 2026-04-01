@@ -17,7 +17,7 @@ public:
 
 private:
     int epollfd_ = -1;
-    epoll_event events_[MAX_EVETN_NUMS];
+    epoll_event events_[MAX_EVENT_NUMS];
     std::map<int, std::shared_ptr<Channel>> channel_map_; // Store channel ownership
     std::mutex channel_map_mutex_; // Protect concurrent access to channel_map_
 };

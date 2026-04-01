@@ -104,7 +104,7 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
     // init event array
     memset(events_, 0, sizeof(events_));
 
-    int infds = epoll_wait(epollfd_, events_, MAX_EVETN_NUMS, timeout);
+    int infds = epoll_wait(epollfd_, events_, MAX_EVENT_NUMS, timeout);
 
     if(infds < 0){
         int saved_errno = errno;

@@ -135,7 +135,7 @@ std::vector<std::shared_ptr<Channel>> KqueueHandler::WaitForEvent(int timeout){
         timeout_ptr = &ts;
     }
 
-    int nevents = kevent(kqueuefd_, nullptr, 0,  events_, MAX_EVETN_NUMS, timeout_ptr);
+    int nevents = kevent(kqueuefd_, nullptr, 0,  events_, MAX_EVENT_NUMS, timeout_ptr);
 
     if(nevents < 0){
         int saved_errno = errno;
@@ -165,7 +165,7 @@ std::vector<std::shared_ptr<Channel>> KqueueHandler::WaitForEvent(int timeout){
             // EVFILT_TIMER events have no associated Channel — set the flag
             // and skip to the next event.
             if(events_[idx].filter == EVFILT_TIMER) {
-                timer_fired_ = true;
+                timer_fired_.store(true, std::memory_order_relaxed);
                 continue;
             }
 
@@ -246,20 +246,27 @@ void KqueueHandler::RegisterTimer(int interval_sec) {
 void KqueueHandler::ResetTimer(int interval_sec) {
     struct kevent ev;
     // Re-add with EV_ONESHOT — idempotent, replaces the previous timer.
+    // With EV_ONESHOT and no fallback, a failed re-arm permanently disables
+    // idle timeout and deadline scanning. Retry on EINTR; error-level log
+    // on persistent failure so operators notice.
     EV_SET(&ev, KQUEUE_TIMER_IDENT, EVFILT_TIMER,
            EV_ADD | EV_ONESHOT, NOTE_SECONDS, interval_sec, nullptr);
-    if (::kevent(kqueuefd_, &ev, 1, nullptr, 0, nullptr) == -1) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (::kevent(kqueuefd_, &ev, 1, nullptr, 0, nullptr) == 0) {
+            return;  // Success
+        }
         int saved_errno = errno;
-        // Don't throw on re-arm failure — log and continue.
-        // The fallback WaitForEvent timeout (1s) will still drive TimerHandler.
-        logging::Get()->warn("kevent EVFILT_TIMER re-arm failed: {}",
-                             logging::SafeStrerror(saved_errno));
+        if (saved_errno == EINTR) {
+            continue;  // Transient — retry
+        }
+        logging::Get()->error("kevent EVFILT_TIMER re-arm failed (attempt {}): {}",
+                              attempt + 1, logging::SafeStrerror(saved_errno));
+        return;  // Non-transient error — no point retrying
     }
+    logging::Get()->error("kevent EVFILT_TIMER re-arm failed after 3 EINTR retries");
 }
 
 bool KqueueHandler::ConsumeTimerFired() {
-    bool fired = timer_fired_;
-    timer_fired_ = false;
-    return fired;
+    return timer_fired_.exchange(false);
 }
 #endif

@@ -9,8 +9,8 @@ class Channel;
 // For macOS/BSD Kqueue
 class KqueueHandler{
 public:
-    // Well-known ident for the dispatcher timer. Negative so it can never
-    // collide with a real fd (fds are always >= 0).
+    // Well-known ident for the dispatcher timer. Set to UINTPTR_MAX so it
+    // can never collide with a real fd (fds are always non-negative ints).
     static constexpr uintptr_t KQUEUE_TIMER_IDENT = static_cast<uintptr_t>(-1);
 
     KqueueHandler();
@@ -28,10 +28,10 @@ public:
 
 private:
     int kqueuefd_ = -1;
-    struct kevent events_[MAX_EVETN_NUMS];
+    struct kevent events_[MAX_EVENT_NUMS];
     std::map<int, std::shared_ptr<Channel>> channel_map_; // Store channel ownership
     std::mutex channel_map_mutex_; // Protect concurrent access to channel_map_
-    bool timer_fired_ = false;  // Set by WaitForEvent, consumed by dispatcher
+    std::atomic<bool> timer_fired_{false};  // Set by WaitForEvent, consumed by dispatcher (same thread, atomic for defensive safety)
 };
 
 #endif
