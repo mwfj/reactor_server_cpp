@@ -128,6 +128,15 @@ The router rejects conflicting routes at registration time (throws `std::invalid
 - Conflicting parameter constraints at the same position: `/:id([0-9]+)` vs `/:id([a-z]+)`
 - Duplicate catch-all routes at the same level
 
+### Non-Origin-Form Routes
+
+The router supports non-origin-form request targets used by CONNECT and OPTIONS methods:
+
+- **CONNECT authority-form**: `server.Route("CONNECT", "example.com:443", handler)` -- matches `CONNECT example.com:443 HTTP/1.1` (no leading `/`)
+- **OPTIONS asterisk-form**: `server.Route("OPTIONS", "*", handler)` -- matches `OPTIONS * HTTP/1.1`
+
+These are registered as exact-match patterns in the `RouteTrie`.
+
 ## Middleware
 
 ```cpp
@@ -153,7 +162,7 @@ server.Use([](const HttpRequest& req, HttpResponse& res) {
 });
 ```
 
-- Middleware executes in registration order before route handlers
+- Route matching runs first (populating `request.params`), then middleware executes in registration order, then the matched handler runs. This means middleware can read route parameters (e.g., `req.params["id"]` for authorization decisions)
 - Return `true` to continue the chain, `false` to short-circuit (response is sent immediately)
 - **Headers survive fallbacks**: middleware-set headers are preserved even on 404/405 responses because `Dispatch()` sets status on the existing response object rather than replacing it
 

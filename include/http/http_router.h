@@ -50,7 +50,6 @@ public:
 
     // WebSocket route lookup
     bool HasWebSocketRoute(const std::string& path) const;
-    WsUpgradeHandler GetWebSocketHandler(const std::string& path) const;
 
     // WebSocket route lookup with param extraction (populates request.params)
     WsUpgradeHandler GetWebSocketHandler(const HttpRequest& request) const;

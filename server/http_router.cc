@@ -149,21 +149,6 @@ bool HttpRouter::HasWebSocketRoute(const std::string& path) const {
     return ws_trie_.HasMatch(path);
 }
 
-HttpRouter::WsUpgradeHandler HttpRouter::GetWebSocketHandler(const std::string& path) const {
-    std::unordered_map<std::string, std::string> params;
-    auto result = ws_trie_.Search(path, params);
-    if (result.handler) {
-        if (!params.empty()) {
-            logging::Get()->warn(
-                "GetWebSocketHandler(string) discards {} extracted route params "
-                "for path {}; use the HttpRequest overload to preserve them",
-                params.size(), logging::SanitizePath(path));
-        }
-        return *result.handler;
-    }
-    return nullptr;
-}
-
 HttpRouter::WsUpgradeHandler HttpRouter::GetWebSocketHandler(const HttpRequest& request) const {
     request.params.clear();
     std::unordered_map<std::string, std::string> params;
