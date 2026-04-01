@@ -423,6 +423,15 @@ void NetServer::SetTimerCb(CALLBACKS_NAMESPACE::NetSrvTimerCallback fn){
         callbacks_.timer_callback = std::move(fn);
 }
 
+void NetServer::ProcessSelfDispatcherTasks() {
+    for (auto& disp : socket_dispatchers_) {
+        if (disp->is_on_loop_thread()) {
+            disp->ProcessPendingTasks();
+            return;
+        }
+    }
+}
+
 bool NetServer::IsOnDispatcherThread() const {
     for (const auto& disp : socket_dispatchers_) {
         if (disp->is_on_loop_thread()) return true;

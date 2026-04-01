@@ -133,6 +133,11 @@ public:
         pre_stop_drain_cb_ = std::move(cb);
     }
 
+    // Process pending tasks on the calling thread's dispatcher.
+    // Used during stop-from-handler drain to keep enqueued tasks
+    // (GOAWAY, CloseAfterWrite) progressing while the event loop is blocked.
+    void ProcessSelfDispatcherTasks();
+
     // Check if the calling thread is a socket dispatcher thread.
     // Used to detect Stop-from-handler scenarios that would deadlock drain wait.
     bool IsOnDispatcherThread() const;

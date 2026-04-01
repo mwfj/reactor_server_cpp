@@ -78,6 +78,10 @@ public:
 
     void WakeUp();
     void HandleEventId();
+    // Process all queued tasks without requiring a wakeup signal.
+    // Used by stop-from-handler drain to pump enqueued tasks while
+    // the event loop is paused (blocked in a handler callback).
+    void ProcessPendingTasks();
     void EnQueue(std::function<void()>);
     void AddConnection(std::shared_ptr<ConnectionHandler>);
     void RemoveTimerConnection(int fd);

@@ -313,6 +313,18 @@ void Dispatcher::HandleEventId(){
     }
 }
 
+void Dispatcher::ProcessPendingTasks() {
+    std::deque<std::function<void()>> tasks;
+    {
+        std::lock_guard<std::mutex> lck(mtx_);
+        if (task_que_.empty()) return;
+        tasks.swap(task_que_);
+    }
+    for (auto& fn : tasks) {
+        try { fn(); } catch (...) {}
+    }
+}
+
 void Dispatcher::EnQueue(std::function<void()> fn){
     // Only discard tasks after explicit stop — allow during startup (before RunEventLoop)
     if (was_stopped_.load(std::memory_order_acquire)) return;

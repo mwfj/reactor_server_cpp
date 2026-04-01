@@ -27,9 +27,14 @@ int HttpServer::ComputeTimerInterval(int idle_timeout_sec, int request_timeout_s
     else if (idle_iv == 0) interval = req_iv;
     else if (req_iv == 0) interval = idle_iv;
     else interval = std::min(idle_iv, req_iv);
-    // Cap at 30s to ensure log rotation checks run at a reasonable
-    // frequency regardless of timeout configuration.
-    return std::min(interval, 30);
+    // Cap at 5s — the shortest protocol deadline (WS close-handshake 5s).
+    // Protocol-level deadlines (WS close 5s, HTTP drain 30s) need the timer
+    // scan regardless of idle/request timeout tuning. Without this cap,
+    // large timeouts push the scan cadence past protocol deadlines.
+    // Log rotation checks also run on this cadence; 5s is reasonable
+    // (they use try_lock, near-zero cost when not due).
+    static constexpr int PROTOCOL_DEADLINE_CAP = 5;
+    return std::min(interval, PROTOCOL_DEADLINE_CAP);
 }
 
 void HttpServer::MarkServerReady() {
@@ -421,30 +426,68 @@ void HttpServer::Stop() {
             WaitForH2Drain();
             if (has_ws) {
                 // Shorten the timer scan interval to 1s so the 5s WS close
-                // deadline is enforced promptly (default scan can be 10s+).
+                // deadline is enforced within 1s (default scan up to 5s).
                 net_server_.SetTimerInterval(1);
                 // Wait for WS close handshakes (5s deadline from SendClose).
                 std::this_thread::sleep_for(std::chrono::seconds(6));
             }
         });
     } else if (!draining_conn_ptrs.empty()) {
-        // On a dispatcher thread: can't do a full blocking wait (deadlock
-        // on self-dispatcher barrier), but still exempt H2/WS from the
-        // close sweep and keep OTHER dispatchers alive briefly so their
-        // timer deadlines can fire and close connections gracefully.
+        // On a dispatcher thread: blocking this thread would freeze the
+        // self-dispatcher's event loop, preventing same-dispatcher connections
+        // from processing I/O, timers, and completions. Instead, poll with
+        // short waits and pump enqueued tasks between polls. Other dispatchers
+        // keep running their event loops normally. Self-dispatcher connections
+        // get task processing (GOAWAY sends, CloseAfterWrite) but not I/O —
+        // an inherent limitation of stopping from within a handler.
         logging::Get()->warn("HttpServer::Stop() called from dispatcher thread — "
                              "using abbreviated drain");
         bool has_ws = !ws_draining.empty();
         net_server_.SetDrainingConns(std::move(draining_conn_ptrs));
+        // Shorten timer scan immediately so other dispatchers (still running)
+        // catch protocol deadlines promptly during the entire drain.
+        net_server_.SetTimerInterval(1);
         net_server_.SetPreStopDrainCallback([this, has_ws]() {
-            // Wait for H2 drain on OTHER dispatchers (self-dispatcher
-            // connections get inline HandleEventId from the barrier).
-            WaitForH2Drain();
+            // H2 drain: poll with task pump instead of blocking wait.
+            static constexpr int PUMP_INTERVAL_MS = 200;
+            {
+                auto deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(
+                                    shutdown_drain_timeout_sec_.load(
+                                        std::memory_order_relaxed));
+                while (std::chrono::steady_clock::now() < deadline) {
+                    net_server_.ProcessSelfDispatcherTasks();
+                    std::unique_lock<std::mutex> lck(drain_mtx_);
+                    if (h2_draining_.empty()) break;
+                    drain_cv_.wait_for(lck,
+                        std::chrono::milliseconds(PUMP_INTERVAL_MS));
+                }
+            }
+            // Force-close H2 connections that didn't complete drain.
+            {
+                std::unique_lock<std::mutex> lck(drain_mtx_);
+                if (!h2_draining_.empty()) {
+                    logging::Get()->warn(
+                        "Dispatcher-thread H2 drain timeout, "
+                        "force-closing {} remaining connections",
+                        h2_draining_.size());
+                    auto remaining = std::move(h2_draining_);
+                    h2_draining_.clear();
+                    lck.unlock();
+                    for (auto& d : remaining) {
+                        if (d.conn) d.conn->ForceClose();
+                    }
+                }
+            }
+            // WS drain: poll for close deadline (5s from SendClose + 1s margin).
             if (has_ws) {
-                // Give WS connections the full 5s close deadline + 1s margin.
-                // Shorten scan interval to 1s so timer catches expired WS.
-                net_server_.SetTimerInterval(1);
-                std::this_thread::sleep_for(std::chrono::seconds(6));
+                auto ws_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(6);
+                while (std::chrono::steady_clock::now() < ws_deadline) {
+                    net_server_.ProcessSelfDispatcherTasks();
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(PUMP_INTERVAL_MS));
+                }
             }
         });
     }
