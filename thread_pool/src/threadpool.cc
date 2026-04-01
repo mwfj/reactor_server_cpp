@@ -104,7 +104,7 @@ void ThreadPool::Start(){
         throw std::runtime_error("Thread Pool already started");
     }
 
-    is_running_.store(true);
+    state_->is_running.store(true);
     workers_.reserve(static_cast<std::size_t>(GetThreadWorkerNum()));
 
     for(int idx = 0; idx < GetThreadWorkerNum(); idx ++){
@@ -116,7 +116,7 @@ void ThreadPool::Stop(){
     // Make Stop() idempotent - safe to call multiple times
     // Use compare_exchange to atomically check and set is_running_
     bool expected = true;
-    if (!is_running_.compare_exchange_strong(expected, false)) {
+    if (!state_->is_running.compare_exchange_strong(expected, false)) {
         // Already stopped (is_running_ was already false)
         return;
     }
@@ -160,23 +160,26 @@ void ThreadPool::Stop(){
 }
 
 void ThreadPool::Run() {
-    while(is_running()){
+    // Capture shared state locally so it survives pool destruction.
+    // If a task destroys the pool, this->state_ becomes dangling, but
+    // local_state keeps the atomics alive for the loop-exit unwind.
+    auto local_state = state_;
+
+    while(local_state->is_running.load()){
         std::shared_ptr<ThreadTaskInterface> task = GetTask();
 
-        // check the running status if no task get
         if(!task){
-            if(!is_running())
+            if(!local_state->is_running.load())
                 break;
             continue;
         }
 
-        // RAII guard to ensure running_threads_ is always decremented
-        running_threads_++;
+        local_state->running_threads++;
         struct RunningGuard {
             std::atomic<int>& counter;
             RunningGuard(std::atomic<int>& c) : counter(c) {}
             ~RunningGuard() { counter--; }
-        } guard(running_threads_);
+        } guard(local_state->running_threads);
 
         try{
             // Execute task

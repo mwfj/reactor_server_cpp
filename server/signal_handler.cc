@@ -158,12 +158,15 @@ void SignalHandler::Cleanup(CleanupMode mode) {
         }
 #endif
 
-        // Restore saved dispositions. SIGPIPE is intentionally NOT restored —
-        // NetServer::SigpipeGuardAcquire() sets it to SIG_IGN via call_once.
-        // Restoring it to SIG_DFL here would break subsequent NetServer
-        // instances (call_once won't re-fire, so SIG_IGN is never re-set).
+        // Restore all saved dispositions including SIGPIPE. Embedders that
+        // had a custom SIGPIPE handler before Install() expect it back.
+        // NetServer uses call_once for SIGPIPE=SIG_IGN, so a new NetServer
+        // after RESTORE won't re-set it — but that's the embedder's
+        // responsibility if they choose to Cleanup(RESTORE) then create
+        // new servers.
         sigaction(SIGTERM, &g_prev_sigterm, nullptr);
         sigaction(SIGINT,  &g_prev_sigint,  nullptr);
+        sigaction(SIGPIPE, &g_prev_sigpipe, nullptr);
         sigaction(SIGHUP,  &g_prev_sighup,  nullptr);
 
         // Restore previous thread signal mask

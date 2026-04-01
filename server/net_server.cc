@@ -6,24 +6,18 @@
 #include <csignal>
 #include <future>
 
-// Process-global SIGPIPE suppression. Set once on first NetServer, never
-// restored. SIGPIPE=SIG_IGN is universally required for network servers
-// (OpenSSL's SSL_write bypasses MSG_NOSIGNAL). Restoring is inherently
-// race-prone in multi-library environments — any handler installed after
-// our save would be silently clobbered on restore.
-static std::once_flag s_sigpipe_once;
-
+// Process-global SIGPIPE suppression. Checked on every NetServer construction
+// (not call_once) so it works correctly after Cleanup(RESTORE) restores the
+// original disposition.
 static void SigpipeGuardAcquire() {
-    std::call_once(s_sigpipe_once, []() {
-        struct sigaction sa_cur{};
-        sigaction(SIGPIPE, nullptr, &sa_cur);
-        if (sa_cur.sa_handler == SIG_DFL) {
-            struct sigaction sa_ign{};
-            sa_ign.sa_handler = SIG_IGN;
-            sigemptyset(&sa_ign.sa_mask);
-            sigaction(SIGPIPE, &sa_ign, nullptr);
-        }
-    });
+    struct sigaction sa_cur{};
+    sigaction(SIGPIPE, nullptr, &sa_cur);
+    if (sa_cur.sa_handler == SIG_DFL) {
+        struct sigaction sa_ign{};
+        sa_ign.sa_handler = SIG_IGN;
+        sigemptyset(&sa_ign.sa_mask);
+        sigaction(SIGPIPE, &sa_ign, nullptr);
+    }
 }
 
 NetServer::NetServer(const std::string& _ip, const size_t _port,

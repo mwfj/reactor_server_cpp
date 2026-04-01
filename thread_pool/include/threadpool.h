@@ -24,8 +24,14 @@ private:
 
     int thread_nums = 0;
     const int DEFAULT_THREAD_NUMS = 6;
-    std::atomic_int running_threads_{0};
-    std::atomic_bool is_running_{false};
+    // Shared state: accessed by worker threads after Run() loop breaks.
+    // Allocated on the heap so orphaned workers (self-destruction path)
+    // don't use-after-free when the pool object is destroyed.
+    struct SharedState {
+        std::atomic_int running_threads{0};
+        std::atomic_bool is_running{false};
+    };
+    std::shared_ptr<SharedState> state_ = std::make_shared<SharedState>();
     // When Stop() is called from a worker thread, the self-thread can't be
     // joined inline (deadlock). It is moved here and joined at the next
     // safe point (destructor or Start()) to avoid detach-related races.
@@ -65,8 +71,8 @@ public:
         error_logger_ = std::move(logger);
     }
 
-    bool is_running() const { return is_running_; }
-    int running_threads() const { return running_threads_.load(); }
+    bool is_running() const { return state_->is_running.load(); }
+    int running_threads() const { return state_->running_threads.load(); }
 
     std::shared_ptr<ThreadTaskInterface> GetTask();
     void AddTask(std::shared_ptr<ThreadTaskInterface>);
