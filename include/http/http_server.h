@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+#include <set>
 #include <string>
 
 class HttpServer {
@@ -165,9 +166,11 @@ private:
         std::shared_ptr<ConnectionHandler> conn;
     };
     std::vector<DrainingH2Conn> h2_draining_;
+    std::set<ConnectionHandler*> ws_draining_;  // WS connections in close handshake
     std::mutex drain_mtx_;
     std::condition_variable drain_cv_;
     void OnH2DrainComplete(ConnectionHandler* conn_ptr);
+    void OnWsDrainComplete(ConnectionHandler* conn_ptr);
     void WaitForH2Drain();
 
     // Helper: set up request handler on an Http2ConnectionHandler

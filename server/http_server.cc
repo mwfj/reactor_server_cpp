@@ -92,6 +92,7 @@ void HttpServer::RemoveConnection(std::shared_ptr<ConnectionHandler> conn) {
         active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
     }
     SafeNotifyWsClose(http_conn);
+    OnWsDrainComplete(conn.get());
 }
 
 void HttpServer::WireNetServerCallbacks() {
@@ -412,6 +413,11 @@ void HttpServer::Stop() {
         std::lock_guard<std::mutex> dlck(drain_mtx_);
         has_draining = !h2_draining_.empty();
     }
+    // Populate ws_draining_ for shutdown drain tracking.
+    if (!ws_draining.empty()) {
+        std::lock_guard<std::mutex> dlck(drain_mtx_);
+        ws_draining_ = ws_draining;
+    }
     // Merge WS draining set into H2 draining set — both are exempt from
     // the generic close sweep in NetServer::Stop().
     draining_conn_ptrs.insert(ws_draining.begin(), ws_draining.end());
@@ -428,8 +434,14 @@ void HttpServer::Stop() {
                 // Shorten the timer scan interval to 1s so the 5s WS close
                 // deadline is enforced within 1s (default scan up to 5s).
                 net_server_.SetTimerInterval(1);
-                // Wait for WS close handshakes (5s deadline from SendClose).
-                std::this_thread::sleep_for(std::chrono::seconds(6));
+                // Wait for WS close handshakes: either peers reply or
+                // the 5s+1s deadline expires. Returns immediately if all
+                // peers already closed during H2 drain.
+                std::unique_lock<std::mutex> lck(drain_mtx_);
+                drain_cv_.wait_until(lck,
+                    std::chrono::steady_clock::now() +
+                        std::chrono::seconds(6),
+                    [this]() { return ws_draining_.empty(); });
             }
         });
     } else if (!draining_conn_ptrs.empty()) {
@@ -479,13 +491,16 @@ void HttpServer::Stop() {
                     }
                 }
             }
-            // WS drain: poll for close deadline (5s from SendClose + 1s margin).
+            // WS drain: poll for close completion (5s from SendClose + 1s margin).
+            // Returns early if all peers close before the deadline.
             if (has_ws) {
                 auto ws_deadline = std::chrono::steady_clock::now() +
                                    std::chrono::seconds(6);
                 while (std::chrono::steady_clock::now() < ws_deadline) {
                     net_server_.ProcessSelfDispatcherTasks();
-                    std::this_thread::sleep_for(
+                    std::unique_lock<std::mutex> lck(drain_mtx_);
+                    if (ws_draining_.empty()) break;
+                    drain_cv_.wait_for(lck,
                         std::chrono::milliseconds(PUMP_INTERVAL_MS));
                 }
             }
@@ -503,6 +518,7 @@ void HttpServer::Stop() {
     {
         std::lock_guard<std::mutex> dlck(drain_mtx_);
         h2_draining_.clear();
+        ws_draining_.clear();
     }
 }
 
@@ -516,6 +532,13 @@ void HttpServer::OnH2DrainComplete(ConnectionHandler* conn_ptr) {
             }),
         h2_draining_.end());
     if (h2_draining_.empty()) {
+        drain_cv_.notify_one();
+    }
+}
+
+void HttpServer::OnWsDrainComplete(ConnectionHandler* conn_ptr) {
+    std::lock_guard<std::mutex> lck(drain_mtx_);
+    if (ws_draining_.erase(conn_ptr) > 0 && ws_draining_.empty()) {
         drain_cv_.notify_one();
     }
 }

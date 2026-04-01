@@ -73,9 +73,10 @@ void CheckRotation();
 // Throws std::runtime_error on failure.
 void EnsureLogDir(const std::string& dir);
 
-// Write a visual start/stop marker via the normal spdlog logger at info level.
+// Write a visual start/stop marker to the log sinks at info level.
 // Format: "================================ {text} ================================"
-// Filtered at warn+ levels (same as any other info message).
+// Uses a temporary logger to bypass g_logger's level without modifying it,
+// so concurrent Get() callers never see a leaked lower level.
 void WriteMarker(const std::string& text);
 
 // Flush all sinks and shut down the logging system.

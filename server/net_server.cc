@@ -165,11 +165,11 @@ void NetServer::Stop(){
         for (auto& disp : socket_dispatchers_) {
             if (disp->was_stopped()) continue;
             if (disp->is_on_loop_thread()) {
-                // Self-dispatcher: process pending tasks inline instead of
-                // skipping. Without this, CloseAfterWrite tasks queued onto
-                // this dispatcher never run (the thread is blocked in Stop()),
-                // and buffered output gets truncated.
-                disp->HandleEventId();
+                // Self-dispatcher: drain the task queue directly instead of
+                // going through HandleEventId (which reads the eventfd first
+                // and returns without touching task_que_ if the read fails —
+                // e.g., when EnQueue's WakeUp write was lost under pressure).
+                disp->ProcessPendingTasks();
                 continue;
             }
             auto barrier = std::make_shared<std::promise<void>>();
