@@ -7,11 +7,11 @@
 Dispatcher::Dispatcher() :
     ep_(std::unique_ptr<EventHandler>(new EventHandler())),
     is_sock_dispatcher_(false),
-    timer_fd_(-1),
     end_t_(0),
     timeout_(std::chrono::seconds(0))
 {
 #if defined(__linux__)
+    timer_fd_ = -1;
     eventfd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (eventfd_ == -1) {
         throw std::runtime_error(std::string("eventfd creation failed: ") + logging::SafeStrerror(errno));
@@ -35,6 +35,7 @@ Dispatcher::Dispatcher(bool _is_sock,  int _end_t, std::chrono::seconds _timeout
     timeout_(_timeout)
 {
 #if defined(__linux__)
+    timer_fd_ = -1;
     eventfd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (eventfd_ == -1) {
         throw std::runtime_error(std::string("eventfd creation failed: ") + logging::SafeStrerror(errno));
@@ -67,16 +68,19 @@ void Dispatcher::Init() {
     // deadline scanning (has_deadline_ per-connection). Always create when
     // end_t_ > 0 (scan interval configured), even if idle timeout is disabled.
     if (is_sock_dispatcher_ && end_t_ > 0) {
-        // Use end_t_ (scan interval) for the initial timer fire, not timeout_ (idle timeout).
-        // TimerHandler re-arms with end_t_ on each fire. Using timeout_ here would delay
-        // the first scan to 300s, missing 30s request deadlines.
+#if defined(__linux__)
+        // Linux: timerfd becomes a Channel in the epoll interest list.
         timer_fd_ = TimeStamp::GenTimerFd(std::chrono::seconds(end_t_), std::chrono::nanoseconds(0));
-        // Guard against platforms where GenTimerFd returns -1 (e.g., macOS)
         if (timer_fd_ >= 0) {
             timer_channel_ = std::make_shared<Channel>(shared_from_this(), timer_fd_);
             timer_channel_->SetReadCallBackFn(std::bind(&Dispatcher::TimerHandler, this));
             timer_channel_->EnableReadMode();
         }
+#elif defined(__APPLE__) || defined(__MACH__)
+        // macOS: EVFILT_TIMER registered directly on the kqueue — no fd, no Channel.
+        // EV_ONESHOT fires once; re-armed by ResetTimer() inside TimerHandler().
+        ep_->RegisterTimer(end_t_);
+#endif
     }
 }
 
@@ -107,19 +111,15 @@ void Dispatcher::RunEventLoop(){
         // This allows the server to check is_running() periodically
         std::vector<std::shared_ptr<Channel>> channels = ep_->WaitForEvent(1000);
 
-        // If no events, just continue loop (don't shutdown!)
-        // The timeout is for periodic checking, not termination
+        // If no channel events, just continue loop (don't shutdown!)
+        // The timeout is for periodic checking, not termination.
+        // Note: on macOS, EVFILT_TIMER may fire with no channel events,
+        // so we still need to check ConsumeTimerFired() below.
         if(channels.size() == 0){
             // Call timeout callback if set
             if(callbacks_.timeout_trigger_callback){
                 callbacks_.timeout_trigger_callback(shared_from_this());
             }
-            // Fallback timer for platforms without timerfd (macOS):
-            // Must also run here so idle connections are caught even with no traffic.
-            if (is_sock_dispatcher_ && timer_fd_ < 0 && end_t_ > 0) {
-                TimerHandler();
-            }
-            continue;
         }
 
         // Process all active channels
@@ -144,10 +144,10 @@ void Dispatcher::RunEventLoop(){
             }
         }
 
-        // Fallback timer for platforms without timerfd (macOS):
-        // Run TimerHandler after processing events so it works even under load.
-        // WaitForEvent has a 1s timeout, so this runs approximately once per second.
-        if (is_sock_dispatcher_ && timer_fd_ < 0 && end_t_ > 0) {
+        // macOS EVFILT_TIMER: check if the timer fired during WaitForEvent().
+        // ConsumeTimerFired() returns false on Linux (timer is a timerfd Channel
+        // that invokes TimerHandler() directly via its read callback).
+        if (is_sock_dispatcher_ && ep_->ConsumeTimerFired()) {
             TimerHandler();
         }
 
@@ -334,14 +334,18 @@ void Dispatcher::SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCal
 }
 
 void Dispatcher::TimerHandler(){
-    // Drain the timerfd expiration count before re-arming.
-    // On Linux, timerfd stays readable until read(); without draining,
-    // epoll_wait returns the timer channel continuously in a tight loop.
+    // Re-arm BEFORE scanning connections — matches the cadence on both platforms.
+    // On Linux, timerfd stays readable until read(); draining + re-arm prevents
+    // epoll_wait from returning the timer channel continuously in a tight loop.
+    // On macOS, EVFILT_TIMER was registered with EV_ONESHOT so it must be
+    // explicitly re-armed via ResetTimer().
 #if defined(__linux__)
     uint64_t expirations;
     ::read(timer_fd_, &expirations, sizeof(expirations));
-#endif
     TimeStamp::ResetTimerFd(timer_fd_, end_t_);
+#elif defined(__APPLE__) || defined(__MACH__)
+    ep_->ResetTimer(end_t_);
+#endif
 
     // Periodic log rotation check. Uses try_lock — skips if another
     // dispatcher is already checking. No contention in steady state.

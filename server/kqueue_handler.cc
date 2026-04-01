@@ -38,8 +38,8 @@ void KqueueHandler::UpdateEvent(std::shared_ptr<Channel> ch){
     uint32_t events = ch->Event();
 
     // kqueue requires separate kevents for read and write filters
-    // Use EV_ADD | EV_ONESHOT to get edge-triggered behavior
-    // EV_CLEAR would work too, but ONESHOT is closer to epoll ET semantics
+    // EV_CLEAR resets the event state after retrieval — functionally
+    // equivalent to epoll's EPOLLET (edge-triggered) for read/write filters.
     struct kevent evSet[4];  // Max: add/delete read + add/delete write
     int numChanges = 0;
 
@@ -162,6 +162,13 @@ std::vector<std::shared_ptr<Channel>> KqueueHandler::WaitForEvent(int timeout){
         std::lock_guard<std::mutex> lock(channel_map_mutex_);
 
         for(int idx = 0; idx < nevents; idx++){
+            // EVFILT_TIMER events have no associated Channel — set the flag
+            // and skip to the next event.
+            if(events_[idx].filter == EVFILT_TIMER) {
+                timer_fired_ = true;
+                continue;
+            }
+
             Channel *ch_raw = static_cast<Channel*>(events_[idx].udata);
 
             // Find the shared_ptr by searching for matching raw pointer
@@ -187,6 +194,9 @@ std::vector<std::shared_ptr<Channel>> KqueueHandler::WaitForEvent(int timeout){
                 }
                 if(events_[idx].filter == EVFILT_WRITE) {
                     platform_events |= EVENT_WRITE;
+                    if(events_[idx].flags & EV_EOF) {
+                        platform_events |= EVENT_RDHUP;  // Peer closed — detected via write filter
+                    }
                 }
                 if(events_[idx].flags & EV_ERROR) {
                     platform_events |= EVENT_ERR;
@@ -215,5 +225,41 @@ std::vector<std::shared_ptr<Channel>> KqueueHandler::WaitForEvent(int timeout){
     }
 
     return channels;  // RVO/NRVO will optimize this (no copy!)
+}
+
+void KqueueHandler::RegisterTimer(int interval_sec) {
+    struct kevent ev;
+    // EV_ONESHOT: fire once, then disarm. Re-armed explicitly by ResetTimer()
+    // after TimerHandler() completes — matches the Linux timerfd pattern where
+    // ResetTimerFd() re-arms at the start of TimerHandler().
+    EV_SET(&ev, KQUEUE_TIMER_IDENT, EVFILT_TIMER,
+           EV_ADD | EV_ONESHOT, NOTE_SECONDS, interval_sec, nullptr);
+    if (::kevent(kqueuefd_, &ev, 1, nullptr, 0, nullptr) == -1) {
+        int saved_errno = errno;
+        logging::Get()->error("kevent EVFILT_TIMER register failed: {}",
+                              logging::SafeStrerror(saved_errno));
+        throw std::runtime_error("Failed to register kqueue timer");
+    }
+    logging::Get()->debug("Kqueue timer registered: interval={}s", interval_sec);
+}
+
+void KqueueHandler::ResetTimer(int interval_sec) {
+    struct kevent ev;
+    // Re-add with EV_ONESHOT — idempotent, replaces the previous timer.
+    EV_SET(&ev, KQUEUE_TIMER_IDENT, EVFILT_TIMER,
+           EV_ADD | EV_ONESHOT, NOTE_SECONDS, interval_sec, nullptr);
+    if (::kevent(kqueuefd_, &ev, 1, nullptr, 0, nullptr) == -1) {
+        int saved_errno = errno;
+        // Don't throw on re-arm failure — log and continue.
+        // The fallback WaitForEvent timeout (1s) will still drive TimerHandler.
+        logging::Get()->warn("kevent EVFILT_TIMER re-arm failed: {}",
+                             logging::SafeStrerror(saved_errno));
+    }
+}
+
+bool KqueueHandler::ConsumeTimerFired() {
+    bool fired = timer_fired_;
+    timer_fired_ = false;
+    return fired;
 }
 #endif

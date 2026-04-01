@@ -57,3 +57,39 @@ std::vector<std::shared_ptr<Channel>> EventHandler::WaitForEvent(int timeout) {
     return kqueue_event_ -> WaitForEvent(timeout);
 #endif
 }
+
+void EventHandler::RegisterTimer(int interval_sec) {
+#if defined(__APPLE__) || defined(__MACH__)
+    if (!kqueue_event_) {
+        logging::Get()->error("Nullptr of kqueue_event");
+        throw std::runtime_error("Nullptr of kqueue_event");
+    }
+    kqueue_event_->RegisterTimer(interval_sec);
+#else
+    (void)interval_sec;  // Linux uses timerfd Channel — no-op here
+#endif
+}
+
+void EventHandler::ResetTimer(int interval_sec) {
+#if defined(__APPLE__) || defined(__MACH__)
+    if (!kqueue_event_) {
+        logging::Get()->error("Nullptr of kqueue_event");
+        throw std::runtime_error("Nullptr of kqueue_event");
+    }
+    kqueue_event_->ResetTimer(interval_sec);
+#else
+    (void)interval_sec;
+#endif
+}
+
+bool EventHandler::ConsumeTimerFired() {
+#if defined(__APPLE__) || defined(__MACH__)
+    if (!kqueue_event_) {
+        logging::Get()->error("Nullptr of kqueue_event");
+        throw std::runtime_error("Nullptr of kqueue_event");
+    }
+    return kqueue_event_->ConsumeTimerFired();
+#else
+    return false;
+#endif
+}

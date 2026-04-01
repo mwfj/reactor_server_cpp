@@ -37,11 +37,13 @@ private:
     std::atomic<std::thread::id> thread_id_{};
 
     // Connection Timer
-    int timer_fd_;
-    int end_t_; // the time that timer should triggered
+#if defined(__linux__)
+    int timer_fd_;                             // Linux: timerfd as a Channel in epoll
+    std::shared_ptr<Channel> timer_channel_;   // Must be shared_ptr because Channel uses shared_from_this()
+#endif
+    // macOS: EVFILT_TIMER registered directly on kqueue — no fd or Channel needed.
+    int end_t_; // the time interval (seconds) that timer should trigger
     std::chrono::seconds timeout_; // Timeout duration for connection handler
-
-    std::shared_ptr<Channel> timer_channel_;  // Must be shared_ptr because Channel uses shared_from_this()
     
     // Timer callback
     CALLBACKS_NAMESPACE::DispatcherCallbacks callbacks_;

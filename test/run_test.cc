@@ -11,6 +11,7 @@
 #include "cli_test.h"
 #include "http2_test.h"
 #include "route_test.h"
+#include "kqueue_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -74,6 +75,10 @@ void RunAllTest(){
     std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     RouteTests::RunAllTests();
 
+    // Run kqueue platform tests (skipped on Linux)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    KqueueTests::RunAllTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -91,8 +96,9 @@ void PrintUsage(const char* program_name) {
     std::cout << "  cli,     -C    Run CLI entry point tests only" << std::endl;
     std::cout << "  http2,   -2    Run HTTP/2 tests only" << std::endl;
     std::cout << "  route,   -R    Run route trie/router pattern tests only" << std::endl;
+    std::cout << "  kqueue,  -K    Run kqueue platform tests only (macOS; skipped on Linux)" << std::endl;
     std::cout << "  help,    -h    Show this help message" << std::endl;
-    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route)" << std::endl;
+    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route + kqueue)" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -136,6 +142,9 @@ int main(int argc, char* argv[]) {
         // Run route trie / router pattern tests
         }else if(mode == "route" || mode == "-R"){
             RouteTests::RunAllTests();
+        // Run kqueue platform tests
+        }else if(mode == "kqueue" || mode == "-K"){
+            KqueueTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

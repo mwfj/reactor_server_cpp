@@ -74,6 +74,7 @@ private:
     }
 
 public:
+    int GetFd() const { return socketfd_; }
     Client() = default;
     Client(int _port, const char* _addr, const char *_buf):
         port_(static_cast<in_port_t>(_port))
