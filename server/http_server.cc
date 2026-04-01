@@ -418,9 +418,13 @@ void HttpServer::Stop() {
             }
         });
     } else if (!draining_conn_ptrs.empty()) {
+        // On a dispatcher thread: can't block for drain (deadlock), but still
+        // exempt H2/WS from the generic close sweep so they get a chance to
+        // finish via the timer deadline. Without this, CloseAfterWrite
+        // truncates active H2 streams and WS close handshakes.
         logging::Get()->warn("HttpServer::Stop() called from dispatcher thread — "
-                             "HTTP/2 graceful drain skipped to avoid deadlock");
-        // Don't exempt H2 connections — let normal close sweep handle them
+                             "blocking drain skipped, connections exempt from sweep");
+        net_server_.SetDrainingConns(std::move(draining_conn_ptrs));
     }
 
     net_server_.Stop();
@@ -823,19 +827,21 @@ bool HttpServer::DetectAndRouteProtocol(
             proto = ProtocolDetector::DetectFromData(message.data(), message.size());
             if (proto == ProtocolDetector::Protocol::UNKNOWN) {
                 // Not enough data to classify — buffer and wait for more bytes.
-                // This handles h2c clients that send the 24-byte preface split
-                // across multiple TCP segments.
                 std::lock_guard<std::mutex> lck(conn_mtx_);
+                // Don't re-insert a closing connection — HandleMessage erased
+                // the pending_detection_ entry before calling us, so
+                // RemoveConnection can't find it. Re-inserting would leak
+                // the entry + counter permanently.
+                if (conn->IsClosing()) {
+                    if (already_counted) {
+                        active_connections_.fetch_sub(1, std::memory_order_relaxed);
+                    }
+                    return true;
+                }
                 auto& pd = pending_detection_[conn->fd()];
                 if (pd.conn == conn) {
-                    // Same conn — append additional preface bytes
                     pd.data += message;
                 } else {
-                    // First insertion for this connection. If not already_counted
-                    // (accept/data race: HandleMessage before HandleNewConnection),
-                    // increment now so the counter is set before the entry exists
-                    // in the map. HandleNewConnection will see the same-conn entry
-                    // and skip its own increment.
                     pd = {conn, message};
                     if (!already_counted) {
                         total_accepted_.fetch_add(1, std::memory_order_relaxed);
