@@ -20,9 +20,9 @@ static int ParsePort(const char* str) {
     errno = 0;
     char* end = nullptr;
     long val = std::strtol(str, &end, 10);
-    if (end == str || *end != '\0' || errno == ERANGE || val < 1 || val > 65535) {
+    if (end == str || *end != '\0' || errno == ERANGE || val < 0 || val > 65535) {
         throw std::runtime_error(
-            std::string("Invalid port: '") + str + "' (must be 1-65535)");
+            std::string("Invalid port: '") + str + "' (must be 0-65535)");
     }
     return static_cast<int>(val);
 }
@@ -281,7 +281,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "\n"
         << "Start options:\n"
         << "  -c, --config <file>         Config file (default: config/server.json)\n"
-        << "  -p, --port <port>           Override bind port (1-65535)\n"
+        << "  -p, --port <port>           Override bind port (0-65535, 0=ephemeral)\n"
         << "  -H, --host <address>        Override bind address (numeric IPv4 only)\n"
         << "  -l, --log-level <level>     Override log level\n"
         << "                              (trace, debug, info, warn, error, critical)\n"

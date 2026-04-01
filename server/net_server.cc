@@ -71,8 +71,12 @@ void NetServer::Start(){
             }));
         sock_workers_.AddTask(work_task);
     }
-    // Init complete — fire ready callback before entering the blocking loop.
-    // Daemon mode uses this to signal the parent process that startup succeeded.
+    // Init complete — fire ready callback before entering the blocking accept loop.
+    // Timing: the listen socket is bound and the OS is queuing incoming connections
+    // in the backlog. Socket dispatchers are already running their event loops in
+    // worker threads. The conn_dispatcher accept loop starts immediately after this
+    // callback returns. There is a brief window where connections queue but aren't
+    // accepted yet — this is acceptable (kernel backlog handles it).
     if (ready_callback_) {
         ready_callback_();
         ready_callback_ = nullptr;  // one-shot

@@ -263,8 +263,14 @@ static int HandleStart(const CliOptions& options) {
     }
 
     // ── Wire readiness callback — fires after bind/listen, before event loop ──
-    server->SetReadyCallback([&options]() {
-        logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
+    server->SetReadyCallback([&options, &server]() {
+        int resolved_port = server->GetBoundPort();
+        if (resolved_port > 0) {
+            logging::Get()->info("{} ready on port {}, accepting connections",
+                                REACTOR_SERVER_NAME, resolved_port);
+        } else {
+            logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
+        }
         logging::WriteMarker("SERVER START");
 #if !defined(_WIN32)
         if (options.daemonize) Daemonizer::NotifyReady();

@@ -212,28 +212,39 @@ void TestParseInvalidPort() {
     }
 }
 
-// Test 6: Negative port must throw.
-// Port 0 is technically reserved/invalid; -1 is clearly out of range.
+// Test 6: Port 0 (ephemeral) must be accepted; negative port must throw.
 void TestParseInvalidPortNegative() {
-    std::cout << "\n[TEST] CliParser: Port -1 throws..." << std::endl;
-    // Note: getopt treats -1 as the end-of-options sentinel, so we pass a
-    // string that looks like -1 but cannot be mistaken for a flag.
-    // We use a string with no leading '-' that parses to a negative strtol value.
-    // However, the flag still has a leading '-' before the number. To
-    // exercise ParsePort with value 0 (boundary), we use port 0 as the
-    // "too low" case (valid range is 1-65535).
+    std::cout << "\n[TEST] CliParser: Port 0 accepted, negative throws..." << std::endl;
+    bool pass = true;
+    std::string err;
+
+    // Port 0 is now valid — OS assigns ephemeral port
     try {
         const char* args[] = {"reactor_server", "start", "--port", "0"};
         int argc = 4;
-        CliParser::Parse(argc, const_cast<char**>(args));
-        TestFramework::RecordTest("CliParser: Port 0 throws", false,
-            "Expected exception for port 0", CLI_CATEGORY);
-    } catch (const std::runtime_error&) {
-        TestFramework::RecordTest("CliParser: Port 0 throws", true, "", CLI_CATEGORY);
+        auto opts = CliParser::Parse(argc, const_cast<char**>(args));
+        if (opts.port != 0) {
+            pass = false; err += "port 0 not accepted; ";
+        }
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("CliParser: Port 0 throws", false,
-            std::string("Wrong exception type: ") + e.what(), CLI_CATEGORY);
+        pass = false; err += std::string("port 0 threw: ") + e.what() + "; ";
     }
+
+    // Negative port must still throw (getopt treats -1 as end-of-options,
+    // so we test the boundary via an out-of-range value)
+    try {
+        const char* args[] = {"reactor_server", "start", "--port", "99999"};
+        int argc = 4;
+        CliParser::Parse(argc, const_cast<char**>(args));
+        pass = false; err += "port 99999 did not throw; ";
+    } catch (const std::runtime_error&) {
+        // Expected
+    } catch (const std::exception& e) {
+        pass = false; err += std::string("port 99999 wrong exception: ") + e.what() + "; ";
+    }
+
+    TestFramework::RecordTest("CliParser: Port 0 accepted, out-of-range throws",
+        pass, err, CLI_CATEGORY);
 }
 
 // Test 7: Non-numeric port string must throw.

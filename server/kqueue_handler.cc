@@ -64,25 +64,28 @@ void KqueueHandler::UpdateEvent(std::shared_ptr<Channel> ch){
         EV_SET(&evSet[numChanges++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
     }
 
-    // Apply changes to kqueue
-    if(numChanges > 0){
-        if(::kevent(kqueuefd_, evSet, numChanges, nullptr, 0, nullptr) == -1){
+    // Apply each change independently — batching can fail entirely if one
+    // operation returns ENOENT (e.g., deleting a filter that was never added),
+    // silently skipping subsequent operations in the same batch.
+    for (int i = 0; i < numChanges; ++i) {
+        if (::kevent(kqueuefd_, &evSet[i], 1, nullptr, 0, nullptr) == -1) {
             int saved_errno = errno;
-            // If fd is invalid or not in kqueue, it might be closing - don't throw
-            if (saved_errno == EBADF || saved_errno == ENOENT) {
-                return;  // Gracefully handle race condition
+            if (saved_errno == EBADF) {
+                return;  // fd is dead — nothing more to do
+            }
+            if (saved_errno == ENOENT) {
+                continue;  // Filter wasn't registered — skip, try next
             }
             logging::Get()->error("kevent failed (fd={}): {}", fd, logging::SafeStrerror(saved_errno));
-            // Don't throw - just log and continue
             return;
         }
+    }
 
-        // Store in map to maintain ownership - must lock to prevent race with WaitForEvent
-        if(events != 0) {
-            std::lock_guard<std::mutex> lock(channel_map_mutex_);
-            channel_map_[fd] = ch;
-            ch->SetEventRead();  // Mark as registered
-        }
+    // Store in map to maintain ownership - must lock to prevent race with WaitForEvent
+    if(events != 0) {
+        std::lock_guard<std::mutex> lock(channel_map_mutex_);
+        channel_map_[fd] = ch;
+        ch->SetEventRead();  // Mark as registered
     }
 }
 
@@ -93,19 +96,27 @@ void KqueueHandler::UpdateEvent(std::shared_ptr<Channel> ch){
 void KqueueHandler::RemoveChannel(std::shared_ptr<Channel> ch){
     int fd = ch->fd();
 
-    // Remove from kqueue if it was registered
+    // Remove from kqueue if it was registered.
+    // Delete each filter independently — batching both in one kevent() call
+    // fails entirely if either filter doesn't exist (ENOENT), leaving the
+    // other filter still registered. Write-only channels would leak the
+    // EVFILT_WRITE filter when the batched EVFILT_READ delete returns ENOENT.
     if(ch->is_read_event()){
-        struct kevent evSets[2];
-        // Delete both read and write filters
-        EV_SET(&evSets[0], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
-        EV_SET(&evSets[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
-        if(::kevent(kqueuefd_, evSets, 2, nullptr, 0, nullptr) == -1){
+        struct kevent ev;
+        // Delete read filter (may not be registered for write-only channels)
+        EV_SET(&ev, fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+        if(::kevent(kqueuefd_, &ev, 1, nullptr, 0, nullptr) == -1){
             int saved_errno = errno;
-            // ENOENT means it wasn't in kqueue (already removed or never added)
-            // EBADF means fd is invalid (already closed)
-            // Both are ok - we just want to ensure it's not in kqueue
             if(saved_errno != ENOENT && saved_errno != EBADF){
-                logging::Get()->warn("kevent DEL warning fd={}: {}", fd, logging::SafeStrerror(saved_errno));
+                logging::Get()->warn("kevent EVFILT_READ DEL warning fd={}: {}", fd, logging::SafeStrerror(saved_errno));
+            }
+        }
+        // Delete write filter (may not be registered for read-only channels)
+        EV_SET(&ev, fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+        if(::kevent(kqueuefd_, &ev, 1, nullptr, 0, nullptr) == -1){
+            int saved_errno = errno;
+            if(saved_errno != ENOENT && saved_errno != EBADF){
+                logging::Get()->warn("kevent EVFILT_WRITE DEL warning fd={}: {}", fd, logging::SafeStrerror(saved_errno));
             }
         }
     }
