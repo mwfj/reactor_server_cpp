@@ -35,48 +35,36 @@ void RunAllTest(){
     BasicTests::RunAllTests();
 
     // Run stress tests
-    // Longer delay to ensure ports are released from TIME_WAIT
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     StressTests::RunStressTests();
 
     // Run race condition tests
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     RaceConditionTests::RunRaceConditionTests();
 
     // Run timeout tests
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     TimeoutTests::RunAllTests();
 
     // Run config tests
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     ConfigTests::RunAllTests();
 
     // Run HTTP tests
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     HttpTests::RunAllTests();
 
     // Run WebSocket tests
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     WebSocketTests::RunAllTests();
 
     // Run TLS tests
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     TlsTests::RunAllTests();
 
     // Run CLI tests
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     CliTests::RunAllTests();
 
     // Run HTTP/2 tests
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     Http2Tests::RunAllTests();
 
     // Run route trie and router pattern tests
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     RouteTests::RunAllTests();
 
     // Run kqueue platform tests (skipped on Linux)
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     KqueueTests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;

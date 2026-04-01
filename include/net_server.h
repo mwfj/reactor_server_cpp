@@ -120,4 +120,9 @@ public:
     // Called after init completes but before the blocking event loop.
     // Used by daemon mode to signal readiness to the parent process.
     void SetReadyCallback(std::function<void()> cb) { ready_callback_ = std::move(cb); }
+
+    // Returns the actual port the server is listening on.
+    // Resolves ephemeral port 0. Available after the constructor completes
+    // (bind happens during construction). IPv4 only.
+    int GetBoundPort() const { return acceptor_ ? acceptor_->GetBoundPort() : 0; }
 };

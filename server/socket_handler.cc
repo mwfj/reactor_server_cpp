@@ -159,3 +159,15 @@ void SocketHandler::SetNonBlocking(int fd) {
     }
 #endif
 }
+
+int SocketHandler::GetBoundPort() const {
+    if (fd_ == -1) return 0;
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    if (getsockname(fd_, reinterpret_cast<struct sockaddr*>(&addr), &len) < 0) {
+        int saved_errno = errno;
+        logging::Get()->warn("getsockname failed: {}", logging::SafeStrerror(saved_errno));
+        return 0;
+    }
+    return ntohs(addr.sin_port);
+}

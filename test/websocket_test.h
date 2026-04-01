@@ -12,8 +12,6 @@
 
 namespace WebSocketTests {
 
-    const int TEST_PORT = 10301;
-
     // === Handshake Tests ===
 
     void TestHandshakeValidation() {

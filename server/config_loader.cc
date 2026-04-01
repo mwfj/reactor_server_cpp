@@ -302,10 +302,10 @@ void ConfigLoader::Validate(const ServerConfig& config) {
         }
     }
 
-    if (config.bind_port < 1 || config.bind_port > 65535) {
+    if (config.bind_port < 0 || config.bind_port > 65535) {
         throw std::invalid_argument(
             "Invalid bind_port: " + std::to_string(config.bind_port) +
-            " (must be 1-65535)");
+            " (must be 0-65535)");
     }
 
     // 0 = unlimited (sentinel), negative = invalid

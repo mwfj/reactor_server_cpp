@@ -1,6 +1,7 @@
 #pragma once
 
 #include "test_framework.h"
+#include "test_server_runner.h"
 #include "http/http_parser.h"
 #include "http/http_response.h"
 #include "http/http_router.h"
@@ -15,8 +16,6 @@
 #include <poll.h>
 
 namespace HttpTests {
-
-    const int TEST_PORT = 10201;
 
     // === Parser Tests ===
 
@@ -409,7 +408,7 @@ namespace HttpTests {
     void TestHttpIntegration() {
         std::cout << "\n[TEST] HTTP Integration (Full Request/Response Cycle)..." << std::endl;
         try {
-            HttpServer server("127.0.0.1", TEST_PORT);
+            HttpServer server("127.0.0.1", 0);
 
             server.Get("/health", [](const HttpRequest& req, HttpResponse& res) {
                 res.Status(200).Json(R"({"status":"ok"})");
@@ -419,12 +418,8 @@ namespace HttpTests {
                 res.Status(200).Body(req.body, "text/plain");
             });
 
-            // Start server in background thread
-            std::thread server_thread([&server]() {
-                try { server.Start(); } catch (...) {}
-            });
-            // Give server time to start up (thread pool + dispatchers)
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
 
             bool pass = true;
             std::string err;
@@ -434,7 +429,7 @@ namespace HttpTests {
 
             // Test 1: GET /health
             {
-                std::string response = SendHttpRequest(TEST_PORT,
+                std::string response = SendHttpRequest(port,
                     "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
 
                 if (response.find("200 OK") == std::string::npos) {
@@ -451,7 +446,7 @@ namespace HttpTests {
             // Test 2: POST /echo with body
             {
                 std::string body = "Hello World";
-                std::string response = SendHttpRequest(TEST_PORT,
+                std::string response = SendHttpRequest(port,
                     "POST /echo HTTP/1.1\r\n"
                     "Host: localhost\r\n"
                     "Content-Length: " + std::to_string(body.size()) + "\r\n"
@@ -468,16 +463,13 @@ namespace HttpTests {
 
             // Test 3: 404 for unknown path
             {
-                std::string response = SendHttpRequest(TEST_PORT,
+                std::string response = SendHttpRequest(port,
                     "GET /unknown HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
 
                 if (response.find("404") == std::string::npos) {
                     pass = false; err += "GET /unknown: expected 404 (got " + std::to_string(response.size()) + " bytes); ";
                 }
             }
-
-            server.Stop();
-            if (server_thread.joinable()) server_thread.join();
 
             TestFramework::RecordTest("HTTP Integration", pass, err, TestFramework::TestCategory::OTHER);
         } catch (const std::exception& e) {
@@ -489,12 +481,10 @@ namespace HttpTests {
     void TestRequestTimeout() {
         std::cout << "\n[TEST] Request Timeout (Slowloris Protection)..." << std::endl;
         try {
-            const int TIMEOUT_PORT = TEST_PORT + 1;
-
             // Configure with a short request timeout for testing
             ServerConfig config;
             config.bind_host = "127.0.0.1";
-            config.bind_port = TIMEOUT_PORT;
+            config.bind_port = 0;
             config.request_timeout_sec = 2;   // 2-second request timeout
             config.idle_timeout_sec = 60;      // idle timeout won't interfere
             config.worker_threads = 2;
@@ -504,10 +494,8 @@ namespace HttpTests {
                 res.Status(200).Text("ok");
             });
 
-            std::thread server_thread([&server]() {
-                try { server.Start(); } catch (...) {}
-            });
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
 
             bool pass = true;
             std::string err;
@@ -517,7 +505,7 @@ namespace HttpTests {
                 int sockfd = socket(AF_INET, SOCK_STREAM, 0);
                 struct sockaddr_in addr{};
                 addr.sin_family = AF_INET;
-                addr.sin_port = htons(TIMEOUT_PORT);
+                addr.sin_port = htons(port);
                 addr.sin_addr.s_addr = inet_addr("127.0.0.1");
                 connect(sockfd, (struct sockaddr*)&addr, sizeof(addr));
 
@@ -554,7 +542,7 @@ namespace HttpTests {
                 int sockfd = socket(AF_INET, SOCK_STREAM, 0);
                 struct sockaddr_in addr{};
                 addr.sin_family = AF_INET;
-                addr.sin_port = htons(TIMEOUT_PORT);
+                addr.sin_port = htons(port);
                 addr.sin_addr.s_addr = inet_addr("127.0.0.1");
                 connect(sockfd, (struct sockaddr*)&addr, sizeof(addr));
 
@@ -577,9 +565,6 @@ namespace HttpTests {
                     err += "Fast request failed: expected 200 OK; ";
                 }
             }
-
-            server.Stop();
-            if (server_thread.joinable()) server_thread.join();
 
             TestFramework::RecordTest("Request Timeout (Slowloris Protection)", pass, err,
                 TestFramework::TestCategory::OTHER);
@@ -617,7 +602,6 @@ namespace HttpTests {
         TestHttpIntegration();
 
         // Timeout tests
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         TestRequestTimeout();
     }
 

@@ -1,4 +1,5 @@
 #pragma once
+#include "test_server_runner.h"
 #include "reactor_server.h"
 #include "client.h"
 #include "test_framework.h"
@@ -7,55 +8,25 @@
 // Stress test namespace
 namespace StressTests {
     const char* TEST_IP = "127.0.0.1";
-    const int TEST_PORT = 9889;
-
-    // RAII wrapper for stress test server
-    class StressServerRunner {
-    private:
-        ReactorServer& server_;
-        std::thread server_thread_;
-
-    public:
-        StressServerRunner(ReactorServer& server) : server_(server) {
-            server_thread_ = std::thread([this]() {
-                try {
-                    std::cout << "[SERVER] Stress test server starting" << std::endl;
-                    server_.Start();
-                } catch (const std::exception& e) {
-                    std::cerr << "[SERVER] Error: " << e.what() << std::endl;
-                }
-            });
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-
-        ~StressServerRunner() {
-            server_.Stop();
-            if(server_thread_.joinable()) {
-                server_thread_.join();
-            }
-        }
-
-        StressServerRunner(const StressServerRunner&) = delete;
-        StressServerRunner& operator=(const StressServerRunner&) = delete;
-    };
 
     void TestHighLoadConnections() {
         const int NUM_CLIENTS = 1000;
         std::cout << "\n[STRESS TEST] High Load (1000 concurrent clients)..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
-            StressServerRunner runner(server);
+            ReactorServer server(TEST_IP, 0);
+            TestServerRunner<ReactorServer> runner(server);
+            const int port = runner.GetPort();
 
             std::vector<std::thread> client_threads;
 
             for (int i = 0; i < NUM_CLIENTS; i++) {
-                client_threads.emplace_back([i]() {
+                client_threads.emplace_back([i, port]() {
                     try {
                         std::stringstream ss;
                         ss << "StressClient" << i;
 
-                        Client client(TEST_PORT, TEST_IP, ss.str().c_str());
+                        Client client(port, TEST_IP, ss.str().c_str());
                         client.SetQuietMode(true);
                         client.Init();
                         // Set 10-second timeout to prevent indefinite hangs

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "test_framework.h"
+#include "test_server_runner.h"
 #include "config/server_config.h"
 #include "config/config_loader.h"
 #include "http2/http2_constants.h"
@@ -42,13 +43,6 @@
 // ============================================================
 
 namespace Http2Tests {
-
-// ---- Port range: 10500-10599 (unique to this suite) ----
-static constexpr int BASE_PORT        = 10500;
-static constexpr int H2_UNIT_PORT     = 10501;   // functional h2c tests
-static constexpr int H2_MULTI_PORT    = 10502;   // multiple-stream test
-static constexpr int H2_BODY_PORT     = 10503;   // large-body / limit tests
-static constexpr int H2_RACE_PORT     = 10504;   // concurrent-streams race
 
 // ---- IO timeout for all raw-socket operations ----
 static constexpr int IO_TIMEOUT_MS    = 5000;
@@ -397,22 +391,6 @@ private:
         return static_cast<ssize_t>(to_copy);
     }
 };
-
-// ============================================================
-// Helper: start an HttpServer in a background thread.
-// Returns the thread. Caller owns server lifetime.
-// ============================================================
-
-static std::thread StartServer(HttpServer& server) {
-    return std::thread([&server]() {
-        try { server.Start(); } catch (...) {}
-    });
-}
-
-static void StopServer(HttpServer& server, std::thread& t) {
-    server.Stop();
-    if (t.joinable()) t.join();
-}
 
 // ============================================================
 // ============================================================
@@ -1338,40 +1316,13 @@ void TestStreamPathWithoutQuery() {
 // ============================================================
 // ============================================================
 
-// Helper: wait for server to be ready by polling TCP connect.
-// After a successful probe, sleeps 150ms to let the reactor fully process the
-// probe connection's close event before the test client connects.  Without this
-// sleep the probe fd may be reused by the test client and the reactor's
-// HandleCloseConnection for the probe connection fires on the new (test) fd,
-// tearing down the h2c session immediately after the server preface is sent.
-static bool WaitForServer(int port, int tries = 30, int delay_ms = 50) {
-    for (int i = 0; i < tries; ++i) {
-        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) continue;
-        struct sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port   = htons(static_cast<uint16_t>(port));
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-        int r = ::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
-        ::close(fd);
-        if (r == 0) {
-            // Give the reactor time to process the probe connection's close event
-            // so the probe fd is fully freed before the test client connects.
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
-            return true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-    }
-    return false;
-}
-
 // Simple GET through h2c connection.
 void TestH2C_SimpleGet() {
     std::cout << "\n[TEST] H2C: simple GET request..." << std::endl;
     try {
         ServerConfig cfg;
         cfg.bind_host       = "127.0.0.1";
-        cfg.bind_port       = H2_UNIT_PORT;
+        cfg.bind_port       = 0;
         cfg.worker_threads  = 2;
         cfg.http2.enabled   = true;
 
@@ -1380,19 +1331,14 @@ void TestH2C_SimpleGet() {
             res.Status(200).Text("Hello HTTP/2");
         });
 
-        auto t = StartServer(server);
-        if (!WaitForServer(H2_UNIT_PORT)) {
-            StopServer(server, t);
-            TestFramework::RecordTest("H2C: simple GET", false, "server did not start",
-                                      TestFramework::TestCategory::OTHER);
-            return;
-        }
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
 
         Http2TestClient client;
         bool pass = true;
         std::string err;
 
-        if (!client.Connect("127.0.0.1", H2_UNIT_PORT)) {
+        if (!client.Connect("127.0.0.1", port)) {
             pass = false; err = "client connect failed";
         } else {
             auto resp = client.Get("/hello");
@@ -1407,7 +1353,6 @@ void TestH2C_SimpleGet() {
             }
         }
         client.Disconnect();
-        StopServer(server, t);
 
         TestFramework::RecordTest("H2C: simple GET", pass, err,
                                   TestFramework::TestCategory::OTHER);
@@ -1423,7 +1368,7 @@ void TestH2C_SimplePost() {
     try {
         ServerConfig cfg;
         cfg.bind_host      = "127.0.0.1";
-        cfg.bind_port      = H2_UNIT_PORT + 10;
+        cfg.bind_port      = 0;
         cfg.worker_threads = 2;
         cfg.http2.enabled  = true;
 
@@ -1432,19 +1377,14 @@ void TestH2C_SimplePost() {
             res.Status(200).Body(req.body, "text/plain");
         });
 
-        auto t = StartServer(server);
-        if (!WaitForServer(H2_UNIT_PORT + 10)) {
-            StopServer(server, t);
-            TestFramework::RecordTest("H2C: POST with body", false, "server did not start",
-                                      TestFramework::TestCategory::OTHER);
-            return;
-        }
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
 
         Http2TestClient client;
         bool pass = true;
         std::string err;
 
-        if (!client.Connect("127.0.0.1", H2_UNIT_PORT + 10)) {
+        if (!client.Connect("127.0.0.1", port)) {
             pass = false; err = "client connect failed";
         } else {
             const std::string body = "Hello from POST";
@@ -1460,7 +1400,6 @@ void TestH2C_SimplePost() {
             }
         }
         client.Disconnect();
-        StopServer(server, t);
 
         TestFramework::RecordTest("H2C: POST with body", pass, err,
                                   TestFramework::TestCategory::OTHER);
@@ -1476,7 +1415,7 @@ void TestH2C_NotFound() {
     try {
         ServerConfig cfg;
         cfg.bind_host      = "127.0.0.1";
-        cfg.bind_port      = H2_UNIT_PORT + 20;
+        cfg.bind_port      = 0;
         cfg.worker_threads = 2;
         cfg.http2.enabled  = true;
 
@@ -1485,19 +1424,14 @@ void TestH2C_NotFound() {
             res.Status(200).Text("ok");
         });
 
-        auto t = StartServer(server);
-        if (!WaitForServer(H2_UNIT_PORT + 20)) {
-            StopServer(server, t);
-            TestFramework::RecordTest("H2C: 404 not found", false, "server did not start",
-                                      TestFramework::TestCategory::OTHER);
-            return;
-        }
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
 
         Http2TestClient client;
         bool pass = true;
         std::string err;
 
-        if (!client.Connect("127.0.0.1", H2_UNIT_PORT + 20)) {
+        if (!client.Connect("127.0.0.1", port)) {
             pass = false; err = "client connect failed";
         } else {
             auto resp = client.Get("/does-not-exist");
@@ -1509,7 +1443,6 @@ void TestH2C_NotFound() {
             }
         }
         client.Disconnect();
-        StopServer(server, t);
 
         TestFramework::RecordTest("H2C: 404 not found", pass, err,
                                   TestFramework::TestCategory::OTHER);
@@ -1525,7 +1458,7 @@ void TestH2C_Middleware() {
     try {
         ServerConfig cfg;
         cfg.bind_host      = "127.0.0.1";
-        cfg.bind_port      = H2_UNIT_PORT + 30;
+        cfg.bind_port      = 0;
         cfg.worker_threads = 2;
         cfg.http2.enabled  = true;
 
@@ -1550,19 +1483,14 @@ void TestH2C_Middleware() {
             return true;
         });
 
-        auto t = StartServer(server);
-        if (!WaitForServer(H2_UNIT_PORT + 30)) {
-            StopServer(server, t);
-            TestFramework::RecordTest("H2C: middleware executes", false, "server did not start",
-                                      TestFramework::TestCategory::OTHER);
-            return;
-        }
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
 
         Http2TestClient client;
         bool pass = true;
         std::string err;
 
-        if (!client.Connect("127.0.0.1", H2_UNIT_PORT + 30)) {
+        if (!client.Connect("127.0.0.1", port)) {
             pass = false; err = "client connect failed";
         } else {
             auto resp = client.Get("/mw-test");
@@ -1576,7 +1504,6 @@ void TestH2C_Middleware() {
             }
         }
         client.Disconnect();
-        StopServer(server, t);
 
         TestFramework::RecordTest("H2C: middleware executes", pass, err,
                                   TestFramework::TestCategory::OTHER);
@@ -1592,7 +1519,7 @@ void TestH2C_MultipleStreams() {
     try {
         ServerConfig cfg;
         cfg.bind_host      = "127.0.0.1";
-        cfg.bind_port      = H2_MULTI_PORT;
+        cfg.bind_port      = 0;
         cfg.worker_threads = 2;
         cfg.http2.enabled  = true;
 
@@ -1607,19 +1534,14 @@ void TestH2C_MultipleStreams() {
             res.Status(200).Text("stream3");
         });
 
-        auto t = StartServer(server);
-        if (!WaitForServer(H2_MULTI_PORT)) {
-            StopServer(server, t);
-            TestFramework::RecordTest("H2C: multiple streams", false, "server did not start",
-                                      TestFramework::TestCategory::OTHER);
-            return;
-        }
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
 
         Http2TestClient client;
         bool pass = true;
         std::string err;
 
-        if (!client.Connect("127.0.0.1", H2_MULTI_PORT)) {
+        if (!client.Connect("127.0.0.1", port)) {
             pass = false; err = "client connect failed";
         } else {
             // Send three sequential requests on the same connection
@@ -1644,7 +1566,6 @@ void TestH2C_MultipleStreams() {
             }
         }
         client.Disconnect();
-        StopServer(server, t);
 
         TestFramework::RecordTest("H2C: multiple streams", pass, err,
                                   TestFramework::TestCategory::OTHER);
@@ -1660,7 +1581,7 @@ void TestH2C_LargeBody() {
     try {
         ServerConfig cfg;
         cfg.bind_host      = "127.0.0.1";
-        cfg.bind_port      = H2_BODY_PORT;
+        cfg.bind_port      = 0;
         cfg.worker_threads = 2;
         cfg.http2.enabled  = true;
         cfg.max_body_size  = 64 * 1024;  // 64 KB limit
@@ -1671,20 +1592,14 @@ void TestH2C_LargeBody() {
                                  std::to_string(req.body.size()) + "}");
         });
 
-        auto t = StartServer(server);
-        if (!WaitForServer(H2_BODY_PORT)) {
-            StopServer(server, t);
-            TestFramework::RecordTest("H2C: large body within limit", false,
-                                      "server did not start",
-                                      TestFramework::TestCategory::OTHER);
-            return;
-        }
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
 
         Http2TestClient client;
         bool pass = true;
         std::string err;
 
-        if (!client.Connect("127.0.0.1", H2_BODY_PORT)) {
+        if (!client.Connect("127.0.0.1", port)) {
             pass = false; err = "client connect failed";
         } else {
             // 32 KB body — well within the 64 KB limit
@@ -1701,7 +1616,6 @@ void TestH2C_LargeBody() {
             }
         }
         client.Disconnect();
-        StopServer(server, t);
 
         TestFramework::RecordTest("H2C: large body within limit", pass, err,
                                   TestFramework::TestCategory::OTHER);
@@ -1723,7 +1637,7 @@ void TestH2C_InvalidPreface() {
     try {
         ServerConfig cfg;
         cfg.bind_host      = "127.0.0.1";
-        cfg.bind_port      = H2_BODY_PORT + 10;
+        cfg.bind_port      = 0;
         cfg.worker_threads = 2;
         cfg.http2.enabled  = true;
 
@@ -1732,19 +1646,14 @@ void TestH2C_InvalidPreface() {
             res.Status(200).Text("ok");
         });
 
-        auto t = StartServer(server);
-        if (!WaitForServer(H2_BODY_PORT + 10)) {
-            StopServer(server, t);
-            TestFramework::RecordTest("H2C: invalid preface", false, "server did not start",
-                                      TestFramework::TestCategory::OTHER);
-            return;
-        }
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
 
         // Connect raw and send binary garbage (not the HTTP/2 preface)
         int fd = ::socket(AF_INET, SOCK_STREAM, 0);
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_port   = htons(static_cast<uint16_t>(H2_BODY_PORT + 10));
+        addr.sin_port   = htons(static_cast<uint16_t>(port));
         addr.sin_addr.s_addr = inet_addr("127.0.0.1");
         bool pass = true;
         std::string err;
@@ -1791,7 +1700,6 @@ void TestH2C_InvalidPreface() {
         }
         if (fd >= 0) ::close(fd);
 
-        StopServer(server, t);
         TestFramework::RecordTest("H2C: invalid preface handled gracefully", pass, err,
                                   TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
@@ -1806,7 +1714,7 @@ void TestH2C_BodyTooLarge() {
     try {
         ServerConfig cfg;
         cfg.bind_host      = "127.0.0.1";
-        cfg.bind_port      = H2_BODY_PORT + 20;
+        cfg.bind_port      = 0;
         cfg.worker_threads = 2;
         cfg.http2.enabled  = true;
         cfg.max_body_size  = 1024;  // 1 KB limit (tiny — easy to exceed)
@@ -1816,19 +1724,14 @@ void TestH2C_BodyTooLarge() {
             res.Status(200).Text("ok");
         });
 
-        auto t = StartServer(server);
-        if (!WaitForServer(H2_BODY_PORT + 20)) {
-            StopServer(server, t);
-            TestFramework::RecordTest("H2C: body too large", false, "server did not start",
-                                      TestFramework::TestCategory::OTHER);
-            return;
-        }
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
 
         Http2TestClient client;
         bool pass = true;
         std::string err;
 
-        if (!client.Connect("127.0.0.1", H2_BODY_PORT + 20)) {
+        if (!client.Connect("127.0.0.1", port)) {
             pass = false; err = "client connect failed";
         } else {
             // Send 4 KB body (4x the configured limit)
@@ -1847,7 +1750,6 @@ void TestH2C_BodyTooLarge() {
             }
         }
         client.Disconnect();
-        StopServer(server, t);
 
         TestFramework::RecordTest("H2C: body too large", pass, err,
                                   TestFramework::TestCategory::OTHER);
@@ -1870,7 +1772,7 @@ void TestH2C_ConcurrentClients() {
     try {
         ServerConfig cfg;
         cfg.bind_host      = "127.0.0.1";
-        cfg.bind_port      = H2_RACE_PORT;
+        cfg.bind_port      = 0;
         cfg.worker_threads = 4;
         cfg.http2.enabled  = true;
 
@@ -1879,13 +1781,8 @@ void TestH2C_ConcurrentClients() {
             res.Status(200).Text("pong");
         });
 
-        auto t = StartServer(server);
-        if (!WaitForServer(H2_RACE_PORT)) {
-            StopServer(server, t);
-            TestFramework::RecordTest("H2C: concurrent clients", false, "server did not start",
-                                      TestFramework::TestCategory::OTHER);
-            return;
-        }
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
 
         static constexpr int NUM_CLIENTS  = 10;
         static constexpr int REQS_PER_CLIENT = 5;
@@ -1896,9 +1793,9 @@ void TestH2C_ConcurrentClients() {
         threads.reserve(NUM_CLIENTS);
 
         for (int i = 0; i < NUM_CLIENTS; ++i) {
-            threads.emplace_back([&]() {
+            threads.emplace_back([&, port]() {
                 Http2TestClient client;
-                if (!client.Connect("127.0.0.1", H2_RACE_PORT)) {
+                if (!client.Connect("127.0.0.1", port)) {
                     fail_count.fetch_add(REQS_PER_CLIENT, std::memory_order_relaxed);
                     return;
                 }
@@ -1914,8 +1811,6 @@ void TestH2C_ConcurrentClients() {
             });
         }
         for (auto& th : threads) th.join();
-
-        StopServer(server, t);
 
         int expected = NUM_CLIENTS * REQS_PER_CLIENT;
         int actual   = success_count.load(std::memory_order_relaxed);
@@ -1941,11 +1836,9 @@ void TestH2C_ConcurrentClients() {
 void TestH2C_MixedProtocolClients() {
     std::cout << "\n[TEST] H2C: mixed HTTP/1.1 and HTTP/2 concurrent clients..." << std::endl;
     try {
-        static constexpr int MIXED_PORT = H2_RACE_PORT + 10;
-
         ServerConfig cfg;
         cfg.bind_host      = "127.0.0.1";
-        cfg.bind_port      = MIXED_PORT;
+        cfg.bind_port      = 0;
         cfg.worker_threads = 4;
         cfg.http2.enabled  = true;
 
@@ -1955,14 +1848,8 @@ void TestH2C_MixedProtocolClients() {
                                  std::to_string(req.http_minor));
         });
 
-        auto t = StartServer(server);
-        if (!WaitForServer(MIXED_PORT)) {
-            StopServer(server, t);
-            TestFramework::RecordTest("H2C: mixed protocol clients", false,
-                                      "server did not start",
-                                      TestFramework::TestCategory::OTHER);
-            return;
-        }
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
 
         static constexpr int N = 6;
         std::atomic<int> h2_ok{0};
@@ -1973,9 +1860,9 @@ void TestH2C_MixedProtocolClients() {
 
         // H2 clients
         for (int i = 0; i < N; ++i) {
-            threads.emplace_back([&]() {
+            threads.emplace_back([&, port]() {
                 Http2TestClient client;
-                if (!client.Connect("127.0.0.1", MIXED_PORT)) return;
+                if (!client.Connect("127.0.0.1", port)) return;
                 auto resp = client.Get("/ver");
                 if (!resp.error && resp.status == 200 && resp.body == "2.0") {
                     h2_ok.fetch_add(1, std::memory_order_relaxed);
@@ -1986,12 +1873,12 @@ void TestH2C_MixedProtocolClients() {
 
         // HTTP/1.1 clients (raw socket)
         for (int i = 0; i < N; ++i) {
-            threads.emplace_back([&]() {
+            threads.emplace_back([&, port]() {
                 int fd = ::socket(AF_INET, SOCK_STREAM, 0);
                 if (fd < 0) return;
                 struct sockaddr_in addr{};
                 addr.sin_family = AF_INET;
-                addr.sin_port   = htons(static_cast<uint16_t>(MIXED_PORT));
+                addr.sin_port   = htons(static_cast<uint16_t>(port));
                 addr.sin_addr.s_addr = inet_addr("127.0.0.1");
                 if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
                               sizeof(addr)) < 0) {
@@ -2016,7 +1903,6 @@ void TestH2C_MixedProtocolClients() {
         }
 
         for (auto& th : threads) th.join();
-        StopServer(server, t);
 
         bool pass = (h2_ok.load() == N && h1_ok.load() == N);
         std::string err;
@@ -2103,39 +1989,20 @@ void RunAllTests() {
     TestStreamRequestComplete();
     TestStreamPathWithoutQuery();
 
-    // Brief settle between unit tests and server tests
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
     // --- Category 4: H2C Functional ---
     TestH2C_SimpleGet();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
     TestH2C_SimplePost();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
     TestH2C_NotFound();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
     TestH2C_Middleware();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
     TestH2C_MultipleStreams();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
     TestH2C_LargeBody();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     // --- Category 5: Error Handling ---
     TestH2C_InvalidPreface();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
     TestH2C_BodyTooLarge();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     // --- Category 6: Race Conditions ---
     TestH2C_ConcurrentClients();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
     TestH2C_MixedProtocolClients();
 }
 

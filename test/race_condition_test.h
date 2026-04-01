@@ -1,4 +1,5 @@
 #pragma once
+#include "test_server_runner.h"
 #include "reactor_server.h"
 #include "client.h"
 #include "test_framework.h"
@@ -11,36 +12,6 @@
 // Tests all issues documented in EVENTFD_RACE_CONDITION_FIXES.md
 namespace RaceConditionTests {
     const char* TEST_IP = "127.0.0.1";
-    const int TEST_PORT = 10000;
-
-    // RAII wrapper for test server
-    class TestServerRunner {
-    private:
-        ReactorServer& server_;
-        std::thread server_thread_;
-
-    public:
-        TestServerRunner(ReactorServer& server) : server_(server) {
-            server_thread_ = std::thread([this]() {
-                try {
-                    server_.Start();
-                } catch (const std::exception& e) {
-                    std::cerr << "[TestServer] Error: " << e.what() << std::endl;
-                }
-            });
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-
-        ~TestServerRunner() {
-            server_.Stop();
-            if(server_thread_.joinable()) {
-                server_thread_.join();
-            }
-        }
-
-        TestServerRunner(const TestServerRunner&) = delete;
-        TestServerRunner& operator=(const TestServerRunner&) = delete;
-    };
 
     //==========================================================================
     // Test 1: EventFD and Dispatcher Initialization (Issue 1)
@@ -91,14 +62,9 @@ namespace RaceConditionTests {
         std::cout << "\n[RC-TEST-2] EnQueue Deadlock Prevention..." << std::endl;
 
         try {
-            // Add delay to ensure previous test's port is released from TIME_WAIT
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-            ReactorServer server(TEST_IP, TEST_PORT);
-            TestServerRunner runner(server);
-
-            // Give server time to fully initialize
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            ReactorServer server(TEST_IP, 0);
+            ::TestServerRunner<ReactorServer> runner(server);
+            const int port = runner.GetPort();
 
             // EnQueue multiple tasks that themselves call EnQueue
             // This used to deadlock when mutex was held during task execution
@@ -107,13 +73,13 @@ namespace RaceConditionTests {
             std::vector<std::thread> threads;
 
             for (int i = 0; i < 10; i++) {
-                threads.emplace_back([&task_count, &started_count, i]() {
+                threads.emplace_back([&task_count, &started_count, i, port]() {
                     started_count++;
                     // Small stagger to avoid overwhelming the server
                     std::this_thread::sleep_for(std::chrono::milliseconds(i * 20));
 
                     try {
-                        Client client(TEST_PORT, TEST_IP, "EnQueueTest");
+                        Client client(port, TEST_IP, "EnQueueTest");
                         client.SetQuietMode(true);
                         client.Init();
                         // Set receive timeout to prevent indefinite blocking if server doesn't respond
@@ -175,17 +141,18 @@ namespace RaceConditionTests {
         std::cout << "\n[RC-TEST-3] Double Close Prevention..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
-            TestServerRunner runner(server);
+            ReactorServer server(TEST_IP, 0);
+            ::TestServerRunner<ReactorServer> runner(server);
+            const int port = runner.GetPort();
 
             std::atomic<int> successful_closes{0};
             const int NUM_RAPID_CLIENTS = 50;
 
             std::vector<std::thread> threads;
             for (int i = 0; i < NUM_RAPID_CLIENTS; i++) {
-                threads.emplace_back([&successful_closes]() {
+                threads.emplace_back([&successful_closes, port]() {
                     try {
-                        Client client(TEST_PORT, TEST_IP, "RapidClose");
+                        Client client(port, TEST_IP, "RapidClose");
                         client.SetQuietMode(true);
                         client.Init();
                         client.Connect();
@@ -230,17 +197,18 @@ namespace RaceConditionTests {
         std::cout << "\n[RC-TEST-4] Concurrent Event Handling (EPOLLRDHUP + EPOLLIN)..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
-            TestServerRunner runner(server);
+            ReactorServer server(TEST_IP, 0);
+            ::TestServerRunner<ReactorServer> runner(server);
+            const int port = runner.GetPort();
 
             std::atomic<int> successful_ops{0};
             const int NUM_CLIENTS = 30;
 
             std::vector<std::thread> threads;
             for (int i = 0; i < NUM_CLIENTS; i++) {
-                threads.emplace_back([&successful_ops]() {
+                threads.emplace_back([&successful_ops, port]() {
                     try {
-                        Client client(TEST_PORT, TEST_IP, "ConcurrentEvent");
+                        Client client(port, TEST_IP, "ConcurrentEvent");
                         client.SetQuietMode(true);
                         client.Init();
                         client.Connect();
@@ -286,8 +254,9 @@ namespace RaceConditionTests {
         std::cout << "\n[RC-TEST-5] channel_map_ Multi-Threaded Race Condition..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
-            TestServerRunner runner(server);
+            ReactorServer server(TEST_IP, 0);
+            ::TestServerRunner<ReactorServer> runner(server);
+            const int port = runner.GetPort();
 
             // This test specifically targets the segfault from Issue 4
             // Multiple threads create/destroy connections rapidly while
@@ -302,14 +271,14 @@ namespace RaceConditionTests {
 
             std::vector<std::thread> threads;
             for (int t = 0; t < NUM_WORKER_THREADS; t++) {
-                threads.emplace_back([&, t]() {
+                threads.emplace_back([&, t, port]() {
                     try {
                         for (int i = 0; i < CONNECTIONS_PER_THREAD; i++) {
                             try {
                                 std::stringstream ss;
                                 ss << "RaceTest-T" << t << "-C" << i;
 
-                                Client client(TEST_PORT, TEST_IP, ss.str().c_str());
+                                Client client(port, TEST_IP, ss.str().c_str());
                                 client.SetQuietMode(true);
                                 client.Init();
                                 client.SetReceiveTimeout(2, 0);  // 2 second timeout to prevent indefinite hang
@@ -377,8 +346,9 @@ namespace RaceConditionTests {
         std::cout << "\n[RC-TEST-6] TOCTOU Race in epoll_ctl..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
-            TestServerRunner runner(server);
+            ReactorServer server(TEST_IP, 0);
+            ::TestServerRunner<ReactorServer> runner(server);
+            const int port = runner.GetPort();
 
             // Create connections that send data then close very rapidly
             // This triggers the race where EnableWriteMode() checks is_closed
@@ -389,9 +359,9 @@ namespace RaceConditionTests {
 
             std::vector<std::thread> threads;
             for (int i = 0; i < NUM_CLIENTS; i++) {
-                threads.emplace_back([&completed]() {
+                threads.emplace_back([&completed, port]() {
                     try {
-                        Client client(TEST_PORT, TEST_IP, "TOCTOUTest");
+                        Client client(port, TEST_IP, "TOCTOUTest");
                         client.SetQuietMode(true);
                         client.Init();
                         client.Connect();
@@ -438,8 +408,9 @@ namespace RaceConditionTests {
         std::cout << "\n[RC-TEST-7] Atomic is_channel_closed_ Flag..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
-            TestServerRunner runner(server);
+            ReactorServer server(TEST_IP, 0);
+            ::TestServerRunner<ReactorServer> runner(server);
+            const int port = runner.GetPort();
 
             // Multiple threads try to close same connection simultaneously
             // With non-atomic flag, both could pass the check and double-close
@@ -449,7 +420,7 @@ namespace RaceConditionTests {
 
             for (int i = 0; i < NUM_CLIENTS; i++) {
                 try {
-                    Client client(TEST_PORT, TEST_IP, "AtomicTest");
+                    Client client(port, TEST_IP, "AtomicTest");
                     client.SetQuietMode(true);
                     client.Init();
                     client.Connect();

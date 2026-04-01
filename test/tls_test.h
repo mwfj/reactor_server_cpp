@@ -7,8 +7,6 @@
 
 namespace TlsTests {
 
-    const int TEST_PORT = 10401;
-
     // Generate self-signed cert for testing
     static bool GenerateTestCert() {
         int ret = std::system(

@@ -1,5 +1,6 @@
 #pragma once
 #include "test_framework.h"
+#include "test_server_runner.h"
 #include "reactor_server.h"
 #include "client.h"
 #include "dispatcher.h"
@@ -16,10 +17,8 @@
 // These exercise kqueue behaviors that have no epoll equivalent.
 // On Linux, the entire suite is skipped.
 //
-// Port range: 10700-10720 (unique to this suite)
+// Uses ephemeral ports (port 0) via TestServerRunner harness.
 namespace KqueueTests {
-
-static constexpr int KQ_PORT_BASE = 10700;
 
 #if defined(__APPLE__) || defined(__MACH__)
 
@@ -43,20 +42,14 @@ static bool WaitForServerClose(int fd, int timeout_ms) {
 // ---------------------------------------------------------------------------
 void TestTimerDrivesIdleTimeout() {
     std::cout << "\n[TEST] KQ-TEST-1: EVFILT_TIMER drives idle timeout..." << std::endl;
-    static constexpr int PORT = KQ_PORT_BASE;
     try {
         // Short idle timeout (3s), scan interval 1s
-        ReactorServer server("127.0.0.1", PORT, 1, std::chrono::seconds(3));
-        std::thread server_thread([&]() {
-            try { server.Start(); }
-            catch (const std::exception& e) {
-                std::cerr << "[KQ-1] Server error: " << e.what() << std::endl;
-            }
-        });
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        ReactorServer server("127.0.0.1", 0, 1, std::chrono::seconds(3));
+        TestServerRunner<ReactorServer> runner(server);
+        int port = runner.GetPort();
 
         // Connect, send data, receive echo
-        Client client(PORT, "127.0.0.1", "hello");
+        Client client(port, "127.0.0.1", "hello");
         client.SetQuietMode(true);
         client.Init();
         client.Connect();
@@ -72,8 +65,6 @@ void TestTimerDrivesIdleTimeout() {
         bool timing_ok = (elapsed.count() >= 2000 && elapsed.count() <= 5500);
 
         client.Close();
-        server.Stop();
-        if (server_thread.joinable()) server_thread.join();
 
         bool pass = close_detected && timing_ok;
         std::string err;
@@ -290,16 +281,10 @@ void TestFilterConsolidation() {
 // ---------------------------------------------------------------------------
 void TestChurnStability() {
     std::cout << "\n[TEST] KQ-TEST-5: Churn stability..." << std::endl;
-    static constexpr int PORT = KQ_PORT_BASE + 5;
     try {
-        ReactorServer server("127.0.0.1", PORT);
-        std::thread server_thread([&]() {
-            try { server.Start(); }
-            catch (const std::exception& e) {
-                std::cerr << "[KQ-5] Server error: " << e.what() << std::endl;
-            }
-        });
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        ReactorServer server("127.0.0.1", 0);
+        TestServerRunner<ReactorServer> runner(server);
+        int port = runner.GetPort();
 
         // Rapidly connect and disconnect 100 clients
         for (int i = 0; i < 100; ++i) {
@@ -308,7 +293,7 @@ void TestChurnStability() {
             struct sockaddr_in addr;
             memset(&addr, 0, sizeof(addr));
             addr.sin_family = AF_INET;
-            addr.sin_port = htons(PORT);
+            addr.sin_port = htons(port);
             inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
             if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
                 // Send partial data and close immediately
@@ -324,7 +309,7 @@ void TestChurnStability() {
         int success_count = 0;
         for (int i = 0; i < 5; ++i) {
             try {
-                Client client(PORT, "127.0.0.1", "PostChurn");
+                Client client(port, "127.0.0.1", "PostChurn");
                 client.SetQuietMode(true);
                 client.Init();
                 client.SetReceiveTimeout(3);
@@ -336,9 +321,6 @@ void TestChurnStability() {
             } catch (...) {}
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-
-        server.Stop();
-        if (server_thread.joinable()) server_thread.join();
 
         bool pass = (success_count == 5);
         std::string err = pass ? "" :
@@ -357,20 +339,14 @@ void TestChurnStability() {
 // ---------------------------------------------------------------------------
 void TestTimerRearm() {
     std::cout << "\n[TEST] KQ-TEST-6: Timer re-arm..." << std::endl;
-    static constexpr int PORT = KQ_PORT_BASE + 6;
     try {
         // idle timeout = 3s, scan interval = 1s
-        ReactorServer server("127.0.0.1", PORT, 1, std::chrono::seconds(3));
-        std::thread server_thread([&]() {
-            try { server.Start(); }
-            catch (const std::exception& e) {
-                std::cerr << "[KQ-6] Server error: " << e.what() << std::endl;
-            }
-        });
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        ReactorServer server("127.0.0.1", 0, 1, std::chrono::seconds(3));
+        TestServerRunner<ReactorServer> runner(server);
+        int port = runner.GetPort();
 
         // Connect client A at t=0
-        Client client_a(PORT, "127.0.0.1", "ClientA");
+        Client client_a(port, "127.0.0.1", "ClientA");
         client_a.SetQuietMode(true);
         client_a.Init();
         client_a.Connect();
@@ -381,7 +357,7 @@ void TestTimerRearm() {
         // Wait 1.5s, connect client B
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
-        Client client_b(PORT, "127.0.0.1", "ClientB");
+        Client client_b(port, "127.0.0.1", "ClientB");
         client_b.SetQuietMode(true);
         client_b.Init();
         client_b.Connect();
@@ -396,7 +372,7 @@ void TestTimerRearm() {
         // Verify server is still alive
         bool server_alive = false;
         try {
-            Client client_c(PORT, "127.0.0.1", "ClientC");
+            Client client_c(port, "127.0.0.1", "ClientC");
             client_c.SetQuietMode(true);
             client_c.Init();
             client_c.SetReceiveTimeout(3);
@@ -409,8 +385,6 @@ void TestTimerRearm() {
 
         client_a.Close();
         client_b.Close();
-        server.Stop();
-        if (server_thread.joinable()) server_thread.join();
 
         bool pass = a_closed && b_closed && server_alive;
         std::string err;
@@ -431,15 +405,15 @@ void TestTimerRearm() {
 // ---------------------------------------------------------------------------
 void TestSoNosigpipe() {
     std::cout << "\n[TEST] KQ-TEST-7: SO_NOSIGPIPE on accepted sockets..." << std::endl;
-    static constexpr int PORT = KQ_PORT_BASE + 7;
     try {
         // Create listening socket via SocketHandler (already non-blocking
         // from CreateSocket() → SetNonBlocking())
         SocketHandler listener;
-        InetAddr addr("127.0.0.1", PORT);
+        InetAddr addr("127.0.0.1", 0);
         listener.SetReuseAddr(true);
         listener.Bind(addr);
         listener.Listen(5);
+        int port = listener.GetBoundPort();
 
         // Phase 1: Verify getsockopt on listener
         int optval = 0;
@@ -452,7 +426,7 @@ void TestSoNosigpipe() {
         struct sockaddr_in sa;
         memset(&sa, 0, sizeof(sa));
         sa.sin_family = AF_INET;
-        sa.sin_port = htons(PORT);
+        sa.sin_port = htons(port);
         inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
         connect(client_fd, (struct sockaddr*)&sa, sizeof(sa));
 
@@ -538,25 +512,12 @@ void RunAllTests() {
     std::cout << std::string(60, '=') << std::endl;
 
     TestTimerDrivesIdleTimeout();
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
     TestEvEofOnWriteFilter();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
     TestPipeWakeupUnderLoad();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
     TestFilterConsolidation();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
     TestChurnStability();
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
     TestTimerRearm();
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
     TestSoNosigpipe();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
 #else
     std::cout << "\n[SKIP] Kqueue tests only run on macOS" << std::endl;
 #endif

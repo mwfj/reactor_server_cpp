@@ -1,42 +1,13 @@
 #pragma once
 #include "common.h"
+#include "test_server_runner.h"
 #include "reactor_server.h"
 #include "client.h"
 #include "test_framework.h"
 #include <thread>
 #include <chrono>
 
-// RAII helper to start/stop server in background thread
-class TimeoutServerRunner {
-private:
-    ReactorServer& server_;
-    std::thread server_thread_;
-
-public:
-    TimeoutServerRunner(ReactorServer& server) : server_(server) {
-        server_thread_ = std::thread([this]() {
-            server_.Start();
-        });
-        // Give server time to initialize
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-
-    ~TimeoutServerRunner() {
-        server_.Stop();
-        if (server_thread_.joinable()) {
-            server_thread_.join();
-        }
-    }
-
-    // Delete copy/move
-    TimeoutServerRunner(const TimeoutServerRunner&) = delete;
-    TimeoutServerRunner& operator=(const TimeoutServerRunner&) = delete;
-};
-
 class TimeoutTests {
-private:
-    static constexpr int BASE_PORT = 10100;
-
 public:
     static void RunAllTests() {
         std::cout << "\n============================================================" << std::endl;
@@ -44,11 +15,7 @@ public:
         std::cout << "============================================================\n" << std::endl;
 
         TestConfigurableTimerParameters();
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
         TestDefaultTimerParameters();
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
         TestActiveConnectionsWork();
     }
 
@@ -59,13 +26,14 @@ private:
 
         try {
             // Create server with custom timer: 5 second check, 10 second timeout
-            ReactorServer server("127.0.0.1", BASE_PORT, 5, std::chrono::seconds(10));
-            TimeoutServerRunner runner(server);
+            ReactorServer server("127.0.0.1", 0, 5, std::chrono::seconds(10));
+            TestServerRunner<ReactorServer> runner(server);
+            const int port = runner.GetPort();
 
             // Send a few messages to verify server works with custom timer config
             for (int i = 0; i < 3; i++) {
                 std::string msg = "CustomTimer" + std::to_string(i);
-                Client client(BASE_PORT, "127.0.0.1", msg.c_str());
+                Client client(port, "127.0.0.1", msg.c_str());
                 client.SetQuietMode(true);
                 client.Init();
                 client.Connect();
@@ -92,13 +60,14 @@ private:
 
         try {
             // Create server with default timer parameters (60s check, 300s timeout)
-            ReactorServer server("127.0.0.1", BASE_PORT + 1);
-            TimeoutServerRunner runner(server);
+            ReactorServer server("127.0.0.1", 0);
+            TestServerRunner<ReactorServer> runner(server);
+            const int port = runner.GetPort();
 
             // Send messages to verify default timer doesn't interfere
             for (int i = 0; i < 5; i++) {
                 std::string msg = "DefaultTimer" + std::to_string(i);
-                Client client(BASE_PORT + 1, "127.0.0.1", msg.c_str());
+                Client client(port, "127.0.0.1", msg.c_str());
                 client.SetQuietMode(true);
                 client.Init();
                 client.Connect();
@@ -125,14 +94,15 @@ private:
 
         try {
             // Use moderate timer: 10 second check, 30 second timeout
-            ReactorServer server("127.0.0.1", BASE_PORT + 2, 10, std::chrono::seconds(30));
-            TimeoutServerRunner runner(server);
+            ReactorServer server("127.0.0.1", 0, 10, std::chrono::seconds(30));
+            TestServerRunner<ReactorServer> runner(server);
+            const int port = runner.GetPort();
 
             // Send 10 sequential messages with small delays
             // This verifies timer doesn't interfere with normal operation
             for (int i = 0; i < 10; i++) {
                 std::string msg = "Message" + std::to_string(i);
-                Client client(BASE_PORT + 2, "127.0.0.1", msg.c_str());
+                Client client(port, "127.0.0.1", msg.c_str());
                 client.SetQuietMode(true);
                 client.Init();
                 client.Connect();

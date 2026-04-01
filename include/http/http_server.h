@@ -44,6 +44,9 @@ public:
     // Used by daemon mode to signal readiness to the parent process.
     void SetReadyCallback(std::function<void()> cb);
 
+    // Returns the actual port the server is listening on.
+    int GetBoundPort() const;
+
 private:
     NetServer net_server_;
     HttpRouter router_;

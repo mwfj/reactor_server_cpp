@@ -71,9 +71,9 @@ static const std::string& ValidateHost(const std::string& host) {
 // Validate port before member construction — must run in the initializer
 // list, before net_server_ tries to bind/listen on the (possibly invalid) port.
 static size_t ValidatePort(int port) {
-    if (port < 1 || port > 65535) {
+    if (port < 0 || port > 65535) {
         throw std::invalid_argument(
-            "Invalid port: " + std::to_string(port) + " (must be 1-65535)");
+            "Invalid port: " + std::to_string(port) + " (must be 0-65535)");
     }
     return static_cast<size_t>(port);
 }
@@ -223,6 +223,10 @@ void HttpServer::Start() {
 
 void HttpServer::SetReadyCallback(std::function<void()> cb) {
     net_server_.SetReadyCallback(std::move(cb));
+}
+
+int HttpServer::GetBoundPort() const {
+    return net_server_.GetBoundPort();
 }
 
 void HttpServer::Stop() {

@@ -1,5 +1,6 @@
 #pragma once
 #include "test_framework.h"
+#include "test_server_runner.h"
 #include "reactor_server.h"
 #include "client.h"
 #include <thread>
@@ -8,50 +9,17 @@
 // Test namespace for basic functionality tests
 namespace BasicTests {
     const char* TEST_IP = "127.0.0.1";
-    const int TEST_PORT = 9888;
-
-    // RAII wrapper for server thread management
-    class ServerRunner {
-    private:
-        ReactorServer& server_;
-        std::thread server_thread_;
-
-    public:
-        ServerRunner(ReactorServer& server) : server_(server) {
-            server_thread_ = std::thread([this]() {
-                try {
-                    std::cout << "[SERVER] Starting on " << TEST_IP << ":" << TEST_PORT << std::endl;
-                    server_.Start();
-                } catch (const std::exception& e) {
-                    std::cerr << "[SERVER] Error: " << e.what() << std::endl;
-                }
-            });
-            // Give server time to start
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-
-        ~ServerRunner() {
-            server_.Stop();
-            if(server_thread_.joinable()) {
-                server_thread_.join();
-            }
-        }
-
-        // Delete copy/move
-        ServerRunner(const ServerRunner&) = delete;
-        ServerRunner& operator=(const ServerRunner&) = delete;
-    };
 
     // Test 1: Single Client Connection
     void TestSingleConnection() {
         std::cout << "\n[TEST] Single Client Connection..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
-            ServerRunner runner(server);
+            ReactorServer server(TEST_IP, 0);
+            TestServerRunner<ReactorServer> runner(server);
 
             // Create and connect client
-            Client client(TEST_PORT, TEST_IP, "Hello");
+            Client client(runner.GetPort(), TEST_IP, "Hello");
             client.Init();
             client.Connect();
 
@@ -70,10 +38,10 @@ namespace BasicTests {
         std::cout << "\n[TEST] Echo Functionality..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
-            ServerRunner runner(server);
+            ReactorServer server(TEST_IP, 0);
+            TestServerRunner<ReactorServer> runner(server);
 
-            Client client(TEST_PORT, TEST_IP, "TestMessage");
+            Client client(runner.GetPort(), TEST_IP, "TestMessage");
             client.SetQuietMode(false);
             client.Init();
             client.Connect();
@@ -99,15 +67,15 @@ namespace BasicTests {
         std::cout << "\n[TEST] Multiple Sequential Connections..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
-            ServerRunner runner(server);
+            ReactorServer server(TEST_IP, 0);
+            TestServerRunner<ReactorServer> runner(server);
 
             const int NUM_CLIENTS = 5;
             for (int i = 0; i < NUM_CLIENTS; i++) {
                 std::stringstream ss;
                 ss << "Client" << i;
 
-                Client client(TEST_PORT, TEST_IP, ss.str().c_str());
+                Client client(runner.GetPort(), TEST_IP, ss.str().c_str());
                 client.SetQuietMode(true);
                 client.Init();
                 client.Connect();
@@ -131,8 +99,9 @@ namespace BasicTests {
         std::cout << "\n[TEST] Concurrent Connections..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
-            ServerRunner runner(server);
+            ReactorServer server(TEST_IP, 0);
+            TestServerRunner<ReactorServer> runner(server);
+            const int port = runner.GetPort();
 
             const int NUM_CLIENTS = 10;
             std::vector<std::thread> client_threads;
@@ -141,12 +110,12 @@ namespace BasicTests {
 
             // Launch multiple clients concurrently
             for (int i = 0; i < NUM_CLIENTS; i++) {
-                client_threads.emplace_back([i, &success_count, &failure_count]() {
+                client_threads.emplace_back([i, port, &success_count, &failure_count]() {
                     try {
                         std::stringstream ss;
                         ss << "ConcurrentClient" << i;
 
-                        Client client(TEST_PORT, TEST_IP, ss.str().c_str());
+                        Client client(port, TEST_IP, ss.str().c_str());
                         client.SetQuietMode(true);
                         client.Init();
                         client.SetReceiveTimeout(5);  // 5 second timeout to prevent hanging
@@ -188,13 +157,13 @@ namespace BasicTests {
         std::cout << "\n[TEST] Large Message Transfer..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
-            ServerRunner runner(server);
+            ReactorServer server(TEST_IP, 0);
+            TestServerRunner<ReactorServer> runner(server);
 
             // Create a large message (close to buffer size)
             std::string large_msg(512, 'A');
 
-            Client client(TEST_PORT, TEST_IP, large_msg.c_str());
+            Client client(runner.GetPort(), TEST_IP, large_msg.c_str());
             client.SetQuietMode(true);
             client.Init();
             client.Connect();
@@ -216,11 +185,11 @@ namespace BasicTests {
         std::cout << "\n[TEST] Quick Connection and Disconnect..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, TEST_PORT);
-            ServerRunner runner(server);
+            ReactorServer server(TEST_IP, 0);
+            TestServerRunner<ReactorServer> runner(server);
 
             for (int i = 0; i < 3; i++) {
-                Client client(TEST_PORT, TEST_IP, "Quick");
+                Client client(runner.GetPort(), TEST_IP, "Quick");
                 client.SetQuietMode(true);
                 client.Init();
                 client.Connect();
@@ -243,21 +212,10 @@ namespace BasicTests {
         std::cout << std::string(60, '=') << std::endl;
 
         TestSingleConnection();
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
         TestEchoFunctionality();
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
         TestMultipleSequentialConnections();
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
         TestConcurrentConnections();
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
         TestLargeMessage();
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
         TestQuickDisconnect();
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 }
