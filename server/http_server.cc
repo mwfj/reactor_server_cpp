@@ -403,10 +403,13 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
         }
     );
 
-    // Route checker: determines if a WebSocket route exists (called before 101)
+    // Route checker: determines if a WebSocket route exists and populates
+    // request.params so middleware can read route parameters (e.g., /ws/:room).
+    // Called BEFORE middleware in the upgrade flow.
     http_conn->SetRouteCheckCallback(
-        [this](const std::string& path) -> bool {
-            return router_.HasWebSocketRoute(path);
+        [this](const HttpRequest& request) -> bool {
+            auto handler = router_.GetWebSocketHandler(request);
+            return handler != nullptr;
         }
     );
 

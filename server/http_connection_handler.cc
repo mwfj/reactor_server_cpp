@@ -152,17 +152,27 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
     // is unreachable — CONNECT enters the WS path and fails validation.
     if (req.upgrade && req.method == "GET" && callbacks_.route_check_callback) {
         try {
-        // Run middleware before upgrade (auth, CORS, rate limiting, etc.)
+        // Check route existence FIRST so that request.params is populated
+        // before middleware runs. This allows auth/rate-limit middleware to
+        // read route parameters (e.g., /ws/:room → req.params["room"]).
+        if (!callbacks_.route_check_callback(req)) {
+            logging::Get()->debug("WebSocket route not found fd={} path={}",
+                                  conn_->fd(), logging::SanitizePath(req.path));
+            auto not_found = HttpResponse::NotFound();
+            not_found.Header("Connection", "close");
+            SendResponse(not_found);
+            CloseConnection();
+            return false;
+        }
+
+        // Run middleware after route check (auth, CORS, rate limiting, etc.)
+        // request.params is now populated for pattern routes.
         // Hoist mw_response so successful middleware headers can be merged
         // into the 101 response (e.g., Set-Cookie, auth tokens).
         HttpResponse mw_response;
         if (callbacks_.middleware_callback) {
             if (!callbacks_.middleware_callback(req, mw_response)) {
                 // Middleware rejected — default to 403 if nothing was set.
-                // Only apply when the response is completely untouched
-                // (default status + no body + no headers). This allows
-                // middleware to intentionally short-circuit with 200 OK
-                // plus custom headers (e.g., CORS preflight, Set-Cookie).
                 if (mw_response.GetStatusCode() == 200 &&
                     mw_response.GetBody().empty() &&
                     mw_response.GetHeaders().empty()) {
@@ -192,17 +202,6 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             }
             reject.Header("Connection", "close");
             SendResponse(reject);
-            CloseConnection();
-            return false;
-        }
-
-        // Check route existence BEFORE sending 101
-        if (!callbacks_.route_check_callback(req.path)) {
-            logging::Get()->debug("WebSocket route not found fd={} path={}",
-                                  conn_->fd(), logging::SanitizePath(req.path));
-            auto not_found = HttpResponse::NotFound();
-            not_found.Header("Connection", "close");
-            SendResponse(not_found);
             CloseConnection();
             return false;
         }
