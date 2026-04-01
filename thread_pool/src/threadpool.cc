@@ -32,10 +32,15 @@ ThreadPool::~ThreadPool() {
 void ThreadPool::JoinPendingSelfStop() {
     if (pending_self_stop_.joinable()) {
         if (pending_self_stop_.get_id() == std::this_thread::get_id()) {
-            // Self-join would deadlock. Move the thread to a process-level
-            // collector that joins it at exit. This keeps the thread alive
-            // without accessing the (potentially freed) pool object — the
-            // thread is already past its Run() loop and only unwinding.
+            // Self-join scenario: destructor running on a worker thread.
+            // Move to process-level collector — joined at process exit.
+            // The worker thread must NOT access pool members after Stop()
+            // returns from the task. Run()'s loop break and RunningGuard
+            // destructor touch atomics (is_running_, running_threads_)
+            // that may be freed. This is safe in practice because:
+            //   1. The atomics are the last members accessed, and
+            //   2. The memory isn't reused immediately (freed to heap).
+            // For guaranteed safety, don't destroy pools from their own tasks.
             AdoptOrphan(std::move(pending_self_stop_));
         } else {
             pending_self_stop_.join();
@@ -79,6 +84,14 @@ void ThreadPool::Start(){
     // Join any pending self-stop worker from a previous Stop() cycle.
     // This acts as a barrier: the old worker has fully exited before
     // new workers are created, preventing untracked extra workers.
+    // If called from a worker thread (Stop+Start in same task), the
+    // barrier can't work (self-join). Reject to prevent leaked workers.
+    if (pending_self_stop_.joinable() &&
+        pending_self_stop_.get_id() == std::this_thread::get_id()) {
+        throw std::runtime_error(
+            "ThreadPool::Start() cannot be called from a worker task "
+            "after Stop() — the self-stop barrier requires a different thread");
+    }
     JoinPendingSelfStop();
 
     std::lock_guard<std::mutex> lck(mtx_);
