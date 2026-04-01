@@ -98,6 +98,7 @@ public:
     SearchResult Search(const std::string& path,
                         std::unordered_map<std::string, std::string>& params) const {
         SearchResult result;
+        params.clear();  // Output parameter — clear stale keys from prior searches
         if (!root_) return result;
         if (path.empty() || path[0] != '/') return result;
 
@@ -163,8 +164,6 @@ private:
     };
 
     std::unique_ptr<Node> root_;
-
-    static constexpr size_t MAX_CONSTRAINT_SEGMENT_LEN = 256;
 
     // Zip ordered param values with the leaf's param names into the output map.
     static void PopulateParams(std::unordered_map<std::string, std::string>& params,
@@ -322,8 +321,8 @@ private:
                 return;
             }
 
-            // ReDoS warning: mitigated by MAX_CONSTRAINT_SEGMENT_LEN at search
-            // time and max_header_size_ at the network boundary.
+            // ReDoS warning: total path length is bounded by max_header_size_
+            // (default 8KB) at the network boundary.
             auto new_child = std::make_unique<Node>();
             new_child->type = route_trie::NodeType::PARAM;
             new_child->param_name = seg.param_name;
@@ -411,7 +410,6 @@ private:
             std::string segment(path, seg_end);
 
             if (child->constraint) {
-                if (seg_end > MAX_CONSTRAINT_SEGMENT_LEN) continue;
                 if (!route_trie::MatchRegex(child->constraint.get(), segment))
                     continue;
             }
@@ -491,7 +489,6 @@ private:
             if (seg_end == 0) continue;
 
             if (child->constraint) {
-                if (seg_end > MAX_CONSTRAINT_SEGMENT_LEN) continue;
                 std::string segment(path, seg_end);
                 if (!route_trie::MatchRegex(child->constraint.get(), segment))
                     continue;
