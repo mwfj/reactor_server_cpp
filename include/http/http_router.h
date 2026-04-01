@@ -2,7 +2,9 @@
 
 #include "http/http_request.h"
 #include "http/http_response.h"
-// <string>, <vector>, <functional>, <memory> provided by common.h (via http_request.h)
+#include "http/route_trie.h"
+// <string>, <vector>, <functional>, <memory>, <unordered_map> provided by
+// common.h (via http_request.h) and route_trie.h
 
 // Forward declaration
 class HttpConnectionHandler;
@@ -48,20 +50,17 @@ public:
 
     // WebSocket route lookup
     bool HasWebSocketRoute(const std::string& path) const;
-    WsUpgradeHandler GetWebSocketHandler(const std::string& path) const;
+
+    // WebSocket route lookup with param extraction (populates request.params)
+    WsUpgradeHandler GetWebSocketHandler(const HttpRequest& request) const;
 
 private:
-    struct RouteEntry {
-        std::string method;
-        std::string path;
-        Handler handler;
-    };
-    std::vector<RouteEntry> routes_;
-    std::vector<Middleware> middlewares_;
+    // Per-method route tries (one trie per HTTP method)
+    std::unordered_map<std::string, RouteTrie<Handler>> method_tries_;
 
-    struct WsRouteEntry {
-        std::string path;
-        WsUpgradeHandler handler;
-    };
-    std::vector<WsRouteEntry> ws_routes_;
+    // WebSocket route trie
+    RouteTrie<WsUpgradeHandler> ws_trie_;
+
+    // Middleware chain (unchanged)
+    std::vector<Middleware> middlewares_;
 };

@@ -55,9 +55,87 @@ Handlers receive a const reference to the parsed request and a mutable reference
 
 ### Route Matching
 
-- **Exact path matching** — no wildcards, no pattern matching, no path parameters
+Routes support exact paths, path parameters, regex constraints, and catch-all wildcards. The router uses a compressed radix trie (`RouteTrie`) per HTTP method for efficient lookup.
+
 - **405 Method Not Allowed** — automatically returned when path matches but method doesn't
 - **HEAD fallback** — if no HEAD handler registered, GET handler is invoked with a cloned request (`method = "GET"`) per RFC 7231 §4.3.2
+
+### Route Pattern Syntax
+
+#### Static routes
+
+Exact literal paths. Highest priority during matching.
+
+```cpp
+server.Get("/health", handler);
+server.Get("/api/v1/status", handler);
+```
+
+#### Path parameters (`:name`)
+
+Capture a single path segment (everything between `/` separators). Accessed via `request.params`.
+
+```cpp
+server.Get("/users/:id", [](const HttpRequest& req, HttpResponse& res) {
+    std::string user_id = req.params["id"];  // guaranteed present when handler runs
+    res.Status(200).Json(R"({"id":")" + user_id + R"("})");
+});
+
+server.Get("/users/:user_id/posts/:post_id", [](const HttpRequest& req, HttpResponse& res) {
+    // req.params["user_id"] and req.params["post_id"] are both populated
+});
+```
+
+#### Regex constraints (`:name(regex)`)
+
+Restrict a parameter to values matching a regex pattern. The regex is placed in parentheses after the parameter name. Non-matching values fall through to other routes or 404.
+
+```cpp
+// Only match numeric IDs
+server.Get("/users/:id([0-9]+)", handler);
+
+// Only match UUIDs
+server.Get("/items/:uuid([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", handler);
+```
+
+#### Catch-all wildcards (`*name`)
+
+Capture the entire remaining path (zero or more segments). Must be the last element in the pattern.
+
+```cpp
+server.Get("/static/*filepath", [](const HttpRequest& req, HttpResponse& res) {
+    // GET /static/css/style.css → req.params["filepath"] = "css/style.css"
+});
+```
+
+The captured value is the raw remaining path after the prefix. For normal paths, it does not include a leading `/` because the prefix consumed the separator (e.g., `"css/style.css"` for `/static/css/style.css`). Paths with `//` are passed through as-is.
+
+### Priority Rules
+
+When multiple patterns could match, the router uses this priority order:
+
+1. **Static segments** — exact literal matches are tried first
+2. **Parameter segments** — `:name` patterns are tried next
+3. **Catch-all** — `*name` is tried last (lowest priority)
+
+This means `/users/admin` (static) takes precedence over `/users/:id` (param) when the request path is `/users/admin`.
+
+### Route Conflicts
+
+The router rejects conflicting routes at registration time (throws `std::invalid_argument`):
+
+- Duplicate exact routes: `Get("/users", h1)` then `Get("/users", h2)`
+- Conflicting parameter constraints at the same position: `/:id([0-9]+)` vs `/:id([a-z]+)`
+- Duplicate catch-all routes at the same level
+
+### Non-Origin-Form Routes
+
+The router supports non-origin-form request targets used by CONNECT and OPTIONS methods:
+
+- **CONNECT authority-form**: `server.Route("CONNECT", "example.com:443", handler)` -- matches `CONNECT example.com:443 HTTP/1.1` (no leading `/`)
+- **OPTIONS asterisk-form**: `server.Route("OPTIONS", "*", handler)` -- matches `OPTIONS * HTTP/1.1`
+
+These are registered as exact-match patterns in the `RouteTrie`.
 
 ## Middleware
 
@@ -84,7 +162,7 @@ server.Use([](const HttpRequest& req, HttpResponse& res) {
 });
 ```
 
-- Middleware executes in registration order before route handlers
+- Route matching runs first (populating `request.params`), then middleware executes in registration order, then the matched handler runs. This means middleware can read route parameters (e.g., `req.params["id"]` for authorization decisions)
 - Return `true` to continue the chain, `false` to short-circuit (response is sent immediately)
 - **Headers survive fallbacks**: middleware-set headers are preserved even on 404/405 responses because `Dispatch()` sets status on the existing response object rather than replacing it
 
@@ -103,6 +181,9 @@ struct HttpRequest {
     bool upgrade;             // Connection: Upgrade (WebSocket)
     size_t content_length;
     bool complete;
+
+    // Route parameters populated by HttpRouter during dispatch.
+    mutable std::unordered_map<std::string, std::string> params;
 
     std::string GetHeader(const std::string& name) const;  // Case-insensitive
     bool HasHeader(const std::string& name) const;

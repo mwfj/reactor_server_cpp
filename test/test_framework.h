@@ -12,6 +12,7 @@ namespace TestFramework {
         BASIC,
         STRESS,
         RACE_CONDITION,
+        ROUTE,
         OTHER
     };
 
