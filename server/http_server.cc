@@ -427,14 +427,14 @@ void HttpServer::Stop() {
         bool has_ws = !ws_draining.empty();
         net_server_.SetDrainingConns(std::move(draining_conn_ptrs));
         net_server_.SetPreStopDrainCallback([this, has_ws]() {
-            // Abbreviated drain: give other dispatchers time to process
-            // timer deadlines for H2 GOAWAY drain and WS close handshakes.
-            // Self-dispatcher connections are handled inline by the barrier
-            // mechanism (HandleEventId in wait_for_dispatcher_barrier).
+            // Wait for H2 drain on OTHER dispatchers (self-dispatcher
+            // connections get inline HandleEventId from the barrier).
+            WaitForH2Drain();
             if (has_ws) {
+                // Give WS connections the full 5s close deadline + 1s margin.
+                // Shorten scan interval to 1s so timer catches expired WS.
                 net_server_.SetTimerInterval(1);
-                // Shorter wait than normal path — best-effort on handler thread
-                std::this_thread::sleep_for(std::chrono::seconds(3));
+                std::this_thread::sleep_for(std::chrono::seconds(6));
             }
         });
     }

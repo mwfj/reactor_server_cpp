@@ -24,8 +24,16 @@ private:
 
 
 /**
- * This class is designed for simulating the specific feature
- * by calling the net server library that we make
+ * Legacy TCP echo server used ONLY by reactor-core test suites
+ * (basic, stress, race condition, timeout tests).
+ *
+ * WARNING: This class is TCP-stream-unsafe — it treats each callback
+ * invocation as one logical message. TCP fragmentation/coalescing can
+ * split or merge messages across callbacks. For proper message framing,
+ * use HttpServer (HTTP framing) or WebSocket (frame-based protocol).
+ *
+ * NOT for production use. Kept solely as test infrastructure for
+ * verifying the reactor core (epoll, connection lifecycle, timeouts).
  */
 
 class ReactorServer

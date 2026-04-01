@@ -101,17 +101,30 @@ void Acceptor::NewConnection(){
             continue;
         }
         if(client_fd == SocketHandler::ACCEPT_MEMORY_PRESSURE){
-            // Memory/buffer pressure (ENOBUFS/ENOMEM). Return and let the
-            // event loop's WaitForEvent timeout (~1s) provide natural backoff.
-            // Re-trigger the accept channel's edge so the next WaitForEvent
-            // cycle includes a readable event for the listen socket, even
-            // without new connections arriving (ET edge recovery).
+            // Memory/buffer pressure (ENOBUFS/ENOMEM). EnQueue a deferred
+            // retry — the WaitForEvent 1s timeout between the current event
+            // batch and the next provides natural backoff. If the EnQueue's
+            // WakeUp write also fails (full pipe under pressure), the timeout
+            // path's opportunistic task drain picks it up within ~1s.
+            // EnableReadMode alone is insufficient: EPOLL_CTL_MOD doesn't
+            // create a new edge when the socket is already readable.
             int saved_errno = errno;
-            logging::Get()->warn("Accept: memory pressure ({}), deferring to next cycle",
+            logging::Get()->warn("Accept: memory pressure ({}), retry in ~1s",
                                  logging::SafeStrerror(saved_errno));
-            if (acceptor_channel_) {
-                acceptor_channel_->EnableReadMode();  // EPOLL_CTL_MOD re-arms edge
-            }
+            // Enqueue a delayed retry. The lambda sleeps briefly to avoid
+            // a tight retry loop under sustained pressure. The 100ms sleep
+            // is acceptable on the conn_dispatcher (accept-only thread).
+            // Shutdown check before AND after sleep ensures prompt exit.
+            event_dispatcher_->EnQueue([this]() {
+                if (!acceptor_channel_ || acceptor_channel_->is_channel_closed()
+                    || event_dispatcher_->was_stopped())
+                    return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (!acceptor_channel_ || acceptor_channel_->is_channel_closed()
+                    || event_dispatcher_->was_stopped())
+                    return;
+                NewConnection();
+            });
             return;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));
