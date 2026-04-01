@@ -359,23 +359,23 @@ void ConfigLoader::Validate(const ServerConfig& config) {
     }
 
     // Bound size limits to prevent overflow in ComputeInputCap() where
-    // max_header_size + max_body_size must not wrap size_t. Use 2 GB to
-    // safely fit 32-bit size_t (max ~4 GB, but two limits can be summed).
-    static constexpr size_t MAX_SIZE_LIMIT = 2ULL * 1024 * 1024 * 1024;  // 2 GB
+    // max_header_size + max_body_size must not wrap size_t. Individual cap
+    // at SIZE_MAX/2 ensures any pair sums safely on both 32-bit and 64-bit.
+    static constexpr size_t MAX_SIZE_LIMIT = SIZE_MAX / 2;
     if (config.max_body_size > MAX_SIZE_LIMIT) {
         throw std::invalid_argument(
             "Invalid max_body_size: " + std::to_string(config.max_body_size) +
-            " (must be <= 2 GB)");
+            " (exceeds maximum)");
     }
     if (config.max_header_size > MAX_SIZE_LIMIT) {
         throw std::invalid_argument(
             "Invalid max_header_size: " + std::to_string(config.max_header_size) +
-            " (must be <= 2 GB)");
+            " (exceeds maximum)");
     }
     if (config.max_ws_message_size > MAX_SIZE_LIMIT) {
         throw std::invalid_argument(
             "Invalid max_ws_message_size: " + std::to_string(config.max_ws_message_size) +
-            " (must be <= 2 GB)");
+            " (exceeds maximum)");
     }
 
     // Validate log level against the set recognized by logging::ParseLevel().
@@ -449,17 +449,32 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             throw std::invalid_argument(
                 "TLS is enabled but key_file is empty");
         }
-        // Verify cert/key files exist — catches typos and missing files at
-        // startup/validate time instead of failing later in TlsContext.
-        if (access(config.tls.cert_file.c_str(), R_OK) != 0) {
-            throw std::invalid_argument(
-                "TLS cert_file not readable: '" + config.tls.cert_file +
-                "' (" + std::strerror(errno) + ")");
+        // Verify cert/key files exist and are regular files — catches typos,
+        // missing files, and directories at startup/validate time instead of
+        // failing later in TlsContext.
+        {
+            struct stat st{};
+            if (stat(config.tls.cert_file.c_str(), &st) != 0) {
+                throw std::invalid_argument(
+                    "TLS cert_file not accessible: '" + config.tls.cert_file +
+                    "' (" + std::strerror(errno) + ")");
+            }
+            if (!S_ISREG(st.st_mode)) {
+                throw std::invalid_argument(
+                    "TLS cert_file is not a regular file: '" + config.tls.cert_file + "'");
+            }
         }
-        if (access(config.tls.key_file.c_str(), R_OK) != 0) {
-            throw std::invalid_argument(
-                "TLS key_file not readable: '" + config.tls.key_file +
-                "' (" + std::strerror(errno) + ")");
+        {
+            struct stat st{};
+            if (stat(config.tls.key_file.c_str(), &st) != 0) {
+                throw std::invalid_argument(
+                    "TLS key_file not accessible: '" + config.tls.key_file +
+                    "' (" + std::strerror(errno) + ")");
+            }
+            if (!S_ISREG(st.st_mode)) {
+                throw std::invalid_argument(
+                    "TLS key_file is not a regular file: '" + config.tls.key_file + "'");
+            }
         }
         if (config.tls.min_version != "1.2" && config.tls.min_version != "1.3") {
             throw std::invalid_argument(

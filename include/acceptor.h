@@ -17,7 +17,7 @@ private:
     // This drains the pending connection from the listen queue, preventing
     // ET mode starvation where the server permanently stops accepting.
     int idle_fd_ = -1;
-    int accept_backoff_ms_ = 0;  // exponential backoff for memory pressure retries
+    int accept_backoff_ms_ = 0;  // exponential backoff for memory pressure
 
     std::function<void(std::unique_ptr<SocketHandler>)> new_conn_cb_;
 public:

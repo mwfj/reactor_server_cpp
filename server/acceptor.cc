@@ -52,6 +52,8 @@ void Acceptor::SetNewConnCb(std::function<void(std::unique_ptr<SocketHandler>)> 
 
 // processing new connection from client
 void Acceptor::NewConnection(){
+    // Accept ALL pending connections in a loop (continued below).
+
     // Accept ALL pending connections in a loop.
     // Edge-triggered epoll only notifies ONCE, so we must drain the entire
     // queue to EAGAIN. Returning before EAGAIN means no future EPOLLIN edge
@@ -99,19 +101,24 @@ void Acceptor::NewConnection(){
             continue;
         }
         if(client_fd == SocketHandler::ACCEPT_MEMORY_PRESSURE){
-            // Memory/buffer pressure (ENOBUFS/ENOMEM). Schedule a deferred
-            // retry via EnQueue — returning without draining the backlog in
-            // ET mode would leave accept stuck (no new edge to wake epoll).
-            // EnQueue lets the event loop process pending closes/frees first,
-            // then retries accept. No sleep — non-blocking event loop.
+            // Memory/buffer pressure (ENOBUFS/ENOMEM). Exponential backoff
+            // with cap at 1s. The conn_dispatcher ONLY handles accept — no
+            // client I/O runs here, so a brief sleep is acceptable. Queued
+            // work (CloseListenSocket for shutdown) runs after the sleep.
+            // Without a retry, ET mode would leave accept stuck permanently.
+            accept_backoff_ms_ = std::min(
+                accept_backoff_ms_ == 0 ? 100 : accept_backoff_ms_ * 2, 1000);
             int saved_errno = errno;
-            logging::Get()->warn("Accept: memory pressure ({}), scheduling retry",
-                                 logging::SafeStrerror(saved_errno));
-            event_dispatcher_->EnQueue([this]() {
+            logging::Get()->warn("Accept: memory pressure ({}), backoff {}ms",
+                                 logging::SafeStrerror(saved_errno), accept_backoff_ms_);
+            int delay = accept_backoff_ms_;
+            event_dispatcher_->EnQueue([this, delay]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
                 NewConnection();
             });
             return;
         }
+        accept_backoff_ms_ = 0;  // successful accept — reset backoff
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));
         new_conn_cb_(std::move(client_sock));
     }
