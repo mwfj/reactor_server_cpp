@@ -332,6 +332,14 @@ static bool ReloadConfig(const std::string& config_path,
     // Apply server limits AFTER log changes succeed — ensures no partial reload.
     if (!server.Reload(new_config)) {
         logging::Get()->error("HttpServer::Reload() rejected the config");
+        // Roll back log changes — restore the old logger config so the
+        // process stays consistent (log state matches current_config).
+        logging::UpdateAndReopen(current_config.log.file,
+                                 current_config.log.max_file_size,
+                                 current_config.log.max_files);
+        if (new_config.log.level != current_config.log.level) {
+            logging::SetLevel(logging::ParseLevel(current_config.log.level));
+        }
         return false;
     }
 

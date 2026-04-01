@@ -401,7 +401,19 @@ void HttpServer::Stop() {
 
     if (!draining_conn_ptrs.empty() && !net_server_.IsOnDispatcherThread()) {
         net_server_.SetDrainingConns(std::move(draining_conn_ptrs));
-        net_server_.SetPreStopDrainCallback([this]() { WaitForH2Drain(); });
+        // Wait for both H2 drain AND WS close handshakes. WS connections
+        // have a 5s deadline set by SendClose — sleep for that duration
+        // so the dispatcher's timer can fire and force-close expired WS.
+        bool has_ws = !ws_draining.empty();
+        net_server_.SetPreStopDrainCallback([this, has_ws]() {
+            WaitForH2Drain();
+            if (has_ws) {
+                // Give WS connections up to 5s to complete close handshake.
+                // The dispatcher timer enforces the SendClose deadline and
+                // will CloseAfterWrite/ForceClose when it expires.
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+            }
+        });
     } else if (!draining_conn_ptrs.empty()) {
         logging::Get()->warn("HttpServer::Stop() called from dispatcher thread — "
                              "HTTP/2 graceful drain skipped to avoid deadlock");
@@ -1027,18 +1039,16 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         }
     }
 
-    // Compute the new input cap from the new config values BEFORE updating
-    // any atomics. Then set the cap first, then the per-request limits.
-    // This ensures a connection accepted mid-reload gets at most the new cap
-    // (which matches the new limits), not the old cap with new lower limits.
-    // Store per-connection limits FIRST, then set input cap. A connection
-    // accepted mid-reload reads limits in SetupHandlers and cap in
-    // HandleNewConnection. Storing limits first ensures the connection never
-    // sees a larger cap with smaller limits (which would allow over-buffering).
-    max_body_size_.store(new_config.max_body_size, std::memory_order_relaxed);
-    max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);
-    max_ws_message_size_.store(new_config.max_ws_message_size, std::memory_order_relaxed);
+    // Three-phase update to prevent mid-reload connections from seeing
+    // inconsistent cap vs limits:
+    //   1. Set cap to min(old_cap, new_cap) — safe for both shrink and grow
+    //   2. Update per-connection limit atomics
+    //   3. Set final cap from new limits
+    // A connection accepted during any phase gets a cap that's ≤ what its
+    // limits enforce, preventing over-buffering.
     {
+        size_t new_cap = ComputeInputCap();  // from current atomics (old values)
+        // Compute what the new cap will be
         size_t body = new_config.max_body_size;
         size_t hdr = new_config.max_header_size;
         size_t ws = new_config.max_ws_message_size;
@@ -1051,9 +1061,18 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         } else if (body > 0) {
             http_cap = body;
         }
-        size_t cap = (ws > 0) ? (http_cap == 0 ? ws : std::min(http_cap, ws))
-                              : http_cap;
-        net_server_.SetMaxInputSize(cap);
+        size_t final_cap = (ws > 0) ? (http_cap == 0 ? ws : std::min(http_cap, ws))
+                                    : http_cap;
+        // Phase 1: set cap to the smaller of old and new
+        size_t old_cap = ComputeInputCap();
+        net_server_.SetMaxInputSize(
+            (old_cap > 0 && final_cap > 0) ? std::min(old_cap, final_cap) : final_cap);
+        // Phase 2: update limit atomics
+        max_body_size_.store(new_config.max_body_size, std::memory_order_relaxed);
+        max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);
+        max_ws_message_size_.store(new_config.max_ws_message_size, std::memory_order_relaxed);
+        // Phase 3: set final cap (may be larger than phase 1 if limits grew)
+        net_server_.SetMaxInputSize(final_cap);
     }
 
     // Update the remaining reload-safe fields
