@@ -37,7 +37,7 @@ Commands:
 
 Start options:
   -c, --config <file>         Config file (default: config/server.json)
-  -p, --port <port>           Override bind port (1-65535)
+  -p, --port <port>           Override bind port (0-65535, 0=ephemeral)
   -H, --host <address>        Override bind address (numeric IPv4 only)
   -l, --log-level <level>     Override log level
                               (trace, debug, info, warn, error, critical)
