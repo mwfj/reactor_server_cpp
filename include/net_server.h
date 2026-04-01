@@ -63,6 +63,9 @@ private:
     std::function<void()> ready_callback_ = nullptr;  // Fires after init, before event loop
     std::set<ConnectionHandler*> draining_conns_;       // H2 connections exempt from force-close
     std::function<void()> pre_stop_drain_cb_;           // H2 drain wait callback
+    // Set by Start() after socket_dispatchers_ is fully populated.
+    // Stop() checks this to avoid racing on the vector during startup.
+    std::atomic<bool> startup_done_{false};
 
 public:
     NetServer() = delete;

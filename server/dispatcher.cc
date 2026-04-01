@@ -97,9 +97,19 @@ void Dispatcher::set_running_state(bool status){
 }
 
 void Dispatcher::RunEventLoop(){
-    set_running_state(true);
+    // If StopEventLoop was called before we started, bail out immediately.
+    if (was_stopped()) return;
 
+    set_running_state(true);
     thread_id_.store(std::this_thread::get_id(), std::memory_order_release);
+
+    // Recheck: StopEventLoop may have raced between our was_stopped check
+    // and set_running_state(true), setting is_running=false which we then
+    // overwrote. Catch this by rechecking was_stopped after arming is_running.
+    if (was_stopped()) {
+        set_running_state(false);
+        return;
+    }
 
     while(is_running()){
       try {

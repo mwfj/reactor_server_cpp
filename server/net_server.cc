@@ -63,6 +63,9 @@ NetServer::~NetServer(){
 void NetServer::Start(){
     socket_dispatchers_.reserve(sock_workers_.GetThreadWorkerNum());
     for(int idx = 0; idx < sock_workers_.GetThreadWorkerNum(); idx ++){
+        // Check for early shutdown (e.g., SIGTERM during startup).
+        if (conn_dispatcher_->was_stopped()) break;
+
         // Use configurable timer parameters
         std::shared_ptr<Dispatcher> task = std::make_shared<Dispatcher>(
             true, timer_interval_,
@@ -70,7 +73,7 @@ void NetServer::Start(){
         // Initialize each socket dispatcher (required for eventfd setup)
         task->Init();
         socket_dispatchers_.emplace_back(task);
-        task->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1)); 
+        task->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
         task->SetTimerCB(std::bind(&NetServer::RemoveConnection, this, std::placeholders::_1));
 
         // Use lambda with COPY-BY-VALUE capture for thread safety
@@ -83,9 +86,21 @@ void NetServer::Start(){
             }));
         sock_workers_.AddTask(work_task);
     }
-    // Init complete — fire ready callback before entering the blocking loop.
-    // Daemon mode uses this to signal the parent process that startup succeeded.
-    if (ready_callback_) {
+
+    // If shutdown was requested during setup, clean up and return.
+    // Stop() returns early when startup_done_ is false, so we own cleanup.
+    if (conn_dispatcher_->was_stopped()) {
+        for (auto& d : socket_dispatchers_) d->StopEventLoop();
+        sock_workers_.Stop();
+        return;
+    }
+
+    // Setup complete. After this point, Stop() handles teardown.
+    startup_done_.store(true, std::memory_order_release);
+
+    // Fire ready callback only if not shutting down. Without this guard,
+    // daemon mode can signal readiness for a server that is already stopping.
+    if (ready_callback_ && !conn_dispatcher_->was_stopped()) {
         ready_callback_();
         ready_callback_ = nullptr;  // one-shot
     }
@@ -120,6 +135,11 @@ void NetServer::StopAccepting() {
 void NetServer::Stop(){
     // First: stop accepting (may already be done by HttpServer::Stop())
     StopAccepting();
+
+    // If startup hasn't completed, Start() will detect was_stopped and
+    // clean up on its own. Don't touch socket_dispatchers_ — it may be
+    // concurrently modified by Start()'s setup loop.
+    if (!startup_done_.load(std::memory_order_acquire)) return;
 
     // Second (deferred): ClearConnections is done AFTER the drain wait so that
     // dispatcher TimerHandler continues enforcing per-connection deadlines during
