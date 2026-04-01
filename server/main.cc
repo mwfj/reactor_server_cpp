@@ -322,16 +322,12 @@ static bool ReloadConfig(const std::string& config_path,
         logging::Get()->info("Log files reopened");
     } else {
         if (new_config.log.file != current_config.log.file) {
-            // Log path change failed, but server limits are already applied and
-            // valid — don't roll them back. Partial success: server config is
-            // updated, log path is not. Operator can fix on next SIGHUP.
-            logging::Get()->error("Log file reopen failed for new path: {} "
-                                  "(server limits updated, log path unchanged)",
+            // Log path change failed — report as failed reload. Server limits
+            // were already applied by Reload(), but we can't claim success when
+            // the requested log destination is not in effect.
+            logging::Get()->error("Log file reopen failed for new path: {}",
                                   new_config.log.file);
-            // Keep the new config for server limits, but preserve old log config
-            new_config.log.file = current_config.log.file;
-            new_config.log.max_file_size = current_config.log.max_file_size;
-            new_config.log.max_files = current_config.log.max_files;
+            return false;
         } else {
             // Same path, rotation settings changed but reopen failed — preserve
             // old rotation settings so current_config matches the live logger.

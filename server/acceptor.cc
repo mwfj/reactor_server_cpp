@@ -101,30 +101,19 @@ void Acceptor::NewConnection(){
             continue;
         }
         if(client_fd == SocketHandler::ACCEPT_MEMORY_PRESSURE){
-            // Memory/buffer pressure (ENOBUFS/ENOMEM). Exponential backoff
-            // with cap at 1s. The conn_dispatcher ONLY handles accept — no
-            // client I/O runs here, so a brief sleep is acceptable. Queued
-            // work (CloseListenSocket for shutdown) runs after the sleep.
-            // Without a retry, ET mode would leave accept stuck permanently.
-            accept_backoff_ms_ = std::min(
-                accept_backoff_ms_ == 0 ? 100 : accept_backoff_ms_ * 2, 1000);
+            // Memory/buffer pressure (ENOBUFS/ENOMEM). Return and let the
+            // event loop's WaitForEvent timeout (~1s) provide natural backoff.
+            // Re-trigger the accept channel's edge so the next WaitForEvent
+            // cycle includes a readable event for the listen socket, even
+            // without new connections arriving (ET edge recovery).
             int saved_errno = errno;
-            logging::Get()->warn("Accept: memory pressure ({}), backoff {}ms",
-                                 logging::SafeStrerror(saved_errno), accept_backoff_ms_);
-            int delay = accept_backoff_ms_;
-            event_dispatcher_->EnQueue([this, delay]() {
-                // Check shutdown BEFORE and AFTER the sleep — CloseListenSocket
-                // may be queued behind us on the same dispatcher.
-                if (!acceptor_channel_ || acceptor_channel_->is_channel_closed())
-                    return;
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-                if (!acceptor_channel_ || acceptor_channel_->is_channel_closed())
-                    return;
-                NewConnection();
-            });
+            logging::Get()->warn("Accept: memory pressure ({}), deferring to next cycle",
+                                 logging::SafeStrerror(saved_errno));
+            if (acceptor_channel_) {
+                acceptor_channel_->EnableReadMode();  // EPOLL_CTL_MOD re-arms edge
+            }
             return;
         }
-        accept_backoff_ms_ = 0;  // successful accept — reset backoff
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));
         new_conn_cb_(std::move(client_sock));
     }
