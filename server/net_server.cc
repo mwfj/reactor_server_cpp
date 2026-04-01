@@ -46,6 +46,11 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
     conn_dispatcher_->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
     acceptor_ = std::unique_ptr<Acceptor>(new Acceptor(conn_dispatcher_, _ip, _port));
     acceptor_->SetNewConnCb(std::bind(&NetServer::HandleNewConnection, this, std::placeholders::_1));
+    // Route thread pool errors through spdlog so they reach the log file
+    // in daemon mode (where stderr is /dev/null).
+    sock_workers_.SetErrorLogger([](const std::string& msg) {
+        logging::Get()->error("{}", msg);
+    });
     if (worker_threads > 0) {
         sock_workers_.Init(worker_threads);
     } else {
