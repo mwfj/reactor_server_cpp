@@ -274,9 +274,14 @@ static bool ReloadConfig(const std::string& config_path,
     // nothing is mutated (no partial state).
     if (!new_config.log.file.empty()) {
         try {
-            std::string dir = new_config.log.file.substr(
-                0, new_config.log.file.rfind('/'));
-            if (!dir.empty()) logging::EnsureLogDir(dir);
+            auto slash_pos = new_config.log.file.rfind('/');
+            // Only create directory if the path has a directory component.
+            // Basename-only paths like "reactor.log" have no slash — they're
+            // valid in foreground mode and need no directory creation.
+            if (slash_pos != std::string::npos && slash_pos > 0) {
+                std::string dir = new_config.log.file.substr(0, slash_pos);
+                logging::EnsureLogDir(dir);
+            }
         } catch (const std::exception& e) {
             logging::Get()->error("Failed to create log directory: {}", e.what());
             reopen_existing_logs();
