@@ -910,22 +910,25 @@ bool HttpServer::DetectAndRouteProtocol(
         auto h1_existing = http_connections_.find(conn->fd());
         if (h1_existing != http_connections_.end() &&
             h1_existing->second->GetConnection() == conn) {
-            // Already published by HandleNewConnection — skip
-            return true;
+            // Already published by HandleNewConnection — save to forward
+            // bytes after lock release.
+            http_conn = h1_existing->second;
+        } else {
+            // Normal path: create new handler
+            if (!already_counted) {
+                total_accepted_.fetch_add(1, std::memory_order_relaxed);
+                active_connections_.fetch_add(1, std::memory_order_relaxed);
+            }
+            active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
+            // Fd-reuse: stale handler for a different connection
+            if (h1_existing != http_connections_.end() &&
+                h1_existing->second->GetConnection() != conn) {
+                stale_existing = h1_existing->second;
+                active_connections_.fetch_sub(1, std::memory_order_relaxed);
+                active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+            }
+            http_connections_[conn->fd()] = http_conn;
         }
-        if (!already_counted) {
-            total_accepted_.fetch_add(1, std::memory_order_relaxed);
-            active_connections_.fetch_add(1, std::memory_order_relaxed);
-        }
-        active_http1_connections_.fetch_add(1, std::memory_order_relaxed);
-        // Fd-reuse: stale handler for a different connection
-        if (h1_existing != http_connections_.end() &&
-            h1_existing->second->GetConnection() != conn) {
-            stale_existing = h1_existing->second;
-            active_connections_.fetch_sub(1, std::memory_order_relaxed);
-            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
-        }
-        http_connections_[conn->fd()] = http_conn;
     }
     SafeNotifyWsClose(stale_existing);
     http_conn->OnRawData(conn, message);

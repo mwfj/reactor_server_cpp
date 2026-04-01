@@ -158,10 +158,12 @@ void SignalHandler::Cleanup(CleanupMode mode) {
         }
 #endif
 
-        // Restore saved dispositions
+        // Restore saved dispositions. SIGPIPE is intentionally NOT restored —
+        // NetServer::SigpipeGuardAcquire() sets it to SIG_IGN via call_once.
+        // Restoring it to SIG_DFL here would break subsequent NetServer
+        // instances (call_once won't re-fire, so SIG_IGN is never re-set).
         sigaction(SIGTERM, &g_prev_sigterm, nullptr);
         sigaction(SIGINT,  &g_prev_sigint,  nullptr);
-        sigaction(SIGPIPE, &g_prev_sigpipe, nullptr);
         sigaction(SIGHUP,  &g_prev_sighup,  nullptr);
 
         // Restore previous thread signal mask
