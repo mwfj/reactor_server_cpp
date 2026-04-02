@@ -545,7 +545,10 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
                 // Don't send 100 Continue for WebSocket upgrade requests —
                 // WebSocketHandshake::Validate() rejects body-bearing
                 // upgrades, so acknowledging the body is contradictory.
-                if (partial.upgrade) {
+                // llhttp sets upgrade=1 on both WebSocket GET and CONNECT.
+                // Only reject Expect: 100-continue for actual WS upgrades
+                // (GET). CONNECT with Expect is a valid HTTP/1.1 pattern.
+                if (partial.upgrade && partial.method == "GET") {
                     count_request();
                     HttpResponse bad_req = HttpResponse::BadRequest(
                         "WebSocket upgrade must not have a request body");

@@ -167,21 +167,24 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
         deadline_armed_ = true;
     }
 
+    // If shutdown was requested before session_ existed (race with Stop()),
+    // send GOAWAY BEFORE processing initial data so nghttp2 rejects new
+    // streams from the buffered packet. Without this, a client that sent
+    // preface + multiple HEADERS in one packet dispatches streams after
+    // Stop() began, extending drain time unexpectedly.
+    if (shutdown_requested_.load(std::memory_order_acquire)) {
+        logging::Get()->debug("H2 shutdown replay: sending GOAWAY fd={}", conn_ ? conn_->fd() : -1);
+        session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
+        session_->SendPendingFrames();
+    }
+
     // If there's initial data (buffered during detection), process it now
     if (!initial_data.empty()) {
         ssize_t consumed = session_->ReceiveData(initial_data.data(),
                                                   initial_data.size());
         if (consumed < 0) {
             logging::Get()->error("HTTP/2 initial data processing failed");
-            // Clear before SendPendingFrames so OnSendComplete/OnWriteProgress
-            // can resume any watermark-deferred output (e.g., GOAWAY). Without
-            // this, the callbacks bail out (initializing_==true) and deferred
-            // frames are silently truncated. Safe: SendServerPreface() already
-            // completed, which is what the guard was protecting.
             initializing_ = false;
-            // Flush any queued error frames (GOAWAY from flood detection, etc.)
-            // before closing, so the peer sees the HTTP/2 error rather than
-            // a bare TCP close.
             session_->SendPendingFrames();
             conn_->CloseAfterWrite();
             return;
@@ -193,15 +196,9 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
         UpdateDeadline();
     }
 
-    // If shutdown was requested before session_ existed (race with Stop()),
-    // replay the shutdown now. Done AFTER initial_data processing so any
-    // buffered request is dispatched before GOAWAY closes the session.
+    // If shutdown: check if all streams completed (may be zero if GOAWAY
+    // was sent before any HEADERS were processed).
     if (shutdown_requested_.load(std::memory_order_acquire)) {
-        logging::Get()->debug("H2 shutdown replay: sending GOAWAY fd={}", conn_ ? conn_->fd() : -1);
-        if (!session_->IsGoawaySent()) {
-            session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
-            session_->SendPendingFrames();
-        }
         if (session_->ActiveStreamCount() == 0) {
             conn_->CloseAfterWrite();
         }

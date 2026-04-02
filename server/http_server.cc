@@ -348,6 +348,7 @@ void HttpServer::Stop() {
             if (ws->IsOpen()) {
                 // Active WS — will send close frame below
                 ws_conns.emplace_back(pair.second, conn);
+                if (conn) ws_draining.insert(conn.get());
             } else if (ws->IsClosing()) {
                 // Already in close handshake (sent close, waiting for reply).
                 // Must exempt from the generic close sweep so the peer has
@@ -355,20 +356,15 @@ void HttpServer::Stop() {
                 if (conn) ws_draining.insert(conn.get());
             }
         }
-    }
-    // Pre-populate ws_draining with all WS connections that will be tracked.
-    // This MUST happen BEFORE sending close frames: if a peer replies between
-    // SendClose and ws_draining_ installation, OnWsDrainComplete would find
-    // nothing to remove, and shutdown would wait the full 6s timeout on stale
-    // entries.
-    for (auto& [http_conn, conn] : ws_conns) {
-        if (conn) ws_draining.insert(conn.get());
-    }
-    // Install ws_draining_ BEFORE sending close frames so OnWsDrainComplete
-    // can track fast peer responses that arrive during the SendClose loop.
-    if (!ws_draining.empty()) {
-        std::lock_guard<std::mutex> dlck(drain_mtx_);
-        ws_draining_ = ws_draining;
+        // Install ws_draining_ INSIDE conn_mtx_ so IsClosing() entries are
+        // published atomically with the snapshot. Without this, a peer that
+        // finishes the close handshake between lock release and ws_draining_
+        // installation would be missed by OnWsDrainComplete (sees empty set),
+        // causing shutdown to wait the full 6s timeout on a stale entry.
+        if (!ws_draining.empty()) {
+            std::lock_guard<std::mutex> dlck(drain_mtx_);
+            ws_draining_ = ws_draining;
+        }
     }
     // Send 1001 Going Away close frames outside the lock.
     for (auto& [http_conn, conn] : ws_conns) {
@@ -391,7 +387,11 @@ void HttpServer::Stop() {
             std::lock_guard<std::mutex> lck(conn_mtx_);
             for (auto& pair : http_connections_) {
                 auto* ws = pair.second->GetWebSocket();
-                if (!ws || !ws->IsOpen()) continue;
+                if (!ws) continue;
+                // Catch both IsOpen (will send close) and IsClosing (already
+                // in close handshake — needs drain tracking like the initial
+                // snapshot's IsClosing path).
+                if (!ws->IsOpen() && !ws->IsClosing()) continue;
                 auto conn = pair.second->GetConnection();
                 if (!conn || ws_draining.count(conn.get())) continue;
                 late_ws.emplace_back(pair.second, conn);
@@ -1172,12 +1172,18 @@ bool HttpServer::DetectAndRouteProtocol(
             SetupH2Handlers(h2_conn);
             h2_connections_[conn->fd()] = h2_conn;
         }
+        // Late H2 detection during shutdown: request shutdown BEFORE
+        // Initialize so the GOAWAY is sent before buffered data is replayed.
+        // This prevents the client's preface + HEADERS from opening new
+        // streams after Stop() began.
+        bool late_shutdown = !server_ready_.load(std::memory_order_acquire);
+        if (late_shutdown) {
+            h2_conn->RequestShutdown();
+        }
         h2_conn->Initialize(message);
-        // Late H2 detection during shutdown: full drain bookkeeping so
-        // WaitForH2Drain() tracks this session and NetServer::Stop() exempts
-        // it from the generic close sweep. Without this, active streams on
-        // late-detected H2 connections get cut off during shutdown.
-        if (!server_ready_.load(std::memory_order_acquire)) {
+        // Full drain bookkeeping so WaitForH2Drain() tracks this session
+        // and NetServer::Stop() exempts it from the generic close sweep.
+        if (late_shutdown) {
             ConnectionHandler* conn_ptr = conn.get();
             h2_conn->SetDrainCompleteCallback([this, conn_ptr]() {
                 OnH2DrainComplete(conn_ptr);
