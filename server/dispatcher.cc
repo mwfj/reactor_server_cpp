@@ -102,10 +102,22 @@ void Dispatcher::Init() {
 }
 
 Dispatcher::~Dispatcher() {
-    // Let smart pointers handle cleanup automatically
-    // wake_channel_ destructor will close the eventfd / wakeup_pipe_[0]
-#if defined(__APPLE__) || defined(__MACH__)
-    // Close the write end of the wakeup pipe (not owned by wake_channel_)
+#if defined(__linux__)
+    // If Init() was never called, wake_channel_ is null and nobody owns
+    // the eventfd. Close it here to prevent a descriptor leak.
+    if (!wake_channel_ && eventfd_ >= 0) {
+        ::close(eventfd_);
+        eventfd_ = -1;
+    }
+    // If wake_channel_ exists, its destructor closes the eventfd.
+#elif defined(__APPLE__) || defined(__MACH__)
+    // If Init() was never called, wake_channel_ is null and nobody owns
+    // the read end of the pipe. Close it here.
+    if (!wake_channel_ && wakeup_pipe_[0] >= 0) {
+        ::close(wakeup_pipe_[0]);
+        wakeup_pipe_[0] = -1;
+    }
+    // Always close the write end (never owned by wake_channel_).
     if (wakeup_pipe_[1] >= 0) {
         ::close(wakeup_pipe_[1]);
         wakeup_pipe_[1] = -1;

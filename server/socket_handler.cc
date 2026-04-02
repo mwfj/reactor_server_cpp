@@ -93,10 +93,16 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
     // to the reactor — later epoll/kqueue registration would operate
     // on an fd that may already belong to another connection.
     SetNonBlocking(clientfd);
-    if (fcntl(clientfd, F_GETFL) == -1) {
-        // fd is dead or fcntl was interrupted — close to prevent fd leak.
-        ::close(clientfd);
-        return ACCEPT_CONN_ABORTED;
+    // Verify the fd is still valid after SetNonBlocking. Retry on EINTR
+    // so that a signal (SIGHUP, SIGTERM) during accept doesn't spuriously
+    // drop a healthy connection.
+    {
+        int probe;
+        do { probe = fcntl(clientfd, F_GETFL); } while (probe == -1 && errno == EINTR);
+        if (probe == -1) {
+            ::close(clientfd);
+            return ACCEPT_CONN_ABORTED;
+        }
     }
 #endif
     _clientAddr.SetAddr(acceptAddr);

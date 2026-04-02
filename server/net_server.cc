@@ -178,13 +178,14 @@ void NetServer::Stop(){
     // First: stop accepting (may already be done by HttpServer::Stop())
     StopAccepting();
 
-    // If Start() hasn't finished building socket_dispatchers_, it will
-    // detect was_stopped_ (set by StopAccepting) and clean up on its own.
-    // Skip dispatcher iteration to avoid racing with the vector build.
-    // Do NOT stop sock_workers_ here — Start() may still be calling
-    // AddTask(), and stopping the pool would turn a normal early shutdown
-    // into a "ThreadPool has been stopped" exception.
+    // If Start() hasn't finished building socket_dispatchers_, skip
+    // dispatcher iteration to avoid racing with the vector build.
+    // Still stop sock_workers_ — StopAccepting() already set was_stopped_
+    // on the conn_dispatcher, so Start() will observe it and stop calling
+    // AddTask() before we join the workers. Without this, early-shutdown
+    // and never-started paths leave worker threads running until destruction.
     if (!dispatchers_ready_.load(std::memory_order_acquire)) {
+        sock_workers_.Stop();
         return;
     }
 
