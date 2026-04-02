@@ -27,6 +27,11 @@ void HttpConnectionHandler::SetRequestCountCallback(
     callbacks_.request_count_callback = std::move(callback);
 }
 
+void HttpConnectionHandler::SetShutdownCheckCallback(
+    HTTP_CALLBACKS_NAMESPACE::HttpConnShutdownCheckCallback callback) {
+    callbacks_.shutdown_check_callback = std::move(callback);
+}
+
 void HttpConnectionHandler::SetMaxBodySize(size_t max) {
     max_body_size_ = max;
     parser_.SetMaxBodySize(max);
@@ -264,6 +269,18 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         if (conn_->IsClosing()) {
             logging::Get()->debug("WS upgrade: connection closed during 101 send fd={}",
                                   conn_->fd());
+            return false;
+        }
+
+        // Late shutdown gate: the early route_check ran before middleware/101.
+        // If shutdown started between then and now, abort the upgrade —
+        // this connection would miss the 1001 "Going Away" close frame
+        // and fall into the generic transport close path.
+        if (callbacks_.shutdown_check_callback &&
+            callbacks_.shutdown_check_callback()) {
+            logging::Get()->debug("WS upgrade aborted: server shutting down fd={}",
+                                  conn_->fd());
+            conn_->CloseAfterWrite();
             return false;
         }
 

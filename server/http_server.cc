@@ -41,7 +41,12 @@ bool HttpServer::HasPendingH1Output() {
     std::lock_guard<std::mutex> lck(conn_mtx_);
     for (const auto& [fd, http_conn] : http_connections_) {
         auto conn = http_conn->GetConnection();
-        if (conn && conn->OutputBufferSize() > 0) {
+        // Use atomic flags as a race-free proxy for "output buffer not empty":
+        // close_after_write is set by the close sweep, and cleared (via
+        // ForceClose → IsClosing) when the buffer drains to zero. Reading
+        // OutputBufferSize() directly would be UB (non-atomic std::string
+        // read while dispatcher threads write).
+        if (conn && conn->IsCloseDeferred() && !conn->IsClosing()) {
             return true;
         }
     }
@@ -347,22 +352,26 @@ void HttpServer::Stop() {
             }
         }
     }
+    // Pre-populate ws_draining with all WS connections that will be tracked.
+    // This MUST happen BEFORE sending close frames: if a peer replies between
+    // SendClose and ws_draining_ installation, OnWsDrainComplete would find
+    // nothing to remove, and shutdown would wait the full 6s timeout on stale
+    // entries.
+    for (auto& [http_conn, conn] : ws_conns) {
+        if (conn) ws_draining.insert(conn.get());
+    }
+    // Install ws_draining_ BEFORE sending close frames so OnWsDrainComplete
+    // can track fast peer responses that arrive during the SendClose loop.
+    if (!ws_draining.empty()) {
+        std::lock_guard<std::mutex> dlck(drain_mtx_);
+        ws_draining_ = ws_draining;
+    }
     // Send 1001 Going Away close frames outside the lock.
     for (auto& [http_conn, conn] : ws_conns) {
         auto* ws = http_conn->GetWebSocket();
         if (ws && ws->IsOpen()) {
             try {
                 ws->SendClose(1001, "Going Away");
-                if (conn) {
-                    // SendClose arms a 5s deadline and writes the close frame
-                    // to the output buffer (EnableWriteMode set by SendFrame).
-                    // The buffer drains naturally via the write path — both
-                    // backpressured and idle connections are handled the same.
-                    // Do NOT call CloseAfterWrite: it force-closes when the
-                    // buffer empties, before the peer can send its close reply,
-                    // resulting in 1006 instead of a clean close handshake.
-                    ws_draining.insert(conn.get());
-                }
             }
             catch (...) {}
         }
@@ -384,12 +393,22 @@ void HttpServer::Stop() {
                 late_ws.emplace_back(pair.second, conn);
             }
         }
+        // Pre-populate drain tracking before sending close frames (same
+        // pattern as the initial snapshot — prevents fast-close races).
+        {
+            std::lock_guard<std::mutex> dlck(drain_mtx_);
+            for (auto& [http_conn, conn] : late_ws) {
+                if (conn) {
+                    ws_draining.insert(conn.get());
+                    ws_draining_.insert(conn.get());
+                }
+            }
+        }
         for (auto& [http_conn, conn] : late_ws) {
             auto* ws = http_conn->GetWebSocket();
             if (ws && ws->IsOpen()) {
                 try {
                     ws->SendClose(1001, "Going Away");
-                    if (conn) ws_draining.insert(conn.get());
                 } catch (...) {}
             }
         }
@@ -442,12 +461,6 @@ void HttpServer::Stop() {
         }
     }
 
-    // If drain wait is safe (not on a dispatcher thread) and H2 connections
-    // Populate ws_draining_ for shutdown drain tracking.
-    if (!ws_draining.empty()) {
-        std::lock_guard<std::mutex> dlck(drain_mtx_);
-        ws_draining_ = ws_draining;
-    }
     // Merge WS draining set into H2 draining set — both are exempt from
     // the generic close sweep in NetServer::Stop().
     draining_conn_ptrs.insert(ws_draining.begin(), ws_draining.end());
@@ -661,6 +674,12 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
             return handler != nullptr;
         }
     );
+
+    // Shutdown check: late gate for WS upgrades that slipped past the early
+    // route_check (which runs before middleware/handshake/101).
+    http_conn->SetShutdownCheckCallback([this]() -> bool {
+        return !server_ready_.load(std::memory_order_acquire);
+    });
 
     // Upgrade handler: wires WS callbacks (called exactly once, after ws_conn_ created)
     http_conn->SetUpgradeCallback(
