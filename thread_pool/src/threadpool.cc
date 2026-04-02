@@ -8,12 +8,18 @@ ThreadPool::~ThreadPool() {
 void ThreadPool::JoinPendingSelfStop() {
     if (pending_self_stop_.joinable()) {
         if (pending_self_stop_.get_id() == std::this_thread::get_id()) {
-            // Self-join scenario: destructor running on a worker thread.
-            // Detach — the worker exits promptly (is_running=false) and
-            // only accesses heap-allocated SharedState after this point.
-            // The shared_ptr<SharedState> captured in Run() keeps it alive.
-            // Detach is safe here because there are no pool-local members
-            // accessed after Stop() returns from the task.
+            // Self-destruction: a worker task is destroying the pool.
+            // This is not supported — there is no safe way to join a thread
+            // from within itself, and all orphan/detach workarounds introduce
+            // lifetime hazards or block unrelated shutdowns.
+            // The server architecture avoids this: Stop() is called from
+            // signal/handler threads, ~ThreadPool runs on the main thread
+            // after server_thread.join(). If this fires, it's a usage bug.
+            LogError("[ThreadPool] BUG: pool destroyed from its own worker task. "
+                     "Call Stop() from a non-worker thread, then destroy the pool.");
+            // Detach as last resort to avoid std::terminate from ~thread.
+            // The worker only accesses heap-allocated SharedState after this
+            // point (kept alive by shared_ptr in Run()).
             pending_self_stop_.detach();
         } else {
             pending_self_stop_.join();
