@@ -1433,19 +1433,16 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     net_server_.SetConnectionTimeout(
         std::chrono::seconds(new_config.idle_timeout_sec));
 
-    // Recompute timer scan interval. Only shorten, never lengthen: existing
-    // connections carry deadlines set at the old cadence, and a longer scan
-    // would delay their enforcement (e.g., a 1s request timeout detected
-    // only after a 5s scan). New connections will use the new timeout values
-    // but existing ones need the current scan frequency until they close.
-    {
-        int new_interval = ComputeTimerInterval(new_config.idle_timeout_sec,
-                                                 new_config.request_timeout_sec);
-        int cur_interval = net_server_.GetTimerInterval();
-        if (new_interval < cur_interval) {
-            net_server_.SetTimerInterval(new_interval);
-        }
-    }
+    // Recompute timer scan interval from the new timeout values. Always
+    // apply — the old "only shorten" logic permanently ratcheted the
+    // interval down, pinning the server to 1s scans for its entire
+    // lifetime after a single low-timeout reload. Existing connections
+    // with old deadlines may see detection delayed by at most one extra
+    // scan cycle when the interval grows, which is acceptable (timeout
+    // changes are documented as applying to new connections).
+    net_server_.SetTimerInterval(
+        ComputeTimerInterval(new_config.idle_timeout_sec,
+                             new_config.request_timeout_sec));
 
     // Update HTTP/2 settings for NEW connections only (under conn_mtx_).
     // Existing sessions keep their negotiated SETTINGS values — submitting
