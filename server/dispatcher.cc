@@ -20,9 +20,12 @@ Dispatcher::Dispatcher() :
     if (::pipe(wakeup_pipe_) == -1) {
         throw std::runtime_error(std::string("pipe creation failed: ") + logging::SafeStrerror(errno));
     }
-    // Set both ends to non-blocking
-    ::fcntl(wakeup_pipe_[0], F_SETFL, O_NONBLOCK);
-    ::fcntl(wakeup_pipe_[1], F_SETFL, O_NONBLOCK);
+    // Set both ends to non-blocking + close-on-exec
+    for (int i = 0; i < 2; ++i) {
+        ::fcntl(wakeup_pipe_[i], F_SETFL, O_NONBLOCK);
+        int fd_flags = ::fcntl(wakeup_pipe_[i], F_GETFD);
+        if (fd_flags != -1) ::fcntl(wakeup_pipe_[i], F_SETFD, fd_flags | FD_CLOEXEC);
+    }
 #endif
     // Note: wake_channel_ initialization moved to Initialize()
     // Cannot use shared_from_this() in constructor
@@ -44,9 +47,12 @@ Dispatcher::Dispatcher(bool _is_sock,  int _end_t, std::chrono::seconds _timeout
     if (::pipe(wakeup_pipe_) == -1) {
         throw std::runtime_error(std::string("pipe creation failed: ") + logging::SafeStrerror(errno));
     }
-    // Set both ends to non-blocking
-    ::fcntl(wakeup_pipe_[0], F_SETFL, O_NONBLOCK);
-    ::fcntl(wakeup_pipe_[1], F_SETFL, O_NONBLOCK);
+    // Set both ends to non-blocking + close-on-exec
+    for (int i = 0; i < 2; ++i) {
+        ::fcntl(wakeup_pipe_[i], F_SETFL, O_NONBLOCK);
+        int fd_flags = ::fcntl(wakeup_pipe_[i], F_GETFD);
+        if (fd_flags != -1) ::fcntl(wakeup_pipe_[i], F_SETFD, fd_flags | FD_CLOEXEC);
+    }
 #endif
     // Note: wake_channel_ initialization moved to Init()
     // Cannot use shared_from_this() in constructor
@@ -61,7 +67,15 @@ void Dispatcher::Init() {
     wake_channel_ = std::make_shared<Channel>(shared_from_this(), wakeup_pipe_[0]);  // Read end of pipe
 #endif
     wake_channel_->SetReadCallBackFn(std::bind(&Dispatcher::HandleEventId, this));
-    wake_channel_->EnableReadMode();
+    // Register the wake channel synchronously — MUST NOT go through
+    // EnableReadMode() → UpdateChannel() → EnQueue(), because the wake
+    // channel itself is what drains the task queue. Enqueueing its own
+    // registration creates a chicken-and-egg deadlock.
+    // Init() runs single-threaded before any event loop, so direct
+    // registration is safe (no concurrent epoll/kqueue access).
+    wake_channel_->EnableETMode();
+    wake_channel_->SetEvent(wake_channel_->Event() | EVENT_READ | EVENT_RDHUP);
+    UpdateChannelInLoop(wake_channel_);
 
     // Initialize timer for socket dispatchers.
     // Timer is needed for both idle timeout (timeout_.count() > 0) and request
@@ -70,11 +84,14 @@ void Dispatcher::Init() {
     if (is_sock_dispatcher_ && end_t_ > 0) {
 #if defined(__linux__)
         // Linux: timerfd becomes a Channel in the epoll interest list.
+        // Same synchronous registration as wake_channel_ — safe during Init().
         timer_fd_ = TimeStamp::GenTimerFd(std::chrono::seconds(end_t_), std::chrono::nanoseconds(0));
         if (timer_fd_ >= 0) {
             timer_channel_ = std::make_shared<Channel>(shared_from_this(), timer_fd_);
             timer_channel_->SetReadCallBackFn(std::bind(&Dispatcher::TimerHandler, this));
-            timer_channel_->EnableReadMode();
+            timer_channel_->EnableETMode();
+            timer_channel_->SetEvent(timer_channel_->Event() | EVENT_READ | EVENT_RDHUP);
+            UpdateChannelInLoop(timer_channel_);
         }
 #elif defined(__APPLE__) || defined(__MACH__)
         // macOS: EVFILT_TIMER registered directly on the kqueue — no fd, no Channel.
@@ -193,24 +210,16 @@ void Dispatcher::StopEventLoop(){
 }
 
 void Dispatcher::UpdateChannel(std::shared_ptr<Channel> ch){
-    // CRITICAL FIX: Always use EnQueue when not in dispatcher thread
-    // The original condition `if(!is_running() || is_dispatcher_thread())` was buggy:
-    // - It would call UpdateChannelInLoop() directly when !is_running(), even from wrong thread
-    // - This caused race conditions where channels weren't properly registered in epoll
     if(is_dispatcher_thread()){
         UpdateChannelInLoop(ch);
         return;
     }
 
-    // From other threads: use EnQueue to ensure thread-safe epoll modifications
-    // But ONLY if running - otherwise, calls during initialization will deadlock
-    if(!is_running()){
-        // Dispatcher not started yet - this is a bug in the calling code
-        // But to maintain compatibility, call directly (thread-unsafe but works for init)
-        UpdateChannelInLoop(ch);
-        return;
-    }
-
+    // Always enqueue when off-thread. This is safe even before RunEventLoop()
+    // starts — the task queues up and is drained when the loop begins.
+    // The previous !is_running() fallback called UpdateChannelInLoop()
+    // directly from the wrong thread, causing cross-thread epoll/kqueue
+    // mutations that are undefined behavior.
     std::weak_ptr<Dispatcher> self = shared_from_this();
     EnQueue([self, ch]() {
         if(auto dispatcher = self.lock()){
@@ -225,12 +234,7 @@ void Dispatcher::RemoveChannel(std::shared_ptr<Channel> ch){
         return;
     }
 
-    if(!is_running()){
-        // Dispatcher not started yet - call directly to avoid deadlock
-        RemoveChannelInLoop(ch);
-        return;
-    }
-
+    // Always enqueue when off-thread — same rationale as UpdateChannel.
     std::weak_ptr<Dispatcher> self = shared_from_this();
     EnQueue([self, ch]() {
         if(auto dispatcher = self.lock()){

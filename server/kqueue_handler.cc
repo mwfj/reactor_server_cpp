@@ -10,6 +10,12 @@ KqueueHandler::KqueueHandler(){
         logging::Get()->error("kqueue() failed: {}", logging::SafeStrerror(saved_errno));
         throw std::runtime_error("kqueue() failed");
     }
+    // Set close-on-exec to prevent leaking the kqueue fd into child processes.
+    // kqueue() has no CLOEXEC flag (unlike Linux's epoll_create1), so use fcntl.
+    int fd_flags = fcntl(kqueuefd_, F_GETFD);
+    if (fd_flags != -1) {
+        fcntl(kqueuefd_, F_SETFD, fd_flags | FD_CLOEXEC);
+    }
 }
 
 KqueueHandler::~KqueueHandler(){

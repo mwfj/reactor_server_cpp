@@ -71,12 +71,23 @@ void NetServer::Start(){
             }));
         sock_workers_.AddTask(work_task);
     }
+    // Mark socket_dispatchers_ as fully built. Stop() checks this flag
+    // to avoid iterating the vector while Start() is still building it.
+    dispatchers_ready_.store(true, std::memory_order_release);
+
+    // If Stop() was called while we were building dispatchers, clean up
+    // and return. Without this, we'd enter RunEventLoop and hang.
+    if (conn_dispatcher_->was_stopped()) {
+        for (auto& d : socket_dispatchers_)
+            d->StopEventLoop();
+        sock_workers_.Stop();
+        return;
+    }
 
     // Barrier: wait for all socket dispatchers to enter their event loops.
-    // Without this, the first accepted connection could be routed to a
-    // dispatcher that hasn't called set_running_state(true) yet, causing
-    // UpdateChannel to fall into the thread-unsafe !is_running() fallback
-    // which does cross-thread epoll/kqueue modifications.
+    // This is an optimization to reduce queued work at startup — correctness
+    // no longer depends on it because UpdateChannel always uses EnQueue for
+    // off-thread calls (the thread-unsafe !is_running() fallback was removed).
     {
         static constexpr int DISPATCHER_START_TIMEOUT_SEC = 5;
         auto deadline = std::chrono::steady_clock::now()
@@ -84,8 +95,8 @@ void NetServer::Start(){
         for (auto& disp : socket_dispatchers_) {
             while (!disp->is_running() && !disp->was_stopped()) {
                 if (std::chrono::steady_clock::now() > deadline) {
-                    logging::Get()->error(
-                        "Socket dispatcher failed to start within {} seconds",
+                    logging::Get()->warn(
+                        "Socket dispatcher slow to start ({}s elapsed)",
                         DISPATCHER_START_TIMEOUT_SEC);
                     break;
                 }
@@ -138,6 +149,14 @@ void NetServer::StopAccepting() {
 void NetServer::Stop(){
     // First: stop accepting (may already be done by HttpServer::Stop())
     StopAccepting();
+
+    // If Start() hasn't finished building socket_dispatchers_, it will
+    // detect was_stopped_ (set by StopAccepting) and clean up on its own.
+    // Skip dispatcher iteration to avoid racing with the vector build.
+    if (!dispatchers_ready_.load(std::memory_order_acquire)) {
+        sock_workers_.Stop();  // idempotent — safe if Start() also calls it
+        return;
+    }
 
     // Second (deferred): ClearConnections is done AFTER the drain wait so that
     // dispatcher TimerHandler continues enforcing per-connection deadlines during

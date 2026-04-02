@@ -6,7 +6,7 @@
 #include "log/log_utils.h"
 
 EpollHandler::EpollHandler(){
-    if((epollfd_ = ::epoll_create(1)) == -1){
+    if((epollfd_ = ::epoll_create1(EPOLL_CLOEXEC)) == -1){
         int saved_errno = errno;
         logging::Get()->error("epoll_create failed: {}", logging::SafeStrerror(saved_errno));
         throw std::runtime_error("Epoll created failed");

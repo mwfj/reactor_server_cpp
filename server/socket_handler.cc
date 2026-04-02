@@ -26,7 +26,11 @@ bool SocketHandler::SetKeepAlive(bool _flag){
 }
 
 int SocketHandler::CreateSocket() {
+#if defined(__linux__)
+    int listenfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+#else
     int listenfd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+#endif
     if (listenfd == -1) {
         logging::Get()->error("Failed to create socket");
         throw std::runtime_error("Invalid socket...");
@@ -55,8 +59,8 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
     sockaddr_in acceptAddr;
     socklen_t len = sizeof(acceptAddr);
 #if defined(__linux__)
-    // Linux: use accept4 with SOCK_NONBLOCK for atomic non-blocking accept
-    int clientfd = accept4(fd_, reinterpret_cast<sockaddr*>(&acceptAddr), &len, SOCK_NONBLOCK);
+    // Linux: use accept4 with SOCK_NONBLOCK|SOCK_CLOEXEC for atomic setup
+    int clientfd = accept4(fd_, reinterpret_cast<sockaddr*>(&acceptAddr), &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
 #elif defined(__APPLE__) || defined(__MACH__)
     // macOS: use regular accept and set non-blocking separately
     int clientfd = accept(fd_, reinterpret_cast<sockaddr*>(&acceptAddr), &len);
@@ -149,6 +153,18 @@ void SocketHandler::SetNonBlocking(int fd) {
                               logging::SafeStrerror(saved_errno), saved_errno);
         throw std::runtime_error(std::string("Failed to set non-blocking mode: ") + logging::SafeStrerror(saved_errno));
     }
+
+    // Set close-on-exec to prevent fd leaks into child processes on exec*().
+    // On Linux, SOCK_CLOEXEC in socket()/accept4() handles this atomically.
+    // On macOS (and any platform without SOCK_CLOEXEC), set it via fcntl.
+#if !defined(__linux__)
+    {
+        int fd_flags = fcntl(fd, F_GETFD);
+        if (fd_flags != -1) {
+            fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC);
+        }
+    }
+#endif
 
     // macOS: suppress SIGPIPE per-socket since MSG_NOSIGNAL is not available
 #ifdef SO_NOSIGPIPE
