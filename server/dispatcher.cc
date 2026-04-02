@@ -398,11 +398,17 @@ void Dispatcher::SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCal
 
 void Dispatcher::SetTimerInterval(int interval) {
     end_t_ = interval;
-    // Re-arm the timerfd immediately so a downward reload takes effect
+    // Re-arm the timer immediately so a downward reload takes effect
     // without waiting for the old (potentially much longer) interval to fire.
+#if defined(__linux__)
     if (timer_fd_ >= 0 && interval > 0) {
         TimeStamp::ResetTimerFd(timer_fd_, interval);
     }
+#elif defined(__APPLE__) || defined(__MACH__)
+    if (interval > 0) {
+        ep_->ResetTimer(interval);
+    }
+#endif
 }
 
 void Dispatcher::TimerHandler(){
