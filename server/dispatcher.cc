@@ -21,11 +21,10 @@ Dispatcher::Dispatcher() :
         throw std::runtime_error(std::string("pipe creation failed: ") + logging::SafeStrerror(errno));
     }
     // Set both ends to non-blocking + close-on-exec
-    for (int i = 0; i < 2; ++i) {
-        ::fcntl(wakeup_pipe_[i], F_SETFL, O_NONBLOCK);
-        int fd_flags = ::fcntl(wakeup_pipe_[i], F_GETFD);
-        if (fd_flags != -1) ::fcntl(wakeup_pipe_[i], F_SETFD, fd_flags | FD_CLOEXEC);
-    }
+    ::fcntl(wakeup_pipe_[0], F_SETFL, O_NONBLOCK);
+    ::fcntl(wakeup_pipe_[1], F_SETFL, O_NONBLOCK);
+    ::fcntl(wakeup_pipe_[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(wakeup_pipe_[1], F_SETFD, FD_CLOEXEC);
 #endif
     // Note: wake_channel_ initialization moved to Initialize()
     // Cannot use shared_from_this() in constructor
@@ -48,11 +47,10 @@ Dispatcher::Dispatcher(bool _is_sock,  int _end_t, std::chrono::seconds _timeout
         throw std::runtime_error(std::string("pipe creation failed: ") + logging::SafeStrerror(errno));
     }
     // Set both ends to non-blocking + close-on-exec
-    for (int i = 0; i < 2; ++i) {
-        ::fcntl(wakeup_pipe_[i], F_SETFL, O_NONBLOCK);
-        int fd_flags = ::fcntl(wakeup_pipe_[i], F_GETFD);
-        if (fd_flags != -1) ::fcntl(wakeup_pipe_[i], F_SETFD, fd_flags | FD_CLOEXEC);
-    }
+    ::fcntl(wakeup_pipe_[0], F_SETFL, O_NONBLOCK);
+    ::fcntl(wakeup_pipe_[1], F_SETFL, O_NONBLOCK);
+    ::fcntl(wakeup_pipe_[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(wakeup_pipe_[1], F_SETFD, FD_CLOEXEC);
 #endif
     // Note: wake_channel_ initialization moved to Init()
     // Cannot use shared_from_this() in constructor
