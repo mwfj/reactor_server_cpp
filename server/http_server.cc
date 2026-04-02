@@ -327,6 +327,10 @@ void HttpServer::Stop() {
 
     // Prevent Reload() from mutating dead state after Stop().
     server_ready_.store(false, std::memory_order_release);
+    // Mark shutdown started — used by GetStats() to keep reporting uptime
+    // during the drain phase (server_ready_ is already false at this point).
+    // The release barrier publishes the already-written start_time_.
+    shutting_down_started_.store(true, std::memory_order_release);
 
     // Stop accepting FIRST — prevents new connections from being accepted
     // between the WS snapshot and the H2 drain snapshot. Without this, a WS
@@ -1462,11 +1466,13 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
 
 HttpServer::ServerStats HttpServer::GetStats() const {
     ServerStats stats;
-    // Compute uptime if start_time_ has been set (by MarkServerReady).
-    // Don't gate on server_ready_ — Stop() clears that before the drain
-    // phase, and /stats during graceful shutdown should still report the
-    // real uptime, not 0 (which looks like a restart to monitoring).
-    if (start_time_ != std::chrono::steady_clock::time_point{}) {
+    // Use server_ready_ as the publication barrier for start_time_ (which
+    // is non-atomic, written by MarkServerReady on the server thread).
+    // Also check shutting_down_started_: Stop() clears server_ready_ before
+    // the drain phase, but start_time_ is still valid — without this,
+    // /stats during graceful shutdown reports uptime 0.
+    if (server_ready_.load(std::memory_order_acquire) ||
+        shutting_down_started_.load(std::memory_order_acquire)) {
         auto now = std::chrono::steady_clock::now();
         stats.uptime_seconds = std::chrono::duration_cast<std::chrono::seconds>(
             now - start_time_).count();

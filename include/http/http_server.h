@@ -165,6 +165,10 @@ private:
     // Set by the ready callback after Start() finishes building dispatchers.
     // Reload() checks this to avoid walking socket_dispatchers_ during startup.
     std::atomic<bool> server_ready_{false};
+    // Set by Stop() after server_ready_=false. Used by GetStats() to keep
+    // reporting valid uptime during the drain phase. Acts as a release
+    // barrier for the non-atomic start_time_ field.
+    std::atomic<bool> shutting_down_started_{false};
     struct DrainingH2Conn {
         std::shared_ptr<Http2ConnectionHandler> handler;
         std::shared_ptr<ConnectionHandler> conn;
