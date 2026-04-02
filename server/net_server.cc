@@ -6,6 +6,20 @@
 #include <csignal>
 #include <future>
 
+// Process-global SIGPIPE suppression. Checked on every NetServer construction
+// (not call_once) so it works correctly after Cleanup(RESTORE) restores the
+// original disposition.
+static void SigpipeGuardAcquire() {
+    struct sigaction sa_cur{};
+    sigaction(SIGPIPE, nullptr, &sa_cur);
+    if (sa_cur.sa_handler == SIG_DFL) {
+        struct sigaction sa_ign{};
+        sa_ign.sa_handler = SIG_IGN;
+        sigemptyset(&sa_ign.sa_mask);
+        sigaction(SIGPIPE, &sa_ign, nullptr);
+    }
+}
+
 NetServer::NetServer(const std::string& _ip, const size_t _port,
                      int timer_interval,
                      std::chrono::seconds connection_timeout,
@@ -13,7 +27,7 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
     : conn_dispatcher_(std::make_shared<Dispatcher>()),
       acceptor_(nullptr),
       timer_interval_(timer_interval),
-      connection_timeout_(connection_timeout)
+      connection_timeout_sec_(static_cast<int>(connection_timeout.count()))
 {
     // Suppress SIGPIPE if the current handler is the default (which kills
     // the process). OpenSSL's SSL_write/SSL_shutdown use the underlying
@@ -21,20 +35,16 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
     // a single peer reset on a TLS connection kills the entire process.
     // Only override SIG_DFL — if the embedder has installed their own
     // handler, leave it alone to avoid breaking their signal handling.
-    {
-        struct sigaction sa_cur;
-        sigaction(SIGPIPE, nullptr, &sa_cur);
-        if (sa_cur.sa_handler == SIG_DFL) {
-            signal(SIGPIPE, SIG_IGN);
-        }
-    }
-    // Initialize conn_dispatcher_ after shared_ptr is constructed (required for eventfd setup)
+    SigpipeGuardAcquire();
     conn_dispatcher_->Init();
     conn_dispatcher_->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
-
-    // Now create acceptor with initialized dispatcher
     acceptor_ = std::unique_ptr<Acceptor>(new Acceptor(conn_dispatcher_, _ip, _port));
     acceptor_->SetNewConnCb(std::bind(&NetServer::HandleNewConnection, this, std::placeholders::_1));
+    // Route thread pool errors through spdlog so they reach the log file
+    // in daemon mode (where stderr is /dev/null).
+    sock_workers_.SetErrorLogger([](const std::string& msg) {
+        logging::Get()->error("{}", msg);
+    });
     if (worker_threads > 0) {
         sock_workers_.Init(worker_threads);
     } else {
@@ -53,12 +63,17 @@ NetServer::~NetServer(){
 void NetServer::Start(){
     socket_dispatchers_.reserve(sock_workers_.GetThreadWorkerNum());
     for(int idx = 0; idx < sock_workers_.GetThreadWorkerNum(); idx ++){
+        // Check for early shutdown (e.g., SIGTERM during startup).
+        if (conn_dispatcher_->was_stopped()) break;
+
         // Use configurable timer parameters
-        std::shared_ptr<Dispatcher> task = std::make_shared<Dispatcher>(true, timer_interval_, connection_timeout_);
+        std::shared_ptr<Dispatcher> task = std::make_shared<Dispatcher>(
+            true, timer_interval_,
+            std::chrono::seconds(connection_timeout_sec_.load(std::memory_order_relaxed)));
         // Initialize each socket dispatcher (required for eventfd setup)
         task->Init();
         socket_dispatchers_.emplace_back(task);
-        task->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1)); 
+        task->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
         task->SetTimerCB(std::bind(&NetServer::RemoveConnection, this, std::placeholders::_1));
 
         // Use lambda with COPY-BY-VALUE capture for thread safety
@@ -69,11 +84,32 @@ void NetServer::Start(){
             new SocketWorker([task]() {
                 task->RunEventLoop();
             }));
-        sock_workers_.AddTask(work_task);
+        try {
+            sock_workers_.AddTask(work_task);
+        } catch (const std::runtime_error&) {
+            // Pool was stopped by concurrent Stop() — break and clean up.
+            // Without this catch, Start() never reaches its cleanup path,
+            // so StopEventLoop is never called on already-running dispatchers,
+            // and Stop()'s sock_workers_.Stop() hangs joining stuck workers.
+            break;
+        }
     }
-    // Init complete — fire ready callback before entering the blocking loop.
-    // Daemon mode uses this to signal the parent process that startup succeeded.
-    if (ready_callback_) {
+
+    // If shutdown was requested during setup, clean up and return.
+    // Stop() also stops sock_workers_ on the early path, but Stop() is
+    // idempotent, so double-call from both paths is safe.
+    if (conn_dispatcher_->was_stopped()) {
+        for (auto& d : socket_dispatchers_) d->StopEventLoop();
+        sock_workers_.Stop();
+        return;
+    }
+
+    // Setup complete. After this point, Stop() handles teardown.
+    startup_done_.store(true, std::memory_order_release);
+
+    // Fire ready callback only if not shutting down. Without this guard,
+    // daemon mode can signal readiness for a server that is already stopping.
+    if (ready_callback_ && !conn_dispatcher_->was_stopped()) {
         ready_callback_();
         ready_callback_ = nullptr;  // one-shot
     }
@@ -86,6 +122,10 @@ void NetServer::StopAccepting() {
     if (conn_dispatcher_->was_stopped()) return;  // already stopped
 
     if (conn_dispatcher_->is_running()) {
+        // Mark closing BEFORE enqueuing CloseListenSocket. Deferred accept
+        // retries already in the task queue check this flag and bail out,
+        // preventing new connections from being accepted after shutdown starts.
+        if (acceptor_) acceptor_->MarkClosing();
         // Event loop is active: enqueue close + barrier to ensure any
         // in-flight accept callback has finished before we return.
         conn_dispatcher_->EnQueue([this]() {
@@ -108,6 +148,16 @@ void NetServer::StopAccepting() {
 void NetServer::Stop(){
     // First: stop accepting (may already be done by HttpServer::Stop())
     StopAccepting();
+
+    // If startup hasn't completed, Start() will detect was_stopped and
+    // clean up socket_dispatchers_ on its own. Don't touch that vector —
+    // it may be concurrently modified by Start()'s setup loop.
+    // But always stop the worker pool: it was started in the constructor,
+    // so threads are running even if Start() never ran or hasn't finished.
+    if (!startup_done_.load(std::memory_order_acquire)) {
+        sock_workers_.Stop();
+        return;
+    }
 
     // Second (deferred): ClearConnections is done AFTER the drain wait so that
     // dispatcher TimerHandler continues enforcing per-connection deadlines during
@@ -132,7 +182,10 @@ void NetServer::Stop(){
         if (conn->IsCloseDeferred()) continue;
         // Skip connections in the H2 graceful drain set — they close
         // themselves after all active streams complete.
-        if (draining_conns_.count(conn.get())) continue;
+        {
+            std::lock_guard<std::mutex> dlck(draining_conns_mtx_);
+            if (draining_conns_.count(conn.get())) continue;
+        }
         conn->CloseAfterWrite();
     }
     // Do NOT clear conns_to_close here. The shared_ptrs must keep
@@ -153,11 +206,11 @@ void NetServer::Stop(){
         for (auto& disp : socket_dispatchers_) {
             if (disp->was_stopped()) continue;
             if (disp->is_on_loop_thread()) {
-                // Self-dispatcher: process pending tasks inline instead of
-                // skipping. Without this, CloseAfterWrite tasks queued onto
-                // this dispatcher never run (the thread is blocked in Stop()),
-                // and buffered output gets truncated.
-                disp->HandleEventId();
+                // Self-dispatcher: drain the task queue directly instead of
+                // going through HandleEventId (which reads the eventfd first
+                // and returns without touching task_que_ if the read fails —
+                // e.g., when EnQueue's WakeUp write was lost under pressure).
+                disp->ProcessPendingTasks();
                 continue;
             }
             auto barrier = std::make_shared<std::promise<void>>();
@@ -179,7 +232,10 @@ void NetServer::Stop(){
         // during the drain wait above.
         wait_for_dispatcher_barrier();
     }
-    draining_conns_.clear();  // one-shot cleanup
+    {
+        std::lock_guard<std::mutex> dlck(draining_conns_mtx_);
+        draining_conns_.clear();  // one-shot cleanup
+    }
 
     // Fourth-C: Now safe to release dispatcher-held connection references.
     // Deferred from earlier so TimerHandler continues enforcing deadlines during drain.
@@ -206,11 +262,12 @@ void NetServer::Stop(){
 
 void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
     // Enforce max_connections limit
-    if (max_connections_ > 0) {
+    int max_conns = max_connections_.load(std::memory_order_relaxed);
+    if (max_conns > 0) {
         std::lock_guard<std::mutex> lck(conn_mtx_);
-        if (static_cast<int>(connections_.size()) >= max_connections_) {
+        if (static_cast<int>(connections_.size()) >= max_conns) {
             logging::Get()->warn("Max connections ({}) reached, rejecting fd {}",
-                                max_connections_, cilent_sock->fd());
+                                max_conns, cilent_sock->fd());
             return;  // SocketHandler destructor closes the fd
         }
     }
@@ -247,8 +304,9 @@ void NetServer::HandleNewConnection(std::unique_ptr<SocketHandler> cilent_sock){
 
     // Set input buffer cap BEFORE epoll registration to eliminate the race where
     // the first read arrives uncapped before HttpServer::HandleNewConnection runs.
-    if (max_input_size_ > 0) {
-        conn->SetMaxInputSize(max_input_size_);
+    size_t max_input = max_input_size_.load(std::memory_order_relaxed);
+    if (max_input > 0) {
+        conn->SetMaxInputSize(max_input);
     }
 
     AddConnection(conn);
@@ -409,9 +467,37 @@ void NetServer::SetTimerCb(CALLBACKS_NAMESPACE::NetSrvTimerCallback fn){
         callbacks_.timer_callback = std::move(fn);
 }
 
+void NetServer::ProcessSelfDispatcherTasks() {
+    for (auto& disp : socket_dispatchers_) {
+        if (disp->is_on_loop_thread()) {
+            disp->ProcessPendingTasks();
+            return;
+        }
+    }
+}
+
 bool NetServer::IsOnDispatcherThread() const {
     for (const auto& disp : socket_dispatchers_) {
         if (disp->is_on_loop_thread()) return true;
     }
     return false;
+}
+
+void NetServer::SetConnectionTimeout(std::chrono::seconds timeout) {
+    connection_timeout_sec_.store(static_cast<int>(timeout.count()),
+                                 std::memory_order_relaxed);
+    for (auto& disp : socket_dispatchers_) {
+        disp->EnQueue([d = disp, timeout]() {
+            d->SetTimeout(timeout);
+        });
+    }
+}
+
+void NetServer::SetTimerInterval(int seconds) {
+    timer_interval_ = seconds;
+    for (auto& disp : socket_dispatchers_) {
+        disp->EnQueue([d = disp, seconds]() {
+            d->SetTimerInterval(seconds);
+        });
+    }
 }

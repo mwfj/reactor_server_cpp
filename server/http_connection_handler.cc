@@ -22,6 +22,16 @@ void HttpConnectionHandler::SetUpgradeCallback(UpgradeCallback callback) {
     callbacks_.upgrade_callback = std::move(callback);
 }
 
+void HttpConnectionHandler::SetRequestCountCallback(
+    HTTP_CALLBACKS_NAMESPACE::HttpConnRequestCountCallback callback) {
+    callbacks_.request_count_callback = std::move(callback);
+}
+
+void HttpConnectionHandler::SetShutdownCheckCallback(
+    HTTP_CALLBACKS_NAMESPACE::HttpConnShutdownCheckCallback callback) {
+    callbacks_.shutdown_check_callback = std::move(callback);
+}
+
 void HttpConnectionHandler::SetMaxBodySize(size_t max) {
     max_body_size_ = max;
     parser_.SetMaxBodySize(max);
@@ -76,6 +86,10 @@ void HttpConnectionHandler::HandleUpgradedData(const std::string& data) {
 
 void HttpConnectionHandler::HandleParseError() {
     logging::Get()->warn("HTTP parse error fd={}: {}", conn_->fd(), parser_.GetError());
+    // Count parse errors as requests for stats consistency with HTTP/2
+    if (callbacks_.request_count_callback) {
+        callbacks_.request_count_callback();
+    }
     // Determine appropriate error response based on parser error type
     HttpResponse err_resp;
     switch (parser_.GetErrorType()) {
@@ -97,6 +111,11 @@ void HttpConnectionHandler::HandleParseError() {
 
 bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& remaining, size_t consumed) {
     const HttpRequest& req = parser_.GetRequest();
+
+    // Count every completed request parse — dispatched, rejected, or upgraded.
+    if (callbacks_.request_count_callback) {
+        callbacks_.request_count_callback();
+    }
 
     // Reject unsupported HTTP versions — only HTTP/1.0 and HTTP/1.1 supported.
     // llhttp will parse any major.minor (e.g. HTTP/2.0, HTTP/0.9), but this
@@ -130,7 +149,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
     // Any other value must be rejected with 417.
     if (req.HasHeader("expect")) {
         std::string expect = req.GetHeader("expect");
-        std::transform(expect.begin(), expect.end(), expect.begin(), ::tolower);
+        std::transform(expect.begin(), expect.end(), expect.begin(), [](unsigned char c){ return std::tolower(c); });
         while (!expect.empty() && (expect.front() == ' ' || expect.front() == '\t'))
             expect.erase(expect.begin());
         while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
@@ -171,6 +190,8 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                     mw_response.GetHeaders().empty()) {
                     mw_response.Status(403).Text("Forbidden");
                 }
+                logging::Get()->debug("WebSocket upgrade rejected by middleware fd={} path={}",
+                                      conn_->fd(), req.path);
                 mw_response.Header("Connection", "close");
                 SendResponse(mw_response);
                 CloseConnection();
@@ -225,7 +246,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         HttpResponse upgrade_resp = WebSocketHandshake::Accept(req);
         for (const auto& hdr : mw_response.GetHeaders()) {
             std::string key = hdr.first;
-            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c); });
             // Skip 101 mandatory headers, framing headers, and WS
             // negotiation headers. This server doesn't implement WS
             // extensions or subprotocol negotiation, so allowing
@@ -241,6 +262,22 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             }
             upgrade_resp.Header(hdr.first, hdr.second);
         }
+        // Late shutdown gate: the early route_check ran before middleware/101.
+        // Must check BEFORE sending 101 — once 101 is on the wire, clients
+        // expect a WebSocket session. Sending 101 then closing the TCP
+        // connection without a WS close frame is a protocol violation.
+        if (callbacks_.shutdown_check_callback &&
+            callbacks_.shutdown_check_callback()) {
+            logging::Get()->debug("WS upgrade rejected: server shutting down fd={}",
+                                  conn_->fd());
+            HttpResponse shutdown_resp;
+            shutdown_resp.Status(503).Text("Service Unavailable");
+            shutdown_resp.Header("Connection", "close");
+            SendResponse(shutdown_resp);
+            CloseConnection();
+            return false;
+        }
+
         SendResponse(upgrade_resp);
 
         // If the send failed (client disconnected), don't proceed with upgrade.
@@ -334,10 +371,10 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         bool resp_close = false;
         for (const auto& hdr : response.GetHeaders()) {
             std::string key = hdr.first;
-            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c); });
             if (key == "connection") {
                 std::string val = hdr.second;
-                std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+                std::transform(val.begin(), val.end(), val.begin(), [](unsigned char c){ return std::tolower(c); });
                 std::istringstream ss(val);
                 std::string token;
                 while (std::getline(ss, token, ',')) {
@@ -448,11 +485,20 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
     if (!sent_100_continue_ && parser_.GetRequest().headers_complete) {
         const auto& partial = parser_.GetRequest();
 
+        // Count early-rejected requests for stats consistency — these are
+        // valid request attempts rejected based on header content, before the
+        // body arrives. Matches HandleCompleteRequest + HandleParseError counting.
+        auto count_request = [this]() {
+            if (callbacks_.request_count_callback)
+                callbacks_.request_count_callback();
+        };
+
         // Early reject: unsupported HTTP version
         if (partial.http_major != 1 ||
             (partial.http_minor != 0 && partial.http_minor != 1)) {
             logging::Get()->warn("Early reject: unsupported HTTP version fd={}",
                                  conn_->fd());
+            count_request();
             HttpResponse ver_resp = HttpResponse::HttpVersionNotSupported();
             ver_resp.Header("Connection", "close");
             SendResponse(ver_resp);
@@ -463,6 +509,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
         // Early reject: HTTP/1.1 missing Host
         if (partial.http_minor >= 1 && !partial.HasHeader("host")) {
             logging::Get()->debug("Early reject: missing Host fd={}", conn_->fd());
+            count_request();
             HttpResponse bad_req = HttpResponse::BadRequest("Missing Host header");
             bad_req.Header("Connection", "close");
             SendResponse(bad_req);
@@ -477,6 +524,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
             partial.content_length > max_body_size_) {
             logging::Get()->warn("Early reject: Content-Length exceeds limit fd={}",
                                  conn_->fd());
+            count_request();
             HttpResponse err = HttpResponse::PayloadTooLarge();
             err.Header("Connection", "close");
             SendResponse(err);
@@ -487,7 +535,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
         // RFC 7231 §5.1.1: handle Expect header
         if (partial.HasHeader("expect")) {
             std::string expect = partial.GetHeader("expect");
-            std::transform(expect.begin(), expect.end(), expect.begin(), ::tolower);
+            std::transform(expect.begin(), expect.end(), expect.begin(), [](unsigned char c){ return std::tolower(c); });
             // Trim OWS (SP/HTAB per RFC 7230 §3.2.3)
             while (!expect.empty() && (expect.front() == ' ' || expect.front() == '\t'))
                 expect.erase(expect.begin());
@@ -497,7 +545,11 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
                 // Don't send 100 Continue for WebSocket upgrade requests —
                 // WebSocketHandshake::Validate() rejects body-bearing
                 // upgrades, so acknowledging the body is contradictory.
-                if (partial.upgrade) {
+                // llhttp sets upgrade=1 on both WebSocket GET and CONNECT.
+                // Only reject Expect: 100-continue for actual WS upgrades
+                // (GET). CONNECT with Expect is a valid HTTP/1.1 pattern.
+                if (partial.upgrade && partial.method == "GET") {
+                    count_request();
                     HttpResponse bad_req = HttpResponse::BadRequest(
                         "WebSocket upgrade must not have a request body");
                     bad_req.Header("Connection", "close");
@@ -513,6 +565,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
             } else {
                 // Unrecognized Expect value — RFC 7231 §5.1.1: 417
                 logging::Get()->debug("Early reject: unsupported Expect fd={}", conn_->fd());
+                count_request();
                 HttpResponse err;
                 err.Status(417, "Expectation Failed");
                 err.Header("Connection", "close");

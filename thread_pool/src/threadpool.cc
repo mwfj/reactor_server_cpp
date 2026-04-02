@@ -1,22 +1,43 @@
 #include "../include/threadpool.h"
 
 ThreadPool::~ThreadPool() {
-    // RAII: Ensure threads are properly stopped and joined during destruction
-    // This is safe because Stop() is idempotent - calling it multiple times is harmless
     Stop();
     JoinPendingSelfStop();
 }
 
 void ThreadPool::JoinPendingSelfStop() {
     if (pending_self_stop_.joinable()) {
-        pending_self_stop_.join();
+        if (pending_self_stop_.get_id() == std::this_thread::get_id()) {
+            // Self-destruction: a worker task is destroying the pool.
+            // This is not supported — there is no safe way to join a thread
+            // from within itself, and all orphan/detach workarounds introduce
+            // lifetime hazards or block unrelated shutdowns.
+            // The server architecture avoids this: Stop() is called from
+            // signal/handler threads, ~ThreadPool runs on the main thread
+            // after server_thread.join(). If this fires, it's a usage bug.
+            LogError("[ThreadPool] BUG: pool destroyed from its own worker task. "
+                     "Call Stop() from a non-worker thread, then destroy the pool.");
+            // Detach as last resort to avoid std::terminate from ~thread.
+            // The worker only accesses heap-allocated SharedState after this
+            // point (kept alive by shared_ptr in Run()).
+            pending_self_stop_.detach();
+        } else {
+            pending_self_stop_.join();
+        }
     }
 }
 
-inline void ThreadPool::SetThreadWorkerNum(int nums, bool set_by_init){
+void ThreadPool::LogError(const std::string& msg) {
+    std::lock_guard<std::mutex> lk(state_->logger_mtx);
+    if (state_->error_logger) {
+        state_->error_logger(msg);
+    } else {
+        std::cerr << msg << std::endl;
+    }
+}
+
+inline void ThreadPool::SetThreadWorkerNum(int nums, bool /*set_by_init*/){
     thread_nums = nums;
-    if(!set_by_init)
-        std::cout << "Set Max Worker Number to: " << nums << std::endl;
 }
 
 inline int ThreadPool::GetThreadWorkerNum(){
@@ -24,21 +45,18 @@ inline int ThreadPool::GetThreadWorkerNum(){
 }
 
 void ThreadPool::Init(int worker_nums){
-    std::lock_guard<std::mutex> lck(mtx_);
+    std::lock_guard<std::mutex> lck(state_->mtx);
     SetThreadWorkerNum(worker_nums, true);
-    std::cout << "[" << std::this_thread::get_id() << "]: Thread Pool Init, worker number: " << GetThreadWorkerNum() << std::endl;
 }
 
 void ThreadPool::Init(){
-    std::lock_guard<std::mutex> lck(mtx_);
+    std::lock_guard<std::mutex> lck(state_->mtx);
     // init the number of thread worker same as the CPU core number
     unsigned int suggested_workers = std::thread::hardware_concurrency() >> 1;
     if(suggested_workers == 0) {
-        std::cout << "Invalid core numbers, set to default number: "<< DEFAULT_THREAD_NUMS << "\n";
         suggested_workers = DEFAULT_THREAD_NUMS;
     }
     SetThreadWorkerNum(static_cast<int>(suggested_workers), true);
-    std::cout << "[" << std::this_thread::get_id() << "]: Thread Pool Init, worker number: " << GetThreadWorkerNum() << std::endl;
 }
 
 
@@ -46,34 +64,39 @@ void ThreadPool::Start(){
     // Join any pending self-stop worker from a previous Stop() cycle.
     // This acts as a barrier: the old worker has fully exited before
     // new workers are created, preventing untracked extra workers.
+    // If called from a worker thread (Stop+Start in same task), the
+    // barrier can't work (self-join). Reject to prevent leaked workers.
+    if (pending_self_stop_.joinable() &&
+        pending_self_stop_.get_id() == std::this_thread::get_id()) {
+        throw std::runtime_error(
+            "ThreadPool::Start() cannot be called from a worker task "
+            "after Stop() — the self-stop barrier requires a different thread");
+    }
     JoinPendingSelfStop();
 
-    std::lock_guard<std::mutex> lck(mtx_);
+    std::lock_guard<std::mutex> lck(state_->mtx);
 
     if(GetThreadWorkerNum() <= 0) {
-        std::cerr << "Thread Pool Start failed: thread count <= 0" << std::endl;
         throw std::runtime_error("Thread Pool Start failed: thread count <= 0");
     }
 
     if(!workers_.empty()){
-        std::cerr << "Thread Pool already started" << std::endl;
         throw std::runtime_error("Thread Pool already started");
     }
 
-    is_running_.store(true);
+    state_->is_running.store(true);
     workers_.reserve(static_cast<std::size_t>(GetThreadWorkerNum()));
 
     for(int idx = 0; idx < GetThreadWorkerNum(); idx ++){
         workers_.emplace_back(&ThreadPool::Run, this);
     }
-    std::cout << "[" << std::this_thread::get_id() << "]: ThreadPool Start" << std::endl;
 }
 
 void ThreadPool::Stop(){
     // Make Stop() idempotent - safe to call multiple times
     // Use compare_exchange to atomically check and set is_running_
     bool expected = true;
-    if (!is_running_.compare_exchange_strong(expected, false)) {
+    if (!state_->is_running.compare_exchange_strong(expected, false)) {
         // Already stopped (is_running_ was already false)
         return;
     }
@@ -82,11 +105,11 @@ void ThreadPool::Stop(){
     // This ensures that any thread checking the predicate in GetTask()
     // either sees is_running_==false OR receives the notification
     {
-        std::lock_guard<std::mutex> lck(mtx_);
-        // Lock establishes happens-before relationship with cv_.wait()
+        std::lock_guard<std::mutex> lck(state_->mtx);
+        // Lock establishes happens-before relationship with cv.wait()
     }
     // Signal all worker threads to exit (safe to call after releasing lock)
-    cv_.notify_all();
+    state_->cv.notify_all();
 
     // Wait for all worker threads to finish.
     // If Stop() is called from a worker thread (e.g., a request handler
@@ -106,7 +129,7 @@ void ThreadPool::Stop(){
     }
 
     {
-        std::lock_guard<std::mutex> lck(mtx_);
+        std::lock_guard<std::mutex> lck(state_->mtx);
         // throw exception for awaiting tasks
         for(const auto& task : tasks_){
             task -> SetException(std::make_exception_ptr(std::runtime_error("ThreadPool Stopped")));
@@ -114,30 +137,37 @@ void ThreadPool::Stop(){
         tasks_.clear();
         workers_.clear();
     }
-
-    std::cout << "[" << std::this_thread::get_id() << "]: ThreadPool Stopped" << std::endl;
 }
 
 void ThreadPool::Run() {
-    std::cout << "[" << std::this_thread::get_id() << "]: ThreadPool Begin Running" << "\n";
+    // Capture shared state and error logger locally so they survive pool
+    // destruction. If a task destroys the pool, this-> becomes dangling,
+    // but these locals keep the needed state alive for the unwind path.
+    auto local_state = state_;
+    auto log_error = [local_state](const std::string& msg) {
+        std::lock_guard<std::mutex> lk(local_state->logger_mtx);
+        if (local_state->error_logger) {
+            local_state->error_logger(msg);
+        } else {
+            std::cerr << msg << std::endl;
+        }
+    };
 
-    while(is_running()){
+    while(local_state->is_running.load()){
         std::shared_ptr<ThreadTaskInterface> task = GetTask();
 
-        // check the running status if no task get
         if(!task){
-            if(!is_running())
+            if(!local_state->is_running.load())
                 break;
             continue;
         }
 
-        // RAII guard to ensure running_threads_ is always decremented
-        running_threads_++;
+        local_state->running_threads++;
         struct RunningGuard {
             std::atomic<int>& counter;
             RunningGuard(std::atomic<int>& c) : counter(c) {}
             ~RunningGuard() { counter--; }
-        } guard(running_threads_);
+        } guard(local_state->running_threads);
 
         try{
             // Execute task
@@ -147,9 +177,9 @@ void ThreadPool::Run() {
             try {
                 task->SetValue(res);
             } catch(const std::exception& e) {
-                std::cerr << "[ThreadPool] SetValue() failed: " << e.what() << std::endl;
+                log_error(std::string("[ThreadPool] SetValue() failed: ") + e.what());
             } catch(...) {
-                std::cerr << "[ThreadPool] SetValue() failed with unknown exception" << std::endl;
+                log_error("[ThreadPool] SetValue() failed with unknown exception");
             }
         } catch(...) {
             // Task execution failed - capture exception
@@ -159,41 +189,46 @@ void ThreadPool::Run() {
                     std::rethrow_exception(ex);
                 }
             } catch (const std::exception& e){
-                std::cerr << "[ThreadPool] Task failed: " << e.what() << std::endl;
+                log_error(std::string("[ThreadPool] Task failed: ") + e.what());
             } catch(...) {
-                std::cerr << "[ThreadPool] Task failed with unknown exception" << std::endl;
+                log_error("[ThreadPool] Task failed with unknown exception");
             }
 
             // Set exception - wrap in try-catch to prevent thread termination
             try {
                 task->SetException(std::move(ex));
             } catch(const std::exception& e) {
-                std::cerr << "[ThreadPool] SetException() failed: " << e.what() << std::endl;
+                log_error(std::string("[ThreadPool] SetException() failed: ") + e.what());
             } catch(...) {
-                std::cerr << "[ThreadPool] SetException() failed with unknown exception" << std::endl;
+                log_error("[ThreadPool] SetException() failed with unknown exception");
             }
         }
         // running_threads_ automatically decremented by RunningGuard destructor
     }
-    std::cout << "[" << std::this_thread::get_id() << "]: End Run" << std::endl;
 }
 
 void ThreadPool::AddTask(std::shared_ptr<ThreadTaskInterface> task) {
     {
-        std::lock_guard<std::mutex> lck(mtx_);
+        std::lock_guard<std::mutex> lck(state_->mtx);
         if(!is_running())
             throw std::runtime_error("ThreadPool has been stopped");
-        task -> SetRunningChecker([this] {return is_running();});
+        // Capture state_ (shared_ptr) instead of this — the task's running
+        // checker must survive pool destruction (self-stop scenario).
+        auto s = state_;
+        task -> SetRunningChecker([s] {return s->is_running.load();});
         tasks_.push_back(std::move(task));
     }
-    cv_.notify_one();
+    state_->cv.notify_one();
 }
 
 std::shared_ptr<ThreadTaskInterface> ThreadPool::GetTask() {
-    std::unique_lock<std::mutex> lck(mtx_);
-    cv_.wait(lck, [this]{ return !is_running() || !tasks_.empty();});
+    std::unique_lock<std::mutex> lck(state_->mtx);
+    state_->cv.wait(lck, [this]{ return !is_running() || !tasks_.empty();});
 
-    if(tasks_.empty()){
+    // After shutdown, don't pop tasks — Stop() will set exceptions on
+    // remaining items. Without this, a queued task can still execute
+    // between is_running=false and Stop()'s join.
+    if(!is_running() || tasks_.empty()){
         return nullptr;
     }
 

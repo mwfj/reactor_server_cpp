@@ -113,7 +113,7 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
 
     // Regular headers — store lowercase (matching HTTP/1.x convention)
     std::string lower_name = name;
-    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), [](unsigned char c){ return std::tolower(c); });
 
     // Cookie headers in HTTP/2 may arrive as separate header fields
     // (RFC 9113 Section 8.2.3) — concatenate with "; "

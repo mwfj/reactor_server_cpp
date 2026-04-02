@@ -52,6 +52,8 @@ void Acceptor::SetNewConnCb(std::function<void(std::unique_ptr<SocketHandler>)> 
 
 // processing new connection from client
 void Acceptor::NewConnection(){
+    // Accept ALL pending connections in a loop (continued below).
+
     // Accept ALL pending connections in a loop.
     // Edge-triggered epoll only notifies ONCE, so we must drain the entire
     // queue to EAGAIN. Returning before EAGAIN means no future EPOLLIN edge
@@ -60,9 +62,31 @@ void Acceptor::NewConnection(){
     // don't accept. This prevents accepting new connections after Stop()
     // has started, even if the accept event and the close task are in the
     // same epoll batch and the accept fires first.
-    if (!acceptor_channel_ || acceptor_channel_->is_channel_closed()) {
-        logging::Get()->debug("Accept: listen socket closed, skipping");
+    if (!acceptor_channel_ || acceptor_channel_->is_channel_closed()
+        || closing_.load(std::memory_order_acquire)) {
+        logging::Get()->debug("Accept: listen socket closed/closing, skipping");
         return;
+    }
+
+    // Timed retry backoff: if an earlier ENOMEM set a retry deadline,
+    // sleep for the remaining backoff then proceed. The sleep blocks the
+    // conn_dispatcher briefly (~100ms max), which is acceptable:
+    //   - The conn_dispatcher only handles accepts (no socket I/O)
+    //   - ENOMEM is rare and transient
+    //   - This avoids both busy-spin (EnQueue loop) and starvation
+    //     (EnQueueDeferred under sustained traffic)
+    // Shutdown tasks enqueued during the sleep run on the next HandleEventId.
+    if (retry_due_at_ != std::chrono::steady_clock::time_point{}) {
+        auto now = std::chrono::steady_clock::now();
+        if (now < retry_due_at_) {
+            std::this_thread::sleep_for(retry_due_at_ - now);
+        }
+        retry_due_at_ = {};
+        // Re-check shutdown after sleep
+        if (closing_.load(std::memory_order_acquire) ||
+            event_dispatcher_->was_stopped()) {
+            return;
+        }
     }
 
     while(true){
@@ -99,17 +123,34 @@ void Acceptor::NewConnection(){
             continue;
         }
         if(client_fd == SocketHandler::ACCEPT_MEMORY_PRESSURE){
-            // Memory/buffer pressure (ENOBUFS/ENOMEM).
-            // The idle fd trick doesn't help — closing fds frees fd slots, not memory.
-            // Cannot drain the queue (accept keeps failing).
-            // Do NOT rely on EPOLL_CTL_MOD to re-trigger the ET edge — the epoll
-            // spec does not guarantee a new edge when the fd is already readable.
-            // Return and wait: the next new connection creates a readiness transition
-            // that fires a fresh edge, retrying the entire backlog. Existing backlog
-            // entries are delayed until memory pressure resolves, which is acceptable
-            // since the server cannot handle more connections under memory pressure.
+            // Memory/buffer pressure (ENOBUFS/ENOMEM). EnQueue a deferred
+            // retry — the WaitForEvent 1s timeout between the current event
+            // batch and the next provides natural backoff. If the EnQueue's
+            // WakeUp write also fails (full pipe under pressure), the timeout
+            // path's opportunistic task drain picks it up within ~1s.
+            // EnableReadMode alone is insufficient: EPOLL_CTL_MOD doesn't
+            // create a new edge when the socket is already readable.
             int saved_errno = errno;
-            logging::Get()->warn("Accept: memory pressure ({}), deferring", logging::SafeStrerror(saved_errno));
+            logging::Get()->warn("Accept: memory pressure ({}), retry in ~100ms",
+                                 logging::SafeStrerror(saved_errno));
+            // Set a timed retry: NewConnection() checks retry_due_at_ at
+            // entry and re-enqueues itself until the backoff elapses. Uses
+            // EnQueue (with WakeUp) so the task runs even under sustained
+            // traffic. Other tasks (shutdown barriers) run between passes.
+            static constexpr int ACCEPT_RETRY_MS = 100;
+            retry_due_at_ = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(ACCEPT_RETRY_MS);
+            event_dispatcher_->EnQueue([this]() {
+                NewConnection();
+            });
+            return;
+        }
+        // Re-check shutdown inside the loop: under a queued backlog, the
+        // pre-loop closing_ check passes but StopAccepting sets closing_=true
+        // while we're draining. Without this, a burst of post-stop connections
+        // is admitted until EAGAIN.
+        if (closing_.load(std::memory_order_acquire)) {
+            ::close(client_fd);
             return;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));

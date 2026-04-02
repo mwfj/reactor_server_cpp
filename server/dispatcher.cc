@@ -97,9 +97,19 @@ void Dispatcher::set_running_state(bool status){
 }
 
 void Dispatcher::RunEventLoop(){
-    set_running_state(true);
+    // If StopEventLoop was called before we started, bail out immediately.
+    if (was_stopped()) return;
 
+    set_running_state(true);
     thread_id_.store(std::this_thread::get_id(), std::memory_order_release);
+
+    // Recheck: StopEventLoop may have raced between our was_stopped check
+    // and set_running_state(true), setting is_running=false which we then
+    // overwrote. Catch this by rechecking was_stopped after arming is_running.
+    if (was_stopped()) {
+        set_running_state(false);
+        return;
+    }
 
     while(is_running()){
       try {
@@ -110,14 +120,29 @@ void Dispatcher::RunEventLoop(){
         // If no events, just continue loop (don't shutdown!)
         // The timeout is for periodic checking, not termination
         if(channels.size() == 0){
-            // Call timeout callback if set
+            // Drain queued tasks on timeout — if WakeUp's write failed
+            // (EAGAIN on full pipe/eventfd), tasks would be stranded until
+            // the next real I/O event without this opportunistic drain.
+            {
+                std::deque<std::function<void()>> tasks;
+                {
+                    std::lock_guard<std::mutex> lck(mtx_);
+                    if (!task_que_.empty()) tasks.swap(task_que_);
+                }
+                for (auto& fn : tasks) {
+                    try { fn(); } catch (...) {}
+                }
+            }
             if(callbacks_.timeout_trigger_callback){
                 callbacks_.timeout_trigger_callback(shared_from_this());
             }
             // Fallback timer for platforms without timerfd (macOS):
-            // Must also run here so idle connections are caught even with no traffic.
             if (is_sock_dispatcher_ && timer_fd_ < 0 && end_t_ > 0) {
-                TimerHandler();
+                auto now = std::chrono::steady_clock::now();
+                if (now - last_fallback_timer_ >= std::chrono::seconds(end_t_)) {
+                    last_fallback_timer_ = now;
+                    TimerHandler();
+                }
             }
             continue;
         }
@@ -145,10 +170,13 @@ void Dispatcher::RunEventLoop(){
         }
 
         // Fallback timer for platforms without timerfd (macOS):
-        // Run TimerHandler after processing events so it works even under load.
-        // WaitForEvent has a 1s timeout, so this runs approximately once per second.
+        // Throttled by end_t_ to match the configured scan interval.
         if (is_sock_dispatcher_ && timer_fd_ < 0 && end_t_ > 0) {
-            TimerHandler();
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_fallback_timer_ >= std::chrono::seconds(end_t_)) {
+                last_fallback_timer_ = now;
+                TimerHandler();
+            }
         }
 
       } catch (const std::exception& e) {
@@ -295,6 +323,18 @@ void Dispatcher::HandleEventId(){
     }
 }
 
+void Dispatcher::ProcessPendingTasks() {
+    std::deque<std::function<void()>> tasks;
+    {
+        std::lock_guard<std::mutex> lck(mtx_);
+        if (task_que_.empty()) return;
+        tasks.swap(task_que_);
+    }
+    for (auto& fn : tasks) {
+        try { fn(); } catch (...) {}
+    }
+}
+
 void Dispatcher::EnQueue(std::function<void()> fn){
     // Only discard tasks after explicit stop — allow during startup (before RunEventLoop)
     if (was_stopped_.load(std::memory_order_acquire)) return;
@@ -303,6 +343,13 @@ void Dispatcher::EnQueue(std::function<void()> fn){
         task_que_.push_back(fn);
     }
     WakeUp();
+}
+
+void Dispatcher::EnQueueDeferred(std::function<void()> fn) {
+    if (was_stopped_.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lck(mtx_);
+    task_que_.push_back(std::move(fn));
+    // No WakeUp — task picked up on next WaitForEvent timeout or HandleEventId
 }
 
 void Dispatcher::AddConnection(std::shared_ptr<ConnectionHandler> conn){
@@ -333,15 +380,30 @@ void Dispatcher::SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCal
     callbacks_.timeout_trigger_callback = std::move(fn);
 }
 
+void Dispatcher::SetTimerInterval(int interval) {
+    end_t_ = interval;
+    // Re-arm the timerfd immediately so a downward reload takes effect
+    // without waiting for the old (potentially much longer) interval to fire.
+    if (timer_fd_ >= 0 && interval > 0) {
+        TimeStamp::ResetTimerFd(timer_fd_, interval);
+    }
+}
+
 void Dispatcher::TimerHandler(){
     // Drain the timerfd expiration count before re-arming.
     // On Linux, timerfd stays readable until read(); without draining,
     // epoll_wait returns the timer channel continuously in a tight loop.
+    // On macOS/BSD (timer_fd_ < 0), the fallback timer in RunEventLoop
+    // calls TimerHandler directly — skip the fd operations.
 #if defined(__linux__)
-    uint64_t expirations;
-    ::read(timer_fd_, &expirations, sizeof(expirations));
+    if (timer_fd_ >= 0) {
+        uint64_t expirations;
+        ::read(timer_fd_, &expirations, sizeof(expirations));
+    }
 #endif
-    TimeStamp::ResetTimerFd(timer_fd_, end_t_);
+    if (timer_fd_ >= 0) {
+        TimeStamp::ResetTimerFd(timer_fd_, end_t_);
+    }
 
     // Periodic log rotation check. Uses try_lock — skips if another
     // dispatcher is already checking. No contention in steady state.

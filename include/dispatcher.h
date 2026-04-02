@@ -40,6 +40,8 @@ private:
     int timer_fd_;
     int end_t_; // the time that timer should triggered
     std::chrono::seconds timeout_; // Timeout duration for connection handler
+    // macOS fallback: throttle TimerHandler to run every end_t_ seconds
+    std::chrono::steady_clock::time_point last_fallback_timer_{};
 
     std::shared_ptr<Channel> timer_channel_;  // Must be shared_ptr because Channel uses shared_from_this()
     
@@ -76,7 +78,15 @@ public:
 
     void WakeUp();
     void HandleEventId();
+    // Process all queued tasks without requiring a wakeup signal.
+    // Used by stop-from-handler drain to pump enqueued tasks while
+    // the event loop is paused (blocked in a handler callback).
+    void ProcessPendingTasks();
     void EnQueue(std::function<void()>);
+    // Enqueue a task without waking the event loop. The task runs on the
+    // next natural WaitForEvent timeout (~1s) or next HandleEventId from
+    // another EnQueue. Used for deferred retries that need backoff.
+    void EnQueueDeferred(std::function<void()>);
     void AddConnection(std::shared_ptr<ConnectionHandler>);
     void RemoveTimerConnection(int fd);
     void RemoveTimerConnectionIfMatch(int fd, std::shared_ptr<ConnectionHandler> conn);
@@ -85,4 +95,13 @@ public:
     void SetTimerCB(CALLBACKS_NAMESPACE::DispatcherTimerCallback);
     void SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCallback);
     void TimerHandler();
+
+    // Update idle timeout duration at runtime. Must be called on the
+    // dispatcher thread (via EnQueue) to avoid racing with TimerHandler.
+    void SetTimeout(std::chrono::seconds timeout) { timeout_ = timeout; }
+
+    // Update timer scan interval at runtime and re-arm the timerfd so the
+    // new cadence takes effect immediately (not deferred to the next fire).
+    // Must be called on the dispatcher thread (via EnQueue).
+    void SetTimerInterval(int interval);
 };

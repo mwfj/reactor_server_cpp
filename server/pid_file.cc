@@ -221,3 +221,38 @@ pid_t PidFile::CheckRunning(const std::string& path) {
     //   -1 = not running
     return (pid > 0) ? pid : 0;
 }
+
+pid_t PidFile::CheckRunningHoldLock(const std::string& path, int& lock_fd) {
+    lock_fd = -1;
+    int fd = open(path.c_str(), O_RDWR | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return -1;
+    }
+    if (st.st_uid != geteuid()) {
+        close(fd);
+        return -1;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        flock(fd, LOCK_UN);
+        close(fd);
+        return -1;
+    }
+    if (errno != EWOULDBLOCK) {
+        close(fd);
+        return -1;
+    }
+
+    char buf[PID_BUF_SIZE];
+    ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+    pid_t pid = ParsePidBuf(buf, n);
+    if (pid > 0) {
+        lock_fd = fd;  // Keep fd open — caller closes after signaling
+        return pid;
+    }
+    close(fd);
+    return 0;
+}

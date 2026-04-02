@@ -56,6 +56,7 @@ static std::string ValidateLogLevel(const char* str) {
 static CliCommand ParseCommand(const char* str) {
     if (std::strcmp(str, "start") == 0)    return CliCommand::START;
     if (std::strcmp(str, "stop") == 0)     return CliCommand::STOP;
+    if (std::strcmp(str, "reload") == 0)   return CliCommand::RELOAD;
     if (std::strcmp(str, "status") == 0)   return CliCommand::STATUS;
     if (std::strcmp(str, "validate") == 0) return CliCommand::VALIDATE;
     if (std::strcmp(str, "config") == 0)   return CliCommand::CONFIG;
@@ -67,6 +68,7 @@ static CliCommand ParseCommand(const char* str) {
 // ── getopt_long option table ─────────────────────────────────────
 
 static constexpr int OPT_NO_HEALTH = 256;
+static constexpr int OPT_NO_STATS  = 257;
 
 // Global options — only -v/-V/-h, valid without a command
 static const struct option global_long_options[] = {
@@ -86,6 +88,7 @@ static const struct option subcmd_long_options[] = {
     {"workers",            required_argument, nullptr, 'w'},
     {"pid-file",           required_argument, nullptr, 'P'},
     {"no-health-endpoint", no_argument,       nullptr, OPT_NO_HEALTH},
+    {"no-stats-endpoint",  no_argument,       nullptr, OPT_NO_STATS},
     {"daemonize",          no_argument,       nullptr, 'd'},
     {nullptr, 0, nullptr, 0}
 };
@@ -130,7 +133,7 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
                 default:
                     throw std::runtime_error(
                         std::string("A command is required. Try '") +
-                        REACTOR_SERVER_NAME + " help' for usage.");
+                        argv[0] + " help' for usage.");
             }
         }
         // Reject trailing positional args (e.g., "-V foo")
@@ -146,7 +149,7 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
     if (options.command == CliCommand::NONE) {
         throw std::runtime_error(
             std::string("Unknown command: '") + argv[1] +
-            "'. Try '" + REACTOR_SERVER_NAME + " help' for usage.");
+            "'. Try '" + argv[0] + " help' for usage.");
     }
 
     // Commands that take no options (except version accepts -V).
@@ -206,6 +209,9 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
             case OPT_NO_HEALTH:
                 options.health_endpoint = false;
                 break;
+            case OPT_NO_STATS:
+                options.stats_endpoint = false;
+                break;
             case 'd':
                 options.daemonize = true;
                 break;
@@ -225,12 +231,13 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
     // Per-command option validation: reject flags that don't apply.
     auto cmd = options.command;
 
-    // stop/status only accept -P
-    if (cmd == CliCommand::STOP || cmd == CliCommand::STATUS) {
+    // stop/status/reload only accept -P
+    if (cmd == CliCommand::STOP || cmd == CliCommand::STATUS ||
+        cmd == CliCommand::RELOAD) {
         if (options.config_path_explicit || options.port >= 0 ||
             !options.host.empty() || !options.log_level.empty() ||
             options.workers >= 0 || !options.health_endpoint ||
-            options.daemonize) {
+            !options.stats_endpoint || options.daemonize) {
             throw std::runtime_error(
                 std::string("'") + argv[1] + "' only accepts -P/--pid-file");
         }
@@ -240,9 +247,9 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
     // config accepts -c, -p, -H, -l, -w but NOT -d or -P
     // Neither accepts --no-health-endpoint
     if (cmd == CliCommand::VALIDATE || cmd == CliCommand::CONFIG) {
-        if (!options.health_endpoint) {
+        if (!options.health_endpoint || !options.stats_endpoint) {
             throw std::runtime_error(
-                std::string("'") + argv[1] + "' does not accept --no-health-endpoint");
+                std::string("'") + argv[1] + "' does not accept --no-health-endpoint/--no-stats-endpoint");
         }
         if (cmd == CliCommand::CONFIG) {
             if (options.daemonize) {
@@ -273,6 +280,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "Commands:\n"
         << "  start       Start the server (foreground, or -d for daemon)\n"
         << "  stop        Stop a running server\n"
+        << "  reload      Reload configuration (daemon mode; shuts down foreground)\n"
         << "  status      Check server status\n"
         << "  validate    Validate configuration\n"
         << "  config      Show effective configuration\n"
@@ -289,8 +297,9 @@ void CliParser::PrintUsage(const char* program_name) {
         << "  -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)\n"
         << "  -d, --daemonize             Run as a background daemon\n"
         << "  --no-health-endpoint       Disable the /health endpoint\n"
+        << "  --no-stats-endpoint        Disable the /stats endpoint\n"
         << "\n"
-        << "Stop/status options:\n"
+        << "Stop/status/reload options:\n"
         << "  -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)\n"
         << "\n"
         << "Validate/config options:\n"
@@ -320,6 +329,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "  " << program_name << " start -p 9090 -l debug\n"
         << "  " << program_name << " start -c config/server.example.json\n"
         << "  " << program_name << " stop\n"
+        << "  " << program_name << " reload\n"
         << "  " << program_name << " status\n"
         << "  " << program_name << " validate -c config/server.example.json\n"
         << "  " << program_name << " config -p 9090 -l debug\n"
@@ -335,5 +345,5 @@ void CliParser::PrintVersionVerbose() {
               << "  Compiler:  " << __VERSION__ << " (C++17)\n"
               << "  OpenSSL:   " << OpenSSL_version(OPENSSL_VERSION) << "\n"
               << "  Platform:  " << REACTOR_PLATFORM << "\n"
-              << "  Features:  HTTP/1.1, WebSocket (RFC 6455), TLS/SSL\n";
+              << "  Features:  HTTP/1.1, HTTP/2 (RFC 9113), WebSocket (RFC 6455), TLS/SSL\n";
 }

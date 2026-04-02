@@ -132,6 +132,12 @@ static int OnHeaderCallback(
         logging::Get()->warn("HTTP/2 stream {} header list size ({}) exceeds limit ({})",
                              frame->hd.stream_id, stream->AccumulatedHeaderSize(),
                              self->MaxHeaderListSize());
+        // Only count as a request if this is the initial header block, not
+        // trailers. Trailers arrive after MarkHeadersComplete, so the stream
+        // was already counted/dispatched.
+        if (!stream->IsRejected() && !stream->GetRequest().headers_complete
+            && self->Callbacks().request_count_callback)
+            self->Callbacks().request_count_callback();
         stream->MarkRejected();
         nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                   frame->hd.stream_id, NGHTTP2_ENHANCE_YOUR_CALM);
@@ -147,6 +153,10 @@ static int OnHeaderCallback(
     // client protocol violations as server faults. MarkRejected() prevents
     // OnFrameRecvCallback from dispatching the malformed request.
     auto reject_protocol_error = [&]() -> int {
+        // Only count as a request for initial headers, not trailers
+        if (!stream->IsRejected() && !stream->GetRequest().headers_complete
+            && self->Callbacks().request_count_callback)
+            self->Callbacks().request_count_callback();
         stream->MarkRejected();
         nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                   frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
@@ -199,7 +209,7 @@ static int OnHeaderCallback(
         if (start != std::string::npos) {
             te_lower = te_lower.substr(start, end - start + 1);
         }
-        std::transform(te_lower.begin(), te_lower.end(), te_lower.begin(), ::tolower);
+        std::transform(te_lower.begin(), te_lower.end(), te_lower.begin(), [](unsigned char c){ return std::tolower(c); });
         if (te_lower != "trailers") {
             logging::Get()->warn("HTTP/2 stream {} received invalid TE value: {}",
                                  frame->hd.stream_id, hdr_value);
@@ -229,6 +239,9 @@ static int OnDataChunkRecvCallback(
         stream->AccumulatedBodySize() + len > self->MaxBodySize()) {
         logging::Get()->warn("HTTP/2 stream {} body exceeds max size ({})",
                              stream_id, self->MaxBodySize());
+        // Only count if not already counted/rejected in the HEADERS path
+        if (!stream->IsRejected() && self->Callbacks().request_count_callback)
+            self->Callbacks().request_count_callback();
         stream->MarkRejected();
         int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                            stream_id, NGHTTP2_CANCEL);
@@ -257,6 +270,8 @@ static int OnDataChunkRecvCallback(
     if (cl_violated) {
         logging::Get()->warn("HTTP/2 stream {} DATA exceeds declared content-length {}",
                              stream_id, req.content_length);
+        if (!stream->IsRejected() && self->Callbacks().request_count_callback)
+            self->Callbacks().request_count_callback();
         stream->MarkRejected();
         int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                            stream_id, NGHTTP2_PROTOCOL_ERROR);
@@ -286,6 +301,9 @@ static int OnFrameRecvCallback(
     case NGHTTP2_HEADERS: {
         auto* stream = self->FindStream(frame->hd.stream_id);
         if (!stream) break;
+        // Short-circuit: stream already rejected in OnHeaderCallback
+        // (header-list overflow, forbidden headers, bad TE, etc.)
+        if (stream->IsRejected()) break;
 
         if (frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
             // Initial request headers
@@ -313,6 +331,8 @@ static int OnFrameRecvCallback(
             if (!valid) {
                 logging::Get()->warn("HTTP/2 stream {} invalid pseudo-headers for {} request",
                                      frame->hd.stream_id, req.method);
+                if (self->Callbacks().request_count_callback)
+                    self->Callbacks().request_count_callback();
                 int rst_rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                                        frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
                 if (rst_rv < 0) {
@@ -329,6 +349,8 @@ static int OnFrameRecvCallback(
             if (self->MaxBodySize() > 0 && req.content_length > self->MaxBodySize()) {
                 logging::Get()->warn("HTTP/2 stream {} content-length {} exceeds max body size {}",
                                      frame->hd.stream_id, req.content_length, self->MaxBodySize());
+                if (self->Callbacks().request_count_callback)
+                    self->Callbacks().request_count_callback();
                 nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                           frame->hd.stream_id, NGHTTP2_CANCEL);
                 stream->MarkRejected();
@@ -340,7 +362,7 @@ static int OnFrameRecvCallback(
             // Must respond before END_STREAM to avoid stalling the upload.
             if (req.HasHeader("expect")) {
                 std::string expect = req.GetHeader("expect");
-                std::transform(expect.begin(), expect.end(), expect.begin(), ::tolower);
+                std::transform(expect.begin(), expect.end(), expect.begin(), [](unsigned char c){ return std::tolower(c); });
                 while (!expect.empty() && (expect.front() == ' ' || expect.front() == '\t'))
                     expect.erase(expect.begin());
                 while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
@@ -359,6 +381,8 @@ static int OnFrameRecvCallback(
                     // Unsupported Expect value — reject with 417.
                     logging::Get()->warn("HTTP/2 stream {} unsupported Expect: {}",
                                          frame->hd.stream_id, expect);
+                    if (self->Callbacks().request_count_callback)
+                        self->Callbacks().request_count_callback();
                     // submit_response2 queues the HTTP response (END_STREAM).
                     nghttp2_nv nva_417[] = {
                         {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
@@ -439,10 +463,12 @@ static int OnStreamCloseCallback(
     // Defer removal — never delete during nghttp2 callback
     self->MarkStreamForRemoval(stream_id);
 
-    // Notify the connection handler. It is safe to invoke std::function
-    // callbacks from within nghttp2 callbacks as long as we do not modify
-    // nghttp2 state (e.g., submit frames) inside the callback.
-    if (self->Callbacks().stream_close_callback) {
+    // Only notify if the stream was actually created (found in our map).
+    // Refused shutdown streams (RST_STREAM in OnBeginHeadersCallback)
+    // never call CreateStream(), so stream_open_callback never fired and
+    // counters were never incremented. Firing close_callback here would
+    // drive counters negative.
+    if (stream && self->Callbacks().stream_close_callback) {
         try {
             self->Callbacks().stream_close_callback(self->Owner(), stream_id, error_code);
         } catch (const std::exception& e) {
@@ -682,7 +708,7 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     lowered_names.reserve(headers.size());
     for (const auto& hdr : headers) {
         std::string key = hdr.first;
-        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c); });
         // Skip HTTP/1.x connection-level headers (RFC 9113 Section 8.2.2)
         if (key == "connection" || key == "keep-alive" ||
             key == "proxy-connection" || key == "te" ||
@@ -771,6 +797,13 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
 }
 
 void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id) {
+    // Count every dispatched request — including those rejected below by
+    // content-length checks. Matches HTTP/1's request_count_callback which
+    // fires at HandleCompleteRequest entry before any rejection.
+    if (callbacks_.request_count_callback) {
+        callbacks_.request_count_callback();
+    }
+
     // Request is complete — no longer incomplete for timeout purposes.
     OnStreamNoLongerIncomplete();
     stream->MarkCounterDecremented();
@@ -843,6 +876,13 @@ Http2Stream* Http2Session::CreateStream(int32_t stream_id) {
         return it->second.get();
     }
     OnStreamBecameIncomplete();
+    // Notify observer (HttpServer counters) of stream creation
+    if (callbacks_.stream_open_callback) {
+        try { callbacks_.stream_open_callback(Owner(), stream_id); }
+        catch (const std::exception& e) {
+            logging::Get()->error("Stream open callback error: {}", e.what());
+        }
+    }
     return it->second.get();
 }
 
@@ -859,6 +899,12 @@ void Http2Session::FlushDeferredRemovals() {
 
 size_t Http2Session::ActiveStreamCount() const {
     return streams_.size();
+}
+
+size_t Http2Session::UnclosedStreamCount() const {
+    size_t total = streams_.size();
+    size_t closing = streams_to_remove_.size();
+    return total > closing ? total - closing : 0;
 }
 
 std::chrono::steady_clock::time_point Http2Session::OldestIncompleteStreamStart() const {
@@ -913,6 +959,16 @@ void Http2Session::SetStreamCloseCallback(
     callbacks_.stream_close_callback = std::move(cb);
 }
 
+void Http2Session::SetStreamOpenCallback(
+    HTTP2_CALLBACKS_NAMESPACE::Http2StreamOpenCallback cb) {
+    callbacks_.stream_open_callback = std::move(cb);
+}
+
+void Http2Session::SetRequestCountCallback(
+    HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback cb) {
+    callbacks_.request_count_callback = std::move(cb);
+}
+
 // --- Flood protection ---
 
 bool Http2Session::CheckFloodProtection(
@@ -936,7 +992,8 @@ bool Http2Session::CheckFloodProtection(
         if (!(flags & NGHTTP2_FLAG_ACK)) {
             ++settings_count_;
             if (settings_count_ > HTTP2_CONSTANTS::MAX_SETTINGS_PER_INTERVAL) {
-                logging::Get()->warn("HTTP/2 SETTINGS flood detected");
+                logging::Get()->warn("HTTP/2 SETTINGS flood detected fd={}",
+                                     conn_ ? conn_->fd() : -1);
                 // Queue GOAWAY only — do NOT call SendPendingFrames() here.
                 // This callback runs inside nghttp2_session_mem_recv2; flushing
                 // output now (via mem_send2) while mem_recv2 is on the call stack
@@ -959,7 +1016,8 @@ bool Http2Session::CheckFloodProtection(
         if (!(flags & NGHTTP2_FLAG_ACK)) {
             ++ping_count_;
             if (ping_count_ > HTTP2_CONSTANTS::MAX_PING_PER_INTERVAL) {
-                logging::Get()->warn("HTTP/2 PING flood detected");
+                logging::Get()->warn("HTTP/2 PING flood detected fd={}",
+                                     conn_ ? conn_->fd() : -1);
                 if (!goaway_sent_) {
                     goaway_sent_ = true;
                     int32_t live_last = nghttp2_session_get_last_proc_stream_id(
@@ -975,7 +1033,8 @@ bool Http2Session::CheckFloodProtection(
     case NGHTTP2_RST_STREAM:
         ++rst_stream_count_;
         if (rst_stream_count_ > HTTP2_CONSTANTS::MAX_RST_STREAM_PER_INTERVAL) {
-            logging::Get()->warn("HTTP/2 RST_STREAM flood detected (rapid reset)");
+            logging::Get()->warn("HTTP/2 RST_STREAM flood detected (rapid reset) fd={}",
+                                 conn_ ? conn_->fd() : -1);
             if (!goaway_sent_) {
                 goaway_sent_ = true;
                 int32_t live_last = nghttp2_session_get_last_proc_stream_id(

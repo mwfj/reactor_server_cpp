@@ -25,14 +25,14 @@ struct HttpRequest {
     // Case-insensitive header lookup
     std::string GetHeader(const std::string& name) const {
         std::string lower = name;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c){ return std::tolower(c); });
         auto it = headers.find(lower);
         return (it != headers.end()) ? it->second : "";
     }
 
     bool HasHeader(const std::string& name) const {
         std::string lower = name;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c){ return std::tolower(c); });
         return headers.find(lower) != headers.end();
     }
 

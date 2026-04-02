@@ -11,6 +11,7 @@ enum class CliCommand {
     NONE,       // no command given → print usage
     START,      // start the server
     STOP,       // stop a running server
+    RELOAD,     // reload configuration (send SIGHUP)
     STATUS,     // check if server is running
     VALIDATE,   // validate configuration
     CONFIG,     // dump effective configuration
@@ -35,8 +36,9 @@ struct CliOptions {
     std::string pid_file = "/tmp/reactor_server.pid";
     bool pid_file_explicit = false;  // true if user passed -P/--pid-file
 
-    // Health endpoint
+    // Health/stats endpoints
     bool health_endpoint = true;
+    bool stats_endpoint = true;
 
     // Daemon mode
     bool daemonize = false;
