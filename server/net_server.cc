@@ -113,6 +113,10 @@ void NetServer::StopAccepting() {
     if (conn_dispatcher_->was_stopped()) return;  // already stopped
 
     if (conn_dispatcher_->is_running()) {
+        // Mark closing BEFORE enqueuing CloseListenSocket. Deferred accept
+        // retries already in the task queue check this flag and bail out,
+        // preventing new connections from being accepted after shutdown starts.
+        if (acceptor_) acceptor_->MarkClosing();
         // Event loop is active: enqueue close + barrier to ensure any
         // in-flight accept callback has finished before we return.
         conn_dispatcher_->EnQueue([this]() {

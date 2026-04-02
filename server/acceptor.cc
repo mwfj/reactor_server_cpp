@@ -62,8 +62,9 @@ void Acceptor::NewConnection(){
     // don't accept. This prevents accepting new connections after Stop()
     // has started, even if the accept event and the close task are in the
     // same epoll batch and the accept fires first.
-    if (!acceptor_channel_ || acceptor_channel_->is_channel_closed()) {
-        logging::Get()->debug("Accept: listen socket closed, skipping");
+    if (!acceptor_channel_ || acceptor_channel_->is_channel_closed()
+        || closing_.load(std::memory_order_acquire)) {
+        logging::Get()->debug("Accept: listen socket closed/closing, skipping");
         return;
     }
 

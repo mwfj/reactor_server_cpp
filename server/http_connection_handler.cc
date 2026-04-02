@@ -262,6 +262,22 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             }
             upgrade_resp.Header(hdr.first, hdr.second);
         }
+        // Late shutdown gate: the early route_check ran before middleware/101.
+        // Must check BEFORE sending 101 — once 101 is on the wire, clients
+        // expect a WebSocket session. Sending 101 then closing the TCP
+        // connection without a WS close frame is a protocol violation.
+        if (callbacks_.shutdown_check_callback &&
+            callbacks_.shutdown_check_callback()) {
+            logging::Get()->debug("WS upgrade rejected: server shutting down fd={}",
+                                  conn_->fd());
+            HttpResponse shutdown_resp;
+            shutdown_resp.Status(503).Text("Service Unavailable");
+            shutdown_resp.Header("Connection", "close");
+            SendResponse(shutdown_resp);
+            CloseConnection();
+            return false;
+        }
+
         SendResponse(upgrade_resp);
 
         // If the send failed (client disconnected), don't proceed with upgrade.
@@ -269,18 +285,6 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         if (conn_->IsClosing()) {
             logging::Get()->debug("WS upgrade: connection closed during 101 send fd={}",
                                   conn_->fd());
-            return false;
-        }
-
-        // Late shutdown gate: the early route_check ran before middleware/101.
-        // If shutdown started between then and now, abort the upgrade —
-        // this connection would miss the 1001 "Going Away" close frame
-        // and fall into the generic transport close path.
-        if (callbacks_.shutdown_check_callback &&
-            callbacks_.shutdown_check_callback()) {
-            logging::Get()->debug("WS upgrade aborted: server shutting down fd={}",
-                                  conn_->fd());
-            conn_->CloseAfterWrite();
             return false;
         }
 

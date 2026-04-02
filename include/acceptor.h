@@ -19,12 +19,21 @@ private:
     int idle_fd_ = -1;
 
     std::function<void(std::unique_ptr<SocketHandler>)> new_conn_cb_;
+    // Set by MarkClosing() from a non-dispatcher thread (StopAccepting)
+    // before enqueuing CloseListenSocket. Checked by deferred retries to
+    // prevent accepting new connections after shutdown starts.
+    std::atomic<bool> closing_{false};
 public:
     Acceptor() = delete;
     Acceptor(std::shared_ptr<Dispatcher>, const std::string&, const size_t);
     ~Acceptor();
 
     void NewConnection(); // process the request from client
+
+    // Signal that the listen socket is about to be closed. Thread-safe.
+    // Called from StopAccepting before enqueuing CloseListenSocket so
+    // deferred retries in the task queue see the flag immediately.
+    void MarkClosing() { closing_.store(true, std::memory_order_release); }
 
     // Close the listening socket and remove from epoll, releasing the port
     // immediately. Safe to call from the conn_dispatcher thread (sequentially
