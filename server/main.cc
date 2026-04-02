@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <exception>
 #if !defined(_WIN32)
+#include <sys/file.h>
 #include <syslog.h>
 #endif
 
@@ -86,7 +87,11 @@ static int HandleStatus(const CliOptions& options) {
 
 static int SendSignalToServer(const CliOptions& options, int sig,
                               const char* sig_name) {
-    pid_t pid = PidFile::CheckRunning(options.pid_file);
+    // Hold the flock fd open while signaling. If the server exits between
+    // CheckRunning and kill(), the kernel may reuse the PID. By keeping the
+    // fd open we can re-probe the lock after kill to detect this race.
+    int lock_fd = -1;
+    pid_t pid = PidFile::CheckRunningHoldLock(options.pid_file, lock_fd);
     if (pid < 0) {
         std::cout << REACTOR_SERVER_NAME << " is not running\n";
         return EXIT_ERROR;
@@ -96,14 +101,27 @@ static int SendSignalToServer(const CliOptions& options, int sig,
                   << " is running but PID is unreadable — cannot send signal\n";
         return EXIT_ERROR;
     }
+    int rc = EXIT_OK;
     if (kill(pid, sig) == 0) {
-        std::cout << "Sent " << sig_name << " to " << REACTOR_SERVER_NAME
-                  << " (PID " << pid << ")\n";
-        return EXIT_OK;
+        // Verify the lock is still held — if we can acquire it now, the
+        // server exited between our check and the kill, and we may have
+        // signaled an unrelated process that reused the PID.
+        if (lock_fd >= 0 && flock(lock_fd, LOCK_EX | LOCK_NB) == 0) {
+            flock(lock_fd, LOCK_UN);
+            std::cerr << "Warning: server exited before signal was delivered "
+                      << "(PID " << pid << " may have been reused)\n";
+            rc = EXIT_ERROR;
+        } else {
+            std::cout << "Sent " << sig_name << " to " << REACTOR_SERVER_NAME
+                      << " (PID " << pid << ")\n";
+        }
+    } else {
+        std::cerr << "Failed to send signal to PID " << pid
+                  << ": " << std::strerror(errno) << "\n";
+        rc = EXIT_ERROR;
     }
-    std::cerr << "Failed to send signal to PID " << pid
-              << ": " << std::strerror(errno) << "\n";
-    return EXIT_ERROR;
+    if (lock_fd >= 0) close(lock_fd);
+    return rc;
 }
 
 static int HandleStop(const CliOptions& options) {
@@ -114,7 +132,9 @@ static int HandleReload(const CliOptions& options) {
     int rc = SendSignalToServer(options, SIGHUP, "SIGHUP");
     if (rc == EXIT_OK) {
         std::cout << "Note: SIGHUP triggers config reload in daemon mode, "
-                  << "but shuts down foreground servers.\n";
+                  << "but shuts down foreground servers.\n"
+                  << "      If the server was launched with nohup, SIGHUP may "
+                  << "be silently ignored.\n";
     }
     return rc;
 }
@@ -660,8 +680,11 @@ static int HandleStart(const CliOptions& options) {
             // notify the daemon parent of failure so it doesn't hang.
             if (options.daemonize) Daemonizer::NotifyFailed();
 #endif
+            // Always surface the failure — even if shutdown was already
+            // requested. A teardown exception is a real error that
+            // systemd/supervisors should see (non-zero exit).
+            server_failed.store(true, std::memory_order_release);
             if (!SignalHandler::ShutdownRequested()) {
-                server_failed.store(true, std::memory_order_release);
                 kill(getpid(), SIGTERM);
             }
         }

@@ -22,5 +22,10 @@ public:
     // Returns: >0 = running (known PID), 0 = locked but PID unreadable, -1 = not running.
     static pid_t CheckRunning(const std::string& path);
 
+    // Like CheckRunning, but keeps the flock fd open so the caller can
+    // verify the lock is still held when signaling the PID. The caller
+    // must close lock_fd when done. On not-running, lock_fd is set to -1.
+    static pid_t CheckRunningHoldLock(const std::string& path, int& lock_fd);
+
     PidFile() = delete;
 };
