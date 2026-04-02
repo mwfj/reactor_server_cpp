@@ -60,12 +60,17 @@ NetServer::~NetServer(){
 void NetServer::Start(){
     socket_dispatchers_.reserve(sock_workers_.GetThreadWorkerNum());
     for(int idx = 0; idx < sock_workers_.GetThreadWorkerNum(); idx ++){
+        // Check for concurrent shutdown before each iteration.
+        // This limits the window between AddTask and cleanup — a worker
+        // that entered RunEventLoop will be stopped by the cleanup below.
+        if (conn_dispatcher_->was_stopped()) break;
+
         // Use configurable timer parameters
         std::shared_ptr<Dispatcher> task = std::make_shared<Dispatcher>(true, timer_interval_, connection_timeout_);
         // Initialize each socket dispatcher (required for eventfd setup)
         task->Init();
         socket_dispatchers_.emplace_back(task);
-        task->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1)); 
+        task->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
         task->SetTimerCB(std::bind(&NetServer::RemoveConnection, this, std::placeholders::_1));
 
         // Use lambda with COPY-BY-VALUE capture for thread safety
@@ -80,7 +85,9 @@ void NetServer::Start(){
     }
 
     // If Stop() was called while we were building dispatchers, clean up
-    // and return. Without this, we'd enter RunEventLoop and hang.
+    // and return. StopEventLoop on each dispatcher unblocks workers that
+    // may have already entered RunEventLoop, so sock_workers_.Stop() can
+    // join without hanging.
     if (conn_dispatcher_->was_stopped()) {
         for (auto& d : socket_dispatchers_)
             d->StopEventLoop();
@@ -180,12 +187,13 @@ void NetServer::Stop(){
 
     // If Start() hasn't finished building socket_dispatchers_, skip
     // dispatcher iteration to avoid racing with the vector build.
-    // Still stop sock_workers_ — StopAccepting() already set was_stopped_
-    // on the conn_dispatcher, so Start() will observe it and stop calling
-    // AddTask() before we join the workers. Without this, early-shutdown
-    // and never-started paths leave worker threads running until destruction.
+    // Don't stop sock_workers_ here — Start() checks was_stopped() in
+    // its build loop and handles dispatcher + worker cleanup itself.
+    // If Start() was never called, ~NetServer() stops the workers.
+    // Calling sock_workers_.Stop() here would hang: it joins workers,
+    // but workers in RunEventLoop() never exit without StopEventLoop(),
+    // and we can't safely iterate socket_dispatchers_ to stop them.
     if (!dispatchers_ready_.load(std::memory_order_acquire)) {
-        sock_workers_.Stop();
         return;
     }
 
@@ -277,10 +285,20 @@ void NetServer::Stop(){
     wait_for_dispatcher_barrier();
 
     // Fifth: Stop socket dispatcher event loops (conn_dispatcher already stopped above).
-    // StopEventLoop's WakeUp triggers one final loop iteration that processes any
-    // write-ready channels (from EnableWriteMode set above), draining buffered output.
-    for(auto task : socket_dispatchers_)
-        task -> StopEventLoop();
+    for(auto& task : socket_dispatchers_) {
+        if (task->is_on_loop_thread()) {
+            // Self-dispatcher (Stop called from a handler on this thread):
+            // enqueue StopEventLoop so the loop does one more WaitForEvent
+            // iteration before exiting. This lets write-ready channels
+            // (armed by CloseAfterWrite/EnableWriteMode in the barrier)
+            // fire and flush buffered output. A direct StopEventLoop would
+            // set is_running_=false immediately, and the loop would exit
+            // as soon as the current handler returns — truncating output.
+            task->EnQueue([t = task]() { t->StopEventLoop(); });
+        } else {
+            task->StopEventLoop();
+        }
+    }
 
     // Sixth: Now safe to join worker threads
     sock_workers_.Stop();
