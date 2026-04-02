@@ -23,6 +23,10 @@ private:
     // before enqueuing CloseListenSocket. Checked by deferred retries to
     // prevent accepting new connections after shutdown starts.
     std::atomic<bool> closing_{false};
+    // Timed retry for ENOBUFS/ENOMEM: set to the earliest time NewConnection
+    // should actually call accept(). If non-zero, NewConnection re-enqueues
+    // itself until the backoff elapses (letting other tasks run between passes).
+    std::chrono::steady_clock::time_point retry_due_at_{};
 public:
     Acceptor() = delete;
     Acceptor(std::shared_ptr<Dispatcher>, const std::string&, const size_t);

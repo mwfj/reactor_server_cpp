@@ -105,7 +105,11 @@ void HttpServer::RemoveConnection(std::shared_ptr<ConnectionHandler> conn) {
         return;
     }
     if (http_conn) {
-        active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+        // Only decrement if not upgraded — the upgrade callback already
+        // decremented active_http1_connections_ at upgrade time.
+        if (!http_conn->IsUpgraded()) {
+            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
     SafeNotifyWsClose(http_conn);
     OnWsDrainComplete(conn.get());
@@ -743,6 +747,10 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetUpgradeCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
                const HttpRequest& request) {
+            // Connection is no longer HTTP/1 — it's now WebSocket.
+            // Decrement here so /stats doesn't count WS as HTTP/1.
+            // RemoveConnection checks IsUpgraded() to skip the double-decrement.
+            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
             // total_requests_ already counted by request_count_callback
             auto ws_handler = router_.GetWebSocketHandler(request);
             if (ws_handler && self->GetWebSocket()) {
@@ -1149,11 +1157,25 @@ bool HttpServer::DetectAndRouteProtocol(
             h2_connections_[conn->fd()] = h2_conn;
         }
         h2_conn->Initialize(message);
-        // Late H2 detection during shutdown: send GOAWAY immediately so the
-        // peer knows the server is stopping. The close sweep + barrier wait
-        // will drain the GOAWAY before closing the transport.
+        // Late H2 detection during shutdown: full drain bookkeeping so
+        // WaitForH2Drain() tracks this session and NetServer::Stop() exempts
+        // it from the generic close sweep. Without this, active streams on
+        // late-detected H2 connections get cut off during shutdown.
         if (!server_ready_.load(std::memory_order_acquire)) {
+            ConnectionHandler* conn_ptr = conn.get();
+            h2_conn->SetDrainCompleteCallback([this, conn_ptr]() {
+                OnH2DrainComplete(conn_ptr);
+            });
+            {
+                std::lock_guard<std::mutex> dlck(drain_mtx_);
+                h2_draining_.push_back({h2_conn, conn});
+            }
+            net_server_.AddDrainingConn(conn_ptr);
             h2_conn->RequestShutdown();
+            // Re-check: connection may have closed during setup
+            if (conn->IsClosing()) {
+                OnH2DrainComplete(conn_ptr);
+            }
         }
         return true;
     }

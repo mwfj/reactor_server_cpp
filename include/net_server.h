@@ -129,6 +129,11 @@ public:
     void SetDrainingConns(std::set<ConnectionHandler*> conns) {
         draining_conns_ = std::move(conns);
     }
+    // Add a single connection to the drain-exempt set. Thread-safe for
+    // late additions during shutdown (e.g., H2 detected after snapshot).
+    void AddDrainingConn(ConnectionHandler* conn) {
+        draining_conns_.insert(conn);
+    }
 
     // Callback invoked after the first drain barrier, while event loops are
     // still running. Used by HttpServer to wait for HTTP/2 stream drain.

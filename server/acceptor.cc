@@ -68,6 +68,17 @@ void Acceptor::NewConnection(){
         return;
     }
 
+    // Timed retry backoff: if an earlier ENOMEM set a retry deadline,
+    // re-enqueue until the backoff elapses (lets other tasks run between
+    // passes). Each pass is ~1ms (EnQueue+WakeUp round-trip).
+    if (retry_due_at_ != std::chrono::steady_clock::time_point{}) {
+        if (std::chrono::steady_clock::now() < retry_due_at_) {
+            event_dispatcher_->EnQueue([this]() { NewConnection(); });
+            return;
+        }
+        retry_due_at_ = {};  // backoff elapsed, proceed to accept
+    }
+
     while(true){
         InetAddr client_addr;
         int client_fd = servsock_ -> Accept(client_addr);
@@ -110,15 +121,16 @@ void Acceptor::NewConnection(){
             // EnableReadMode alone is insufficient: EPOLL_CTL_MOD doesn't
             // create a new edge when the socket is already readable.
             int saved_errno = errno;
-            logging::Get()->warn("Accept: memory pressure ({}), deferring retry",
+            logging::Get()->warn("Accept: memory pressure ({}), retry in ~100ms",
                                  logging::SafeStrerror(saved_errno));
-            // Deferred retry without WakeUp — the task runs on the next
-            // WaitForEvent timeout (~1s), providing natural backoff under
-            // sustained pressure. EnQueue+WakeUp would retry immediately.
-            event_dispatcher_->EnQueueDeferred([this]() {
-                if (!acceptor_channel_ || acceptor_channel_->is_channel_closed()
-                    || event_dispatcher_->was_stopped())
-                    return;
+            // Set a timed retry: NewConnection() checks retry_due_at_ at
+            // entry and re-enqueues itself until the backoff elapses. Uses
+            // EnQueue (with WakeUp) so the task runs even under sustained
+            // traffic. Other tasks (shutdown barriers) run between passes.
+            static constexpr int ACCEPT_RETRY_MS = 100;
+            retry_due_at_ = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(ACCEPT_RETRY_MS);
+            event_dispatcher_->EnQueue([this]() {
                 NewConnection();
             });
             return;
