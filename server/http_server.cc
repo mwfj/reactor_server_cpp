@@ -1462,9 +1462,11 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
 
 HttpServer::ServerStats HttpServer::GetStats() const {
     ServerStats stats;
-    // Return 0 uptime before the ready callback sets start_time_ — avoids
-    // bogus values from default-constructed time_point{}.
-    if (server_ready_.load(std::memory_order_acquire)) {
+    // Compute uptime if start_time_ has been set (by MarkServerReady).
+    // Don't gate on server_ready_ — Stop() clears that before the drain
+    // phase, and /stats during graceful shutdown should still report the
+    // real uptime, not 0 (which looks like a restart to monitoring).
+    if (start_time_ != std::chrono::steady_clock::time_point{}) {
         auto now = std::chrono::steady_clock::now();
         stats.uptime_seconds = std::chrono::duration_cast<std::chrono::seconds>(
             now - start_time_).count();

@@ -1,36 +1,5 @@
 #include "../include/threadpool.h"
 
-// Process-level collector for worker threads that can't be joined inline
-// (self-join from destructor). Joined at process exit to avoid use-after-free.
-static std::mutex s_orphan_mtx;
-static std::vector<std::thread>* s_orphan_threads = nullptr;
-
-static void JoinOrphans() {
-    if (s_orphan_threads) {
-        for (auto& t : *s_orphan_threads) {
-            if (t.joinable()) t.join();
-        }
-        delete s_orphan_threads;
-        s_orphan_threads = nullptr;
-    }
-}
-
-static void AdoptOrphan(std::thread t) {
-    std::lock_guard<std::mutex> lk(s_orphan_mtx);
-    if (!s_orphan_threads) {
-        s_orphan_threads = new std::vector<std::thread>();
-        std::atexit(JoinOrphans);
-    }
-    // Eagerly join previous orphans to prevent unbounded accumulation.
-    // Workers exit promptly after Stop() (Run() breaks on is_running=false),
-    // so these joins return quickly.
-    for (auto& th : *s_orphan_threads) {
-        if (th.joinable()) th.join();
-    }
-    s_orphan_threads->clear();
-    s_orphan_threads->push_back(std::move(t));
-}
-
 ThreadPool::~ThreadPool() {
     Stop();
     JoinPendingSelfStop();
@@ -40,14 +9,12 @@ void ThreadPool::JoinPendingSelfStop() {
     if (pending_self_stop_.joinable()) {
         if (pending_self_stop_.get_id() == std::this_thread::get_id()) {
             // Self-join scenario: destructor running on a worker thread.
-            // Move to process-level collector — joined at process exit.
-            // Safe because Run() captures a local shared_ptr<SharedState>:
-            // after the task that destroyed the pool returns, the worker
-            // only accesses heap-allocated SharedState (is_running, mtx,
-            // cv, running_threads) — never pool-local members. The
-            // shared_ptr keeps SharedState alive until Run() returns and
-            // the thread exits, regardless of when the pool is freed.
-            AdoptOrphan(std::move(pending_self_stop_));
+            // Detach — the worker exits promptly (is_running=false) and
+            // only accesses heap-allocated SharedState after this point.
+            // The shared_ptr<SharedState> captured in Run() keeps it alive.
+            // Detach is safe here because there are no pool-local members
+            // accessed after Stop() returns from the task.
+            pending_self_stop_.detach();
         } else {
             pending_self_stop_.join();
         }

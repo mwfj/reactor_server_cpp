@@ -393,11 +393,17 @@ void Dispatcher::TimerHandler(){
     // Drain the timerfd expiration count before re-arming.
     // On Linux, timerfd stays readable until read(); without draining,
     // epoll_wait returns the timer channel continuously in a tight loop.
+    // On macOS/BSD (timer_fd_ < 0), the fallback timer in RunEventLoop
+    // calls TimerHandler directly — skip the fd operations.
 #if defined(__linux__)
-    uint64_t expirations;
-    ::read(timer_fd_, &expirations, sizeof(expirations));
+    if (timer_fd_ >= 0) {
+        uint64_t expirations;
+        ::read(timer_fd_, &expirations, sizeof(expirations));
+    }
 #endif
-    TimeStamp::ResetTimerFd(timer_fd_, end_t_);
+    if (timer_fd_ >= 0) {
+        TimeStamp::ResetTimerFd(timer_fd_, end_t_);
+    }
 
     // Periodic log rotation check. Uses try_lock — skips if another
     // dispatcher is already checking. No contention in steady state.
