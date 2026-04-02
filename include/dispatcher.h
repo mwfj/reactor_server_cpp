@@ -83,6 +83,10 @@ public:
     // the event loop is paused (blocked in a handler callback).
     void ProcessPendingTasks();
     void EnQueue(std::function<void()>);
+    // Enqueue a task without waking the event loop. The task runs on the
+    // next natural WaitForEvent timeout (~1s) or next HandleEventId from
+    // another EnQueue. Used for deferred retries that need backoff.
+    void EnQueueDeferred(std::function<void()>);
     void AddConnection(std::shared_ptr<ConnectionHandler>);
     void RemoveTimerConnection(int fd);
     void RemoveTimerConnectionIfMatch(int fd, std::shared_ptr<ConnectionHandler> conn);

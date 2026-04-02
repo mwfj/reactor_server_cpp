@@ -345,6 +345,13 @@ void Dispatcher::EnQueue(std::function<void()> fn){
     WakeUp();
 }
 
+void Dispatcher::EnQueueDeferred(std::function<void()> fn) {
+    if (was_stopped_.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lck(mtx_);
+    task_que_.push_back(std::move(fn));
+    // No WakeUp — task picked up on next WaitForEvent timeout or HandleEventId
+}
+
 void Dispatcher::AddConnection(std::shared_ptr<ConnectionHandler> conn){
     connections_[conn -> fd()] = conn;
 }

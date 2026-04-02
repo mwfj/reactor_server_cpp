@@ -169,8 +169,9 @@ static size_t ValidatePort(int port) {
 
 HttpServer::HttpServer(const std::string& ip, int port)
     : net_server_(ValidateHost(ip), ValidatePort(port),
-                  10,                          // scan interval: 30s default timeout / 3
-                  std::chrono::seconds(300),   // default idle timeout
+                  ComputeTimerInterval(ServerConfig{}.idle_timeout_sec,
+                                       ServerConfig{}.request_timeout_sec),
+                  std::chrono::seconds(ServerConfig{}.idle_timeout_sec),
                   ServerConfig{}.worker_threads)
 {
     WireNetServerCallbacks();
@@ -342,18 +343,44 @@ void HttpServer::Stop() {
             try {
                 ws->SendClose(1001, "Going Away");
                 if (conn) {
-                    // Backpressured: arm CloseAfterWrite so the drain path
-                    // extends the write window until the close frame flushes.
-                    // Idle: SendClose's 5s deadline handles the handshake.
-                    // Both cases: track in ws_draining so the pre-stop wait
-                    // knows when all WS connections have actually closed.
-                    if (conn->OutputBufferSize() > 0) {
-                        conn->CloseAfterWrite();
-                    }
+                    // SendClose arms a 5s deadline and writes the close frame
+                    // to the output buffer (EnableWriteMode set by SendFrame).
+                    // The buffer drains naturally via the write path — both
+                    // backpressured and idle connections are handled the same.
+                    // Do NOT call CloseAfterWrite: it force-closes when the
+                    // buffer empties, before the peer can send its close reply,
+                    // resulting in 1006 instead of a clean close handshake.
                     ws_draining.insert(conn.get());
                 }
             }
             catch (...) {}
+        }
+    }
+
+    // Rescan: catch keep-alive connections that upgraded to WS between the
+    // initial snapshot and now. These late upgrades missed the 1001 close
+    // frame above. The window is small but real under concurrent traffic.
+    {
+        std::vector<std::pair<std::shared_ptr<HttpConnectionHandler>,
+                              std::shared_ptr<ConnectionHandler>>> late_ws;
+        {
+            std::lock_guard<std::mutex> lck(conn_mtx_);
+            for (auto& pair : http_connections_) {
+                auto* ws = pair.second->GetWebSocket();
+                if (!ws || !ws->IsOpen()) continue;
+                auto conn = pair.second->GetConnection();
+                if (!conn || ws_draining.count(conn.get())) continue;
+                late_ws.emplace_back(pair.second, conn);
+            }
+        }
+        for (auto& [http_conn, conn] : late_ws) {
+            auto* ws = http_conn->GetWebSocket();
+            if (ws && ws->IsOpen()) {
+                try {
+                    ws->SendClose(1001, "Going Away");
+                    if (conn) ws_draining.insert(conn.get());
+                } catch (...) {}
+            }
         }
     }
 

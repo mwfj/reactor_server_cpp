@@ -111,11 +111,10 @@ void Acceptor::NewConnection(){
             int saved_errno = errno;
             logging::Get()->warn("Accept: memory pressure ({}), deferring retry",
                                  logging::SafeStrerror(saved_errno));
-            // Enqueue a non-blocking retry. The event loop cycle (EnQueue →
-            // WakeUp → WaitForEvent → HandleEventId) provides natural spacing
-            // without stalling the accept dispatcher. Other queued tasks
-            // (shutdown barriers, close callbacks) run between retries.
-            event_dispatcher_->EnQueue([this]() {
+            // Deferred retry without WakeUp — the task runs on the next
+            // WaitForEvent timeout (~1s), providing natural backoff under
+            // sustained pressure. EnQueue+WakeUp would retry immediately.
+            event_dispatcher_->EnQueueDeferred([this]() {
                 if (!acceptor_channel_ || acceptor_channel_->is_channel_closed()
                     || event_dispatcher_->was_stopped())
                     return;
