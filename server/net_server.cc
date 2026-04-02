@@ -92,9 +92,12 @@ void NetServer::Start(){
     // silently queue work that never runs.
     {
         static constexpr int DISPATCHER_START_TIMEOUT_SEC = 5;
-        auto deadline = std::chrono::steady_clock::now()
-                      + std::chrono::seconds(DISPATCHER_START_TIMEOUT_SEC);
         for (auto& disp : socket_dispatchers_) {
+            // Per-dispatcher deadline — each gets the full timeout window.
+            // A shared deadline across all dispatchers would starve later
+            // ones on slow/loaded machines with many worker threads.
+            auto deadline = std::chrono::steady_clock::now()
+                          + std::chrono::seconds(DISPATCHER_START_TIMEOUT_SEC);
             while (!disp->is_running() && !disp->was_stopped()) {
                 if (std::chrono::steady_clock::now() > deadline) {
                     logging::Get()->error(
@@ -168,8 +171,10 @@ void NetServer::Stop(){
     // If Start() hasn't finished building socket_dispatchers_, it will
     // detect was_stopped_ (set by StopAccepting) and clean up on its own.
     // Skip dispatcher iteration to avoid racing with the vector build.
+    // Do NOT stop sock_workers_ here — Start() may still be calling
+    // AddTask(), and stopping the pool would turn a normal early shutdown
+    // into a "ThreadPool has been stopped" exception.
     if (!dispatchers_ready_.load(std::memory_order_acquire)) {
-        sock_workers_.Stop();  // idempotent — safe if Start() also calls it
         return;
     }
 

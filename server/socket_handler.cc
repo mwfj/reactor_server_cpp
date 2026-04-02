@@ -94,7 +94,8 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
     // on an fd that may already belong to another connection.
     SetNonBlocking(clientfd);
     if (fcntl(clientfd, F_GETFL) == -1) {
-        // fd is dead — treat as aborted connection, continue draining
+        // fd is dead or fcntl was interrupted — close to prevent fd leak.
+        ::close(clientfd);
         return ACCEPT_CONN_ABORTED;
     }
 #endif
