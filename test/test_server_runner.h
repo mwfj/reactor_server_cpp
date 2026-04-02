@@ -47,13 +47,20 @@ public:
                 server.Start();
             } catch (...) {
                 // Unblock the test thread with the real error.
-                // If the ready callback already set the value (server started
-                // but threw later during the event loop), the promise is
-                // already satisfied — set_exception throws future_error.
+                auto server_ex = std::current_exception();
                 try {
-                    shared_promise->set_exception(std::current_exception());
+                    shared_promise->set_exception(server_ex);
                 } catch (const std::future_error&) {
-                    // Promise already satisfied — ignore.
+                    // Promise already satisfied — server threw after the
+                    // ready callback. Log the real error so it's not silently
+                    // swallowed, turning into misleading connection failures.
+                    try { std::rethrow_exception(server_ex); }
+                    catch (const std::exception& e) {
+                        std::cerr << "TestServerRunner: post-ready exception: "
+                                  << e.what() << "\n";
+                    } catch (...) {
+                        std::cerr << "TestServerRunner: unknown post-ready exception\n";
+                    }
                 }
             }
         });

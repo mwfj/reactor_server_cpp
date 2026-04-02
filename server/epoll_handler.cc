@@ -37,7 +37,8 @@ void EpollHandler::UpdateEvent(std::shared_ptr<Channel> ch){
     }
 
     epoll_event ev;
-    ev.data.ptr = ch.get(); // Store raw pointer for epoll
+    memset(&ev, 0, sizeof(ev));
+    ev.data.fd = fd;  // Store fd for O(1) lookup in WaitForEvent
     ev.events = ch->Event();
 
     if(ch->is_read_event()){
@@ -124,25 +125,22 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
     // Reserve space to avoid reallocations
     channels.reserve(infds);
 
-    for(int idx = 0; idx < infds; idx++){
-        Channel *ch_raw = static_cast<Channel*>(events_[idx].data.ptr);
-
-        // CRITICAL: Lock and validate BEFORE dereferencing the raw pointer
-        // The channel may have been deleted between epoll_wait() returning and now
+    {
+        // Lock once for all events — prevents channel_map_ from changing
+        // while we process the batch.
         std::lock_guard<std::mutex> lock(channel_map_mutex_);
 
-        // Find the shared_ptr by searching for matching raw pointer
-        std::shared_ptr<Channel> ch;
-        for(auto& pair : channel_map_) {
-            if(pair.second && pair.second.get() == ch_raw) {
-                ch = pair.second;
-                break;
-            }
-        }
+        for(int idx = 0; idx < infds; idx++){
+            int event_fd = events_[idx].data.fd;
 
-        // Only dereference if we found a valid shared_ptr
-        if(ch) {
-            ch->SetDEvent(events_[idx].events);  // NOW SAFE - we hold a shared_ptr
+            // O(log N) lookup by fd instead of O(N) linear scan
+            auto it = channel_map_.find(event_fd);
+            if(it == channel_map_.end() || !it->second) {
+                continue;  // Channel was removed between epoll_wait and now
+            }
+
+            auto& ch = it->second;
+            ch->SetDEvent(events_[idx].events);
             channels.push_back(ch);
         }
     }

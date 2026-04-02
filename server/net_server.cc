@@ -6,6 +6,8 @@
 #include <csignal>
 #include <future>
 
+static constexpr int STOP_BARRIER_TIMEOUT_SEC = 5;
+
 NetServer::NetServer(const std::string& _ip, const size_t _port,
                      int timer_interval,
                      std::chrono::seconds connection_timeout,
@@ -140,12 +142,21 @@ void NetServer::StopAccepting() {
             auto barrier = std::make_shared<std::promise<void>>();
             auto future = barrier->get_future();
             conn_dispatcher_->EnQueue([barrier]() { barrier->set_value(); });
-            future.wait();
+            if (future.wait_for(std::chrono::seconds(STOP_BARRIER_TIMEOUT_SEC))
+                    == std::future_status::timeout) {
+                logging::Get()->error(
+                    "conn_dispatcher barrier timed out during StopAccepting");
+            }
         }
     } else {
-        // Event loop not started (Stop before Start, ready_callback shutdown):
-        // close synchronously — no concurrent accept callbacks possible.
+        // Event loop not started (Stop before Start, ready_callback shutdown).
+        // Set was_stopped BEFORE closing so that CloseChannel's off-loop
+        // check sees was_stopped_ == true and takes the inline path.
+        // Without this, CloseChannel enqueues the fd close to a dispatcher
+        // that will never run, leaving the listen socket bound.
+        conn_dispatcher_->StopEventLoop();
         if (acceptor_) acceptor_->CloseListenSocket();
+        return;  // StopEventLoop already called
     }
     conn_dispatcher_->StopEventLoop();
 }
@@ -202,7 +213,6 @@ void NetServer::Stop(){
     // triggers one final WaitForEvent that includes the write-ready channels.
     // Wait for each socket dispatcher to process enqueued work.
     // Skips self-dispatcher to avoid deadlock when Stop() is called from a handler.
-    static constexpr int STOP_BARRIER_TIMEOUT_SEC = 5;
     auto wait_for_dispatcher_barrier = [this]() {
         for (auto& disp : socket_dispatchers_) {
             if (disp->was_stopped()) continue;

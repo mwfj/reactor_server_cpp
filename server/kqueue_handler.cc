@@ -92,9 +92,13 @@ void KqueueHandler::UpdateEvent(std::shared_ptr<Channel> ch){
             if (saved_errno == ENOENT) {
                 continue;  // Filter wasn't registered — skip, try next
             }
+            // Fatal error (ENOMEM, EINVAL, etc.) — throw so callers like
+            // Dispatcher::Init() and Acceptor() propagate the failure
+            // instead of silently running with an unregistered channel.
+            // Matches EpollHandler::UpdateEvent() which also throws.
             logging::Get()->error("kevent failed (fd={}): {}", fd, logging::SafeStrerror(saved_errno));
-            // Continue applying remaining changes — don't abort on partial failure.
-            // Ownership is already established in channel_map_.
+            throw std::runtime_error(
+                std::string("kevent failed: ") + logging::SafeStrerror(saved_errno));
         }
     }
 
@@ -198,15 +202,16 @@ std::vector<std::shared_ptr<Channel>> KqueueHandler::WaitForEvent(int timeout){
                 continue;
             }
 
+            // O(log N) lookup by fd (ident) instead of O(N) linear scan.
+            // Also verify the raw pointer matches to guard against fd reuse.
+            int event_fd = static_cast<int>(events_[idx].ident);
             Channel *ch_raw = static_cast<Channel*>(events_[idx].udata);
 
-            // Find the shared_ptr by searching for matching raw pointer
+            auto it = channel_map_.find(event_fd);
             std::shared_ptr<Channel> ch;
-            for(auto& pair : channel_map_) {
-                if(pair.second && pair.second.get() == ch_raw) {
-                    ch = pair.second;
-                    break;
-                }
+            if (it != channel_map_.end() && it->second
+                && it->second.get() == ch_raw) {
+                ch = it->second;
             }
 
             // Only process if we found a valid shared_ptr
