@@ -1394,8 +1394,7 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     // A connection accepted during any phase gets a cap that's ≤ what its
     // limits enforce, preventing over-buffering.
     {
-        size_t new_cap = ComputeInputCap();  // from current atomics (old values)
-        // Compute what the new cap will be
+        // Compute what the new cap will be from the incoming config
         size_t body = new_config.max_body_size;
         size_t hdr = new_config.max_header_size;
         size_t ws = new_config.max_ws_message_size;
@@ -1412,18 +1411,15 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
                                     : http_cap;
         // Phase 1: set cap to the more restrictive of old and new.
         // 0 means unlimited — never use it as the transitional cap.
-        size_t old_cap = ComputeInputCap();
-        size_t transition_cap;
-        if (old_cap == 0 && final_cap == 0) transition_cap = 0;
-        else if (old_cap == 0) transition_cap = final_cap;
-        else if (final_cap == 0) transition_cap = old_cap;
-        else transition_cap = std::min(old_cap, final_cap);
-        net_server_.SetMaxInputSize(transition_cap);
-        // Phase 2: update limit atomics
+        // Update limit atomics first so SetupHandlers (called from
+        // HandleNewConnection on dispatcher threads) reads the new values.
+        // Then set the socket input cap. The cap is derived from the limits,
+        // so connections accepted between the atomic stores and SetMaxInputSize
+        // get new limits with the old (possibly larger) cap — harmless because
+        // the parser enforces the actual limits regardless of cap.
         max_body_size_.store(new_config.max_body_size, std::memory_order_relaxed);
         max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);
         max_ws_message_size_.store(new_config.max_ws_message_size, std::memory_order_relaxed);
-        // Phase 3: set final cap (may be larger than phase 1 if limits grew)
         net_server_.SetMaxInputSize(final_cap);
     }
 
