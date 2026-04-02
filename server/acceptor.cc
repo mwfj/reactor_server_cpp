@@ -136,6 +136,14 @@ void Acceptor::NewConnection(){
             });
             return;
         }
+        // Re-check shutdown inside the loop: under a queued backlog, the
+        // pre-loop closing_ check passes but StopAccepting sets closing_=true
+        // while we're draining. Without this, a burst of post-stop connections
+        // is admitted until EAGAIN.
+        if (closing_.load(std::memory_order_acquire)) {
+            ::close(client_fd);
+            return;
+        }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));
         new_conn_cb_(std::move(client_sock));
     }

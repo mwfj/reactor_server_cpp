@@ -469,6 +469,19 @@ void HttpServer::Stop() {
     // the generic close sweep in NetServer::Stop().
     draining_conn_ptrs.insert(ws_draining.begin(), ws_draining.end());
 
+    // Exempt pending-detection connections from the close sweep. These
+    // haven't been classified yet — they might become H2 (slow h2c preface
+    // or post-TLS ALPN). If the close sweep CloseAfterWrite's them before
+    // detection finishes, late H2 sessions get truncated despite the drain
+    // bookkeeping in DetectAndRouteProtocol. Once detected, the late H2
+    // path adds its own entry via AddDrainingConn.
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        for (auto& [fd, pd] : pending_detection_) {
+            if (pd.conn) draining_conn_ptrs.insert(pd.conn.get());
+        }
+    }
+
     if (!draining_conn_ptrs.empty()) {
         net_server_.SetDrainingConns(std::move(draining_conn_ptrs));
     }
