@@ -640,29 +640,33 @@ void HttpServer::Stop() {
                 }
             }
             // Re-check for late H2 sessions (same as off-thread path).
+            // Must release drain_mtx_ before ProcessSelfDispatcherTasks:
+            // H2 drain callbacks call OnH2DrainComplete which takes drain_mtx_.
             {
+                auto deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(
+                                    shutdown_drain_timeout_sec_.load(
+                                        std::memory_order_relaxed));
+                bool has_late = false;
+                { std::lock_guard<std::mutex> lck(drain_mtx_); has_late = !h2_draining_.empty(); }
+                while (has_late && std::chrono::steady_clock::now() < deadline) {
+                    net_server_.ProcessSelfDispatcherTasks();
+                    std::unique_lock<std::mutex> lck(drain_mtx_);
+                    if (h2_draining_.empty()) break;
+                    drain_cv_.wait_for(lck, std::chrono::milliseconds(PUMP_INTERVAL_MS));
+                    has_late = !h2_draining_.empty();
+                }
+                // Force-close remaining late H2 sessions.
                 std::unique_lock<std::mutex> lck(drain_mtx_);
                 if (!h2_draining_.empty()) {
-                    auto deadline = std::chrono::steady_clock::now() +
-                                    std::chrono::seconds(
-                                        shutdown_drain_timeout_sec_.load(
-                                            std::memory_order_relaxed));
-                    while (std::chrono::steady_clock::now() < deadline) {
-                        net_server_.ProcessSelfDispatcherTasks();
-                        if (h2_draining_.empty()) break;
-                        drain_cv_.wait_for(lck,
-                            std::chrono::milliseconds(PUMP_INTERVAL_MS));
-                    }
-                    if (!h2_draining_.empty()) {
-                        logging::Get()->warn(
-                            "Late H2 drain timeout, force-closing {} remaining",
-                            h2_draining_.size());
-                        auto remaining = std::move(h2_draining_);
-                        h2_draining_.clear();
-                        lck.unlock();
-                        for (auto& d : remaining) {
-                            if (d.conn) d.conn->ForceClose();
-                        }
+                    logging::Get()->warn(
+                        "Late H2 drain timeout, force-closing {} remaining",
+                        h2_draining_.size());
+                    auto remaining = std::move(h2_draining_);
+                    h2_draining_.clear();
+                    lck.unlock();
+                    for (auto& d : remaining) {
+                        if (d.conn) d.conn->ForceClose();
                     }
                 }
             }
