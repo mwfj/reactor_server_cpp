@@ -63,6 +63,7 @@ private:
     std::function<void()> pre_stop_drain_cb_;           // H2 drain wait callback
     std::atomic<bool> dispatchers_ready_{false};        // True after socket_dispatchers_ is fully built
     std::atomic<bool> start_called_{false};             // True once Start() begins executing
+    std::atomic<bool> stop_requested_{false};           // True once Stop() begins — suppresses ready callback
 
 public:
     NetServer() = delete;

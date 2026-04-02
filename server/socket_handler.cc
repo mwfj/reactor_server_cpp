@@ -71,6 +71,13 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
         if(saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
             return ACCEPT_QUEUE_DRAINED;
         }
+        if(saved_errno == EINTR) {
+            // Signal interrupted accept — not an error. Return a
+            // retryable code so the ET drain loop continues instead
+            // of throwing (which would break the loop and stall
+            // accept until the next edge transition).
+            return ACCEPT_CONN_ABORTED;
+        }
         if(saved_errno == ECONNABORTED) {
             return ACCEPT_CONN_ABORTED;
         }

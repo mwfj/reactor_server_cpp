@@ -149,14 +149,16 @@ void NetServer::Start(){
     // registered the wake channel. The enqueued task + WakeUp() causes the first
     // WaitForEvent() to return immediately, executing the callback.
     if (ready_callback_) {
-        // Capture by value and guard with was_stopped() so the callback
-        // is a no-op if Stop() races in before the first event loop drain.
-        // Without this, daemon mode could send NotifyReady() after shutdown
-        // started, and TestServerRunner could observe a false-ready server.
+        // Guard with stop_requested_ (set at the very start of Stop(),
+        // before any dispatcher interaction) so the callback is suppressed
+        // even if Stop() races in after EnQueue but before the first drain.
+        // Using was_stopped() on conn_dispatcher is insufficient — it's
+        // set later in StopAccepting(), after the event loop may have
+        // already executed this task.
         auto cb = std::move(ready_callback_);
         ready_callback_ = nullptr;
         conn_dispatcher_->EnQueue([cb = std::move(cb), this]() {
-            if (!conn_dispatcher_->was_stopped()) {
+            if (!stop_requested_.load(std::memory_order_acquire)) {
                 cb();
             }
         });
@@ -199,6 +201,13 @@ void NetServer::StopAccepting() {
 }
 
 void NetServer::Stop(){
+    // Set stop_requested_ FIRST — before any dispatcher interaction.
+    // The ready callback checks this flag to suppress false-ready
+    // notifications. Using was_stopped() on the conn_dispatcher is
+    // insufficient because StopAccepting() sets it after the event
+    // loop may have already drained and executed the ready task.
+    stop_requested_.store(true, std::memory_order_release);
+
     // First: stop accepting (may already be done by HttpServer::Stop())
     StopAccepting();
 
