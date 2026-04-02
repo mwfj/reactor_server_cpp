@@ -572,9 +572,11 @@ bool Reopen() {
 
     try {
         RebuildLogger();
-        // Prune after successful rebuild — safe here because Reopen()
-        // is a terminal operation (no further steps that could fail).
-        if (g_max_files > 1) PruneOldFiles();
+        // Note: no pruning here. Reopen() is also called by
+        // reopen_existing_logs() on failed-reload paths — pruning there
+        // would delete archives when no config change was committed.
+        // Pruning happens in CheckRotation() (periodic) and via the
+        // explicit PruneLogFiles() call after a reload fully commits.
         return true;
     } catch (const std::exception& e) {
         // Rebuild failed — the old logger is still active. The caller
