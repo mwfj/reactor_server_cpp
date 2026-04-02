@@ -76,7 +76,14 @@ void ReactorServer::ProcessMessage(std::shared_ptr<ConnectionHandler> conn, std:
                 std::string mutable_msg = msg;
                 this->OnMessage(conn, mutable_msg);
             }));
-        task_workers_.AddTask(task);
+        try {
+            task_workers_.AddTask(task);
+        } catch (const std::runtime_error&) {
+            // Pool stopped concurrently (shutdown race). Drop the message
+            // gracefully instead of letting the exception propagate to the
+            // dispatcher, which would treat it as a connection failure.
+            return;
+        }
     } else {
         OnMessage(conn, message);
     }
