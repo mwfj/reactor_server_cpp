@@ -294,23 +294,39 @@ static bool ReloadConfig(const std::string& config_path,
         }
     }
 
-    // Validate log fields BEFORE applying them — invalid log.level or
-    // rotation params must reject the reload, not be silently applied.
-    // ConfigLoader::Validate checks both log and restart-required fields,
-    // so we call it and reject on log-field errors, warn on others.
-    try {
-        ConfigLoader::Validate(new_config);
-    } catch (const std::invalid_argument& e) {
-        std::string err = e.what();
-        // Log-field errors are fatal for reload (they'd corrupt runtime state).
-        // Restart-required field errors are warnings (not applied during reload).
-        if (err.find("log.") != std::string::npos) {
-            logging::Get()->error("Config reload rejected: {}", err);
+    // Validate log fields explicitly BEFORE the full Validate call.
+    // ConfigLoader::Validate stops at the first error — if a restart-only
+    // field is bad AND a log field is bad, the restart-only error is thrown
+    // first and the log error is missed (downgraded to a warning).
+    {
+        // log.level validation
+        spdlog::level::level_enum parsed = logging::ParseLevel(new_config.log.level);
+        if (parsed == spdlog::level::info && new_config.log.level != "info") {
+            logging::Get()->error("Config reload rejected: invalid log.level '{}'",
+                                  new_config.log.level);
             reopen_existing_logs();
             return false;
         }
+        // log.max_file_size / log.max_files validation (when file logging is on)
+        if (!new_config.log.file.empty()) {
+            if (new_config.log.max_file_size == 0) {
+                logging::Get()->error("Config reload rejected: log.max_file_size must be > 0");
+                reopen_existing_logs();
+                return false;
+            }
+            if (new_config.log.max_files < 1) {
+                logging::Get()->error("Config reload rejected: log.max_files must be >= 1");
+                reopen_existing_logs();
+                return false;
+            }
+        }
+    }
+    // Warn about restart-required field issues (not applied during reload).
+    try {
+        ConfigLoader::Validate(new_config);
+    } catch (const std::invalid_argument& e) {
         logging::Get()->warn("Config has restart-required field issues that will "
-                             "fail on next restart: {}", err);
+                             "fail on next restart: {}", e.what());
     }
     if (options.daemonize) {
         int drc = ValidateDaemonConfig(new_config, options);

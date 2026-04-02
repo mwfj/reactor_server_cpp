@@ -69,11 +69,12 @@ void Acceptor::NewConnection(){
     }
 
     // Timed retry backoff: if an earlier ENOMEM set a retry deadline,
-    // re-enqueue until the backoff elapses (lets other tasks run between
-    // passes). Each pass is ~1ms (EnQueue+WakeUp round-trip).
+    // wait until it elapses. EnQueueDeferred (no WakeUp) avoids spinning
+    // the dispatcher under memory pressure — the task fires on the next
+    // WaitForEvent timeout (~1s), which is well past the 100ms backoff.
     if (retry_due_at_ != std::chrono::steady_clock::time_point{}) {
         if (std::chrono::steady_clock::now() < retry_due_at_) {
-            event_dispatcher_->EnQueue([this]() { NewConnection(); });
+            event_dispatcher_->EnQueueDeferred([this]() { NewConnection(); });
             return;
         }
         retry_due_at_ = {};  // backoff elapsed, proceed to accept

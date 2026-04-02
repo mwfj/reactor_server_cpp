@@ -62,6 +62,7 @@ private:
     std::atomic<size_t> max_input_size_{0};    // 0 = unlimited, set before RegisterCallbacks
     std::function<void()> ready_callback_ = nullptr;  // Fires after init, before event loop
     std::set<ConnectionHandler*> draining_conns_;       // H2 connections exempt from force-close
+    std::mutex draining_conns_mtx_;                     // Protects draining_conns_ for late additions
     std::function<void()> pre_stop_drain_cb_;           // H2 drain wait callback
     // Set by Start() after socket_dispatchers_ is fully populated.
     // Stop() checks this to avoid racing on the vector during startup.
@@ -127,11 +128,13 @@ public:
     // Connections exempt from CloseAfterWrite during Stop().
     // Set by HttpServer before Stop() for HTTP/2 graceful drain.
     void SetDrainingConns(std::set<ConnectionHandler*> conns) {
+        std::lock_guard<std::mutex> lck(draining_conns_mtx_);
         draining_conns_ = std::move(conns);
     }
     // Add a single connection to the drain-exempt set. Thread-safe for
     // late additions during shutdown (e.g., H2 detected after snapshot).
     void AddDrainingConn(ConnectionHandler* conn) {
+        std::lock_guard<std::mutex> lck(draining_conns_mtx_);
         draining_conns_.insert(conn);
     }
 

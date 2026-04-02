@@ -182,7 +182,10 @@ void NetServer::Stop(){
         if (conn->IsCloseDeferred()) continue;
         // Skip connections in the H2 graceful drain set — they close
         // themselves after all active streams complete.
-        if (draining_conns_.count(conn.get())) continue;
+        {
+            std::lock_guard<std::mutex> dlck(draining_conns_mtx_);
+            if (draining_conns_.count(conn.get())) continue;
+        }
         conn->CloseAfterWrite();
     }
     // Do NOT clear conns_to_close here. The shared_ptrs must keep
@@ -229,7 +232,10 @@ void NetServer::Stop(){
         // during the drain wait above.
         wait_for_dispatcher_barrier();
     }
-    draining_conns_.clear();  // one-shot cleanup
+    {
+        std::lock_guard<std::mutex> dlck(draining_conns_mtx_);
+        draining_conns_.clear();  // one-shot cleanup
+    }
 
     // Fourth-C: Now safe to release dispatcher-held connection references.
     // Deferred from earlier so TimerHandler continues enforcing deadlines during drain.

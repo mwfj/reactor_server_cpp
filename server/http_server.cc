@@ -863,7 +863,11 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         }
         if (stale_h1) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
-            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+            // Only decrement HTTP/1 counter if NOT upgraded — the upgrade
+            // callback already decremented at upgrade time.
+            if (!stale_h1->IsUpgraded()) {
+                active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+            }
         }
         if (evicted_pd && !stale_h2 && !stale_h1) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
@@ -908,7 +912,9 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         // Compensating decrement for evicted stale handler (fd reuse)
         if (old_handler) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
-            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+            if (!old_handler->IsUpgraded()) {
+                active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+            }
         }
         SafeNotifyWsClose(old_handler);
         if (old_handler) {
@@ -987,6 +993,7 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         // Guard against fd-reuse: if the handler wraps a stale connection,
         // notify the old WS handler and replace with a fresh one.
         if (http_conn->GetConnection() != conn) {
+            bool was_upgraded = http_conn->IsUpgraded();
             SafeNotifyWsClose(http_conn);
             {
                 auto c = http_conn->GetConnection();
@@ -1005,7 +1012,9 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             }
             if (evicted_stale_h1) {
                 active_connections_.fetch_sub(1, std::memory_order_relaxed);
-                active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+                if (!was_upgraded) {
+                    active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+                }
             }
             // Fall through to DetectAndRouteProtocol below
         } else {
@@ -1226,7 +1235,9 @@ bool HttpServer::DetectAndRouteProtocol(
                 h1_existing->second->GetConnection() != conn) {
                 stale_existing = h1_existing->second;
                 active_connections_.fetch_sub(1, std::memory_order_relaxed);
-                active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+                if (!stale_existing->IsUpgraded()) {
+                    active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+                }
             }
             http_connections_[conn->fd()] = http_conn;
         }
