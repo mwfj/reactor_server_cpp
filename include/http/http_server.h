@@ -102,6 +102,10 @@ private:
     // Compute timer scan interval from timeout values.
     static int ComputeTimerInterval(int idle_timeout_sec, int request_timeout_sec);
 
+    // Returns true if any HTTP/1 connection has pending output data.
+    // Used during shutdown to wait for in-flight responses to drain.
+    bool HasPendingH1Output();
+
     // Set start_time_ and server_ready_ flag. Called by the ready callback.
     void MarkServerReady();
 
