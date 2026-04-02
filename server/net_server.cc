@@ -71,6 +71,29 @@ void NetServer::Start(){
             }));
         sock_workers_.AddTask(work_task);
     }
+
+    // Barrier: wait for all socket dispatchers to enter their event loops.
+    // Without this, the first accepted connection could be routed to a
+    // dispatcher that hasn't called set_running_state(true) yet, causing
+    // UpdateChannel to fall into the thread-unsafe !is_running() fallback
+    // which does cross-thread epoll/kqueue modifications.
+    {
+        static constexpr int DISPATCHER_START_TIMEOUT_SEC = 5;
+        auto deadline = std::chrono::steady_clock::now()
+                      + std::chrono::seconds(DISPATCHER_START_TIMEOUT_SEC);
+        for (auto& disp : socket_dispatchers_) {
+            while (!disp->is_running() && !disp->was_stopped()) {
+                if (std::chrono::steady_clock::now() > deadline) {
+                    logging::Get()->error(
+                        "Socket dispatcher failed to start within {} seconds",
+                        DISPATCHER_START_TIMEOUT_SEC);
+                    break;
+                }
+                std::this_thread::yield();
+            }
+        }
+    }
+
     // Enqueue the ready callback into the conn_dispatcher's task queue so it
     // fires from within the first event loop iteration — after the accept loop
     // is running and processing events. This eliminates the startup race where

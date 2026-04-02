@@ -86,6 +86,12 @@ void KqueueHandler::UpdateEvent(std::shared_ptr<Channel> ch){
         std::lock_guard<std::mutex> lock(channel_map_mutex_);
         channel_map_[fd] = ch;
         ch->SetEventRead();  // Mark as registered
+    } else if (is_registered) {
+        // All interest bits cleared — kqueue filters were deleted above.
+        // Remove from channel_map_ to release the shared_ptr and prevent
+        // stale entries from keeping the channel alive indefinitely.
+        std::lock_guard<std::mutex> lock(channel_map_mutex_);
+        channel_map_.erase(fd);
     }
 }
 

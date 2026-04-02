@@ -4,9 +4,11 @@ Channel::Channel(std::shared_ptr<Dispatcher> _dispatcher, int _fd)
     : fd_(_fd), event_dispatcher_(_dispatcher){}
 
 Channel::~Channel() {
-    // Close the file descriptor if not already closed
-    // Don't call close callback during destruction to avoid use-after-free
-    if(!is_channel_closed_ && fd_ != -1){
+    // Safety net: close the fd if it's still valid regardless of
+    // is_channel_closed_ state. This covers the edge case where
+    // CloseChannel() enqueued the teardown to the dispatcher (off-loop
+    // path) but the task was discarded because the dispatcher stopped.
+    if(fd_ != -1){
         ::close(fd_);
         fd_ = -1;
     }
@@ -164,13 +166,40 @@ void Channel::CloseChannel(){
     // NOTE: Do NOT call close_fn_() here to avoid recursion
     // The close callback should call CloseChannel(), not the other way around
 
+    std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
+
+    // Off-loop path: enqueue the entire teardown so RemoveChannel sees
+    // valid fd_ and is_read_event_ state. Without this, the old code
+    // would enqueue RemoveChannel then immediately clear fd_ = -1 and
+    // is_read_event_ = false, causing the enqueued task to skip kqueue/
+    // epoll deletion and channel_map_ cleanup.
+    // The CAS above prevents HandleEvent from firing callbacks while
+    // the teardown is pending. The shared_ptr in the lambda keeps the
+    // Channel alive until cleanup completes.
+    if (ep_shared && !ep_shared->is_on_loop_thread()
+        && !ep_shared->was_stopped()) {
+        auto self = shared_from_this();
+        ep_shared->EnQueue([self]() {
+            auto disp = self->event_dispatcher_.lock();
+            if (self->fd_ != -1 && self->is_read_event_ && disp) {
+                disp->RemoveChannel(self);
+            }
+            if (self->fd_ != -1) {
+                ::close(self->fd_);
+                self->fd_ = -1;
+            }
+            self->is_read_event_ = false;
+            self->event_ = 0;
+            self->devent_ = 0;
+        });
+        return;
+    }
+
+    // On-loop or dispatcher unavailable: execute inline
     // IMPORTANT: Remove fd from epoll BEFORE closing it
     // This prevents epoll fd reuse bugs when the OS reuses the fd number
-    if(fd_ != -1 && is_read_event_){
-        std::shared_ptr<Dispatcher> ep_shared = event_dispatcher_.lock();
-        if(ep_shared){
-            ep_shared->RemoveChannel(shared_from_this());
-        }
+    if(fd_ != -1 && is_read_event_ && ep_shared){
+        ep_shared->RemoveChannel(shared_from_this());
     }
 
     if(fd_ != -1){
