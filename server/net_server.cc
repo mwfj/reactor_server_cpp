@@ -58,6 +58,7 @@ NetServer::~NetServer(){
 
 // start event loop
 void NetServer::Start(){
+    start_called_.store(true, std::memory_order_release);
     socket_dispatchers_.reserve(sock_workers_.GetThreadWorkerNum());
     for(int idx = 0; idx < sock_workers_.GetThreadWorkerNum(); idx ++){
         // Check for concurrent shutdown before each iteration.
@@ -124,6 +125,19 @@ void NetServer::Start(){
         }
     }
 
+    // Re-check: Stop() may have arrived while we were in the barrier.
+    // Stop() would have taken the early-return (dispatchers_ready_ false)
+    // and left cleanup to us. Without this, we'd set dispatchers_ready_,
+    // enter RunEventLoop (which returns immediately — was_stopped), and
+    // leave socket dispatcher threads orphaned.
+    if (conn_dispatcher_->was_stopped()) {
+        for (auto& d : socket_dispatchers_)
+            d->StopEventLoop();
+        sock_workers_.Stop();
+        dispatchers_ready_.store(true, std::memory_order_release);
+        return;
+    }
+
     // All socket dispatchers are running. Mark ready so Stop() knows
     // it's safe to iterate socket_dispatchers_. Placed AFTER the barrier
     // (not before) so that a racing Stop() takes the early-return path
@@ -187,13 +201,15 @@ void NetServer::Stop(){
 
     // If Start() hasn't finished building socket_dispatchers_, skip
     // dispatcher iteration to avoid racing with the vector build.
-    // Don't stop sock_workers_ here — Start() checks was_stopped() in
-    // its build loop and handles dispatcher + worker cleanup itself.
-    // If Start() was never called, ~NetServer() stops the workers.
-    // Calling sock_workers_.Stop() here would hang: it joins workers,
-    // but workers in RunEventLoop() never exit without StopEventLoop(),
-    // and we can't safely iterate socket_dispatchers_ to stop them.
     if (!dispatchers_ready_.load(std::memory_order_acquire)) {
+        if (!start_called_.load(std::memory_order_acquire)) {
+            // Start() was never called — workers are idle in GetTask(),
+            // not in RunEventLoop(), so stopping the pool won't hang.
+            sock_workers_.Stop();
+        }
+        // If Start() IS running, it checks was_stopped() in its build
+        // loop and after the barrier, and handles dispatcher + worker
+        // cleanup itself.
         return;
     }
 

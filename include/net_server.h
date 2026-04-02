@@ -62,6 +62,7 @@ private:
     std::set<ConnectionHandler*> draining_conns_;       // H2 connections exempt from force-close
     std::function<void()> pre_stop_drain_cb_;           // H2 drain wait callback
     std::atomic<bool> dispatchers_ready_{false};        // True after socket_dispatchers_ is fully built
+    std::atomic<bool> start_called_{false};             // True once Start() begins executing
 
 public:
     NetServer() = delete;
