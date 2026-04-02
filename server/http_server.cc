@@ -485,6 +485,36 @@ void HttpServer::Stop() {
                     std::chrono::steady_clock::now() +
                         std::chrono::seconds(6),
                     [this]() { return ws_draining_.empty(); });
+                // Force-close WS connections that didn't complete handshake.
+                // Without this, they stay exempt from the close sweep and
+                // only close on shared_ptr destruction, skipping OnClose callbacks.
+                if (!ws_draining_.empty()) {
+                    logging::Get()->warn("WS drain timeout, force-closing {} "
+                                         "remaining connections",
+                                         ws_draining_.size());
+                    auto remaining = std::move(ws_draining_);
+                    ws_draining_.clear();
+                    lck.unlock();
+                    for (auto* conn_ptr : remaining) {
+                        // Look up the connection in http_connections_ to get
+                        // the shared_ptr needed for SafeNotifyWsClose + ForceClose.
+                        std::shared_ptr<HttpConnectionHandler> http_conn;
+                        std::shared_ptr<ConnectionHandler> conn;
+                        {
+                            std::lock_guard<std::mutex> clck(conn_mtx_);
+                            for (auto& [fd, hc] : http_connections_) {
+                                auto c = hc->GetConnection();
+                                if (c && c.get() == conn_ptr) {
+                                    http_conn = hc;
+                                    conn = c;
+                                    break;
+                                }
+                            }
+                        }
+                        SafeNotifyWsClose(http_conn);
+                        if (conn) conn->ForceClose();
+                    }
+                }
             }
             // Wait for HTTP/1 output buffers to drain (max 2s).
             // Without this, large/slow responses are truncated when
@@ -546,6 +576,34 @@ void HttpServer::Stop() {
                     if (ws_draining_.empty()) break;
                     drain_cv_.wait_for(lck,
                         std::chrono::milliseconds(PUMP_INTERVAL_MS));
+                }
+                // Force-close remaining WS connections (same as off-thread path).
+                std::unique_lock<std::mutex> lck(drain_mtx_);
+                if (!ws_draining_.empty()) {
+                    logging::Get()->warn(
+                        "Dispatcher-thread WS drain timeout, "
+                        "force-closing {} remaining connections",
+                        ws_draining_.size());
+                    auto remaining = std::move(ws_draining_);
+                    ws_draining_.clear();
+                    lck.unlock();
+                    for (auto* conn_ptr : remaining) {
+                        std::shared_ptr<HttpConnectionHandler> http_conn;
+                        std::shared_ptr<ConnectionHandler> conn;
+                        {
+                            std::lock_guard<std::mutex> clck(conn_mtx_);
+                            for (auto& [fd, hc] : http_connections_) {
+                                auto c = hc->GetConnection();
+                                if (c && c.get() == conn_ptr) {
+                                    http_conn = hc;
+                                    conn = c;
+                                    break;
+                                }
+                            }
+                        }
+                        SafeNotifyWsClose(http_conn);
+                        if (conn) conn->ForceClose();
+                    }
                 }
             }
             // HTTP/1 drain with task pump.
@@ -804,6 +862,10 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         }
         // Notify stale WS handler outside the lock.
         SafeNotifyWsClose(stale_h1);
+        if (stale_h1) {
+            auto c = stale_h1->GetConnection();
+            if (c) OnWsDrainComplete(c.get());
+        }
     } else {
         // HTTP/2 disabled — always create HTTP/1.x handler immediately.
         std::shared_ptr<HttpConnectionHandler> old_handler;
@@ -841,6 +903,10 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
             active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
         SafeNotifyWsClose(old_handler);
+        if (old_handler) {
+            auto c = old_handler->GetConnection();
+            if (c) OnWsDrainComplete(c.get());
+        }
         if (already_initialized) return;
     }
 
@@ -914,6 +980,10 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         // notify the old WS handler and replace with a fresh one.
         if (http_conn->GetConnection() != conn) {
             SafeNotifyWsClose(http_conn);
+            {
+                auto c = http_conn->GetConnection();
+                if (c) OnWsDrainComplete(c.get());
+            }
             http_conn = nullptr;
             bool evicted_stale_h1 = false;
             {
@@ -1140,6 +1210,10 @@ bool HttpServer::DetectAndRouteProtocol(
         }
     }
     SafeNotifyWsClose(stale_existing);
+    if (stale_existing) {
+        auto c = stale_existing->GetConnection();
+        if (c) OnWsDrainComplete(c.get());
+    }
     http_conn->OnRawData(conn, message);
     return true;
 }

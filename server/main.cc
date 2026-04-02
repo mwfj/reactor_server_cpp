@@ -294,12 +294,23 @@ static bool ReloadConfig(const std::string& config_path,
         }
     }
 
-    // Warn if the FULL config (including restart-required fields) is invalid.
+    // Validate log fields BEFORE applying them — invalid log.level or
+    // rotation params must reject the reload, not be silently applied.
+    // ConfigLoader::Validate checks both log and restart-required fields,
+    // so we call it and reject on log-field errors, warn on others.
     try {
         ConfigLoader::Validate(new_config);
     } catch (const std::invalid_argument& e) {
+        std::string err = e.what();
+        // Log-field errors are fatal for reload (they'd corrupt runtime state).
+        // Restart-required field errors are warnings (not applied during reload).
+        if (err.find("log.") != std::string::npos) {
+            logging::Get()->error("Config reload rejected: {}", err);
+            reopen_existing_logs();
+            return false;
+        }
         logging::Get()->warn("Config has restart-required field issues that will "
-                             "fail on next restart: {}", e.what());
+                             "fail on next restart: {}", err);
     }
     if (options.daemonize) {
         int drc = ValidateDaemonConfig(new_config, options);
