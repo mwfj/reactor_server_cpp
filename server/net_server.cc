@@ -84,7 +84,15 @@ void NetServer::Start(){
             new SocketWorker([task]() {
                 task->RunEventLoop();
             }));
-        sock_workers_.AddTask(work_task);
+        try {
+            sock_workers_.AddTask(work_task);
+        } catch (const std::runtime_error&) {
+            // Pool was stopped by concurrent Stop() — break and clean up.
+            // Without this catch, Start() never reaches its cleanup path,
+            // so StopEventLoop is never called on already-running dispatchers,
+            // and Stop()'s sock_workers_.Stop() hangs joining stuck workers.
+            break;
+        }
     }
 
     // If shutdown was requested during setup, clean up and return.

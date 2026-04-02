@@ -359,6 +359,11 @@ static bool ReloadConfig(const std::string& config_path,
         return false;
     }
 
+    // Full reload committed (logger + server). Now safe to prune old
+    // log files — UpdateAndReopen deferred pruning so a failed Reload()
+    // wouldn't cause irreversible log loss.
+    logging::PruneLogFiles();
+
     // Log reload-safe changes at info level.
     if (new_config.idle_timeout_sec != current_config.idle_timeout_sec)
         logging::Get()->info("idle_timeout_sec: {} -> {} (immediate)",

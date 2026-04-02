@@ -323,11 +323,10 @@ static void RebuildLogger() {
         g_current_log_date = std::move(sinks_new_date);
     }
 
-    // Prune after full commit — file deletion is irreversible, so only
-    // do it after the new logger is successfully constructed and installed.
-    if (g_max_files > 1) {
-        PruneOldFiles();
-    }
+    // Note: pruning removed from RebuildLogger — callers that want pruning
+    // must call PruneOldFiles() explicitly after their operation fully commits.
+    // This prevents irreversible file deletion during UpdateAndReopen() when
+    // a later step (server.Reload) might fail and roll back.
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -573,6 +572,9 @@ bool Reopen() {
 
     try {
         RebuildLogger();
+        // Prune after successful rebuild — safe here because Reopen()
+        // is a terminal operation (no further steps that could fail).
+        if (g_max_files > 1) PruneOldFiles();
         return true;
     } catch (const std::exception& e) {
         // Rebuild failed — the old logger is still active. The caller
@@ -580,6 +582,13 @@ bool Reopen() {
         // globals so CheckRotation stays consistent with the live logger.
         g_logger->error("Failed to reopen log file: {}", e.what());
         return false;
+    }
+}
+
+void PruneLogFiles() {
+    std::lock_guard<std::mutex> lock(g_logger_mtx);
+    if (g_max_files > 1) {
+        PruneOldFiles();
     }
 }
 
@@ -627,6 +636,8 @@ void CheckRotation() {
 
     try {
         RebuildLogger();
+        // Prune after successful rotation — safe here (periodic, no rollback).
+        if (g_max_files > 1) PruneOldFiles();
     } catch (const std::exception& e) {
         g_logger->error("Failed to rotate log file: {}", e.what());
     }

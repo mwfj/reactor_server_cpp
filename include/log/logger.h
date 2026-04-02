@@ -64,6 +64,12 @@ void UpdateFileConfig(const std::string& file, size_t max_size, int max_files);
 // Returns true on success, false on failure (old logger kept active).
 bool UpdateAndReopen(const std::string& file, size_t max_size, int max_files);
 
+// Prune old log files exceeding max_files. Thread-safe. Called explicitly
+// after a reload is fully committed (logger + server config both applied).
+// Deferred from UpdateAndReopen so a failed server.Reload() doesn't cause
+// irreversible log loss.
+void PruneLogFiles();
+
 // Check if the current log file exceeds max_file_size or the date has
 // rolled over, and rotate if needed. Called periodically from the
 // Dispatcher timer handler. Thread-safe. No-op if no file sink is configured.
