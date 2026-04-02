@@ -38,7 +38,7 @@ void EpollHandler::UpdateEvent(std::shared_ptr<Channel> ch){
 
     epoll_event ev;
     memset(&ev, 0, sizeof(ev));
-    ev.data.fd = fd;  // Store fd for O(1) lookup in WaitForEvent
+    ev.data.ptr = ch.get();  // Raw pointer for fd-reuse validation in WaitForEvent
     ev.events = ch->Event();
 
     if(ch->is_read_event()){
@@ -131,17 +131,25 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
         std::lock_guard<std::mutex> lock(channel_map_mutex_);
 
         for(int idx = 0; idx < infds; idx++){
-            int event_fd = events_[idx].data.fd;
+            Channel *ch_raw = static_cast<Channel*>(events_[idx].data.ptr);
 
-            // O(log N) lookup by fd instead of O(N) linear scan
-            auto it = channel_map_.find(event_fd);
-            if(it == channel_map_.end() || !it->second) {
-                continue;  // Channel was removed between epoll_wait and now
+            // Validate the raw pointer against channel_map_ to guard against
+            // fd-reuse races: between epoll_wait() and this lock, the old
+            // channel may have been removed and a new one inserted with the
+            // same fd. The pointer check ensures we only process events for
+            // the Channel that was registered when the event fired.
+            std::shared_ptr<Channel> ch;
+            for(auto& pair : channel_map_) {
+                if(pair.second.get() == ch_raw) {
+                    ch = pair.second;
+                    break;
+                }
             }
 
-            auto& ch = it->second;
-            ch->SetDEvent(events_[idx].events);
-            channels.push_back(ch);
+            if(ch) {
+                ch->SetDEvent(events_[idx].events);
+                channels.push_back(ch);
+            }
         }
     }
 

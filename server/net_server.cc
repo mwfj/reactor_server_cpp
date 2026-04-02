@@ -47,6 +47,11 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
 
 NetServer::~NetServer(){
     Stop();
+    // Ensure worker threads are stopped even if Stop() took the early-return
+    // path (dispatchers_ready_ == false). Covers the case where Start() was
+    // never called but the constructor already started sock_workers_.
+    // ThreadPool::Stop() is idempotent.
+    sock_workers_.Stop();
     socket_dispatchers_.clear();
     connections_.clear();
 }

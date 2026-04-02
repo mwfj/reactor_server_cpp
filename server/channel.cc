@@ -176,8 +176,7 @@ void Channel::CloseChannel(){
     // The CAS above prevents HandleEvent from firing callbacks while
     // the teardown is pending. The shared_ptr in the lambda keeps the
     // Channel alive until cleanup completes.
-    if (ep_shared && !ep_shared->is_on_loop_thread()
-        && !ep_shared->was_stopped()) {
+    if (ep_shared && !ep_shared->is_on_loop_thread()) {
         auto self = shared_from_this();
         ep_shared->EnQueue([self]() {
             auto disp = self->event_dispatcher_.lock();
@@ -192,7 +191,15 @@ void Channel::CloseChannel(){
             self->event_ = 0;
             self->devent_ = 0;
         });
-        return;
+        // If was_stopped_ flipped between is_on_loop_thread() and EnQueue,
+        // the task may have been dropped. Re-check: if the dispatcher is
+        // stopped, the event loop is no longer running, so inline cleanup
+        // below is safe. If the task WAS accepted, the inline ops no-op
+        // (fd_ is already -1 or the guards prevent double work).
+        if (!ep_shared->was_stopped()) {
+            return;  // Task accepted — will run on the event loop
+        }
+        // Dispatcher stopped — fall through to inline cleanup
     }
 
     // On-loop or dispatcher unavailable: execute inline
