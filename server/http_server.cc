@@ -1172,18 +1172,14 @@ bool HttpServer::DetectAndRouteProtocol(
             SetupH2Handlers(h2_conn);
             h2_connections_[conn->fd()] = h2_conn;
         }
-        // Late H2 detection during shutdown: request shutdown BEFORE
-        // Initialize so the GOAWAY is sent before buffered data is replayed.
-        // This prevents the client's preface + HEADERS from opening new
-        // streams after Stop() began.
-        bool late_shutdown = !server_ready_.load(std::memory_order_acquire);
-        if (late_shutdown) {
-            h2_conn->RequestShutdown();
-        }
         h2_conn->Initialize(message);
-        // Full drain bookkeeping so WaitForH2Drain() tracks this session
-        // and NetServer::Stop() exempts it from the generic close sweep.
-        if (late_shutdown) {
+        // Late H2 detection during shutdown: full drain bookkeeping so
+        // WaitForH2Drain() tracks this session and NetServer::Stop() exempts
+        // it from the generic close sweep. RequestShutdown sends GOAWAY AFTER
+        // Initialize processes buffered data — requests already in the packet
+        // are honored (drained), not refused.
+        if (!server_ready_.load(std::memory_order_acquire)) {
+            h2_conn->RequestShutdown();
             ConnectionHandler* conn_ptr = conn.get();
             h2_conn->SetDrainCompleteCallback([this, conn_ptr]() {
                 OnH2DrainComplete(conn_ptr);

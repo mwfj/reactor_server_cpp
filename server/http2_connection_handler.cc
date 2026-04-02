@@ -167,18 +167,11 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
         deadline_armed_ = true;
     }
 
-    // If shutdown was requested before session_ existed (race with Stop()),
-    // send GOAWAY BEFORE processing initial data so nghttp2 rejects new
-    // streams from the buffered packet. Without this, a client that sent
-    // preface + multiple HEADERS in one packet dispatches streams after
-    // Stop() began, extending drain time unexpectedly.
-    if (shutdown_requested_.load(std::memory_order_acquire)) {
-        logging::Get()->debug("H2 shutdown replay: sending GOAWAY fd={}", conn_ ? conn_->fd() : -1);
-        session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
-        session_->SendPendingFrames();
-    }
-
-    // If there's initial data (buffered during detection), process it now
+    // If there's initial data (buffered during detection), process it now.
+    // This MUST happen before GOAWAY: requests in the buffered packet were
+    // already accepted (the client sent them before the server announced
+    // shutdown). Sending GOAWAY first would reject them with REFUSED_STREAM,
+    // which is the opposite of graceful drain.
     if (!initial_data.empty()) {
         ssize_t consumed = session_->ReceiveData(initial_data.data(),
                                                   initial_data.size());
@@ -196,9 +189,15 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
         UpdateDeadline();
     }
 
-    // If shutdown: check if all streams completed (may be zero if GOAWAY
-    // was sent before any HEADERS were processed).
+    // If shutdown was requested before session_ existed (race with Stop()),
+    // replay the shutdown now. Done AFTER initial_data processing so any
+    // buffered request is dispatched before GOAWAY closes the session.
     if (shutdown_requested_.load(std::memory_order_acquire)) {
+        logging::Get()->debug("H2 shutdown replay: sending GOAWAY fd={}", conn_ ? conn_->fd() : -1);
+        if (!session_->IsGoawaySent()) {
+            session_->SendGoaway(HTTP2_CONSTANTS::ERROR_NO_ERROR);
+            session_->SendPendingFrames();
+        }
         if (session_->ActiveStreamCount() == 0) {
             conn_->CloseAfterWrite();
         }

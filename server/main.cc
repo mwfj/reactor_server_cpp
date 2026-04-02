@@ -16,7 +16,6 @@
 #include <cstdlib>
 #include <exception>
 #if !defined(_WIN32)
-#include <sys/file.h>
 #include <syslog.h>
 #endif
 
@@ -87,11 +86,7 @@ static int HandleStatus(const CliOptions& options) {
 
 static int SendSignalToServer(const CliOptions& options, int sig,
                               const char* sig_name) {
-    // Hold the flock fd open while signaling. If the server exits between
-    // CheckRunning and kill(), the kernel may reuse the PID. By keeping the
-    // fd open we can re-probe the lock after kill to detect this race.
-    int lock_fd = -1;
-    pid_t pid = PidFile::CheckRunningHoldLock(options.pid_file, lock_fd);
+    pid_t pid = PidFile::CheckRunning(options.pid_file);
     if (pid < 0) {
         std::cout << REACTOR_SERVER_NAME << " is not running\n";
         return EXIT_ERROR;
@@ -101,27 +96,14 @@ static int SendSignalToServer(const CliOptions& options, int sig,
                   << " is running but PID is unreadable — cannot send signal\n";
         return EXIT_ERROR;
     }
-    int rc = EXIT_OK;
     if (kill(pid, sig) == 0) {
-        // Verify the lock is still held — if we can acquire it now, the
-        // server exited between our check and the kill, and we may have
-        // signaled an unrelated process that reused the PID.
-        if (lock_fd >= 0 && flock(lock_fd, LOCK_EX | LOCK_NB) == 0) {
-            flock(lock_fd, LOCK_UN);
-            std::cerr << "Warning: server exited before signal was delivered "
-                      << "(PID " << pid << " may have been reused)\n";
-            rc = EXIT_ERROR;
-        } else {
-            std::cout << "Sent " << sig_name << " to " << REACTOR_SERVER_NAME
-                      << " (PID " << pid << ")\n";
-        }
-    } else {
-        std::cerr << "Failed to send signal to PID " << pid
-                  << ": " << std::strerror(errno) << "\n";
-        rc = EXIT_ERROR;
+        std::cout << "Sent " << sig_name << " to " << REACTOR_SERVER_NAME
+                  << " (PID " << pid << ")\n";
+        return EXIT_OK;
     }
-    if (lock_fd >= 0) close(lock_fd);
-    return rc;
+    std::cerr << "Failed to send signal to PID " << pid
+              << ": " << std::strerror(errno) << "\n";
+    return EXIT_ERROR;
 }
 
 static int HandleStop(const CliOptions& options) {
