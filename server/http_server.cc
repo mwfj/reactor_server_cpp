@@ -629,8 +629,11 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     // Route checker: determines if a WebSocket route exists and populates
     // request.params so middleware can read route parameters (e.g., /ws/:room).
     // Called BEFORE middleware in the upgrade flow.
+    // Also acts as a shutdown gate: reject WS upgrades during shutdown so
+    // late-upgrading connections don't miss the 1001 "Going Away" close frame.
     http_conn->SetRouteCheckCallback(
         [this](const HttpRequest& request) -> bool {
+            if (!server_ready_.load(std::memory_order_acquire)) return false;
             auto handler = router_.GetWebSocketHandler(request);
             return handler != nullptr;
         }
@@ -1034,6 +1037,12 @@ bool HttpServer::DetectAndRouteProtocol(
             h2_connections_[conn->fd()] = h2_conn;
         }
         h2_conn->Initialize(message);
+        // Late H2 detection during shutdown: send GOAWAY immediately so the
+        // peer knows the server is stopping. The close sweep + barrier wait
+        // will drain the GOAWAY before closing the transport.
+        if (!server_ready_.load(std::memory_order_acquire)) {
+            h2_conn->RequestShutdown();
+        }
         return true;
     }
 
