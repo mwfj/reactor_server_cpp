@@ -23,13 +23,15 @@ void ReactorServer::Start(){
 }
 
 void ReactorServer::Stop(){
-    // Stop task_workers_ FIRST — waits for in-flight tasks to complete their
-    // SendData() calls while dispatchers are still running. Stopping
-    // net_server_ first would drop sends from in-flight tasks (dispatchers
-    // stopped → EnQueue drops). New tasks may still be enqueued by
-    // ProcessMessage during this window, but task_workers_.Stop() rejects
-    // them with exceptions via SetException after setting is_running=false.
+    // Stop accepting FIRST — prevents new connections from being dispatched
+    // while we tear down the task workers.
+    net_server_.StopAccepting();
+    // Stop task_workers_ — waits for in-flight tasks to complete their
+    // SendData() calls while dispatchers are still running. Must happen
+    // AFTER StopAccepting so no new ProcessMessage callbacks enqueue work
+    // on the already-stopped pool (which would throw from AddTask).
     task_workers_.Stop();
+    // Stop the rest of the net server (close connections, stop event loops).
     net_server_.Stop();
 }
 

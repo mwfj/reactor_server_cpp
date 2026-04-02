@@ -1408,7 +1408,10 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     // Update HTTP/2 settings for NEW connections only (under conn_mtx_).
     // Existing sessions keep their negotiated SETTINGS values — submitting
     // a new SETTINGS frame to live sessions mid-stream is not supported.
-    {
+    // Only apply when H2 is currently enabled. If the new config sets
+    // http2.enabled=false, that's a restart-required change — don't
+    // alter live H2 SETTINGS values for currently-serving sessions.
+    if (http2_enabled_) {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         h2_settings_.max_concurrent_streams = new_config.http2.max_concurrent_streams;
         h2_settings_.initial_window_size    = new_config.http2.initial_window_size;

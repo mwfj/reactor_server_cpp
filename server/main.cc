@@ -366,9 +366,20 @@ static bool ReloadConfig(const std::string& config_path,
         logging::Get()->error("HttpServer::Reload() rejected the config");
         // Roll back log changes — restore the old logger config so the
         // process stays consistent (log state matches current_config).
-        logging::UpdateAndReopen(current_config.log.file,
-                                 current_config.log.max_file_size,
-                                 current_config.log.max_files);
+        if (!logging::UpdateAndReopen(current_config.log.file,
+                                      current_config.log.max_file_size,
+                                      current_config.log.max_files)) {
+            // Rollback failed — the old log path is no longer usable.
+            // The process keeps logging to the new file/rotation policy.
+            // Update current_config to match the live logger state so
+            // subsequent reloads don't try to roll back to a dead path.
+            logging::Get()->warn(
+                "Logger rollback failed — keeping new log destination. "
+                "current_config updated to match live logger state.");
+            current_config.log.file = new_config.log.file;
+            current_config.log.max_file_size = new_config.log.max_file_size;
+            current_config.log.max_files = new_config.log.max_files;
+        }
         if (new_config.log.level != current_config.log.level) {
             logging::SetLevel(logging::ParseLevel(current_config.log.level));
         }
