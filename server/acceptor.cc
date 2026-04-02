@@ -69,17 +69,24 @@ void Acceptor::NewConnection(){
     }
 
     // Timed retry backoff: if an earlier ENOMEM set a retry deadline,
-    // wait until it elapses. Uses EnQueue (with WakeUp) so the retry is
-    // guaranteed to fire even under sustained traffic on existing connections.
-    // EnQueueDeferred can starve if the WaitForEvent timeout never fires.
-    // Each re-enqueue pass takes ~1ms (EnQueue+WakeUp round-trip), so the
-    // ~100 passes for 100ms backoff are bounded and other tasks run between.
+    // sleep for the remaining backoff then proceed. The sleep blocks the
+    // conn_dispatcher briefly (~100ms max), which is acceptable:
+    //   - The conn_dispatcher only handles accepts (no socket I/O)
+    //   - ENOMEM is rare and transient
+    //   - This avoids both busy-spin (EnQueue loop) and starvation
+    //     (EnQueueDeferred under sustained traffic)
+    // Shutdown tasks enqueued during the sleep run on the next HandleEventId.
     if (retry_due_at_ != std::chrono::steady_clock::time_point{}) {
-        if (std::chrono::steady_clock::now() < retry_due_at_) {
-            event_dispatcher_->EnQueue([this]() { NewConnection(); });
+        auto now = std::chrono::steady_clock::now();
+        if (now < retry_due_at_) {
+            std::this_thread::sleep_for(retry_due_at_ - now);
+        }
+        retry_due_at_ = {};
+        // Re-check shutdown after sleep
+        if (closing_.load(std::memory_order_acquire) ||
+            event_dispatcher_->was_stopped()) {
             return;
         }
-        retry_due_at_ = {};  // backoff elapsed, proceed to accept
     }
 
     while(true){

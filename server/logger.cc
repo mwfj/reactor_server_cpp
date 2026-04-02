@@ -683,20 +683,23 @@ void WriteMarker(const std::string& text) {
     auto marker_logger = std::make_shared<spdlog::logger>(
         g_logger->name(), g_logger->sinks().begin(), g_logger->sinks().end());
     marker_logger->set_level(spdlog::level::info);
-    // SetLevel() raises sink levels too, so sinks also block info markers
-    // at warn+. Temporarily lower them. g_logger's level is NOT changed,
-    // so concurrent threads can't slip info messages through — g_logger
-    // blocks them at the logger level before they reach sinks.
-    std::vector<spdlog::level::level_enum> saved_sink_levels;
-    saved_sink_levels.reserve(g_logger->sinks().size());
-    for (auto& sink : g_logger->sinks()) {
-        saved_sink_levels.push_back(sink->level());
-        sink->set_level(spdlog::level::info);
+    // SetLevel() raises sink levels too, so sinks at warn+ block info
+    // markers. Only LOWER sink levels (to info), never RAISE them — if a
+    // sink is at trace/debug, it already passes the info marker through,
+    // and raising it would drop concurrent debug/trace records from other
+    // threads (they pass g_logger's level check but hit the raised sink).
+    std::vector<std::pair<size_t, spdlog::level::level_enum>> saved_sink_levels;
+    for (size_t i = 0; i < g_logger->sinks().size(); ++i) {
+        auto cur = g_logger->sinks()[i]->level();
+        if (cur > spdlog::level::info) {
+            saved_sink_levels.push_back({i, cur});
+            g_logger->sinks()[i]->set_level(spdlog::level::info);
+        }
     }
     marker_logger->info("================================ {} ================================", text);
     marker_logger->flush();
-    for (size_t i = 0; i < g_logger->sinks().size(); ++i) {
-        g_logger->sinks()[i]->set_level(saved_sink_levels[i]);
+    for (auto& [idx, lvl] : saved_sink_levels) {
+        g_logger->sinks()[idx]->set_level(lvl);
     }
 }
 
