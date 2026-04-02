@@ -86,34 +86,28 @@ static int HandleStatus(const CliOptions& options) {
 
 static int SendSignalToServer(const CliOptions& options, int sig,
                               const char* sig_name) {
-    // Hold the flock fd open through kill() to prevent the TOCTOU race:
-    // if the daemon exits between CheckRunning and kill, the PID could be
-    // reused by an unrelated process. The held flock proves the daemon is
-    // alive while we signal it. Closed immediately after kill returns.
-    int lock_fd = -1;
-    pid_t pid = PidFile::CheckRunningHoldLock(options.pid_file, lock_fd);
+    // CheckRunning verifies via flock that the PID-file holder is alive,
+    // then reads the PID. The TOCTOU gap between check and kill is inherent
+    // to PID-based signaling (shared with nginx/haproxy) — advisory locks
+    // cannot eliminate it because the CLI doesn't hold the server's lock.
+    pid_t pid = PidFile::CheckRunning(options.pid_file);
     if (pid < 0) {
         std::cout << REACTOR_SERVER_NAME << " is not running\n";
         return EXIT_ERROR;
     }
     if (pid == 0) {
-        if (lock_fd >= 0) close(lock_fd);
         std::cerr << REACTOR_SERVER_NAME
                   << " is running but PID is unreadable — cannot send signal\n";
         return EXIT_ERROR;
     }
-    int rc;
     if (kill(pid, sig) == 0) {
         std::cout << "Sent " << sig_name << " to " << REACTOR_SERVER_NAME
                   << " (PID " << pid << ")\n";
-        rc = EXIT_OK;
-    } else {
-        std::cerr << "Failed to send signal to PID " << pid
-                  << ": " << std::strerror(errno) << "\n";
-        rc = EXIT_ERROR;
+        return EXIT_OK;
     }
-    if (lock_fd >= 0) close(lock_fd);
-    return rc;
+    std::cerr << "Failed to send signal to PID " << pid
+              << ": " << std::strerror(errno) << "\n";
+    return EXIT_ERROR;
 }
 
 static int HandleStop(const CliOptions& options) {

@@ -539,6 +539,17 @@ void HttpServer::Stop() {
                         std::chrono::milliseconds(PUMP_INTERVAL_MS));
                 }
             }
+            // Re-check for late H2 sessions added by DetectAndRouteProtocol
+            // during the WS/H1 drain phases above. Without this, a slow
+            // h2c connection classified after WaitForH2Drain returned would
+            // never get its streams drained.
+            {
+                std::unique_lock<std::mutex> lck(drain_mtx_);
+                if (!h2_draining_.empty()) {
+                    lck.unlock();
+                    WaitForH2Drain();
+                }
+            }
         });
     } else {
         // On a dispatcher thread: poll with task pump between waits.
@@ -626,6 +637,33 @@ void HttpServer::Stop() {
                     if (!HasPendingH1Output()) break;
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(PUMP_INTERVAL_MS));
+                }
+            }
+            // Re-check for late H2 sessions (same as off-thread path).
+            {
+                std::unique_lock<std::mutex> lck(drain_mtx_);
+                if (!h2_draining_.empty()) {
+                    auto deadline = std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(
+                                        shutdown_drain_timeout_sec_.load(
+                                            std::memory_order_relaxed));
+                    while (std::chrono::steady_clock::now() < deadline) {
+                        net_server_.ProcessSelfDispatcherTasks();
+                        if (h2_draining_.empty()) break;
+                        drain_cv_.wait_for(lck,
+                            std::chrono::milliseconds(PUMP_INTERVAL_MS));
+                    }
+                    if (!h2_draining_.empty()) {
+                        logging::Get()->warn(
+                            "Late H2 drain timeout, force-closing {} remaining",
+                            h2_draining_.size());
+                        auto remaining = std::move(h2_draining_);
+                        h2_draining_.clear();
+                        lck.unlock();
+                        for (auto& d : remaining) {
+                            if (d.conn) d.conn->ForceClose();
+                        }
+                    }
                 }
             }
         });
