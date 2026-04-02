@@ -19,15 +19,16 @@ private:
     // double-end link list to store the tasks awaiting processing
     std::deque<std::shared_ptr<ThreadTaskInterface>> tasks_;
 
-    std::mutex mtx_;
-    std::condition_variable cv_;
-
     int thread_nums = 0;
     const int DEFAULT_THREAD_NUMS = 6;
-    // Shared state: accessed by worker threads after Run() loop breaks.
-    // Allocated on the heap so orphaned workers (self-destruction path)
-    // don't use-after-free when the pool object is destroyed.
+    // Shared state: heap-allocated and ref-counted so worker threads can
+    // safely access it after a task destroys the pool (self-stop path).
+    // Contains everything a worker touches: the run flag, counters, the
+    // task queue mutex/cv, and the error logger. Run() captures a local
+    // shared_ptr so the state outlives the pool object.
     struct SharedState {
+        std::mutex mtx;
+        std::condition_variable cv;
         std::atomic_int running_threads{0};
         std::atomic_bool is_running{false};
         std::mutex logger_mtx;
