@@ -78,9 +78,6 @@ void NetServer::Start(){
             }));
         sock_workers_.AddTask(work_task);
     }
-    // Mark socket_dispatchers_ as fully built. Stop() checks this flag
-    // to avoid iterating the vector while Start() is still building it.
-    dispatchers_ready_.store(true, std::memory_order_release);
 
     // If Stop() was called while we were building dispatchers, clean up
     // and return. Without this, we'd enter RunEventLoop and hang.
@@ -88,6 +85,7 @@ void NetServer::Start(){
         for (auto& d : socket_dispatchers_)
             d->StopEventLoop();
         sock_workers_.Stop();
+        dispatchers_ready_.store(true, std::memory_order_release);
         return;
     }
 
@@ -118,6 +116,13 @@ void NetServer::Start(){
             }
         }
     }
+
+    // All socket dispatchers are running. Mark ready so Stop() knows
+    // it's safe to iterate socket_dispatchers_. Placed AFTER the barrier
+    // (not before) so that a racing Stop() takes the early-return path
+    // instead of enqueueing barrier tasks to dispatchers that haven't
+    // entered their event loops yet (which would stall 5s × N workers).
+    dispatchers_ready_.store(true, std::memory_order_release);
 
     // Enqueue the ready callback into the conn_dispatcher's task queue so it
     // fires from within the first event loop iteration — after the accept loop

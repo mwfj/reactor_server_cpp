@@ -32,7 +32,15 @@ Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _
     // kqueue/epoll error immediately (as a thrown exception from Bind/Listen
     // or a failed epoll_ctl), and the Acceptor constructor propagates it.
     acceptor_channel_->SetEvent(acceptor_channel_->Event() | EVENT_READ | EVENT_RDHUP);
-    event_dispatcher_->UpdateChannelInLoop(acceptor_channel_);
+    try {
+        event_dispatcher_->UpdateChannelInLoop(acceptor_channel_);
+    } catch (...) {
+        // Constructor is aborting — destructor won't run, so clean up
+        // the idle fd manually. Without this, repeated startup retries
+        // under resource pressure leak one fd per attempt.
+        if (idle_fd_ >= 0) { ::close(idle_fd_); idle_fd_ = -1; }
+        throw;
+    }
 }
 
 Acceptor::~Acceptor() {
