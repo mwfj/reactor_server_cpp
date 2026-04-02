@@ -444,10 +444,18 @@ void HttpServer::Stop() {
         if (conn->IsClosing()) continue;
         ConnectionHandler* conn_ptr = conn.get();
 
-        // Install drain-complete callback
-        h2_conn->SetDrainCompleteCallback([this, conn_ptr]() {
-            OnH2DrainComplete(conn_ptr);
-        });
+        // Install drain-complete callback on the dispatcher thread to avoid
+        // racing with NotifyDrainComplete (which reads drain_complete_cb_
+        // on the dispatcher thread). std::function is not safe for concurrent
+        // read/write, so both must happen on the same thread.
+        {
+            auto h2 = h2_conn;  // copy shared_ptr for the lambda
+            conn->RunOnDispatcher([h2, this, conn_ptr]() {
+                h2->SetDrainCompleteCallback([this, conn_ptr]() {
+                    OnH2DrainComplete(conn_ptr);
+                });
+            });
+        }
 
         // Strong refs — kept alive through drain.
         // Install callback + push atomically under drain_mtx_ to prevent
@@ -1452,10 +1460,11 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     // Update HTTP/2 settings for NEW connections only (under conn_mtx_).
     // Existing sessions keep their negotiated SETTINGS values — submitting
     // a new SETTINGS frame to live sessions mid-stream is not supported.
-    // Only apply when H2 is currently enabled. If the new config sets
-    // http2.enabled=false, that's a restart-required change — don't
-    // alter live H2 SETTINGS values for currently-serving sessions.
-    if (http2_enabled_) {
+    // Only apply when H2 is currently enabled AND the new config keeps it
+    // enabled. If the new config sets http2.enabled=false, that's a
+    // restart-required change — all H2 tuning should be deferred to restart
+    // so new connections don't observe staged-for-restart settings.
+    if (http2_enabled_ && new_config.http2.enabled) {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         h2_settings_.max_concurrent_streams = new_config.http2.max_concurrent_streams;
         h2_settings_.initial_window_size    = new_config.http2.initial_window_size;
