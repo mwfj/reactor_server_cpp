@@ -109,17 +109,13 @@ void Acceptor::NewConnection(){
             // EnableReadMode alone is insufficient: EPOLL_CTL_MOD doesn't
             // create a new edge when the socket is already readable.
             int saved_errno = errno;
-            logging::Get()->warn("Accept: memory pressure ({}), retry in ~1s",
+            logging::Get()->warn("Accept: memory pressure ({}), deferring retry",
                                  logging::SafeStrerror(saved_errno));
-            // Enqueue a delayed retry. The lambda sleeps briefly to avoid
-            // a tight retry loop under sustained pressure. The 100ms sleep
-            // is acceptable on the conn_dispatcher (accept-only thread).
-            // Shutdown check before AND after sleep ensures prompt exit.
+            // Enqueue a non-blocking retry. The event loop cycle (EnQueue →
+            // WakeUp → WaitForEvent → HandleEventId) provides natural spacing
+            // without stalling the accept dispatcher. Other queued tasks
+            // (shutdown barriers, close callbacks) run between retries.
             event_dispatcher_->EnQueue([this]() {
-                if (!acceptor_channel_ || acceptor_channel_->is_channel_closed()
-                    || event_dispatcher_->was_stopped())
-                    return;
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 if (!acceptor_channel_ || acceptor_channel_->is_channel_closed()
                     || event_dispatcher_->was_stopped())
                     return;

@@ -173,6 +173,12 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
                                                   initial_data.size());
         if (consumed < 0) {
             logging::Get()->error("HTTP/2 initial data processing failed");
+            // Clear before SendPendingFrames so OnSendComplete/OnWriteProgress
+            // can resume any watermark-deferred output (e.g., GOAWAY). Without
+            // this, the callbacks bail out (initializing_==true) and deferred
+            // frames are silently truncated. Safe: SendServerPreface() already
+            // completed, which is what the guard was protecting.
+            initializing_ = false;
             // Flush any queued error frames (GOAWAY from flood detection, etc.)
             // before closing, so the peer sees the HTTP/2 error rather than
             // a bare TCP close.

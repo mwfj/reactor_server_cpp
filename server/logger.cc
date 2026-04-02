@@ -667,13 +667,24 @@ void WriteMarker(const std::string& text) {
     // info level. This avoids modifying g_logger's level, which would leak
     // through Get()'s spdlog::default_logger() fallback: concurrent threads
     // could briefly pass info-level messages when runtime level is warn+.
-    // Sink levels (default: trace) are not changed — the marker passes
-    // through sinks without per-sink level manipulation.
     auto marker_logger = std::make_shared<spdlog::logger>(
         g_logger->name(), g_logger->sinks().begin(), g_logger->sinks().end());
     marker_logger->set_level(spdlog::level::info);
+    // SetLevel() raises sink levels too, so sinks also block info markers
+    // at warn+. Temporarily lower them. g_logger's level is NOT changed,
+    // so concurrent threads can't slip info messages through — g_logger
+    // blocks them at the logger level before they reach sinks.
+    std::vector<spdlog::level::level_enum> saved_sink_levels;
+    saved_sink_levels.reserve(g_logger->sinks().size());
+    for (auto& sink : g_logger->sinks()) {
+        saved_sink_levels.push_back(sink->level());
+        sink->set_level(spdlog::level::info);
+    }
     marker_logger->info("================================ {} ================================", text);
     marker_logger->flush();
+    for (size_t i = 0; i < g_logger->sinks().size(); ++i) {
+        g_logger->sinks()[i]->set_level(saved_sink_levels[i]);
+    }
 }
 
 } // namespace logging

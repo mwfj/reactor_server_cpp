@@ -75,8 +75,9 @@ void EnsureLogDir(const std::string& dir);
 
 // Write a visual start/stop marker to the log sinks at info level.
 // Format: "================================ {text} ================================"
-// Uses a temporary logger to bypass g_logger's level without modifying it,
-// so concurrent Get() callers never see a leaked lower level.
+// Bypasses the runtime log level: uses a temporary logger (avoids leaking
+// a lowered level via Get()'s default_logger fallback) and temporarily
+// lowers sink levels (SetLevel raises them alongside the logger level).
 void WriteMarker(const std::string& text);
 
 // Flush all sinks and shut down the logging system.
