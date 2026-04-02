@@ -449,10 +449,40 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             throw std::invalid_argument(
                 "TLS is enabled but key_file is empty");
         }
-        // Note: no stat() checks on cert/key files here. Validate() may run
-        // as a different user (CI, unprivileged operator) than the daemon, so
-        // file-access checks would fail on configs that work at runtime.
-        // TlsContext catches missing/invalid files when the daemon starts.
+        // Check cert/key files exist and are regular files. Uses stat()
+        // which only needs directory traversal permission, not read access —
+        // so CI/operator validation works even when the certs are owned by
+        // the daemon user. TlsContext does the full OpenSSL load at runtime.
+        {
+            struct stat st{};
+            if (stat(config.tls.cert_file.c_str(), &st) != 0) {
+                if (errno == EACCES) {
+                    // Can't traverse path — skip check, TlsContext handles it
+                } else {
+                    throw std::invalid_argument(
+                        "TLS cert_file not found: '" + config.tls.cert_file +
+                        "' (" + std::strerror(errno) + ")");
+                }
+            } else if (!S_ISREG(st.st_mode)) {
+                throw std::invalid_argument(
+                    "TLS cert_file is not a regular file: '" + config.tls.cert_file + "'");
+            }
+        }
+        {
+            struct stat st{};
+            if (stat(config.tls.key_file.c_str(), &st) != 0) {
+                if (errno == EACCES) {
+                    // Can't traverse path — skip check, TlsContext handles it
+                } else {
+                    throw std::invalid_argument(
+                        "TLS key_file not found: '" + config.tls.key_file +
+                        "' (" + std::strerror(errno) + ")");
+                }
+            } else if (!S_ISREG(st.st_mode)) {
+                throw std::invalid_argument(
+                    "TLS key_file is not a regular file: '" + config.tls.key_file + "'");
+            }
+        }
         if (config.tls.min_version != "1.2" && config.tls.min_version != "1.3") {
             throw std::invalid_argument(
                 "Invalid tls.min_version: '" + config.tls.min_version +

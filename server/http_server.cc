@@ -1409,14 +1409,19 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         }
         size_t final_cap = (ws > 0) ? (http_cap == 0 ? ws : std::min(http_cap, ws))
                                     : http_cap;
-        // Phase 1: set cap to the more restrictive of old and new.
+        // Three-phase update ensures the cap is never larger than what the
+        // limits enforce at any point during the transition:
+        //   Phase 1: set cap to min(old, new) — tightest constraint
+        //   Phase 2: update limit atomics (SetupHandlers reads these)
+        //   Phase 3: set final cap (may be larger if limits grew)
         // 0 means unlimited — never use it as the transitional cap.
-        // Update limit atomics first so SetupHandlers (called from
-        // HandleNewConnection on dispatcher threads) reads the new values.
-        // Then set the socket input cap. The cap is derived from the limits,
-        // so connections accepted between the atomic stores and SetMaxInputSize
-        // get new limits with the old (possibly larger) cap — harmless because
-        // the parser enforces the actual limits regardless of cap.
+        size_t old_cap = ComputeInputCap();  // from current atomics
+        size_t transition_cap;
+        if (old_cap == 0 && final_cap == 0) transition_cap = 0;
+        else if (old_cap == 0) transition_cap = final_cap;
+        else if (final_cap == 0) transition_cap = old_cap;
+        else transition_cap = std::min(old_cap, final_cap);
+        net_server_.SetMaxInputSize(transition_cap);
         max_body_size_.store(new_config.max_body_size, std::memory_order_relaxed);
         max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);
         max_ws_message_size_.store(new_config.max_ws_message_size, std::memory_order_relaxed);
