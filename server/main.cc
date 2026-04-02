@@ -86,24 +86,34 @@ static int HandleStatus(const CliOptions& options) {
 
 static int SendSignalToServer(const CliOptions& options, int sig,
                               const char* sig_name) {
-    pid_t pid = PidFile::CheckRunning(options.pid_file);
+    // Hold the flock fd open through kill() to prevent the TOCTOU race:
+    // if the daemon exits between CheckRunning and kill, the PID could be
+    // reused by an unrelated process. The held flock proves the daemon is
+    // alive while we signal it. Closed immediately after kill returns.
+    int lock_fd = -1;
+    pid_t pid = PidFile::CheckRunningHoldLock(options.pid_file, lock_fd);
     if (pid < 0) {
         std::cout << REACTOR_SERVER_NAME << " is not running\n";
         return EXIT_ERROR;
     }
     if (pid == 0) {
+        if (lock_fd >= 0) close(lock_fd);
         std::cerr << REACTOR_SERVER_NAME
                   << " is running but PID is unreadable — cannot send signal\n";
         return EXIT_ERROR;
     }
+    int rc;
     if (kill(pid, sig) == 0) {
         std::cout << "Sent " << sig_name << " to " << REACTOR_SERVER_NAME
                   << " (PID " << pid << ")\n";
-        return EXIT_OK;
+        rc = EXIT_OK;
+    } else {
+        std::cerr << "Failed to send signal to PID " << pid
+                  << ": " << std::strerror(errno) << "\n";
+        rc = EXIT_ERROR;
     }
-    std::cerr << "Failed to send signal to PID " << pid
-              << ": " << std::strerror(errno) << "\n";
-    return EXIT_ERROR;
+    if (lock_fd >= 0) close(lock_fd);
+    return rc;
 }
 
 static int HandleStop(const CliOptions& options) {
