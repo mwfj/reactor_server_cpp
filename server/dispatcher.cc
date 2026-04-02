@@ -269,10 +269,14 @@ void Dispatcher::HandleEventId(){
 #if defined(__linux__)
     uint64_t val;
     ssize_t n = ::read(eventfd_, &val, sizeof val);
-    if (n != sizeof val) {
-        logging::Get()->error("eventfd read failed");
-        return;
+    if (n != sizeof val && errno != EAGAIN && errno != EWOULDBLOCK) {
+        logging::Get()->error("eventfd read failed: {}",
+                              logging::SafeStrerror(errno));
     }
+    // Proceed to drain tasks even if no token was pending (EAGAIN).
+    // HandleEventId() is called both from the event loop (token guaranteed)
+    // and from inline drain paths (e.g., self-dispatcher barrier in
+    // NetServer::Stop) where no token may exist.
 #elif defined(__APPLE__) || defined(__MACH__)
     // Drain the pipe - may have multiple wake-ups queued
     char buf[256];

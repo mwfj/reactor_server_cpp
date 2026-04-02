@@ -307,10 +307,6 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             "Invalid bind_port: " + std::to_string(config.bind_port) +
             " (must be 0-65535)");
     }
-    if (config.bind_port == 0) {
-        logging::Get()->warn("bind_port=0: OS will assign ephemeral port "
-                             "(typically used for testing only)");
-    }
 
     // 0 = unlimited (sentinel), negative = invalid
     if (config.max_connections < 0) {

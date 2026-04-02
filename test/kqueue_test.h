@@ -465,13 +465,19 @@ void TestSoNosigpipe() {
         // Phase 3: Forked child — write to closed peer, verify no SIGPIPE
         bool write_test_pass = false;
         if (accept_ok) {
+            // Parent closes client_fd BEFORE fork so the child's write
+            // targets a peer with zero open references — a true dead peer.
+            // Without this, the parent's copy of client_fd keeps the kernel
+            // socket alive and the child's write succeeds regardless of
+            // SO_NOSIGPIPE, making the test a false positive.
+            ::close(client_fd);
+            client_fd = -1;  // mark closed to avoid double-close below
+
             pid_t pid = fork();
             if (pid == 0) {
                 // Child process
                 // Restore SIGPIPE to default — if SO_NOSIGPIPE is broken, we die
                 signal(SIGPIPE, SIG_DFL);
-                // Close client end (peer) — makes accepted_fd's peer gone
-                ::close(client_fd);
                 // Small delay to ensure close propagates
                 usleep(50000);
                 // Write to the now-dead peer
@@ -488,16 +494,13 @@ void TestSoNosigpipe() {
                 if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
                     write_test_pass = true;
                 }
-                // Parent cleans up its copies of fds
             } else {
                 // fork failed
             }
         }
 
-        // Both parent and child close their copies of client_fd and accepted_fd.
-        // After fork(), each process has independent fd table entries — closing
-        // in both is correct and required. (Would be a double-close bug with threads.)
-        ::close(client_fd);
+        // Close remaining fds. client_fd was closed before fork (marked -1).
+        if (client_fd >= 0) ::close(client_fd);
         if (accept_ok) ::close(accepted_fd);
 
         bool pass = listener_has_opt && accept_ok && accepted_has_opt && write_test_pass;

@@ -246,6 +246,10 @@ static int HandleStart(const CliOptions& options) {
     logging::Get()->info("{} version {} starting", REACTOR_SERVER_NAME,
                          REACTOR_SERVER_VERSION);
     logging::Get()->info("  Listen:  {}:{}", config.bind_host, config.bind_port);
+    if (config.bind_port == 0) {
+        logging::Get()->warn("bind_port=0: OS will assign ephemeral port "
+                             "(typically used for testing only)");
+    }
     logging::Get()->info("  TLS:     {}",
         config.tls.enabled
             ? "enabled (" + config.tls.min_version + "+)"
