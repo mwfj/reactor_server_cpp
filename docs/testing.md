@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all tests (145 tests across 11 suites)
+make test               # Build and run all tests (211 tests across 12 suites)
 \./test_runner                   # Run all tests directly (after building)
 
 # Individual test suites
@@ -17,6 +17,7 @@ make test               # Build and run all tests (145 tests across 11 suites)
 \./test_runner tls               # TLS/SSL tests (or: \./test_runner -T)
 \./test_runner http2             # HTTP/2 protocol tests (or: \./test_runner -2)
 \./test_runner cli               # CLI entry point tests (or: \./test_runner -C)
+\./test_runner route             # Route trie/pattern matching tests (or: \./test_runner -R)
 \./test_runner help              # Show all options
 
 # Make targets for individual suites
@@ -37,14 +38,15 @@ make test_cli           # Build and run CLI tests
 |-------|-------|------|------|---------|
 | Basic | 6 | 9888 | `test/basic_test.h` | `\./test_runner basic` |
 | Stress | 1 | 9889 | `test/stress_test.h` | `\./test_runner stress` |
-| Race Condition | 7 | 10000 | `test/race_condition_test.h` | `\./test_runner race` |
-| Timeout | 3 | 10100 | `test/timeout_test.h` | `\./test_runner timeout` |
+| Race Condition | 14 | 10000 | `test/race_condition_test.h` | `\./test_runner race` |
+| Timeout | 6 | 10100 | `test/timeout_test.h` | `\./test_runner timeout` |
 | Config | 8 | N/A | `test/config_test.h` | `\./test_runner config` |
-| HTTP | 13 | 10201 | `test/http_test.h` | `\./test_runner http` |
+| HTTP | 14 | 10201 | `test/http_test.h` | `\./test_runner http` |
 | WebSocket | 10 | 10301 | `test/websocket_test.h` | `\./test_runner ws` |
 | TLS | 2 | 10401 | `test/tls_test.h` | `\./test_runner tls` |
-| HTTP/2 | 32 | 10500 | `test/http2_test.h` | `\./test_runner http2` |
-| CLI | 50 | N/A | `test/cli_test.h` | `\./test_runner cli` |
+| HTTP/2 | 37 | 10500 | `test/http2_test.h` | `\./test_runner http2` |
+| CLI | 79 | N/A | `test/cli_test.h` | `\./test_runner cli` |
+| Route | 44 | N/A | `test/route_test.h` | `\./test_runner route` |
 
 ### Basic Tests (port 9888)
 - Single client connection

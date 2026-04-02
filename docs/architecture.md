@@ -107,3 +107,44 @@ Other Thread                         Dispatcher Thread
 | Linux | epoll (edge-triggered) | eventfd | timerfd | Production-ready |
 | macOS | kqueue | pipe | kqueue timer | Implemented |
 | Windows | IOCP (planned) | — | — | Not started |
+
+## Operational Endpoints
+
+The production server (`server_runner`) registers operational endpoints when started via `main.cc`:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Liveness check. Returns `{"status":"ok"}` with uptime and connection count. Disabled with `--no-health-endpoint`. |
+| `/stats` | GET | Runtime metrics snapshot. Returns JSON with active connections (by protocol), stream counts, request counters, uptime, and reload-safe config values. Disabled with `--no-stats-endpoint`. |
+
+Stats counters use `memory_order_relaxed` atomics — snapshots are approximate but never stale by more than one operation.
+
+## Config Hot-Reload
+
+SIGHUP triggers config reload in daemon mode (foreground: triggers shutdown). Reload-safe fields are applied immediately to running connections:
+
+| Reload-safe | Restart-required |
+|-------------|-----------------|
+| `idle_timeout_sec`, `request_timeout_sec` | `bind_host`, `bind_port` |
+| `max_connections`, `max_body_size` | `tls.*`, `worker_threads` |
+| `max_header_size`, `max_ws_message_size` | `http2.enabled` |
+| `log.level`, `log.file`, `log.max_*` | |
+| `http2.max_concurrent_streams`, etc. | |
+| `shutdown_drain_timeout_sec` | |
+
+The reload path is transactional: log changes are applied first, then server limits. If server limits are rejected, log changes are rolled back. Log file pruning is deferred until the full reload commits.
+
+## Graceful Shutdown
+
+Shutdown follows a protocol-aware drain sequence:
+
+1. **Stop accepting** — close listen socket, set `closing_` flag on acceptor
+2. **WS close handshake** — send 1001 "Going Away", track in `ws_draining_`, wait up to 6s
+3. **H2 GOAWAY + stream drain** — send GOAWAY, wait for active streams, bounded by `shutdown_drain_timeout_sec`
+4. **HTTP/1 output drain** — wait up to 2s for in-flight responses to flush under backpressure
+5. **Late H2 re-drain** — catch sessions detected after the initial drain wait
+6. **Close sweep** — `CloseAfterWrite` on remaining connections (exempt: draining H2/WS)
+7. **Stop event loops** — `StopEventLoop` on all dispatchers
+8. **Join workers** — `sock_workers_.Stop()`
+
+During shutdown, HTTP/1 responses include `Connection: close`, WS upgrades are rejected with 503, and late H2 detections get immediate `RequestShutdown`.
