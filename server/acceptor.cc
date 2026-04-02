@@ -116,12 +116,14 @@ void Acceptor::NewConnection(){
         }
         if(client_fd == SocketHandler::ACCEPT_MEMORY_PRESSURE){
             // Memory/buffer pressure (ENOBUFS/ENOMEM).
-            // Brief backoff then retry — returning immediately would break
-            // the ET drain loop, and with no new connection to create a
-            // fresh edge, already-queued clients could hang indefinitely.
-            logging::Get()->warn("Accept: memory pressure, retrying after backoff");
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
+            // Return to the event loop so queued tasks (including shutdown)
+            // can execute. The listen socket is still readable, so the next
+            // WaitForEvent cycle re-triggers NewConnection() to retry the
+            // remaining backlog once memory pressure clears.
+            // Sleeping here would wedge the dispatcher — shutdown tasks
+            // from StopAccepting() couldn't drain until the sleep ends.
+            logging::Get()->warn("Accept: memory pressure, deferring to event loop");
+            return;
         }
         std::unique_ptr<SocketHandler> client_sock(new SocketHandler(client_fd, client_addr.Ip(), client_addr.Port()));
         new_conn_cb_(std::move(client_sock));

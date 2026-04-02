@@ -169,6 +169,13 @@ void NetServer::Start(){
 
 // stop event loop
 void NetServer::StopAccepting() {
+    // Suppress the ready callback before any dispatcher interaction.
+    // This is the common entry point for all shutdown paths (NetServer::Stop,
+    // HttpServer::Stop, direct callers). Setting it here instead of only in
+    // NetServer::Stop() ensures the flag is set even when HttpServer::Stop()
+    // calls StopAccepting() directly.
+    stop_requested_.store(true, std::memory_order_release);
+
     if (conn_dispatcher_->was_stopped()) return;  // already stopped
 
     if (conn_dispatcher_->is_running()) {
@@ -201,14 +208,8 @@ void NetServer::StopAccepting() {
 }
 
 void NetServer::Stop(){
-    // Set stop_requested_ FIRST — before any dispatcher interaction.
-    // The ready callback checks this flag to suppress false-ready
-    // notifications. Using was_stopped() on the conn_dispatcher is
-    // insufficient because StopAccepting() sets it after the event
-    // loop may have already drained and executed the ready task.
-    stop_requested_.store(true, std::memory_order_release);
-
-    // First: stop accepting (may already be done by HttpServer::Stop())
+    // First: stop accepting (may already be done by HttpServer::Stop()).
+    // StopAccepting() sets stop_requested_ to suppress the ready callback.
     StopAccepting();
 
     // If Start() hasn't finished building socket_dispatchers_, skip
