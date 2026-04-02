@@ -635,6 +635,13 @@ static int HandleStart(const CliOptions& options) {
                                ]() {
         try {
             server->Start();
+            // Start() returned normally — the server was stopped from within
+            // (e.g., a request handler called HttpServer::Stop()). Signal the
+            // main thread so it exits WaitForSignal() instead of hanging.
+            if (!SignalHandler::ShutdownRequested()) {
+                SignalHandler::MarkShutdownRequested();
+                kill(getpid(), SIGTERM);
+            }
         } catch (...) {
             server_error = std::current_exception();
 #if !defined(_WIN32)
