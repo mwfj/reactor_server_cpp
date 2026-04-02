@@ -70,6 +70,16 @@ void KqueueHandler::UpdateEvent(std::shared_ptr<Channel> ch){
         EV_SET(&evSet[numChanges++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
     }
 
+    // Ensure shared_ptr ownership in channel_map_ BEFORE kevent operations.
+    // kevent stores a raw pointer (udata = ch.get()) — if a partial failure
+    // leaves a filter registered but channel_map_ unset, the Channel can be
+    // destroyed while the live filter still references it (use-after-free).
+    if (events != 0) {
+        std::lock_guard<std::mutex> lock(channel_map_mutex_);
+        channel_map_[fd] = ch;
+        ch->SetEventRead();  // Mark as registered
+    }
+
     // Apply each change independently — batching can fail entirely if one
     // operation returns ENOENT (e.g., deleting a filter that was never added),
     // silently skipping subsequent operations in the same batch.
@@ -77,22 +87,18 @@ void KqueueHandler::UpdateEvent(std::shared_ptr<Channel> ch){
         if (::kevent(kqueuefd_, &evSet[i], 1, nullptr, 0, nullptr) == -1) {
             int saved_errno = errno;
             if (saved_errno == EBADF) {
-                return;  // fd is dead — nothing more to do
+                return;  // fd is dead — channel_map_ entry cleaned up by RemoveChannel
             }
             if (saved_errno == ENOENT) {
                 continue;  // Filter wasn't registered — skip, try next
             }
             logging::Get()->error("kevent failed (fd={}): {}", fd, logging::SafeStrerror(saved_errno));
-            return;
+            // Continue applying remaining changes — don't abort on partial failure.
+            // Ownership is already established in channel_map_.
         }
     }
 
-    // Store in map to maintain ownership - must lock to prevent race with WaitForEvent
-    if(events != 0) {
-        std::lock_guard<std::mutex> lock(channel_map_mutex_);
-        channel_map_[fd] = ch;
-        ch->SetEventRead();  // Mark as registered
-    } else if (is_registered) {
+    if (events == 0 && is_registered) {
         // All interest bits cleared — kqueue filters were deleted above.
         // Remove from channel_map_ to release the shared_ptr and prevent
         // stale entries from keeping the channel alive indefinitely.

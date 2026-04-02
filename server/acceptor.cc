@@ -24,7 +24,15 @@ Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _
 
     acceptor_channel_ = std::shared_ptr<Channel>(new Channel(event_dispatcher_, servsock_ -> fd()));
     acceptor_channel_ -> SetReadCallBackFn(std::bind(&Acceptor::NewConnection, this));
-    acceptor_channel_ -> EnableReadMode(); // let epoll_wait monitorting reading event
+    // Register the acceptor channel synchronously — MUST NOT go through
+    // EnableReadMode() → UpdateChannel() → EnQueue(). The constructor runs
+    // before any event loop starts, so enqueued registration would only
+    // execute later. If it fails silently, the ready callback fires but the
+    // server can't accept connections. Direct registration surfaces any
+    // kqueue/epoll error immediately (as a thrown exception from Bind/Listen
+    // or a failed epoll_ctl), and the Acceptor constructor propagates it.
+    acceptor_channel_->SetEvent(acceptor_channel_->Event() | EVENT_READ | EVENT_RDHUP);
+    event_dispatcher_->UpdateChannelInLoop(acceptor_channel_);
 }
 
 Acceptor::~Acceptor() {

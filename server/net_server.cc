@@ -85,9 +85,9 @@ void NetServer::Start(){
     }
 
     // Barrier: wait for all socket dispatchers to enter their event loops.
-    // This is an optimization to reduce queued work at startup — correctness
-    // no longer depends on it because UpdateChannel always uses EnQueue for
-    // off-thread calls (the thread-unsafe !is_running() fallback was removed).
+    // Fatal on timeout — if a dispatcher never starts, Stop()'s barrier
+    // future.wait() would hang forever, and connections routed to it would
+    // silently queue work that never runs.
     {
         static constexpr int DISPATCHER_START_TIMEOUT_SEC = 5;
         auto deadline = std::chrono::steady_clock::now()
@@ -95,10 +95,14 @@ void NetServer::Start(){
         for (auto& disp : socket_dispatchers_) {
             while (!disp->is_running() && !disp->was_stopped()) {
                 if (std::chrono::steady_clock::now() > deadline) {
-                    logging::Get()->warn(
-                        "Socket dispatcher slow to start ({}s elapsed)",
+                    logging::Get()->error(
+                        "Socket dispatcher failed to start within {} seconds",
                         DISPATCHER_START_TIMEOUT_SEC);
-                    break;
+                    for (auto& d : socket_dispatchers_)
+                        d->StopEventLoop();
+                    sock_workers_.Stop();
+                    throw std::runtime_error(
+                        "Socket dispatcher failed to start within timeout");
                 }
                 std::this_thread::yield();
             }
@@ -198,6 +202,7 @@ void NetServer::Stop(){
     // triggers one final WaitForEvent that includes the write-ready channels.
     // Wait for each socket dispatcher to process enqueued work.
     // Skips self-dispatcher to avoid deadlock when Stop() is called from a handler.
+    static constexpr int STOP_BARRIER_TIMEOUT_SEC = 5;
     auto wait_for_dispatcher_barrier = [this]() {
         for (auto& disp : socket_dispatchers_) {
             if (disp->was_stopped()) continue;
@@ -212,7 +217,13 @@ void NetServer::Stop(){
             auto barrier = std::make_shared<std::promise<void>>();
             auto future = barrier->get_future();
             disp->EnQueue([barrier]() { barrier->set_value(); });
-            future.wait();
+            if (future.wait_for(std::chrono::seconds(STOP_BARRIER_TIMEOUT_SEC))
+                    == std::future_status::timeout) {
+                logging::Get()->error(
+                    "Socket dispatcher barrier timed out during Stop(), "
+                    "forcing StopEventLoop");
+                disp->StopEventLoop();
+            }
         }
     };
 

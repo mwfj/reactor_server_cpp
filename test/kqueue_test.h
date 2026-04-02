@@ -480,11 +480,16 @@ void TestSoNosigpipe() {
                 signal(SIGPIPE, SIG_DFL);
                 // Small delay to ensure close propagates
                 usleep(50000);
-                // Write to the now-dead peer
+                // Write twice: the first write to a closed TCP peer often
+                // succeeds (buffered locally before RST arrives). The second
+                // write, after the RST is received, is the one that triggers
+                // EPIPE/SIGPIPE. Without the double write, the test can
+                // false-pass even when SO_NOSIGPIPE is broken.
                 char buf[] = "test";
-                ssize_t n = ::write(accepted_fd, buf, sizeof(buf));
+                ::write(accepted_fd, buf, sizeof(buf));
+                usleep(50000);  // let RST propagate after first write
+                ::write(accepted_fd, buf, sizeof(buf));
                 // If we get here, SO_NOSIGPIPE worked (we got EPIPE, not killed)
-                (void)n;
                 ::close(accepted_fd);
                 _exit(0);
             } else if (pid > 0) {
