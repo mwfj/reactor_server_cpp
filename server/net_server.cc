@@ -88,7 +88,8 @@ void NetServer::Start(){
     }
 
     // If shutdown was requested during setup, clean up and return.
-    // Stop() returns early when startup_done_ is false, so we own cleanup.
+    // Stop() also stops sock_workers_ on the early path, but Stop() is
+    // idempotent, so double-call from both paths is safe.
     if (conn_dispatcher_->was_stopped()) {
         for (auto& d : socket_dispatchers_) d->StopEventLoop();
         sock_workers_.Stop();
@@ -141,9 +142,14 @@ void NetServer::Stop(){
     StopAccepting();
 
     // If startup hasn't completed, Start() will detect was_stopped and
-    // clean up on its own. Don't touch socket_dispatchers_ — it may be
-    // concurrently modified by Start()'s setup loop.
-    if (!startup_done_.load(std::memory_order_acquire)) return;
+    // clean up socket_dispatchers_ on its own. Don't touch that vector —
+    // it may be concurrently modified by Start()'s setup loop.
+    // But always stop the worker pool: it was started in the constructor,
+    // so threads are running even if Start() never ran or hasn't finished.
+    if (!startup_done_.load(std::memory_order_acquire)) {
+        sock_workers_.Stop();
+        return;
+    }
 
     // Second (deferred): ClearConnections is done AFTER the drain wait so that
     // dispatcher TimerHandler continues enforcing per-connection deadlines during

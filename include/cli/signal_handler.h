@@ -36,10 +36,11 @@ public:
     // Saves prior signal dispositions and thread mask for Cleanup(RESTORE).
     // Must be called from the main thread before spawning any threads.
     // No-op if already installed (prevents overwriting saved prior state).
-    // @param daemon_mode  Affects log message only. SIGHUP is always reset to
-    //                     SIG_DFL regardless of mode (nohup's SIG_IGN would
-    //                     prevent sigwait from receiving the signal on macOS/BSD).
-    //                     Daemon: SIGHUP = config reload. Foreground: SIGHUP = shutdown.
+    // @param daemon_mode  If true, SIGHUP is always reset to SIG_DFL even if
+    //                     inherited as SIG_IGN (nohup). A daemon has no terminal,
+    //                     so inherited SIG_IGN is meaningless and would silently
+    //                     break SIGHUP-based config reload. In foreground mode,
+    //                     inherited SIG_IGN is preserved (nohup compatibility).
     static void Install(bool daemon_mode = false);
 
     // Wait for the next actionable signal via sigwait().

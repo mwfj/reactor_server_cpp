@@ -59,27 +59,19 @@ void SignalHandler::Install(bool daemon_mode) {
     }
 
     // On macOS/BSD, sigwait() cannot receive signals whose disposition is SIG_IGN —
-    // the kernel discards them before they become pending. All waited signals must
-    // be SIG_DFL so they reach sigwait(). Safe: signals are blocked, so SIG_DFL
-    // cannot fire between here and sigwait().
-    // SIGHUP: always reset, even if inherited as SIG_IGN from nohup. In daemon
-    // mode, SIG_IGN would break SIGHUP-based config reload. In foreground mode,
-    // SIG_IGN would silently swallow the terminal-hangup shutdown signal.
+    // the kernel discards them before they become pending. SIGTERM/SIGINT must
+    // always be SIG_DFL so shutdown signals reach sigwait().
+    // SIGHUP: in daemon mode, always reset (no terminal → inherited SIG_IGN is
+    // meaningless and would break SIGHUP-based config reload). In foreground,
+    // only undo our own Cleanup(FOR_EXIT)'s SIG_IGN — preserve nohup's inherited
+    // SIG_IGN so `nohup ./server_runner start &` keeps working as expected.
+    // Safe: signals are blocked, so SIG_DFL cannot fire.
     SetDisposition(SIGTERM, SIG_DFL);
     SetDisposition(SIGINT, SIG_DFL);
-    if (!daemon_mode && !g_was_cleaned_up &&
-        g_prev_sighup.sa_handler == SIG_IGN) {
-        // Overriding inherited SIG_IGN (e.g., nohup). Log so the operator
-        // knows SIGHUP handling is active despite nohup.
-        // Best-effort: logger may not be initialized yet.
-        try {
-            logging::Get()->info(
-                "Overriding inherited SIGHUP SIG_IGN (nohup) — "
-                "SIGHUP will trigger shutdown in foreground mode");
-        } catch (...) {}
+    if (daemon_mode || g_was_cleaned_up) {
+        SetDisposition(SIGHUP, SIG_DFL);
+        g_was_cleaned_up = false;
     }
-    SetDisposition(SIGHUP, SIG_DFL);
-    g_was_cleaned_up = false;
 
     sigemptyset(&g_wait_mask);
     sigaddset(&g_wait_mask, SIGTERM);
