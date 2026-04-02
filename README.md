@@ -1,18 +1,19 @@
 # Reactor pattern based HTTP/Websocket Server
 
-A high-performance C++ network server built on the Reactor pattern with epoll/kqueue I/O multiplexing. Supports HTTP/1.1, WebSocket (RFC 6455), and TLS — all layered on top of a non-blocking, edge-triggered event loop designed for thousands of concurrent connections.
+A high-performance C++ network server built on the Reactor pattern with epoll/kqueue I/O multiplexing. Supports HTTP/1.1, HTTP/2 (RFC 9113), WebSocket (RFC 6455), and TLS — all layered on top of a non-blocking, edge-triggered event loop designed for thousands of concurrent connections.
 
 ## Features
 
 - **HTTP/1.1** — request routing, middleware, keep-alive, pipelining, chunked transfer
+- **HTTP/2** — RFC 9113 compliant: stream multiplexing, HPACK, flow control, ALPN negotiation, flood protection
 - **WebSocket** — RFC 6455 compliant: handshake, binary/text frames, fragmentation, close handshake, ping/pong
 - **TLS/SSL** — optional OpenSSL 3.x integration with configurable minimum version and cipher suites
 - **Reactor Core** — edge-triggered epoll (Linux) / kqueue (macOS), non-blocking I/O, multi-threaded dispatcher pool
 - **Thread Pool** — configurable worker threads for event loop dispatchers
-- **Connection Management** — idle timeout detection, request deadlines (Slowloris protection), graceful shutdown with WS close frames
-- **CLI** — production binary with config validation, signal management, PID file tracking, health endpoint
+- **Connection Management** — idle timeout detection, request deadlines (Slowloris protection), graceful shutdown with WS close frames and H2 GOAWAY drain
+- **CLI** — production binary with config validation, signal management, PID file tracking, health/stats endpoints, daemon mode
 - **Configuration** — JSON config files + environment variable overrides + CLI flag overrides
-- **Structured Logging** — spdlog-based async logging with file rotation
+- **Structured Logging** — spdlog-based logging with date-based file rotation
 
 ## Quick Start
 
@@ -21,19 +22,19 @@ A high-performance C++ network server built on the Reactor pattern with epoll/kq
 make
 
 # Start the server
-./reactor_server start
+./server_runner start
 
 # Start with custom port and log level
-./reactor_server start -p 9090 -l debug
+./server_runner start -p 9090 -l debug
 
 # Start with a config file
-./reactor_server start -c config/server.example.json
+./server_runner start -c config/server.example.json
 
 # Check server status
-./reactor_server status
+./server_runner status
 
 # Graceful shutdown
-./reactor_server stop
+./server_runner stop
 ```
 
 ## Running the Server
@@ -42,31 +43,34 @@ make
 
 ```bash
 # Start with defaults (127.0.0.1:8080)
-./reactor_server start
+./server_runner start
 
 # Override host and port
-./reactor_server start -H 0.0.0.0 -p 8080
+./server_runner start -H 0.0.0.0 -p 8080
+
+# Daemon mode
+./server_runner start -d -c config/production.json
 
 # Validate config without starting
-./reactor_server validate -c config/server.example.json
+./server_runner validate -c config/server.example.json
 
 # Show resolved config (defaults + file + env + CLI)
-./reactor_server config -p 9090 -l debug
+./server_runner config -p 9090 -l debug
 
 # Version info
-./reactor_server version -V
+./server_runner version -V
 
 # Show usage
-./reactor_server
+./server_runner
 ```
 
 ### CLI Reference
 
 ```
-reactor_server <command> [options]
+server_runner <command> [options]
 
 Commands:
-  start       Start the server (foreground)
+  start       Start the server (foreground, or -d for daemon)
   stop        Stop a running server
   status      Check server status
   validate    Validate configuration
@@ -81,7 +85,9 @@ Start options:
   -l, --log-level <level>     Override log level (trace/debug/info/warn/error/critical)
   -w, --workers <N>           Override worker thread count (0 = auto)
   -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)
-  --no-health-endpoint       Disable the /health endpoint
+  -d, --daemonize             Run as a background daemon
+  --no-health-endpoint       Disable /health and /stats endpoints
+  --no-stats-endpoint        Disable the /stats endpoint
 
 Stop/status options:
   -P, --pid-file <file>       PID file path
@@ -96,8 +102,9 @@ Global options:
 
 | Signal | Behavior |
 |--------|----------|
-| `SIGTERM` | Graceful shutdown (sends WS Close 1001, drains connections, exits) |
+| `SIGTERM` | Graceful shutdown (sends WS Close 1001, H2 GOAWAY, drains connections, exits) |
 | `SIGINT` | Same as SIGTERM (Ctrl+C) |
+| `SIGHUP` | Daemon: reopen log files for rotation. Foreground: graceful shutdown |
 | `SIGPIPE` | Ignored |
 
 ### Config Override Precedence
@@ -108,16 +115,19 @@ defaults < config file < environment variables < CLI flags
 
 Environment variables: `REACTOR_BIND_HOST`, `REACTOR_BIND_PORT`, `REACTOR_TLS_ENABLED`, `REACTOR_TLS_CERT`, `REACTOR_TLS_KEY`, `REACTOR_LOG_LEVEL`, `REACTOR_LOG_FILE`, `REACTOR_MAX_CONNECTIONS`, `REACTOR_IDLE_TIMEOUT`, `REACTOR_WORKER_THREADS`, `REACTOR_REQUEST_TIMEOUT`
 
-### Health Endpoint
+### Health & Stats Endpoints
 
-Enabled by default at `/health`:
+Enabled by default:
 
 ```bash
 curl http://127.0.0.1:8080/health
 # {"status":"ok","pid":12345,"uptime_seconds":3600}
+
+curl http://127.0.0.1:8080/stats
+# {"uptime_seconds":3600,"connections":{"active":42,...},"requests":{"total":50000,...},...}
 ```
 
-Disable with `--no-health-endpoint`.
+Disable with `--no-health-endpoint` (disables both) or `--no-stats-endpoint` (disables only `/stats`).
 
 ## Programming API
 
@@ -190,6 +200,7 @@ JSON config file:
     "max_header_size": 8192,
     "max_ws_message_size": 16777216,
     "request_timeout_sec": 30,
+    "shutdown_drain_timeout_sec": 30,
     "tls": {
         "enabled": false,
         "cert_file": "",
@@ -201,6 +212,13 @@ JSON config file:
         "file": "",
         "max_file_size": 10485760,
         "max_files": 3
+    },
+    "http2": {
+        "enabled": true,
+        "max_concurrent_streams": 100,
+        "initial_window_size": 65535,
+        "max_frame_size": 16384,
+        "max_header_list_size": 65536
     }
 }
 ```
@@ -211,8 +229,11 @@ JSON config file:
 Layer 5: HttpServer / ReactorServer         (application entry points)
 Layer 4: HttpRouter, WebSocketConnection    (routing, WS message API)
 Layer 3: HttpParser, WebSocketParser        (protocol parsing)
-         HttpConnectionHandler              (HTTP state machine)
-Layer 2: TlsContext, TlsConnection          (optional TLS)
+         HttpConnectionHandler              (HTTP/1.1 state machine)
+         Http2Session, Http2Stream          (HTTP/2 session/stream management)
+         Http2ConnectionHandler             (HTTP/2 state machine)
+         ProtocolDetector                   (HTTP/1.x vs HTTP/2 detection)
+Layer 2: TlsContext, TlsConnection          (optional TLS, ALPN)
 Layer 1: ConnectionHandler, Channel,        (reactor core)
          Dispatcher, EventHandler
 ```
@@ -225,18 +246,19 @@ See [docs/architecture.md](docs/architecture.md) for the full design, data flow 
 reactor_server_cpp/
 ├── include/              # Headers
 │   ├── http/             #   HTTP layer (server, router, parser, request/response)
+│   ├── http2/            #   HTTP/2 layer (session, stream, connection handler)
 │   ├── ws/               #   WebSocket layer (connection, parser, frame, handshake)
 │   ├── tls/              #   TLS layer (context, connection)
 │   ├── cli/              #   CLI layer (parser, signal handler, PID file, version)
 │   ├── config/           #   Configuration (server_config, config_loader)
-│   ├── log/              #   Logging (logger)
+│   ├── log/              #   Logging (logger, log_utils)
 │   └── *.h               #   Reactor core (dispatcher, channel, connection, etc.)
 ├── server/               # Implementation (.cc)
 │   ├── main.cc           #   Production entry point
 │   └── *.cc              #   All component implementations
-├── test/                 # Test suites (basic, stress, race, timeout, http, ws, tls, cli)
+├── test/                 # Test suites (basic, stress, race, timeout, http, ws, tls, http2, cli)
 ├── thread_pool/          # Standalone thread pool (separate build)
-├── third_party/          # llhttp (HTTP parser), nlohmann/json, spdlog
+├── third_party/          # llhttp, nghttp2, nlohmann/json, spdlog
 ├── config/               # Example config files
 ├── docs/                 # Documentation
 └── Makefile
@@ -245,23 +267,23 @@ reactor_server_cpp/
 ## Build
 
 ```bash
-make                # Build both test runner (./run) and server (./reactor_server)
-make server         # Build only the production server
-make test           # Build and run all tests (133 tests)
-make clean          # Remove artifacts
-make help           # Show all targets
+make                    # Build both test runner (./test_runner) and server (./server_runner)
+make server             # Build only the production server
+make test               # Build and run all tests (167 tests)
+make clean              # Remove artifacts
+make help               # Show all targets
 
 # Run specific test suites
-./run basic         # Basic functionality (6 tests)
-./run stress        # Stress tests — 100 concurrent clients (1 test)
-./run race          # Race condition tests (7 tests)
-./run timeout       # Connection timeout tests (3 tests)
-./run config        # Configuration tests (8 tests)
-./run http          # HTTP protocol tests (14 tests)
-./run ws            # WebSocket protocol tests (10 tests)
-./run tls           # TLS/SSL tests (2 tests)
-./run http2         # HTTP/2 protocol tests (32 tests)
-./run cli           # CLI entry point tests (50 tests)
+./test_runner basic     # Basic functionality (6 tests)
+./test_runner stress    # Stress tests — 100 concurrent clients (1 test)
+./test_runner race      # Race condition tests (9 tests)
+./test_runner timeout   # Connection timeout tests (3 tests)
+./test_runner config    # Configuration tests (8 tests)
+./test_runner http      # HTTP protocol tests (14 tests)
+./test_runner ws        # WebSocket protocol tests (10 tests)
+./test_runner tls       # TLS/SSL tests (2 tests)
+./test_runner http2     # HTTP/2 protocol tests (32 tests)
+./test_runner cli       # CLI entry point tests (82 tests)
 
 # Thread pool subproject (independent)
 cd thread_pool && make && ./run
@@ -273,11 +295,12 @@ cd thread_pool && make && ./run
 
 | Document | Description |
 |----------|-------------|
-| [docs/cli.md](docs/cli.md) | CLI usage, flags, signal handling, PID files |
+| [docs/cli.md](docs/cli.md) | CLI usage, flags, signal handling, PID files, daemon mode |
 | [docs/architecture.md](docs/architecture.md) | Reactor pattern, layered design, data flow, memory management |
 | [docs/callback_architecture.md](docs/callback_architecture.md) | 3-layer callback chain, type definitions, weak_ptr design pattern |
 | [docs/testing.md](docs/testing.md) | Test suites, running tests, port configuration |
 | [docs/http.md](docs/http.md) | HTTP/1.1 layer — routing, middleware, request/response API |
+| [docs/http2.md](docs/http2.md) | HTTP/2 layer — streams, HPACK, flow control, ALPN |
 | [docs/websocket.md](docs/websocket.md) | WebSocket — upgrade flow, frames, message API, RFC 6455 compliance |
 | [docs/tls.md](docs/tls.md) | TLS/SSL — configuration, state machine, OpenSSL integration |
 | [docs/configuration.md](docs/configuration.md) | JSON config, environment variables, structured logging |

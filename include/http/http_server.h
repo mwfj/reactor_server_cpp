@@ -8,14 +8,34 @@
 #include "config/server_config.h"
 #include "tls/tls_context.h"
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+#include <set>
 #include <string>
 
 class HttpServer {
 public:
+    // Snapshot of server runtime statistics. All values are approximate
+    // (relaxed atomic reads) — slightly stale snapshots are acceptable.
+    struct ServerStats {
+        int64_t uptime_seconds = 0;
+        int64_t active_connections = 0;
+        int64_t active_http1_connections = 0;
+        int64_t active_http2_connections = 0;
+        int64_t active_h2_streams = 0;
+        int64_t total_accepted = 0;
+        int64_t total_requests = 0;
+        int64_t active_requests = 0;
+        // Reload-safe config fields (live values from atomics)
+        int max_connections = 0;
+        int idle_timeout_sec = 0;
+        int request_timeout_sec = 0;
+        int worker_threads = 0;  // resolved from auto mode
+    };
+
     // Construct with explicit host/port
     HttpServer(const std::string& ip, int port);
 
@@ -40,9 +60,23 @@ public:
     void Start();  // Blocks in event loop
     void Stop();
 
+    // Apply reload-safe config fields at runtime. Called from the main
+    // (signal) thread on SIGHUP. Thread-safe: uses atomic stores for limit
+    // fields and EnQueue for dispatcher-thread-affine updates.
+    // Restart-required fields (bind_host, bind_port, tls.*, worker_threads,
+    // http2.enabled) are silently ignored — the caller logs them.
+    // Returns false if the config was rejected (validation failure, not ready).
+    bool Reload(const ServerConfig& new_config);
+
+    // Return a snapshot of server runtime statistics.
+    ServerStats GetStats() const;
+
     // Called after init completes but before the blocking event loop.
     // Used by daemon mode to signal readiness to the parent process.
     void SetReadyCallback(std::function<void()> cb);
+
+    // True after Start() finishes building dispatchers and ready callback fires.
+    bool IsReady() const { return server_ready_.load(std::memory_order_acquire); }
 
     // Returns the actual port the server is listening on.
     int GetBoundPort() const;
@@ -68,14 +102,34 @@ private:
     // Must be called OUTSIDE conn_mtx_ to prevent deadlock.
     void SafeNotifyWsClose(const std::shared_ptr<HttpConnectionHandler>& http_conn);
 
+    // Compute timer scan interval from timeout values.
+    static int ComputeTimerInterval(int idle_timeout_sec, int request_timeout_sec);
+
+    // Returns true if any HTTP/1 connection has pending output data.
+    // Used during shutdown to wait for in-flight responses to drain.
+    bool HasPendingH1Output();
+
+    // Set start_time_ and server_ready_ flag. Called by the ready callback.
+    void MarkServerReady();
+
+    // Subtract remaining stream count from active_h2_streams_.
+    void CompensateH2Streams(const std::shared_ptr<Http2ConnectionHandler>& h2);
+
+    // Shared implementation for HandleCloseConnection/HandleErrorConnection.
+    // Removes the connection from all maps, decrements counters, and notifies
+    // drain/WS handlers. Must be called with conn_mtx_ NOT held.
+    void RemoveConnection(std::shared_ptr<ConnectionHandler> conn);
+
     std::shared_ptr<TlsContext> tls_ctx_;  // Shared with NetServer for safe lifetime
 
     // Request limits — defaults match ServerConfig defaults.
     // The ip/port constructor uses these; the config constructor overwrites them.
-    size_t max_body_size_ = 1048576;       // 1 MB
-    size_t max_header_size_ = 8192;        // 8 KB
-    size_t max_ws_message_size_ = 16777216; // 16 MB
-    int request_timeout_sec_ = 30;         // Slowloris protection
+    // Atomic: Reload() writes from main thread, SetupHandlers()/SetupH2Handlers()
+    // reads from dispatcher threads.
+    std::atomic<size_t> max_body_size_{1048576};       // 1 MB
+    std::atomic<size_t> max_header_size_{8192};        // 8 KB
+    std::atomic<size_t> max_ws_message_size_{16777216}; // 16 MB
+    std::atomic<int> request_timeout_sec_{30};         // Slowloris protection
 
     // HTTP/2 support
     bool http2_enabled_ = true;
@@ -92,15 +146,42 @@ private:
     std::map<int, PendingDetection> pending_detection_;
 
     // Graceful HTTP/2 shutdown drain
-    int shutdown_drain_timeout_sec_ = 30;
+    std::atomic<int> shutdown_drain_timeout_sec_{30};
+
+    // Runtime counters for /stats endpoint. All use memory_order_relaxed.
+    std::atomic<int64_t> active_connections_{0};
+    std::atomic<int64_t> active_http1_connections_{0};
+    std::atomic<int64_t> active_http2_connections_{0};
+    std::atomic<int64_t> active_h2_streams_{0};
+    std::atomic<int64_t> total_accepted_{0};
+    std::atomic<int64_t> total_requests_{0};
+    std::atomic<int64_t> active_requests_{0};
+
+    // Server start time for uptime calculation. Set by the ready callback
+    // when the server actually starts accepting connections, not at construction.
+    std::chrono::steady_clock::time_point start_time_;
+
+    // Resolved worker count (set at construction, never changes).
+    // Needed because auto mode (worker_threads=0) resolves inside ThreadPool.
+    int resolved_worker_threads_ = 0;
+
+    // Set by the ready callback after Start() finishes building dispatchers.
+    // Reload() checks this to avoid walking socket_dispatchers_ during startup.
+    std::atomic<bool> server_ready_{false};
+    // Set by Stop() after server_ready_=false. Used by GetStats() to keep
+    // reporting valid uptime during the drain phase. Acts as a release
+    // barrier for the non-atomic start_time_ field.
+    std::atomic<bool> shutting_down_started_{false};
     struct DrainingH2Conn {
         std::shared_ptr<Http2ConnectionHandler> handler;
         std::shared_ptr<ConnectionHandler> conn;
     };
     std::vector<DrainingH2Conn> h2_draining_;
+    std::set<ConnectionHandler*> ws_draining_;  // WS connections in close handshake
     std::mutex drain_mtx_;
     std::condition_variable drain_cv_;
     void OnH2DrainComplete(ConnectionHandler* conn_ptr);
+    void OnWsDrainComplete(ConnectionHandler* conn_ptr);
     void WaitForH2Drain();
 
     // Helper: set up request handler on an Http2ConnectionHandler
@@ -108,6 +189,9 @@ private:
 
     // Detect protocol and create the appropriate handler (HTTP/1.x or HTTP/2).
     // Returns true if handler was created and data was routed.
+    // already_counted: true if total_accepted_/active_connections_ were already
+    // incremented by HandleNewConnection (normal path); false on the accept/data
+    // race path where HandleMessage runs before HandleNewConnection.
     bool DetectAndRouteProtocol(std::shared_ptr<ConnectionHandler> conn,
-                                std::string& message);
+                                std::string& message, bool already_counted);
 };

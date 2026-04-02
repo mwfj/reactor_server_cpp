@@ -129,15 +129,21 @@ void Dispatcher::set_running_state(bool status){
 
 void Dispatcher::RunEventLoop(){
     // Guard: if StopEventLoop() was called before we entered the loop
-    // (e.g., TestServerRunner timeout calling Stop() while the server thread
-    // is still setting up), return immediately so the thread can be joined.
-    // Without this, set_running_state(true) would override the stop and the
-    // loop would run forever, hanging the join().
+    // (e.g., shutdown during startup), return immediately so the thread
+    // can be joined. Without this, set_running_state(true) would override
+    // the stop and the loop would run forever, hanging the join().
     if (was_stopped()) return;
 
     set_running_state(true);
-
     thread_id_.store(std::this_thread::get_id(), std::memory_order_release);
+
+    // Recheck: StopEventLoop may have raced between our was_stopped check
+    // and set_running_state(true), setting is_running=false which we then
+    // overwrote. Catch this by rechecking was_stopped after arming is_running.
+    if (was_stopped()) {
+        set_running_state(false);
+        return;
+    }
 
     while(is_running()){
       try {
@@ -150,10 +156,23 @@ void Dispatcher::RunEventLoop(){
         // Note: on macOS, EVFILT_TIMER may fire with no channel events,
         // so we still need to check ConsumeTimerFired() below.
         if(channels.size() == 0){
-            // Call timeout callback if set
+            // Drain queued tasks on timeout — if WakeUp's write failed
+            // (EAGAIN on full pipe/eventfd), tasks would be stranded until
+            // the next real I/O event without this opportunistic drain.
+            {
+                std::deque<std::function<void()>> tasks;
+                {
+                    std::lock_guard<std::mutex> lck(mtx_);
+                    if (!task_que_.empty()) tasks.swap(task_que_);
+                }
+                for (auto& fn : tasks) {
+                    try { fn(); } catch (...) {}
+                }
+            }
             if(callbacks_.timeout_trigger_callback){
                 callbacks_.timeout_trigger_callback(shared_from_this());
             }
+            continue;
         }
 
         // Process all active channels
@@ -320,6 +339,18 @@ void Dispatcher::HandleEventId(){
     }
 }
 
+void Dispatcher::ProcessPendingTasks() {
+    std::deque<std::function<void()>> tasks;
+    {
+        std::lock_guard<std::mutex> lck(mtx_);
+        if (task_que_.empty()) return;
+        tasks.swap(task_que_);
+    }
+    for (auto& fn : tasks) {
+        try { fn(); } catch (...) {}
+    }
+}
+
 void Dispatcher::EnQueue(std::function<void()> fn){
     // Only discard tasks after explicit stop — allow during startup (before RunEventLoop)
     if (was_stopped_.load(std::memory_order_acquire)) return;
@@ -328,6 +359,13 @@ void Dispatcher::EnQueue(std::function<void()> fn){
         task_que_.push_back(fn);
     }
     WakeUp();
+}
+
+void Dispatcher::EnQueueDeferred(std::function<void()> fn) {
+    if (was_stopped_.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lck(mtx_);
+    task_que_.push_back(std::move(fn));
+    // No WakeUp — task picked up on next WaitForEvent timeout or HandleEventId
 }
 
 void Dispatcher::AddConnection(std::shared_ptr<ConnectionHandler> conn){
@@ -356,6 +394,15 @@ void Dispatcher::SetTimerCB(CALLBACKS_NAMESPACE::DispatcherTimerCallback fn){
 
 void Dispatcher::SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCallback fn){
     callbacks_.timeout_trigger_callback = std::move(fn);
+}
+
+void Dispatcher::SetTimerInterval(int interval) {
+    end_t_ = interval;
+    // Re-arm the timerfd immediately so a downward reload takes effect
+    // without waiting for the old (potentially much longer) interval to fire.
+    if (timer_fd_ >= 0 && interval > 0) {
+        TimeStamp::ResetTimerFd(timer_fd_, interval);
+    }
 }
 
 void Dispatcher::TimerHandler(){

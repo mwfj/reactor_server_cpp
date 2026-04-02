@@ -78,7 +78,15 @@ public:
 
     void WakeUp();
     void HandleEventId();
+    // Process all queued tasks without requiring a wakeup signal.
+    // Used by stop-from-handler drain to pump enqueued tasks while
+    // the event loop is paused (blocked in a handler callback).
+    void ProcessPendingTasks();
     void EnQueue(std::function<void()>);
+    // Enqueue a task without waking the event loop. The task runs on the
+    // next natural WaitForEvent timeout (~1s) or next HandleEventId from
+    // another EnQueue. Used for deferred retries that need backoff.
+    void EnQueueDeferred(std::function<void()>);
     void AddConnection(std::shared_ptr<ConnectionHandler>);
     void RemoveTimerConnection(int fd);
     void RemoveTimerConnectionIfMatch(int fd, std::shared_ptr<ConnectionHandler> conn);
@@ -87,4 +95,13 @@ public:
     void SetTimerCB(CALLBACKS_NAMESPACE::DispatcherTimerCallback);
     void SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCallback);
     void TimerHandler();
+
+    // Update idle timeout duration at runtime. Must be called on the
+    // dispatcher thread (via EnQueue) to avoid racing with TimerHandler.
+    void SetTimeout(std::chrono::seconds timeout) { timeout_ = timeout; }
+
+    // Update timer scan interval at runtime and re-arm the timerfd so the
+    // new cadence takes effect immediately (not deferred to the next fire).
+    // Must be called on the dispatcher thread (via EnQueue).
+    void SetTimerInterval(int interval);
 };

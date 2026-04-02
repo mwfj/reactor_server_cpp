@@ -24,6 +24,21 @@ void Http2ConnectionHandler::SetStreamCloseCallback(StreamCloseCallback callback
     }
 }
 
+void Http2ConnectionHandler::SetStreamOpenCallback(StreamOpenCallback callback) {
+    pending_stream_open_cb_ = callback;  // Store for Initialize()
+    if (session_) {
+        session_->SetStreamOpenCallback(std::move(callback));
+    }
+}
+
+void Http2ConnectionHandler::SetRequestCountCallback(
+    HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback callback) {
+    pending_request_count_cb_ = callback;
+    if (session_) {
+        session_->SetRequestCountCallback(std::move(callback));
+    }
+}
+
 void Http2ConnectionHandler::SetMaxBodySize(size_t max) {
     max_body_size_ = max;
     if (session_) {
@@ -58,6 +73,14 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
     if (pending_stream_close_cb_) {
         session_->SetStreamCloseCallback(std::move(pending_stream_close_cb_));
         pending_stream_close_cb_ = nullptr;
+    }
+    if (pending_stream_open_cb_) {
+        session_->SetStreamOpenCallback(std::move(pending_stream_open_cb_));
+        pending_stream_open_cb_ = nullptr;
+    }
+    if (pending_request_count_cb_) {
+        session_->SetRequestCountCallback(std::move(pending_request_count_cb_));
+        pending_request_count_cb_ = nullptr;
     }
 
     // Apply body size limit. Header list size comes from h2_settings_
@@ -144,15 +167,17 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
         deadline_armed_ = true;
     }
 
-    // If there's initial data (buffered during detection), process it now
+    // If there's initial data (buffered during detection), process it now.
+    // This MUST happen before GOAWAY: requests in the buffered packet were
+    // already accepted (the client sent them before the server announced
+    // shutdown). Sending GOAWAY first would reject them with REFUSED_STREAM,
+    // which is the opposite of graceful drain.
     if (!initial_data.empty()) {
         ssize_t consumed = session_->ReceiveData(initial_data.data(),
                                                   initial_data.size());
         if (consumed < 0) {
             logging::Get()->error("HTTP/2 initial data processing failed");
-            // Flush any queued error frames (GOAWAY from flood detection, etc.)
-            // before closing, so the peer sees the HTTP/2 error rather than
-            // a bare TCP close.
+            initializing_ = false;
             session_->SendPendingFrames();
             conn_->CloseAfterWrite();
             return;
@@ -205,9 +230,22 @@ void Http2ConnectionHandler::OnRawData(
         // ReceiveData failures are almost always caused by malformed peer
         // frames (bad preface, protocol violations, etc.). Use PROTOCOL_ERROR
         // so clients get the correct retry/diagnostic signal.
-        logging::Get()->error("HTTP/2 session recv error, closing connection");
-        session_->ClearDeferredOutput();  // prevent stale resume
+        logging::Get()->error("HTTP/2 session recv error fd={}, closing connection",
+                              conn_ ? conn_->fd() : -1);
+        // Flush ALL deferred response frames before GOAWAY. A single
+        // ResumeOutput may not drain everything under backpressure (nghttp2
+        // defers when the output buffer is full). Loop until empty so
+        // CloseAfterWrite (which suppresses complete_callback) doesn't
+        // strand remaining frames.
         resume_scheduled_ = false;
+        static constexpr int MAX_RESUME_ROUNDS = 64;  // prevent infinite loop
+        for (int i = 0; i < MAX_RESUME_ROUNDS && session_->HasDeferredOutput(); ++i) {
+            session_->ResumeOutput();
+        }
+        if (session_->HasDeferredOutput()) {
+            // Still deferred after max rounds — drop remaining to avoid hang
+            session_->ClearDeferredOutput();
+        }
         session_->SendGoaway(HTTP2_CONSTANTS::ERROR_PROTOCOL_ERROR);
         session_->SendPendingFrames();
         conn_->CloseAfterWrite();

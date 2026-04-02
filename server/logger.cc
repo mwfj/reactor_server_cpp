@@ -25,7 +25,7 @@ static std::string g_current_file_path;  // Currently open file path with date+s
 static std::string g_current_log_date;  // Date string ("YYYY-MM-DD") of the current log file
 
 static constexpr const char* LOG_PATTERN = "[%Y-%m-%d %H:%M:%S.%e] [%n] [%^%l%$] %v";
-static constexpr size_t DATE_BUF_SIZE = 16;
+static constexpr size_t DATE_BUF_SIZE = 36;
 
 // ── Path decomposition helpers ──────────────────────────────────────
 
@@ -248,7 +248,13 @@ static void PruneOldFiles() {
 // Caller must hold g_logger_mtx. Does NOT prune — caller must prune
 // after the new logger is fully committed (to avoid irreversible side effects
 // before the rebuild is confirmed successful).
+// Staging area for BuildSinks — committed by RebuildLogger after success.
+static std::string sinks_new_path;
+static std::string sinks_new_date;
+
 static std::vector<spdlog::sink_ptr> BuildSinks(spdlog::level::level_enum level) {
+    sinks_new_path.clear();
+    sinks_new_date.clear();
     std::vector<spdlog::sink_ptr> sinks;
 
     if (g_console_enabled) {
@@ -277,11 +283,14 @@ static std::vector<spdlog::sink_ptr> BuildSinks(spdlog::level::level_enum level)
         // This can throw (e.g., permission denied) — globals are still intact.
         auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
             new_path, /*truncate=*/false);
-        // Sink opened successfully — now commit to globals.
-        g_current_file_path = std::move(new_path);
-        g_current_log_date = std::move(new_date);
         file_sink->set_level(level);
         sinks.push_back(file_sink);
+        // Store resolved path/date for commit AFTER the full logger rebuild
+        // succeeds. Don't commit here — if RebuildLogger fails after
+        // BuildSinks returns, these would describe a file the live logger
+        // never adopted.
+        sinks_new_path = std::move(new_path);
+        sinks_new_date = std::move(new_date);
     }
 
     return sinks;
@@ -304,11 +313,20 @@ static void RebuildLogger() {
     spdlog::set_default_logger(new_logger);
     g_logger = new_logger;
 
-    // Prune after full commit — file deletion is irreversible, so only
-    // do it after the new logger is successfully constructed and installed.
-    if (g_max_files > 1) {
-        PruneOldFiles();
+    // Commit file path/date only after the logger is fully installed.
+    // BuildSinks staged these — if we threw before this point, they're
+    // not committed and rotation/reopen state stays consistent.
+    if (!sinks_new_path.empty()) {
+        g_current_file_path = std::move(sinks_new_path);
     }
+    if (!sinks_new_date.empty()) {
+        g_current_log_date = std::move(sinks_new_date);
+    }
+
+    // Note: pruning removed from RebuildLogger — callers that want pruning
+    // must call PruneOldFiles() explicitly after their operation fully commits.
+    // This prevents irreversible file deletion during UpdateAndReopen() when
+    // a later step (server.Reload) might fail and roll back.
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -368,14 +386,20 @@ void Init(const std::string& name,
         auto new_logger = std::make_shared<spdlog::logger>(name, sinks.begin(), sinks.end());
         new_logger->set_level(level);
         new_logger->set_pattern(LOG_PATTERN);
-        // Flush on info or above. Never flush on every debug/trace message —
-    // that would turn verbose troubleshooting into synchronous I/O on
-    // nearly every socket event.
-    new_logger->flush_on(std::max(g_log_level, spdlog::level::info));
+        // Flush on info or above — never per-message at debug/trace.
+        new_logger->flush_on(std::max(g_log_level, spdlog::level::info));
 
         // All succeeded — commit
         g_logger = new_logger;
         spdlog::set_default_logger(new_logger);
+
+        // Commit staged file path/date from BuildSinks
+        if (!sinks_new_path.empty()) {
+            g_current_file_path = std::move(sinks_new_path);
+        }
+        if (!sinks_new_date.empty()) {
+            g_current_log_date = std::move(sinks_new_date);
+        }
 
         // Prune after full commit — file deletion is irreversible
         if (g_max_files > 1) {
@@ -456,17 +480,117 @@ void SetConsoleEnabled(bool enabled) {
     g_console_enabled = enabled;
 }
 
-bool Reopen() {
+void SetLevel(spdlog::level::level_enum level) {
     std::lock_guard<std::mutex> lock(g_logger_mtx);
-    if (!g_logger || g_log_file.empty()) return true;  // no-op is success
+    g_log_level = level;
+    if (g_logger) {
+        g_logger->set_level(level);
+        // Update flush threshold: flush at info or above, never per-message
+        // at debug/trace. Must track level changes so reloading from
+        // critical→debug doesn't leave flush stuck at the old threshold.
+        g_logger->flush_on(std::max(level, spdlog::level::info));
+        for (auto& sink : g_logger->sinks()) {
+            sink->set_level(level);
+        }
+    }
+}
 
+void UpdateFileConfig(const std::string& file, size_t max_size, int max_files) {
+    std::lock_guard<std::mutex> lock(g_logger_mtx);
+    g_log_file = file;
+    g_max_size = max_size;
+    g_max_files = max_files;
+    // Re-parse decomposed path components so BuildSinks() resolves
+    // rotated paths from the new file, not the old Init() path.
+    if (!file.empty()) {
+        ParseLogPath(file, g_log_dir, g_log_prefix, g_log_extension);
+    } else {
+        g_log_dir.clear();
+        g_log_prefix.clear();
+        g_log_extension.clear();
+    }
+}
+
+bool UpdateAndReopen(const std::string& file, size_t max_size, int max_files) {
+    std::lock_guard<std::mutex> lock(g_logger_mtx);
+    if (!g_logger) return true;
+
+    // Save old config for rollback
+    auto old_file = g_log_file;
+    auto old_dir = g_log_dir;
+    auto old_prefix = g_log_prefix;
+    auto old_ext = g_log_extension;
+    auto old_size = g_max_size;
+    auto old_max = g_max_files;
+
+    // Apply new config
+    g_log_file = file;
+    g_max_size = max_size;
+    g_max_files = max_files;
+    if (!file.empty()) {
+        ParseLogPath(file, g_log_dir, g_log_prefix, g_log_extension);
+    } else {
+        g_log_dir.clear();
+        g_log_prefix.clear();
+        g_log_extension.clear();
+    }
+
+    // Rebuild under the same lock — CheckRotation can't observe partial state
     try {
         RebuildLogger();
         return true;
     } catch (const std::exception& e) {
-        // Keep old logger active — never fail open
+        // Roll back to old config
+        g_log_file = std::move(old_file);
+        g_log_dir = std::move(old_dir);
+        g_log_prefix = std::move(old_prefix);
+        g_log_extension = std::move(old_ext);
+        g_max_size = old_size;
+        g_max_files = old_max;
         g_logger->error("Failed to reopen log file: {}", e.what());
         return false;
+    }
+}
+
+bool Reopen() {
+    std::lock_guard<std::mutex> lock(g_logger_mtx);
+    if (!g_logger) return true;  // no logger → no-op is success
+
+    // No-op if no file sink is configured AND the current logger has no file
+    // sink to remove. This prevents rebuilding into an empty sink list when
+    // console logging is also disabled (daemon mode).
+    if (g_log_file.empty()) {
+        bool has_file_sink = false;
+        for (const auto& sink : g_logger->sinks()) {
+            if (dynamic_cast<spdlog::sinks::basic_file_sink_mt*>(sink.get())) {
+                has_file_sink = true;
+                break;
+            }
+        }
+        if (!has_file_sink) return true;  // no file sink to reopen or remove
+    }
+
+    try {
+        RebuildLogger();
+        // Note: no pruning here. Reopen() is also called by
+        // reopen_existing_logs() on failed-reload paths — pruning there
+        // would delete archives when no config change was committed.
+        // Pruning happens in CheckRotation() (periodic) and via the
+        // explicit PruneLogFiles() call after a reload fully commits.
+        return true;
+    } catch (const std::exception& e) {
+        // Rebuild failed — the old logger is still active. The caller
+        // (ReloadConfig) is responsible for rolling back UpdateFileConfig
+        // globals so CheckRotation stays consistent with the live logger.
+        g_logger->error("Failed to reopen log file: {}", e.what());
+        return false;
+    }
+}
+
+void PruneLogFiles() {
+    std::lock_guard<std::mutex> lock(g_logger_mtx);
+    if (g_max_files > 1) {
+        PruneOldFiles();
     }
 }
 
@@ -514,6 +638,8 @@ void CheckRotation() {
 
     try {
         RebuildLogger();
+        // Prune after successful rotation — safe here (periodic, no rollback).
+        if (g_max_files > 1) PruneOldFiles();
     } catch (const std::exception& e) {
         g_logger->error("Failed to rotate log file: {}", e.what());
     }
@@ -548,14 +674,33 @@ void EnsureLogDir(const std::string& dir) {
 }
 
 void WriteMarker(const std::string& text) {
-    auto logger = Get();
-    if (!logger) return;
-    // Log at info level through the normal spdlog path. This ensures markers
-    // go through the same sink/fd as other log messages (no file splitting
-    // during logrotate) and get the standard timestamp/logger formatting.
-    // Markers are filtered at warn+ levels — this is acceptable because
-    // operators using higher levels have chosen to suppress info output.
-    logger->info("================================ {} ================================", text);
+    std::lock_guard<std::mutex> lock(g_logger_mtx);
+    if (!g_logger) return;
+    // Use a temporary logger sharing g_logger's sinks but with its own
+    // info level. This avoids modifying g_logger's level, which would leak
+    // through Get()'s spdlog::default_logger() fallback: concurrent threads
+    // could briefly pass info-level messages when runtime level is warn+.
+    auto marker_logger = std::make_shared<spdlog::logger>(
+        g_logger->name(), g_logger->sinks().begin(), g_logger->sinks().end());
+    marker_logger->set_level(spdlog::level::info);
+    // SetLevel() raises sink levels too, so sinks at warn+ block info
+    // markers. Only LOWER sink levels (to info), never RAISE them — if a
+    // sink is at trace/debug, it already passes the info marker through,
+    // and raising it would drop concurrent debug/trace records from other
+    // threads (they pass g_logger's level check but hit the raised sink).
+    std::vector<std::pair<size_t, spdlog::level::level_enum>> saved_sink_levels;
+    for (size_t i = 0; i < g_logger->sinks().size(); ++i) {
+        auto cur = g_logger->sinks()[i]->level();
+        if (cur > spdlog::level::info) {
+            saved_sink_levels.push_back({i, cur});
+            g_logger->sinks()[i]->set_level(spdlog::level::info);
+        }
+    }
+    marker_logger->info("================================ {} ================================", text);
+    marker_logger->flush();
+    for (auto& [idx, lvl] : saved_sink_levels) {
+        g_logger->sinks()[idx]->set_level(lvl);
+    }
 }
 
 } // namespace logging

@@ -15,9 +15,12 @@ public:
     // Type aliases for callbacks (set by HttpServer)
     using RequestCallback     = HTTP2_CALLBACKS_NAMESPACE::Http2RequestCallback;
     using StreamCloseCallback = HTTP2_CALLBACKS_NAMESPACE::Http2StreamCloseCallback;
+    using StreamOpenCallback  = HTTP2_CALLBACKS_NAMESPACE::Http2StreamOpenCallback;
 
     void SetRequestCallback(RequestCallback callback);
     void SetStreamCloseCallback(StreamCloseCallback callback);
+    void SetStreamOpenCallback(StreamOpenCallback callback);
+    void SetRequestCountCallback(HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback callback);
 
     // Set request limits (applied per-stream)
     void SetMaxBodySize(size_t max);
@@ -60,6 +63,18 @@ public:
     // True during Initialize() — suppresses premature shutdown rejection
     bool IsInitializing() const { return initializing_; }
 
+    // Thread-safe per-connection stream tracking for counter compensation
+    // when the transport closes abruptly.
+    int64_t LocalStreamCount() const {
+        return local_stream_count_.load(std::memory_order_relaxed);
+    }
+    void IncrementLocalStreamCount() {
+        local_stream_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+    void DecrementLocalStreamCount() {
+        local_stream_count_.fetch_sub(1, std::memory_order_relaxed);
+    }
+
     // Check if shutdown was requested (atomic, safe from any thread)
     bool IsShutdownRequested() const {
         return shutdown_requested_.load(std::memory_order_acquire);
@@ -83,6 +98,12 @@ private:
     bool resume_scheduled_ = false;  // dispatcher-thread only
     std::chrono::steady_clock::time_point last_deadline_;  // avoids redundant SetDeadline calls
 
+    // Per-connection stream counter. Incremented by stream-open callback,
+    // decremented by stream-close callback. Thread-safe (atomic). Used for
+    // counter compensation on abrupt close — avoids reading non-atomic
+    // session containers from the wrong thread.
+    std::atomic<int64_t> local_stream_count_{0};
+
     // Internal: set connection deadline based on oldest incomplete stream.
     void UpdateDeadline();
 
@@ -92,4 +113,6 @@ private:
     // Stored callbacks for deferred initialization
     RequestCallback pending_request_cb_;
     StreamCloseCallback pending_stream_close_cb_;
+    StreamOpenCallback pending_stream_open_cb_;
+    HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback pending_request_count_cb_;
 };

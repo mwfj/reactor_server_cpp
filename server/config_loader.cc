@@ -218,8 +218,16 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     val = std::getenv("REACTOR_TLS_ENABLED");
     if (val) {
         std::string s(val);
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-        config.tls.enabled = (s == "1" || s == "true" || s == "yes");
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
+        if (s == "1" || s == "true" || s == "yes") {
+            config.tls.enabled = true;
+        } else if (s == "0" || s == "false" || s == "no") {
+            config.tls.enabled = false;
+        } else {
+            throw std::invalid_argument(
+                "Invalid REACTOR_TLS_ENABLED: '" + std::string(val) +
+                "' (must be true/false/yes/no/1/0)");
+        }
     }
 
     val = std::getenv("REACTOR_TLS_CERT");
@@ -253,8 +261,16 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     val = std::getenv("REACTOR_HTTP2_ENABLED");
     if (val) {
         std::string s(val);
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-        config.http2.enabled = (s == "1" || s == "true" || s == "yes");
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
+        if (s == "1" || s == "true" || s == "yes") {
+            config.http2.enabled = true;
+        } else if (s == "0" || s == "false" || s == "no") {
+            config.http2.enabled = false;
+        } else {
+            throw std::invalid_argument(
+                "Invalid REACTOR_HTTP2_ENABLED: '" + std::string(val) +
+                "' (must be true/false/yes/no/1/0)");
+        }
     }
     val = std::getenv("REACTOR_HTTP2_MAX_CONCURRENT_STREAMS");
     if (val) {
@@ -342,6 +358,26 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             " (must be >= 0, 0 = disabled)");
     }
 
+    // Bound size limits to prevent overflow in ComputeInputCap() where
+    // max_header_size + max_body_size must not wrap size_t. Individual cap
+    // at SIZE_MAX/2 ensures any pair sums safely on both 32-bit and 64-bit.
+    static constexpr size_t MAX_SIZE_LIMIT = SIZE_MAX / 2;
+    if (config.max_body_size > MAX_SIZE_LIMIT) {
+        throw std::invalid_argument(
+            "Invalid max_body_size: " + std::to_string(config.max_body_size) +
+            " (exceeds maximum)");
+    }
+    if (config.max_header_size > MAX_SIZE_LIMIT) {
+        throw std::invalid_argument(
+            "Invalid max_header_size: " + std::to_string(config.max_header_size) +
+            " (exceeds maximum)");
+    }
+    if (config.max_ws_message_size > MAX_SIZE_LIMIT) {
+        throw std::invalid_argument(
+            "Invalid max_ws_message_size: " + std::to_string(config.max_ws_message_size) +
+            " (exceeds maximum)");
+    }
+
     // Validate log level against the set recognized by logging::ParseLevel().
     // ParseLevel returns info for unrecognized strings — if the input isn't
     // literally "info" but maps to info, it's unrecognized (including empty).
@@ -412,6 +448,40 @@ void ConfigLoader::Validate(const ServerConfig& config) {
         if (config.tls.key_file.empty()) {
             throw std::invalid_argument(
                 "TLS is enabled but key_file is empty");
+        }
+        // Check cert/key files exist and are regular files. Uses stat()
+        // which only needs directory traversal permission, not read access —
+        // so CI/operator validation works even when the certs are owned by
+        // the daemon user. TlsContext does the full OpenSSL load at runtime.
+        {
+            struct stat st{};
+            if (stat(config.tls.cert_file.c_str(), &st) != 0) {
+                if (errno == EACCES) {
+                    // Can't traverse path — skip check, TlsContext handles it
+                } else {
+                    throw std::invalid_argument(
+                        "TLS cert_file not found: '" + config.tls.cert_file +
+                        "' (" + std::strerror(errno) + ")");
+                }
+            } else if (!S_ISREG(st.st_mode)) {
+                throw std::invalid_argument(
+                    "TLS cert_file is not a regular file: '" + config.tls.cert_file + "'");
+            }
+        }
+        {
+            struct stat st{};
+            if (stat(config.tls.key_file.c_str(), &st) != 0) {
+                if (errno == EACCES) {
+                    // Can't traverse path — skip check, TlsContext handles it
+                } else {
+                    throw std::invalid_argument(
+                        "TLS key_file not found: '" + config.tls.key_file +
+                        "' (" + std::strerror(errno) + ")");
+                }
+            } else if (!S_ISREG(st.st_mode)) {
+                throw std::invalid_argument(
+                    "TLS key_file is not a regular file: '" + config.tls.key_file + "'");
+            }
         }
         if (config.tls.min_version != "1.2" && config.tls.min_version != "1.3") {
             throw std::invalid_argument(

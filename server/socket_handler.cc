@@ -32,10 +32,17 @@ int SocketHandler::CreateSocket() {
     int listenfd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 #endif
     if (listenfd == -1) {
-        logging::Get()->error("Failed to create socket");
-        throw std::runtime_error("Invalid socket...");
+        int saved_errno = errno;
+        logging::Get()->error("Failed to create socket: {}", std::strerror(saved_errno));
+        throw std::runtime_error(
+            std::string("Failed to create socket: ") + std::strerror(saved_errno));
     }
-    SetNonBlocking(listenfd);
+    try {
+        SetNonBlocking(listenfd);
+    } catch (...) {
+        ::close(listenfd);
+        throw;
+    }
     return listenfd;
 }
 

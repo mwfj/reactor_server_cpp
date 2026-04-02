@@ -24,6 +24,8 @@ public:
     void SetRouteCheckCallback(RouteCheckCallback callback);
     void SetMiddlewareCallback(MiddlewareCallback callback);
     void SetUpgradeCallback(UpgradeCallback callback);
+    void SetRequestCountCallback(HTTP_CALLBACKS_NAMESPACE::HttpConnRequestCountCallback callback);
+    void SetShutdownCheckCallback(HTTP_CALLBACKS_NAMESPACE::HttpConnShutdownCheckCallback callback);
 
     // Send an HTTP response
     void SendResponse(const HttpResponse& response);

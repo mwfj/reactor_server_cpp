@@ -39,8 +39,8 @@ UTIL_DIR = util
 THIRD_PARTY_DIR = third_party
 
 # Target executables
-TARGET = run
-SERVER_TARGET = reactor_server
+TARGET = test_runner
+SERVER_TARGET = server_runner
 
 # Source files (organized by component)
 # Core reactor components
@@ -222,21 +222,21 @@ help:
 	@echo ""
 	@echo "Available targets:"
 	@echo "  make [all]       - Build the project (default target)"
-	@echo "                     Compiles all source files and creates './run' executable"
+	@echo "                     Compiles all source files and creates './test_runner' executable"
 	@echo ""
 	@echo "  make test        - Build and run all tests"
 	@echo "                     Runs BasicTests (port 9888), StressTests (port 9889),"
 	@echo "                     RaceConditionTests (port 10000), and ConfigTests"
 	@echo ""
 	@echo "  make test_basic  - Build and run only basic tests"
-	@echo "                     Equivalent to './run basic'"
+	@echo "                     Equivalent to './test_runner basic'"
 	@echo ""
 	@echo "  make test_stress - Build and run only stress tests"
-	@echo "                     Runs 100 concurrent clients (equivalent to './run stress' or './run -s')"
+	@echo "                     Runs 100 concurrent clients (equivalent to './test_runner stress' or './test_runner -s')"
 	@echo "                     Validates fixes from STRESS_TEST_BUG_FIXES.md"
 	@echo ""
 	@echo "  make test_race   - Build and run only race condition tests"
-	@echo "                     Runs 7 race condition tests (equivalent to './run race')"
+	@echo "                     Runs 7 race condition tests (equivalent to './test_runner race')"
 	@echo "                     Validates fixes from EVENTFD_RACE_CONDITION_FIXES.md"
 	@echo ""
 	@echo "  make test_config - Build and run only config tests"
@@ -249,7 +249,7 @@ help:
 	@echo "  make test_tls    - Build and run only TLS tests (Phase 4)"
 	@echo ""
 	@echo "  make clean       - Remove build artifacts"
-	@echo "                     Deletes './run' executable and llhttp object files"
+	@echo "                     Deletes './test_runner' executable and llhttp object files"
 	@echo ""
 	@echo "  make help        - Show this help message"
 	@echo ""
@@ -265,7 +265,8 @@ help:
 	@echo "  Thread Pool:   thread_pool/include/*.h thread_pool/src/*.cc"
 	@echo "  Third Party:   third_party/ (nlohmann/json, spdlog, llhttp)"
 	@echo "  Tests:         test/*.cc test/*.h"
-	@echo "  Executable:    ./run"
+	@echo "  Test runner:   ./test_runner"
+	@echo "  Server:        ./server_runner"
 	@echo ""
 	@echo "Usage examples:"
 	@echo "  make              # Build the project"
@@ -277,13 +278,13 @@ help:
 	@echo "  make test_config  # Run only config tests"
 	@echo ""
 	@echo "Direct executable usage (after building):"
-	@echo "  ./run             # Run all tests"
-	@echo "  ./run basic       # Run basic tests only (or: ./run -b)"
-	@echo "  ./run stress      # Run stress tests only (or: ./run -s)"
-	@echo "  ./run race        # Run race condition tests only (or: ./run -r)"
-	@echo "  ./run timeout     # Run timeout tests only (or: ./run -t)"
-	@echo "  ./run config      # Run config tests only (or: ./run -c)"
-	@echo "  ./run help        # Show help message (or: ./run -h)"
+	@echo "  ./test_runner             # Run all tests"
+	@echo "  ./test_runner basic       # Run basic tests only (or: ./test_runner -b)"
+	@echo "  ./test_runner stress      # Run stress tests only (or: ./test_runner -s)"
+	@echo "  ./test_runner race        # Run race condition tests only (or: ./test_runner -r)"
+	@echo "  ./test_runner timeout     # Run timeout tests only (or: ./test_runner -t)"
+	@echo "  ./test_runner config      # Run config tests only (or: ./test_runner -c)"
+	@echo "  ./test_runner help        # Show help message (or: ./test_runner -h)"
 	@echo ""
 	@echo "For more information, see:"
 	@echo "  - STRESS_TEST_BUG_FIXES.md - Stress test bug analysis"

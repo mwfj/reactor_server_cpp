@@ -50,6 +50,26 @@ void SetConsoleEnabled(bool enabled);
 // Returns true on success, false on failure (old logger kept active).
 bool Reopen();
 
+// Change the log level at runtime without reconstructing the logger.
+// Thread-safe. No-op if Init() has not been called.
+void SetLevel(spdlog::level::level_enum level);
+
+// Update the stored file sink config (file path, max size, max files).
+// Takes effect on next Reopen(). Thread-safe. Does NOT reopen immediately.
+void UpdateFileConfig(const std::string& file, size_t max_size, int max_files);
+
+// Atomically update file config AND reopen under a single lock.
+// Prevents CheckRotation from observing partial state between update and reopen.
+// On failure, rolls back config globals to the previous values.
+// Returns true on success, false on failure (old logger kept active).
+bool UpdateAndReopen(const std::string& file, size_t max_size, int max_files);
+
+// Prune old log files exceeding max_files. Thread-safe. Called explicitly
+// after a reload is fully committed (logger + server config both applied).
+// Deferred from UpdateAndReopen so a failed server.Reload() doesn't cause
+// irreversible log loss.
+void PruneLogFiles();
+
 // Check if the current log file exceeds max_file_size or the date has
 // rolled over, and rotate if needed. Called periodically from the
 // Dispatcher timer handler. Thread-safe. No-op if no file sink is configured.
@@ -59,9 +79,11 @@ void CheckRotation();
 // Throws std::runtime_error on failure.
 void EnsureLogDir(const std::string& dir);
 
-// Write a visual start/stop marker via the normal spdlog logger at info level.
+// Write a visual start/stop marker to the log sinks at info level.
 // Format: "================================ {text} ================================"
-// Filtered at warn+ levels (same as any other info message).
+// Bypasses the runtime log level: uses a temporary logger (avoids leaking
+// a lowered level via Get()'s default_logger fallback) and temporarily
+// lowers sink levels (SetLevel raises them alongside the logger level).
 void WriteMarker(const std::string& text);
 
 // Flush all sinks and shut down the logging system.

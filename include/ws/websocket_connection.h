@@ -32,6 +32,8 @@ public:
     // Connection info
     int fd() const;
     bool IsOpen() const { return is_open_ && !close_sent_; }
+    // True if we sent a close frame and are waiting for the peer's reply.
+    bool IsClosing() const { return is_open_ && close_sent_; }
 
     // Access parser (for setting max payload size)
     WebSocketParser& GetParser() { return parser_; }

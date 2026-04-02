@@ -23,7 +23,15 @@ void ReactorServer::Start(){
 }
 
 void ReactorServer::Stop(){
+    // Stop accepting FIRST — prevents new connections from being dispatched
+    // while we tear down the task workers.
+    net_server_.StopAccepting();
+    // Stop task_workers_ — waits for in-flight tasks to complete their
+    // SendData() calls while dispatchers are still running. Must happen
+    // AFTER StopAccepting so no new ProcessMessage callbacks enqueue work
+    // on the already-stopped pool (which would throw from AddTask).
     task_workers_.Stop();
+    // Stop the rest of the net server (close connections, stop event loops).
     net_server_.Stop();
 }
 
@@ -76,7 +84,14 @@ void ReactorServer::ProcessMessage(std::shared_ptr<ConnectionHandler> conn, std:
                 std::string mutable_msg = msg;
                 this->OnMessage(conn, mutable_msg);
             }));
-        task_workers_.AddTask(task);
+        try {
+            task_workers_.AddTask(task);
+        } catch (const std::runtime_error&) {
+            // Pool stopped concurrently (shutdown race). Drop the message
+            // gracefully instead of letting the exception propagate to the
+            // dispatcher, which would treat it as a connection failure.
+            return;
+        }
     } else {
         OnMessage(conn, message);
     }

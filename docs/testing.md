@@ -3,23 +3,23 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all tests (196 tests across 13 suites)
-./run                   # Run all tests directly (after building)
+make test               # Build and run all tests (211 tests across 13 suites)
+./test_runner                   # Run all tests directly (after building)
 
 # Individual test suites
-./run basic             # Basic functionality (or: ./run -b)
-./run stress            # Stress tests — 100 concurrent clients (or: ./run -s)
-./run race              # Race condition tests (or: ./run -r)
-./run timeout           # Connection timeout tests (or: ./run -t)
-./run config            # Configuration tests (or: ./run -c)
-./run http              # HTTP protocol tests (or: ./run -H)
-./run ws                # WebSocket protocol tests (or: ./run -w)
-./run tls               # TLS/SSL tests (or: ./run -T)
-./run http2             # HTTP/2 protocol tests (or: ./run -2)
-./run cli               # CLI entry point tests (or: ./run -C)
-./run route             # Route trie/pattern matching tests (or: ./run -R)
-./run kqueue            # macOS kqueue platform tests (or: ./run -K)
-./run help              # Show all options
+./test_runner basic             # Basic functionality (or: ./test_runner -b)
+./test_runner stress            # Stress tests — 100 concurrent clients (or: ./test_runner -s)
+./test_runner race              # Race condition tests (or: ./test_runner -r)
+./test_runner timeout           # Connection timeout tests (or: ./test_runner -t)
+./test_runner config            # Configuration tests (or: ./test_runner -c)
+./test_runner http              # HTTP protocol tests (or: ./test_runner -H)
+./test_runner ws                # WebSocket protocol tests (or: ./test_runner -w)
+./test_runner tls               # TLS/SSL tests (or: ./test_runner -T)
+./test_runner http2             # HTTP/2 protocol tests (or: ./test_runner -2)
+./test_runner cli               # CLI entry point tests (or: ./test_runner -C)
+./test_runner route             # Route trie/pattern matching tests (or: ./test_runner -R)
+./test_runner kqueue            # macOS kqueue platform tests (or: ./test_runner -K)
+./test_runner help              # Show all options
 
 # Make targets for individual suites
 make test_basic         # Build and run basic tests
@@ -37,18 +37,18 @@ make test_cli           # Build and run CLI tests
 
 | Suite | Tests | Port | File | Command |
 |-------|-------|------|------|---------|
-| Basic | 9 | ephemeral | `test/basic_test.h` | `./run basic` |
-| Stress | 3 | ephemeral | `test/stress_test.h` | `./run stress` |
-| Race Condition | 9 | ephemeral | `test/race_condition_test.h` | `./run race` |
-| Timeout | 3 | ephemeral | `test/timeout_test.h` | `./run timeout` |
-| Config | 8 | N/A | `test/config_test.h` | `./run config` |
-| HTTP | 13 | ephemeral | `test/http_test.h` | `./run http` |
-| WebSocket | 10 | ephemeral | `test/websocket_test.h` | `./run ws` |
-| TLS | 2 | ephemeral | `test/tls_test.h` | `./run tls` |
-| HTTP/2 | 31 | ephemeral | `test/http2_test.h` | `./run http2` |
-| CLI | 69 | N/A | `test/cli_test.h` | `./run cli` |
-| Route | 44 | ephemeral | `test/route_test.h` | `./run route` |
-| Kqueue | 7 | ephemeral | `test/kqueue_test.h` | `./run kqueue` (macOS only, skipped on Linux) |
+| Basic | 6 | ephemeral | `test/basic_test.h` | `./test_runner basic` |
+| Stress | 1 | ephemeral | `test/stress_test.h` | `./test_runner stress` |
+| Race Condition | 14 | ephemeral | `test/race_condition_test.h` | `./test_runner race` |
+| Timeout | 6 | ephemeral | `test/timeout_test.h` | `./test_runner timeout` |
+| Config | 8 | N/A | `test/config_test.h` | `./test_runner config` |
+| HTTP | 14 | ephemeral | `test/http_test.h` | `./test_runner http` |
+| WebSocket | 10 | ephemeral | `test/websocket_test.h` | `./test_runner ws` |
+| TLS | 2 | ephemeral | `test/tls_test.h` | `./test_runner tls` |
+| HTTP/2 | 37 | ephemeral | `test/http2_test.h` | `./test_runner http2` |
+| CLI | 79 | N/A | `test/cli_test.h` | `./test_runner cli` |
+| Route | 44 | ephemeral | `test/route_test.h` | `./test_runner route` |
+| Kqueue | 7 | ephemeral | `test/kqueue_test.h` | `./test_runner kqueue` (macOS only, skipped on Linux) |
 
 ### Basic Tests
 - Single client connection
@@ -214,7 +214,7 @@ Success Rate: 100%
 The `thread_pool/` subproject has its own test suite:
 
 ```bash
-cd thread_pool && make clean && make && ./run
+cd thread_pool && make clean && make && \./test_runner
 ```
 
 Tests include:
