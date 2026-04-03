@@ -46,7 +46,10 @@ void TestTimerDrivesIdleTimeout() {
 #ifdef MSG_NOSIGNAL
         flags |= MSG_NOSIGNAL;
 #endif
-        send(sockfd, req.data(), req.size(), flags);
+        if (send(sockfd, req.data(), req.size(), flags) < 0) {
+            close(sockfd);
+            throw std::runtime_error("send failed");
+        }
 
         // Read the response
         TestHttpClient::SetReceiveTimeout(sockfd, 3);
@@ -361,7 +364,10 @@ void TestTimerRearm() {
 #ifdef MSG_NOSIGNAL
             flags |= MSG_NOSIGNAL;
 #endif
-            send(fd_a, req.data(), req.size(), flags);
+            if (send(fd_a, req.data(), req.size(), flags) < 0) {
+                close(fd_a);
+                throw std::runtime_error("send A failed");
+            }
             TestHttpClient::SetReceiveTimeout(fd_a, 3);
             char buf[4096];
             recv(fd_a, buf, sizeof(buf), 0);
@@ -378,7 +384,10 @@ void TestTimerRearm() {
 #ifdef MSG_NOSIGNAL
             flags |= MSG_NOSIGNAL;
 #endif
-            send(fd_b, req.data(), req.size(), flags);
+            if (send(fd_b, req.data(), req.size(), flags) < 0) {
+                close(fd_b);
+                throw std::runtime_error("send B failed");
+            }
             TestHttpClient::SetReceiveTimeout(fd_b, 3);
             char buf[4096];
             recv(fd_b, buf, sizeof(buf), 0);

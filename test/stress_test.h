@@ -17,15 +17,17 @@ namespace StressTests {
             const int port = runner.GetPort();
 
             std::vector<std::thread> client_threads;
+            std::atomic<int> success_count{0};
 
             for (int i = 0; i < NUM_CLIENTS; i++) {
-                client_threads.emplace_back([port]() {
+                client_threads.emplace_back([port, &success_count]() {
                     try {
                         std::string response = TestHttpClient::HttpGet(port, "/health", 10000);
-                        // Some failures expected under high load
-                        (void)response;
+                        if (TestHttpClient::HasStatus(response, 200)) {
+                            success_count++;
+                        }
                     } catch (const std::exception&) {
-                        // Silent - some failures expected under high load
+                        // Some failures expected under high load
                     }
                 });
             }
@@ -34,9 +36,15 @@ namespace StressTests {
                 t.join();
             }
 
-            std::cout << "[STRESS TEST] Completed " << NUM_CLIENTS << " concurrent connections" << std::endl;
+            double success_rate = static_cast<double>(success_count) / NUM_CLIENTS;
+            std::cout << "[STRESS TEST] Completed " << NUM_CLIENTS << " concurrent connections, "
+                      << success_count << " succeeded (" << (success_rate * 100) << "%)" << std::endl;
 
-            TestFramework::RecordTest("High Load Connections (1000 clients)", true, "", TestFramework::TestCategory::STRESS);
+            bool pass = (success_rate > 0.9);
+            std::string error_msg = pass ? "" :
+                "Only " + std::to_string(success_count.load()) + "/" + std::to_string(NUM_CLIENTS) +
+                " requests succeeded (" + std::to_string(static_cast<int>(success_rate * 100)) + "%)";
+            TestFramework::RecordTest("High Load Connections (1000 clients)", pass, error_msg, TestFramework::TestCategory::STRESS);
         } catch (const std::exception& e) {
             TestFramework::RecordTest("High Load Connections (1000 clients)", false, e.what(), TestFramework::TestCategory::STRESS);
         }

@@ -45,6 +45,8 @@ namespace TestHttpClient {
         int set = 1;
         setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set));
 #endif
+        // Set close-on-exec to prevent fd leaks into exec'd children
+        fcntl(sockfd, F_SETFD, FD_CLOEXEC);
 
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -114,9 +116,16 @@ namespace TestHttpClient {
                     if (hdr_end != std::string::npos) {
                         size_t body_start = hdr_end + 4;
                         size_t content_length = 0;
-                        auto cl_pos = response.find("Content-Length: ");
-                        if (cl_pos != std::string::npos && cl_pos < hdr_end) {
-                            content_length = std::stoul(response.substr(cl_pos + 16));
+                        // Case-insensitive Content-Length search (RFC 9110: headers are case-insensitive)
+                        std::string headers = response.substr(0, hdr_end);
+                        for (auto& c : headers) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        auto cl_pos = headers.find("content-length: ");
+                        if (cl_pos != std::string::npos) {
+                            try {
+                                content_length = std::stoul(headers.substr(cl_pos + 16));
+                            } catch (const std::exception&) {
+                                // Malformed Content-Length — fall through to Connection: close EOF
+                            }
                         }
                         if (response.size() >= body_start + content_length) {
                             break;  // Full response received
@@ -162,11 +171,14 @@ namespace TestHttpClient {
     }
 
     // Check if the HTTP status line contains the given status code.
+    // HTTP/1.1 status line format: "HTTP/1.1 NNN Reason\r\n"
+    // Status code is at fixed offset 9, length 3.
     inline bool HasStatus(const std::string& response, int status_code) {
         auto line_end = response.find("\r\n");
         if (line_end == std::string::npos) return false;
         std::string status_line = response.substr(0, line_end);
-        return status_line.find(std::to_string(status_code)) != std::string::npos;
+        if (status_line.size() < 12) return false;
+        return status_line.substr(9, 3) == std::to_string(status_code);
     }
 
     // Wait for the server to close a connection. Returns true if recv() == 0
