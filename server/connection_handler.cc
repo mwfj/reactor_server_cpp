@@ -159,7 +159,13 @@ void ConnectionHandler::OnMessage(){
             }
             // Read error — use CallCloseCb for proper server map cleanup
             int saved_errno = errno;
-            logging::Get()->warn("Read error fd={}: {} (errno={})", fd(), logging::SafeStrerror(saved_errno), saved_errno);
+            // ECONNRESET/EPIPE/ENOTCONN are peer-initiated disconnections,
+            // not server errors — log at debug to avoid noise under load.
+            if (saved_errno == ECONNRESET || saved_errno == EPIPE || saved_errno == ENOTCONN) {
+                logging::Get()->debug("Peer disconnected fd={}: {} (errno={})", fd(), logging::SafeStrerror(saved_errno), saved_errno);
+            } else {
+                logging::Get()->warn("Read error fd={}: {} (errno={})", fd(), logging::SafeStrerror(saved_errno), saved_errno);
+            }
             CallCloseCb();
             return;
         } else {
