@@ -26,6 +26,7 @@ public:
 
     PoolPartition(std::shared_ptr<Dispatcher> dispatcher,
                   const std::string& upstream_host, int upstream_port,
+                  const std::string& sni_hostname,
                   const UpstreamPoolConfig& config,
                   std::shared_ptr<TlsClientContext> tls_ctx,
                   std::atomic<int64_t>& outstanding_conns,
@@ -37,6 +38,10 @@ public:
     PoolPartition& operator=(const PoolPartition&) = delete;
 
     // Async checkout (dispatcher-thread-only, no locking).
+    // NOTE: ready_cb or error_cb may be invoked synchronously before this
+    // function returns (e.g., when a valid idle connection is available or
+    // the pool is immediately exhausted). Callers must not hold any lock
+    // that the callback itself might attempt to acquire.
     void CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb);
 
     // Return a connection to the pool. Called by UpstreamLease destructor.
@@ -66,6 +71,7 @@ private:
     std::shared_ptr<Dispatcher> dispatcher_;
     std::string upstream_host_;
     int upstream_port_;
+    std::string sni_hostname_;  // Empty = use upstream_host_ for SNI
     UpstreamPoolConfig config_;
     std::shared_ptr<TlsClientContext> tls_ctx_;
 

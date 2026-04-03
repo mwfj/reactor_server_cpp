@@ -1219,6 +1219,7 @@ void TestUpstreamHostPoolPartitionCount() {
 
         UpstreamHostPool pool(
             ucfg.name, ucfg.host, ucfg.port,
+            ucfg.tls.sni_hostname,
             ucfg.pool, {d0, d1}, nullptr,
             outstanding, drain_cv);
 
@@ -1266,6 +1267,7 @@ void TestUpstreamHostPoolAccessors() {
 
         UpstreamHostPool pool(
             ucfg.name, ucfg.host, ucfg.port,
+            ucfg.tls.sni_hostname,
             ucfg.pool, {dispatcher}, nullptr,
             outstanding, drain_cv);
 

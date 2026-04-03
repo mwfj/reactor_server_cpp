@@ -5,6 +5,7 @@
 UpstreamHostPool::UpstreamHostPool(
     const std::string& service_name,
     const std::string& host, int port,
+    const std::string& sni_hostname,
     const UpstreamPoolConfig& config,
     const std::vector<std::shared_ptr<Dispatcher>>& dispatchers,
     std::shared_ptr<TlsClientContext> tls_ctx,
@@ -42,7 +43,7 @@ UpstreamHostPool::UpstreamHostPool(
         partition_config.max_idle_connections = static_cast<int>(per_partition_idle);
 
         partitions_.push_back(std::make_unique<PoolPartition>(
-            dispatchers[i], host, port, partition_config, tls_ctx,
+            dispatchers[i], host, port, sni_hostname, partition_config, tls_ctx,
             outstanding_conns, drain_cv));
     }
 

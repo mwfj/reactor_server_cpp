@@ -28,6 +28,7 @@ void UpstreamLease::Release() {
 PoolPartition::PoolPartition(
     std::shared_ptr<Dispatcher> dispatcher,
     const std::string& upstream_host, int upstream_port,
+    const std::string& sni_hostname,
     const UpstreamPoolConfig& config,
     std::shared_ptr<TlsClientContext> tls_ctx,
     std::atomic<int64_t>& outstanding_conns,
@@ -35,6 +36,7 @@ PoolPartition::PoolPartition(
     : dispatcher_(std::move(dispatcher))
     , upstream_host_(upstream_host)
     , upstream_port_(upstream_port)
+    , sni_hostname_(sni_hostname)
     , config_(config)
     , tls_ctx_(std::move(tls_ctx))
     , outstanding_conns_(outstanding_conns)
@@ -69,6 +71,14 @@ PoolPartition::~PoolPartition() {
 }
 
 void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb) {
+    // All pool operations must run on the owning dispatcher thread.
+    // Off-thread access would data-race on the containers.
+    if (dispatcher_ && !dispatcher_->is_dispatcher_thread()) {
+        logging::Get()->error("BUG: CheckoutAsync called off dispatcher thread");
+        error_cb(CHECKOUT_CONNECT_FAILED);
+        return;
+    }
+
     if (shutting_down_) {
         error_cb(CHECKOUT_SHUTTING_DOWN);
         return;
@@ -240,6 +250,11 @@ void PoolPartition::InitiateShutdown() {
 }
 
 void PoolPartition::ForceCloseActive() {
+    // Known limitation: outstanding UpstreamLease objects held by request
+    // handlers become dangling after this call. The lease destructor's
+    // ReturnConnection will find nothing in active_conns_ and log a warning.
+    // This is acceptable because ForceCloseActive only runs after the drain
+    // timeout expires, meaning the handler is stuck/unresponsive.
     // Move active connections to a local vector to iterate safely while
     // destroying — DestroyConnection modifies active_conns_ indirectly.
     auto active = std::move(active_conns_);
@@ -277,7 +292,7 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
 
     int connect_result = ::connect(fd, reinterpret_cast<struct sockaddr*>(&sa),
                                     sizeof(sa));
-    if (connect_result < 0 && errno != EINPROGRESS) {
+    if (connect_result < 0 && errno != EINPROGRESS && errno != EINTR) {
         int saved_errno = errno;
         logging::Get()->warn("connect() failed for {}:{}: {} (errno={})",
                              upstream_host_, upstream_port_,
@@ -322,7 +337,7 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
             // TLS? Start handshake
             if (tls_ctx_) {
                 try {
-                    std::string sni = upstream_host_;
+                    std::string sni = sni_hostname_.empty() ? upstream_host_ : sni_hostname_;
                     auto tls = std::make_unique<TlsConnection>(
                         *tls_ctx_, handler->fd(), sni);
                     handler->SetTlsConnection(std::move(tls));
@@ -347,6 +362,18 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
 
     // Wire close callback for connect failure / timeout
     conn_handler->SetCloseCb(
+        [this, raw_conn, error_cb_copy]
+        (std::shared_ptr<ConnectionHandler>) {
+            if (raw_conn->IsConnecting()) {
+                (*error_cb_copy)(CHECKOUT_CONNECT_FAILED);
+            }
+            OnConnectionClosed(raw_conn);
+        });
+
+    // Wire error callback for EPOLLERR events (async reset, local error).
+    // CallErroCb does NOT invoke the close callback, so without this,
+    // EPOLLERR events would silently leak pool slots.
+    conn_handler->SetErrorCb(
         [this, raw_conn, error_cb_copy]
         (std::shared_ptr<ConnectionHandler>) {
             if (raw_conn->IsConnecting()) {
@@ -423,13 +450,19 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
     // run on the dispatcher thread (single-threaded). OnConnectionClosed
     // extracts from containers; DestroyConnection clears callbacks before
     // ForceClose, so the close callback can't re-fire.
-    // Try to find and remove from any container
     auto owned = ExtractFromConnecting(conn);
     if (!owned) owned = ExtractFromActive(conn);
     if (!owned) owned = ExtractFromIdle(conn);
 
     if (owned) {
-        // Don't call ForceClose again — it was already triggered
+        // Clear callbacks and deadline BEFORE destruction — the transport
+        // (ConnectionHandler) survives in the dispatcher's connections_ map.
+        // Without this, a pending deadline or error event would fire callbacks
+        // that capture the now-freed raw_conn pointer (use-after-free).
+        ClearTransportCallbacks(owned.get());
+        if (owned->GetTransport()) {
+            owned->GetTransport()->ClearDeadline();
+        }
         outstanding_conns_.fetch_sub(1, std::memory_order_release);
         MaybeSignalDrain();
     }

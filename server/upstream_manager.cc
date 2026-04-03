@@ -40,6 +40,7 @@ UpstreamManager::UpstreamManager(
         // Create the host pool
         pools_[upstream.name] = std::make_unique<UpstreamHostPool>(
             upstream.name, upstream.host, upstream.port,
+            upstream.tls.sni_hostname,
             upstream.pool, dispatchers, tls_ctx,
             outstanding_conns_, drain_cv_);
     }

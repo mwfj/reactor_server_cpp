@@ -11,6 +11,7 @@ class UpstreamHostPool {
 public:
     UpstreamHostPool(const std::string& service_name,
                      const std::string& host, int port,
+                     const std::string& sni_hostname,
                      const UpstreamPoolConfig& config,
                      const std::vector<std::shared_ptr<Dispatcher>>& dispatchers,
                      std::shared_ptr<TlsClientContext> tls_ctx,
@@ -27,15 +28,6 @@ public:
 
     // Shutdown all partitions (enqueues to each dispatcher)
     void InitiateShutdown();
-
-    // Aggregate stats across all partitions
-    struct PoolStats {
-        size_t idle_count = 0;
-        size_t active_count = 0;
-        size_t connecting_count = 0;
-        size_t total_count = 0;
-        size_t wait_queue_size = 0;
-    };
 
     const std::string& service_name() const { return service_name_; }
     const std::string& host() const { return host_; }

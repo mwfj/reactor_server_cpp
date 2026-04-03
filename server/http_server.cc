@@ -179,6 +179,17 @@ void HttpServer::WireNetServerCallbacks() {
                 h2_conn->OnWriteProgress(remaining);
             }
         });
+
+    // Wire timer callback for upstream pool idle eviction.
+    // Fires periodically on each dispatcher thread — calls EvictExpired
+    // on the partition for that dispatcher's index.
+    net_server_.SetTimerCb(
+        [this](std::shared_ptr<Dispatcher> disp) {
+            if (upstream_manager_ && disp->dispatcher_index() >= 0) {
+                upstream_manager_->EvictExpired(
+                    static_cast<size_t>(disp->dispatcher_index()));
+            }
+        });
 }
 
 // Validate host is a strict dotted-quad IPv4 address. Uses inet_pton (not
