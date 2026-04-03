@@ -169,9 +169,11 @@ void Dispatcher::RunEventLoop(){
                     try { fn(); } catch (...) {}
                 }
             }
-            if(callbacks_.timeout_trigger_callback){
-                callbacks_.timeout_trigger_callback(shared_from_this());
-            }
+            // NOTE: timeout_trigger_callback is NOT fired here. It fires
+            // exclusively from TimerHandler() (periodic timerfd/EVFILT_TIMER)
+            // to avoid double-invocation on macOS where EVFILT_TIMER can fire
+            // with channels.size()==0, causing both paths to execute in the
+            // same loop iteration.
             // Do NOT continue here — fall through to ConsumeTimerFired()
             // so macOS EVFILT_TIMER events are processed even on timeout.
         }

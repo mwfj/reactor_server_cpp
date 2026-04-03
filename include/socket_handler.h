@@ -10,10 +10,9 @@ public:
     static constexpr int ACCEPT_FD_EXHAUSTION   = -3;  // EMFILE/ENFILE (recoverable via idle fd trick)
     static constexpr int ACCEPT_MEMORY_PRESSURE = -4;  // ENOBUFS/ENOMEM
 
-    // Connect() return codes for outbound connections
-    static constexpr int CONNECT_SUCCESS     =  0;  // Connected immediately or EISCONN
-    static constexpr int CONNECT_IN_PROGRESS =  1;  // EINPROGRESS (non-blocking connect pending)
-    static constexpr int CONNECT_ERROR       = -1;  // Unrecoverable connect error
+    // Outbound connect result codes (used by ConnectionHandler::FinishConnect)
+    static constexpr int CONNECT_SUCCESS     =  0;  // SO_ERROR == 0
+    static constexpr int CONNECT_ERROR       = -1;  // SO_ERROR != 0 or getsockopt failure
 
 private:
     int fd_;
