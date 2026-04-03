@@ -67,8 +67,6 @@ public:
     void Bind(const InetAddr& servAddr);
     void Listen(int maxLen);
     int Accept(InetAddr& clientAddr);
-    int Connect(const InetAddr& addr);
-    int FinishConnect();
     void Close();
 
     // Query the actual port bound by the OS (resolves ephemeral port 0).

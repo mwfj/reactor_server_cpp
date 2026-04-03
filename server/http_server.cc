@@ -181,11 +181,16 @@ void HttpServer::WireNetServerCallbacks() {
         });
 
     // Wire timer callback for upstream pool idle eviction.
-    // Fires periodically on each dispatcher thread — calls EvictExpired
-    // on the partition for that dispatcher's index.
+    // Fires periodically on each dispatcher thread (via TimerHandler
+    // and epoll_wait timeout) — calls EvictExpired on the partition
+    // for that dispatcher's index.
+    // Guard with server_ready_ to avoid racing with MarkServerReady()
+    // which writes upstream_manager_ from the main thread. The acquire
+    // load synchronizes with the release store in MarkServerReady().
     net_server_.SetTimerCb(
         [this](std::shared_ptr<Dispatcher> disp) {
-            if (upstream_manager_ && disp->dispatcher_index() >= 0) {
+            if (server_ready_.load(std::memory_order_acquire) &&
+                upstream_manager_ && disp->dispatcher_index() >= 0) {
                 upstream_manager_->EvictExpired(
                     static_cast<size_t>(disp->dispatcher_index()));
             }

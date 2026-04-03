@@ -163,45 +163,6 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
     return clientfd;
 }
 
-int SocketHandler::Connect(const InetAddr& addr) {
-    int ret = ::connect(fd_, addr.Addr(), sizeof(sockaddr_in));
-    if (ret == 0) {
-        return CONNECT_SUCCESS;
-    }
-    int saved_errno = errno;
-    if (saved_errno == EINPROGRESS) {
-        return CONNECT_IN_PROGRESS;
-    }
-    if (saved_errno == EISCONN) {
-        // Already connected (can happen if connect is called again after completion)
-        return CONNECT_SUCCESS;
-    }
-    logging::Get()->warn("Connect failed fd={}: {} (errno={})",
-                         fd_, logging::SafeStrerror(saved_errno), saved_errno);
-    return CONNECT_ERROR;
-}
-
-int SocketHandler::FinishConnect() {
-    int error = 0;
-    socklen_t len = sizeof(error);
-    int ret;
-    do {
-        ret = ::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &len);
-    } while (ret == -1 && errno == EINTR);
-    if (ret == -1) {
-        int saved_errno = errno;
-        logging::Get()->error("FinishConnect getsockopt failed fd={}: {} (errno={})",
-                              fd_, logging::SafeStrerror(saved_errno), saved_errno);
-        return CONNECT_ERROR;
-    }
-    if (error != 0) {
-        logging::Get()->warn("FinishConnect failed fd={}: {} (errno={})",
-                             fd_, logging::SafeStrerror(error), error);
-        return CONNECT_ERROR;
-    }
-    return CONNECT_SUCCESS;
-}
-
 void SocketHandler::Close() {
     if (fd_ != -1) {
         ::close(fd_);

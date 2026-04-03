@@ -377,8 +377,8 @@ void TestConfigRoundTrip() {
 // Section 2: SocketHandler connect tests
 // ---------------------------------------------------------------------------
 
-// SocketHandler::Connect to a listening socket succeeds (CONNECT_SUCCESS or
-// CONNECT_IN_PROGRESS because the connect may complete without waiting).
+// Non-blocking connect to a listening socket succeeds (EINPROGRESS or immediate 0).
+// Tests the same raw ::connect() path used by PoolPartition::CreateNewConnection.
 void TestSocketHandlerConnectSuccess() {
     std::cout << "\n[TEST] UpstreamPool SocketHandler: connect to listening socket..." << std::endl;
     try {
@@ -388,7 +388,6 @@ void TestSocketHandlerConnectSuccess() {
             ~ListenerGuard() { ::close(fd); }
         } lg{lfd};
 
-        // Create a non-blocking client socket and attempt connect.
         int cfd = SocketHandler::CreateClientSocket();
         if (cfd < 0) throw std::runtime_error("CreateClientSocket failed");
 
@@ -397,17 +396,18 @@ void TestSocketHandlerConnectSuccess() {
             ~ClientGuard() { if (fd >= 0) ::close(fd); }
         } cg{cfd};
 
-        SocketHandler sh(cfd);
-        InetAddr target("127.0.0.1", port);
-        int rc = sh.Connect(target);
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(port);
+        sa.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-        bool pass = (rc == SocketHandler::CONNECT_SUCCESS ||
-                     rc == SocketHandler::CONNECT_IN_PROGRESS);
+        int rc = ::connect(cfd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa));
+        // Non-blocking: expect 0 (immediate) or -1 with EINPROGRESS
+        bool pass = (rc == 0 || (rc == -1 && errno == EINPROGRESS));
         std::string err = pass ? "" :
-            "unexpected Connect() return code: " + std::to_string(rc);
-
-        // Prevent double-close: SocketHandler owns the fd after construction.
-        cg.fd = -1;
+            "unexpected connect() result: rc=" + std::to_string(rc) +
+            " errno=" + std::to_string(errno);
 
         TestFramework::RecordTest("UpstreamPool SocketHandler: connect to listening socket",
                                   pass, err);
@@ -417,30 +417,34 @@ void TestSocketHandlerConnectSuccess() {
     }
 }
 
-// SocketHandler::Connect to a closed port (connection refused) returns error.
+// Non-blocking connect to a closed port gets EINPROGRESS (async failure)
+// or immediate ECONNREFUSED. Tests the same raw path as production code.
 void TestSocketHandlerConnectRefused() {
     std::cout << "\n[TEST] UpstreamPool SocketHandler: connect refused..." << std::endl;
     try {
-        // Pick an ephemeral port, bind, then immediately close — so the port
-        // is guaranteed to be available-then-gone.
         auto [lfd, port] = MakeListenerFd();
         ::close(lfd);  // close before connecting → ECONNREFUSED
 
         int cfd = SocketHandler::CreateClientSocket();
         if (cfd < 0) throw std::runtime_error("CreateClientSocket failed");
 
-        SocketHandler sh(cfd);
-        InetAddr target("127.0.0.1", port);
-        int rc = sh.Connect(target);
+        struct ClientGuard {
+            int fd;
+            ~ClientGuard() { if (fd >= 0) ::close(fd); }
+        } cg{cfd};
 
-        // Non-blocking connect may return IN_PROGRESS first; FinishConnect
-        // would then give the error. Accept either CONNECT_ERROR immediately
-        // or IN_PROGRESS (the test validates only the initial call here since
-        // we don't run an event loop for async completion).
-        bool pass = (rc == SocketHandler::CONNECT_ERROR ||
-                     rc == SocketHandler::CONNECT_IN_PROGRESS);
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(port);
+        sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+        int rc = ::connect(cfd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa));
+        // Non-blocking: expect ECONNREFUSED immediately or EINPROGRESS
+        // (async failure detected via SO_ERROR later)
+        bool pass = (rc == -1 && (errno == ECONNREFUSED || errno == EINPROGRESS));
         std::string err = pass ? "" :
-            "unexpected rc=" + std::to_string(rc) + " for refused port";
+            "unexpected rc=" + std::to_string(rc) + " errno=" + std::to_string(errno);
 
         TestFramework::RecordTest("UpstreamPool SocketHandler: connect refused", pass, err);
     } catch (const std::exception& e) {

@@ -468,5 +468,13 @@ void Dispatcher::TimerHandler(){
                 conn->CloseAfterWrite();
             }
         }
+
+        // Fire the timeout_trigger_callback from the periodic timer path too,
+        // not just the epoll_wait idle-timeout path (channels.size()==0).
+        // This ensures upstream pool eviction runs even under sustained I/O
+        // where epoll_wait always returns events and never times out.
+        if (callbacks_.timeout_trigger_callback) {
+            callbacks_.timeout_trigger_callback(shared_from_this());
+        }
     }
 }
