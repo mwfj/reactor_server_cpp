@@ -133,14 +133,14 @@ void NetServer::Start(){
 
     dispatchers_ready_.store(true, std::memory_order_release);
 
-    if (ready_callback_) {
-        auto cb = std::move(ready_callback_);
+    // Fire ready callback synchronously BEFORE RunEventLoop(). This ensures
+    // server_ready_ is set before any accept events are processed — otherwise
+    // early requests hit the shutdown path (Connection: close, WS 503, H2
+    // GOAWAY) on an otherwise healthy server. The stop_requested_ guard
+    // suppresses the callback if Stop() raced in during startup.
+    if (ready_callback_ && !stop_requested_.load(std::memory_order_acquire)) {
+        ready_callback_();
         ready_callback_ = nullptr;
-        conn_dispatcher_->EnQueue([cb = std::move(cb), this]() {
-            if (!stop_requested_.load(std::memory_order_acquire)) {
-                cb();
-            }
-        });
     }
 
     conn_dispatcher_->RunEventLoop();
