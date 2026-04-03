@@ -15,10 +15,28 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - name: Build
         run: make -j$(nproc)
-      - name: Run tests
-        run: ./test_runner
-      - name: Run tests (stability)
-        run: ./test_runner
+      - name: Test - Basic
+        run: ./test_runner basic
+      - name: Test - Stress
+        run: ./test_runner stress
+      - name: Test - Race Condition
+        run: ./test_runner race
+      - name: Test - Timeout
+        run: ./test_runner timeout
+      - name: Test - Config
+        run: ./test_runner config
+      - name: Test - HTTP
+        run: ./test_runner http
+      - name: Test - WebSocket
+        run: ./test_runner ws
+      - name: Test - TLS
+        run: ./test_runner tls
+      - name: Test - HTTP/2
+        run: ./test_runner http2
+      - name: Test - CLI
+        run: ./test_runner cli
+      - name: Test - Route
+        run: ./test_runner route
 
   build-macos:
     runs-on: macos-14
@@ -28,7 +46,27 @@ jobs:
         run: brew install --quiet openssl@3 || true
       - name: Build
         run: make -j$(sysctl -n hw.ncpu)
-      - name: Run tests
-        run: ./test_runner
-      - name: Run tests (stability)
-        run: ./test_runner
+      - name: Test - Basic
+        run: ./test_runner basic
+      - name: Test - Stress
+        run: ./test_runner stress
+      - name: Test - Race Condition
+        run: ./test_runner race
+      - name: Test - Timeout
+        run: ./test_runner timeout
+      - name: Test - Config
+        run: ./test_runner config
+      - name: Test - HTTP
+        run: ./test_runner http
+      - name: Test - WebSocket
+        run: ./test_runner ws
+      - name: Test - TLS
+        run: ./test_runner tls
+      - name: Test - HTTP/2
+        run: ./test_runner http2
+      - name: Test - CLI
+        run: ./test_runner cli
+      - name: Test - Route
+        run: ./test_runner route
+      - name: Test - Kqueue
+        run: ./test_runner kqueue
