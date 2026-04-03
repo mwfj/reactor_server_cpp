@@ -201,7 +201,10 @@ namespace TestHttpClient {
         struct pollfd pfd;
         pfd.fd = fd;
         pfd.events = POLLIN;
-        int ret = poll(&pfd, 1, timeout_ms);
+        int ret;
+        do {
+            ret = poll(&pfd, 1, timeout_ms);
+        } while (ret < 0 && errno == EINTR);
         if (ret > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
             char buf[16];
             return (recv(fd, buf, sizeof(buf), 0) == 0);
