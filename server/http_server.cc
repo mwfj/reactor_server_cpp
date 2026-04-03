@@ -2,6 +2,7 @@
 #include "config/config_loader.h"
 #include "ws/websocket_frame.h"
 #include "http2/http2_constants.h"
+#include "upstream/upstream_manager.h"
 #include "log/logger.h"
 #include <algorithm>
 #include <set>
@@ -54,6 +55,24 @@ bool HttpServer::HasPendingH1Output() {
 }
 
 void HttpServer::MarkServerReady() {
+    // Assign dispatcher indices for upstream pool partition affinity
+    const auto& dispatchers = net_server_.GetSocketDispatchers();
+    for (size_t i = 0; i < dispatchers.size(); ++i) {
+        dispatchers[i]->SetDispatcherIndex(static_cast<int>(i));
+    }
+
+    // Create upstream pool manager if upstreams are configured
+    if (!upstream_configs_.empty()) {
+        try {
+            upstream_manager_ = std::make_unique<UpstreamManager>(
+                upstream_configs_, dispatchers);
+        } catch (const std::exception& e) {
+            logging::Get()->error("Failed to create UpstreamManager: {}",
+                                  e.what());
+            // Non-fatal — server starts without upstream pools
+        }
+    }
+
     start_time_ = std::chrono::steady_clock::now();
     server_ready_.store(true, std::memory_order_release);
 }
@@ -267,6 +286,9 @@ HttpServer::HttpServer(const ServerConfig& config)
     h2_settings_.initial_window_size    = config.http2.initial_window_size;
     h2_settings_.max_frame_size         = config.http2.max_frame_size;
     h2_settings_.max_header_list_size   = config.http2.max_header_list_size;
+
+    // Store upstream configurations for pool creation in Start()
+    upstream_configs_ = config.upstreams;
 }
 
 size_t HttpServer::ComputeInputCap() const {
@@ -340,6 +362,32 @@ void HttpServer::Stop() {
     // between the WS snapshot and the H2 drain snapshot. Without this, a WS
     // accepted in the gap would miss the 1001 "Going Away" close frame.
     net_server_.StopAccepting();
+
+    // Upstream pool shutdown — before WS/H2 drain so upstream responses
+    // can still flow while dispatchers are running.
+    if (upstream_manager_) {
+        upstream_manager_->InitiateShutdown();
+
+        auto drain_timeout = std::chrono::seconds(
+            shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
+
+        if (!net_server_.IsOnDispatcherThread()) {
+            upstream_manager_->WaitForDrain(drain_timeout);
+        } else {
+            // Stop-from-handler: poll + pump tasks (same pattern as H2 drain)
+            logging::Get()->warn("Upstream drain: stop-from-handler, "
+                                 "using task pump");
+            static constexpr int PUMP_INTERVAL_MS = 200;
+            auto deadline = std::chrono::steady_clock::now() + drain_timeout;
+            while (std::chrono::steady_clock::now() < deadline) {
+                net_server_.ProcessSelfDispatcherTasks();
+                if (upstream_manager_->AllDrained()) break;
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(PUMP_INTERVAL_MS));
+            }
+            upstream_manager_->ForceCloseRemaining();
+        }
+    }
 
     // Collect WS connections while holding the lock, then send close frames
     // AFTER releasing. Sending under the lock would deadlock: a failed inline

@@ -810,6 +810,11 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
 
     const HttpRequest& req = stream->GetRequest();
 
+    // Propagate dispatcher index for upstream pool partition affinity
+    if (conn_) {
+        req.dispatcher_index = conn_->dispatcher_index();
+    }
+
     // RFC 9110 Section 8.6: If content-length is declared, the actual body
     // size must match. A mismatch means the message is malformed.
     if (req.content_length > 0 &&

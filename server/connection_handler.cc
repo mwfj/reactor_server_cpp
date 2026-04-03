@@ -49,6 +49,64 @@ void ConnectionHandler::RegisterCallbacks(){
     client_channel_ -> EnableReadMode();
 }
 
+void ConnectionHandler::RegisterOutboundCallbacks(){
+    // Use weak_ptr to avoid keeping ConnectionHandler alive via callbacks
+    std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
+
+    client_channel_ -> SetReadCallBackFn([weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->OnMessage();
+        }
+    });
+
+    client_channel_ -> SetCloseCallBackFn([weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->CallCloseCb();
+        }
+    });
+
+    client_channel_ -> SetErrorCallBackFn([weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->CallErroCb();
+        }
+    });
+
+    client_channel_ -> SetWriteCallBackFn([weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->CallWriteCb();
+        }
+    });
+
+    connect_state_ = ConnectState::CONNECTING;
+    client_channel_ -> EnableETMode();
+    // Enable ONLY write mode — EPOLLOUT fires when connect() completes.
+    // Read mode is enabled later in CallWriteCb after connect succeeds.
+    client_channel_ -> EnableWriteMode();
+}
+
+int ConnectionHandler::FinishConnect(){
+    int err = 0;
+    socklen_t len = sizeof(err);
+    if (::getsockopt(fd(), SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
+        logging::Get()->warn("getsockopt(SO_ERROR) failed fd={}: {} (errno={})",
+                             fd(), logging::SafeStrerror(errno), errno);
+        return SocketHandler::CONNECT_ERROR;
+    }
+    if (err != 0) {
+        logging::Get()->warn("Outbound connect SO_ERROR fd={}: {} (errno={})",
+                             fd(), logging::SafeStrerror(err), err);
+        return SocketHandler::CONNECT_ERROR;
+    }
+    return SocketHandler::CONNECT_SUCCESS;
+}
+
+void ConnectionHandler::SetConnectCompleteCallback(ConnectCompleteCallback cb) {
+    connect_complete_callback_ = std::move(cb);
+}
+
+int ConnectionHandler::dispatcher_index() const {
+    return event_dispatcher_ ? event_dispatcher_->dispatcher_index() : -1;
+}
 
 void ConnectionHandler::OnMessage(){
     if(client_channel_ -> is_channel_closed()){
@@ -570,6 +628,36 @@ void ConnectionHandler::CallWriteCb(){
     // Check if channel is closed or write mode disabled (can happen during shutdown)
     if(!client_channel_ || client_channel_->is_channel_closed() || !client_channel_->isEnableWriteMode()) {
         return; // Silently ignore - channel is closing or already closed
+    }
+
+    // Outbound connect completion: the first EPOLLOUT after connect(EINPROGRESS)
+    // signals that the TCP handshake finished. Must be checked before any TLS
+    // or write logic — the socket isn't usable until connect succeeds.
+    if (connect_state_ == ConnectState::CONNECTING) {
+        int result = FinishConnect();
+        if (result == SocketHandler::CONNECT_SUCCESS) {
+            connect_state_ = ConnectState::CONNECTED;
+            client_channel_->EnableReadMode();
+            if (connect_complete_callback_) {
+                connect_complete_callback_(shared_from_this());
+                connect_complete_callback_ = nullptr;  // one-shot
+            }
+            // CRITICAL: If callback set tls_state_ = HANDSHAKE, fall through
+            // to the existing TLS handshake block. With ET mode, returning here
+            // would stall — no new EPOLLOUT fires on an already-writable socket.
+            if (tls_state_ == TlsState::HANDSHAKE) {
+                // Fall through to existing TLS handshake handler below
+            } else {
+                if (output_bf_.Size() == 0) {
+                    client_channel_->DisableWriteMode();
+                }
+                return;
+            }
+        } else {
+            logging::Get()->warn("Outbound connect failed fd={}", fd());
+            CallCloseCb();
+            return;
+        }
     }
 
     // If a previous SSL_read returned WANT_WRITE, the next writable event

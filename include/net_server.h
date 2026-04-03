@@ -125,6 +125,13 @@ public:
     // Get the actual worker thread count (resolved from auto mode).
     int GetWorkerCount() { return sock_workers_.GetThreadWorkerNum(); }
 
+    // Access the socket dispatchers (one per worker thread).
+    // Used by upstream connection pooling to pin outbound connections
+    // to the same dispatcher as the inbound request.
+    const std::vector<std::shared_ptr<Dispatcher>>& GetSocketDispatchers() const {
+        return socket_dispatchers_;
+    }
+
     // Connections exempt from CloseAfterWrite during Stop().
     // Set by HttpServer before Stop() for HTTP/2 graceful drain.
     void SetDrainingConns(std::set<ConnectionHandler*> conns) {

@@ -46,6 +46,46 @@ int SocketHandler::CreateSocket() {
     return listenfd;
 }
 
+int SocketHandler::CreateClientSocket() {
+#if defined(__linux__)
+    int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd == -1) {
+        int saved_errno = errno;
+        logging::Get()->error("Failed to create client socket: {}", logging::SafeStrerror(saved_errno));
+        return -1;
+    }
+#else
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == -1) {
+        int saved_errno = errno;
+        logging::Get()->error("Failed to create client socket: {}", logging::SafeStrerror(saved_errno));
+        return -1;
+    }
+    // Set non-blocking
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        int saved_errno = errno;
+        logging::Get()->error("Failed to set client socket non-blocking: {}", logging::SafeStrerror(saved_errno));
+        ::close(fd);
+        return -1;
+    }
+    // Set close-on-exec
+    int fd_flags = fcntl(fd, F_GETFD);
+    if (fd_flags != -1) {
+        fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC);
+    }
+    // Suppress SIGPIPE per-socket on macOS (MSG_NOSIGNAL not available)
+#ifdef SO_NOSIGPIPE
+    int set = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set)) < 0) {
+        int saved_errno = errno;
+        logging::Get()->warn("Failed to set SO_NOSIGPIPE on client socket: {}", logging::SafeStrerror(saved_errno));
+    }
+#endif
+#endif
+    return fd;
+}
+
 void SocketHandler::Bind(const InetAddr& _servAddr){
     if(::bind(fd_, _servAddr.Addr(), sizeof(sockaddr_in)) < 0){
         int saved_errno = errno;  // Save errno before any other calls
@@ -121,6 +161,45 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
 #endif
     _clientAddr.SetAddr(acceptAddr);
     return clientfd;
+}
+
+int SocketHandler::Connect(const InetAddr& addr) {
+    int ret = ::connect(fd_, addr.Addr(), sizeof(sockaddr_in));
+    if (ret == 0) {
+        return CONNECT_SUCCESS;
+    }
+    int saved_errno = errno;
+    if (saved_errno == EINPROGRESS) {
+        return CONNECT_IN_PROGRESS;
+    }
+    if (saved_errno == EISCONN) {
+        // Already connected (can happen if connect is called again after completion)
+        return CONNECT_SUCCESS;
+    }
+    logging::Get()->warn("Connect failed fd={}: {} (errno={})",
+                         fd_, logging::SafeStrerror(saved_errno), saved_errno);
+    return CONNECT_ERROR;
+}
+
+int SocketHandler::FinishConnect() {
+    int error = 0;
+    socklen_t len = sizeof(error);
+    int ret;
+    do {
+        ret = ::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &len);
+    } while (ret == -1 && errno == EINTR);
+    if (ret == -1) {
+        int saved_errno = errno;
+        logging::Get()->error("FinishConnect getsockopt failed fd={}: {} (errno={})",
+                              fd_, logging::SafeStrerror(saved_errno), saved_errno);
+        return CONNECT_ERROR;
+    }
+    if (error != 0) {
+        logging::Get()->warn("FinishConnect failed fd={}: {} (errno={})",
+                             fd_, logging::SafeStrerror(error), error);
+        return CONNECT_ERROR;
+    }
+    return CONNECT_SUCCESS;
 }
 
 void SocketHandler::Close() {

@@ -16,6 +16,9 @@
 #include <set>
 #include <string>
 
+// Forward declaration for upstream pool
+class UpstreamManager;
+
 class HttpServer {
 public:
     // Snapshot of server runtime statistics. All values are approximate
@@ -80,6 +83,10 @@ public:
 
     // Returns the actual port the server is listening on.
     int GetBoundPort() const;
+
+    // Access the upstream pool manager for proxy handlers.
+    // Returns nullptr if no upstreams configured or server not started.
+    UpstreamManager* GetUpstreamManager() const { return upstream_manager_.get(); }
 
 private:
     NetServer net_server_;
@@ -194,4 +201,8 @@ private:
     // race path where HandleMessage runs before HandleNewConnection.
     bool DetectAndRouteProtocol(std::shared_ptr<ConnectionHandler> conn,
                                 std::string& message, bool already_counted);
+
+    // Upstream connection pool
+    std::vector<UpstreamConfig> upstream_configs_;
+    std::unique_ptr<UpstreamManager> upstream_manager_;
 };

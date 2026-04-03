@@ -3,6 +3,9 @@
 #include "tls/tls_context.h"
 // <string>, <stdexcept> provided by common.h (via tls_context.h)
 
+// Forward declaration — avoids pulling tls_client_context.h into every includer
+class TlsClientContext;
+
 class TlsConnection {
 public:
     // TLS operation return codes
@@ -13,7 +16,12 @@ public:
     static constexpr int TLS_PEER_CLOSED = -2;  // Peer sent close_notify (Read only)
     static constexpr int TLS_CROSS_RW    = -3;  // Read needs write / Write needs read (renegotiation)
 
+    // Server-mode constructor (existing)
     TlsConnection(TlsContext& ctx, int fd);
+
+    // Client-mode constructor — uses TLS_client_method context.
+    // If sni_hostname is non-empty, sets SNI (Server Name Indication) for virtual hosting.
+    TlsConnection(TlsClientContext& ctx, int fd, const std::string& sni_hostname = "");
     ~TlsConnection();
 
     // Non-copyable and non-movable (SSL* ownership must not be transferred)

@@ -68,7 +68,10 @@ WS_SRCS = $(SERVER_DIR)/websocket_frame.cc $(SERVER_DIR)/websocket_handshake.cc 
 HTTP2_SRCS = $(SERVER_DIR)/http2_session.cc $(SERVER_DIR)/http2_stream.cc $(SERVER_DIR)/http2_connection_handler.cc $(SERVER_DIR)/protocol_detector.cc
 
 # TLS layer sources
-TLS_SRCS = $(SERVER_DIR)/tls_context.cc $(SERVER_DIR)/tls_connection.cc
+TLS_SRCS = $(SERVER_DIR)/tls_context.cc $(SERVER_DIR)/tls_connection.cc $(SERVER_DIR)/tls_client_context.cc
+
+# Upstream connection pool sources
+UPSTREAM_SRCS = $(SERVER_DIR)/upstream_connection.cc $(SERVER_DIR)/pool_partition.cc $(SERVER_DIR)/upstream_host_pool.cc $(SERVER_DIR)/upstream_manager.cc
 
 # CLI layer sources
 CLI_SRCS = $(SERVER_DIR)/cli_parser.cc $(SERVER_DIR)/signal_handler.cc $(SERVER_DIR)/pid_file.cc $(SERVER_DIR)/daemonizer.cc
@@ -116,7 +119,7 @@ NGHTTP2_SRC = $(THIRD_PARTY_DIR)/nghttp2/nghttp2_alpn.c \
 NGHTTP2_OBJ = $(NGHTTP2_SRC:.c=.o)
 
 # Server library sources (shared between test and production binaries)
-LIB_SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(FOUNDATION_SRCS) $(HTTP_SRCS) $(HTTP2_SRCS) $(WS_SRCS) $(TLS_SRCS) $(CLI_SRCS) $(UTIL_SRCS)
+LIB_SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(FOUNDATION_SRCS) $(HTTP_SRCS) $(HTTP2_SRCS) $(WS_SRCS) $(TLS_SRCS) $(UPSTREAM_SRCS) $(CLI_SRCS) $(UTIL_SRCS)
 
 # Test binary sources
 TEST_SRCS = $(LIB_SRCS) $(SERVER_DIR)/reactor_server.cc $(TEST_DIR)/test_framework.cc $(TEST_DIR)/run_test.cc
@@ -135,7 +138,7 @@ HTTP2_HEADERS = $(LIB_DIR)/http2/http2_callbacks.h $(LIB_DIR)/http2/http2_connec
 WS_HEADERS = $(LIB_DIR)/ws/websocket_connection.h $(LIB_DIR)/ws/websocket_frame.h $(LIB_DIR)/ws/websocket_handshake.h $(LIB_DIR)/ws/websocket_parser.h $(LIB_DIR)/ws/utf8_validate.h
 TLS_HEADERS = $(LIB_DIR)/tls/tls_context.h $(LIB_DIR)/tls/tls_connection.h
 CLI_HEADERS = $(LIB_DIR)/cli/cli_parser.h $(LIB_DIR)/cli/signal_handler.h $(LIB_DIR)/cli/pid_file.h $(LIB_DIR)/cli/version.h $(LIB_DIR)/cli/daemonizer.h
-TEST_HEADERS = $(TEST_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h $(TEST_DIR)/route_test.h
+TEST_HEADERS = $(TEST_DIR)/client.h $(TEST_DIR)/test_framework.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h $(TEST_DIR)/route_test.h $(TEST_DIR)/upstream_pool_test.h
 
 # All headers combined
 HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(FOUNDATION_HEADERS) $(HTTP_HEADERS) $(HTTP2_HEADERS) $(WS_HEADERS) $(TLS_HEADERS) $(CLI_HEADERS) $(TEST_HEADERS)
@@ -214,6 +217,11 @@ test_cli: $(TARGET) $(SERVER_TARGET)
 test_http2: $(TARGET)
 	@echo "Running HTTP/2 tests only..."
 	./$(TARGET) http2
+
+# Run only upstream connection pool tests
+test_upstream: $(TARGET)
+	@echo "Running upstream connection pool tests only..."
+	./$(TARGET) upstream
 
 # Display help information
 help:
@@ -295,4 +303,4 @@ help:
 # Build only the production server binary
 server: $(SERVER_TARGET)
 
-.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 help
+.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream help

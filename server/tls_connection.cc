@@ -1,4 +1,6 @@
 #include "tls/tls_connection.h"
+#include "tls/tls_client_context.h"
+#include "log/logger.h"
 #include <openssl/err.h>
 
 TlsConnection::TlsConnection(TlsContext& ctx, int fd) {
@@ -16,6 +18,34 @@ TlsConnection::TlsConnection(TlsContext& ctx, int fd) {
     // Allow retrying SSL_write with a different buffer address.
     // Our output_bf_ can reallocate between the original write and the retry.
     SSL_set_mode(ssl_, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_ENABLE_PARTIAL_WRITE);
+}
+
+TlsConnection::TlsConnection(TlsClientContext& ctx, int fd, const std::string& sni_hostname) {
+    ssl_ = SSL_new(ctx.GetCtx());
+    if (!ssl_) {
+        throw std::runtime_error("Failed to create client SSL object");
+    }
+    if (SSL_set_fd(ssl_, fd) != 1) {
+        SSL_free(ssl_);
+        ssl_ = nullptr;
+        throw std::runtime_error("Failed to set client SSL file descriptor");
+    }
+    SSL_set_connect_state(ssl_);  // Client-side
+
+    // Set SNI hostname for virtual hosting — server uses this to select certificate
+    if (!sni_hostname.empty()) {
+        if (SSL_set_tlsext_host_name(ssl_, sni_hostname.c_str()) != 1) {
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+            throw std::runtime_error("Failed to set SNI hostname: " + sni_hostname);
+        }
+        logging::Get()->debug("TlsConnection client: SNI set to {}", sni_hostname);
+    }
+
+    // Allow retrying SSL_write with a different buffer address (same as server mode)
+    SSL_set_mode(ssl_, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_ENABLE_PARTIAL_WRITE);
+
+    logging::Get()->debug("TlsConnection client: created fd={}", fd);
 }
 
 TlsConnection::~TlsConnection() {

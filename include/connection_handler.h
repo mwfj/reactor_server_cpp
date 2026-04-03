@@ -38,6 +38,12 @@ private:
     // while the on-thread path writes it — plain unsigned would be UB.
     std::atomic<unsigned> deadline_generation_{0};
 
+    // Outbound connect support (for upstream/proxy connections)
+    enum class ConnectState { NONE, CONNECTING, CONNECTED };
+    ConnectState connect_state_ = ConnectState::NONE;
+    using ConnectCompleteCallback = std::function<void(std::shared_ptr<ConnectionHandler>)>;
+    ConnectCompleteCallback connect_complete_callback_ = nullptr;
+
     // TLS support
     bool tls_ready_from_write_ = false;  // TLS handshake completed via CallWriteCb
     enum class TlsState { NONE, HANDSHAKE, READY };
@@ -63,6 +69,12 @@ public:
 
     // Two-phase initialization: must be called after object is wrapped in shared_ptr
     void RegisterCallbacks();
+    // Outbound variant: registers callbacks for connect-in-progress sockets.
+    // Enables ET + write-only mode (EPOLLOUT detects connect completion).
+    void RegisterOutboundCallbacks();
+    void SetConnectCompleteCallback(ConnectCompleteCallback cb);
+    int FinishConnect();  // Check SO_ERROR via getsockopt; returns CONNECT_SUCCESS or CONNECT_ERROR
+    int dispatcher_index() const;
 
     int fd() const{ return sock_ ? sock_ -> fd() : -1; }
     bool IsClosing() const { return is_closing_.load(std::memory_order_acquire); }

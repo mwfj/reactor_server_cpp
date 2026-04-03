@@ -10,6 +10,11 @@ public:
     static constexpr int ACCEPT_FD_EXHAUSTION   = -3;  // EMFILE/ENFILE (recoverable via idle fd trick)
     static constexpr int ACCEPT_MEMORY_PRESSURE = -4;  // ENOBUFS/ENOMEM
 
+    // Connect() return codes for outbound connections
+    static constexpr int CONNECT_SUCCESS     =  0;  // Connected immediately or EISCONN
+    static constexpr int CONNECT_IN_PROGRESS =  1;  // EINPROGRESS (non-blocking connect pending)
+    static constexpr int CONNECT_ERROR       = -1;  // Unrecoverable connect error
+
 private:
     int fd_;
     std::string ip_addr_;
@@ -58,9 +63,12 @@ public:
     bool SetKeepAlive(bool);
     
     int CreateSocket();
+    static int CreateClientSocket();
     void Bind(const InetAddr& servAddr);
     void Listen(int maxLen);
     int Accept(InetAddr& clientAddr);
+    int Connect(const InetAddr& addr);
+    int FinishConnect();
     void Close();
 
     // Query the actual port bound by the OS (resolves ephemeral port 0).

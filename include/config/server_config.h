@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <chrono>
 #include <cstdint>
 
@@ -26,6 +27,31 @@ struct Http2Config {
     uint32_t max_header_list_size = 65536;       // 64 KB
 };
 
+struct UpstreamTlsConfig {
+    bool enabled = false;
+    std::string ca_file;
+    bool verify_peer = true;
+    std::string sni_hostname;
+    std::string min_version = "1.2";
+};
+
+struct UpstreamPoolConfig {
+    int max_connections = 64;
+    int max_idle_connections = 16;
+    int connect_timeout_ms = 5000;
+    int idle_timeout_sec = 90;
+    int max_lifetime_sec = 3600;
+    int max_requests_per_conn = 0;
+};
+
+struct UpstreamConfig {
+    std::string name;
+    std::string host;
+    int port = 80;
+    UpstreamTlsConfig tls;
+    UpstreamPoolConfig pool;
+};
+
 // NOTE: When adding fields, also update ConfigLoader::LoadFromString(),
 // ConfigLoader::ToJson(), ConfigLoader::ApplyEnvOverrides(), and
 // ConfigLoader::Validate() to keep serialization/deserialization in sync.
@@ -43,4 +69,5 @@ struct ServerConfig {
     int request_timeout_sec = 30;
     int shutdown_drain_timeout_sec = 30; // Max seconds to wait for in-flight H2 streams during shutdown. 0 = immediate.
     Http2Config http2;
+    std::vector<UpstreamConfig> upstreams;
 };

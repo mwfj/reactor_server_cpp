@@ -112,6 +112,9 @@ void HttpConnectionHandler::HandleParseError() {
 bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& remaining, size_t consumed) {
     const HttpRequest& req = parser_.GetRequest();
 
+    // Propagate dispatcher index for upstream pool partition affinity
+    req.dispatcher_index = conn_->dispatcher_index();
+
     // Count every completed request parse — dispatched, rejected, or upgraded.
     if (callbacks_.request_count_callback) {
         callbacks_.request_count_callback();
