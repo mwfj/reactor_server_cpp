@@ -1,33 +1,28 @@
 #pragma once
 #include "test_framework.h"
 #include "test_server_runner.h"
-#include "reactor_server.h"
-#include "client.h"
+#include "http_test_client.h"
 #include <thread>
-
 
 // Test namespace for basic functionality tests
 namespace BasicTests {
-    const char* TEST_IP = "127.0.0.1";
 
     // Test 1: Single Client Connection
     void TestSingleConnection() {
         std::cout << "\n[TEST] Single Client Connection..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, 0);
-            TestServerRunner<ReactorServer> runner(server);
+            HttpServer server("127.0.0.1", 0);
+            TestHttpClient::SetupEchoRoutes(server);
+            TestServerRunner<HttpServer> runner(server);
 
-            // Create and connect client
-            Client client(runner.GetPort(), TEST_IP, "Hello");
-            client.Init();
-            client.Connect();
+            // Connect and send a simple GET request
+            std::string response = TestHttpClient::HttpGet(runner.GetPort(), "/health");
 
-            std::cout << "[TEST] Client connected successfully" << std::endl;
+            bool pass = !response.empty() && TestHttpClient::HasStatus(response, 200);
+            std::string err = pass ? "" : "No valid response from server";
 
-            client.Close();
-
-            TestFramework::RecordTest("Single Client Connection", true, "", TestFramework::TestCategory::BASIC);
+            TestFramework::RecordTest("Single Client Connection", pass, err, TestFramework::TestCategory::BASIC);
         } catch (const std::exception& e) {
             TestFramework::RecordTest("Single Client Connection", false, e.what(), TestFramework::TestCategory::BASIC);
         }
@@ -38,25 +33,18 @@ namespace BasicTests {
         std::cout << "\n[TEST] Echo Functionality..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, 0);
-            TestServerRunner<ReactorServer> runner(server);
+            HttpServer server("127.0.0.1", 0);
+            TestHttpClient::SetupEchoRoutes(server);
+            TestServerRunner<HttpServer> runner(server);
 
-            Client client(runner.GetPort(), TEST_IP, "TestMessage");
-            client.SetQuietMode(false);
-            client.Init();
-            client.Connect();
+            std::string response = TestHttpClient::HttpPost(
+                runner.GetPort(), "/echo", "TestMessage");
 
-            // Send message
-            client.Send();
-            std::cout << "[TEST] Sent: TestMessage" << std::endl;
+            bool pass = TestHttpClient::HasStatus(response, 200) &&
+                        TestHttpClient::ExtractBody(response) == "TestMessage";
+            std::string err = pass ? "" : "Echo mismatch, got: " + TestHttpClient::ExtractBody(response);
 
-            // Receive echo
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            client.Receive();
-
-            client.Close();
-
-            TestFramework::RecordTest("Echo Functionality", true, "", TestFramework::TestCategory::BASIC);
+            TestFramework::RecordTest("Echo Functionality", pass, err, TestFramework::TestCategory::BASIC);
         } catch (const std::exception& e) {
             TestFramework::RecordTest("Echo Functionality", false, e.what(), TestFramework::TestCategory::BASIC);
         }
@@ -67,24 +55,21 @@ namespace BasicTests {
         std::cout << "\n[TEST] Multiple Sequential Connections..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, 0);
-            TestServerRunner<ReactorServer> runner(server);
+            HttpServer server("127.0.0.1", 0);
+            TestHttpClient::SetupEchoRoutes(server);
+            TestServerRunner<HttpServer> runner(server);
+            const int port = runner.GetPort();
 
             const int NUM_CLIENTS = 5;
             for (int i = 0; i < NUM_CLIENTS; i++) {
-                std::stringstream ss;
-                ss << "Client" << i;
+                std::string body = "Client" + std::to_string(i);
+                std::string response = TestHttpClient::HttpPost(port, "/echo", body);
 
-                Client client(runner.GetPort(), TEST_IP, ss.str().c_str());
-                client.SetQuietMode(true);
-                client.Init();
-                client.Connect();
-                client.Send();
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                client.Receive();
-                client.Close();
-
-                // Give time for server to clean up
+                if (!TestHttpClient::HasStatus(response, 200)) {
+                    TestFramework::RecordTest("Multiple Sequential Connections", false,
+                        "Request " + std::to_string(i) + " failed", TestFramework::TestCategory::BASIC);
+                    return;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
 
@@ -99,8 +84,9 @@ namespace BasicTests {
         std::cout << "\n[TEST] Concurrent Connections..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, 0);
-            TestServerRunner<ReactorServer> runner(server);
+            HttpServer server("127.0.0.1", 0);
+            TestHttpClient::SetupEchoRoutes(server);
+            TestServerRunner<HttpServer> runner(server);
             const int port = runner.GetPort();
 
             const int NUM_CLIENTS = 10;
@@ -108,23 +94,17 @@ namespace BasicTests {
             std::atomic<int> success_count{0};
             std::atomic<int> failure_count{0};
 
-            // Launch multiple clients concurrently
             for (int i = 0; i < NUM_CLIENTS; i++) {
                 client_threads.emplace_back([i, port, &success_count, &failure_count]() {
                     try {
-                        std::stringstream ss;
-                        ss << "ConcurrentClient" << i;
+                        std::string body = "ConcurrentClient" + std::to_string(i);
+                        std::string response = TestHttpClient::HttpPost(port, "/echo", body, 5000);
 
-                        Client client(port, TEST_IP, ss.str().c_str());
-                        client.SetQuietMode(true);
-                        client.Init();
-                        client.SetReceiveTimeout(5);  // 5 second timeout to prevent hanging
-                        client.Connect();
-                        std::this_thread::sleep_for(std::chrono::milliseconds(10));  // Reduced from 100ms - acceptor now handles all connections
-                        client.Send();
-                        client.Receive();  // Block until response arrives (5 second timeout)
-                        client.Close();
-                        success_count++;  // Only increment if no exception thrown
+                        if (TestHttpClient::HasStatus(response, 200)) {
+                            success_count++;
+                        } else {
+                            failure_count++;
+                        }
                     } catch (const std::exception& e) {
                         std::cerr << "[TEST] Client " << i << " error: " << e.what() << std::endl;
                         failure_count++;
@@ -132,7 +112,6 @@ namespace BasicTests {
                 });
             }
 
-            // Wait for all clients to finish
             for (auto& t : client_threads) {
                 t.join();
             }
@@ -140,9 +119,6 @@ namespace BasicTests {
             std::cout << "[TEST] All " << NUM_CLIENTS << " concurrent clients completed" << std::endl;
             std::cout << "[TEST] Success: " << success_count << ", Failures: " << failure_count << std::endl;
 
-            // FIX: Test now properly tracks success/failure instead of always passing
-            // Previously, exceptions were caught and logged but test always recorded as PASS
-            // Now, test only passes if ALL clients successfully connect, send, and receive
             bool all_success = (success_count == NUM_CLIENTS && failure_count == 0);
             std::string error_msg = all_success ? "" :
                 "Only " + std::to_string(success_count.load()) + "/" + std::to_string(NUM_CLIENTS) + " clients succeeded";
@@ -157,24 +133,23 @@ namespace BasicTests {
         std::cout << "\n[TEST] Large Message Transfer..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, 0);
-            TestServerRunner<ReactorServer> runner(server);
+            HttpServer server("127.0.0.1", 0);
+            TestHttpClient::SetupEchoRoutes(server);
+            TestServerRunner<HttpServer> runner(server);
 
-            // Create a large message (close to buffer size)
+            // Create a large message (512 bytes)
             std::string large_msg(512, 'A');
 
-            Client client(runner.GetPort(), TEST_IP, large_msg.c_str());
-            client.SetQuietMode(true);
-            client.Init();
-            client.Connect();
-            client.Send();
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            client.Receive();
-            client.Close();
+            std::string response = TestHttpClient::HttpPost(
+                runner.GetPort(), "/echo", large_msg);
+
+            bool pass = TestHttpClient::HasStatus(response, 200) &&
+                        TestHttpClient::ExtractBody(response) == large_msg;
+            std::string err = pass ? "" : "Large message echo mismatch";
 
             std::cout << "[TEST] Large message (" << large_msg.size() << " bytes) transferred" << std::endl;
 
-            TestFramework::RecordTest("Large Message Transfer", true, "", TestFramework::TestCategory::BASIC);
+            TestFramework::RecordTest("Large Message Transfer", pass, err, TestFramework::TestCategory::BASIC);
         } catch (const std::exception& e) {
             TestFramework::RecordTest("Large Message Transfer", false, e.what(), TestFramework::TestCategory::BASIC);
         }
@@ -185,15 +160,16 @@ namespace BasicTests {
         std::cout << "\n[TEST] Quick Connection and Disconnect..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, 0);
-            TestServerRunner<ReactorServer> runner(server);
+            HttpServer server("127.0.0.1", 0);
+            TestHttpClient::SetupEchoRoutes(server);
+            TestServerRunner<HttpServer> runner(server);
+            const int port = runner.GetPort();
 
             for (int i = 0; i < 3; i++) {
-                Client client(runner.GetPort(), TEST_IP, "Quick");
-                client.SetQuietMode(true);
-                client.Init();
-                client.Connect();
-                client.Close();  // Immediate disconnect
+                int sockfd = TestHttpClient::ConnectRawSocket(port);
+                if (sockfd >= 0) {
+                    close(sockfd);  // Immediate disconnect
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
 
@@ -208,7 +184,7 @@ namespace BasicTests {
     // Run all tests
     void RunAllTests() {
         std::cout << "\n" << std::string(60, '=') << std::endl;
-        std::cout << "REACTOR SERVER - UNIT TESTS" << std::endl;
+        std::cout << "BASIC FUNCTIONALITY TESTS" << std::endl;
         std::cout << std::string(60, '=') << std::endl;
 
         TestSingleConnection();

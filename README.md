@@ -227,7 +227,7 @@ JSON config file:
 ## Architecture
 
 ```
-Layer 5: HttpServer / ReactorServer         (application entry points)
+Layer 5: HttpServer                          (application entry point)
 Layer 4: HttpRouter, WebSocketConnection    (routing, WS message API)
 Layer 3: HttpParser, WebSocketParser        (protocol parsing)
          HttpConnectionHandler              (HTTP/1.1 state machine)

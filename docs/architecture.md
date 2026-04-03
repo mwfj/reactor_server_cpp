@@ -26,7 +26,7 @@ The server uses the [Reactor pattern](https://en.wikipedia.org/wiki/Reactor_patt
 ## Layered Design
 
 ```
-Layer 5: HttpServer / ReactorServer         (application entry points)
+Layer 5: HttpServer                          (application entry point)
 Layer 4: HttpRouter, WebSocketConnection    (routing, WS message API)
 Layer 3: HttpParser, WebSocketParser        (HTTP/1.1 protocol parsing)
          HttpConnectionHandler              (HTTP/1.1 state machine)

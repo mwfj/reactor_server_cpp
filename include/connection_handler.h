@@ -58,7 +58,7 @@ private:
     // Prevents allocating far beyond configured limits (max_body_size, etc.)
     // before the parser has a chance to reject. The read loop still drains
     // to EAGAIN (required for ET mode) but discards bytes past this limit.
-    // 0 = unlimited (default, for backward compatibility with ReactorServer).
+    // 0 = unlimited (default). HttpServer sets this via ComputeInputCap().
     size_t max_input_size_ = 0;
 public:
     ConnectionHandler() = delete;

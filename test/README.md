@@ -1,327 +1,179 @@
-# Race Condition Test Suite
+# Test Suite
 
-This document describes the comprehensive race condition test suite created to validate all fixes documented in [`EVENTFD_RACE_CONDITION_FIXES.md`](../EVENTFD_RACE_CONDITION_FIXES.md).
+218 tests across 13 suites covering the reactor core, HTTP/1.1, HTTP/2, WebSocket, TLS, configuration, CLI, and route matching.
 
-## Overview
-
-The race condition test suite specifically targets multi-threaded edge cases and race conditions that were discovered and fixed during development. These tests ensure that the fixes remain effective and prevent regression.
-
-## Test File
-
-**Location**: [test/race_condition_test.h](race_condition_test.h)
-
-## Test Coverage
-
-### RC-TEST-1: Dispatcher Initialization (Issue 1)
-
-**Validates**: EventFD implementation and two-phase initialization pattern
-
-**What it tests**:
-- Dispatcher can be created without crash
-- `Init()` can be called after construction without `bad_weak_ptr` exception
-- Event loop can start and stop cleanly
-- wake_channel_ is properly initialized
-
-**Related Issues**:
-- Uninitialized `wake_channel_` dereferencing
-- `shared_from_this()` called in constructor
-- Resource leaks
-
----
-
-### RC-TEST-2: EnQueue Deadlock Prevention (Issue 1.3)
-
-**Validates**: Lock-free task execution in `HandleEventId()`
-
-**What it tests**:
-- Tasks can be enqueued without deadlock
-- Concurrent connections trigger EnQueue internally
-- No deadlock when tasks call EnQueue recursively
-- Mutex is not held during task execution
-
-**Related Issues**:
-- Deadlock when task calls `EnQueue()` while mutex is held
-- Poor concurrency from long mutex hold times
-
----
-
-### RC-TEST-3: Double Close Prevention (Issue 2.1, 2.4)
-
-**Validates**: Atomic close guards and duplicate callback prevention
-
-**What it tests**:
-- 50 rapid connect/disconnect cycles
-- No "Bad file descriptor" errors from double-close
-- No duplicate "Connection Closed" messages
-- `is_channel_closed_` and `is_closing_` atomic flags work correctly
-
-**Related Issues**:
-- Double-close bug causing fd reuse issues
-- Duplicate close callbacks from multiple code paths
-- Non-atomic boolean flags in multi-threaded code
-
----
-
-### RC-TEST-4: Concurrent Event Handling (Issue 2.3)
-
-**Validates**: Priority-based event handling with EPOLLRDHUP + EPOLLIN
-
-**What it tests**:
-- 30 clients send data and close rapidly
-- EPOLLRDHUP and EPOLLIN events handled correctly
-- Close events take priority (early return prevents other event processing)
-- No crashes from concurrent read/close events
-
-**Related Issues**:
-- EPOLLRDHUP + EPOLLIN concurrent event race
-- else-if logic prevented both events from being processed
-- Read events calling close while close callback also runs
-
----
-
-### RC-TEST-5: channel_map_ Multi-Threaded Race (Issue 4 - CRITICAL)
-
-**Validates**: Mutex-protected channel_map_ access and safe pointer handling
-
-**What it tests**:
-- 20 worker threads × 10 connections each = 200 concurrent operations
-- Rapid connection creation/destruction while event loop processes events
-- No segfaults from null pointer dereference
-- Validate-before-dereference pattern works correctly
-- Mutex prevents concurrent map modification
-
-**Related Issues**:
-- **CRITICAL SEGFAULT**: `Channel::HandleEvent (this=0x0)`
-- Raw pointer from `epoll_wait()` dereferenced without validation
-- No mutex protecting `channel_map_`
-- Data races between `WaitForEvent()` and `RemoveChannel()`
-
-**This is the most important test** - it directly reproduces the segfault from the GDB trace.
-
----
-
-### RC-TEST-6: TOCTOU Race in epoll_ctl (Issue 3)
-
-**Validates**: Defense-in-depth checks in `EpollHandler::UpdateEvent()`
-
-**What it tests**:
-- 40 clients trigger write mode then close immediately
-- Creates TOCTOU window between `is_channel_closed_` check and `epoll_ctl()` call
-- No "Bad file descriptor" exceptions
-- Graceful error handling (EBADF, ENOENT, EEXIST)
-
-**Related Issues**:
-- Time-Of-Check-Time-Of-Use race condition
-- Channel closed between check and epoll_ctl
-- `epoll_ctl ADD failed: Bad file descriptor` errors
-
----
-
-### RC-TEST-7: Atomic Closed Flag (Issue 2.2)
-
-**Validates**: `std::atomic<bool>` for `is_channel_closed_` and `is_closing_`
-
-**What it tests**:
-- 25 sequential rapid connect/send/close cycles
-- Atomic compare-exchange prevents duplicate operations
-- No race conditions from non-atomic bool operations
-
-**Related Issues**:
-- Non-atomic `bool is_channel_closed_` allowed race conditions
-- Multiple threads could both pass the check and double-close
-- Changed to `std::atomic<bool>` with `compare_exchange_strong()`
-
----
-
-## Running the Tests
-
-### Run All Tests (Including Race Condition Tests)
+## Running Tests
 
 ```bash
-make clean && make
-./run
+make clean && make -j4    # Build test_runner and server_runner
+./test_runner             # Run all 218 tests
+./test_runner <suite>     # Run a specific suite (see table below)
 ```
 
-This runs:
-1. Basic functional tests (6 tests)
-2. Stress tests (1 test - 100 concurrent clients)
-3. **Race condition tests (7 tests)**
+All tests use ephemeral ports (port 0) to avoid conflicts. The test runner automatically raises the fd limit on macOS where the default soft limit (256) is insufficient.
 
-### Run Only Race Condition Tests
+### Suite Commands
+
+| Suite | Command | Short | Tests | What It Validates |
+|-------|---------|-------|------:|-------------------|
+| basic | `./test_runner basic` | `-b` | 6 | Connection lifecycle, echo, sequential/concurrent connections, large messages, quick disconnect |
+| stress | `./test_runner stress` | `-s` | 1 | 1000 concurrent clients (200 in CI); validates no crashes under load |
+| race | `./test_runner race` | `-r` | 7 | Reactor core race conditions: dispatcher init, deadlock prevention, double close, concurrent events, channel_map races, TOCTOU, atomic flags |
+| timeout | `./test_runner timeout` | `-t` | 3 | Idle connection timeout with custom and default timer parameters |
+| config | `./test_runner config` | `-c` | 8 | JSON config loading, environment variable overrides, validation, serialization |
+| http | `./test_runner http` | `-H` | 14 | HTTP/1.1 parsing, routing, middleware, integration (request/response cycle), request timeout |
+| ws | `./test_runner ws` | `-w` | 10 | WebSocket handshake validation, frame serialization, parser (masked/binary/16-bit/64-bit length frames), close frame handling, integration |
+| tls | `./test_runner tls` | `-T` | 2 | TLS context creation and HTTPS request/response |
+| http2 | `./test_runner http2` | `-2` | 37 | Protocol detection, ALPN, HTTP/2 stream lifecycle, header/body handling, H2C cleartext (GET, POST, 404, middleware, multiple streams, large body, invalid preface, body limits), config/settings |
+| cli | `./test_runner cli` | `-C` | 79 | CLI argument parsing (start/stop/status/reload/validate/config commands), signal handling, PID file management, logging subsystem, config reload, /stats endpoint, server counters |
+| route | `./test_runner route` | `-R` | 44 | Route trie: exact/param/catch-all matching, regex constraints, priority (static > param > catch-all), conflict detection, edge cases. HttpRouter: dispatch, 405, HEAD fallback, middleware, WebSocket routes |
+| kqueue | `./test_runner kqueue` | `-K` | 7 | macOS-only: EVFILT_TIMER idle timeout, EV_EOF on write filter, pipe wakeup under load, filter consolidation, churn stability, timer re-arm, SO_NOSIGPIPE |
+
+### Make Targets
 
 ```bash
-make test_race
+make test            # Build and run all tests
+make test_basic      # Build and run basic tests only
+make test_stress     # Build and run stress tests only
+make test_race       # Build and run race condition tests only
+make test_config     # Build and run config tests only
+make test_http       # Build and run HTTP tests only
+make test_ws         # Build and run WebSocket tests only
+make test_tls        # Build and run TLS tests only
+make test_http2      # Build and run HTTP/2 tests only
+make test_cli        # Build and run CLI tests only
 ```
 
-Or manually:
-```bash
-g++ -std=c++11 -g -Wall -Iinclude -Ithread_pool/include \
-    server/dispatcher.cc server/epoll_handler.cc server/channel.cc \
-    server/socket_handler.cc server/acceptor.cc server/connection_handler.cc \
-    server/net_server.cc server/buffer.cc \
-    thread_pool/src/threadpool.cc thread_pool/src/threadtask.cc \
-    server/reactor_server.cc test/test_framework.cc \
-    test/test_race_condition.cc -lpthread -o run_race_test
+## Test Infrastructure
 
-./run_race_test
-```
+| File | Purpose |
+|------|---------|
+| `run_test.cc` | Main entry point — suite selection, fd limit setup |
+| `test_framework.h/cc` | Test result tracking, categorized summary output |
+| `test_server_runner.h` | `TestServerRunner<T>` — RAII template that starts any server in a background thread, blocks until the ready callback fires, and stops + joins on destruction |
+| `http_test_client.h` | `TestHttpClient` namespace — shared helpers: `ConnectRawSocket`, `SendHttpRequest`, `HttpGet`, `HttpPost`, `HasStatus`, `ExtractBody`, `WaitForServerClose`, `SetupEchoRoutes`, `MakeTestConfig` |
 
----
+## Suite Details
 
-## Test Results
+### Basic (6 tests)
 
-### Expected Output
+Validates fundamental reactor core functionality through HttpServer:
+- Single client connection and health check
+- Echo (POST body round-trip)
+- 5 sequential connections
+- 10 concurrent connections (all must succeed)
+- 512-byte large message transfer
+- Rapid connect/disconnect without sending data
 
-```
-======================================================================
-RACE CONDITION TESTS (EVENTFD_RACE_CONDITION_FIXES.md)
-======================================================================
+### Stress (1 test)
 
-[RC-TEST-1] Dispatcher Initialization (EventFD setup)...
-[RC-TEST-1] PASS: Dispatcher initialized without crash
+Spawns 1000 concurrent threads (200 in CI via `$CI` env var), each sending an HTTP GET. Validates no crashes and >95% success rate locally (>90% in CI). Tests reactor core scalability under extreme connection pressure.
 
-[RC-TEST-2] EnQueue Deadlock Prevention...
-[RC-TEST-2] PASS: No deadlock, 10 tasks completed
+### Race Condition (7 tests)
 
-[RC-TEST-3] Double Close Prevention...
-[RC-TEST-3] PASS: 49/50 clean closes
+Targets specific reactor core race conditions documented in `EVENTFD_RACE_CONDITION_FIXES.md`:
 
-[RC-TEST-4] Concurrent Event Handling (EPOLLRDHUP + EPOLLIN)...
-[RC-TEST-4] PASS: 30/30 handled concurrent events
+| Test | Validates |
+|------|-----------|
+| RC-1: Dispatcher Initialization | Two-phase init pattern — no `bad_weak_ptr` from `shared_from_this()` in constructor |
+| RC-2: EnQueue No Deadlock | Concurrent task enqueue under load — no mutex deadlock |
+| RC-3: Double Close Prevention | 50 rapid connect/disconnect — atomic close guards prevent double-close |
+| RC-4: Concurrent Event Handling | Send + immediate close — EPOLLRDHUP + EPOLLIN handled correctly |
+| RC-5: channel_map_ Race | 20 threads x 10 connections — no segfault from concurrent map access |
+| RC-6: TOCTOU Race epoll_ctl | Send + immediate close — no "Bad file descriptor" from stale epoll state |
+| RC-7: Atomic Closed Flag | 25 sequential rapid cycles — atomic compare-exchange prevents duplicate ops |
 
-[RC-TEST-5] channel_map_ Multi-Threaded Race Condition...
-[RC-TEST-5] PASS: No crash with 200 connections (85% success rate)
-              Messages sent/received: 67
+### Timeout (3 tests)
 
-[RC-TEST-6] TOCTOU Race in epoll_ctl...
-[RC-TEST-6] PASS: 40/40 completed without epoll_ctl errors
+Validates idle connection timeout through HttpServer with `ServerConfig`:
+- Custom timer parameters (10s idle timeout)
+- Default timer parameters (300s idle, 30s request)
+- Active connections unaffected by timer (10 sequential requests with 1s delays)
 
-[RC-TEST-7] Atomic Closed Flag...
-[RC-TEST-7] PASS: 25/25 handled with atomic protection
+### Config (8 tests)
 
-============================================================
-TEST RESULTS SUMMARY
-============================================================
-[PASS] RC-1: Dispatcher Initialization
-[PASS] RC-2: EnQueue No Deadlock
-[PASS] RC-3: Double Close Prevention
-[PASS] RC-4: Concurrent Event Handling
-[PASS] RC-5: channel_map_ Race Condition
-[PASS] RC-6: TOCTOU Race epoll_ctl
-[PASS] RC-7: Atomic Closed Flag
-------------------------------------------------------------
-Total: 7 | Passed: 7 | Failed: 0
-============================================================
-```
+Tests `ConfigLoader` and `ServerConfig`:
+- JSON parsing, default values, validation
+- Environment variable overrides (`REACTOR_HOST`, `REACTOR_PORT`, etc.)
+- Invalid config rejection, serialization round-trip
 
----
+### HTTP (14 tests)
 
-## Test Parameters
+Tests HTTP/1.1 layer:
+- **Parser**: GET, POST with body, WebSocket upgrade, invalid request, keep-alive, HTTP/1.0
+- **Router**: Exact match, 404, 405 Method Not Allowed, middleware chain
+- **Integration**: Full request/response cycle (health, echo, 404), request timeout (slow client gets 408 or connection close)
 
-| Test | Clients | Threads | Operation | Key Metric |
-|------|---------|---------|-----------|------------|
-| RC-1 | N/A | 1 | Init/Run/Stop | No crash |
-| RC-2 | 10 | 10 | Concurrent EnQueue | No deadlock |
-| RC-3 | 50 | 50 | Rapid close | No double-close |
-| RC-4 | 30 | 30 | Send + rapid close | Concurrent events |
-| RC-5 | 200 | 20 | Massive concurrency | **No segfault** |
-| RC-6 | 40 | 40 | Write + close race | TOCTOU handling |
-| RC-7 | 25 | Sequential | Atomic flags | No race |
+### WebSocket (10 tests)
 
----
+Tests RFC 6455 WebSocket implementation:
+- Handshake validation, accept key computation, missing header rejection
+- Frame serialization (text, close)
+- Parser: masked frames, 16-bit/64-bit length, binary frames
+- Close frame: code + reason extraction
+- Integration: HTTP upgrade to WebSocket
 
-## Success Criteria
+### TLS (2 tests)
 
-### Critical Tests (Must Pass 100%)
-- **RC-1**: Dispatcher Initialization - Must not crash
-- **RC-5**: channel_map_ Race - **Must not segfault** (this was the critical bug)
+- TLS context creation with certificate and key files
+- Full HTTPS request/response cycle over TLS
 
-### High Priority (Should Pass >90%)
-- RC-2: EnQueue Deadlock - No timeout/deadlock
-- RC-3: Double Close - >90% clean closes
-- RC-4: Concurrent Events - >90% handled
-- RC-6: TOCTOU Race - >90% no epoll errors
-- RC-7: Atomic Flags - >90% success
+### HTTP/2 (37 tests)
 
-### Note on Success Rates
+Tests RFC 9113 HTTP/2 implementation:
+- **Protocol detection**: ALPN (h2, http/1.1, empty), client preface, partial preface, MinDetectionBytes
+- **Stream**: Pseudo-headers, header lowercase, invalid header rejection, cookie concatenation, body accumulation, state lifecycle, request completeness
+- **H2C cleartext**: GET, POST with body, 404, middleware, multiple streams, large body, invalid preface, body-too-large rejection
+- **Config**: Default values, JSON parsing, validation, env overrides, disabled state, serialization, shutdown drain timeout
 
-Some tests may have <100% success rates under extreme load due to:
-- Connection refused (too many simultaneous connections)
-- Timing-dependent edge cases
-- OS resource limits
+### CLI (79 tests)
 
-**The key metric is NO CRASHES/SEGFAULTS**, not 100% connection success.
+Tests the CLI entry point (`cli_parser.h`, `signal_handler.h`, `pid_file.h`, `logger.h`):
+- **Argument parsing**: All commands (start, stop, status, reload, validate, config) with flags (-p, -c, -l, -w, -P, -d, --no-health-endpoint, --no-stats-endpoint)
+- **Validation**: Missing config file, port ranges, invalid flags per command
+- **Signal handling**: SIGTERM shutdown, SIGHUP reload, signal mask cleanup/restore
+- **PID file**: Creation, locking, stale detection, removal
+- **Logging**: Init, level setting, console enable/disable, file rotation, date-based naming, reopen, log markers, sanitize path
+- **Config reload**: Limit changes, restart-required fields ignored, missing/invalid file handling, log level changes
+- **Server endpoints**: /stats JSON shape, uptime, config section, connection/request counters under concurrent load
 
----
+### Route (44 tests)
 
-## Integration with Main Test Suite
+Tests `RouteTrie` (compressed radix trie) and `HttpRouter` pattern matching:
+- **RouteTrie**: Exact static match, parameter extraction (`:id`), multiple parameters, regex constraints (`:id(\d+)`), catch-all wildcards (`*filepath`), priority (static > param > catch-all), conflict detection (duplicate routes, conflicting constraints), edge cases (empty param, catch-all not last, invalid regex, percent-encoded paths, slash boundaries)
+- **HttpRouter**: Pattern dispatch, 405 + Allow header, HEAD fallback to GET, middleware on pattern routes, params cleared between dispatches, WebSocket pattern routes
 
-The race condition tests are integrated into [test/run_test.cc](run_test.cc) and run automatically after the stress tests:
+### Kqueue (7 tests, macOS only)
 
-```cpp
-// Run basic functional tests
-BasicTests::RunAllTests();
+Tests macOS kqueue-specific behaviors (skipped on Linux):
+- EVFILT_TIMER drives idle timeout correctly (3s timeout, verified timing window)
+- EV_EOF detected on EVFILT_WRITE when peer closes
+- Pipe wakeup under concurrent load (10 threads x 100 tasks)
+- Filter consolidation: read + write events on same fd, read-before-write ordering
+- Churn stability: 100 rapid connect/disconnect, server remains healthy
+- Timer re-arm: second client timeout after first (timer doesn't stop after first fire)
+- SO_NOSIGPIPE set on accepted sockets (verified via forked child write to dead peer)
 
-// Run stress tests
-StressTests::RunStressTests();
+## CI
 
-// Run race condition tests (validates EVENTFD_RACE_CONDITION_FIXES.md)
-RaceConditionTests::RunRaceConditionTests();
-
-// Print test summary
-TestFramework::PrintResults();
-```
-
----
+Tests run on both Linux (`ubuntu-latest`) and macOS (`macos-14`) via GitHub Actions. The stress test adapts to CI environments automatically (`$CI` env var reduces client count from 1000 to 200). Kqueue tests only run on macOS.
 
 ## Debugging Failed Tests
 
-If a race condition test fails:
-
-1. **Check for segfaults**: Look for "Segmentation fault" or core dumps
-2. **Check error messages**: "Bad file descriptor", "epoll_ctl failed", etc.
-3. **Review related code**: See the "Related Issues" section for each test
-4. **Run under valgrind**: Check for memory corruption
-5. **Run with GDB**: Capture stack traces on crash
-
 ```bash
-# Run with valgrind
-valgrind --leak-check=full ./run_race_only
+# Run a specific suite with full output
+./test_runner race
 
-# Run with GDB
-gdb ./run_race_only
-(gdb) run
-# If crash occurs:
-(gdb) bt
-(gdb) frame 2
-(gdb) info locals
+# Run under address sanitizer (rebuild required)
+# Add -fsanitize=address to CXXFLAGS in Makefile
+
+# Run under valgrind (Linux)
+valgrind --leak-check=full ./test_runner race
+
+# Run under GDB
+gdb ./test_runner
+(gdb) run race
+(gdb) bt          # on crash
 ```
 
----
-
-## Test Maintenance
-
-These tests should be run:
-- **Before each release** - Verify no regression
-- **After any concurrency changes** - Especially in Dispatcher, EpollHandler, Channel
-- **After modifying smart pointers** - Memory management changes can introduce races
-- **When adding new features** - Ensure new code doesn't break existing race fixes
-
----
-
-## References
-
-- **Bug Documentation**: [EVENTFD_RACE_CONDITION_FIXES.md](../EVENTFD_RACE_CONDITION_FIXES.md)
-- **Architecture**: [CLAUDE.md](../CLAUDE.md)
-- **Test Framework**: [test_framework.h](test_framework.h)
-- **Basic Tests**: [basic_test.h](basic_test.h)
-- **Stress Tests**: [stress_test.h](stress_test.h)
-
----
-
-## Version History
-
-- **2025-10-27**: Initial creation - All 7 race condition tests passing
-  - Validates all issues from EVENTFD_RACE_CONDITION_FIXES.md
-  - Focus on Issue 4 (CRITICAL segfault) prevention
-  - 100% test pass rate on initial run
+For race condition and stress test failures, the key metric is **no crashes/segfaults** — success rates below 100% are expected under extreme load due to OS resource limits.

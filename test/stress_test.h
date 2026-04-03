@@ -1,44 +1,41 @@
 #pragma once
 #include "test_server_runner.h"
-#include "reactor_server.h"
-#include "client.h"
+#include "http_test_client.h"
 #include "test_framework.h"
-#include "string.h"
+#include <cstdlib>
 
 // Stress test namespace
 namespace StressTests {
-    const char* TEST_IP = "127.0.0.1";
 
     void TestHighLoadConnections() {
-        const int NUM_CLIENTS = 1000;
-        std::cout << "\n[STRESS TEST] High Load (1000 concurrent clients)..." << std::endl;
+        // CI runners have limited resources (3 vCPU, 7GB RAM on macos-14).
+        // Use reduced client count and threshold in CI to avoid false failures
+        // while still validating concurrent load handling.
+        const bool is_ci = (std::getenv("CI") != nullptr);
+        const int NUM_CLIENTS = is_ci ? 200 : 1000;
+        const double THRESHOLD = is_ci ? 0.90 : 0.95;
+
+        std::cout << "\n[STRESS TEST] High Load (" << NUM_CLIENTS
+                  << " concurrent clients" << (is_ci ? ", CI mode" : "") << ")..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, 0);
-            TestServerRunner<ReactorServer> runner(server);
+            HttpServer server("127.0.0.1", 0);
+            TestHttpClient::SetupEchoRoutes(server);
+            TestServerRunner<HttpServer> runner(server);
             const int port = runner.GetPort();
 
             std::vector<std::thread> client_threads;
+            std::atomic<int> success_count{0};
 
             for (int i = 0; i < NUM_CLIENTS; i++) {
-                client_threads.emplace_back([i, port]() {
+                client_threads.emplace_back([port, &success_count]() {
                     try {
-                        std::stringstream ss;
-                        ss << "StressClient" << i;
-
-                        Client client(port, TEST_IP, ss.str().c_str());
-                        client.SetQuietMode(true);
-                        client.Init();
-                        // Set 10-second timeout to prevent indefinite hangs
-                        client.SetReceiveTimeout(10, 0);
-                        client.Connect();
-                        client.Send();
-                        // Wait longer for server to process under high load
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                        client.Receive();
-                        client.Close();
-                    } catch (const std::exception& e) {
-                        // Silent - some failures expected under high load
+                        std::string response = TestHttpClient::HttpGet(port, "/health", 10000);
+                        if (TestHttpClient::HasStatus(response, 200)) {
+                            success_count++;
+                        }
+                    } catch (const std::exception&) {
+                        // Some failures expected under high load
                     }
                 });
             }
@@ -47,11 +44,19 @@ namespace StressTests {
                 t.join();
             }
 
-            std::cout << "[STRESS TEST] Completed " << NUM_CLIENTS << " concurrent connections" << std::endl;
+            double success_rate = static_cast<double>(success_count) / NUM_CLIENTS;
+            std::cout << "[STRESS TEST] Completed " << NUM_CLIENTS << " concurrent connections, "
+                      << success_count << " succeeded (" << (success_rate * 100) << "%)" << std::endl;
 
-            TestFramework::RecordTest("High Load Connections (1000 clients)", true, "", TestFramework::TestCategory::STRESS);
+            bool pass = (success_rate > THRESHOLD);
+            std::string error_msg = pass ? "" :
+                "Only " + std::to_string(success_count.load()) + "/" + std::to_string(NUM_CLIENTS) +
+                " requests succeeded (" + std::to_string(static_cast<int>(success_rate * 100)) + "%)";
+            TestFramework::RecordTest("High Load Connections (" + std::to_string(NUM_CLIENTS) + " clients)",
+                pass, error_msg, TestFramework::TestCategory::STRESS);
         } catch (const std::exception& e) {
-            TestFramework::RecordTest("High Load Connections (1000 clients)", false, e.what(), TestFramework::TestCategory::STRESS);
+            TestFramework::RecordTest("High Load Connections (" + std::to_string(NUM_CLIENTS) + " clients)",
+                false, e.what(), TestFramework::TestCategory::STRESS);
         }
     }
 
