@@ -111,15 +111,15 @@ bool UpstreamManager::AllDrained() const {
 
 void UpstreamManager::ForceCloseRemaining() {
     logging::Get()->warn("Force-closing remaining upstream connections");
-    // Each pool's partitions need to be shut down on their dispatcher thread.
-    // InitiateShutdown() already enqueued — remaining are active connections
-    // that haven't been returned yet. Force their transport close.
+    // InitiateShutdown() was already called for all partitions. Active connections
+    // that weren't returned before the drain timeout are still alive. Force-close
+    // them by enqueuing ForceCloseActive() on each partition's dispatcher thread.
     for (auto& [name, pool] : pools_) {
         for (size_t i = 0; i < pool->partition_count(); ++i) {
             auto* partition = pool->GetPartition(i);
-            if (partition && !partition->IsShuttingDown()) {
+            if (partition) {
                 dispatchers_[i]->EnQueue([partition]() {
-                    partition->InitiateShutdown();
+                    partition->ForceCloseActive();
                 });
             }
         }

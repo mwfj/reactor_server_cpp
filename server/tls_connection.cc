@@ -39,7 +39,11 @@ TlsConnection::TlsConnection(TlsClientContext& ctx, int fd, const std::string& s
             ssl_ = nullptr;
             throw std::runtime_error("Failed to set SNI hostname: " + sni_hostname);
         }
-        logging::Get()->debug("TlsConnection client: SNI set to {}", sni_hostname);
+        // Enable hostname verification — SSL_VERIFY_PEER (set on the CTX) validates
+        // chain trust, but SSL_set1_host() is required to verify the certificate's
+        // CN/SAN matches the expected hostname, preventing MITM attacks.
+        SSL_set1_host(ssl_, sni_hostname.c_str());
+        logging::Get()->debug("TlsConnection client: SNI + hostname verification set to {}", sni_hostname);
     }
 
     // Allow retrying SSL_write with a different buffer address (same as server mode)

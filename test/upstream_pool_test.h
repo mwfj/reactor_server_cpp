@@ -702,9 +702,10 @@ void TestUpstreamLeaseMoveSematics() {
 
         auto sock = std::make_unique<SocketHandler>(sv[0]);
         auto conn_handler = std::make_shared<ConnectionHandler>(nullptr, std::move(sock));
-        // Allocate UpstreamConnection on the heap. With partition_=nullptr the
-        // lease destructor is a no-op, so we own and must delete it manually.
-        UpstreamConnection* raw_conn = new UpstreamConnection(conn_handler, "127.0.0.1", 9999);
+        // Use unique_ptr to manage UpstreamConnection lifetime. With partition_=nullptr
+        // the lease destructor is a no-op, so we retain ownership here.
+        auto uc_owner = std::make_unique<UpstreamConnection>(conn_handler, "127.0.0.1", 9999);
+        UpstreamConnection* raw_conn = uc_owner.get();
 
         UpstreamLease src(raw_conn, nullptr);
 
@@ -728,10 +729,9 @@ void TestUpstreamLeaseMoveSematics() {
             pass = false; err += "dst should hold conn after move; ";
         }
 
-        // Release so the destructor (with null partition) is a no-op, then
-        // manually free the raw UpstreamConnection.
+        // Release so the destructor (with null partition) is a no-op.
+        // uc_owner handles cleanup when it goes out of scope.
         dst.Release();
-        delete raw_conn;
 
         TestFramework::RecordTest("UpstreamPool UpstreamLease: move semantics", pass, err);
     } catch (const std::exception& e) {
@@ -750,7 +750,8 @@ void TestUpstreamLeaseExplicitRelease() {
 
         auto sock = std::make_unique<SocketHandler>(sv[0]);
         auto conn_handler = std::make_shared<ConnectionHandler>(nullptr, std::move(sock));
-        UpstreamConnection* raw_conn = new UpstreamConnection(conn_handler, "127.0.0.1", 9999);
+        auto uc_owner = std::make_unique<UpstreamConnection>(conn_handler, "127.0.0.1", 9999);
+        UpstreamConnection* raw_conn = uc_owner.get();
 
         UpstreamLease lease(raw_conn, nullptr);
         bool pass = true;
@@ -763,9 +764,7 @@ void TestUpstreamLeaseExplicitRelease() {
         if (static_cast<bool>(lease) || lease.Get() != nullptr) {
             pass = false; err += "after Release(), lease should be empty; ";
         }
-
-        // Safe to delete now — lease no longer holds the raw ptr.
-        delete raw_conn;
+        // uc_owner handles cleanup when it goes out of scope.
 
         TestFramework::RecordTest("UpstreamPool UpstreamLease: explicit Release()", pass, err);
     } catch (const std::exception& e) {
@@ -784,7 +783,8 @@ void TestUpstreamLeaseMoveAssignment() {
 
         auto sock = std::make_unique<SocketHandler>(sv[0]);
         auto conn_handler = std::make_shared<ConnectionHandler>(nullptr, std::move(sock));
-        UpstreamConnection* raw_conn = new UpstreamConnection(conn_handler, "127.0.0.1", 9999);
+        auto uc_owner = std::make_unique<UpstreamConnection>(conn_handler, "127.0.0.1", 9999);
+        UpstreamConnection* raw_conn = uc_owner.get();
 
         UpstreamLease src(raw_conn, nullptr);
         UpstreamLease dst;
@@ -803,8 +803,9 @@ void TestUpstreamLeaseMoveAssignment() {
         if (dst.Get() != nullptr) { pass = false; err += "dst not cleared; "; }
         if (src.Get() != raw_conn) { pass = false; err += "src did not receive back; "; }
 
+        // Release so lease destructor (with null partition) is a no-op.
+        // uc_owner handles cleanup when it goes out of scope.
         src.Release();
-        delete raw_conn;
 
         TestFramework::RecordTest("UpstreamPool UpstreamLease: move-assignment", pass, err);
     } catch (const std::exception& e) {

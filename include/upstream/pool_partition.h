@@ -48,6 +48,9 @@ public:
     // Shutdown: close idle, reject new checkouts, force-close connecting.
     void InitiateShutdown();
 
+    // Force-close all active connections. Called after drain timeout.
+    void ForceCloseActive();
+
     bool IsShuttingDown() const { return shutting_down_; }
 
     // Stats (dispatcher-thread-only reads)
@@ -98,7 +101,6 @@ private:
     void OnConnectionClosed(UpstreamConnection* conn);
     bool ValidateConnection(UpstreamConnection* conn);
     void ServiceWaitQueue();
-    UpstreamLease ActivateConnection(std::unique_ptr<UpstreamConnection> conn);
     void DestroyConnection(std::unique_ptr<UpstreamConnection> conn);
 
     // Find and extract a unique_ptr from a container by raw pointer

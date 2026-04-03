@@ -244,8 +244,14 @@ void ConnectionHandler::OnMessage(){
     // Also fire on TLS handshake completion without data ONLY when ALPN negotiated h2,
     // so the upper layer can send the server SETTINGS preface immediately.
     // For HTTP/1.x, skip the empty callback to avoid arming request timeout prematurely.
-    bool alpn_h2_ready = tls_just_ready && input_bf_.Size() == 0 &&
-                         tls_ && GetAlpnProtocol() == "h2";
+    // Fire on TLS handshake completion for h2 (to send SETTINGS preface) and
+    // for outbound connections (connect_state_ == CONNECTED) regardless of ALPN
+    // so the upstream pool's checkout completes for HTTP/1.1 upstreams too.
+    // Inbound connections always have connect_state_ == NONE, so this doesn't
+    // affect the server-side path.
+    bool alpn_h2_ready = tls_just_ready && input_bf_.Size() == 0 && tls_ &&
+                         (GetAlpnProtocol() == "h2" ||
+                          connect_state_ == ConnectState::CONNECTED);
     bool callback_ran = false;
     if((input_bf_.Size() > 0 || alpn_h2_ready) && callbacks_.on_message_callback){
         std::string message(input_bf_.Data(), input_bf_.Size());

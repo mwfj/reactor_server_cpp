@@ -136,12 +136,13 @@ FOUNDATION_HEADERS = $(LIB_DIR)/log/logger.h $(LIB_DIR)/log/log_utils.h $(LIB_DI
 HTTP_HEADERS = $(LIB_DIR)/http/http_callbacks.h $(LIB_DIR)/http/http_connection_handler.h $(LIB_DIR)/http/http_parser.h $(LIB_DIR)/http/http_request.h $(LIB_DIR)/http/http_response.h $(LIB_DIR)/http/http_router.h $(LIB_DIR)/http/http_server.h $(LIB_DIR)/http/route_trie.h $(LIB_DIR)/http/route_trie_impl.h
 HTTP2_HEADERS = $(LIB_DIR)/http2/http2_callbacks.h $(LIB_DIR)/http2/http2_connection_handler.h $(LIB_DIR)/http2/http2_constants.h $(LIB_DIR)/http2/http2_session.h $(LIB_DIR)/http2/http2_stream.h $(LIB_DIR)/http2/protocol_detector.h
 WS_HEADERS = $(LIB_DIR)/ws/websocket_connection.h $(LIB_DIR)/ws/websocket_frame.h $(LIB_DIR)/ws/websocket_handshake.h $(LIB_DIR)/ws/websocket_parser.h $(LIB_DIR)/ws/utf8_validate.h
-TLS_HEADERS = $(LIB_DIR)/tls/tls_context.h $(LIB_DIR)/tls/tls_connection.h
+TLS_HEADERS = $(LIB_DIR)/tls/tls_context.h $(LIB_DIR)/tls/tls_connection.h $(LIB_DIR)/tls/tls_client_context.h
+UPSTREAM_HEADERS = $(LIB_DIR)/upstream/upstream_manager.h $(LIB_DIR)/upstream/upstream_host_pool.h $(LIB_DIR)/upstream/pool_partition.h $(LIB_DIR)/upstream/upstream_connection.h $(LIB_DIR)/upstream/upstream_lease.h
 CLI_HEADERS = $(LIB_DIR)/cli/cli_parser.h $(LIB_DIR)/cli/signal_handler.h $(LIB_DIR)/cli/pid_file.h $(LIB_DIR)/cli/version.h $(LIB_DIR)/cli/daemonizer.h
 TEST_HEADERS = $(TEST_DIR)/test_framework.h $(TEST_DIR)/http_test_client.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h $(TEST_DIR)/route_test.h $(TEST_DIR)/upstream_pool_test.h
 
 # All headers combined
-HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(FOUNDATION_HEADERS) $(HTTP_HEADERS) $(HTTP2_HEADERS) $(WS_HEADERS) $(TLS_HEADERS) $(CLI_HEADERS) $(TEST_HEADERS)
+HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(FOUNDATION_HEADERS) $(HTTP_HEADERS) $(HTTP2_HEADERS) $(WS_HEADERS) $(TLS_HEADERS) $(UPSTREAM_HEADERS) $(CLI_HEADERS) $(TEST_HEADERS)
 
 # Default target
 .DEFAULT_GOAL := all

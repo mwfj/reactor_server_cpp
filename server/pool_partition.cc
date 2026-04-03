@@ -5,6 +5,7 @@
 #include "tls/tls_client_context.h"
 #include "tls/tls_connection.h"
 #include "log/logger.h"
+#include "log/log_utils.h"
 
 // ── UpstreamLease out-of-line definitions ──────────────────────────────
 // These live here because the destructor/Release need the complete
@@ -119,8 +120,8 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     auto owned = ExtractFromActive(conn);
     if (!owned) {
         // Not in active — might be a double-return or already cleaned up
-        logging::Get()->warn("ReturnConnection: connection fd={} not found "
-                             "in active set", conn->fd());
+        logging::Get()->warn("ReturnConnection: connection not found in active set "
+                             "(already closed or double-return)");
         return;
     }
 
@@ -130,8 +131,8 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
         return;
     }
 
-    owned->MarkIdle();
     owned->IncrementRequestCount();
+    owned->MarkIdle();
 
     // Check if expired
     if (owned->IsExpired(config_.max_lifetime_sec, config_.max_requests_per_conn)) {
@@ -219,11 +220,12 @@ void PoolPartition::InitiateShutdown() {
         DestroyConnection(std::move(conn));
     }
 
-    // Force-close all connecting
-    while (!connecting_conns_.empty()) {
-        auto conn = std::move(connecting_conns_.front());
-        connecting_conns_.erase(connecting_conns_.begin());
-        DestroyConnection(std::move(conn));
+    // Force-close all connecting — move to local first to avoid O(N²) erase-from-front
+    {
+        auto conns_to_destroy = std::move(connecting_conns_);
+        for (auto& conn : conns_to_destroy) {
+            DestroyConnection(std::move(conn));
+        }
     }
 
     // Reject all waiters
@@ -235,6 +237,15 @@ void PoolPartition::InitiateShutdown() {
 
     // Active connections will be destroyed when returned via ReturnConnection
     MaybeSignalDrain();
+}
+
+void PoolPartition::ForceCloseActive() {
+    // Move active connections to a local vector to iterate safely while
+    // destroying — DestroyConnection modifies active_conns_ indirectly.
+    auto active = std::move(active_conns_);
+    for (auto& conn : active) {
+        DestroyConnection(std::move(conn));
+    }
 }
 
 void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
@@ -270,7 +281,7 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
         int saved_errno = errno;
         logging::Get()->warn("connect() failed for {}:{}: {} (errno={})",
                              upstream_host_, upstream_port_,
-                             strerror(saved_errno), saved_errno);
+                             logging::SafeStrerror(saved_errno), saved_errno);
         ::close(fd);
         error_cb(CHECKOUT_CONNECT_FAILED);
         return;
@@ -294,6 +305,12 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
         conn_handler, upstream_host_, upstream_port_);
     UpstreamConnection* raw_conn = upstream_conn.get();
 
+    // Safety invariant for `this` captures: PoolPartition destruction only happens
+    // after dispatchers stop (HttpServer::Stop → UpstreamManager destroyed after
+    // NetServer::Stop). ClearTransportCallbacks in ~PoolPartition and DestroyConnection
+    // nulls all callbacks before the partition is freed. Single-threaded dispatcher
+    // execution means callbacks can't race with destruction.
+
     // Shared callbacks — connect is async, so callbacks outlive this scope
     auto ready_cb_copy = std::make_shared<ReadyCallback>(std::move(ready_cb));
     auto error_cb_copy = std::make_shared<ErrorCallback>(std::move(error_cb));
@@ -316,6 +333,7 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
                                           upstream_host_, upstream_port_,
                                           e.what());
                     (*error_cb_copy)(CHECKOUT_CONNECT_FAILED);
+                    OnConnectionClosed(raw_conn);  // clean up the leaked pool slot
                     return;
                 }
                 // Don't deliver ready — TLS handshake still in progress.
@@ -401,6 +419,10 @@ void PoolPartition::OnConnectComplete(UpstreamConnection* conn,
 }
 
 void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
+    // Safe from double-decrement with DestroyConnection because both paths
+    // run on the dispatcher thread (single-threaded). OnConnectionClosed
+    // extracts from containers; DestroyConnection clears callbacks before
+    // ForceClose, so the close callback can't re-fire.
     // Try to find and remove from any container
     auto owned = ExtractFromConnecting(conn);
     if (!owned) owned = ExtractFromActive(conn);
@@ -441,14 +463,6 @@ void PoolPartition::ServiceWaitQueue() {
         wait_queue_.pop_front();
         entry.ready_callback(UpstreamLease(raw, this));
     }
-}
-
-UpstreamLease PoolPartition::ActivateConnection(
-    std::unique_ptr<UpstreamConnection> conn) {
-    conn->MarkInUse();
-    UpstreamConnection* raw = conn.get();
-    active_conns_.push_back(std::move(conn));
-    return UpstreamLease(raw, this);
 }
 
 void PoolPartition::DestroyConnection(
