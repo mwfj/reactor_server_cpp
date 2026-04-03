@@ -162,8 +162,8 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     // max_idle_connections=0 starves queued checkouts even though capacity
     // just freed.
     if (idle_conns_.size() >= static_cast<size_t>(config_.max_idle_connections)) {
-        if (!wait_queue_.empty()) {
-            // Hand directly to the next waiter
+        if (!wait_queue_.empty() && ValidateConnection(owned.get())) {
+            // Hand directly to the next waiter (validated — not dead/expired)
             owned->MarkInUse();
             owned->GetTransport()->ClearDeadline();
             UpstreamConnection* raw = owned.get();
@@ -172,7 +172,16 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
             wait_queue_.pop_front();
             entry.ready_callback(UpstreamLease(raw, this));
         } else {
+            // No waiters, or connection is dead/expired — destroy it.
+            // If waiters exist but connection is invalid, create a replacement.
+            bool has_waiters = !wait_queue_.empty();
             DestroyConnection(std::move(owned));
+            if (has_waiters && TotalCount() < partition_max_connections_) {
+                auto entry = std::move(wait_queue_.front());
+                wait_queue_.pop_front();
+                CreateNewConnection(std::move(entry.ready_callback),
+                                    std::move(entry.error_callback));
+            }
         }
         return;
     }
