@@ -115,21 +115,23 @@ namespace TestHttpClient {
                     auto hdr_end = response.find("\r\n\r\n");
                     if (hdr_end != std::string::npos) {
                         size_t body_start = hdr_end + 4;
-                        size_t content_length = 0;
                         // Case-insensitive Content-Length search (RFC 9110: headers are case-insensitive)
                         std::string headers = response.substr(0, hdr_end);
                         for (auto& c : headers) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                         auto cl_pos = headers.find("content-length: ");
                         if (cl_pos != std::string::npos) {
+                            size_t content_length = 0;
                             try {
                                 content_length = std::stoul(headers.substr(cl_pos + 16));
                             } catch (const std::exception&) {
                                 // Malformed Content-Length — fall through to Connection: close EOF
+                                continue;
+                            }
+                            if (response.size() >= body_start + content_length) {
+                                break;  // Full response received
                             }
                         }
-                        if (response.size() >= body_start + content_length) {
-                            break;  // Full response received
-                        }
+                        // No Content-Length — continue reading until EOF or timeout
                     }
                 } else {
                     break;  // Connection closed or error
@@ -170,9 +172,9 @@ namespace TestHttpClient {
         return response.substr(pos + 4);
     }
 
-    // Check if the HTTP status line contains the given status code.
-    // HTTP/1.1 status line format: "HTTP/1.1 NNN Reason\r\n"
-    // Status code is at fixed offset 9, length 3.
+    // Check if the HTTP/1.x status line contains the given status code.
+    // Assumes HTTP/1.x format: "HTTP/1.x NNN Reason\r\n" — status code
+    // at fixed offset 9, length 3. Not applicable to HTTP/2 (binary framing).
     inline bool HasStatus(const std::string& response, int status_code) {
         auto line_end = response.find("\r\n");
         if (line_end == std::string::npos) return false;

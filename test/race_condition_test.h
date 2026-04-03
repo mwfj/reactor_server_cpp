@@ -205,7 +205,8 @@ namespace RaceConditionTests {
                         int sockfd = TestHttpClient::ConnectRawSocket(port);
                         if (sockfd >= 0) {
                             // Send partial HTTP data and close rapidly to trigger
-                            // concurrent EPOLLIN + EPOLLRDHUP
+                            // concurrent EPOLLIN + EPOLLRDHUP.
+                            // Return value intentionally unchecked — testing server-side error paths.
                             const char* partial = "GET /health HTTP/1.1\r\n";
                             int flags = 0;
 #ifdef MSG_NOSIGNAL
@@ -277,7 +278,8 @@ namespace RaceConditionTests {
                                 if (sockfd < 0) continue;
                                 connections_made++;
 
-                                // Some send HTTP requests, some close immediately
+                                // Some send HTTP requests, some close immediately.
+                                // send() return value intentionally unchecked — testing server-side race handling.
                                 if (i % 3 == 0) {
                                     std::string req = "GET /health HTTP/1.1\r\n"
                                                       "Host: localhost\r\n"
@@ -365,7 +367,8 @@ namespace RaceConditionTests {
                     try {
                         int sockfd = TestHttpClient::ConnectRawSocket(port);
                         if (sockfd >= 0) {
-                            // Trigger write mode by sending partial data
+                            // Trigger write mode by sending partial data.
+                            // Return value intentionally unchecked — testing server-side TOCTOU handling.
                             const char* partial = "GET /health HTTP/1.1\r\n";
                             int flags = 0;
 #ifdef MSG_NOSIGNAL
@@ -427,7 +430,8 @@ namespace RaceConditionTests {
                 try {
                     int sockfd = TestHttpClient::ConnectRawSocket(port);
                     if (sockfd >= 0) {
-                        // Rapid send and close
+                        // Rapid send and close.
+                        // Return value intentionally unchecked — testing server-side atomic flag handling.
                         const char* req = "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
                         int flags = 0;
 #ifdef MSG_NOSIGNAL

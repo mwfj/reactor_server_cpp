@@ -300,17 +300,10 @@ void TestChurnStability() {
         // Rapidly connect and disconnect 100 clients
         int connect_count = 0;
         for (int i = 0; i < 100; ++i) {
-            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            int sock = TestHttpClient::ConnectRawSocket(port);
             if (sock < 0) continue;
-            struct sockaddr_in addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(port);
-            inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-            if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-                ++connect_count;
-                ::write(sock, "X", 1);
-            }
+            ++connect_count;
+            ::write(sock, "X", 1);
             ::close(sock);
         }
 
@@ -377,7 +370,10 @@ void TestTimerRearm() {
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
         int fd_b = TestHttpClient::ConnectRawSocket(port);
-        if (fd_b < 0) throw std::runtime_error("connect B failed");
+        if (fd_b < 0) {
+            close(fd_a);
+            throw std::runtime_error("connect B failed");
+        }
         {
             std::string req = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
             int flags = 0;
@@ -385,6 +381,7 @@ void TestTimerRearm() {
             flags |= MSG_NOSIGNAL;
 #endif
             if (send(fd_b, req.data(), req.size(), flags) < 0) {
+                close(fd_a);
                 close(fd_b);
                 throw std::runtime_error("send B failed");
             }
