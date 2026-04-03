@@ -157,9 +157,23 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
         return;
     }
 
-    // Check if over idle cap
+    // Check if over idle cap. If waiters are queued, hand the connection
+    // directly to the next waiter instead of destroying it — otherwise
+    // max_idle_connections=0 starves queued checkouts even though capacity
+    // just freed.
     if (idle_conns_.size() >= static_cast<size_t>(config_.max_idle_connections)) {
-        DestroyConnection(std::move(owned));
+        if (!wait_queue_.empty()) {
+            // Hand directly to the next waiter
+            owned->MarkInUse();
+            owned->GetTransport()->ClearDeadline();
+            UpstreamConnection* raw = owned.get();
+            active_conns_.push_back(std::move(owned));
+            auto entry = std::move(wait_queue_.front());
+            wait_queue_.pop_front();
+            entry.ready_callback(UpstreamLease(raw, this));
+        } else {
+            DestroyConnection(std::move(owned));
+        }
         return;
     }
 
@@ -460,8 +474,16 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
         // Without this, a pending deadline or error event would fire callbacks
         // that capture the now-freed raw_conn pointer (use-after-free).
         ClearTransportCallbacks(owned.get());
-        if (owned->GetTransport()) {
-            owned->GetTransport()->ClearDeadline();
+        auto transport = owned->GetTransport();
+        if (transport) {
+            transport->ClearDeadline();
+            // Remove from dispatcher timer map to prevent memory leak.
+            // Without this, the shared_ptr in connections_ keeps the
+            // ConnectionHandler alive indefinitely after close.
+            int conn_fd = owned->fd();
+            if (conn_fd >= 0) {
+                dispatcher_->RemoveTimerConnectionIfMatch(conn_fd, transport);
+            }
         }
         outstanding_conns_.fetch_sub(1, std::memory_order_release);
         MaybeSignalDrain();
