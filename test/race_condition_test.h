@@ -1,7 +1,6 @@
 #pragma once
 #include "test_server_runner.h"
-#include "reactor_server.h"
-#include "client.h"
+#include "http_test_client.h"
 #include "test_framework.h"
 #include <atomic>
 #include <chrono>
@@ -11,7 +10,6 @@
 // Race Condition Test Suite
 // Tests all issues documented in EVENTFD_RACE_CONDITION_FIXES.md
 namespace RaceConditionTests {
-    const char* TEST_IP = "127.0.0.1";
 
     //==========================================================================
     // Test 1: EventFD and Dispatcher Initialization (Issue 1)
@@ -62,8 +60,9 @@ namespace RaceConditionTests {
         std::cout << "\n[RC-TEST-2] EnQueue Deadlock Prevention..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, 0);
-            TestServerRunner<ReactorServer> runner(server);
+            HttpServer server("127.0.0.1", 0);
+            TestHttpClient::SetupEchoRoutes(server);
+            TestServerRunner<HttpServer> runner(server);
             const int port = runner.GetPort();
 
             // EnQueue multiple tasks that themselves call EnQueue
@@ -79,18 +78,12 @@ namespace RaceConditionTests {
                     std::this_thread::sleep_for(std::chrono::milliseconds(i * 20));
 
                     try {
-                        Client client(port, TEST_IP, "EnQueueTest");
-                        client.SetQuietMode(true);
-                        client.Init();
-                        // Set receive timeout to prevent indefinite blocking if server doesn't respond
-                        client.SetReceiveTimeout(5);  // 5 second timeout
-                        client.Connect();
-                        client.Send();
-                        client.Receive();
-                        client.Close();
-                        task_count++;
-                    } catch (const std::exception& e) {
-                        // Connection might fail under load, timeout, but shouldn't deadlock
+                        std::string response = TestHttpClient::HttpGet(port, "/health", 5000);
+                        if (!response.empty()) {
+                            task_count++;
+                        }
+                    } catch (const std::exception&) {
+                        // Connection might fail under load, but shouldn't deadlock
                     }
                 });
             }
@@ -141,8 +134,9 @@ namespace RaceConditionTests {
         std::cout << "\n[RC-TEST-3] Double Close Prevention..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, 0);
-            TestServerRunner<ReactorServer> runner(server);
+            HttpServer server("127.0.0.1", 0);
+            TestHttpClient::SetupEchoRoutes(server);
+            TestServerRunner<HttpServer> runner(server);
             const int port = runner.GetPort();
 
             std::atomic<int> successful_closes{0};
@@ -152,14 +146,13 @@ namespace RaceConditionTests {
             for (int i = 0; i < NUM_RAPID_CLIENTS; i++) {
                 threads.emplace_back([&successful_closes, port]() {
                     try {
-                        Client client(port, TEST_IP, "RapidClose");
-                        client.SetQuietMode(true);
-                        client.Init();
-                        client.Connect();
-                        // Close immediately without sending - triggers edge case
-                        client.Close();
-                        successful_closes++;
-                    } catch (const std::exception& e) {
+                        int sockfd = TestHttpClient::ConnectRawSocket(port);
+                        if (sockfd >= 0) {
+                            // Close immediately without sending - triggers edge case
+                            close(sockfd);
+                            successful_closes++;
+                        }
+                    } catch (const std::exception&) {
                         // Some failures expected under rapid load
                     }
                 });
@@ -197,8 +190,9 @@ namespace RaceConditionTests {
         std::cout << "\n[RC-TEST-4] Concurrent Event Handling (EPOLLRDHUP + EPOLLIN)..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, 0);
-            TestServerRunner<ReactorServer> runner(server);
+            HttpServer server("127.0.0.1", 0);
+            TestHttpClient::SetupEchoRoutes(server);
+            TestServerRunner<HttpServer> runner(server);
             const int port = runner.GetPort();
 
             std::atomic<int> successful_ops{0};
@@ -208,18 +202,21 @@ namespace RaceConditionTests {
             for (int i = 0; i < NUM_CLIENTS; i++) {
                 threads.emplace_back([&successful_ops, port]() {
                     try {
-                        Client client(port, TEST_IP, "ConcurrentEvent");
-                        client.SetQuietMode(true);
-                        client.Init();
-                        client.Connect();
-
-                        // Send data and close rapidly to trigger concurrent EPOLLIN + EPOLLRDHUP
-                        client.Send();
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                        client.Close();  // Close while server might still be processing read
-
-                        successful_ops++;
-                    } catch (const std::exception& e) {
+                        int sockfd = TestHttpClient::ConnectRawSocket(port);
+                        if (sockfd >= 0) {
+                            // Send partial HTTP data and close rapidly to trigger
+                            // concurrent EPOLLIN + EPOLLRDHUP
+                            const char* partial = "GET /health HTTP/1.1\r\n";
+                            int flags = 0;
+#ifdef MSG_NOSIGNAL
+                            flags |= MSG_NOSIGNAL;
+#endif
+                            send(sockfd, partial, strlen(partial), flags);
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            close(sockfd);
+                            successful_ops++;
+                        }
+                    } catch (const std::exception&) {
                         // Expected under rapid close
                     }
                 });
@@ -254,13 +251,14 @@ namespace RaceConditionTests {
         std::cout << "\n[RC-TEST-5] channel_map_ Multi-Threaded Race Condition..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, 0);
-            TestServerRunner<ReactorServer> runner(server);
+            HttpServer server("127.0.0.1", 0);
+            TestHttpClient::SetupEchoRoutes(server);
+            TestServerRunner<HttpServer> runner(server);
             const int port = runner.GetPort();
 
             // This test specifically targets the segfault from Issue 4
             // Multiple threads create/destroy connections rapidly while
-            // the event loop is processing events from epoll_wait
+            // the event loop is processing events from epoll_wait/kevent
 
             std::atomic<int> connections_made{0};
             std::atomic<int> messages_sent{0};
@@ -271,35 +269,38 @@ namespace RaceConditionTests {
 
             std::vector<std::thread> threads;
             for (int t = 0; t < NUM_WORKER_THREADS; t++) {
-                threads.emplace_back([&, t, port]() {
+                threads.emplace_back([&, port]() {
                     try {
                         for (int i = 0; i < CONNECTIONS_PER_THREAD; i++) {
                             try {
-                                std::stringstream ss;
-                                ss << "RaceTest-T" << t << "-C" << i;
-
-                                Client client(port, TEST_IP, ss.str().c_str());
-                                client.SetQuietMode(true);
-                                client.Init();
-                                client.SetReceiveTimeout(2, 0);  // 2 second timeout to prevent indefinite hang
-                                client.Connect();
+                                int sockfd = TestHttpClient::ConnectRawSocket(port);
+                                if (sockfd < 0) continue;
                                 connections_made++;
 
-                                // Some send, some close immediately
+                                // Some send HTTP requests, some close immediately
                                 if (i % 3 == 0) {
-                                    client.Send();
+                                    std::string req = "GET /health HTTP/1.1\r\n"
+                                                      "Host: localhost\r\n"
+                                                      "Connection: close\r\n\r\n";
+                                    int flags = 0;
+#ifdef MSG_NOSIGNAL
+                                    flags |= MSG_NOSIGNAL;
+#endif
+                                    send(sockfd, req.data(), req.size(), flags);
                                     messages_sent++;
-                                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                                    client.Receive();
+
+                                    TestHttpClient::SetReceiveTimeout(sockfd, 2);
+                                    char buf[4096];
+                                    recv(sockfd, buf, sizeof(buf), 0);
                                 }
 
-                                client.Close();
+                                close(sockfd);
 
                                 // Small random delay to create race conditions
                                 if (i % 5 == 0) {
                                     std::this_thread::sleep_for(std::chrono::microseconds(100));
                                 }
-                            } catch (const std::exception& e) {
+                            } catch (const std::exception&) {
                                 // Connection failures expected under extreme load
                             }
                         }
@@ -346,8 +347,9 @@ namespace RaceConditionTests {
         std::cout << "\n[RC-TEST-6] TOCTOU Race in epoll_ctl..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, 0);
-            TestServerRunner<ReactorServer> runner(server);
+            HttpServer server("127.0.0.1", 0);
+            TestHttpClient::SetupEchoRoutes(server);
+            TestServerRunner<HttpServer> runner(server);
             const int port = runner.GetPort();
 
             // Create connections that send data then close very rapidly
@@ -361,18 +363,20 @@ namespace RaceConditionTests {
             for (int i = 0; i < NUM_CLIENTS; i++) {
                 threads.emplace_back([&completed, port]() {
                     try {
-                        Client client(port, TEST_IP, "TOCTOUTest");
-                        client.SetQuietMode(true);
-                        client.Init();
-                        client.Connect();
-
-                        // Trigger write mode by sending
-                        client.Send();
-
-                        // Close immediately - creates TOCTOU window
-                        client.Close();
-                        completed++;
-                    } catch (const std::exception& e) {
+                        int sockfd = TestHttpClient::ConnectRawSocket(port);
+                        if (sockfd >= 0) {
+                            // Trigger write mode by sending partial data
+                            const char* partial = "GET /health HTTP/1.1\r\n";
+                            int flags = 0;
+#ifdef MSG_NOSIGNAL
+                            flags |= MSG_NOSIGNAL;
+#endif
+                            send(sockfd, partial, strlen(partial), flags);
+                            // Close immediately - creates TOCTOU window
+                            close(sockfd);
+                            completed++;
+                        }
+                    } catch (const std::exception&) {
                         // Expected
                     }
                 });
@@ -408,8 +412,9 @@ namespace RaceConditionTests {
         std::cout << "\n[RC-TEST-7] Atomic is_channel_closed_ Flag..." << std::endl;
 
         try {
-            ReactorServer server(TEST_IP, 0);
-            TestServerRunner<ReactorServer> runner(server);
+            HttpServer server("127.0.0.1", 0);
+            TestHttpClient::SetupEchoRoutes(server);
+            TestServerRunner<HttpServer> runner(server);
             const int port = runner.GetPort();
 
             // Multiple threads try to close same connection simultaneously
@@ -420,17 +425,19 @@ namespace RaceConditionTests {
 
             for (int i = 0; i < NUM_CLIENTS; i++) {
                 try {
-                    Client client(port, TEST_IP, "AtomicTest");
-                    client.SetQuietMode(true);
-                    client.Init();
-                    client.Connect();
-
-                    // Rapid send and close
-                    client.Send();
-                    client.Close();
-
-                    successful++;
-                } catch (const std::exception& e) {
+                    int sockfd = TestHttpClient::ConnectRawSocket(port);
+                    if (sockfd >= 0) {
+                        // Rapid send and close
+                        const char* req = "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+                        int flags = 0;
+#ifdef MSG_NOSIGNAL
+                        flags |= MSG_NOSIGNAL;
+#endif
+                        send(sockfd, req, strlen(req), flags);
+                        close(sockfd);
+                        successful++;
+                    }
+                } catch (const std::exception&) {
                     // Expected
                 }
 

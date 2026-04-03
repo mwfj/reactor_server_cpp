@@ -147,8 +147,8 @@ All test suites use ephemeral ports (port 0 + `getsockname()`) via the `TestServ
 ### Core Components
 
 - **`TestFramework`** (`test/test_framework.h`/`.cc`) -- Result tracking with automatic categorization
-- **`TestServerRunner<T>`** -- RAII template harness for server thread lifecycle. Works with both `ReactorServer` and `HttpServer`. Uses exception-safe constructor with promise/future synchronization to communicate the ephemeral port back to the test. Automatically stops the server and joins the thread on destruction.
-- **`Client`** (`test/client.h`) -- Test client helper with timeout support
+- **`TestServerRunner<T>`** -- RAII template harness for server thread lifecycle. Works with any server type exposing `SetReadyCallback`/`GetBoundPort`/`Start`/`Stop`. Uses exception-safe constructor with promise/future synchronization to communicate the ephemeral port back to the test. Automatically stops the server and joins the thread on destruction.
+- **`TestHttpClient`** (`test/http_test_client.h`) -- Shared HTTP test client helpers: raw socket connect, HTTP GET/POST, response parsing, server-close detection
 
 ### Test Categories
 

@@ -160,7 +160,7 @@ g++ -std=c++11 -g -Wall -Iinclude -Ithread_pool/include \
     server/socket_handler.cc server/acceptor.cc server/connection_handler.cc \
     server/net_server.cc server/buffer.cc \
     thread_pool/src/threadpool.cc thread_pool/src/threadtask.cc \
-    server/reactor_server.cc test/test_framework.cc \
+    test/test_framework.cc \
     test/test_race_condition.cc -lpthread -o run_race_test
 
 ./run_race_test
