@@ -98,6 +98,8 @@ namespace TestHttpClient {
 
         std::string response;
         char buf[4096];
+        bool have_cl = false;
+        size_t expected_total = 0;  // body_start + content_length
 
         auto start = std::chrono::steady_clock::now();
 
@@ -108,36 +110,46 @@ namespace TestHttpClient {
             if (remaining <= 0) break;
 
             int ret = poll(&pfd, 1, remaining);
-            if (ret > 0 && (pfd.revents & POLLIN)) {
-                ssize_t n = recv(sockfd, buf, sizeof(buf) - 1, 0);
-                if (n > 0) {
-                    response.append(buf, n);
+            if (ret < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (ret == 0) break;  // Timeout
+
+            if (!(pfd.revents & POLLIN)) break;
+
+            ssize_t n = recv(sockfd, buf, sizeof(buf) - 1, 0);
+            if (n > 0) {
+                response.append(buf, n);
+                // Parse headers once to extract Content-Length
+                if (!have_cl) {
                     auto hdr_end = response.find("\r\n\r\n");
                     if (hdr_end != std::string::npos) {
                         size_t body_start = hdr_end + 4;
-                        // Case-insensitive Content-Length search (RFC 9110: headers are case-insensitive)
+                        // Case-insensitive search (RFC 9110: headers are case-insensitive)
                         std::string headers = response.substr(0, hdr_end);
                         for (auto& c : headers) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                         auto cl_pos = headers.find("content-length: ");
                         if (cl_pos != std::string::npos) {
-                            size_t content_length = 0;
                             try {
-                                content_length = std::stoul(headers.substr(cl_pos + 16));
+                                size_t content_length = std::stoul(headers.substr(cl_pos + 16));
+                                expected_total = body_start + content_length;
+                                have_cl = true;
                             } catch (const std::exception&) {
-                                // Malformed Content-Length — fall through to Connection: close EOF
-                                continue;
-                            }
-                            if (response.size() >= body_start + content_length) {
-                                break;  // Full response received
+                                // Malformed Content-Length — read until EOF
                             }
                         }
                         // No Content-Length — continue reading until EOF or timeout
                     }
-                } else {
-                    break;  // Connection closed or error
                 }
+                if (have_cl && response.size() >= expected_total) {
+                    break;  // Full response received
+                }
+            } else if (n == 0) {
+                break;  // Connection closed (EOF)
             } else {
-                break;  // Timeout or error
+                if (errno == EINTR) continue;
+                break;  // Real error
             }
         }
         close(sockfd);
