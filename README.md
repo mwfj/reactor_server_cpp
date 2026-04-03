@@ -72,6 +72,7 @@ server_runner <command> [options]
 Commands:
   start       Start the server (foreground, or -d for daemon)
   stop        Stop a running server
+  reload      Reload configuration (daemon: hot-reload, foreground: shutdown)
   status      Check server status
   validate    Validate configuration
   config      Show effective configuration
@@ -104,7 +105,7 @@ Global options:
 |--------|----------|
 | `SIGTERM` | Graceful shutdown (sends WS Close 1001, H2 GOAWAY, drains connections, exits) |
 | `SIGINT` | Same as SIGTERM (Ctrl+C) |
-| `SIGHUP` | Daemon: reopen log files for rotation. Foreground: graceful shutdown |
+| `SIGHUP` | Daemon: config hot-reload + log reopen. Foreground: graceful shutdown |
 | `SIGPIPE` | Ignored |
 
 ### Config Override Precedence
@@ -256,7 +257,7 @@ reactor_server_cpp/
 ├── server/               # Implementation (.cc)
 │   ├── main.cc           #   Production entry point
 │   └── *.cc              #   All component implementations
-├── test/                 # Test suites (basic, stress, race, timeout, http, ws, tls, http2, cli)
+├── test/                 # Test suites (basic, stress, race, timeout, http, ws, tls, http2, cli, route, kqueue)
 ├── thread_pool/          # Standalone thread pool (separate build)
 ├── third_party/          # llhttp, nghttp2, nlohmann/json, spdlog
 ├── config/               # Example config files
@@ -269,21 +270,23 @@ reactor_server_cpp/
 ```bash
 make                    # Build both test runner (./test_runner) and server (./server_runner)
 make server             # Build only the production server
-make test               # Build and run all tests (167 tests)
+make test               # Build and run all tests (211 tests across 13 suites)
 make clean              # Remove artifacts
 make help               # Show all targets
 
 # Run specific test suites
 ./test_runner basic     # Basic functionality (6 tests)
 ./test_runner stress    # Stress tests — 100 concurrent clients (1 test)
-./test_runner race      # Race condition tests (9 tests)
-./test_runner timeout   # Connection timeout tests (3 tests)
+./test_runner race      # Race condition tests (14 tests)
+./test_runner timeout   # Connection timeout tests (6 tests)
 ./test_runner config    # Configuration tests (8 tests)
 ./test_runner http      # HTTP protocol tests (14 tests)
 ./test_runner ws        # WebSocket protocol tests (10 tests)
 ./test_runner tls       # TLS/SSL tests (2 tests)
-./test_runner http2     # HTTP/2 protocol tests (32 tests)
-./test_runner cli       # CLI entry point tests (82 tests)
+./test_runner http2     # HTTP/2 protocol tests (37 tests)
+./test_runner cli       # CLI entry point tests (79 tests)
+./test_runner route     # Route trie/pattern matching (44 tests)
+./test_runner kqueue    # macOS kqueue platform tests (7 tests, skipped on Linux)
 
 # Thread pool subproject (independent)
 cd thread_pool && make && ./run
@@ -310,5 +313,5 @@ cd thread_pool && make && ./run
 | Platform | Status |
 |----------|--------|
 | Linux (epoll) | Production-ready |
-| macOS (kqueue) | Implemented |
+| macOS (kqueue) | Production-ready |
 | Windows (IOCP) | Planned |
