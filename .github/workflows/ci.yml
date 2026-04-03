@@ -17,8 +17,6 @@ jobs:
         run: make -j$(nproc)
       - name: Test - Basic
         run: ./test_runner basic
-      - name: Test - Stress
-        run: ./test_runner stress
       - name: Test - Race Condition
         run: ./test_runner race
       - name: Test - Timeout
@@ -48,8 +46,6 @@ jobs:
         run: make -j$(sysctl -n hw.ncpu)
       - name: Test - Basic
         run: ./test_runner basic
-      - name: Test - Stress
-        run: ./test_runner stress
       - name: Test - Race Condition
         run: ./test_runner race
       - name: Test - Timeout

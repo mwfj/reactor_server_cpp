@@ -40,7 +40,7 @@ namespace StressTests {
             std::cout << "[STRESS TEST] Completed " << NUM_CLIENTS << " concurrent connections, "
                       << success_count << " succeeded (" << (success_rate * 100) << "%)" << std::endl;
 
-            bool pass = (success_rate > 0.9);
+            bool pass = (success_rate > 0.95);
             std::string error_msg = pass ? "" :
                 "Only " + std::to_string(success_count.load()) + "/" + std::to_string(NUM_CLIENTS) +
                 " requests succeeded (" + std::to_string(static_cast<int>(success_rate * 100)) + "%)";
