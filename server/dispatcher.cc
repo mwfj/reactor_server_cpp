@@ -172,7 +172,8 @@ void Dispatcher::RunEventLoop(){
             if(callbacks_.timeout_trigger_callback){
                 callbacks_.timeout_trigger_callback(shared_from_this());
             }
-            continue;
+            // Do NOT continue here — fall through to ConsumeTimerFired()
+            // so macOS EVFILT_TIMER events are processed even on timeout.
         }
 
         // Process all active channels
