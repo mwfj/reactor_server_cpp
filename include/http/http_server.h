@@ -78,6 +78,9 @@ public:
     // True after Start() finishes building dispatchers and ready callback fires.
     bool IsReady() const { return server_ready_.load(std::memory_order_acquire); }
 
+    // Returns the actual port the server is listening on.
+    int GetBoundPort() const;
+
 private:
     NetServer net_server_;
     HttpRouter router_;

@@ -35,6 +35,14 @@ void ReactorServer::Stop(){
     net_server_.Stop();
 }
 
+void ReactorServer::SetReadyCallback(std::function<void()> cb) {
+    net_server_.SetReadyCallback(std::move(cb));
+}
+
+int ReactorServer::GetBoundPort() const {
+    return net_server_.GetBoundPort();
+}
+
 void ReactorServer::NewConnection(std::shared_ptr<ConnectionHandler> conn){
     logging::Get()->debug("New Connection Comes In");
     // Can add some extra features related code below

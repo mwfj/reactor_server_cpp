@@ -64,9 +64,9 @@ private:
     std::set<ConnectionHandler*> draining_conns_;       // H2 connections exempt from force-close
     std::mutex draining_conns_mtx_;                     // Protects draining_conns_ for late additions
     std::function<void()> pre_stop_drain_cb_;           // H2 drain wait callback
-    // Set by Start() after socket_dispatchers_ is fully populated.
-    // Stop() checks this to avoid racing on the vector during startup.
-    std::atomic<bool> startup_done_{false};
+    std::atomic<bool> dispatchers_ready_{false};        // True after socket_dispatchers_ is fully built
+    std::atomic<bool> start_called_{false};             // True once Start() begins executing
+    std::atomic<bool> stop_requested_{false};           // True once Stop() begins — suppresses ready callback
 
 public:
     NetServer() = delete;
@@ -156,4 +156,9 @@ public:
     // Called after init completes but before the blocking event loop.
     // Used by daemon mode to signal readiness to the parent process.
     void SetReadyCallback(std::function<void()> cb) { ready_callback_ = std::move(cb); }
+
+    // Returns the actual port the server is listening on.
+    // Resolves ephemeral port 0. Available after the constructor completes
+    // (bind happens during construction). IPv4 only.
+    int GetBoundPort() const { return acceptor_ ? acceptor_->GetBoundPort() : 0; }
 };

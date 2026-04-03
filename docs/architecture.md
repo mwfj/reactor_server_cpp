@@ -105,7 +105,7 @@ Other Thread                         Dispatcher Thread
 | Platform | I/O Multiplexing | Wakeup Mechanism | Timer | Status |
 |----------|-----------------|------------------|-------|--------|
 | Linux | epoll (edge-triggered) | eventfd | timerfd | Production-ready |
-| macOS | kqueue | pipe | kqueue timer | Implemented |
+| macOS | kqueue (EV_CLEAR) | pipe | EVFILT_TIMER | Production-tested |
 | Windows | IOCP (planned) | — | — | Not started |
 
 ## Operational Endpoints

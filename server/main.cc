@@ -614,6 +614,10 @@ static int HandleStart(const CliOptions& options) {
     logging::Get()->info("{} version {} starting", REACTOR_SERVER_NAME,
                          REACTOR_SERVER_VERSION);
     logging::Get()->info("  Listen:  {}:{}", config.bind_host, config.bind_port);
+    if (config.bind_port == 0) {
+        logging::Get()->warn("bind_port=0: OS will assign ephemeral port "
+                             "(typically used for testing only)");
+    }
     logging::Get()->info("  TLS:     {}",
         config.tls.enabled
             ? "enabled (" + config.tls.min_version + "+)"
@@ -637,8 +641,14 @@ static int HandleStart(const CliOptions& options) {
     }
 
     // ── Wire readiness callback — fires after bind/listen, before event loop ──
-    server->SetReadyCallback([&options]() {
-        logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
+    server->SetReadyCallback([&options, &server]() {
+        int resolved_port = server->GetBoundPort();
+        if (resolved_port > 0) {
+            logging::Get()->info("{} ready on port {}, accepting connections",
+                                REACTOR_SERVER_NAME, resolved_port);
+        } else {
+            logging::Get()->info("{} ready, accepting connections", REACTOR_SERVER_NAME);
+        }
         logging::WriteMarker("SERVER START");
 #if !defined(_WIN32)
         if (options.daemonize) Daemonizer::NotifyReady();

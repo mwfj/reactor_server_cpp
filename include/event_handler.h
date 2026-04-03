@@ -24,6 +24,12 @@ public:
     EventHandler();
     ~EventHandler() = default;
     void UpdateEvent(std::shared_ptr<Channel>);
-    void RemoveChannel(std::shared_ptr<Channel>);  // Remove channel from epoll
+    void RemoveChannel(std::shared_ptr<Channel>);  // Remove channel from epoll/kqueue
     std::vector<std::shared_ptr<Channel>> WaitForEvent(int);
+
+    // Timer support — used by Dispatcher on macOS (EVFILT_TIMER).
+    // On Linux these are no-ops because the timer is a timerfd Channel.
+    void RegisterTimer(int interval_sec);
+    void ResetTimer(int interval_sec);
+    bool ConsumeTimerFired();
 };

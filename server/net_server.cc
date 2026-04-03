@@ -20,6 +20,8 @@ static void SigpipeGuardAcquire() {
     }
 }
 
+static constexpr int STOP_BARRIER_TIMEOUT_SEC = 5;
+
 NetServer::NetServer(const std::string& _ip, const size_t _port,
                      int timer_interval,
                      std::chrono::seconds connection_timeout,
@@ -55,63 +57,90 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
 
 NetServer::~NetServer(){
     Stop();
+    // Ensure worker threads are stopped even if Stop() took the early-return
+    // path (dispatchers_ready_ == false). Covers the case where Start() was
+    // never called but the constructor already started sock_workers_.
+    // ThreadPool::Stop() is idempotent.
+    sock_workers_.Stop();
     socket_dispatchers_.clear();
     connections_.clear();
 }
 
 // start event loop
 void NetServer::Start(){
-    socket_dispatchers_.reserve(sock_workers_.GetThreadWorkerNum());
-    for(int idx = 0; idx < sock_workers_.GetThreadWorkerNum(); idx ++){
-        // Check for early shutdown (e.g., SIGTERM during startup).
-        if (conn_dispatcher_->was_stopped()) break;
+    start_called_.store(true, std::memory_order_release);
 
-        // Use configurable timer parameters
-        std::shared_ptr<Dispatcher> task = std::make_shared<Dispatcher>(
-            true, timer_interval_,
-            std::chrono::seconds(connection_timeout_sec_.load(std::memory_order_relaxed)));
-        // Initialize each socket dispatcher (required for eventfd setup)
-        task->Init();
-        socket_dispatchers_.emplace_back(task);
-        task->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
-        task->SetTimerCB(std::bind(&NetServer::RemoveConnection, this, std::placeholders::_1));
-
-        // Use lambda with COPY-BY-VALUE capture for thread safety
-        // Why copy? The lambda will execute in a different thread later.
-        // Capturing 'task' by value ensures the Dispatcher shared_ptr is safely
-        // shared across threads without dangling references.
-        std::shared_ptr<SocketWorker> work_task = std::shared_ptr<SocketWorker>(
-            new SocketWorker([task]() {
-                task->RunEventLoop();
-            }));
-        try {
-            sock_workers_.AddTask(work_task);
-        } catch (const std::runtime_error&) {
-            // Pool was stopped by concurrent Stop() — break and clean up.
-            // Without this catch, Start() never reaches its cleanup path,
-            // so StopEventLoop is never called on already-running dispatchers,
-            // and Stop()'s sock_workers_.Stop() hangs joining stuck workers.
-            break;
-        }
-    }
-
-    // If shutdown was requested during setup, clean up and return.
-    // Stop() also stops sock_workers_ on the early path, but Stop() is
-    // idempotent, so double-call from both paths is safe.
-    if (conn_dispatcher_->was_stopped()) {
-        for (auto& d : socket_dispatchers_) d->StopEventLoop();
+    auto cleanup_partial_startup = [this]() {
+        for (auto& d : socket_dispatchers_)
+            d->StopEventLoop();
         sock_workers_.Stop();
-        return;
+        dispatchers_ready_.store(true, std::memory_order_release);
+    };
+
+    try {
+        socket_dispatchers_.reserve(sock_workers_.GetThreadWorkerNum());
+        for(int idx = 0; idx < sock_workers_.GetThreadWorkerNum(); idx ++){
+            if (conn_dispatcher_->was_stopped()) break;
+
+            std::shared_ptr<Dispatcher> task = std::make_shared<Dispatcher>(
+                true, timer_interval_,
+                std::chrono::seconds(connection_timeout_sec_.load(std::memory_order_relaxed)));
+            task->Init();
+            socket_dispatchers_.emplace_back(task);
+            task->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
+            task->SetTimerCB(std::bind(&NetServer::RemoveConnection, this, std::placeholders::_1));
+
+            std::shared_ptr<SocketWorker> work_task = std::shared_ptr<SocketWorker>(
+                new SocketWorker([task]() {
+                    task->RunEventLoop();
+                }));
+            sock_workers_.AddTask(work_task);
+        }
+
+        if (conn_dispatcher_->was_stopped()) {
+            cleanup_partial_startup();
+            return;
+        }
+
+        {
+            static constexpr int DISPATCHER_START_TIMEOUT_SEC = 5;
+            for (auto& disp : socket_dispatchers_) {
+                auto deadline = std::chrono::steady_clock::now()
+                              + std::chrono::seconds(DISPATCHER_START_TIMEOUT_SEC);
+                while (!disp->is_running() && !disp->was_stopped()) {
+                    if (std::chrono::steady_clock::now() > deadline) {
+                        logging::Get()->error(
+                            "Socket dispatcher failed to start within {} seconds",
+                            DISPATCHER_START_TIMEOUT_SEC);
+                        cleanup_partial_startup();
+                        throw std::runtime_error(
+                            "Socket dispatcher failed to start within timeout");
+                    }
+                    std::this_thread::yield();
+                }
+            }
+        }
+
+        if (conn_dispatcher_->was_stopped()) {
+            cleanup_partial_startup();
+            return;
+        }
+
+    } catch (...) {
+        cleanup_partial_startup();
+        throw;
     }
 
-    // Setup complete. After this point, Stop() handles teardown.
-    startup_done_.store(true, std::memory_order_release);
+    dispatchers_ready_.store(true, std::memory_order_release);
 
-    // Fire ready callback only if not shutting down. Without this guard,
-    // daemon mode can signal readiness for a server that is already stopping.
-    if (ready_callback_ && !conn_dispatcher_->was_stopped()) {
+    // Fire ready callback synchronously BEFORE RunEventLoop(). This ensures
+    // server_ready_ is set before any accept events are processed — otherwise
+    // early requests hit the shutdown path (Connection: close, WS 503, H2
+    // GOAWAY) on an otherwise healthy server. The stop_requested_ guard
+    // suppresses the callback if Stop() raced in during startup.
+    if (ready_callback_ && !stop_requested_.load(std::memory_order_acquire)) {
         ready_callback_();
-        ready_callback_ = nullptr;  // one-shot
+        ready_callback_ = nullptr;
     }
 
     conn_dispatcher_->RunEventLoop();
@@ -119,6 +148,13 @@ void NetServer::Start(){
 
 // stop event loop
 void NetServer::StopAccepting() {
+    // Suppress the ready callback before any dispatcher interaction.
+    // This is the common entry point for all shutdown paths (NetServer::Stop,
+    // HttpServer::Stop, direct callers). Setting it here instead of only in
+    // NetServer::Stop() ensures the flag is set even when HttpServer::Stop()
+    // calls StopAccepting() directly.
+    stop_requested_.store(true, std::memory_order_release);
+
     if (conn_dispatcher_->was_stopped()) return;  // already stopped
 
     if (conn_dispatcher_->is_running()) {
@@ -135,27 +171,41 @@ void NetServer::StopAccepting() {
             auto barrier = std::make_shared<std::promise<void>>();
             auto future = barrier->get_future();
             conn_dispatcher_->EnQueue([barrier]() { barrier->set_value(); });
-            future.wait();
+            if (future.wait_for(std::chrono::seconds(STOP_BARRIER_TIMEOUT_SEC))
+                    == std::future_status::timeout) {
+                logging::Get()->error(
+                    "conn_dispatcher barrier timed out during StopAccepting");
+            }
         }
     } else {
-        // Event loop not started (Stop before Start, ready_callback shutdown):
-        // close synchronously — no concurrent accept callbacks possible.
+        // Event loop not started (Stop before Start, ready_callback shutdown).
+        // Set was_stopped BEFORE closing so that CloseChannel's off-loop
+        // check sees was_stopped_ == true and takes the inline path.
+        // Without this, CloseChannel enqueues the fd close to a dispatcher
+        // that will never run, leaving the listen socket bound.
+        conn_dispatcher_->StopEventLoop();
         if (acceptor_) acceptor_->CloseListenSocket();
+        return;  // StopEventLoop already called
     }
     conn_dispatcher_->StopEventLoop();
 }
 
 void NetServer::Stop(){
-    // First: stop accepting (may already be done by HttpServer::Stop())
+    // First: stop accepting (may already be done by HttpServer::Stop()).
+    // StopAccepting() sets stop_requested_ to suppress the ready callback.
     StopAccepting();
 
-    // If startup hasn't completed, Start() will detect was_stopped and
-    // clean up socket_dispatchers_ on its own. Don't touch that vector —
-    // it may be concurrently modified by Start()'s setup loop.
-    // But always stop the worker pool: it was started in the constructor,
-    // so threads are running even if Start() never ran or hasn't finished.
-    if (!startup_done_.load(std::memory_order_acquire)) {
-        sock_workers_.Stop();
+    // If Start() hasn't finished building socket_dispatchers_, skip
+    // dispatcher iteration to avoid racing with the vector build.
+    if (!dispatchers_ready_.load(std::memory_order_acquire)) {
+        if (!start_called_.load(std::memory_order_acquire)) {
+            // Start() was never called — workers are idle in GetTask(),
+            // not in RunEventLoop(), so stopping the pool won't hang.
+            sock_workers_.Stop();
+        }
+        // If Start() IS running, it checks was_stopped() in its build
+        // loop and after the barrier, and handles dispatcher + worker
+        // cleanup itself.
         return;
     }
 
@@ -216,7 +266,13 @@ void NetServer::Stop(){
             auto barrier = std::make_shared<std::promise<void>>();
             auto future = barrier->get_future();
             disp->EnQueue([barrier]() { barrier->set_value(); });
-            future.wait();
+            if (future.wait_for(std::chrono::seconds(STOP_BARRIER_TIMEOUT_SEC))
+                    == std::future_status::timeout) {
+                logging::Get()->error(
+                    "Socket dispatcher barrier timed out during Stop(), "
+                    "forcing StopEventLoop");
+                disp->StopEventLoop();
+            }
         }
     };
 
@@ -247,10 +303,20 @@ void NetServer::Stop(){
     wait_for_dispatcher_barrier();
 
     // Fifth: Stop socket dispatcher event loops (conn_dispatcher already stopped above).
-    // StopEventLoop's WakeUp triggers one final loop iteration that processes any
-    // write-ready channels (from EnableWriteMode set above), draining buffered output.
-    for(auto task : socket_dispatchers_)
-        task -> StopEventLoop();
+    for(auto& task : socket_dispatchers_) {
+        if (task->is_on_loop_thread()) {
+            // Self-dispatcher (Stop called from a handler on this thread):
+            // enqueue StopEventLoop so the loop does one more WaitForEvent
+            // iteration before exiting. This lets write-ready channels
+            // (armed by CloseAfterWrite/EnableWriteMode in the barrier)
+            // fire and flush buffered output. A direct StopEventLoop would
+            // set is_running_=false immediately, and the loop would exit
+            // as soon as the current handler returns — truncating output.
+            task->EnQueue([t = task]() { t->StopEventLoop(); });
+        } else {
+            task->StopEventLoop();
+        }
+    }
 
     // Sixth: Now safe to join worker threads
     sock_workers_.Stop();

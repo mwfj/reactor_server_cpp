@@ -26,7 +26,11 @@ bool SocketHandler::SetKeepAlive(bool _flag){
 }
 
 int SocketHandler::CreateSocket() {
+#if defined(__linux__)
+    int listenfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+#else
     int listenfd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+#endif
     if (listenfd == -1) {
         int saved_errno = errno;
         logging::Get()->error("Failed to create socket: {}", std::strerror(saved_errno));
@@ -62,8 +66,8 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
     sockaddr_in acceptAddr;
     socklen_t len = sizeof(acceptAddr);
 #if defined(__linux__)
-    // Linux: use accept4 with SOCK_NONBLOCK for atomic non-blocking accept
-    int clientfd = accept4(fd_, reinterpret_cast<sockaddr*>(&acceptAddr), &len, SOCK_NONBLOCK);
+    // Linux: use accept4 with SOCK_NONBLOCK|SOCK_CLOEXEC for atomic setup
+    int clientfd = accept4(fd_, reinterpret_cast<sockaddr*>(&acceptAddr), &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
 #elif defined(__APPLE__) || defined(__MACH__)
     // macOS: use regular accept and set non-blocking separately
     int clientfd = accept(fd_, reinterpret_cast<sockaddr*>(&acceptAddr), &len);
@@ -73,6 +77,13 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
         // Don't close listening socket on accept error
         if(saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
             return ACCEPT_QUEUE_DRAINED;
+        }
+        if(saved_errno == EINTR) {
+            // Signal interrupted accept — not an error. Return a
+            // retryable code so the ET drain loop continues instead
+            // of throwing (which would break the loop and stall
+            // accept until the next edge transition).
+            return ACCEPT_CONN_ABORTED;
         }
         if(saved_errno == ECONNABORTED) {
             return ACCEPT_CONN_ABORTED;
@@ -96,9 +107,16 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
     // to the reactor — later epoll/kqueue registration would operate
     // on an fd that may already belong to another connection.
     SetNonBlocking(clientfd);
-    if (fcntl(clientfd, F_GETFL) == -1) {
-        // fd is dead — treat as aborted connection, continue draining
-        return ACCEPT_CONN_ABORTED;
+    // Verify the fd is still valid after SetNonBlocking. Retry on EINTR
+    // so that a signal (SIGHUP, SIGTERM) during accept doesn't spuriously
+    // drop a healthy connection.
+    {
+        int probe;
+        do { probe = fcntl(clientfd, F_GETFL); } while (probe == -1 && errno == EINTR);
+        if (probe == -1) {
+            ::close(clientfd);
+            return ACCEPT_CONN_ABORTED;
+        }
     }
 #endif
     _clientAddr.SetAddr(acceptAddr);
@@ -157,6 +175,18 @@ void SocketHandler::SetNonBlocking(int fd) {
         throw std::runtime_error(std::string("Failed to set non-blocking mode: ") + logging::SafeStrerror(saved_errno));
     }
 
+    // Set close-on-exec to prevent fd leaks into child processes on exec*().
+    // On Linux, SOCK_CLOEXEC in socket()/accept4() handles this atomically.
+    // On macOS (and any platform without SOCK_CLOEXEC), set it via fcntl.
+#if !defined(__linux__)
+    {
+        int fd_flags = fcntl(fd, F_GETFD);
+        if (fd_flags != -1) {
+            fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC);
+        }
+    }
+#endif
+
     // macOS: suppress SIGPIPE per-socket since MSG_NOSIGNAL is not available
 #ifdef SO_NOSIGPIPE
     int set = 1;
@@ -165,4 +195,19 @@ void SocketHandler::SetNonBlocking(int fd) {
         logging::Get()->warn("Failed to set SO_NOSIGPIPE: {}", logging::SafeStrerror(saved_errno));
     }
 #endif
+}
+
+int SocketHandler::GetBoundPort() const {
+    if (fd_ == -1) return 0;
+    // IPv4 only — matches the project's current AF_INET-only stack.
+    // If IPv6 is added (sockaddr_in6 is 28 bytes vs sockaddr_in's 16),
+    // this must change to sockaddr_storage to avoid buffer overflow.
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    if (getsockname(fd_, reinterpret_cast<struct sockaddr*>(&addr), &len) < 0) {
+        int saved_errno = errno;
+        logging::Get()->warn("getsockname failed: {}", logging::SafeStrerror(saved_errno));
+        return 0;
+    }
+    return ntohs(addr.sin_port);
 }

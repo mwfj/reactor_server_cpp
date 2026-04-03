@@ -138,7 +138,7 @@ Environment variables take precedence over JSON file values:
 ### Validation
 
 `ConfigLoader::Validate()` checks:
-- Port in valid range (1-65535)
+- Port in valid range (0-65535, 0 = OS-assigned ephemeral port)
 - Worker threads > 0
 - If TLS enabled, cert_file and key_file must be non-empty
 - shutdown_drain_timeout_sec: 0-300 (0 = immediate close)

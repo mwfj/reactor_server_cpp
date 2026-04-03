@@ -7,11 +7,11 @@
 Dispatcher::Dispatcher() :
     ep_(std::unique_ptr<EventHandler>(new EventHandler())),
     is_sock_dispatcher_(false),
-    timer_fd_(-1),
     end_t_(0),
     timeout_(std::chrono::seconds(0))
 {
 #if defined(__linux__)
+    timer_fd_ = -1;
     eventfd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (eventfd_ == -1) {
         throw std::runtime_error(std::string("eventfd creation failed: ") + logging::SafeStrerror(errno));
@@ -20,9 +20,11 @@ Dispatcher::Dispatcher() :
     if (::pipe(wakeup_pipe_) == -1) {
         throw std::runtime_error(std::string("pipe creation failed: ") + logging::SafeStrerror(errno));
     }
-    // Set both ends to non-blocking
+    // Set both ends to non-blocking + close-on-exec
     ::fcntl(wakeup_pipe_[0], F_SETFL, O_NONBLOCK);
     ::fcntl(wakeup_pipe_[1], F_SETFL, O_NONBLOCK);
+    ::fcntl(wakeup_pipe_[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(wakeup_pipe_[1], F_SETFD, FD_CLOEXEC);
 #endif
     // Note: wake_channel_ initialization moved to Initialize()
     // Cannot use shared_from_this() in constructor
@@ -35,6 +37,7 @@ Dispatcher::Dispatcher(bool _is_sock,  int _end_t, std::chrono::seconds _timeout
     timeout_(_timeout)
 {
 #if defined(__linux__)
+    timer_fd_ = -1;
     eventfd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (eventfd_ == -1) {
         throw std::runtime_error(std::string("eventfd creation failed: ") + logging::SafeStrerror(errno));
@@ -43,9 +46,11 @@ Dispatcher::Dispatcher(bool _is_sock,  int _end_t, std::chrono::seconds _timeout
     if (::pipe(wakeup_pipe_) == -1) {
         throw std::runtime_error(std::string("pipe creation failed: ") + logging::SafeStrerror(errno));
     }
-    // Set both ends to non-blocking
+    // Set both ends to non-blocking + close-on-exec
     ::fcntl(wakeup_pipe_[0], F_SETFL, O_NONBLOCK);
     ::fcntl(wakeup_pipe_[1], F_SETFL, O_NONBLOCK);
+    ::fcntl(wakeup_pipe_[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(wakeup_pipe_[1], F_SETFD, FD_CLOEXEC);
 #endif
     // Note: wake_channel_ initialization moved to Init()
     // Cannot use shared_from_this() in constructor
@@ -60,31 +65,57 @@ void Dispatcher::Init() {
     wake_channel_ = std::make_shared<Channel>(shared_from_this(), wakeup_pipe_[0]);  // Read end of pipe
 #endif
     wake_channel_->SetReadCallBackFn(std::bind(&Dispatcher::HandleEventId, this));
-    wake_channel_->EnableReadMode();
+    // Register the wake channel synchronously — MUST NOT go through
+    // EnableReadMode() → UpdateChannel() → EnQueue(), because the wake
+    // channel itself is what drains the task queue. Enqueueing its own
+    // registration creates a chicken-and-egg deadlock.
+    // Init() runs single-threaded before any event loop, so direct
+    // registration is safe (no concurrent epoll/kqueue access).
+    wake_channel_->EnableETMode();
+    wake_channel_->SetEvent(wake_channel_->Event() | EVENT_READ | EVENT_RDHUP);
+    UpdateChannelInLoop(wake_channel_);
 
     // Initialize timer for socket dispatchers.
     // Timer is needed for both idle timeout (timeout_.count() > 0) and request
     // deadline scanning (has_deadline_ per-connection). Always create when
     // end_t_ > 0 (scan interval configured), even if idle timeout is disabled.
     if (is_sock_dispatcher_ && end_t_ > 0) {
-        // Use end_t_ (scan interval) for the initial timer fire, not timeout_ (idle timeout).
-        // TimerHandler re-arms with end_t_ on each fire. Using timeout_ here would delay
-        // the first scan to 300s, missing 30s request deadlines.
+#if defined(__linux__)
+        // Linux: timerfd becomes a Channel in the epoll interest list.
+        // Same synchronous registration as wake_channel_ — safe during Init().
         timer_fd_ = TimeStamp::GenTimerFd(std::chrono::seconds(end_t_), std::chrono::nanoseconds(0));
-        // Guard against platforms where GenTimerFd returns -1 (e.g., macOS)
         if (timer_fd_ >= 0) {
             timer_channel_ = std::make_shared<Channel>(shared_from_this(), timer_fd_);
             timer_channel_->SetReadCallBackFn(std::bind(&Dispatcher::TimerHandler, this));
-            timer_channel_->EnableReadMode();
+            timer_channel_->EnableETMode();
+            timer_channel_->SetEvent(timer_channel_->Event() | EVENT_READ | EVENT_RDHUP);
+            UpdateChannelInLoop(timer_channel_);
         }
+#elif defined(__APPLE__) || defined(__MACH__)
+        // macOS: EVFILT_TIMER registered directly on the kqueue — no fd, no Channel.
+        // EV_ONESHOT fires once; re-armed by ResetTimer() inside TimerHandler().
+        ep_->RegisterTimer(end_t_);
+#endif
     }
 }
 
 Dispatcher::~Dispatcher() {
-    // Let smart pointers handle cleanup automatically
-    // wake_channel_ destructor will close the eventfd / wakeup_pipe_[0]
-#if defined(__APPLE__) || defined(__MACH__)
-    // Close the write end of the wakeup pipe (not owned by wake_channel_)
+#if defined(__linux__)
+    // If Init() was never called, wake_channel_ is null and nobody owns
+    // the eventfd. Close it here to prevent a descriptor leak.
+    if (!wake_channel_ && eventfd_ >= 0) {
+        ::close(eventfd_);
+        eventfd_ = -1;
+    }
+    // If wake_channel_ exists, its destructor closes the eventfd.
+#elif defined(__APPLE__) || defined(__MACH__)
+    // If Init() was never called, wake_channel_ is null and nobody owns
+    // the read end of the pipe. Close it here.
+    if (!wake_channel_ && wakeup_pipe_[0] >= 0) {
+        ::close(wakeup_pipe_[0]);
+        wakeup_pipe_[0] = -1;
+    }
+    // Always close the write end (never owned by wake_channel_).
     if (wakeup_pipe_[1] >= 0) {
         ::close(wakeup_pipe_[1]);
         wakeup_pipe_[1] = -1;
@@ -97,7 +128,10 @@ void Dispatcher::set_running_state(bool status){
 }
 
 void Dispatcher::RunEventLoop(){
-    // If StopEventLoop was called before we started, bail out immediately.
+    // Guard: if StopEventLoop() was called before we entered the loop
+    // (e.g., shutdown during startup), return immediately so the thread
+    // can be joined. Without this, set_running_state(true) would override
+    // the stop and the loop would run forever, hanging the join().
     if (was_stopped()) return;
 
     set_running_state(true);
@@ -117,8 +151,10 @@ void Dispatcher::RunEventLoop(){
         // This allows the server to check is_running() periodically
         std::vector<std::shared_ptr<Channel>> channels = ep_->WaitForEvent(1000);
 
-        // If no events, just continue loop (don't shutdown!)
-        // The timeout is for periodic checking, not termination
+        // If no channel events, just continue loop (don't shutdown!)
+        // The timeout is for periodic checking, not termination.
+        // Note: on macOS, EVFILT_TIMER may fire with no channel events,
+        // so we still need to check ConsumeTimerFired() below.
         if(channels.size() == 0){
             // Drain queued tasks on timeout — if WakeUp's write failed
             // (EAGAIN on full pipe/eventfd), tasks would be stranded until
@@ -136,15 +172,8 @@ void Dispatcher::RunEventLoop(){
             if(callbacks_.timeout_trigger_callback){
                 callbacks_.timeout_trigger_callback(shared_from_this());
             }
-            // Fallback timer for platforms without timerfd (macOS):
-            if (is_sock_dispatcher_ && timer_fd_ < 0 && end_t_ > 0) {
-                auto now = std::chrono::steady_clock::now();
-                if (now - last_fallback_timer_ >= std::chrono::seconds(end_t_)) {
-                    last_fallback_timer_ = now;
-                    TimerHandler();
-                }
-            }
-            continue;
+            // Do NOT continue here — fall through to ConsumeTimerFired()
+            // so macOS EVFILT_TIMER events are processed even on timeout.
         }
 
         // Process all active channels
@@ -169,14 +198,11 @@ void Dispatcher::RunEventLoop(){
             }
         }
 
-        // Fallback timer for platforms without timerfd (macOS):
-        // Throttled by end_t_ to match the configured scan interval.
-        if (is_sock_dispatcher_ && timer_fd_ < 0 && end_t_ > 0) {
-            auto now = std::chrono::steady_clock::now();
-            if (now - last_fallback_timer_ >= std::chrono::seconds(end_t_)) {
-                last_fallback_timer_ = now;
-                TimerHandler();
-            }
+        // macOS EVFILT_TIMER: check if the timer fired during WaitForEvent().
+        // ConsumeTimerFired() returns false on Linux (timer is a timerfd Channel
+        // that invokes TimerHandler() directly via its read callback).
+        if (is_sock_dispatcher_ && ep_->ConsumeTimerFired()) {
+            TimerHandler();
         }
 
       } catch (const std::exception& e) {
@@ -214,24 +240,16 @@ void Dispatcher::StopEventLoop(){
 }
 
 void Dispatcher::UpdateChannel(std::shared_ptr<Channel> ch){
-    // CRITICAL FIX: Always use EnQueue when not in dispatcher thread
-    // The original condition `if(!is_running() || is_dispatcher_thread())` was buggy:
-    // - It would call UpdateChannelInLoop() directly when !is_running(), even from wrong thread
-    // - This caused race conditions where channels weren't properly registered in epoll
     if(is_dispatcher_thread()){
         UpdateChannelInLoop(ch);
         return;
     }
 
-    // From other threads: use EnQueue to ensure thread-safe epoll modifications
-    // But ONLY if running - otherwise, calls during initialization will deadlock
-    if(!is_running()){
-        // Dispatcher not started yet - this is a bug in the calling code
-        // But to maintain compatibility, call directly (thread-unsafe but works for init)
-        UpdateChannelInLoop(ch);
-        return;
-    }
-
+    // Always enqueue when off-thread. This is safe even before RunEventLoop()
+    // starts — the task queues up and is drained when the loop begins.
+    // The previous !is_running() fallback called UpdateChannelInLoop()
+    // directly from the wrong thread, causing cross-thread epoll/kqueue
+    // mutations that are undefined behavior.
     std::weak_ptr<Dispatcher> self = shared_from_this();
     EnQueue([self, ch]() {
         if(auto dispatcher = self.lock()){
@@ -246,12 +264,7 @@ void Dispatcher::RemoveChannel(std::shared_ptr<Channel> ch){
         return;
     }
 
-    if(!is_running()){
-        // Dispatcher not started yet - call directly to avoid deadlock
-        RemoveChannelInLoop(ch);
-        return;
-    }
-
+    // Always enqueue when off-thread — same rationale as UpdateChannel.
     std::weak_ptr<Dispatcher> self = shared_from_this();
     EnQueue([self, ch]() {
         if(auto dispatcher = self.lock()){
@@ -290,10 +303,14 @@ void Dispatcher::HandleEventId(){
 #if defined(__linux__)
     uint64_t val;
     ssize_t n = ::read(eventfd_, &val, sizeof val);
-    if (n != sizeof val) {
-        logging::Get()->error("eventfd read failed");
-        return;
+    if (n != sizeof val && errno != EAGAIN && errno != EWOULDBLOCK) {
+        logging::Get()->error("eventfd read failed: {}",
+                              logging::SafeStrerror(errno));
     }
+    // Proceed to drain tasks even if no token was pending (EAGAIN).
+    // HandleEventId() is called both from the event loop (token guaranteed)
+    // and from inline drain paths (e.g., self-dispatcher barrier in
+    // NetServer::Stop) where no token may exist.
 #elif defined(__APPLE__) || defined(__MACH__)
     // Drain the pipe - may have multiple wake-ups queued
     char buf[256];
@@ -382,28 +399,32 @@ void Dispatcher::SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCal
 
 void Dispatcher::SetTimerInterval(int interval) {
     end_t_ = interval;
-    // Re-arm the timerfd immediately so a downward reload takes effect
+    // Re-arm the timer immediately so a downward reload takes effect
     // without waiting for the old (potentially much longer) interval to fire.
+#if defined(__linux__)
     if (timer_fd_ >= 0 && interval > 0) {
         TimeStamp::ResetTimerFd(timer_fd_, interval);
     }
+#elif defined(__APPLE__) || defined(__MACH__)
+    if (interval > 0) {
+        ep_->ResetTimer(interval);
+    }
+#endif
 }
 
 void Dispatcher::TimerHandler(){
-    // Drain the timerfd expiration count before re-arming.
-    // On Linux, timerfd stays readable until read(); without draining,
-    // epoll_wait returns the timer channel continuously in a tight loop.
-    // On macOS/BSD (timer_fd_ < 0), the fallback timer in RunEventLoop
-    // calls TimerHandler directly — skip the fd operations.
+    // Re-arm BEFORE scanning connections — matches the cadence on both platforms.
+    // On Linux, timerfd stays readable until read(); draining + re-arm prevents
+    // epoll_wait from returning the timer channel continuously in a tight loop.
+    // On macOS, EVFILT_TIMER was registered with EV_ONESHOT so it must be
+    // explicitly re-armed via ResetTimer().
 #if defined(__linux__)
-    if (timer_fd_ >= 0) {
-        uint64_t expirations;
-        ::read(timer_fd_, &expirations, sizeof(expirations));
-    }
+    uint64_t expirations;
+    ::read(timer_fd_, &expirations, sizeof(expirations));
+    TimeStamp::ResetTimerFd(timer_fd_, end_t_);
+#elif defined(__APPLE__) || defined(__MACH__)
+    ep_->ResetTimer(end_t_);
 #endif
-    if (timer_fd_ >= 0) {
-        TimeStamp::ResetTimerFd(timer_fd_, end_t_);
-    }
 
     // Periodic log rotation check. Uses try_lock — skips if another
     // dispatcher is already checking. No contention in steady state.

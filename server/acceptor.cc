@@ -24,7 +24,23 @@ Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _
 
     acceptor_channel_ = std::shared_ptr<Channel>(new Channel(event_dispatcher_, servsock_ -> fd()));
     acceptor_channel_ -> SetReadCallBackFn(std::bind(&Acceptor::NewConnection, this));
-    acceptor_channel_ -> EnableReadMode(); // let epoll_wait monitorting reading event
+    // Register the acceptor channel synchronously — MUST NOT go through
+    // EnableReadMode() → UpdateChannel() → EnQueue(). The constructor runs
+    // before any event loop starts, so enqueued registration would only
+    // execute later. If it fails silently, the ready callback fires but the
+    // server can't accept connections. Direct registration surfaces any
+    // kqueue/epoll error immediately (as a thrown exception from Bind/Listen
+    // or a failed epoll_ctl), and the Acceptor constructor propagates it.
+    acceptor_channel_->SetEvent(acceptor_channel_->Event() | EVENT_READ | EVENT_RDHUP);
+    try {
+        event_dispatcher_->UpdateChannelInLoop(acceptor_channel_);
+    } catch (...) {
+        // Constructor is aborting — destructor won't run, so clean up
+        // the idle fd manually. Without this, repeated startup retries
+        // under resource pressure leak one fd per attempt.
+        if (idle_fd_ >= 0) { ::close(idle_fd_); idle_fd_ = -1; }
+        throw;
+    }
 }
 
 Acceptor::~Acceptor() {
@@ -123,20 +139,15 @@ void Acceptor::NewConnection(){
             continue;
         }
         if(client_fd == SocketHandler::ACCEPT_MEMORY_PRESSURE){
-            // Memory/buffer pressure (ENOBUFS/ENOMEM). EnQueue a deferred
-            // retry — the WaitForEvent 1s timeout between the current event
-            // batch and the next provides natural backoff. If the EnQueue's
-            // WakeUp write also fails (full pipe under pressure), the timeout
-            // path's opportunistic task drain picks it up within ~1s.
-            // EnableReadMode alone is insufficient: EPOLL_CTL_MOD doesn't
-            // create a new edge when the socket is already readable.
+            // Memory/buffer pressure (ENOBUFS/ENOMEM).
+            // Set a timed retry with sleep-based backoff. On epoll ET mode,
+            // EPOLL_CTL_MOD doesn't create a new edge when the socket is
+            // already readable, so we can't just return and rely on
+            // re-notification. Kqueue level-triggered would retry naturally,
+            // but this approach works on both platforms.
             int saved_errno = errno;
             logging::Get()->warn("Accept: memory pressure ({}), retry in ~100ms",
                                  logging::SafeStrerror(saved_errno));
-            // Set a timed retry: NewConnection() checks retry_due_at_ at
-            // entry and re-enqueues itself until the backoff elapses. Uses
-            // EnQueue (with WakeUp) so the task runs even under sustained
-            // traffic. Other tasks (shutdown barriers) run between passes.
             static constexpr int ACCEPT_RETRY_MS = 100;
             retry_due_at_ = std::chrono::steady_clock::now() +
                             std::chrono::milliseconds(ACCEPT_RETRY_MS);

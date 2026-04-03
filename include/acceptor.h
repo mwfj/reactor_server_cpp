@@ -45,4 +45,7 @@ public:
     void CloseListenSocket();
 
     void SetNewConnCb(std::function<void(std::unique_ptr<SocketHandler>)>);
+
+    // Returns the actual port the listen socket is bound to.
+    int GetBoundPort() const { return servsock_ ? servsock_->GetBoundPort() : 0; }
 };

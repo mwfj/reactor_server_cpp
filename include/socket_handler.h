@@ -62,4 +62,8 @@ public:
     void Listen(int maxLen);
     int Accept(InetAddr& clientAddr);
     void Close();
+
+    // Query the actual port bound by the OS (resolves ephemeral port 0).
+    // Must be called after Bind(). Returns 0 if getsockname() fails.
+    int GetBoundPort() const;
 };

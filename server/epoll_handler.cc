@@ -6,7 +6,7 @@
 #include "log/log_utils.h"
 
 EpollHandler::EpollHandler(){
-    if((epollfd_ = ::epoll_create(1)) == -1){
+    if((epollfd_ = ::epoll_create1(EPOLL_CLOEXEC)) == -1){
         int saved_errno = errno;
         logging::Get()->error("epoll_create failed: {}", logging::SafeStrerror(saved_errno));
         throw std::runtime_error("Epoll created failed");
@@ -37,7 +37,8 @@ void EpollHandler::UpdateEvent(std::shared_ptr<Channel> ch){
     }
 
     epoll_event ev;
-    ev.data.ptr = ch.get(); // Store raw pointer for epoll
+    memset(&ev, 0, sizeof(ev));
+    ev.data.ptr = ch.get();  // Raw pointer for fd-reuse validation in WaitForEvent
     ev.events = ch->Event();
 
     if(ch->is_read_event()){
@@ -104,7 +105,7 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
     // init event array
     memset(events_, 0, sizeof(events_));
 
-    int infds = epoll_wait(epollfd_, events_, MAX_EVETN_NUMS, timeout);
+    int infds = epoll_wait(epollfd_, events_, MAX_EVENT_NUMS, timeout);
 
     if(infds < 0){
         int saved_errno = errno;
@@ -124,26 +125,31 @@ std::vector<std::shared_ptr<Channel>> EpollHandler::WaitForEvent(int timeout){
     // Reserve space to avoid reallocations
     channels.reserve(infds);
 
-    for(int idx = 0; idx < infds; idx++){
-        Channel *ch_raw = static_cast<Channel*>(events_[idx].data.ptr);
-
-        // CRITICAL: Lock and validate BEFORE dereferencing the raw pointer
-        // The channel may have been deleted between epoll_wait() returning and now
+    {
+        // Lock once for all events — prevents channel_map_ from changing
+        // while we process the batch.
         std::lock_guard<std::mutex> lock(channel_map_mutex_);
 
-        // Find the shared_ptr by searching for matching raw pointer
-        std::shared_ptr<Channel> ch;
-        for(auto& pair : channel_map_) {
-            if(pair.second && pair.second.get() == ch_raw) {
-                ch = pair.second;
-                break;
-            }
-        }
+        for(int idx = 0; idx < infds; idx++){
+            Channel *ch_raw = static_cast<Channel*>(events_[idx].data.ptr);
 
-        // Only dereference if we found a valid shared_ptr
-        if(ch) {
-            ch->SetDEvent(events_[idx].events);  // NOW SAFE - we hold a shared_ptr
-            channels.push_back(ch);
+            // Validate the raw pointer against channel_map_ to guard against
+            // fd-reuse races: between epoll_wait() and this lock, the old
+            // channel may have been removed and a new one inserted with the
+            // same fd. The pointer check ensures we only process events for
+            // the Channel that was registered when the event fired.
+            std::shared_ptr<Channel> ch;
+            for(auto& pair : channel_map_) {
+                if(pair.second.get() == ch_raw) {
+                    ch = pair.second;
+                    break;
+                }
+            }
+
+            if(ch) {
+                ch->SetDEvent(events_[idx].events);
+                channels.push_back(ch);
+            }
         }
     }
 

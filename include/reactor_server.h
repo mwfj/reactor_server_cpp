@@ -50,6 +50,12 @@ public:
     void Start();
     void Stop();
 
+    // Called after init completes but before the blocking event loop.
+    void SetReadyCallback(std::function<void()> cb);
+
+    // Returns the actual port the server is listening on.
+    int GetBoundPort() const;
+
     void NewConnection(std::shared_ptr<ConnectionHandler>);
     void CloseConnecition(std::shared_ptr<ConnectionHandler>);
     void Error(std::shared_ptr<ConnectionHandler>);
