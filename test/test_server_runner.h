@@ -8,15 +8,15 @@
 // RAII wrapper that starts a server in a background thread, waits for the
 // ready callback (no sleep), and provides the OS-assigned bound port.
 //
-// Works with both ReactorServer and HttpServer — any type that exposes:
+// Works with any server type that exposes:
 //   void SetReadyCallback(std::function<void()>)
 //   int  GetBoundPort() const
 //   void Start()       // blocks in event loop
 //   void Stop()
 //
 // Usage:
-//   ReactorServer server("127.0.0.1", 0);     // ephemeral port
-//   TestServerRunner<ReactorServer> runner(server);
+//   HttpServer server("127.0.0.1", 0);         // ephemeral port
+//   TestServerRunner<HttpServer> runner(server);
 //   int port = runner.GetPort();
 //   // ... test with port ...
 //   // ~TestServerRunner calls Stop() + join

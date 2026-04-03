@@ -1,8 +1,7 @@
 #pragma once
 #include "test_framework.h"
 #include "test_server_runner.h"
-#include "reactor_server.h"
-#include "client.h"
+#include "http_test_client.h"
 #include "dispatcher.h"
 #include "channel.h"
 #include "socket_handler.h"
@@ -22,20 +21,8 @@ namespace KqueueTests {
 
 #if defined(__APPLE__) || defined(__MACH__)
 
-// Wait for the server to close a connection. Returns true if recv() == 0
-// (clean EOF) within timeout_ms. Uses poll() + recv() — the deterministic
-// TCP close detection pattern (no send-buffer races).
-inline bool WaitForServerClose(int fd, int timeout_ms) {
-    struct pollfd pfd;
-    pfd.fd = fd;
-    pfd.events = POLLIN;
-    int ret = poll(&pfd, 1, timeout_ms);
-    if (ret > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
-        char buf[16];
-        return (recv(fd, buf, sizeof(buf), 0) == 0);
-    }
-    return false;
-}
+// Use TestHttpClient::MakeTestConfig and TestHttpClient::SetupEchoRoutes
+// from http_test_client.h for shared test server setup.
 
 // ---------------------------------------------------------------------------
 // KQ-TEST-1: EVFILT_TIMER Drives Idle Timeout Correctly
@@ -43,28 +30,40 @@ inline bool WaitForServerClose(int fd, int timeout_ms) {
 void TestTimerDrivesIdleTimeout() {
     std::cout << "\n[TEST] KQ-TEST-1: EVFILT_TIMER drives idle timeout..." << std::endl;
     try {
-        // Short idle timeout (3s), scan interval 1s
-        ReactorServer server("127.0.0.1", 0, 1, std::chrono::seconds(3));
-        TestServerRunner<ReactorServer> runner(server);
+        // Short idle timeout (3s) — ComputeTimerInterval yields max(3/6,1)=1s scan
+        auto config = TestHttpClient::MakeTestConfig(3);
+        HttpServer server(config);
+        TestHttpClient::SetupEchoRoutes(server);
+        TestServerRunner<HttpServer> runner(server);
         int port = runner.GetPort();
 
-        // Connect, send data, receive echo
-        Client client(port, "127.0.0.1", "hello");
-        client.SetQuietMode(true);
-        client.Init();
-        client.Connect();
-        client.Send();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        client.Receive();
+        // Connect, send request, receive response
+        int sockfd = TestHttpClient::ConnectRawSocket(port);
+        if (sockfd < 0) throw std::runtime_error("connect failed");
+
+        std::string req = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        int flags = 0;
+#ifdef MSG_NOSIGNAL
+        flags |= MSG_NOSIGNAL;
+#endif
+        if (send(sockfd, req.data(), req.size(), flags) < 0) {
+            close(sockfd);
+            throw std::runtime_error("send failed");
+        }
+
+        // Read the response
+        TestHttpClient::SetReceiveTimeout(sockfd, 3);
+        char buf[4096];
+        recv(sockfd, buf, sizeof(buf), 0);
 
         // Hold idle — wait for server-initiated close via poll+recv
         auto start = std::chrono::steady_clock::now();
-        bool close_detected = WaitForServerClose(client.GetFd(), 6000);
+        bool close_detected = TestHttpClient::WaitForServerClose(sockfd, 6000);
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start);
         bool timing_ok = (elapsed.count() >= 2000 && elapsed.count() <= 5500);
 
-        client.Close();
+        close(sockfd);
 
         bool pass = close_detected && timing_ok;
         std::string err;
@@ -293,43 +292,32 @@ void TestFilterConsolidation() {
 void TestChurnStability() {
     std::cout << "\n[TEST] KQ-TEST-5: Churn stability..." << std::endl;
     try {
-        ReactorServer server("127.0.0.1", 0);
-        TestServerRunner<ReactorServer> runner(server);
+        HttpServer server("127.0.0.1", 0);
+        TestHttpClient::SetupEchoRoutes(server);
+        TestServerRunner<HttpServer> runner(server);
         int port = runner.GetPort();
 
         // Rapidly connect and disconnect 100 clients
         int connect_count = 0;
         for (int i = 0; i < 100; ++i) {
-            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            int sock = TestHttpClient::ConnectRawSocket(port);
             if (sock < 0) continue;
-            struct sockaddr_in addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(port);
-            inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-            if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-                ++connect_count;
-                ::write(sock, "X", 1);
-            }
+            ++connect_count;
+            ::write(sock, "X", 1);
             ::close(sock);
         }
 
         // Wait for cleanup
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-        // Verify server is healthy: 5 sequential full requests
+        // Verify server is healthy: 5 sequential full HTTP requests
         int success_count = 0;
         for (int i = 0; i < 5; ++i) {
             try {
-                Client client(port, "127.0.0.1", "PostChurn");
-                client.SetQuietMode(true);
-                client.Init();
-                client.SetReceiveTimeout(3);
-                client.Connect();
-                client.Send();
-                client.Receive();
-                client.Close();
-                ++success_count;
+                std::string response = TestHttpClient::HttpGet(port, "/health", 3000);
+                if (TestHttpClient::HasStatus(response, 200)) {
+                    ++success_count;
+                }
             } catch (...) {}
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
@@ -353,51 +341,68 @@ void TestChurnStability() {
 void TestTimerRearm() {
     std::cout << "\n[TEST] KQ-TEST-6: Timer re-arm..." << std::endl;
     try {
-        // idle timeout = 3s, scan interval = 1s
-        ReactorServer server("127.0.0.1", 0, 1, std::chrono::seconds(3));
-        TestServerRunner<ReactorServer> runner(server);
+        // idle timeout = 3s — ComputeTimerInterval yields 1s scan
+        auto config = TestHttpClient::MakeTestConfig(3);
+        HttpServer server(config);
+        TestHttpClient::SetupEchoRoutes(server);
+        TestServerRunner<HttpServer> runner(server);
         int port = runner.GetPort();
 
-        // Connect client A at t=0
-        Client client_a(port, "127.0.0.1", "ClientA");
-        client_a.SetQuietMode(true);
-        client_a.Init();
-        client_a.Connect();
-        client_a.Send();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        client_a.Receive();
+        // Connect client A at t=0, send keep-alive request
+        int fd_a = TestHttpClient::ConnectRawSocket(port);
+        if (fd_a < 0) throw std::runtime_error("connect A failed");
+        {
+            std::string req = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            int flags = 0;
+#ifdef MSG_NOSIGNAL
+            flags |= MSG_NOSIGNAL;
+#endif
+            if (send(fd_a, req.data(), req.size(), flags) < 0) {
+                close(fd_a);
+                throw std::runtime_error("send A failed");
+            }
+            TestHttpClient::SetReceiveTimeout(fd_a, 3);
+            char buf[4096];
+            recv(fd_a, buf, sizeof(buf), 0);
+        }
 
         // Wait 1.5s, connect client B
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
-        Client client_b(port, "127.0.0.1", "ClientB");
-        client_b.SetQuietMode(true);
-        client_b.Init();
-        client_b.Connect();
-        client_b.Send();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        client_b.Receive();
+        int fd_b = TestHttpClient::ConnectRawSocket(port);
+        if (fd_b < 0) {
+            close(fd_a);
+            throw std::runtime_error("connect B failed");
+        }
+        {
+            std::string req = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            int flags = 0;
+#ifdef MSG_NOSIGNAL
+            flags |= MSG_NOSIGNAL;
+#endif
+            if (send(fd_b, req.data(), req.size(), flags) < 0) {
+                close(fd_a);
+                close(fd_b);
+                throw std::runtime_error("send B failed");
+            }
+            TestHttpClient::SetReceiveTimeout(fd_b, 3);
+            char buf[4096];
+            recv(fd_b, buf, sizeof(buf), 0);
+        }
 
         // Wait for both clients to timeout via poll+recv EOF
-        bool a_closed = WaitForServerClose(client_a.GetFd(), 6000);
-        bool b_closed = WaitForServerClose(client_b.GetFd(), 6000);
+        bool a_closed = TestHttpClient::WaitForServerClose(fd_a, 6000);
+        bool b_closed = TestHttpClient::WaitForServerClose(fd_b, 6000);
 
         // Verify server is still alive
         bool server_alive = false;
         try {
-            Client client_c(port, "127.0.0.1", "ClientC");
-            client_c.SetQuietMode(true);
-            client_c.Init();
-            client_c.SetReceiveTimeout(3);
-            client_c.Connect();
-            client_c.Send();
-            client_c.Receive();
-            client_c.Close();
-            server_alive = true;
+            std::string response = TestHttpClient::HttpGet(port, "/health", 3000);
+            server_alive = TestHttpClient::HasStatus(response, 200);
         } catch (...) {}
 
-        client_a.Close();
-        client_b.Close();
+        close(fd_a);
+        close(fd_b);
 
         bool pass = a_closed && b_closed && server_alive;
         std::string err;
