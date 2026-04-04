@@ -61,6 +61,12 @@ void UpstreamManager::CheckoutAsync(
 
     // Reject immediately if shutdown has started — the per-partition
     // InitiateShutdown tasks may not have executed yet on all dispatchers.
+    // Note: a narrow TOCTOU window exists where a handler reads false here,
+    // then InitiateShutdown stores true on the stopper thread, and the
+    // handler proceeds to create one last connection. This is acceptable:
+    // the connection is cleaned up during the normal shutdown drain, and
+    // closing the window would require a global mutex that serializes all
+    // checkouts across all dispatchers, defeating the per-partition design.
     if (shutting_down_.load(std::memory_order_acquire)) {
         error_cb(PoolPartition::CHECKOUT_SHUTTING_DOWN);
         return;
