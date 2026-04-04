@@ -1539,6 +1539,14 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         h2_settings_.max_frame_size         = new_config.http2.max_frame_size;
         h2_settings_.max_header_list_size   = new_config.http2.max_header_list_size;
     }
+
+    // Upstream pool changes require a restart — pools are built once in Start()
+    // and cannot be rebuilt at runtime without a full drain cycle.
+    if (new_config.upstreams != upstream_configs_) {
+        logging::Get()->warn("Reload: upstream configuration changes require a "
+                             "restart to take effect (ignored)");
+    }
+
     return true;
 }
 

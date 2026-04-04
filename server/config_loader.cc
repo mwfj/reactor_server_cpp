@@ -552,6 +552,17 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name + "'): host must not be empty");
             }
+            // Upstream host must be a dotted-quad IPv4 address (no hostnames).
+            // Hostnames would pass validation but fail at connect time with
+            // inet_addr() returning INADDR_NONE. Reject early with a clear error.
+            {
+                struct in_addr upstream_addr{};
+                if (inet_pton(AF_INET, u.host.c_str(), &upstream_addr) != 1) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name + "'): host must be a valid IPv4 address, got '" +
+                        u.host + "'");
+                }
+            }
             if (u.port < 1 || u.port > 65535) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name + "'): port must be 1-65535, got " +

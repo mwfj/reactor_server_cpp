@@ -21,25 +21,25 @@ UpstreamHostPool::UpstreamHostPool(
     size_t num_dispatchers = dispatchers.size();
     partitions_.reserve(num_dispatchers);
 
-    // Per-partition connection limit = ceil(max_connections / num_dispatchers)
-    size_t per_partition = (num_dispatchers > 0)
-        ? (static_cast<size_t>(config.max_connections) + num_dispatchers - 1)
-          / num_dispatchers
-        : static_cast<size_t>(config.max_connections);
+    // Distribute limits across partitions using floor division + remainder.
+    // The first R partitions get floor+1, the rest get floor. This ensures
+    // the aggregate never exceeds the configured global cap.
+    // Example: max_connections=5 over 4 dispatchers → [2, 1, 1, 1] (sum=5).
+    size_t total_conn = static_cast<size_t>(config.max_connections);
+    size_t total_idle = static_cast<size_t>(config.max_idle_connections);
+    size_t conn_floor = (num_dispatchers > 0) ? total_conn / num_dispatchers : total_conn;
+    size_t conn_remainder = (num_dispatchers > 0) ? total_conn % num_dispatchers : 0;
+    size_t idle_floor = (num_dispatchers > 0) ? total_idle / num_dispatchers : total_idle;
+    size_t idle_remainder = (num_dispatchers > 0) ? total_idle % num_dispatchers : 0;
 
     for (size_t i = 0; i < num_dispatchers; ++i) {
-        // Create a config copy with the per-partition limit
         UpstreamPoolConfig partition_config = config;
+        size_t per_partition = conn_floor + (i < conn_remainder ? 1 : 0);
+        // Ensure at least 1 connection per partition so every dispatcher can serve
+        if (per_partition == 0) per_partition = 1;
         partition_config.max_connections = static_cast<int>(per_partition);
-        // Scale max_idle proportionally
-        size_t per_partition_idle = (num_dispatchers > 0)
-            ? (static_cast<size_t>(config.max_idle_connections) + num_dispatchers - 1)
-              / num_dispatchers
-            : static_cast<size_t>(config.max_idle_connections);
-        // Ensure at least 1 idle per partition if configured
-        if (config.max_idle_connections > 0 && per_partition_idle == 0) {
-            per_partition_idle = 1;
-        }
+
+        size_t per_partition_idle = idle_floor + (i < idle_remainder ? 1 : 0);
         partition_config.max_idle_connections = static_cast<int>(per_partition_idle);
 
         partitions_.push_back(std::make_unique<PoolPartition>(
@@ -48,9 +48,9 @@ UpstreamHostPool::UpstreamHostPool(
     }
 
     logging::Get()->info("UpstreamHostPool '{}' created for {}:{} with {} "
-                         "partitions (max_conn={} per partition)",
+                         "partitions (max_conn={}, max_idle={})",
                          service_name_, host_, port_, num_dispatchers,
-                         per_partition);
+                         config.max_connections, config.max_idle_connections);
 }
 
 UpstreamHostPool::~UpstreamHostPool() {

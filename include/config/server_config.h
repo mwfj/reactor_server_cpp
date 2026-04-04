@@ -33,6 +33,13 @@ struct UpstreamTlsConfig {
     bool verify_peer = true;
     std::string sni_hostname;
     std::string min_version = "1.2";
+
+    bool operator==(const UpstreamTlsConfig& o) const {
+        return enabled == o.enabled && ca_file == o.ca_file &&
+               verify_peer == o.verify_peer && sni_hostname == o.sni_hostname &&
+               min_version == o.min_version;
+    }
+    bool operator!=(const UpstreamTlsConfig& o) const { return !(*this == o); }
 };
 
 struct UpstreamPoolConfig {
@@ -42,6 +49,16 @@ struct UpstreamPoolConfig {
     int idle_timeout_sec = 90;
     int max_lifetime_sec = 3600;
     int max_requests_per_conn = 0;
+
+    bool operator==(const UpstreamPoolConfig& o) const {
+        return max_connections == o.max_connections &&
+               max_idle_connections == o.max_idle_connections &&
+               connect_timeout_ms == o.connect_timeout_ms &&
+               idle_timeout_sec == o.idle_timeout_sec &&
+               max_lifetime_sec == o.max_lifetime_sec &&
+               max_requests_per_conn == o.max_requests_per_conn;
+    }
+    bool operator!=(const UpstreamPoolConfig& o) const { return !(*this == o); }
 };
 
 struct UpstreamConfig {
@@ -50,6 +67,12 @@ struct UpstreamConfig {
     int port = 80;
     UpstreamTlsConfig tls;
     UpstreamPoolConfig pool;
+
+    bool operator==(const UpstreamConfig& o) const {
+        return name == o.name && host == o.host && port == o.port &&
+               tls == o.tls && pool == o.pool;
+    }
+    bool operator!=(const UpstreamConfig& o) const { return !(*this == o); }
 };
 
 // NOTE: When adding fields, also update ConfigLoader::LoadFromString(),

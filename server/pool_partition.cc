@@ -495,6 +495,17 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
             }
         }
         outstanding_conns_.fetch_sub(1, std::memory_order_release);
+
+        // A slot just freed — retry queued checkouts. Without this, waiters
+        // sit until CHECKOUT_QUEUE_TIMEOUT even though capacity is available.
+        if (!shutting_down_ && !wait_queue_.empty() &&
+            TotalCount() < partition_max_connections_) {
+            auto entry = std::move(wait_queue_.front());
+            wait_queue_.pop_front();
+            CreateNewConnection(std::move(entry.ready_callback),
+                                std::move(entry.error_callback));
+        }
+
         MaybeSignalDrain();
     }
 }
@@ -526,6 +537,16 @@ void PoolPartition::ServiceWaitQueue() {
         auto entry = std::move(wait_queue_.front());
         wait_queue_.pop_front();
         entry.ready_callback(UpstreamLease(raw, this));
+    }
+
+    // If idle connections ran out (all stale) but waiters remain and capacity
+    // is available, create new connections for them instead of letting them
+    // sit until CHECKOUT_QUEUE_TIMEOUT.
+    while (!wait_queue_.empty() && TotalCount() < partition_max_connections_) {
+        auto entry = std::move(wait_queue_.front());
+        wait_queue_.pop_front();
+        CreateNewConnection(std::move(entry.ready_callback),
+                            std::move(entry.error_callback));
     }
 }
 
