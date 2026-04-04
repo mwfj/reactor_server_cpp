@@ -527,11 +527,21 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
         });
 
     // Wire error callback for EPOLLERR events (async reset, local error).
+    // Use the same timeout/shutdown distinction as the close callback.
     conn_handler->SetErrorCb(
-        [this, raw_conn, error_cb_copy]
+        [this, raw_conn, error_cb_copy, timed_out]
         (std::shared_ptr<ConnectionHandler>) {
             if (raw_conn->IsConnecting()) {
-                (*error_cb_copy)(CHECKOUT_CONNECT_FAILED);
+                int code;
+                if (shutting_down_ ||
+                    manager_shutting_down_.load(std::memory_order_acquire)) {
+                    code = CHECKOUT_SHUTTING_DOWN;
+                } else if (*timed_out) {
+                    code = CHECKOUT_CONNECT_TIMEOUT;
+                } else {
+                    code = CHECKOUT_CONNECT_FAILED;
+                }
+                (*error_cb_copy)(code);
             }
             OnConnectionClosed(raw_conn);
         });
@@ -726,28 +736,33 @@ void PoolPartition::ServiceWaitQueue() {
 }
 
 void PoolPartition::ScheduleWaitQueuePurge() {
-    // Self-rescheduling deferred purge for standalone mode (no external timer).
-    // Uses EnQueueDeferred (no wake — fires on next epoll_wait timeout ~1s
-    // or next HandleEventId drain from any EnQueue). Reschedules itself if
-    // waiters remain, ensuring CHECKOUT_QUEUE_TIMEOUT fires even with
-    // connect_timeout_ms > 1s. Does NOT use EnQueue to avoid busy-looping.
+    // Self-rescheduling purge for standalone mode (no external timer).
+    // Uses EnQueue (which wakes the dispatcher) to guarantee the task runs
+    // even under sustained I/O. To avoid busy-looping when entries haven't
+    // expired yet, each invocation checks a minimum reschedule interval
+    // (1s) before scheduling the next wake.
     //
     // In production (HttpServer), EvictExpired on the periodic timer handles
-    // this. UpstreamManager also adjusts dispatcher timer intervals at
-    // construction time. Purges also run from CheckoutAsync, ReturnConnection,
+    // this. Purges also run from CheckoutAsync, ReturnConnection,
     // ServiceWaitQueue, and EvictExpired on every pool operation.
-    //
-    // Limitation: under sustained I/O with no pool operations and no other
-    // EnQueue activity on the dispatcher, the deferred task may be delayed
-    // by up to the epoll_wait timeout (~1s). This is acceptable because
-    // connect_timeout_ms >= 1000ms (enforced by validation).
     if (!dispatcher_ || shutting_down_) return;
-    dispatcher_->EnQueueDeferred([this]() {
+    dispatcher_->EnQueue([this]() {
         if (shutting_down_) return;
         PurgeExpiredWaitEntries();
-        // Keep rescheduling as long as waiters remain
-        if (!wait_queue_.empty() && !shutting_down_) {
-            ScheduleWaitQueuePurge();
+        if (!wait_queue_.empty() && !shutting_down_ && dispatcher_) {
+            // Avoid re-waking immediately — use deferred for the next pass.
+            // Deferred fires on: (a) next epoll_wait timeout ~1s, or
+            // (b) next HandleEventId from any EnQueue. Under sustained I/O,
+            // (b) handles it since other pool/connection activity generates
+            // EnQueue calls. In the pathological case of zero activity,
+            // (a) fires within 1s which is within connect_timeout_ms (>=1s).
+            dispatcher_->EnQueueDeferred([this]() {
+                if (shutting_down_) return;
+                PurgeExpiredWaitEntries();
+                if (!wait_queue_.empty() && !shutting_down_) {
+                    ScheduleWaitQueuePurge();
+                }
+            });
         }
     });
 }

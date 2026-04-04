@@ -635,8 +635,12 @@ void HttpServer::Stop() {
                     WaitForH2Drain();
                 }
             }
-            // Upstream shutdown — after all protocol drains complete.
-            // In-flight proxy requests have had their chance to finish.
+            // Upstream shutdown — after H2/WS/H1 protocol drains.
+            // Known limitation: async H1 proxy handlers that haven't started
+            // writing their response are force-closed by NetServer's earlier
+            // CloseAfterWrite sweep (no buffered output → immediate close).
+            // This is inherent to the current shutdown model which was designed
+            // for synchronous handlers. H2 proxy handlers are fully drained.
             if (upstream_manager_) {
                 upstream_manager_->InitiateShutdown();
                 upstream_manager_->WaitForDrain(
