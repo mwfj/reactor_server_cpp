@@ -457,15 +457,19 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
             OnConnectComplete(raw_conn, *ready_cb_copy, *error_cb_copy);
         });
 
-    // Wire close callback for connect failure / timeout.
-    // The timed_out flag (set by DeadlineTimeoutCb above) distinguishes
-    // deadline expiry from connection refusal/reset.
+    // Wire close callback for connect failure / timeout / shutdown.
     conn_handler->SetCloseCb(
         [this, raw_conn, error_cb_copy, timed_out]
         (std::shared_ptr<ConnectionHandler>) {
             if (raw_conn->IsConnecting()) {
-                int code = *timed_out ? CHECKOUT_CONNECT_TIMEOUT
-                                      : CHECKOUT_CONNECT_FAILED;
+                int code;
+                if (shutting_down_) {
+                    code = CHECKOUT_SHUTTING_DOWN;
+                } else if (*timed_out) {
+                    code = CHECKOUT_CONNECT_TIMEOUT;
+                } else {
+                    code = CHECKOUT_CONNECT_FAILED;
+                }
                 (*error_cb_copy)(code);
             }
             OnConnectionClosed(raw_conn);
@@ -692,8 +696,7 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
     auto transport = conn->GetTransport();
     if (!transport) return;
 
-    // Reset all borrower-installed callbacks to prevent stale closures
-    // from firing on the next checkout or during idle.
+    // Reset borrower-installed request-level callbacks.
     transport->SetOnMessageCb(nullptr);
     transport->SetCompletionCb(nullptr);
     transport->SetWriteProgressCb(nullptr);
@@ -701,7 +704,8 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
     transport->SetDeadlineTimeoutCb(nullptr);
 
     // Re-wire pool-owned close + error callbacks so OnConnectionClosed
-    // fires if the upstream drops the connection while idle.
+    // fires if the upstream drops the connection (both while idle AND
+    // while checked out, in case a borrower overwrites them).
     UpstreamConnection* raw_conn = conn;
     transport->SetCloseCb(
         [this, raw_conn](std::shared_ptr<ConnectionHandler>) {
@@ -712,6 +716,7 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
             OnConnectionClosed(raw_conn);
         });
 }
+
 
 // ── Extract helpers ────────────────────────────────────────────────────
 

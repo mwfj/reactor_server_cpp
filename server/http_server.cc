@@ -787,11 +787,11 @@ void HttpServer::Stop() {
 
     net_server_.Stop();
 
-    // Destroy upstream pools AFTER dispatchers are stopped and joined.
-    // This ensures no UpstreamLease can call ReturnConnection() after
-    // the PoolPartition is freed. Dispatcher threads are dead at this
-    // point — all handler code has completed and all leases released.
-    upstream_manager_.reset();
+    // Do NOT reset upstream_manager_ here. In the stop-from-handler case,
+    // the calling handler is still on the stack and may hold an UpstreamLease
+    // that destructs when the handler unwinds. upstream_manager_ must outlive
+    // all handler stack frames. It is destroyed naturally by ~HttpServer()
+    // after Stop() returns and all stack frames have unwound.
 
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);

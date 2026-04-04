@@ -57,7 +57,12 @@ public:
     uint64_t request_count() const { return request_count_; }
     void IncrementRequestCount();
 
-    // Access to underlying transport
+    // Access to underlying transport.
+    // IMPORTANT: Borrowers MUST NOT overwrite SetCloseCb or SetErrorCb
+    // on the transport — these are owned by the pool for lifecycle tracking.
+    // Use SetOnMessageCb, SetCompletionCb, and SetWriteProgressCb for
+    // request-level I/O. Overwriting close/error callbacks causes the pool
+    // to lose track of upstream disconnections until the lease is returned.
     std::shared_ptr<ConnectionHandler> GetTransport() const { return conn_; }
 
 private:
