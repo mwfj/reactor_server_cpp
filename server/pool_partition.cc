@@ -185,12 +185,20 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     // Check if expired
     if (owned->IsExpired(config_.max_lifetime_sec, config_.max_requests_per_conn)) {
         DestroyConnection(std::move(owned));
+        // Retry all queued waiters while capacity is available. Loop so
+        // synchronous CreateNewConnection failures (e.g., ECONNREFUSED)
+        // don't strand remaining waiters.
         PurgeExpiredWaitEntries();
-        if (!wait_queue_.empty() && TotalCount() < partition_max_connections_) {
+        while (!shutting_down_ &&
+               !manager_shutting_down_.load(std::memory_order_acquire) &&
+               !wait_queue_.empty() &&
+               TotalCount() < partition_max_connections_) {
             auto entry = std::move(wait_queue_.front());
             wait_queue_.pop_front();
+            size_t count_before = TotalCount();
             CreateNewConnection(std::move(entry.ready_callback),
                                 std::move(entry.error_callback));
+            if (TotalCount() > count_before) break;
         }
         return;
     }
@@ -217,11 +225,17 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
             // If waiters exist but connection is invalid, create a replacement.
             bool has_waiters = !wait_queue_.empty();
             DestroyConnection(std::move(owned));
-            if (has_waiters && TotalCount() < partition_max_connections_) {
+            PurgeExpiredWaitEntries();
+            while (!shutting_down_ &&
+                   !manager_shutting_down_.load(std::memory_order_acquire) &&
+                   !wait_queue_.empty() &&
+                   TotalCount() < partition_max_connections_) {
                 auto entry = std::move(wait_queue_.front());
                 wait_queue_.pop_front();
+                size_t count_before = TotalCount();
                 CreateNewConnection(std::move(entry.ready_callback),
                                     std::move(entry.error_callback));
+                if (TotalCount() > count_before) break;
             }
         }
         return;
@@ -714,13 +728,19 @@ void PoolPartition::ServiceWaitQueue() {
 void PoolPartition::ScheduleWaitQueuePurge() {
     // Self-rescheduling deferred purge for standalone mode (no external timer).
     // Uses EnQueueDeferred (no wake — fires on next epoll_wait timeout ~1s
-    // or next HandleEventId drain). Reschedules itself if waiters remain,
-    // ensuring CHECKOUT_QUEUE_TIMEOUT fires even with connect_timeout_ms > 1s.
-    // Does NOT use EnQueue to avoid busy-looping under pool saturation.
+    // or next HandleEventId drain from any EnQueue). Reschedules itself if
+    // waiters remain, ensuring CHECKOUT_QUEUE_TIMEOUT fires even with
+    // connect_timeout_ms > 1s. Does NOT use EnQueue to avoid busy-looping.
     //
     // In production (HttpServer), EvictExpired on the periodic timer handles
-    // this. Purges also run from CheckoutAsync, ReturnConnection, and
-    // ServiceWaitQueue on every pool operation.
+    // this. UpstreamManager also adjusts dispatcher timer intervals at
+    // construction time. Purges also run from CheckoutAsync, ReturnConnection,
+    // ServiceWaitQueue, and EvictExpired on every pool operation.
+    //
+    // Limitation: under sustained I/O with no pool operations and no other
+    // EnQueue activity on the dispatcher, the deferred task may be delayed
+    // by up to the epoll_wait timeout (~1s). This is acceptable because
+    // connect_timeout_ms >= 1000ms (enforced by validation).
     if (!dispatcher_ || shutting_down_) return;
     dispatcher_->EnQueueDeferred([this]() {
         if (shutting_down_) return;

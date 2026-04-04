@@ -4,6 +4,7 @@
 
 #include <openssl/ssl.h>
 #include <signal.h>
+#include <limits>
 
 // Suppress SIGPIPE for TLS upstream connections. SSL_write uses the
 // underlying socket's write() which bypasses MSG_NOSIGNAL. Without
@@ -69,6 +70,27 @@ UpstreamManager::UpstreamManager(
             upstream.tls.sni_hostname,
             upstream.pool, dispatchers, tls_ctx,
             outstanding_conns_, shutting_down_, drain_mtx_, drain_cv_);
+    }
+
+    // Adjust dispatcher timer intervals for upstream timeout enforcement.
+    // Without this, standalone dispatchers use their default interval (often
+    // 60s), making connect_timeout_ms and idle_timeout_sec fire tens of
+    // seconds late. HttpServer::MarkServerReady does this for production;
+    // this covers standalone UpstreamManager usage.
+    int min_upstream_sec = std::numeric_limits<int>::max();
+    for (const auto& u : upstreams) {
+        int connect_sec = std::max((u.pool.connect_timeout_ms + 999) / 1000, 1);
+        min_upstream_sec = std::min(min_upstream_sec, connect_sec);
+        if (u.pool.idle_timeout_sec > 0) {
+            min_upstream_sec = std::min(min_upstream_sec, u.pool.idle_timeout_sec);
+        }
+    }
+    if (min_upstream_sec < std::numeric_limits<int>::max()) {
+        for (auto& disp : dispatchers_) {
+            disp->EnQueue([disp, min_upstream_sec]() {
+                disp->SetTimerInterval(min_upstream_sec);
+            });
+        }
     }
 
     logging::Get()->info("UpstreamManager initialized with {} upstream(s)",
