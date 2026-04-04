@@ -127,13 +127,12 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
             std::move(error_cb),
             std::chrono::steady_clock::now()
         });
-        // Schedule a deferred purge so queued checkouts get QUEUE_TIMEOUT
-        // even in standalone mode without an external eviction timer.
-        // EnQueueDeferred runs on the next epoll_wait timeout (~1s).
-        if (dispatcher_) {
-            dispatcher_->EnQueueDeferred([this]() {
-                PurgeExpiredWaitEntries();
-            });
+        // Ensure queued checkouts eventually get CHECKOUT_QUEUE_TIMEOUT.
+        // In production (HttpServer), the timer callback calls EvictExpired
+        // periodically. In standalone mode, we schedule a self-rescheduling
+        // purge task that checks timestamps each iteration.
+        if (dispatcher_ && !shutting_down_) {
+            ScheduleWaitQueuePurge();
         }
         return;
     }
@@ -325,8 +324,18 @@ void PoolPartition::ForceCloseActive() {
     // lease destructor calls ReturnConnection(), it finds the connection
     // in zombie_conns_, cleans it up, and decrements outstanding_conns_.
     for (auto& conn : active_conns_) {
-        ClearTransportCallbacks(conn.get());
         auto transport = conn->GetTransport();
+        // Notify the borrower of upstream abort BEFORE clearing callbacks.
+        // Without this, a borrower waiting on SetOnMessageCb hangs until
+        // an external timeout because ClearTransportCallbacks nulls everything.
+        if (transport && conn->IsInUse()) {
+            auto& on_msg = transport->GetOnMessageCb();
+            if (on_msg) {
+                std::string empty;
+                try { on_msg(transport, empty); } catch (...) {}
+            }
+        }
+        ClearTransportCallbacks(conn.get());
         if (transport) {
             transport->ClearDeadline();
             int conn_fd = conn->fd();
@@ -610,13 +619,22 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
         }
 
         // A slot just freed — retry queued checkouts (purge expired first).
+        // Use a loop: if CreateNewConnection fails synchronously (e.g.,
+        // ECONNREFUSED), TotalCount() stays low and the next waiter should
+        // also get a chance instead of stalling until queue timeout.
         PurgeExpiredWaitEntries();
-        if (!shutting_down_ && !wait_queue_.empty() &&
-            TotalCount() < partition_max_connections_) {
+        while (!shutting_down_ && !wait_queue_.empty() &&
+               TotalCount() < partition_max_connections_) {
             auto entry = std::move(wait_queue_.front());
             wait_queue_.pop_front();
+            size_t count_before = TotalCount();
             CreateNewConnection(std::move(entry.ready_callback),
                                 std::move(entry.error_callback));
+            // If CreateNewConnection increased TotalCount, it succeeded
+            // (async connect started). Stop — the next waiter will be
+            // serviced when this connection completes or returns.
+            if (TotalCount() > count_before) break;
+            // Otherwise it failed synchronously — try the next waiter.
         }
 
         MaybeSignalDrain();
@@ -667,6 +685,17 @@ void PoolPartition::ServiceWaitQueue() {
         CreateNewConnection(std::move(entry.ready_callback),
                             std::move(entry.error_callback));
     }
+}
+
+void PoolPartition::ScheduleWaitQueuePurge() {
+    // Schedule a purge via EnQueue (wakes the event loop). The purge is a
+    // no-op if no entries have expired yet. In production, the timer callback
+    // provides periodic purges. For standalone use, this ensures at least one
+    // purge runs after each queued checkout. Subsequent purges are triggered
+    // by CheckoutAsync, ReturnConnection, ServiceWaitQueue, and EvictExpired.
+    dispatcher_->EnQueue([this]() {
+        PurgeExpiredWaitEntries();
+    });
 }
 
 void PoolPartition::PurgeExpiredWaitEntries() {

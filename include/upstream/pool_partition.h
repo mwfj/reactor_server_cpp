@@ -117,6 +117,7 @@ private:
     bool ValidateConnection(UpstreamConnection* conn);
     void ServiceWaitQueue();
     void PurgeExpiredWaitEntries();
+    void ScheduleWaitQueuePurge();
     void DestroyConnection(std::unique_ptr<UpstreamConnection> conn);
 
     // Re-wire pool-owned close/error callbacks on a connection's transport.
