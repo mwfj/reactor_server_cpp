@@ -410,37 +410,6 @@ void HttpServer::Stop() {
     // accepted in the gap would miss the 1001 "Going Away" close frame.
     net_server_.StopAccepting();
 
-    // Upstream pool shutdown — before WS/H2 drain so upstream responses
-    // can still flow while dispatchers are running.
-    if (upstream_manager_) {
-        upstream_manager_->InitiateShutdown();
-
-        auto drain_timeout = std::chrono::seconds(
-            shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
-
-        if (!net_server_.IsOnDispatcherThread()) {
-            upstream_manager_->WaitForDrain(drain_timeout);
-        } else {
-            // Stop-from-handler: poll + pump tasks (same pattern as H2 drain).
-            // Limitation: upstream I/O pinned to this dispatcher cannot make
-            // progress because we can't return to the event loop while the
-            // handler is still on the call stack. Same-dispatcher upstream
-            // requests will be force-closed on timeout. This is inherent to
-            // stop-from-handler and matches the existing H2 degraded drain.
-            logging::Get()->warn("Upstream drain: stop-from-handler, "
-                                 "using task pump");
-            static constexpr int PUMP_INTERVAL_MS = 200;
-            auto deadline = std::chrono::steady_clock::now() + drain_timeout;
-            while (std::chrono::steady_clock::now() < deadline) {
-                net_server_.ProcessSelfDispatcherTasks();
-                if (upstream_manager_->AllDrained()) break;
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(PUMP_INTERVAL_MS));
-            }
-            upstream_manager_->ForceCloseRemaining();
-        }
-    }
-
     // Collect WS connections while holding the lock, then send close frames
     // AFTER releasing. Sending under the lock would deadlock: a failed inline
     // write in DoSendRaw → CallCloseCb → HandleCloseConnection → conn_mtx_.
@@ -787,6 +756,32 @@ void HttpServer::Stop() {
                 }
             }
         });
+    }
+
+    // Upstream pool shutdown — AFTER WS/H2 drain so in-flight proxy requests
+    // from already-accepted connections have a chance to complete before
+    // checkouts are rejected. Dispatchers are still running at this point.
+    if (upstream_manager_) {
+        upstream_manager_->InitiateShutdown();
+
+        auto drain_timeout = std::chrono::seconds(
+            shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
+
+        if (!net_server_.IsOnDispatcherThread()) {
+            upstream_manager_->WaitForDrain(drain_timeout);
+        } else {
+            logging::Get()->warn("Upstream drain: stop-from-handler, "
+                                 "using task pump");
+            static constexpr int PUMP_INTERVAL_MS = 200;
+            auto deadline = std::chrono::steady_clock::now() + drain_timeout;
+            while (std::chrono::steady_clock::now() < deadline) {
+                net_server_.ProcessSelfDispatcherTasks();
+                if (upstream_manager_->AllDrained()) break;
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(PUMP_INTERVAL_MS));
+            }
+            upstream_manager_->ForceCloseRemaining();
+        }
     }
 
     net_server_.Stop();

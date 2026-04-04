@@ -469,11 +469,16 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
                                           upstream_host_, upstream_port_,
                                           e.what());
                     (*error_cb_copy)(CHECKOUT_CONNECT_FAILED);
-                    // Clear callbacks BEFORE ForceClose to prevent the close
-                    // callback from firing error_cb a second time. ForceClose
-                    // triggers CallCloseCb → close callback, which would
-                    // check IsConnecting() and call error_cb again.
+                    // Capture fd BEFORE ForceClose — ForceClose releases it
+                    // (fd becomes -1), so OnConnectionClosed wouldn't be able
+                    // to remove the handler from the dispatcher's timer map.
+                    int pre_close_fd = handler ? handler->fd() : -1;
                     ClearTransportCallbacks(raw_conn);
+                    // Remove from timer map BEFORE ForceClose while fd is valid
+                    if (pre_close_fd >= 0 && handler) {
+                        dispatcher_->RemoveTimerConnectionIfMatch(
+                            pre_close_fd, handler);
+                    }
                     if (handler && !handler->IsClosing()) {
                         handler->ForceClose();
                     }
@@ -707,22 +712,19 @@ void PoolPartition::ServiceWaitQueue() {
 }
 
 void PoolPartition::ScheduleWaitQueuePurge() {
-    // Self-rescheduling purge for standalone mode (no external timer).
-    // Uses EnQueue (which wakes the event loop) so the task runs even
-    // under sustained I/O. PurgeExpiredWaitEntries is a no-op on
-    // unexpired entries, so early runs cost one wake + timestamp check.
-    // Reschedules itself (also via EnQueue) until the queue empties or
-    // all entries expire. The chain terminates because either:
-    //   a) Entries expire → PurgeExpiredWaitEntries removes them → queue empties
-    //   b) Other pool activity (return/close) services or purges the queue
-    //   c) Shutdown sets shutting_down_ → early return
+    // Schedule a single deferred purge as a safety net for standalone mode.
+    // EnQueueDeferred fires on the next epoll_wait timeout (~1s) or
+    // HandleEventId drain. Does NOT self-reschedule to avoid busy-looping.
+    //
+    // In production (HttpServer), EvictExpired runs on the periodic timer
+    // and calls PurgeExpiredWaitEntries. In standalone mode, purges also
+    // run from CheckoutAsync, ReturnConnection, and ServiceWaitQueue on
+    // every pool operation. This deferred task is a fallback for the case
+    // where no pool operations occur for a while.
     if (!dispatcher_ || shutting_down_) return;
-    dispatcher_->EnQueue([this]() {
+    dispatcher_->EnQueueDeferred([this]() {
         if (shutting_down_) return;
         PurgeExpiredWaitEntries();
-        if (!wait_queue_.empty() && !shutting_down_) {
-            ScheduleWaitQueuePurge();
-        }
     });
 }
 
