@@ -1219,6 +1219,7 @@ void TestUpstreamHostPoolPartitionCount() {
 
         UpstreamConfig ucfg = MakeUpstreamConfig("svc", "127.0.0.1", 9001);
         std::atomic<int64_t> outstanding{0};
+        std::atomic<bool> mgr_shutdown{false};
         std::mutex drain_mtx;
         std::condition_variable drain_cv;
 
@@ -1226,7 +1227,7 @@ void TestUpstreamHostPoolPartitionCount() {
             ucfg.name, ucfg.host, ucfg.port,
             ucfg.tls.sni_hostname,
             ucfg.pool, {d0, d1}, nullptr,
-            outstanding, drain_mtx, drain_cv);
+            outstanding, mgr_shutdown, drain_mtx, drain_cv);
 
         bool pass = true;
         std::string err;
@@ -1268,6 +1269,7 @@ void TestUpstreamHostPoolAccessors() {
 
         UpstreamConfig ucfg = MakeUpstreamConfig("my-service", "10.0.0.1", 7777);
         std::atomic<int64_t> outstanding{0};
+        std::atomic<bool> mgr_shutdown{false};
         std::mutex drain_mtx;
         std::condition_variable drain_cv;
 
@@ -1275,7 +1277,7 @@ void TestUpstreamHostPoolAccessors() {
             ucfg.name, ucfg.host, ucfg.port,
             ucfg.tls.sni_hostname,
             ucfg.pool, {dispatcher}, nullptr,
-            outstanding, drain_mtx, drain_cv);
+            outstanding, mgr_shutdown, drain_mtx, drain_cv);
 
         bool pass = true;
         std::string err;

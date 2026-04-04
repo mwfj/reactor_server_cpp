@@ -32,6 +32,7 @@ PoolPartition::PoolPartition(
     const UpstreamPoolConfig& config,
     std::shared_ptr<TlsClientContext> tls_ctx,
     std::atomic<int64_t>& outstanding_conns,
+    std::atomic<bool>& manager_shutting_down,
     std::mutex& drain_mtx,
     std::condition_variable& drain_cv)
     : dispatcher_(std::move(dispatcher))
@@ -41,6 +42,7 @@ PoolPartition::PoolPartition(
     , config_(config)
     , tls_ctx_(std::move(tls_ctx))
     , outstanding_conns_(outstanding_conns)
+    , manager_shutting_down_(manager_shutting_down)
     , drain_mtx_(drain_mtx)
     , drain_cv_(drain_cv)
     , partition_max_connections_(static_cast<size_t>(config.max_connections))
@@ -173,7 +175,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     // Check if expired
     if (owned->IsExpired(config_.max_lifetime_sec, config_.max_requests_per_conn)) {
         DestroyConnection(std::move(owned));
-        // If waiters are queued, create a replacement
+        PurgeExpiredWaitEntries();
         if (!wait_queue_.empty() && TotalCount() < partition_max_connections_) {
             auto entry = std::move(wait_queue_.front());
             wait_queue_.pop_front();
@@ -188,6 +190,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     // max_idle_connections=0 starves queued checkouts even though capacity
     // just freed.
     if (idle_conns_.size() >= static_cast<size_t>(config_.max_idle_connections)) {
+        PurgeExpiredWaitEntries();
         if (!wait_queue_.empty() && ValidateConnection(owned.get())) {
             // Hand directly to the next waiter (validated — not dead/expired)
             static constexpr auto FAR_FUTURE_HANDOFF = std::chrono::hours(24 * 365);
@@ -521,7 +524,11 @@ void PoolPartition::OnConnectComplete(UpstreamConnection* conn,
         return;
     }
 
-    if (shutting_down_) {
+    // Check both partition-local flag AND manager-wide flag. The manager flag
+    // is set immediately by InitiateShutdown(); the partition flag is set later
+    // by the enqueued task. Without checking both, a connect that completes
+    // between the two can deliver a lease after Stop() has begun.
+    if (shutting_down_ || manager_shutting_down_.load(std::memory_order_acquire)) {
         DestroyConnection(std::move(owned));
         error_cb(CHECKOUT_SHUTTING_DOWN);
         return;
@@ -585,7 +592,8 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
             outstanding_conns_.fetch_sub(1, std::memory_order_release);
         }
 
-        // A slot just freed — retry queued checkouts.
+        // A slot just freed — retry queued checkouts (purge expired first).
+        PurgeExpiredWaitEntries();
         if (!shutting_down_ && !wait_queue_.empty() &&
             TotalCount() < partition_max_connections_) {
             auto entry = std::move(wait_queue_.front());

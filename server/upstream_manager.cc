@@ -68,7 +68,7 @@ UpstreamManager::UpstreamManager(
             upstream.name, upstream.host, upstream.port,
             upstream.tls.sni_hostname,
             upstream.pool, dispatchers, tls_ctx,
-            outstanding_conns_, drain_mtx_, drain_cv_);
+            outstanding_conns_, shutting_down_, drain_mtx_, drain_cv_);
     }
 
     logging::Get()->info("UpstreamManager initialized with {} upstream(s)",

@@ -30,6 +30,7 @@ public:
                   const UpstreamPoolConfig& config,
                   std::shared_ptr<TlsClientContext> tls_ctx,
                   std::atomic<int64_t>& outstanding_conns,
+                  std::atomic<bool>& manager_shutting_down,
                   std::mutex& drain_mtx,
                   std::condition_variable& drain_cv);
     ~PoolPartition();
@@ -78,6 +79,7 @@ private:
 
     // Manager-owned drain coordination — partitions signal when empty
     std::atomic<int64_t>& outstanding_conns_;
+    std::atomic<bool>& manager_shutting_down_;  // Set immediately by manager
     std::mutex& drain_mtx_;
     std::condition_variable& drain_cv_;
 
