@@ -36,6 +36,11 @@ public:
     // Returns: >0 bytes read, TLS_COMPLETE (would_block), TLS_CROSS_RW, TLS_PEER_CLOSED, or TLS_ERROR
     int Read(char* buf, size_t len);
 
+    // Non-destructive peek: returns >0 if application data is buffered,
+    // TLS_COMPLETE if no app data (benign TLS record consumed internally),
+    // TLS_PEER_CLOSED if close_notify, or TLS_ERROR.
+    int Peek(char* buf, size_t len);
+
     // Returns: >0 bytes written, TLS_COMPLETE (would_block), TLS_CROSS_RW, or TLS_ERROR
     int Write(const char* buf, size_t len);
 

@@ -61,16 +61,14 @@ void HttpServer::MarkServerReady() {
         dispatchers[i]->SetDispatcherIndex(static_cast<int>(i));
     }
 
-    // Create upstream pool manager if upstreams are configured
+    // Create upstream pool manager if upstreams are configured.
+    // This is fatal: if upstreams are explicitly configured, the server
+    // cannot serve proxy traffic without them. Letting the exception
+    // propagate prevents the server from starting with a broken config
+    // that would turn boot-time errors into request-time proxy failures.
     if (!upstream_configs_.empty()) {
-        try {
-            upstream_manager_ = std::make_unique<UpstreamManager>(
-                upstream_configs_, dispatchers);
-        } catch (const std::exception& e) {
-            logging::Get()->error("Failed to create UpstreamManager: {}",
-                                  e.what());
-            // Non-fatal — server starts without upstream pools
-        }
+        upstream_manager_ = std::make_unique<UpstreamManager>(
+            upstream_configs_, dispatchers);
 
         // Ensure the timer cadence is fast enough for upstream connect timeouts.
         // SetDeadline stores a ms-precision deadline, but TimerHandler only fires

@@ -1,4 +1,5 @@
 #include "upstream/upstream_connection.h"
+#include "tls/tls_connection.h"
 #include "log/logger.h"
 #include <poll.h>
 
@@ -74,11 +75,23 @@ bool UpstreamConnection::IsAlive() const {
         return false;
     }
     if (pfd.revents & POLLIN) {
-        // Unexpected data on idle — could be RST, half-close, close_notify,
-        // stale application bytes, or a benign TLS 1.3 NewSessionTicket.
-        // We can't distinguish without SSL_peek, so treat all POLLIN as
-        // non-reusable. The cost of an extra TCP/TLS handshake is lower than
-        // the risk of handing a dirty/closing socket to the next borrower.
+        // For TLS connections, POLLIN may be a benign post-handshake record
+        // (e.g., TLS 1.3 NewSessionTicket). Use SSL_peek to distinguish:
+        // - TLS_COMPLETE (WANT_READ): benign record consumed internally → alive
+        // - >0: stale application data buffered → not reusable
+        // - TLS_PEER_CLOSED / TLS_ERROR: close_notify or error → dead
+        if (conn_ && conn_->IsTlsReady()) {
+            char peek_buf[1];
+            int peek_result = conn_->TlsPeek(peek_buf, sizeof(peek_buf));
+            if (peek_result == TlsConnection::TLS_COMPLETE) {
+                // Benign TLS record consumed (e.g., NewSessionTicket) — still alive
+                return true;
+            }
+            logging::Get()->debug("UpstreamConnection fd={} TLS peek returned {}, "
+                                  "marking non-reusable", conn_fd, peek_result);
+            return false;
+        }
+        // For raw TCP: unexpected data on idle — likely RST or half-close
         logging::Get()->debug("UpstreamConnection fd={} POLLIN while idle, "
                               "marking non-reusable", conn_fd);
         return false;

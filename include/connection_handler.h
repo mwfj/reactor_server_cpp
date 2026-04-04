@@ -108,6 +108,13 @@ public:
 
     // Returns true if this connection has TLS (any state: handshake or ready).
     bool HasTls() const { return tls_state_ != TlsState::NONE; }
+    // Returns true if TLS is fully established (handshake complete).
+    bool IsTlsReady() const { return tls_state_ == TlsState::READY; }
+
+    // Non-destructive TLS peek for idle connection validation.
+    // Returns: >0 (app data buffered — stale), TLS_COMPLETE (clean — benign
+    // record consumed), TLS_PEER_CLOSED, TLS_ERROR. Only valid when IsTlsReady().
+    int TlsPeek(char* buf, size_t len);
 
     // Enqueue a task to run on this connection's dispatcher thread.
     // Thread-safe. Used by protocol layers that need dispatcher-thread

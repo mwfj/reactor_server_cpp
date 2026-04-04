@@ -93,6 +93,16 @@ int TlsConnection::Read(char* buf, size_t len) {
     return TLS_ERROR;
 }
 
+int TlsConnection::Peek(char* buf, size_t len) {
+    int ret = SSL_peek(ssl_, buf, static_cast<int>(len));
+    if (ret > 0) return ret;  // Application data is buffered
+
+    int err = SSL_get_error(ssl_, ret);
+    if (err == SSL_ERROR_WANT_READ) return TLS_COMPLETE;      // No app data (benign record consumed)
+    if (err == SSL_ERROR_ZERO_RETURN) return TLS_PEER_CLOSED;  // close_notify received
+    return TLS_ERROR;
+}
+
 int TlsConnection::Write(const char* buf, size_t len) {
     int ret = SSL_write(ssl_, buf, static_cast<int>(len));
     if (ret > 0) return ret;

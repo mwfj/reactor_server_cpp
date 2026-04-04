@@ -108,6 +108,13 @@ void ConnectionHandler::SetConnectCompleteCallback(ConnectCompleteCallback cb) {
     connect_complete_callback_ = std::move(cb);
 }
 
+int ConnectionHandler::TlsPeek(char* buf, size_t len) {
+    if (tls_state_ != TlsState::READY || !tls_) {
+        return TlsConnection::TLS_ERROR;
+    }
+    return tls_->Peek(buf, len);
+}
+
 int ConnectionHandler::dispatcher_index() const {
     return event_dispatcher_ ? event_dispatcher_->dispatcher_index() : -1;
 }
