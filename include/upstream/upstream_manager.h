@@ -54,6 +54,10 @@ private:
     // All dispatchers (for shutdown coordination)
     std::vector<std::shared_ptr<Dispatcher>> dispatchers_;
 
+    // Set immediately by InitiateShutdown — checked by CheckoutAsync to
+    // reject new checkouts before per-partition shutdown tasks execute.
+    std::atomic<bool> shutting_down_{false};
+
     // Manager-owned atomic counter: total outstanding connections
     std::atomic<int64_t> outstanding_conns_{0};
 

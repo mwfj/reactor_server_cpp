@@ -32,6 +32,7 @@ PoolPartition::PoolPartition(
     const UpstreamPoolConfig& config,
     std::shared_ptr<TlsClientContext> tls_ctx,
     std::atomic<int64_t>& outstanding_conns,
+    std::mutex& drain_mtx,
     std::condition_variable& drain_cv)
     : dispatcher_(std::move(dispatcher))
     , upstream_host_(upstream_host)
@@ -40,6 +41,7 @@ PoolPartition::PoolPartition(
     , config_(config)
     , tls_ctx_(std::move(tls_ctx))
     , outstanding_conns_(outstanding_conns)
+    , drain_mtx_(drain_mtx)
     , drain_cv_(drain_cv)
     , partition_max_connections_(static_cast<size_t>(config.max_connections))
 {
@@ -674,6 +676,14 @@ void PoolPartition::DestroyConnection(
 void PoolPartition::MaybeSignalDrain() {
     if (shutting_down_ &&
         outstanding_conns_.load(std::memory_order_acquire) <= 0) {
+        // Lock drain_mtx_ before notify to prevent lost wakeups.
+        // Without this, the waiter can check the predicate (sees non-zero),
+        // we decrement + notify, then the waiter enters wait_until and
+        // misses the notification. The lock serializes the notify with
+        // the waiter's predicate check + wait transition.
+        {
+            std::lock_guard<std::mutex> lck(drain_mtx_);
+        }
         drain_cv_.notify_all();
     }
 }

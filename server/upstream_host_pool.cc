@@ -10,6 +10,7 @@ UpstreamHostPool::UpstreamHostPool(
     const std::vector<std::shared_ptr<Dispatcher>>& dispatchers,
     std::shared_ptr<TlsClientContext> tls_ctx,
     std::atomic<int64_t>& outstanding_conns,
+    std::mutex& drain_mtx,
     std::condition_variable& drain_cv)
     : service_name_(service_name)
     , host_(host)
@@ -48,7 +49,7 @@ UpstreamHostPool::UpstreamHostPool(
 
         partitions_.push_back(std::make_unique<PoolPartition>(
             dispatchers[i], host, port, sni_hostname, partition_config, tls_ctx,
-            outstanding_conns, drain_cv));
+            outstanding_conns, drain_mtx, drain_cv));
     }
 
     // Warn if effective cap exceeds configured cap due to per-partition minimum of 1

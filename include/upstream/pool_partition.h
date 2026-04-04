@@ -30,6 +30,7 @@ public:
                   const UpstreamPoolConfig& config,
                   std::shared_ptr<TlsClientContext> tls_ctx,
                   std::atomic<int64_t>& outstanding_conns,
+                  std::mutex& drain_mtx,
                   std::condition_variable& drain_cv);
     ~PoolPartition();
 
@@ -75,8 +76,9 @@ private:
     UpstreamPoolConfig config_;
     std::shared_ptr<TlsClientContext> tls_ctx_;
 
-    // Manager-owned atomic counter — partitions increment/decrement
+    // Manager-owned drain coordination — partitions signal when empty
     std::atomic<int64_t>& outstanding_conns_;
+    std::mutex& drain_mtx_;
     std::condition_variable& drain_cv_;
 
     // Idle connections (front = most recently used, LRU eviction from back)

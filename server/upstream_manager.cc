@@ -42,7 +42,7 @@ UpstreamManager::UpstreamManager(
             upstream.name, upstream.host, upstream.port,
             upstream.tls.sni_hostname,
             upstream.pool, dispatchers, tls_ctx,
-            outstanding_conns_, drain_cv_);
+            outstanding_conns_, drain_mtx_, drain_cv_);
     }
 
     logging::Get()->info("UpstreamManager initialized with {} upstream(s)",
@@ -58,6 +58,13 @@ void UpstreamManager::CheckoutAsync(
     size_t dispatcher_index,
     PoolPartition::ReadyCallback ready_cb,
     PoolPartition::ErrorCallback error_cb) {
+
+    // Reject immediately if shutdown has started — the per-partition
+    // InitiateShutdown tasks may not have executed yet on all dispatchers.
+    if (shutting_down_.load(std::memory_order_acquire)) {
+        error_cb(PoolPartition::CHECKOUT_SHUTTING_DOWN);
+        return;
+    }
 
     auto it = pools_.find(service_name);
     if (it == pools_.end()) {
@@ -86,6 +93,10 @@ void UpstreamManager::EvictExpired(size_t dispatcher_index) {
 
 void UpstreamManager::InitiateShutdown() {
     logging::Get()->info("UpstreamManager initiating shutdown");
+    // Set the atomic flag BEFORE enqueueing per-partition shutdown tasks.
+    // CheckoutAsync checks this flag synchronously, preventing new checkouts
+    // between the flag set and the per-partition InitiateShutdown execution.
+    shutting_down_.store(true, std::memory_order_release);
     for (auto& [name, pool] : pools_) {
         pool->InitiateShutdown();
     }

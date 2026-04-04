@@ -74,7 +74,14 @@ bool UpstreamConnection::IsAlive() const {
         return false;
     }
     if (pfd.revents & POLLIN) {
-        // Unexpected data on idle connection — likely RST or half-close
+        // For TLS connections, POLLIN on idle is often benign: TLS 1.3 servers
+        // send post-handshake records (NewSessionTicket) on keep-alive sockets.
+        // Destroying these connections defeats connection reuse for HTTPS pools.
+        // The SSL layer will handle the data on next use.
+        if (conn_ && conn_->HasTls()) {
+            return true;
+        }
+        // For raw TCP: unexpected data on idle — likely RST or half-close
         logging::Get()->debug("UpstreamConnection fd={} unexpected POLLIN "
                               "while idle", conn_fd);
         return false;

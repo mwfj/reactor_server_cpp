@@ -657,10 +657,14 @@ void ConnectionHandler::CallWriteCb(){
             // would stall — no new EPOLLOUT fires on an already-writable socket.
             if (tls_state_ == TlsState::HANDSHAKE) {
                 // Fall through to existing TLS handshake handler below
+            } else if (output_bf_.Size() > 0) {
+                // The connect-complete callback sent data (e.g., HTTP request).
+                // Fall through to the write logic below to flush it. Returning
+                // here would consume the only EPOLLOUT edge from connect() —
+                // with ET mode, no new edge fires on an already-writable socket,
+                // so the buffered request would stall indefinitely.
             } else {
-                if (output_bf_.Size() == 0) {
-                    client_channel_->DisableWriteMode();
-                }
+                client_channel_->DisableWriteMode();
                 return;
             }
         } else {
