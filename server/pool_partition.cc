@@ -94,9 +94,12 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
             continue;
         }
 
-        // Valid idle connection found — activate and deliver synchronously
+        // Valid idle connection found — activate and deliver synchronously.
+        // Set far-future deadline to suppress server-wide idle timeout.
+        static constexpr auto FAR_FUTURE_CHECKOUT = std::chrono::hours(24 * 365);
         conn->MarkInUse();
-        conn->GetTransport()->ClearDeadline();
+        conn->GetTransport()->SetDeadline(
+            std::chrono::steady_clock::now() + FAR_FUTURE_CHECKOUT);
         UpstreamConnection* raw = conn.get();
         active_conns_.push_back(std::move(conn));
         ready_cb(UpstreamLease(raw, this));
@@ -134,10 +137,9 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
         for (auto it = zombie_conns_.begin(); it != zombie_conns_.end(); ++it) {
             if (it->get() == conn) {
                 zombie_conns_.erase(it);
-                // outstanding_conns_ already decremented by ForceCloseActive path
-                // (not decremented there — it was left for this cleanup)
-                outstanding_conns_.fetch_sub(1, std::memory_order_release);
-                MaybeSignalDrain();
+                // Do NOT decrement outstanding_conns_ here — it was already
+                // decremented by OnConnectionClosed (or ForceCloseActive doesn't
+                // decrement but OnConnectionClosed does before zombifying).
                 return;
             }
         }
@@ -179,8 +181,10 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     if (idle_conns_.size() >= static_cast<size_t>(config_.max_idle_connections)) {
         if (!wait_queue_.empty() && ValidateConnection(owned.get())) {
             // Hand directly to the next waiter (validated — not dead/expired)
+            static constexpr auto FAR_FUTURE_HANDOFF = std::chrono::hours(24 * 365);
             owned->MarkInUse();
-            owned->GetTransport()->ClearDeadline();
+            owned->GetTransport()->SetDeadline(
+                std::chrono::steady_clock::now() + FAR_FUTURE_HANDOFF);
             UpstreamConnection* raw = owned.get();
             active_conns_.push_back(std::move(owned));
             auto entry = std::move(wait_queue_.front());
@@ -514,8 +518,14 @@ void PoolPartition::OnConnectComplete(UpstreamConnection* conn,
         return;
     }
 
-    // Clear connect deadline
-    owned->GetTransport()->ClearDeadline();
+    // Set a far-future deadline instead of clearing. ClearDeadline would
+    // expose the transport to the server-wide idle timeout (since the fd is
+    // still in the dispatcher's connections_ map). A far-future deadline
+    // keeps has_deadline_=true, which suppresses the idle timeout check in
+    // ConnectionHandler::IsTimeOut(). The borrower can set their own deadline.
+    static constexpr auto FAR_FUTURE = std::chrono::hours(24 * 365);
+    owned->GetTransport()->SetDeadline(
+        std::chrono::steady_clock::now() + FAR_FUTURE);
     owned->MarkInUse();
 
     UpstreamConnection* raw = owned.get();
@@ -594,8 +604,11 @@ void PoolPartition::ServiceWaitQueue() {
             continue;
         }
 
+        // Set far-future deadline to suppress server-wide idle timeout
+        static constexpr auto FAR_FUTURE_SWQ = std::chrono::hours(24 * 365);
         conn->MarkInUse();
-        conn->GetTransport()->ClearDeadline();
+        conn->GetTransport()->SetDeadline(
+            std::chrono::steady_clock::now() + FAR_FUTURE_SWQ);
 
         UpstreamConnection* raw = conn.get();
         active_conns_.push_back(std::move(conn));

@@ -76,17 +76,22 @@ void HttpServer::MarkServerReady() {
         // SetDeadline stores a ms-precision deadline, but TimerHandler only fires
         // at the timer scan interval. If connect_timeout_ms < current interval,
         // timeouts would fire late. Reduce the interval if needed.
-        int min_connect_sec = std::numeric_limits<int>::max();
+        int min_upstream_sec = std::numeric_limits<int>::max();
         for (const auto& u : upstream_configs_) {
-            int sec = std::max(u.pool.connect_timeout_ms / 1000, 1);
-            min_connect_sec = std::min(min_connect_sec, sec);
+            int connect_sec = std::max(u.pool.connect_timeout_ms / 1000, 1);
+            min_upstream_sec = std::min(min_upstream_sec, connect_sec);
+            // Also consider idle timeout for eviction cadence
+            if (u.pool.idle_timeout_sec > 0) {
+                min_upstream_sec = std::min(min_upstream_sec,
+                                            u.pool.idle_timeout_sec);
+            }
         }
-        if (min_connect_sec < std::numeric_limits<int>::max()) {
+        if (min_upstream_sec < std::numeric_limits<int>::max()) {
             int current_interval = net_server_.GetTimerInterval();
-            if (min_connect_sec < current_interval) {
-                net_server_.SetTimerInterval(min_connect_sec);
+            if (min_upstream_sec < current_interval) {
+                net_server_.SetTimerInterval(min_upstream_sec);
                 logging::Get()->debug("Timer interval reduced to {}s for "
-                                      "upstream connect timeout", min_connect_sec);
+                                      "upstream timeouts", min_upstream_sec);
             }
         }
     }
@@ -1542,12 +1547,14 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     {
         int new_interval = ComputeTimerInterval(new_config.idle_timeout_sec,
                                                  new_config.request_timeout_sec);
-        // Preserve upstream connect timeout cadence — upstream configs are
-        // restart-only, so the connect_timeout_ms values don't change on reload.
-        // But the timer interval must not widen past the shortest upstream timeout.
+        // Preserve upstream timeout cadence — upstream configs are restart-only,
+        // but the timer interval must not widen past the shortest upstream timeout.
         for (const auto& u : upstream_configs_) {
-            int sec = std::max(u.pool.connect_timeout_ms / 1000, 1);
-            new_interval = std::min(new_interval, sec);
+            int connect_sec = std::max(u.pool.connect_timeout_ms / 1000, 1);
+            new_interval = std::min(new_interval, connect_sec);
+            if (u.pool.idle_timeout_sec > 0) {
+                new_interval = std::min(new_interval, u.pool.idle_timeout_sec);
+            }
         }
         net_server_.SetTimerInterval(new_interval);
     }
