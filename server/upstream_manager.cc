@@ -87,8 +87,14 @@ UpstreamManager::UpstreamManager(
     }
     if (min_upstream_sec < std::numeric_limits<int>::max()) {
         for (auto& disp : dispatchers_) {
+            // Only narrow the interval, never widen. The dispatcher may
+            // already have a shorter cadence from request_timeout_sec or
+            // idle_timeout_sec (set by HttpServer before this runs).
             disp->EnQueue([disp, min_upstream_sec]() {
-                disp->SetTimerInterval(min_upstream_sec);
+                int current = disp->GetTimerInterval();
+                if (current <= 0 || min_upstream_sec < current) {
+                    disp->SetTimerInterval(min_upstream_sec);
+                }
             });
         }
     }
@@ -98,6 +104,24 @@ UpstreamManager::UpstreamManager(
 }
 
 UpstreamManager::~UpstreamManager() {
+    // Safety net: ensure shutdown is initiated and pools are drained before
+    // destruction. In production (HttpServer), Stop() handles this explicitly.
+    // In standalone use, the caller may not have called InitiateShutdown.
+    if (!shutting_down_.load(std::memory_order_acquire)) {
+        InitiateShutdown();
+    }
+    // Brief drain — give queued tasks a chance to complete. Dispatcher
+    // threads must still be running for this to work; if they're already
+    // stopped (HttpServer::~HttpServer after net_server_.Stop()), this
+    // is a no-op and safe.
+    static constexpr int DTOR_DRAIN_MS = 100;
+    if (outstanding_conns_.load(std::memory_order_acquire) > 0) {
+        std::unique_lock<std::mutex> lck(drain_mtx_);
+        drain_cv_.wait_for(lck, std::chrono::milliseconds(DTOR_DRAIN_MS),
+            [this]() {
+                return outstanding_conns_.load(std::memory_order_acquire) <= 0;
+            });
+    }
     logging::Get()->debug("UpstreamManager destroyed");
 }
 
