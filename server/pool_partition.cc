@@ -712,19 +712,23 @@ void PoolPartition::ServiceWaitQueue() {
 }
 
 void PoolPartition::ScheduleWaitQueuePurge() {
-    // Schedule a single deferred purge as a safety net for standalone mode.
-    // EnQueueDeferred fires on the next epoll_wait timeout (~1s) or
-    // HandleEventId drain. Does NOT self-reschedule to avoid busy-looping.
+    // Self-rescheduling deferred purge for standalone mode (no external timer).
+    // Uses EnQueueDeferred (no wake — fires on next epoll_wait timeout ~1s
+    // or next HandleEventId drain). Reschedules itself if waiters remain,
+    // ensuring CHECKOUT_QUEUE_TIMEOUT fires even with connect_timeout_ms > 1s.
+    // Does NOT use EnQueue to avoid busy-looping under pool saturation.
     //
-    // In production (HttpServer), EvictExpired runs on the periodic timer
-    // and calls PurgeExpiredWaitEntries. In standalone mode, purges also
-    // run from CheckoutAsync, ReturnConnection, and ServiceWaitQueue on
-    // every pool operation. This deferred task is a fallback for the case
-    // where no pool operations occur for a while.
+    // In production (HttpServer), EvictExpired on the periodic timer handles
+    // this. Purges also run from CheckoutAsync, ReturnConnection, and
+    // ServiceWaitQueue on every pool operation.
     if (!dispatcher_ || shutting_down_) return;
     dispatcher_->EnQueueDeferred([this]() {
         if (shutting_down_) return;
         PurgeExpiredWaitEntries();
+        // Keep rescheduling as long as waiters remain
+        if (!wait_queue_.empty() && !shutting_down_) {
+            ScheduleWaitQueuePurge();
+        }
     });
 }
 
