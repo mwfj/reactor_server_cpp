@@ -64,7 +64,25 @@ bool UpstreamConnection::IsAlive() const {
         return false;
     }
     if (ret == 0) {
-        // No events — socket is healthy and idle
+        // No kernel-level events. For TLS connections, also check OpenSSL's
+        // internal buffer — it can hold unread application bytes from a
+        // previous response even when poll() sees no POLLIN (the kernel
+        // buffer was already drained into SSL's buffer). Reusing such a
+        // connection would corrupt the next request with stale bytes.
+        if (conn_ && conn_->IsTlsReady()) {
+            char peek_buf[1];
+            int peek_result = conn_->TlsPeek(peek_buf, sizeof(peek_buf));
+            if (peek_result > 0) {
+                // Application data buffered — stale bytes from previous response
+                logging::Get()->debug("UpstreamConnection fd={} has buffered TLS "
+                                      "data, marking non-reusable", conn_fd);
+                return false;
+            }
+            // TLS_COMPLETE = no app data, TLS_ERROR/TLS_PEER_CLOSED = dead
+            if (peek_result != TlsConnection::TLS_COMPLETE) {
+                return false;
+            }
+        }
         return true;
     }
 

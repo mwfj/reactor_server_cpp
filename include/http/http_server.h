@@ -85,8 +85,11 @@ public:
     int GetBoundPort() const;
 
     // Access the upstream pool manager for proxy handlers.
-    // Returns nullptr if no upstreams configured or server not started.
-    UpstreamManager* GetUpstreamManager() const { return upstream_manager_.get(); }
+    // Returns nullptr if no upstreams configured, not started, or stopped.
+    UpstreamManager* GetUpstreamManager() const {
+        if (!server_ready_.load(std::memory_order_acquire)) return nullptr;
+        return upstream_manager_.get();
+    }
 
 private:
     NetServer net_server_;

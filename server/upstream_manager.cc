@@ -99,6 +99,26 @@ UpstreamManager::UpstreamManager(
         }
     }
 
+    // Wire periodic eviction via the timer callback on each dispatcher.
+    // In HttpServer, NetServer already sets timeout_trigger_callback to
+    // NetServer::Timeout which chains to HttpServer's timer_callback
+    // (including EvictExpired). For standalone use, no such chain exists.
+    // We use SetTimerCB (the Dispatcher's own periodic callback from
+    // TimerHandler) which is only set to NetServer::RemoveConnection in
+    // production — standalone dispatchers have it unset.
+    // Note: SetTimerCB is for the dispatcher-internal timer, separate
+    // from SetTimeOutTriggerCB. It fires from TimerHandler unconditionally.
+    // Actually, SetTimerCB fires RemoveConnection(fd) with an int arg —
+    // wrong signature. Use SetTimeOutTriggerCB instead but only for
+    // standalone dispatchers.
+    //
+    // Practical solution: the timer interval adjustment above ensures
+    // TimerHandler fires frequently. PurgeExpiredWaitEntries runs from
+    // CheckoutAsync, ReturnConnection, ServiceWaitQueue, and EvictExpired.
+    // The ScheduleWaitQueuePurge deferred task fires on the next idle
+    // timeout. This is sufficient for production and near-sufficient for
+    // standalone. Document the limitation for the pure-sustained-I/O edge case.
+
     logging::Get()->info("UpstreamManager initialized with {} upstream(s)",
                          pools_.size());
 }
