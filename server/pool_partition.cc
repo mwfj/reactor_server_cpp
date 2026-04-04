@@ -155,6 +155,10 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     owned->IncrementRequestCount();
     owned->MarkIdle();
 
+    // Re-wire pool-owned callbacks — borrowers may have overwritten them
+    // with request-specific handlers during checkout.
+    WirePoolCallbacks(owned.get());
+
     // Check if expired
     if (owned->IsExpired(config_.max_lifetime_sec, config_.max_requests_per_conn)) {
         DestroyConnection(std::move(owned));
@@ -379,6 +383,15 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
                     std::chrono::milliseconds(config_.connect_timeout_ms);
     conn_handler->SetDeadline(deadline);
 
+    // Wire deadline timeout callback to distinguish timeout from refusal.
+    // Returns false so the default close behavior proceeds (CloseAfterWrite).
+    // The close callback below will be overridden by the timeout flag.
+    auto timed_out = std::make_shared<bool>(false);
+    conn_handler->SetDeadlineTimeoutCb([timed_out]() {
+        *timed_out = true;
+        return false;  // proceed with default close behavior
+    });
+
     // Create the upstream connection wrapper
     auto upstream_conn = std::make_unique<UpstreamConnection>(
         conn_handler, upstream_host_, upstream_port_);
@@ -427,19 +440,21 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
             OnConnectComplete(raw_conn, *ready_cb_copy, *error_cb_copy);
         });
 
-    // Wire close callback for connect failure / timeout
+    // Wire close callback for connect failure / timeout.
+    // The timed_out flag (set by DeadlineTimeoutCb above) distinguishes
+    // deadline expiry from connection refusal/reset.
     conn_handler->SetCloseCb(
-        [this, raw_conn, error_cb_copy]
+        [this, raw_conn, error_cb_copy, timed_out]
         (std::shared_ptr<ConnectionHandler>) {
             if (raw_conn->IsConnecting()) {
-                (*error_cb_copy)(CHECKOUT_CONNECT_FAILED);
+                int code = *timed_out ? CHECKOUT_CONNECT_TIMEOUT
+                                      : CHECKOUT_CONNECT_FAILED;
+                (*error_cb_copy)(code);
             }
             OnConnectionClosed(raw_conn);
         });
 
     // Wire error callback for EPOLLERR events (async reset, local error).
-    // CallErroCb does NOT invoke the close callback, so without this,
-    // EPOLLERR events would silently leak pool slots.
     conn_handler->SetErrorCb(
         [this, raw_conn, error_cb_copy]
         (std::shared_ptr<ConnectionHandler>) {
@@ -518,30 +533,37 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
     // extracts from containers; DestroyConnection clears callbacks before
     // ForceClose, so the close callback can't re-fire.
     auto owned = ExtractFromConnecting(conn);
-    if (!owned) owned = ExtractFromActive(conn);
+    bool was_active = false;
+    if (!owned) {
+        owned = ExtractFromActive(conn);
+        if (owned) was_active = true;
+    }
     if (!owned) owned = ExtractFromIdle(conn);
 
     if (owned) {
-        // Clear callbacks and deadline BEFORE destruction — the transport
-        // (ConnectionHandler) survives in the dispatcher's connections_ map.
-        // Without this, a pending deadline or error event would fire callbacks
-        // that capture the now-freed raw_conn pointer (use-after-free).
         ClearTransportCallbacks(owned.get());
         auto transport = owned->GetTransport();
         if (transport) {
             transport->ClearDeadline();
-            // Remove from dispatcher timer map to prevent memory leak.
-            // Without this, the shared_ptr in connections_ keeps the
-            // ConnectionHandler alive indefinitely after close.
             int conn_fd = owned->fd();
             if (conn_fd >= 0) {
                 dispatcher_->RemoveTimerConnectionIfMatch(conn_fd, transport);
             }
         }
+        owned->MarkClosing();
+
+        if (was_active) {
+            // An UpstreamLease may still hold a raw pointer to this connection.
+            // Move to zombie list instead of destroying — the lease destructor's
+            // ReturnConnection will clean it up. Same pattern as ForceCloseActive.
+            zombie_conns_.push_back(std::move(owned));
+        }
+        // For connecting/idle connections, no lease exists — safe to destroy.
+        // (owned is already nullptr if moved to zombie_conns_)
+
         outstanding_conns_.fetch_sub(1, std::memory_order_release);
 
-        // A slot just freed — retry queued checkouts. Without this, waiters
-        // sit until CHECKOUT_QUEUE_TIMEOUT even though capacity is available.
+        // A slot just freed — retry queued checkouts.
         if (!shutting_down_ && !wait_queue_.empty() &&
             TotalCount() < partition_max_connections_) {
             auto entry = std::move(wait_queue_.front());
@@ -627,6 +649,30 @@ void PoolPartition::MaybeSignalDrain() {
         outstanding_conns_.load(std::memory_order_acquire) <= 0) {
         drain_cv_.notify_all();
     }
+}
+
+void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
+    auto transport = conn->GetTransport();
+    if (!transport) return;
+
+    // Reset all borrower-installed callbacks to prevent stale closures
+    // from firing on the next checkout or during idle.
+    transport->SetOnMessageCb(nullptr);
+    transport->SetCompletionCb(nullptr);
+    transport->SetWriteProgressCb(nullptr);
+    transport->SetConnectCompleteCallback(nullptr);
+
+    // Re-wire pool-owned close + error callbacks so OnConnectionClosed
+    // fires if the upstream drops the connection while idle.
+    UpstreamConnection* raw_conn = conn;
+    transport->SetCloseCb(
+        [this, raw_conn](std::shared_ptr<ConnectionHandler>) {
+            OnConnectionClosed(raw_conn);
+        });
+    transport->SetErrorCb(
+        [this, raw_conn](std::shared_ptr<ConnectionHandler>) {
+            OnConnectionClosed(raw_conn);
+        });
 }
 
 // ── Extract helpers ────────────────────────────────────────────────────

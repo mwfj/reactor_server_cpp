@@ -114,6 +114,11 @@ private:
     void ServiceWaitQueue();
     void DestroyConnection(std::unique_ptr<UpstreamConnection> conn);
 
+    // Re-wire pool-owned close/error callbacks on a connection's transport.
+    // Called when returning a connection to idle — borrowers may have
+    // overwritten the callbacks during their request.
+    void WirePoolCallbacks(UpstreamConnection* conn);
+
     // Find and extract a unique_ptr from a container by raw pointer
     std::unique_ptr<UpstreamConnection> ExtractFromIdle(UpstreamConnection* conn);
     std::unique_ptr<UpstreamConnection> ExtractFromActive(UpstreamConnection* conn);

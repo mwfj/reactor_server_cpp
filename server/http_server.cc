@@ -1539,9 +1539,18 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     // with old deadlines may see detection delayed by at most one extra
     // scan cycle when the interval grows, which is acceptable (timeout
     // changes are documented as applying to new connections).
-    net_server_.SetTimerInterval(
-        ComputeTimerInterval(new_config.idle_timeout_sec,
-                             new_config.request_timeout_sec));
+    {
+        int new_interval = ComputeTimerInterval(new_config.idle_timeout_sec,
+                                                 new_config.request_timeout_sec);
+        // Preserve upstream connect timeout cadence — upstream configs are
+        // restart-only, so the connect_timeout_ms values don't change on reload.
+        // But the timer interval must not widen past the shortest upstream timeout.
+        for (const auto& u : upstream_configs_) {
+            int sec = std::max(u.pool.connect_timeout_ms / 1000, 1);
+            new_interval = std::min(new_interval, sec);
+        }
+        net_server_.SetTimerInterval(new_interval);
+    }
 
     // Update HTTP/2 settings for NEW connections only (under conn_mtx_).
     // Existing sessions keep their negotiated SETTINGS values — submitting
