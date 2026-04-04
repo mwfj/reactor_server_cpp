@@ -71,6 +71,24 @@ void HttpServer::MarkServerReady() {
                                   e.what());
             // Non-fatal — server starts without upstream pools
         }
+
+        // Ensure the timer cadence is fast enough for upstream connect timeouts.
+        // SetDeadline stores a ms-precision deadline, but TimerHandler only fires
+        // at the timer scan interval. If connect_timeout_ms < current interval,
+        // timeouts would fire late. Reduce the interval if needed.
+        int min_connect_sec = std::numeric_limits<int>::max();
+        for (const auto& u : upstream_configs_) {
+            int sec = std::max(u.pool.connect_timeout_ms / 1000, 1);
+            min_connect_sec = std::min(min_connect_sec, sec);
+        }
+        if (min_connect_sec < std::numeric_limits<int>::max()) {
+            int current_interval = net_server_.GetTimerInterval();
+            if (min_connect_sec < current_interval) {
+                net_server_.SetTimerInterval(min_connect_sec);
+                logging::Get()->debug("Timer interval reduced to {}s for "
+                                      "upstream connect timeout", min_connect_sec);
+            }
+        }
     }
 
     start_time_ = std::chrono::steady_clock::now();

@@ -35,8 +35,11 @@ UpstreamHostPool::UpstreamHostPool(
     for (size_t i = 0; i < num_dispatchers; ++i) {
         UpstreamPoolConfig partition_config = config;
         size_t per_partition = conn_floor + (i < conn_remainder ? 1 : 0);
-        // Ensure at least 1 connection per partition so every dispatcher can serve
-        if (per_partition == 0) per_partition = 1;
+        // Do NOT inflate 0→1: if max_connections < num_dispatchers, some
+        // partitions get 0 and return POOL_EXHAUSTED. This preserves the
+        // user-configured global cap. Requests on zero-capacity partitions
+        // are handled by returning POOL_EXHAUSTED to the caller, which can
+        // retry or fail the proxied request.
         partition_config.max_connections = static_cast<int>(per_partition);
 
         size_t per_partition_idle = idle_floor + (i < idle_remainder ? 1 : 0);

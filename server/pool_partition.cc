@@ -253,11 +253,26 @@ void PoolPartition::InitiateShutdown() {
         DestroyConnection(std::move(conn));
     }
 
-    // Force-close all connecting — move to local first to avoid O(N²) erase-from-front
-    {
-        auto conns_to_destroy = std::move(connecting_conns_);
-        for (auto& conn : conns_to_destroy) {
-            DestroyConnection(std::move(conn));
+    // Force-close all connecting connections. Use ForceClose() instead of
+    // DestroyConnection() so the close callback fires and delivers
+    // CHECKOUT_CONNECT_FAILED to the caller's error_cb. DestroyConnection
+    // would clear callbacks first, leaving callers' promises unresolved.
+    // ForceClose → CallCloseCb → close callback → error_cb + OnConnectionClosed
+    // which extracts from connecting_conns_ and decrements outstanding_conns_.
+    // Iterate while non-empty: each ForceClose removes the front entry via
+    // OnConnectionClosed, so the loop converges.
+    while (!connecting_conns_.empty()) {
+        auto& conn = connecting_conns_.front();
+        if (conn && conn->GetTransport() && !conn->GetTransport()->IsClosing()) {
+            conn->GetTransport()->ForceClose();
+        } else {
+            // Transport already closing or null — extract and destroy manually
+            auto orphan = std::move(connecting_conns_.front());
+            connecting_conns_.erase(connecting_conns_.begin());
+            if (orphan) {
+                ClearTransportCallbacks(orphan.get());
+                outstanding_conns_.fetch_sub(1, std::memory_order_release);
+            }
         }
     }
 
@@ -360,9 +375,12 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
             // TLS? Start handshake
             if (tls_ctx_) {
                 try {
-                    std::string sni = sni_hostname_.empty() ? upstream_host_ : sni_hostname_;
+                    // Use configured sni_hostname for SNI + hostname verification.
+                    // When empty, pass empty string — TlsConnection skips SNI and
+                    // SSL_set1_host when sni_hostname is empty. Sending an IPv4
+                    // address as SNI would fail against name-based certificates.
                     auto tls = std::make_unique<TlsConnection>(
-                        *tls_ctx_, handler->fd(), sni);
+                        *tls_ctx_, handler->fd(), sni_hostname_);
                     handler->SetTlsConnection(std::move(tls));
                     // The fall-through in CallWriteCb kicks off DoHandshake
                     // inline on the same EPOLLOUT. OnMessage fires when done.
