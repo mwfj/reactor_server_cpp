@@ -114,6 +114,7 @@ private:
     void OnConnectionClosed(UpstreamConnection* conn);
     bool ValidateConnection(UpstreamConnection* conn);
     void ServiceWaitQueue();
+    void PurgeExpiredWaitEntries();
     void DestroyConnection(std::unique_ptr<UpstreamConnection> conn);
 
     // Re-wire pool-owned close/error callbacks on a connection's transport.

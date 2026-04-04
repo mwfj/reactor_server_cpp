@@ -81,6 +81,10 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
         return;
     }
 
+    // Purge expired wait queue entries inline — ensures queue timeouts
+    // fire even without external EvictExpired calls (standalone usage).
+    PurgeExpiredWaitEntries();
+
     if (shutting_down_) {
         error_cb(CHECKOUT_SHUTTING_DOWN);
         return;
@@ -252,19 +256,7 @@ void PoolPartition::EvictExpired() {
         }
     }
 
-    // Evict timed-out wait queue entries
-    while (!wait_queue_.empty()) {
-        auto& entry = wait_queue_.front();
-        auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - entry.queued_at);
-        if (waited.count() >= config_.connect_timeout_ms) {
-            auto error_cb = std::move(entry.error_callback);
-            wait_queue_.pop_front();
-            error_cb(CHECKOUT_QUEUE_TIMEOUT);
-        } else {
-            break;  // Queue is ordered by time — stop at first non-expired
-        }
-    }
+    PurgeExpiredWaitEntries();
 }
 
 void PoolPartition::InitiateShutdown() {
@@ -614,6 +606,9 @@ bool PoolPartition::ValidateConnection(UpstreamConnection* conn) {
 }
 
 void PoolPartition::ServiceWaitQueue() {
+    // Purge expired entries first so we don't hand connections to stale waiters
+    PurgeExpiredWaitEntries();
+
     while (!wait_queue_.empty() && !idle_conns_.empty()) {
         // Validate the idle connection
         auto conn = std::move(idle_conns_.front());
@@ -646,6 +641,22 @@ void PoolPartition::ServiceWaitQueue() {
         wait_queue_.pop_front();
         CreateNewConnection(std::move(entry.ready_callback),
                             std::move(entry.error_callback));
+    }
+}
+
+void PoolPartition::PurgeExpiredWaitEntries() {
+    auto now = std::chrono::steady_clock::now();
+    while (!wait_queue_.empty()) {
+        auto& entry = wait_queue_.front();
+        auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - entry.queued_at);
+        if (waited.count() >= config_.connect_timeout_ms) {
+            auto error_cb = std::move(entry.error_callback);
+            wait_queue_.pop_front();
+            error_cb(CHECKOUT_QUEUE_TIMEOUT);
+        } else {
+            break;  // Queue is ordered by time — stop at first non-expired
+        }
     }
 }
 

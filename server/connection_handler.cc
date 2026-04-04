@@ -648,7 +648,11 @@ void ConnectionHandler::CallWriteCb(){
         // same epoll batch), skip connect completion — the connection is
         // already doomed. Fall through to the write/close logic below.
         if (close_after_write_.load(std::memory_order_acquire)) {
-            connect_state_ = ConnectState::CONNECTED;
+            // Do NOT change connect_state_ — leave it as CONNECTING so the
+            // close callback (which checks IsConnecting()) fires the error_cb
+            // with CHECKOUT_CONNECT_TIMEOUT / CHECKOUT_SHUTTING_DOWN.
+            // Changing to CONNECTED here would make the close callback skip
+            // the error delivery, leaving the caller hanging.
             connect_complete_callback_ = nullptr;
             // Fall through — the output-buffer-empty check below will
             // see close_after_write_ and ForceClose.
