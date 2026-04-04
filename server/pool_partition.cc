@@ -435,9 +435,11 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
                                           upstream_host_, upstream_port_,
                                           e.what());
                     (*error_cb_copy)(CHECKOUT_CONNECT_FAILED);
-                    // Force-close the transport to release the fd and epoll
-                    // registration. OnConnectionClosed only handles pool
-                    // bookkeeping — it doesn't close the channel/fd.
+                    // Clear callbacks BEFORE ForceClose to prevent the close
+                    // callback from firing error_cb a second time. ForceClose
+                    // triggers CallCloseCb → close callback, which would
+                    // check IsConnecting() and call error_cb again.
+                    ClearTransportCallbacks(raw_conn);
                     if (handler && !handler->IsClosing()) {
                         handler->ForceClose();
                     }
@@ -686,6 +688,7 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
     transport->SetCompletionCb(nullptr);
     transport->SetWriteProgressCb(nullptr);
     transport->SetConnectCompleteCallback(nullptr);
+    transport->SetDeadlineTimeoutCb(nullptr);
 
     // Re-wire pool-owned close + error callbacks so OnConnectionClosed
     // fires if the upstream drops the connection while idle.

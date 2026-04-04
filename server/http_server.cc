@@ -1493,6 +1493,9 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // h2_settings_ but they're never used (no H2 sessions are created),
         // so invalid placeholder values are harmless and should not block reload.
         validation_copy.http2.enabled = http2_enabled_;
+        // Upstream configs are restart-only — clear them so staged edits
+        // in the config file don't block live-safe field reloads.
+        validation_copy.upstreams.clear();
         try {
             ConfigLoader::Validate(validation_copy);
         } catch (const std::invalid_argument& e) {
