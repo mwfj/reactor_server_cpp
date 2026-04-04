@@ -98,7 +98,8 @@ int TlsConnection::Peek(char* buf, size_t len) {
     if (ret > 0) return ret;  // Application data is buffered
 
     int err = SSL_get_error(ssl_, ret);
-    if (err == SSL_ERROR_WANT_READ) return TLS_COMPLETE;      // No app data (benign record consumed)
+    if (err == SSL_ERROR_WANT_READ) return TLS_COMPLETE;       // No app data (benign record consumed)
+    if (err == SSL_ERROR_WANT_WRITE) return TLS_COMPLETE;      // Benign: TLS needs to send (e.g., KeyUpdate ack)
     if (err == SSL_ERROR_ZERO_RETURN) return TLS_PEER_CLOSED;  // close_notify received
     return TLS_ERROR;
 }

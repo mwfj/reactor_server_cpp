@@ -706,17 +706,27 @@ void PoolPartition::ServiceWaitQueue() {
 
 void PoolPartition::ScheduleWaitQueuePurge() {
     // Self-rescheduling purge for standalone mode (no external timer).
-    // Uses EnQueueDeferred so it fires on the next epoll_wait timeout (~1s)
-    // without spinning the event loop. Reschedules itself as long as
-    // unexpired waiters remain, ensuring CHECKOUT_QUEUE_TIMEOUT eventually
-    // fires even with connect_timeout_ms > 1s.
+    // Uses EnQueue (which wakes the event loop via eventfd/pipe) so the
+    // task runs even under sustained I/O. PurgeExpiredWaitEntries only
+    // removes entries past connect_timeout_ms, so early runs are no-ops.
+    // Reschedules via EnQueueDeferred (no wake — piggybacks on the next
+    // natural wake) to avoid busy-looping on unexpired entries.
     if (!dispatcher_ || shutting_down_) return;
-    dispatcher_->EnQueueDeferred([this]() {
+    dispatcher_->EnQueue([this]() {
         if (shutting_down_) return;
         PurgeExpiredWaitEntries();
-        // Keep rescheduling as long as waiters remain
-        if (!wait_queue_.empty() && !shutting_down_) {
-            ScheduleWaitQueuePurge();
+        if (!wait_queue_.empty() && !shutting_down_ && dispatcher_) {
+            // Waiters still pending — reschedule via deferred (no wake).
+            // Fires on the next HandleEventId from any EnQueue, or on
+            // the next epoll_wait timeout (~1s).
+            dispatcher_->EnQueueDeferred([this]() {
+                if (shutting_down_) return;
+                PurgeExpiredWaitEntries();
+                // If still pending, schedule another wake-based purge.
+                if (!wait_queue_.empty() && !shutting_down_) {
+                    ScheduleWaitQueuePurge();
+                }
+            });
         }
     });
 }
