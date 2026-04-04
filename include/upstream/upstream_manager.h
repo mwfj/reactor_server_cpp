@@ -32,7 +32,11 @@ public:
     // Initiate graceful shutdown of all pools.
     void InitiateShutdown();
 
-    // Blocking wait for all upstream connections to close.
+    // Blocking wait for upstream connections to drain. On timeout, enqueues
+    // ForceCloseActive which zombifies active connections but does NOT destroy
+    // them (leases may still hold raw pointers). The manager must NOT be
+    // destroyed until all dispatcher threads are joined — HttpServer::Stop()
+    // ensures this by calling upstream_manager_.reset() after net_server_.Stop().
     void WaitForDrain(std::chrono::seconds timeout);
 
     // Non-blocking check: true if outstanding_conns_ == 0.

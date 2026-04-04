@@ -42,7 +42,12 @@ TlsConnection::TlsConnection(TlsClientContext& ctx, int fd, const std::string& s
         // Enable hostname verification — SSL_VERIFY_PEER (set on the CTX) validates
         // chain trust, but SSL_set1_host() is required to verify the certificate's
         // CN/SAN matches the expected hostname, preventing MITM attacks.
-        SSL_set1_host(ssl_, sni_hostname.c_str());
+        if (SSL_set1_host(ssl_, sni_hostname.c_str()) != 1) {
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+            throw std::runtime_error(
+                "Failed to enable hostname verification for: " + sni_hostname);
+        }
         logging::Get()->debug("TlsConnection client: SNI + hostname verification set to {}", sni_hostname);
     }
 

@@ -1552,21 +1552,22 @@ void TestUpstreamDropsConnectionWhileLeaseHeld() {
         DispatcherThreadGuard dtg{dispatcher, dt};
 
         // Step 1: Checkout a connection while the backend is up.
+        // Store the lease in a shared_ptr visible to the outer scope so we
+        // can hold it across the backend stop — exercising the zombie path.
+        auto held_lease = std::make_shared<UpstreamLease>();
         auto lease_p = std::make_shared<std::promise<int>>();
         auto lease_f = lease_p->get_future();
 
-        dispatcher->EnQueue([&mgr, lease_p]() {
+        dispatcher->EnQueue([&mgr, lease_p, held_lease]() {
             mgr.CheckoutAsync(
                 "drop-svc", 0,
-                [lease_p](UpstreamLease lease) {
+                [lease_p, held_lease](UpstreamLease lease) {
                     int fd = lease ? lease->fd() : -1;
-                    // Deliberately DO NOT return the lease here — hold it so that
-                    // the next step can stop the backend while the lease is active.
-                    // The lease goes out of scope (and is returned) when the lambda
-                    // completes. Since we need to hold it across the backend stop,
-                    // we capture the fd value and let the lease return naturally.
+                    // Move the lease into held_lease so it survives the lambda.
+                    // The lease is NOT returned to the pool here — it stays
+                    // alive in the outer scope until we explicitly release it.
+                    *held_lease = std::move(lease);
                     try { lease_p->set_value(fd); } catch (...) {}
-                    // lease destructor fires ReturnConnection here, on the dispatcher thread.
                 },
                 [lease_p](int ec) {
                     try {
@@ -1596,6 +1597,14 @@ void TestUpstreamDropsConnectionWhileLeaseHeld() {
         }
 
         if (!pass) {
+            // Release lease on dispatcher thread before shutdown
+            auto release_p = std::make_shared<std::promise<void>>();
+            auto release_f = release_p->get_future();
+            dispatcher->EnQueue([held_lease, release_p]() {
+                held_lease->Release();
+                release_p->set_value();
+            });
+            release_f.wait_for(std::chrono::seconds(2));
             mgr.InitiateShutdown();
             mgr.WaitForDrain(std::chrono::seconds(2));
             TestFramework::RecordTest(
@@ -1604,30 +1613,29 @@ void TestUpstreamDropsConnectionWhileLeaseHeld() {
             return;
         }
 
-        // Step 2: Stop the backend (sends RST/FIN to all open connections).
-        // bk1 destructor does this. Give the OS and dispatcher a moment to
-        // process the close event (EPOLLRDHUP) on the connection fd.
-        // NOTE: The lease has already been returned (lambda returned above),
-        // so the pool now holds the connection in idle_conns_.
-        {
-            // bk1 goes out of scope here → backend stops, connections RST/FIN.
-        }
-        // bk1 is still in scope from the outer try block, so stop it explicitly.
-        // We destroy it by stopping and re-checking out in a moment.
-        // Actually bk1 is still alive here. We need to destroy the backend runner.
-        // Instead of destroying bk1 (which requires it being in inner scope),
-        // we just stop the backend server directly.
+        // Step 2: Stop the backend while the lease is STILL HELD.
+        // This sends RST/FIN to the upstream connection. The connection's
+        // close callback fires on the dispatcher thread, moving it to
+        // zombie_conns_ (since an active lease holds a raw pointer).
         backend1.Stop();
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        // Step 3: Attempt a second checkout. The pool should detect the stale
-        // connection via ValidateConnection / IsAlive and either:
-        //   a) Skip the stale idle connection and create a new one (which will
-        //      fail to connect since the backend is stopped) — error callback fires.
-        //   b) Return the stale connection directly (IsAlive may still be true
-        //      before the FIN is processed), in which case the fd is still valid
-        //      at the transport level but closed at the application level.
-        // Either outcome is acceptable; we verify no crash and the callback fires.
+        // Step 3: Release the held lease on the dispatcher thread.
+        // The connection is now in zombie_conns_ (closed by backend stop).
+        // ReturnConnection finds it in the zombie list and cleans it up.
+        {
+            auto rel_p = std::make_shared<std::promise<void>>();
+            auto rel_f = rel_p->get_future();
+            dispatcher->EnQueue([held_lease, rel_p]() {
+                held_lease->Release();
+                rel_p->set_value();
+            });
+            rel_f.wait_for(std::chrono::seconds(2));
+        }
+
+        // Step 4: Attempt a second checkout. Backend is stopped, so this
+        // should fail (connect refused) — error callback fires.
+        // We verify no crash and the callback fires.
         auto second_p = std::make_shared<std::promise<int>>();
         auto second_f = second_p->get_future();
 
