@@ -107,6 +107,10 @@ private:
     static constexpr size_t MAX_WAIT_QUEUE_SIZE = 256;
 
     size_t partition_max_connections_;
+
+    // Shared flag cleared in destructor. Captured by deferred purge tasks
+    // to detect partition destruction and avoid use-after-free.
+    std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
     bool shutting_down_ = false;
 
     // Internal helpers

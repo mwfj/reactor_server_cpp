@@ -66,6 +66,9 @@ static void ClearTransportCallbacks(UpstreamConnection* conn) {
 }
 
 PoolPartition::~PoolPartition() {
+    // Signal deferred purge tasks to stop — they capture alive_ by shared_ptr
+    *alive_ = false;
+
     // Do NOT call ForceClose() here — destructor may run on the main thread
     // and ForceClose() does cross-thread epoll operations (UB).
     // SocketHandler::~SocketHandler() will close the fd naturally.
@@ -736,28 +739,19 @@ void PoolPartition::ServiceWaitQueue() {
 }
 
 void PoolPartition::ScheduleWaitQueuePurge() {
-    // Self-rescheduling purge for standalone mode (no external timer).
-    // Uses EnQueue (which wakes the dispatcher) to guarantee the task runs
-    // even under sustained I/O. To avoid busy-looping when entries haven't
-    // expired yet, each invocation checks a minimum reschedule interval
-    // (1s) before scheduling the next wake.
-    //
-    // In production (HttpServer), EvictExpired on the periodic timer handles
-    // this. Purges also run from CheckoutAsync, ReturnConnection,
-    // ServiceWaitQueue, and EvictExpired on every pool operation.
     if (!dispatcher_ || shutting_down_) return;
-    dispatcher_->EnQueue([this]() {
-        if (shutting_down_) return;
+    // Capture alive_ by shared_ptr — survives partition destruction.
+    // All lambdas check *alive before touching `this`.
+    std::weak_ptr<bool> alive_weak = alive_;
+    dispatcher_->EnQueue([this, alive_weak]() {
+        auto alive = alive_weak.lock();
+        if (!alive || !*alive || shutting_down_) return;
         PurgeExpiredWaitEntries();
         if (!wait_queue_.empty() && !shutting_down_ && dispatcher_) {
-            // Avoid re-waking immediately — use deferred for the next pass.
-            // Deferred fires on: (a) next epoll_wait timeout ~1s, or
-            // (b) next HandleEventId from any EnQueue. Under sustained I/O,
-            // (b) handles it since other pool/connection activity generates
-            // EnQueue calls. In the pathological case of zero activity,
-            // (a) fires within 1s which is within connect_timeout_ms (>=1s).
-            dispatcher_->EnQueueDeferred([this]() {
-                if (shutting_down_) return;
+            std::weak_ptr<bool> inner_alive = alive_;
+            dispatcher_->EnQueueDeferred([this, inner_alive]() {
+                auto alive2 = inner_alive.lock();
+                if (!alive2 || !*alive2 || shutting_down_) return;
                 PurgeExpiredWaitEntries();
                 if (!wait_queue_.empty() && !shutting_down_) {
                     ScheduleWaitQueuePurge();
@@ -812,7 +806,11 @@ void PoolPartition::DestroyConnection(
 }
 
 void PoolPartition::MaybeSignalDrain() {
-    if (shutting_down_ &&
+    // Check both partition-local and manager-wide shutdown flags.
+    // Without the manager check, a lease returned between manager shutdown
+    // and partition shutdown won't signal the drain CV, leaving WaitForDrain
+    // blocked until timeout.
+    if ((shutting_down_ || manager_shutting_down_.load(std::memory_order_acquire)) &&
         outstanding_conns_.load(std::memory_order_acquire) <= 0) {
         // Lock drain_mtx_ before notify to prevent lost wakeups.
         // Without this, the waiter can check the predicate (sees non-zero),
