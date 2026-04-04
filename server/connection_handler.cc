@@ -644,33 +644,42 @@ void ConnectionHandler::CallWriteCb(){
     // signals that the TCP handshake finished. Must be checked before any TLS
     // or write logic — the socket isn't usable until connect succeeds.
     if (connect_state_ == ConnectState::CONNECTING) {
-        int result = FinishConnect();
-        if (result == SocketHandler::CONNECT_SUCCESS) {
+        // If close_after_write was set (e.g., deadline timeout fired in the
+        // same epoll batch), skip connect completion — the connection is
+        // already doomed. Fall through to the write/close logic below.
+        if (close_after_write_.load(std::memory_order_acquire)) {
             connect_state_ = ConnectState::CONNECTED;
-            client_channel_->EnableReadMode();
-            if (connect_complete_callback_) {
-                connect_complete_callback_(shared_from_this());
-                connect_complete_callback_ = nullptr;  // one-shot
-            }
-            // CRITICAL: If callback set tls_state_ = HANDSHAKE, fall through
-            // to the existing TLS handshake block. With ET mode, returning here
-            // would stall — no new EPOLLOUT fires on an already-writable socket.
-            if (tls_state_ == TlsState::HANDSHAKE) {
-                // Fall through to existing TLS handshake handler below
-            } else if (output_bf_.Size() > 0) {
-                // The connect-complete callback sent data (e.g., HTTP request).
-                // Fall through to the write logic below to flush it. Returning
-                // here would consume the only EPOLLOUT edge from connect() —
-                // with ET mode, no new edge fires on an already-writable socket,
-                // so the buffered request would stall indefinitely.
+            connect_complete_callback_ = nullptr;
+            // Fall through — the output-buffer-empty check below will
+            // see close_after_write_ and ForceClose.
+        } else {
+            int result = FinishConnect();
+            if (result == SocketHandler::CONNECT_SUCCESS) {
+                connect_state_ = ConnectState::CONNECTED;
+                client_channel_->EnableReadMode();
+                if (connect_complete_callback_) {
+                    connect_complete_callback_(shared_from_this());
+                    connect_complete_callback_ = nullptr;  // one-shot
+                }
+                // CRITICAL: If callback set tls_state_ = HANDSHAKE, fall through
+                // to the existing TLS handshake block. With ET mode, returning
+                // here would stall — no new EPOLLOUT fires on an already-writable
+                // socket.
+                if (tls_state_ == TlsState::HANDSHAKE) {
+                    // Fall through to existing TLS handshake handler below
+                } else if (output_bf_.Size() > 0) {
+                    // The connect-complete callback sent data. Fall through to
+                    // the write logic to flush it — returning would consume the
+                    // EPOLLOUT edge and stall the buffered request.
+                } else {
+                    client_channel_->DisableWriteMode();
+                    return;
+                }
             } else {
-                client_channel_->DisableWriteMode();
+                logging::Get()->warn("Outbound connect failed fd={}", fd());
+                CallCloseCb();
                 return;
             }
-        } else {
-            logging::Get()->warn("Outbound connect failed fd={}", fd());
-            CallCloseCb();
-            return;
         }
     }
 

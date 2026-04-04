@@ -3,12 +3,38 @@
 #include "log/logger.h"
 
 #include <openssl/ssl.h>
+#include <signal.h>
+
+// Suppress SIGPIPE for TLS upstream connections. SSL_write uses the
+// underlying socket's write() which bypasses MSG_NOSIGNAL. Without
+// this, a peer reset during SSL_write kills the process.
+// Safe to call multiple times — only overrides SIG_DFL.
+static void SuppressSigpipe() {
+    struct sigaction sa_cur{};
+    sigaction(SIGPIPE, nullptr, &sa_cur);
+    if (sa_cur.sa_handler == SIG_DFL) {
+        struct sigaction sa_ign{};
+        sa_ign.sa_handler = SIG_IGN;
+        sigemptyset(&sa_ign.sa_mask);
+        sigaction(SIGPIPE, &sa_ign, nullptr);
+    }
+}
 
 UpstreamManager::UpstreamManager(
     const std::vector<UpstreamConfig>& upstreams,
     const std::vector<std::shared_ptr<Dispatcher>>& dispatchers)
     : dispatchers_(dispatchers)
 {
+    // Check if any upstream uses TLS — suppress SIGPIPE if so.
+    // When used inside HttpServer/NetServer, SIGPIPE is already suppressed.
+    // When used standalone (e.g., tests), this is the only protection.
+    for (const auto& u : upstreams) {
+        if (u.tls.enabled) {
+            SuppressSigpipe();
+            break;
+        }
+    }
+
     for (const auto& upstream : upstreams) {
         // Create TLS context if enabled
         std::shared_ptr<TlsClientContext> tls_ctx;

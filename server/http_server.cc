@@ -805,6 +805,9 @@ void HttpServer::Stop() {
         h2_draining_.clear();
         ws_draining_.clear();
     }
+    // Clear shutdown flag so GetStats() stops reporting uptime.
+    // Without this, uptime keeps increasing after Stop() completes.
+    shutting_down_started_.store(false, std::memory_order_release);
 }
 
 void HttpServer::OnH2DrainComplete(ConnectionHandler* conn_ptr) {
