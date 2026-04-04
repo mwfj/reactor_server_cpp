@@ -435,7 +435,13 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
                                           upstream_host_, upstream_port_,
                                           e.what());
                     (*error_cb_copy)(CHECKOUT_CONNECT_FAILED);
-                    OnConnectionClosed(raw_conn);  // clean up the leaked pool slot
+                    // Force-close the transport to release the fd and epoll
+                    // registration. OnConnectionClosed only handles pool
+                    // bookkeeping — it doesn't close the channel/fd.
+                    if (handler && !handler->IsClosing()) {
+                        handler->ForceClose();
+                    }
+                    OnConnectionClosed(raw_conn);
                     return;
                 }
                 // Don't deliver ready — TLS handshake still in progress.

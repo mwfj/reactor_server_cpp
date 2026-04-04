@@ -78,7 +78,11 @@ void HttpServer::MarkServerReady() {
         // timeouts would fire late. Reduce the interval if needed.
         int min_upstream_sec = std::numeric_limits<int>::max();
         for (const auto& u : upstream_configs_) {
-            int connect_sec = std::max(u.pool.connect_timeout_ms / 1000, 1);
+            // ceil division: ensures the timer fires within 1 interval of the
+            // deadline, minimizing overshoot. Floor would let deadlines fire
+            // up to (interval - 1)s late in the worst case.
+            int connect_sec = std::max(
+                (u.pool.connect_timeout_ms + 999) / 1000, 1);
             min_upstream_sec = std::min(min_upstream_sec, connect_sec);
             // Also consider idle timeout for eviction cadence
             if (u.pool.idle_timeout_sec > 0) {
@@ -782,6 +786,13 @@ void HttpServer::Stop() {
     }
 
     net_server_.Stop();
+
+    // Destroy upstream pools AFTER dispatchers are stopped and joined.
+    // This ensures no UpstreamLease can call ReturnConnection() after
+    // the PoolPartition is freed. Dispatcher threads are dead at this
+    // point — all handler code has completed and all leases released.
+    upstream_manager_.reset();
+
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         http_connections_.clear();
@@ -1555,7 +1566,8 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // Preserve upstream timeout cadence — upstream configs are restart-only,
         // but the timer interval must not widen past the shortest upstream timeout.
         for (const auto& u : upstream_configs_) {
-            int connect_sec = std::max(u.pool.connect_timeout_ms / 1000, 1);
+            int connect_sec = std::max(
+                (u.pool.connect_timeout_ms + 999) / 1000, 1);
             new_interval = std::min(new_interval, connect_sec);
             if (u.pool.idle_timeout_sec > 0) {
                 new_interval = std::min(new_interval, u.pool.idle_timeout_sec);

@@ -620,25 +620,28 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                         "(upstream host is an IPv4 address, which cannot be verified "
                         "against certificate CN/SAN)");
                 }
-            }
-            if (!u.tls.ca_file.empty()) {
-                struct stat st{};
-                if (stat(u.tls.ca_file.c_str(), &st) != 0) {
-                    if (errno == EACCES) {
-                        // Can't traverse path — skip check, runtime handles it
-                    } else {
+                // CA file validation — only when TLS is enabled.
+                // An old ca_file left behind after disabling TLS should not
+                // block startup/reload.
+                if (!u.tls.ca_file.empty()) {
+                    struct stat st{};
+                    if (stat(u.tls.ca_file.c_str(), &st) != 0) {
+                        if (errno == EACCES) {
+                            // Can't traverse path — skip check, runtime handles it
+                        } else {
+                            throw std::invalid_argument(
+                                idx + " ('" + u.name +
+                                "'): tls.ca_file not found: '" + u.tls.ca_file +
+                                "' (" + std::strerror(errno) + ")");
+                        }
+                    } else if (!S_ISREG(st.st_mode)) {
                         throw std::invalid_argument(
                             idx + " ('" + u.name +
-                            "'): tls.ca_file not found: '" + u.tls.ca_file +
-                            "' (" + std::strerror(errno) + ")");
+                            "'): tls.ca_file is not a regular file: '" +
+                            u.tls.ca_file + "'");
                     }
-                } else if (!S_ISREG(st.st_mode)) {
-                    throw std::invalid_argument(
-                        idx + " ('" + u.name +
-                        "'): tls.ca_file is not a regular file: '" +
-                        u.tls.ca_file + "'");
                 }
-            }
+            }  // if (u.tls.enabled)
         }
     }
 }

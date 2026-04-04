@@ -103,16 +103,12 @@ void UpstreamManager::WaitForDrain(std::chrono::seconds timeout) {
                              outstanding_conns_.load(std::memory_order_relaxed));
         lck.unlock();
         ForceCloseRemaining();
-        // Wait briefly for the enqueued ForceCloseActive tasks to execute.
-        // Without this, WaitForDrain returns while zombie_conns_ still exist
-        // and the manager may be destroyed before leases release, causing
-        // UpstreamLease::~UpstreamLease() to call through a dangling partition_.
-        static constexpr int FORCE_CLOSE_WAIT_MS = 500;
-        lck.lock();
-        drain_cv_.wait_for(lck, std::chrono::milliseconds(FORCE_CLOSE_WAIT_MS),
-            [this]() {
-                return outstanding_conns_.load(std::memory_order_acquire) <= 0;
-            });
+        // Note: ForceCloseActive moves leased connections to zombie_conns_.
+        // outstanding_conns_ stays positive until leases release. The manager
+        // must outlive all dispatchers — HttpServer::Stop() ensures this by
+        // calling net_server_.Stop() (which joins all threads) before
+        // resetting upstream_manager_. See HttpServer::Stop() for the
+        // explicit destruction ordering.
     }
 }
 
