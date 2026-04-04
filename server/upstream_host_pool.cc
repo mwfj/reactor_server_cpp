@@ -34,15 +34,20 @@ UpstreamHostPool::UpstreamHostPool(
     size_t idle_floor = (num_dispatchers > 0) ? total_idle / num_dispatchers : total_idle;
     size_t idle_remainder = (num_dispatchers > 0) ? total_idle % num_dispatchers : 0;
 
+    // max_connections must be >= num_dispatchers so every partition gets at
+    // least 1. Zero-capacity partitions would silently fail all checkouts on
+    // that dispatcher (dispatcher-affine, no cross-partition fallback).
+    // Inflating 0→1 would violate the operator's configured cap.
+    if (total_conn < num_dispatchers) {
+        throw std::invalid_argument(
+            "upstream '" + service_name + "': pool.max_connections (" +
+            std::to_string(config.max_connections) + ") must be >= worker_threads (" +
+            std::to_string(num_dispatchers) + ")");
+    }
+
     for (size_t i = 0; i < num_dispatchers; ++i) {
         UpstreamPoolConfig partition_config = config;
         size_t per_partition = conn_floor + (i < conn_remainder ? 1 : 0);
-        // Ensure at least 1 per partition: zero-capacity partitions cause
-        // requests on that dispatcher to always fail (POOL_EXHAUSTED) since
-        // checkout is dispatcher-affine with no cross-partition fallback.
-        // When max_connections < num_dispatchers, this inflates the effective
-        // cap. We log a warning below so operators know the actual limit.
-        if (per_partition == 0) per_partition = 1;
         partition_config.max_connections = static_cast<int>(per_partition);
 
         size_t per_partition_idle = idle_floor + (i < idle_remainder ? 1 : 0);
@@ -53,19 +58,6 @@ UpstreamHostPool::UpstreamHostPool(
             outstanding_conns, manager_shutting_down, drain_mtx, drain_cv));
     }
 
-    // Warn if effective cap exceeds configured cap due to per-partition minimum of 1
-    size_t effective_total = 0;
-    for (size_t i = 0; i < num_dispatchers; ++i) {
-        size_t pp = conn_floor + (i < conn_remainder ? 1 : 0);
-        if (pp == 0) pp = 1;
-        effective_total += pp;
-    }
-    if (effective_total > total_conn) {
-        logging::Get()->warn("UpstreamHostPool '{}': max_connections={} < {} workers, "
-                             "effective cap inflated to {} (1 per partition minimum)",
-                             service_name_, config.max_connections, num_dispatchers,
-                             effective_total);
-    }
 
     logging::Get()->info("UpstreamHostPool '{}' created for {}:{} with {} "
                          "partitions (max_conn={}, max_idle={})",

@@ -410,6 +410,15 @@ void HttpServer::Stop() {
     // accepted in the gap would miss the 1001 "Going Away" close frame.
     net_server_.StopAccepting();
 
+    // Signal upstream pools to stop accepting new checkouts immediately.
+    // This runs BEFORE NetServer::Stop()'s CloseAfterWrite sweep so handlers
+    // that haven't called CheckoutAsync yet get CHECKOUT_SHUTTING_DOWN instead
+    // of starting new upstream work. In-flight leases (already checked out)
+    // continue normally — WaitForDrain in pre_stop_drain_cb lets them finish.
+    if (upstream_manager_) {
+        upstream_manager_->InitiateShutdown();
+    }
+
     // Collect WS connections while holding the lock, then send close frames
     // AFTER releasing. Sending under the lock would deadlock: a failed inline
     // write in DoSendRaw → CallCloseCb → HandleCloseConnection → conn_mtx_.
@@ -636,13 +645,13 @@ void HttpServer::Stop() {
                 }
             }
             // Upstream shutdown — after H2/WS/H1 protocol drains.
-            // Known limitation: async H1 proxy handlers that haven't started
-            // writing their response are force-closed by NetServer's earlier
-            // CloseAfterWrite sweep (no buffered output → immediate close).
-            // This is inherent to the current shutdown model which was designed
-            // for synchronous handlers. H2 proxy handlers are fully drained.
+            // Upstream drain — InitiateShutdown was called before the close
+            // sweep (rejects new checkouts). In-flight leases from H2 handlers
+            // drain normally. H1 handlers that have buffered output drain via
+            // CloseAfterWrite. H1 handlers with no buffered output yet are
+            // force-closed by the sweep — this is inherent to the shutdown
+            // model (designed for synchronous handlers).
             if (upstream_manager_) {
-                upstream_manager_->InitiateShutdown();
                 upstream_manager_->WaitForDrain(
                     std::chrono::seconds(shutdown_drain_timeout_sec_.load(
                         std::memory_order_relaxed)));
@@ -767,9 +776,9 @@ void HttpServer::Stop() {
                     }
                 }
             }
-            // Upstream shutdown — after all protocol drains complete.
+            // Upstream drain — InitiateShutdown was called early (before
+            // the close sweep). Now wait for in-flight leases to complete.
             if (upstream_manager_) {
-                upstream_manager_->InitiateShutdown();
                 static constexpr int UP_PUMP_MS = 200;
                 auto up_deadline = std::chrono::steady_clock::now() +
                     std::chrono::seconds(shutdown_drain_timeout_sec_.load(
