@@ -620,10 +620,10 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                         "(upstream host is an IPv4 address, which cannot be verified "
                         "against certificate CN/SAN)");
                 }
-                // CA file validation — only when TLS is enabled.
-                // An old ca_file left behind after disabling TLS should not
-                // block startup/reload.
-                if (!u.tls.ca_file.empty()) {
+                // CA file validation — only when TLS + verify_peer is enabled.
+                // When verify_peer=false, the runtime skips CA loading, so a
+                // stale ca_file path should not block startup/reload.
+                if (u.tls.verify_peer && !u.tls.ca_file.empty()) {
                     struct stat st{};
                     if (stat(u.tls.ca_file.c_str(), &st) != 0) {
                         if (errno == EACCES) {

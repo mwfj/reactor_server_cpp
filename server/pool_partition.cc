@@ -270,6 +270,9 @@ void PoolPartition::EvictExpired() {
     }
 
     PurgeExpiredWaitEntries();
+
+    // Eviction freed capacity — retry queued checkouts.
+    ServiceWaitQueue();
 }
 
 void PoolPartition::InitiateShutdown() {
@@ -702,25 +705,18 @@ void PoolPartition::ServiceWaitQueue() {
 }
 
 void PoolPartition::ScheduleWaitQueuePurge() {
-    // Schedule a self-rescheduling purge. Uses EnQueueDeferred so it doesn't
-    // spin the event loop — the task fires on the next epoll_wait timeout
-    // (~1s). If entries remain unexpired, it reschedules itself. This ensures
-    // CHECKOUT_QUEUE_TIMEOUT fires even in standalone mode without an external
-    // eviction timer.
-    dispatcher_->EnQueue([this]() {
+    // Self-rescheduling purge for standalone mode (no external timer).
+    // Uses EnQueueDeferred so it fires on the next epoll_wait timeout (~1s)
+    // without spinning the event loop. Reschedules itself as long as
+    // unexpired waiters remain, ensuring CHECKOUT_QUEUE_TIMEOUT eventually
+    // fires even with connect_timeout_ms > 1s.
+    if (!dispatcher_ || shutting_down_) return;
+    dispatcher_->EnQueueDeferred([this]() {
         if (shutting_down_) return;
         PurgeExpiredWaitEntries();
-        // If waiters remain, schedule another check on the next iteration.
-        // Uses EnQueueDeferred to avoid spinning — fires on next natural
-        // wake (~1s epoll_wait timeout or next real event).
-        if (!wait_queue_.empty() && !shutting_down_ && dispatcher_) {
-            dispatcher_->EnQueueDeferred([this]() {
-                if (!shutting_down_ && !wait_queue_.empty()) {
-                    PurgeExpiredWaitEntries();
-                    // Final attempt — by now connect_timeout_ms (>=1s) has
-                    // passed since the original queue time.
-                }
-            });
+        // Keep rescheduling as long as waiters remain
+        if (!wait_queue_.empty() && !shutting_down_) {
+            ScheduleWaitQueuePurge();
         }
     });
 }
