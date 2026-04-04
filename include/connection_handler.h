@@ -97,6 +97,10 @@ public:
     void CallWriteCb();
 
     void SetOnMessageCb(CALLBACKS_NAMESPACE::ConnOnMsgCallback);
+    // Get the current on-message callback (for upstream pool disconnect notification).
+    const CALLBACKS_NAMESPACE::ConnOnMsgCallback& GetOnMessageCb() const {
+        return callbacks_.on_message_callback;
+    }
     void SetCompletionCb(CALLBACKS_NAMESPACE::ConnCompleteCallback);
     void SetWriteProgressCb(CALLBACKS_NAMESPACE::ConnWriteProgressCallback);
     void SetCloseCb(CALLBACKS_NAMESPACE::ConnCloseCallback);

@@ -159,8 +159,11 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
         return;
     }
 
-    // If shutting down, destroy instead of pooling
-    if (shutting_down_) {
+    // If shutting down (partition-local or manager-wide), destroy instead of
+    // pooling. Without the manager check, a lease returned between the manager
+    // flag and the partition's enqueued InitiateShutdown can re-enter the pool
+    // and start new upstream work after Stop() has begun.
+    if (shutting_down_ || manager_shutting_down_.load(std::memory_order_acquire)) {
         DestroyConnection(std::move(owned));
         return;
     }
@@ -722,16 +725,36 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
     transport->SetConnectCompleteCallback(nullptr);
     transport->SetDeadlineTimeoutCb(nullptr);
 
-    // Re-wire pool-owned close + error callbacks so OnConnectionClosed
-    // fires if the upstream drops the connection (both while idle AND
-    // while checked out, in case a borrower overwrites them).
+    // Re-wire pool-owned close + error callbacks. These handle pool
+    // bookkeeping AND notify the borrower (if checked out) by firing
+    // on_message_callback with an empty string to signal EOF. Without
+    // this, a borrower waiting on SetOnMessageCb hangs indefinitely
+    // when the upstream disconnects mid-request.
     UpstreamConnection* raw_conn = conn;
     transport->SetCloseCb(
-        [this, raw_conn](std::shared_ptr<ConnectionHandler>) {
+        [this, raw_conn](std::shared_ptr<ConnectionHandler> handler) {
+            // Notify borrower of upstream disconnect before pool cleanup.
+            // The borrower's on_message_callback (if set) sees empty data = EOF.
+            // Without this, a borrower waiting on response data hangs until
+            // an external timeout when the upstream disconnects mid-request.
+            if (raw_conn->IsInUse() && handler) {
+                auto& on_msg = handler->GetOnMessageCb();
+                if (on_msg) {
+                    std::string empty;
+                    try { on_msg(handler, empty); } catch (...) {}
+                }
+            }
             OnConnectionClosed(raw_conn);
         });
     transport->SetErrorCb(
-        [this, raw_conn](std::shared_ptr<ConnectionHandler>) {
+        [this, raw_conn](std::shared_ptr<ConnectionHandler> handler) {
+            if (raw_conn->IsInUse() && handler) {
+                auto& on_msg = handler->GetOnMessageCb();
+                if (on_msg) {
+                    std::string empty;
+                    try { on_msg(handler, empty); } catch (...) {}
+                }
+            }
             OnConnectionClosed(raw_conn);
         });
 }
