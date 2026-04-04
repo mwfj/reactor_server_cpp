@@ -5,6 +5,7 @@
 #include <openssl/ssl.h>
 #include <signal.h>
 #include <limits>
+#include <future>
 
 // Suppress SIGPIPE for TLS upstream connections. SSL_write uses the
 // underlying socket's write() which bypasses MSG_NOSIGNAL. Without
@@ -99,41 +100,45 @@ UpstreamManager::UpstreamManager(
         }
     }
 
-    // Wire periodic eviction via the timer callback on each dispatcher.
-    // In HttpServer, NetServer already sets timeout_trigger_callback to
-    // NetServer::Timeout which chains to HttpServer's timer_callback
-    // (including EvictExpired). For standalone use, no such chain exists.
-    // We use SetTimerCB (the Dispatcher's own periodic callback from
-    // TimerHandler) which is only set to NetServer::RemoveConnection in
-    // production — standalone dispatchers have it unset.
-    // Note: SetTimerCB is for the dispatcher-internal timer, separate
-    // from SetTimeOutTriggerCB. It fires from TimerHandler unconditionally.
-    // Actually, SetTimerCB fires RemoveConnection(fd) with an int arg —
-    // wrong signature. Use SetTimeOutTriggerCB instead but only for
-    // standalone dispatchers.
-    //
-    // Practical solution: the timer interval adjustment above ensures
-    // TimerHandler fires frequently. PurgeExpiredWaitEntries runs from
-    // CheckoutAsync, ReturnConnection, ServiceWaitQueue, and EvictExpired.
-    // The ScheduleWaitQueuePurge deferred task fires on the next idle
-    // timeout. This is sufficient for production and near-sufficient for
-    // standalone. Document the limitation for the pure-sustained-I/O edge case.
+    // Periodic eviction: In production, HttpServer wires EvictExpired via
+    // the NetServer timer callback chain. For standalone use, the caller
+    // must call EvictExpired periodically (or rely on inline purges from
+    // CheckoutAsync/ReturnConnection/ServiceWaitQueue). The timer interval
+    // adjustment above ensures deadline-based timeouts fire promptly.
+    // Queue timeouts are handled by ScheduleWaitQueuePurge (deferred task).
 
     logging::Get()->info("UpstreamManager initialized with {} upstream(s)",
                          pools_.size());
 }
 
 UpstreamManager::~UpstreamManager() {
-    // Safety net: ensure shutdown is initiated and pools are drained before
-    // destruction. In production (HttpServer), Stop() handles this explicitly.
-    // In standalone use, the caller may not have called InitiateShutdown.
+    // Safety net: ensure shutdown is initiated before destruction.
     if (!shutting_down_.load(std::memory_order_acquire)) {
         InitiateShutdown();
     }
-    // Brief drain — give queued tasks a chance to complete. Dispatcher
-    // threads must still be running for this to work; if they're already
-    // stopped (HttpServer::~HttpServer after net_server_.Stop()), this
-    // is a no-op and safe.
+
+    // Wait for enqueued InitiateShutdown tasks to execute on each dispatcher.
+    // Without this, pools_ destruction frees PoolPartition objects while
+    // the enqueued lambdas still hold raw partition pointers → use-after-free.
+    // Use a per-dispatcher barrier: enqueue a no-op and wait for it to complete.
+    // If dispatchers are already stopped (production path), EnQueue is a no-op.
+    {
+        auto barrier = std::make_shared<std::atomic<int>>(
+            static_cast<int>(dispatchers_.size()));
+        auto done = std::make_shared<std::promise<void>>();
+        auto fut = done->get_future();
+        for (auto& disp : dispatchers_) {
+            disp->EnQueue([barrier, done]() {
+                if (barrier->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    done->set_value();
+                }
+            });
+        }
+        // Wait with timeout — dispatchers may be stopped already
+        fut.wait_for(std::chrono::milliseconds(500));
+    }
+
+    // Brief drain for outstanding connections
     static constexpr int DTOR_DRAIN_MS = 100;
     if (outstanding_conns_.load(std::memory_order_acquire) > 0) {
         std::unique_lock<std::mutex> lck(drain_mtx_);
