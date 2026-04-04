@@ -317,42 +317,56 @@ void PoolPartition::InitiateShutdown() {
 }
 
 void PoolPartition::ForceCloseActive() {
-    // Force-close the transports of all active connections but keep the
-    // UpstreamConnection objects alive in zombie_conns_. Outstanding
-    // UpstreamLease objects held by request handlers still point to these
-    // objects — destroying them here would be use-after-free. When the
-    // lease destructor calls ReturnConnection(), it finds the connection
-    // in zombie_conns_, cleans it up, and decrements outstanding_conns_.
+    // Collect transports + borrower callbacks, then move to zombie, then
+    // close transports, then notify borrowers. This ordering ensures:
+    // 1. Connections are in zombie_conns_ before notifications (so
+    //    ReturnConnection finds them if the borrower releases the lease)
+    // 2. Callbacks are copied before ClearTransportCallbacks nulls them
+    // 3. No iteration over active_conns_ during mutation
+    struct CloseWork {
+        std::shared_ptr<ConnectionHandler> transport;
+        CALLBACKS_NAMESPACE::ConnOnMsgCallback on_msg;
+        int fd;
+    };
+    std::vector<CloseWork> work;
+    work.reserve(active_conns_.size());
+
     for (auto& conn : active_conns_) {
-        auto transport = conn->GetTransport();
-        // Notify the borrower of upstream abort BEFORE clearing callbacks.
-        // Without this, a borrower waiting on SetOnMessageCb hangs until
-        // an external timeout because ClearTransportCallbacks nulls everything.
-        if (transport && conn->IsInUse()) {
-            auto& on_msg = transport->GetOnMessageCb();
-            if (on_msg) {
-                std::string empty;
-                try { on_msg(transport, empty); } catch (...) {}
-            }
+        CloseWork w;
+        w.transport = conn->GetTransport();
+        w.fd = conn->fd();
+        if (w.transport && conn->IsInUse()) {
+            w.on_msg = w.transport->GetOnMessageCb();
         }
         ClearTransportCallbacks(conn.get());
-        if (transport) {
-            transport->ClearDeadline();
-            int conn_fd = conn->fd();
-            if (conn_fd >= 0) {
-                dispatcher_->RemoveTimerConnectionIfMatch(conn_fd, transport);
+        if (w.transport) {
+            w.transport->ClearDeadline();
+            if (w.fd >= 0) {
+                dispatcher_->RemoveTimerConnectionIfMatch(w.fd, w.transport);
             }
-            if (!transport->IsClosing()) {
-                transport->ForceClose();
+            if (!w.transport->IsClosing()) {
+                w.transport->ForceClose();
             }
         }
         conn->MarkClosing();
+        work.push_back(std::move(w));
     }
-    // Move to zombie list — kept alive until leases release them
+
+    // Move to zombie list — kept alive until leases release them.
     for (auto& conn : active_conns_) {
         zombie_conns_.push_back(std::move(conn));
     }
     active_conns_.clear();
+
+    // Notify borrowers AFTER zombification. If the notification triggers
+    // lease release → ReturnConnection, it finds the connection in
+    // zombie_conns_ and cleans up safely.
+    for (auto& w : work) {
+        if (w.on_msg && w.transport) {
+            std::string empty;
+            try { w.on_msg(w.transport, empty); } catch (...) {}
+        }
+    }
 }
 
 void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
@@ -688,13 +702,26 @@ void PoolPartition::ServiceWaitQueue() {
 }
 
 void PoolPartition::ScheduleWaitQueuePurge() {
-    // Schedule a purge via EnQueue (wakes the event loop). The purge is a
-    // no-op if no entries have expired yet. In production, the timer callback
-    // provides periodic purges. For standalone use, this ensures at least one
-    // purge runs after each queued checkout. Subsequent purges are triggered
-    // by CheckoutAsync, ReturnConnection, ServiceWaitQueue, and EvictExpired.
+    // Schedule a self-rescheduling purge. Uses EnQueueDeferred so it doesn't
+    // spin the event loop — the task fires on the next epoll_wait timeout
+    // (~1s). If entries remain unexpired, it reschedules itself. This ensures
+    // CHECKOUT_QUEUE_TIMEOUT fires even in standalone mode without an external
+    // eviction timer.
     dispatcher_->EnQueue([this]() {
+        if (shutting_down_) return;
         PurgeExpiredWaitEntries();
+        // If waiters remain, schedule another check on the next iteration.
+        // Uses EnQueueDeferred to avoid spinning — fires on next natural
+        // wake (~1s epoll_wait timeout or next real event).
+        if (!wait_queue_.empty() && !shutting_down_ && dispatcher_) {
+            dispatcher_->EnQueueDeferred([this]() {
+                if (!shutting_down_ && !wait_queue_.empty()) {
+                    PurgeExpiredWaitEntries();
+                    // Final attempt — by now connect_timeout_ms (>=1s) has
+                    // passed since the original queue time.
+                }
+            });
+        }
     });
 }
 
