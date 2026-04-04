@@ -127,6 +127,14 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
             std::move(error_cb),
             std::chrono::steady_clock::now()
         });
+        // Schedule a deferred purge so queued checkouts get QUEUE_TIMEOUT
+        // even in standalone mode without an external eviction timer.
+        // EnQueueDeferred runs on the next epoll_wait timeout (~1s).
+        if (dispatcher_) {
+            dispatcher_->EnQueueDeferred([this]() {
+                PurgeExpiredWaitEntries();
+            });
+        }
         return;
     }
 
@@ -547,6 +555,12 @@ void PoolPartition::OnConnectComplete(UpstreamConnection* conn,
         std::chrono::steady_clock::now() + FAR_FUTURE);
     owned->MarkInUse();
 
+    // Wire pool-owned close/error callbacks BEFORE handing to the borrower.
+    // Without this, a fresh connection from CreateNewConnection still has
+    // the connect-phase callbacks that don't forward EOF to the borrower's
+    // on_message_callback, so a disconnect on the very first request hangs.
+    WirePoolCallbacks(owned.get());
+
     UpstreamConnection* raw = owned.get();
     active_conns_.push_back(std::move(owned));
 
@@ -733,29 +747,34 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
     UpstreamConnection* raw_conn = conn;
     transport->SetCloseCb(
         [this, raw_conn](std::shared_ptr<ConnectionHandler> handler) {
-            // Notify borrower of upstream disconnect before pool cleanup.
-            // The borrower's on_message_callback (if set) sees empty data = EOF.
-            // Without this, a borrower waiting on response data hangs until
-            // an external timeout when the upstream disconnects mid-request.
+            // Save the borrower's callback BEFORE pool cleanup, because
+            // OnConnectionClosed zombifies the connection and the borrower's
+            // on_message_callback release (in the notification below) may
+            // trigger ReturnConnection which can destroy raw_conn.
+            CALLBACKS_NAMESPACE::ConnOnMsgCallback borrower_cb;
             if (raw_conn->IsInUse() && handler) {
-                auto& on_msg = handler->GetOnMessageCb();
-                if (on_msg) {
-                    std::string empty;
-                    try { on_msg(handler, empty); } catch (...) {}
-                }
+                borrower_cb = handler->GetOnMessageCb();
             }
+            // Pool cleanup first — safe ordering: raw_conn is zombified
+            // (kept alive) not destroyed, so the notification below is safe.
             OnConnectionClosed(raw_conn);
+            // Notify borrower of upstream disconnect. Empty data = EOF.
+            if (borrower_cb && handler) {
+                std::string empty;
+                try { borrower_cb(handler, empty); } catch (...) {}
+            }
         });
     transport->SetErrorCb(
         [this, raw_conn](std::shared_ptr<ConnectionHandler> handler) {
+            CALLBACKS_NAMESPACE::ConnOnMsgCallback borrower_cb;
             if (raw_conn->IsInUse() && handler) {
-                auto& on_msg = handler->GetOnMessageCb();
-                if (on_msg) {
-                    std::string empty;
-                    try { on_msg(handler, empty); } catch (...) {}
-                }
+                borrower_cb = handler->GetOnMessageCb();
             }
             OnConnectionClosed(raw_conn);
+            if (borrower_cb && handler) {
+                std::string empty;
+                try { borrower_cb(handler, empty); } catch (...) {}
+            }
         });
 }
 
