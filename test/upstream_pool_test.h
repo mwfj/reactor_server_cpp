@@ -303,24 +303,24 @@ void TestConfigValidateMaxIdleExceedsMax() {
     }
 }
 
-// Validate rejects connect_timeout_ms < 100.
+// Validate rejects connect_timeout_ms < 1000 (timer resolution is 1s).
 void TestConfigValidateConnectTimeoutTooLow() {
-    std::cout << "\n[TEST] UpstreamPool Config: connect_timeout_ms < 100 rejected..." << std::endl;
+    std::cout << "\n[TEST] UpstreamPool Config: connect_timeout_ms < 1000 rejected..." << std::endl;
     try {
         ServerConfig cfg;
         UpstreamConfig u = MakeUpstreamConfig("svc", "127.0.0.1", 9001);
-        u.pool.connect_timeout_ms = 99;
+        u.pool.connect_timeout_ms = 999;
         cfg.upstreams.push_back(u);
 
         try {
             ConfigLoader::Validate(cfg);
-            TestFramework::RecordTest("UpstreamPool Config: connect_timeout_ms < 100 rejected",
+            TestFramework::RecordTest("UpstreamPool Config: connect_timeout_ms < 1000 rejected",
                                       false, "expected invalid_argument exception");
         } catch (const std::invalid_argument&) {
-            TestFramework::RecordTest("UpstreamPool Config: connect_timeout_ms < 100 rejected", true, "");
+            TestFramework::RecordTest("UpstreamPool Config: connect_timeout_ms < 1000 rejected", true, "");
         }
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("UpstreamPool Config: connect_timeout_ms < 100 rejected", false, e.what());
+        TestFramework::RecordTest("UpstreamPool Config: connect_timeout_ms < 1000 rejected", false, e.what());
     }
 }
 

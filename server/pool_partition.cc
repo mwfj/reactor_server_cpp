@@ -129,7 +129,18 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     // Find in active_conns_ and extract
     auto owned = ExtractFromActive(conn);
     if (!owned) {
-        // Not in active — might be a double-return or already cleaned up
+        // Check zombie list — connection was force-closed after drain timeout
+        // but the lease just released it. Clean up now.
+        for (auto it = zombie_conns_.begin(); it != zombie_conns_.end(); ++it) {
+            if (it->get() == conn) {
+                zombie_conns_.erase(it);
+                // outstanding_conns_ already decremented by ForceCloseActive path
+                // (not decremented there — it was left for this cleanup)
+                outstanding_conns_.fetch_sub(1, std::memory_order_release);
+                MaybeSignalDrain();
+                return;
+            }
+        }
         logging::Get()->warn("ReturnConnection: connection not found in active set "
                              "(already closed or double-return)");
         return;
@@ -288,17 +299,32 @@ void PoolPartition::InitiateShutdown() {
 }
 
 void PoolPartition::ForceCloseActive() {
-    // Known limitation: outstanding UpstreamLease objects held by request
-    // handlers become dangling after this call. The lease destructor's
-    // ReturnConnection will find nothing in active_conns_ and log a warning.
-    // This is acceptable because ForceCloseActive only runs after the drain
-    // timeout expires, meaning the handler is stuck/unresponsive.
-    // Move active connections to a local vector to iterate safely while
-    // destroying — DestroyConnection modifies active_conns_ indirectly.
-    auto active = std::move(active_conns_);
-    for (auto& conn : active) {
-        DestroyConnection(std::move(conn));
+    // Force-close the transports of all active connections but keep the
+    // UpstreamConnection objects alive in zombie_conns_. Outstanding
+    // UpstreamLease objects held by request handlers still point to these
+    // objects — destroying them here would be use-after-free. When the
+    // lease destructor calls ReturnConnection(), it finds the connection
+    // in zombie_conns_, cleans it up, and decrements outstanding_conns_.
+    for (auto& conn : active_conns_) {
+        ClearTransportCallbacks(conn.get());
+        auto transport = conn->GetTransport();
+        if (transport) {
+            transport->ClearDeadline();
+            int conn_fd = conn->fd();
+            if (conn_fd >= 0) {
+                dispatcher_->RemoveTimerConnectionIfMatch(conn_fd, transport);
+            }
+            if (!transport->IsClosing()) {
+                transport->ForceClose();
+            }
+        }
+        conn->MarkClosing();
     }
+    // Move to zombie list — kept alive until leases release them
+    for (auto& conn : active_conns_) {
+        zombie_conns_.push_back(std::move(conn));
+    }
+    active_conns_.clear();
 }
 
 void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,

@@ -35,11 +35,12 @@ UpstreamHostPool::UpstreamHostPool(
     for (size_t i = 0; i < num_dispatchers; ++i) {
         UpstreamPoolConfig partition_config = config;
         size_t per_partition = conn_floor + (i < conn_remainder ? 1 : 0);
-        // Do NOT inflate 0→1: if max_connections < num_dispatchers, some
-        // partitions get 0 and return POOL_EXHAUSTED. This preserves the
-        // user-configured global cap. Requests on zero-capacity partitions
-        // are handled by returning POOL_EXHAUSTED to the caller, which can
-        // retry or fail the proxied request.
+        // Ensure at least 1 per partition: zero-capacity partitions cause
+        // requests on that dispatcher to always fail (POOL_EXHAUSTED) since
+        // checkout is dispatcher-affine with no cross-partition fallback.
+        // When max_connections < num_dispatchers, this inflates the effective
+        // cap. We log a warning below so operators know the actual limit.
+        if (per_partition == 0) per_partition = 1;
         partition_config.max_connections = static_cast<int>(per_partition);
 
         size_t per_partition_idle = idle_floor + (i < idle_remainder ? 1 : 0);
@@ -48,6 +49,20 @@ UpstreamHostPool::UpstreamHostPool(
         partitions_.push_back(std::make_unique<PoolPartition>(
             dispatchers[i], host, port, sni_hostname, partition_config, tls_ctx,
             outstanding_conns, drain_cv));
+    }
+
+    // Warn if effective cap exceeds configured cap due to per-partition minimum of 1
+    size_t effective_total = 0;
+    for (size_t i = 0; i < num_dispatchers; ++i) {
+        size_t pp = conn_floor + (i < conn_remainder ? 1 : 0);
+        if (pp == 0) pp = 1;
+        effective_total += pp;
+    }
+    if (effective_total > total_conn) {
+        logging::Get()->warn("UpstreamHostPool '{}': max_connections={} < {} workers, "
+                             "effective cap inflated to {} (1 per partition minimum)",
+                             service_name_, config.max_connections, num_dispatchers,
+                             effective_total);
     }
 
     logging::Get()->info("UpstreamHostPool '{}' created for {}:{} with {} "

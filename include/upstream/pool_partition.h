@@ -88,6 +88,11 @@ private:
     // Connections in the process of connecting
     std::vector<std::unique_ptr<UpstreamConnection>> connecting_conns_;
 
+    // Zombie connections: force-closed after drain timeout but kept alive
+    // because outstanding UpstreamLease objects still hold raw pointers.
+    // Cleaned up when leases release them via ReturnConnection.
+    std::vector<std::unique_ptr<UpstreamConnection>> zombie_conns_;
+
     // Bounded wait queue
     struct WaitEntry {
         ReadyCallback ready_callback;

@@ -581,10 +581,10 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     "'): pool.max_idle_connections must be 0 to pool.max_connections (" +
                     std::to_string(u.pool.max_connections) + ")");
             }
-            if (u.pool.connect_timeout_ms < 100) {
+            if (u.pool.connect_timeout_ms < 1000) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name +
-                    "'): pool.connect_timeout_ms must be >= 100");
+                    "'): pool.connect_timeout_ms must be >= 1000 (timer resolution is 1s)");
             }
             if (u.pool.idle_timeout_sec < 1) {
                 throw std::invalid_argument(
@@ -609,6 +609,16 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                         idx + " ('" + u.name +
                         "'): tls.min_version must be '1.2' or '1.3', got '" +
                         u.tls.min_version + "'");
+                }
+                // When verify_peer is true, sni_hostname must be set so
+                // SSL_set1_host() can verify the certificate's CN/SAN.
+                // Without it, only CA trust is checked — any trusted cert passes.
+                if (u.tls.verify_peer && u.tls.sni_hostname.empty()) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): tls.sni_hostname is required when verify_peer is true "
+                        "(upstream host is an IPv4 address, which cannot be verified "
+                        "against certificate CN/SAN)");
                 }
             }
             if (!u.tls.ca_file.empty()) {
