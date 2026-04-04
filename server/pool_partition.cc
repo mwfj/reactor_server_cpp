@@ -640,7 +640,9 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
         // ECONNREFUSED), TotalCount() stays low and the next waiter should
         // also get a chance instead of stalling until queue timeout.
         PurgeExpiredWaitEntries();
-        while (!shutting_down_ && !wait_queue_.empty() &&
+        while (!shutting_down_ &&
+               !manager_shutting_down_.load(std::memory_order_acquire) &&
+               !wait_queue_.empty() &&
                TotalCount() < partition_max_connections_) {
             auto entry = std::move(wait_queue_.front());
             wait_queue_.pop_front();
@@ -706,27 +708,20 @@ void PoolPartition::ServiceWaitQueue() {
 
 void PoolPartition::ScheduleWaitQueuePurge() {
     // Self-rescheduling purge for standalone mode (no external timer).
-    // Uses EnQueue (which wakes the event loop via eventfd/pipe) so the
-    // task runs even under sustained I/O. PurgeExpiredWaitEntries only
-    // removes entries past connect_timeout_ms, so early runs are no-ops.
-    // Reschedules via EnQueueDeferred (no wake — piggybacks on the next
-    // natural wake) to avoid busy-looping on unexpired entries.
+    // Uses EnQueue (which wakes the event loop) so the task runs even
+    // under sustained I/O. PurgeExpiredWaitEntries is a no-op on
+    // unexpired entries, so early runs cost one wake + timestamp check.
+    // Reschedules itself (also via EnQueue) until the queue empties or
+    // all entries expire. The chain terminates because either:
+    //   a) Entries expire → PurgeExpiredWaitEntries removes them → queue empties
+    //   b) Other pool activity (return/close) services or purges the queue
+    //   c) Shutdown sets shutting_down_ → early return
     if (!dispatcher_ || shutting_down_) return;
     dispatcher_->EnQueue([this]() {
         if (shutting_down_) return;
         PurgeExpiredWaitEntries();
-        if (!wait_queue_.empty() && !shutting_down_ && dispatcher_) {
-            // Waiters still pending — reschedule via deferred (no wake).
-            // Fires on the next HandleEventId from any EnQueue, or on
-            // the next epoll_wait timeout (~1s).
-            dispatcher_->EnQueueDeferred([this]() {
-                if (shutting_down_) return;
-                PurgeExpiredWaitEntries();
-                // If still pending, schedule another wake-based purge.
-                if (!wait_queue_.empty() && !shutting_down_) {
-                    ScheduleWaitQueuePurge();
-                }
-            });
+        if (!wait_queue_.empty() && !shutting_down_) {
+            ScheduleWaitQueuePurge();
         }
     });
 }
