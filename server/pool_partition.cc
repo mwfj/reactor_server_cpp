@@ -137,9 +137,12 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
         for (auto it = zombie_conns_.begin(); it != zombie_conns_.end(); ++it) {
             if (it->get() == conn) {
                 zombie_conns_.erase(it);
-                // Do NOT decrement outstanding_conns_ here — it was already
-                // decremented by OnConnectionClosed (or ForceCloseActive doesn't
-                // decrement but OnConnectionClosed does before zombifying).
+                // Decrement here — zombie producers (OnConnectionClosed for
+                // active connections, ForceCloseActive) intentionally defer
+                // the decrement until the lease releases, so WaitForDrain
+                // doesn't see 0 while leases are still alive.
+                outstanding_conns_.fetch_sub(1, std::memory_order_release);
+                MaybeSignalDrain();
                 return;
             }
         }
@@ -564,14 +567,17 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
 
         if (was_active) {
             // An UpstreamLease may still hold a raw pointer to this connection.
-            // Move to zombie list instead of destroying — the lease destructor's
-            // ReturnConnection will clean it up. Same pattern as ForceCloseActive.
+            // Move to zombie list — the lease destructor's ReturnConnection
+            // will clean it up and decrement outstanding_conns_ at that point.
+            // Do NOT decrement here: WaitForDrain must not see 0 until all
+            // leases are released, otherwise the manager can be destroyed
+            // while a lease is still alive (use-after-free on partition_).
             zombie_conns_.push_back(std::move(owned));
+        } else {
+            // For connecting/idle connections, no lease exists — safe to
+            // decrement and destroy immediately.
+            outstanding_conns_.fetch_sub(1, std::memory_order_release);
         }
-        // For connecting/idle connections, no lease exists — safe to destroy.
-        // (owned is already nullptr if moved to zombie_conns_)
-
-        outstanding_conns_.fetch_sub(1, std::memory_order_release);
 
         // A slot just freed — retry queued checkouts.
         if (!shutting_down_ && !wait_queue_.empty() &&

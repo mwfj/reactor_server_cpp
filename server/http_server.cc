@@ -413,7 +413,12 @@ void HttpServer::Stop() {
         if (!net_server_.IsOnDispatcherThread()) {
             upstream_manager_->WaitForDrain(drain_timeout);
         } else {
-            // Stop-from-handler: poll + pump tasks (same pattern as H2 drain)
+            // Stop-from-handler: poll + pump tasks (same pattern as H2 drain).
+            // Limitation: upstream I/O pinned to this dispatcher cannot make
+            // progress because we can't return to the event loop while the
+            // handler is still on the call stack. Same-dispatcher upstream
+            // requests will be force-closed on timeout. This is inherent to
+            // stop-from-handler and matches the existing H2 degraded drain.
             logging::Get()->warn("Upstream drain: stop-from-handler, "
                                  "using task pump");
             static constexpr int PUMP_INTERVAL_MS = 200;
