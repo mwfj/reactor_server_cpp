@@ -108,9 +108,19 @@ private:
 
     size_t partition_max_connections_;
 
-    // Shared flag cleared in destructor. Captured by deferred purge tasks
-    // to detect partition destruction and avoid use-after-free.
-    std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
+    // Shared atomic flag cleared in destructor. Atomic because it's written
+    // from the teardown thread and read from dispatcher lambdas.
+    // Captured by deferred purge tasks via weak_ptr to detect partition
+    // destruction and avoid use-after-free.
+    std::shared_ptr<std::atomic<bool>> alive_ =
+        std::make_shared<std::atomic<bool>>(true);
+
+    // Count of dispatcher tasks that may dereference `this`. Incremented
+    // BEFORE each EnQueue/EnQueueDeferred, decremented inside the lambda
+    // on ALL return paths. Destructor waits for this to reach 0 before
+    // returning, guaranteeing no lambda can access freed members.
+    std::shared_ptr<std::atomic<int>> inflight_tasks_ =
+        std::make_shared<std::atomic<int>>(0);
 
     // True when a self-rescheduling wait-queue purge chain is already
     // scheduled. Prevents spawning duplicate chains per queued waiter.

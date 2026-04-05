@@ -67,47 +67,84 @@ static void ClearTransportCallbacks(UpstreamConnection* conn) {
 }
 
 PoolPartition::~PoolPartition() {
-    // Critical state changes must happen on the dispatcher thread to
-    // serialize with in-flight lambdas. The dispatcher is single-threaded,
-    // so a task we enqueue runs to completion before/after other tasks —
-    // never concurrently. Without this, a lambda mid-execution (having
-    // read *alive_=true) can race with our *alive_=false write and
-    // subsequent ClearTransportCallbacks on ConnectionHandler callback
-    // slots (std::function, not thread-safe).
-    auto finalize = [this]() {
-        *alive_ = false;
-        // Clear callbacks on-loop — safe because dispatcher is single-threaded
-        // and no concurrent lambda can be touching these std::function fields.
-        for (auto& c : idle_conns_)       ClearTransportCallbacks(c.get());
-        for (auto& c : active_conns_)     ClearTransportCallbacks(c.get());
-        for (auto& c : connecting_conns_) ClearTransportCallbacks(c.get());
-        for (auto& c : zombie_conns_)     ClearTransportCallbacks(c.get());
+    // Atomic write — stops new purge chains from being scheduled.
+    alive_->store(false, std::memory_order_release);
+
+    // The destructor cannot safely walk containers off-thread (close
+    // callbacks fired by dispatcher channel events can mutate them
+    // concurrently). Instead, enqueue a task that runs on the dispatcher
+    // thread and does ALL the work: walk containers, collect transports,
+    // clear callbacks. Then wait for the task to complete via inflight_tasks_.
+    //
+    // The inflight counter uses an RAII guard so the decrement fires even
+    // if EnQueue drops the task (dispatcher stopped mid-shutdown). Without
+    // this, a lossy EnQueue would leak the counter and the destructor
+    // would hang forever.
+
+    auto on_dispatcher = [this]() {
+        // On dispatcher thread — single-threaded, no concurrent mutation.
+        // Safe to walk containers and touch connection transports.
+        auto clear = [](auto& container) {
+            for (auto& c : container) {
+                if (!c) continue;
+                auto t = c->GetTransport();  // GetTransport returns by value
+                if (t) {
+                    t->SetConnectCompleteCallback(nullptr);
+                    t->SetCloseCb(nullptr);
+                    t->SetErrorCb(nullptr);
+                    t->SetOnMessageCb(nullptr);
+                    t->SetCompletionCb(nullptr);
+                    t->SetWriteProgressCb(nullptr);
+                }
+            }
+        };
+        clear(idle_conns_);
+        clear(active_conns_);
+        clear(connecting_conns_);
+        clear(zombie_conns_);
     };
 
     if (dispatcher_ && !dispatcher_->was_stopped() &&
         !dispatcher_->is_on_loop_thread()) {
-        // Off dispatcher thread with a live dispatcher — enqueue the
-        // finalize and wait for completion. This serializes with any
-        // lambdas already in-flight on the dispatcher.
-        auto p = std::make_shared<std::promise<void>>();
-        auto f = p->get_future();
-        dispatcher_->EnQueue([finalize, p]() {
-            finalize();
-            p->set_value();
+        // Create an RAII guard that decrements inflight_tasks_ when destroyed.
+        // The guard is captured into the lambda. If EnQueue accepts the
+        // lambda, the guard fires when the lambda completes. If EnQueue
+        // drops the lambda (was_stopped), the lambda is destroyed without
+        // running and the guard still fires. Either way, exactly one
+        // decrement matches the fetch_add below.
+        inflight_tasks_->fetch_add(1, std::memory_order_relaxed);
+        auto inflight = inflight_tasks_;
+        auto guard = std::shared_ptr<void>(nullptr, [inflight](void*) {
+            inflight->fetch_sub(1, std::memory_order_release);
         });
-        // Bounded wait. If dispatcher is hung, we have bigger problems.
-        if (f.wait_for(std::chrono::milliseconds(500)) !=
-            std::future_status::ready) {
-            logging::Get()->warn("PoolPartition destructor finalize timed out");
-            // Force inline as fallback — at this point the dispatcher
-            // appears unresponsive so the race window is low but real.
-            finalize();
-        }
+        dispatcher_->EnQueue([on_dispatcher, guard]() {
+            on_dispatcher();
+            // guard decrements when captured shared_ptr is destroyed
+        });
+        // guard is now held by the lambda only (no other copy)
     } else {
-        // On dispatcher thread OR dispatcher stopped — safe to run inline.
-        // Dispatcher-stopped case: no lambdas can run, no race.
-        // On-thread case: we ARE the dispatcher, no race.
-        finalize();
+        // On-thread OR dispatcher stopped: no concurrent access possible.
+        // Run inline (safe).
+        on_dispatcher();
+    }
+
+    // Wait for all in-flight dispatcher tasks to complete. Every lambda
+    // that touches `this` increments inflight_tasks_ before enqueue and
+    // decrements via RAII guard, so this counter is accurate even under
+    // lossy EnQueue (dispatcher stopped mid-shutdown).
+    //
+    // No timeout — we MUST wait. A stale task firing after the destructor
+    // returns would dereference freed members. inflight_tasks_ is a
+    // shared_ptr<atomic>, so it outlives the partition safely.
+    int iteration = 0;
+    while (inflight_tasks_->load(std::memory_order_acquire) > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (++iteration == 500) {  // ~5 second warning threshold
+            logging::Get()->warn("PoolPartition destructor waiting on {} "
+                                 "in-flight dispatcher tasks",
+                                 inflight_tasks_->load(std::memory_order_relaxed));
+            iteration = 0;
+        }
     }
 
     // Do NOT call ForceClose() here — destructor may run on the main thread
@@ -778,18 +815,32 @@ void PoolPartition::ServiceWaitQueue() {
 
 void PoolPartition::ScheduleWaitQueuePurge() {
     if (!dispatcher_ || shutting_down_) return;
-    // Dedupe: one chain is enough even when many waiters are queued.
-    // Without this, every queued checkout spawns its own chain, burning
-    // CPU under saturation exactly when the pool is back-pressured.
+    // Dedup: one chain is enough. Without this, every queued waiter would
+    // spawn its own chain, burning CPU under back-pressure.
     if (purge_chain_active_) return;
     purge_chain_active_ = true;
 
-    // Capture alive_ by weak_ptr — survives partition destruction.
-    std::weak_ptr<bool> alive_weak = alive_;
-    dispatcher_->EnQueue([this, alive_weak]() {
+    // RAII guard for inflight counter. Increment here; decrement fires
+    // when the captured shared_ptr is destroyed (whether the lambda runs
+    // to completion, early-returns, or is dropped by a lossy EnQueue on
+    // stopped dispatcher). Exactly one decrement per increment.
+    inflight_tasks_->fetch_add(1, std::memory_order_relaxed);
+    auto inflight = inflight_tasks_;
+    auto guard = std::shared_ptr<void>(nullptr, [inflight](void*) {
+        inflight->fetch_sub(1, std::memory_order_release);
+    });
+
+    std::weak_ptr<std::atomic<bool>> alive_weak = alive_;
+    dispatcher_->EnQueue([this, alive_weak, guard]() {
         auto alive = alive_weak.lock();
-        if (!alive || !*alive || shutting_down_) {
-            if (alive && *alive) purge_chain_active_ = false;
+        if (!alive || !alive->load(std::memory_order_acquire)) {
+            // Partition destroyed — do not touch `this`.
+            return;
+        }
+        // alive==true and destructor waits for inflight=0 (guard not yet
+        // destroyed) before freeing members, so touching `this` is safe.
+        if (shutting_down_) {
+            purge_chain_active_ = false;
             return;
         }
         PurgeExpiredWaitEntries();
@@ -797,11 +848,27 @@ void PoolPartition::ScheduleWaitQueuePurge() {
             purge_chain_active_ = false;
             return;
         }
-        std::weak_ptr<bool> inner_alive = alive_;
-        dispatcher_->EnQueueDeferred([this, inner_alive]() {
+        // Reschedule via EnQueueDeferred (no wake). This prevents hot-
+        // spinning the dispatcher when entries haven't expired yet. The
+        // deferred task fires on the next wake (any EnQueue from any
+        // source) or the ~1s idle timeout. Accepted limitation: under
+        // pure dispatcher isolation with no activity, queue timeouts
+        // may be delayed by up to 1s, which is within connect_timeout_ms
+        // (minimum 1000ms per config validation).
+        inflight_tasks_->fetch_add(1, std::memory_order_relaxed);
+        auto inner_inflight = inflight_tasks_;
+        auto inner_guard = std::shared_ptr<void>(nullptr,
+            [inner_inflight](void*) {
+                inner_inflight->fetch_sub(1, std::memory_order_release);
+            });
+        std::weak_ptr<std::atomic<bool>> inner_alive = alive_;
+        dispatcher_->EnQueueDeferred([this, inner_alive, inner_guard]() {
             auto alive2 = inner_alive.lock();
-            if (!alive2 || !*alive2 || shutting_down_) {
-                if (alive2 && *alive2) purge_chain_active_ = false;
+            if (!alive2 || !alive2->load(std::memory_order_acquire)) {
+                return;
+            }
+            if (shutting_down_) {
+                purge_chain_active_ = false;
                 return;
             }
             PurgeExpiredWaitEntries();
@@ -809,8 +876,9 @@ void PoolPartition::ScheduleWaitQueuePurge() {
                 purge_chain_active_ = false;
                 return;
             }
-            // Clear the flag before rescheduling so the next call can
-            // set it again — the chain continues as a single logical unit.
+            // Clear the dedup flag and re-enter — ScheduleWaitQueuePurge
+            // will set it again and start a fresh EnQueue→EnQueueDeferred
+            // cycle. One logical chain, bounded CPU cost.
             purge_chain_active_ = false;
             ScheduleWaitQueuePurge();
         });
