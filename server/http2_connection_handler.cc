@@ -333,6 +333,14 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
         return;
     }
     session_->SubmitResponse(stream_id, response);
+    // Flush nghttp2's outgoing frame queue onto the transport. The sync H2
+    // path hits the SendPendingFrames call at the tail of OnRawData after
+    // ReceiveData → OnRequest → SubmitResponse returns. Async completions
+    // come from outside that loop (user code via RunOnDispatcher), so if
+    // we don't flush here the response sits queued until some unrelated
+    // inbound frame, shutdown, or timeout happens to flush it — hanging
+    // any async H2 route.
+    session_->SendPendingFrames();
 }
 
 void Http2ConnectionHandler::NotifyDrainComplete() {

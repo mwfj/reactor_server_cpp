@@ -178,9 +178,15 @@ bool HttpRouter::RunMiddleware(const HttpRequest& request, HttpResponse& respons
 }
 
 void HttpRouter::FillDefaultRejectionResponse(HttpResponse& response) {
-    if (response.GetStatusCode() == 200 &&
-        response.GetBody().empty() &&
-        response.GetHeaders().empty()) {
+    // Upgrade to 403 when middleware rejected (returned false) but left
+    // the status code unchanged from the HttpResponse default (200). The
+    // headers check used to be part of this guard, but middleware that
+    // legitimately adds CORS / request-id / auth headers before rejecting
+    // would then leave a 200 status on what is supposed to be a failure
+    // response, and the client would silently succeed. We keep the empty-
+    // body check so a middleware that explicitly populated a 200-status
+    // body (unusual but well-defined) is still preserved.
+    if (response.GetStatusCode() == 200 && response.GetBody().empty()) {
         response.Status(403).Text("Forbidden");
     }
 }

@@ -8,9 +8,6 @@ namespace {
 // request-line, headers, and framing bytes that may accumulate while an
 // async response is pending on a pipelined keep-alive connection.
 constexpr size_t DEFERRED_STASH_OVERHEAD = 8192;
-// Fallback cap when the connection has no configured body/header limits
-// (standalone/test usage). Matches a common "one small request" budget.
-constexpr size_t DEFERRED_STASH_DEFAULT_CAP = 1 * 1024 * 1024;  // 1 MB
 }  // namespace
 
 HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn)
@@ -120,25 +117,31 @@ void HttpConnectionHandler::BeginAsyncResponse(const HttpRequest& req) {
 
 void HttpConnectionHandler::StashDeferredBytes(const std::string& data) {
     if (data.empty()) return;
-    // Cap the stash to the same ceiling as a single request body, plus the
-    // header limit, to bound memory while an async response is pending.
-    // A malicious client that pipelines gigabytes against a slow async
-    // handler is otherwise an OOM DoS vector. When exceeded we force-close
-    // the connection — the in-flight async completion will see
-    // IsClosing() and bail out.
-    const size_t cap = (max_body_size_ > 0 && max_header_size_ > 0)
-        ? (max_body_size_ + max_header_size_ + DEFERRED_STASH_OVERHEAD)
-        : DEFERRED_STASH_DEFAULT_CAP;
-    if (deferred_pending_buf_.size() + data.size() > cap) {
-        logging::Get()->warn(
-            "Deferred pipeline buffer cap exceeded fd={} ({} + {} > {}), "
-            "force-closing connection",
-            conn_ ? conn_->fd() : -1, deferred_pending_buf_.size(),
-            data.size(), cap);
-        deferred_pending_buf_.clear();
-        if (conn_ && !conn_->IsClosing()) conn_->ForceClose();
-        return;
+    // Bound memory while an async response is pending so a client
+    // pipelining gigabytes against a slow async handler can't OOM us.
+    // Honor the server-configured body/header caps: treat 0 as "unlimited"
+    // per docs so `max_body_size_ = 0` means no stash cap at all, and
+    // apply whichever field IS set so e.g. max_body_size = 64 KiB with
+    // max_header_size = 0 still enforces the 64 KiB body budget (previously
+    // fell back to a hard-coded 1 MiB, which both bypassed a tight body
+    // cap and spuriously force-closed "unlimited" configs at 1 MiB).
+    if (max_body_size_ != 0 || max_header_size_ != 0) {
+        const size_t cap = max_body_size_ + max_header_size_
+                           + DEFERRED_STASH_OVERHEAD;
+        if (deferred_pending_buf_.size() + data.size() > cap) {
+            logging::Get()->warn(
+                "Deferred pipeline buffer cap exceeded fd={} ({} + {} > {}), "
+                "force-closing connection",
+                conn_ ? conn_->fd() : -1, deferred_pending_buf_.size(),
+                data.size(), cap);
+            deferred_pending_buf_.clear();
+            if (conn_ && !conn_->IsClosing()) conn_->ForceClose();
+            return;
+        }
     }
+    // Both limits unlimited: the user has opted out of memory caps. Append
+    // without a cap — consistent with how unlimited max_body_size is
+    // handled in the synchronous request path.
     deferred_pending_buf_.append(data);
 }
 
