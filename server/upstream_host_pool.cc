@@ -80,10 +80,12 @@ PoolPartition* UpstreamHostPool::GetPartition(size_t dispatcher_index) {
 }
 
 void UpstreamHostPool::InitiateShutdown() {
-    for (size_t i = 0; i < partitions_.size(); ++i) {
-        auto* partition = partitions_[i].get();
-        dispatchers_[i]->EnQueue([partition]() {
-            partition->InitiateShutdown();
-        });
+    // Route through PoolPartition::ScheduleInitiateShutdown so the enqueue
+    // is tracked by the partition's inflight_tasks_ counter. The partition
+    // destructor blocks on that counter before freeing containers, which
+    // eliminates the standalone-teardown race where a queued InitiateShutdown
+    // lambda could run after the partition had been freed.
+    for (auto& partition : partitions_) {
+        partition->ScheduleInitiateShutdown();
     }
 }

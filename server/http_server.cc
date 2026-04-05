@@ -575,23 +575,12 @@ void HttpServer::Stop() {
     // the generic close sweep in NetServer::Stop().
     draining_conn_ptrs.insert(ws_draining.begin(), ws_draining.end());
 
-    // Exempt HTTP/1 connections whose handlers have opted out of the sweep
-    // (e.g. proxy handlers with in-flight upstream work). Without this,
-    // NetServer::Stop()'s generic CloseAfterWrite pass force-closes the
-    // client transport BEFORE the deferred upstream drain runs, dropping
-    // the in-flight proxied request even though the PR's upstream graceful-
-    // shutdown phase would otherwise give it time to complete. The opt-in
-    // is intentional: only handlers that know they're doing async work need
-    // (or want) the exemption; idle keep-alive connections are still closed
-    // by the sweep as before.
-    {
-        std::lock_guard<std::mutex> lck(conn_mtx_);
-        for (auto& [fd, http_conn] : http_connections_) {
-            if (!http_conn || !http_conn->IsShutdownExempt()) continue;
-            auto c = http_conn->GetConnection();
-            if (c) draining_conn_ptrs.insert(c.get());
-        }
-    }
+    // HTTP/1 async handlers (proxy / deferred responses) mark their transport
+    // exempt via ConnectionHandler::SetShutdownExempt, which NetServer's
+    // sweep live-checks per iteration. A pre-sweep snapshot here would be
+    // UNSAFE: a request that enters its async handler after the snapshot
+    // but before the sweep would be dropped by CloseAfterWrite on an empty
+    // output buffer. The live check closes that race.
 
     // Note: pending_detection_ connections are NOT exempted from the close
     // sweep. If one becomes H2 late, DetectAndRouteProtocol's late drain
@@ -967,7 +956,9 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
             //      weak_ptr re-locks the handler and CompleteAsyncResponse
             //      performs normalization, sends the bytes, and either
             //      closes or resumes parsing pipelined data.
-            auto async_handler = router_.GetAsyncHandler(request);
+            bool async_head_fallback = false;
+            auto async_handler = router_.GetAsyncHandler(
+                request, &async_head_fallback);
             if (async_handler) {
                 bool mw_ok = router_.RunMiddleware(request, response);
                 if (!mw_ok) {
@@ -978,6 +969,10 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     return;  // Sync send path below runs auto-send
                 }
 
+                // BeginAsyncResponse must see the ORIGINAL request so
+                // deferred_was_head_ captures the real client method —
+                // CompleteAsyncResponse uses it to strip the body at send
+                // time (RFC 7231 §4.3.2), mirroring the sync HEAD path.
                 response.Defer();
                 self->BeginAsyncResponse(request);
 
@@ -1006,7 +1001,19 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     };
 
                 try {
-                    async_handler(request, std::move(complete));
+                    if (async_head_fallback) {
+                        // HEAD → GET fallback: hand the handler a cloned
+                        // request with method rewritten to "GET" so user
+                        // code sees a GET (matches sync Dispatch semantics).
+                        // The original HEAD method is already captured in
+                        // deferred_was_head_ so CompleteAsyncResponse will
+                        // strip the body on send.
+                        HttpRequest get_req = request;
+                        get_req.method = "GET";
+                        async_handler(get_req, std::move(complete));
+                    } else {
+                        async_handler(request, std::move(complete));
+                    }
                 } catch (const std::exception& e) {
                     // Handler threw before scheduling async work. Recover
                     // by completing synchronously with a 500. Never leak
@@ -1603,7 +1610,9 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
             // graceful-shutdown drain already waits on open streams, so
             // the async operation is naturally protected during shutdown
             // without needing shutdown_exempt_ bookkeeping.
-            auto async_handler = router_.GetAsyncHandler(request);
+            bool async_head_fallback = false;
+            auto async_handler = router_.GetAsyncHandler(
+                request, &async_head_fallback);
             if (async_handler) {
                 if (!router_.RunMiddleware(request, response)) {
                     HttpRouter::FillDefaultRejectionResponse(response);
@@ -1631,7 +1640,13 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     };
 
                 try {
-                    async_handler(request, std::move(complete));
+                    if (async_head_fallback) {
+                        HttpRequest get_req = request;
+                        get_req.method = "GET";
+                        async_handler(get_req, std::move(complete));
+                    } else {
+                        async_handler(request, std::move(complete));
+                    }
                 } catch (const std::exception& e) {
                     logging::Get()->error("Exception in async H2 handler: {}",
                                           e.what());

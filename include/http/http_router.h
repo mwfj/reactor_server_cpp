@@ -82,7 +82,14 @@ public:
 
     // Async-route lookup. Returns an empty function if no async route matches.
     // Populates request.params with extracted path parameters on match.
-    AsyncHandler GetAsyncHandler(const HttpRequest& request) const;
+    // When `head_fallback_out` is non-null, it is set to true iff the match
+    // came via the HEAD → GET fallback path — the caller must rewrite the
+    // request method to "GET" before invoking the handler (mirroring sync
+    // Dispatch), otherwise the user's handler sees "HEAD" but the framework
+    // applies GET-style response normalization + body stripping, which
+    // diverges between sync and async routes.
+    AsyncHandler GetAsyncHandler(const HttpRequest& request,
+                                 bool* head_fallback_out = nullptr) const;
 
     // Run middleware chain only (for WebSocket upgrades that need auth/CORS/etc.)
     // Returns true if all middleware passed, false if any short-circuited.

@@ -111,9 +111,11 @@ void HttpConnectionHandler::BeginAsyncResponse(const HttpRequest& req) {
     deferred_keep_alive_ = req.keep_alive;
     // current_http_minor_ was updated by the parser when headers completed
     // and persists across the deferred window, so no separate capture is
-    // needed. Exempt the connection from the shutdown close sweep until
-    // CompleteAsyncResponse runs.
-    shutdown_exempt_.store(true, std::memory_order_release);
+    // needed. Mark the transport exempt from NetServer::Stop()'s close
+    // sweep until CompleteAsyncResponse runs; the sweep live-checks this
+    // flag on each iteration so a request entering the async handler just
+    // before the sweep cannot be dropped on an empty output buffer.
+    if (conn_) conn_->SetShutdownExempt(true);
 }
 
 void HttpConnectionHandler::StashDeferredBytes(const std::string& data) {
@@ -162,7 +164,7 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     deferred_response_pending_ = false;
     deferred_was_head_ = false;
     deferred_keep_alive_ = true;
-    shutdown_exempt_.store(false, std::memory_order_release);
+    if (conn_) conn_->SetShutdownExempt(false);
 
     if (conn_->IsClosing()) {
         deferred_pending_buf_.clear();

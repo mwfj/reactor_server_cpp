@@ -81,11 +81,15 @@ public:
     // async route API. Also exposed publicly so advanced users implementing
     // custom async patterns outside the AsyncHandler API can still mark
     // their connections exempt from HttpServer::Stop()'s close sweep.
+    //
+    // The flag lives on the underlying ConnectionHandler so NetServer's
+    // close sweep can check it live (a pre-sweep snapshot cannot close
+    // the race with a request that's just now entering an async handler).
     void SetShutdownExempt(bool exempt) {
-        shutdown_exempt_.store(exempt, std::memory_order_release);
+        if (conn_) conn_->SetShutdownExempt(exempt);
     }
     bool IsShutdownExempt() const {
-        return shutdown_exempt_.load(std::memory_order_acquire);
+        return conn_ && conn_->IsShutdownExempt();
     }
 
 private:
@@ -137,11 +141,6 @@ private:
     HTTP_CALLBACKS_NAMESPACE::HttpConnCallbacks callbacks_;
     bool upgraded_ = false;
     std::unique_ptr<WebSocketConnection> ws_conn_;
-
-    // Set by handlers doing async work (e.g. upstream proxy) to opt out of
-    // the shutdown close sweep. Atomic because it's written on the dispatcher
-    // thread (in handlers) and read on the stopper thread (in HttpServer::Stop).
-    std::atomic<bool> shutdown_exempt_{false};
 
     // Deferred-response state — dispatcher-thread only, no atomics needed.
     // Populated by BeginAsyncResponse and consumed by CompleteAsyncResponse.

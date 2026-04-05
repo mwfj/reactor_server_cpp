@@ -740,6 +740,92 @@ namespace HttpTests {
         }
     }
 
+    // P2: HEAD→GetAsync fallback must rewrite the request method to "GET"
+    // before invoking the user handler, mirroring the sync Dispatch behavior.
+    // Handler-observable test — asserts the method the handler sees is "GET".
+    void TestAsyncRouteHeadFallbackRewritesMethod() {
+        std::cout << "\n[TEST] Async route: HEAD fallback rewrites method to GET..."
+                  << std::endl;
+        AsyncScheduler sched;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            std::atomic<bool> saw_get{false};
+            std::atomic<bool> saw_head{false};
+            server.GetAsync("/r",
+                [&](const HttpRequest& req,
+                    HttpRouter::AsyncCompletionCallback complete) {
+                    if (req.method == "GET")  saw_get.store(true);
+                    if (req.method == "HEAD") saw_head.store(true);
+                    auto shared = std::make_shared<
+                        HttpRouter::AsyncCompletionCallback>(std::move(complete));
+                    sched.Schedule(20, [shared]() {
+                        HttpResponse r;
+                        r.Status(200).Text("BODY");
+                        (*shared)(std::move(r));
+                    });
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+            SendRawAndDrain(port,
+                "HEAD /r HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                3000);
+
+            bool pass = saw_get.load() && !saw_head.load();
+            std::string err;
+            if (!saw_get.load()) err += "handler did not see method=GET; ";
+            if (saw_head.load()) err += "handler observed method=HEAD (fallback must rewrite); ";
+            TestFramework::RecordTest("Async route: HEAD fallback rewrites method",
+                                      pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("Async route: HEAD fallback rewrites method",
+                                      false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // P2: a PostAsync-only route with a GET request must return 405 with an
+    // Allow: POST header, not 404. The 405 logic in HttpRouter::Dispatch
+    // must consult the async route trie.
+    void TestAsyncRoute405IncludesAsyncMethods() {
+        std::cout << "\n[TEST] Async route: 405/Allow includes async methods..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.PostAsync("/jobs",
+                [](const HttpRequest&, HttpRouter::AsyncCompletionCallback c) {
+                    HttpResponse r;
+                    r.Status(202).Text("accepted");
+                    c(std::move(r));
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendHttpRequest(port,
+                "GET /jobs HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+
+            bool pass = true;
+            std::string err;
+            if (resp.find(" 405 ") == std::string::npos) {
+                pass = false;
+                err += "expected 405 Method Not Allowed (got " +
+                       std::to_string(resp.size()) + " bytes); ";
+            }
+            // Allow header must advertise POST.
+            auto allow_pos = resp.find("Allow:");
+            if (allow_pos == std::string::npos) {
+                pass = false; err += "missing Allow header; ";
+            } else if (resp.find("POST", allow_pos) == std::string::npos) {
+                pass = false; err += "Allow header missing POST; ";
+            }
+            TestFramework::RecordTest("Async route: 405 advertises async methods",
+                                      pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("Async route: 405 advertises async methods",
+                                      false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // P2: a HEAD request served via a GetAsync fallback MUST NOT carry a
     // body. Matches the sync path's RFC 7231 §4.3.2 behavior.
     void TestAsyncRouteHeadStripping() {
@@ -868,6 +954,8 @@ namespace HttpTests {
         // Async-route integration tests
         TestAsyncRouteMiddlewareGating();
         TestAsyncRoutePipelineOrdering();
+        TestAsyncRouteHeadFallbackRewritesMethod();
+        TestAsyncRoute405IncludesAsyncMethods();
         TestAsyncRouteHeadStripping();
         TestAsyncRouteClientCloseHeader();
 

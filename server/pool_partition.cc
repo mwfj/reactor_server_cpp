@@ -114,22 +114,13 @@ PoolPartition::~PoolPartition() {
 
     if (dispatcher_ && !dispatcher_->was_stopped() &&
         !dispatcher_->is_on_loop_thread()) {
-        // Create an RAII guard that decrements inflight_tasks_ when destroyed.
-        // The guard is captured into the lambda. If EnQueue accepts the
-        // lambda, the guard fires when the lambda completes. If EnQueue
-        // drops the lambda (was_stopped), the lambda is destroyed without
-        // running and the guard still fires. Either way, exactly one
-        // decrement matches the fetch_add below.
-        inflight_tasks_->fetch_add(1, std::memory_order_relaxed);
-        auto inflight = inflight_tasks_;
-        auto guard = std::shared_ptr<void>(nullptr, [inflight](void*) {
-            inflight->fetch_sub(1, std::memory_order_release);
-        });
+        // RAII guard — see MakeInflightGuard for semantics. Captured by the
+        // lambda so the decrement fires whether the lambda runs or is
+        // dropped by a stopped dispatcher.
+        auto guard = MakeInflightGuard();
         dispatcher_->EnQueue([on_dispatcher, guard]() {
             on_dispatcher();
-            // guard decrements when captured shared_ptr is destroyed
         });
-        // guard is now held by the lambda only (no other copy)
     } else {
         // On-thread OR dispatcher stopped: no concurrent access possible.
         // Run inline (safe).
@@ -386,6 +377,38 @@ void PoolPartition::EvictExpired() {
 
     // Eviction freed capacity — retry queued checkouts.
     ServiceWaitQueue();
+}
+
+std::shared_ptr<void> PoolPartition::MakeInflightGuard() {
+    inflight_tasks_->fetch_add(1, std::memory_order_relaxed);
+    auto inflight = inflight_tasks_;
+    return std::shared_ptr<void>(nullptr, [inflight](void*) {
+        inflight->fetch_sub(1, std::memory_order_release);
+    });
+}
+
+void PoolPartition::ScheduleInitiateShutdown() {
+    // Direct call if no dispatcher (degenerate/test path).
+    if (!dispatcher_) {
+        InitiateShutdown();
+        return;
+    }
+    // Already on the dispatcher thread — run inline.
+    if (dispatcher_->is_dispatcher_thread()) {
+        InitiateShutdown();
+        return;
+    }
+    // Off-thread: enqueue and track via MakeInflightGuard so ~PoolPartition
+    // blocks until the lambda has executed (or been dropped by a stopped
+    // dispatcher). Guarded by alive_weak so a task that somehow races past
+    // the destructor is a no-op instead of a UAF on freed containers.
+    auto guard = MakeInflightGuard();
+    std::weak_ptr<std::atomic<bool>> alive_weak = alive_;
+    dispatcher_->EnQueue([this, alive_weak, guard]() {
+        auto alive = alive_weak.lock();
+        if (!alive || !alive->load(std::memory_order_acquire)) return;
+        InitiateShutdown();
+    });
 }
 
 void PoolPartition::InitiateShutdown() {
@@ -898,15 +921,8 @@ void PoolPartition::ScheduleWaitQueuePurge() {
     if (purge_chain_active_) return;
     purge_chain_active_ = true;
 
-    // RAII guard for inflight counter. Increment here; decrement fires
-    // when the captured shared_ptr is destroyed (whether the lambda runs
-    // to completion, early-returns, or is dropped by a lossy EnQueue on
-    // stopped dispatcher). Exactly one decrement per increment.
-    inflight_tasks_->fetch_add(1, std::memory_order_relaxed);
-    auto inflight = inflight_tasks_;
-    auto guard = std::shared_ptr<void>(nullptr, [inflight](void*) {
-        inflight->fetch_sub(1, std::memory_order_release);
-    });
+    // RAII guard — see MakeInflightGuard for semantics.
+    auto guard = MakeInflightGuard();
 
     std::weak_ptr<std::atomic<bool>> alive_weak = alive_;
     dispatcher_->EnQueue([this, alive_weak, guard]() {
@@ -933,12 +949,7 @@ void PoolPartition::ScheduleWaitQueuePurge() {
         // pure dispatcher isolation with no activity, queue timeouts
         // may be delayed by up to 1s, which is within connect_timeout_ms
         // (minimum 1000ms per config validation).
-        inflight_tasks_->fetch_add(1, std::memory_order_relaxed);
-        auto inner_inflight = inflight_tasks_;
-        auto inner_guard = std::shared_ptr<void>(nullptr,
-            [inner_inflight](void*) {
-                inner_inflight->fetch_sub(1, std::memory_order_release);
-            });
+        auto inner_guard = MakeInflightGuard();
         std::weak_ptr<std::atomic<bool>> inner_alive = alive_;
         dispatcher_->EnQueueDeferred([this, inner_alive, inner_guard]() {
             auto alive2 = inner_alive.lock();

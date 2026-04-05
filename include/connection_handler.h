@@ -26,6 +26,14 @@ private:
     std::atomic<bool> is_closing_{false};
     std::atomic<bool> close_after_write_{false};
 
+    // Opt-in flag for the graceful-shutdown close sweep in NetServer::Stop().
+    // A higher layer (e.g. HttpConnectionHandler during an async response
+    // cycle) sets this to true so the sweep skips CloseAfterWrite and lets
+    // the in-flight async work complete. Live-checked at sweep time so a
+    // request that enters its async handler just before the sweep cannot
+    // race a stale snapshot.
+    std::atomic<bool> shutdown_exempt_{false};
+
     TimeStamp ts_; // Each connection owns a timestamp to manage
     bool has_deadline_ = false;
     std::chrono::steady_clock::time_point deadline_;
@@ -79,6 +87,12 @@ public:
     int fd() const{ return sock_ ? sock_ -> fd() : -1; }
     bool IsClosing() const { return is_closing_.load(std::memory_order_acquire); }
     bool IsCloseDeferred() const { return close_after_write_.load(std::memory_order_acquire); }
+    bool IsShutdownExempt() const {
+        return shutdown_exempt_.load(std::memory_order_acquire);
+    }
+    void SetShutdownExempt(bool exempt) {
+        shutdown_exempt_.store(exempt, std::memory_order_release);
+    }
     const std::string& ip_addr() const { return sock_ -> ip_addr(); }
     int port() const { return sock_ -> port(); }
 

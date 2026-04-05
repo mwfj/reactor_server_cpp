@@ -5,7 +5,6 @@
 #include <openssl/ssl.h>
 #include <signal.h>
 #include <limits>
-#include <future>
 
 // Suppress SIGPIPE for TLS upstream connections. SSL_write uses the
 // underlying socket's write() which bypasses MSG_NOSIGNAL. Without
@@ -117,37 +116,12 @@ UpstreamManager::~UpstreamManager() {
         InitiateShutdown();
     }
 
-    // Wait for enqueued InitiateShutdown tasks to execute on each live
-    // dispatcher. Without this, pools_ destruction frees PoolPartition
-    // objects while the enqueued lambdas still hold raw partition pointers.
-    //
-    // In production (HttpServer::Stop), dispatchers are already stopped by
-    // net_server_.Stop() before this destructor runs — EnQueue is a no-op
-    // and no barrier is needed. Only standalone usage with live dispatchers
-    // requires the barrier.
-    {
-        std::vector<std::shared_ptr<Dispatcher>> live_dispatchers;
-        for (auto& disp : dispatchers_) {
-            if (disp && !disp->was_stopped()) {
-                live_dispatchers.push_back(disp);
-            }
-        }
-        if (!live_dispatchers.empty()) {
-            auto barrier = std::make_shared<std::atomic<int>>(
-                static_cast<int>(live_dispatchers.size()));
-            auto done = std::make_shared<std::promise<void>>();
-            auto fut = done->get_future();
-            for (auto& disp : live_dispatchers) {
-                disp->EnQueue([barrier, done]() {
-                    if (barrier->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                        done->set_value();
-                    }
-                });
-            }
-            // Bounded wait — even live dispatchers may stop mid-wait
-            fut.wait_for(std::chrono::milliseconds(500));
-        }
-    }
+    // The old 500ms best-effort barrier here has been removed: PoolPartition
+    // now schedules its own InitiateShutdown via inflight_tasks_-tracked
+    // enqueue, and ~PoolPartition blocks on inflight_tasks_ unconditionally.
+    // That gives us a hard guarantee that every queued shutdown lambda has
+    // either executed or been dropped (RAII guard decrement) before pools_
+    // is destroyed, eliminating the standalone UAF/hang race.
 
     // Block until every outstanding connection (including checked-out leases
     // and zombies held by leases) has been released. UpstreamLease stores a

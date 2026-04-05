@@ -53,7 +53,16 @@ public:
     void EvictExpired();
 
     // Shutdown: close idle, reject new checkouts, force-close connecting.
+    // Must run on the partition's dispatcher thread (mutates containers).
     void InitiateShutdown();
+
+    // Cross-thread safe variant of InitiateShutdown: enqueues the work
+    // onto the owning dispatcher, tracked by inflight_tasks_ so the
+    // PoolPartition destructor blocks on completion. Guarded by alive_
+    // so that if the partition is destroyed before the lambda runs, the
+    // task is a no-op instead of a use-after-free on freed containers.
+    // Called by UpstreamHostPool::InitiateShutdown from the stopper thread.
+    void ScheduleInitiateShutdown();
 
     // Force-close all active connections. Called after drain timeout.
     void ForceCloseActive();
@@ -143,6 +152,15 @@ private:
     // Called when returning a connection to idle — borrowers may have
     // overwritten the callbacks during their request.
     void WirePoolCallbacks(UpstreamConnection* conn);
+
+    // Increment inflight_tasks_ and return an RAII guard that decrements it
+    // on destruction. Capture the returned shared_ptr into any lambda
+    // enqueued on the dispatcher: if EnQueue accepts the lambda, the guard
+    // fires when the lambda completes; if EnQueue drops the lambda (stopped
+    // dispatcher), the lambda is destroyed without running and the guard
+    // still fires. Either way, exactly one decrement per increment.
+    // The destructor's wait-for-zero loop uses this counter as its barrier.
+    std::shared_ptr<void> MakeInflightGuard();
 
     // Find and extract a unique_ptr from a container by raw pointer
     std::unique_ptr<UpstreamConnection> ExtractFromIdle(UpstreamConnection* conn);
