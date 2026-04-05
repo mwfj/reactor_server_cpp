@@ -366,6 +366,25 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             return false;
         }
 
+        // Async handler path: the handler marked the response as deferred
+        // and is expected to drive SendResponse itself when the async work
+        // completes. Skip the auto-send, reset per-request state, and
+        // stop the pipelining loop — the connection remains alive until
+        // the async response is sent (or shutdown/idle timeout tears it down).
+        // Additional pipelined requests on the same connection will be
+        // processed by the next OnRawData call (triggered by new client
+        // data or the async SendResponse path resuming the parser).
+        if (response.IsDeferred()) {
+            request_in_progress_ = false;
+            conn_->ClearDeadline();
+            conn_->SetDeadlineTimeoutCb(nullptr);
+            buf += consumed;
+            remaining -= consumed;
+            parser_.Reset();
+            sent_100_continue_ = false;
+            return false;
+        }
+
         // Determine if response sets Connection: close (needed for
         // keep-alive logic AND the close decision after sending).
         // Scan ALL Connection headers and parse each as a comma-separated

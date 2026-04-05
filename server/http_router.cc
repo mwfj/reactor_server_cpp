@@ -23,6 +23,26 @@ void HttpRouter::Route(const std::string& method, const std::string& path, Handl
     method_tries_[method].Insert(path, std::move(handler));
 }
 
+void HttpRouter::RouteAsync(const std::string& method, const std::string& path,
+                            AsyncHandler handler) {
+    async_method_tries_[method].Insert(path, std::move(handler));
+}
+
+HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(const HttpRequest& request) const {
+    auto it = async_method_tries_.find(request.method);
+    if (it == async_method_tries_.end()) {
+        // HEAD fallback to GET for async routes (consistent with sync path).
+        if (request.method != "HEAD") return nullptr;
+        it = async_method_tries_.find("GET");
+        if (it == async_method_tries_.end()) return nullptr;
+    }
+    std::unordered_map<std::string, std::string> params;
+    auto result = it->second.Search(request.path, params);
+    if (!result.handler) return nullptr;
+    request.params = std::move(params);
+    return *result.handler;
+}
+
 void HttpRouter::WebSocket(const std::string& path, WsUpgradeHandler handler) {
     ws_trie_.Insert(path, std::move(handler));
 }

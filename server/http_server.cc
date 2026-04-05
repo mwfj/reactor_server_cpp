@@ -379,6 +379,12 @@ void HttpServer::Route(const std::string& method, const std::string& path, HttpR
 void HttpServer::WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler) { router_.WebSocket(path, std::move(handler)); }
 void HttpServer::Use(HttpRouter::Middleware middleware) { router_.Use(std::move(middleware)); }
 
+void HttpServer::GetAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { router_.RouteAsync("GET",    path, std::move(handler)); }
+void HttpServer::PostAsync(const std::string& path, HttpRouter::AsyncHandler handler)   { router_.RouteAsync("POST",   path, std::move(handler)); }
+void HttpServer::PutAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { router_.RouteAsync("PUT",    path, std::move(handler)); }
+void HttpServer::DeleteAsync(const std::string& path, HttpRouter::AsyncHandler handler) { router_.RouteAsync("DELETE", path, std::move(handler)); }
+void HttpServer::RouteAsync(const std::string& method, const std::string& path, HttpRouter::AsyncHandler handler) { router_.RouteAsync(method, path, std::move(handler)); }
+
 void HttpServer::Start() {
     logging::Get()->info("HttpServer starting");
     net_server_.Start();
@@ -672,14 +678,29 @@ void HttpServer::Stop() {
             // drains so proxy handlers dispatched during the drain window
             // can still call CheckoutAsync() successfully. Initiating here
             // sets the reject-new-checkouts flag, then WaitForDrain waits
-            // for in-flight leases to complete. H1 handlers with no buffered
-            // output are force-closed by the sweep above — inherent to the
-            // shutdown model (designed for synchronous handlers).
+            // for in-flight leases to complete.
             if (upstream_manager_) {
                 upstream_manager_->InitiateShutdown();
                 upstream_manager_->WaitForDrain(
                     std::chrono::seconds(shutdown_drain_timeout_sec_.load(
                         std::memory_order_relaxed)));
+            }
+            // Post-upstream H1 flush window: an async (exempt) HTTP/1 proxy
+            // handler whose upstream reply arrives during the upstream drain
+            // above only starts writing its client response AFTER the first
+            // H1 drain loop has already finished. Without a second flush
+            // window here, NetServer::Stop()'s post-drain barrier runs
+            // straight into StopEventLoop with at most one writable
+            // iteration — truncating slow or chunked responses. Give those
+            // late responses the same H1_DRAIN_TIMEOUT_SEC budget to flush.
+            {
+                auto h1_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(H1_DRAIN_TIMEOUT_SEC);
+                while (std::chrono::steady_clock::now() < h1_deadline) {
+                    if (!HasPendingH1Output()) break;
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(PUMP_INTERVAL_MS));
+                }
             }
         });
     } else {
@@ -804,6 +825,9 @@ void HttpServer::Stop() {
             // Upstream drain — initiate AFTER protocol drains so late
             // proxy handlers can still check out. Then poll with task pump
             // until leases are returned, and force-close stragglers.
+            // Followed by a second H1 flush window so async proxy
+            // responses that arrive DURING the upstream drain still have
+            // time to write their client bytes before the event loop stops.
             if (upstream_manager_) {
                 upstream_manager_->InitiateShutdown();
                 static constexpr int UP_PUMP_MS = 200;
@@ -817,6 +841,20 @@ void HttpServer::Stop() {
                         std::chrono::milliseconds(UP_PUMP_MS));
                 }
                 upstream_manager_->ForceCloseRemaining();
+            }
+            // Post-upstream H1 flush window: async proxy responses that
+            // arrive during the upstream drain need time to write their
+            // client bytes before StopEventLoop. Same rationale as the
+            // off-thread branch above — matches H1_DRAIN_TIMEOUT_SEC budget.
+            {
+                auto h1_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(H1_DRAIN_TIMEOUT_SEC);
+                while (std::chrono::steady_clock::now() < h1_deadline) {
+                    net_server_.ProcessSelfDispatcherTasks();
+                    if (!HasPendingH1Output()) break;
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(PUMP_INTERVAL_MS));
+                }
             }
         });
     }
@@ -914,6 +952,29 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                HttpResponse& response) {
             active_requests_.fetch_add(1, std::memory_order_relaxed);
             RequestGuard guard{active_requests_};
+
+            // Async routes take precedence over sync routes for the same
+            // path. An async handler is responsible for building and sending
+            // its own response via conn->SendResponse() from an async
+            // completion callback — the framework marks the response as
+            // deferred so HandleCompleteRequest skips the auto-send.
+            auto async_handler = router_.GetAsyncHandler(request);
+            if (async_handler) {
+                response.Defer();
+                try {
+                    async_handler(self, request);
+                } catch (const std::exception& e) {
+                    // Handler threw before scheduling async work. Recover by
+                    // sending a generic 500 directly — do NOT leak e.what()
+                    // (may contain stack traces, file paths, credentials).
+                    logging::Get()->error("Exception in async request handler: {}",
+                                          e.what());
+                    HttpResponse err = HttpResponse::InternalError();
+                    err.Header("Connection", "close");
+                    self->SendResponse(err);
+                }
+                return;
+            }
 
             if (!router_.Dispatch(request, response)) {
                 response.Status(404).Text("Not Found");

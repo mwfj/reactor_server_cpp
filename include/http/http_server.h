@@ -47,7 +47,10 @@ public:
 
     ~HttpServer();
 
-    // Route registration (delegates to router)
+    // Route registration (delegates to router) — synchronous handlers.
+    // The framework serializes the response and closes out the request when
+    // the handler returns. Use the *Async variants for handlers that need
+    // to dispatch async work (e.g. upstream proxy) and send the response later.
     void Get(const std::string& path, HttpRouter::Handler handler);
     void Post(const std::string& path, HttpRouter::Handler handler);
     void Put(const std::string& path, HttpRouter::Handler handler);
@@ -55,6 +58,42 @@ public:
     void Route(const std::string& method, const std::string& path, HttpRouter::Handler handler);
     void WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler);
     void Use(HttpRouter::Middleware middleware);
+
+    // Route registration — asynchronous handlers.
+    // The handler receives a shared_ptr<HttpConnectionHandler> and is
+    // responsible for calling conn->SendResponse() from its async completion
+    // callback. The framework will NOT auto-send any response after the
+    // handler returns. Typical pattern for an upstream proxy handler:
+    //
+    //   server.GetAsync("/proxy", [this](auto conn, const HttpRequest& req) {
+    //       conn->SetShutdownExempt(true);  // protect during graceful shutdown
+    //       upstream_->CheckoutAsync("svc", req.dispatcher_index,
+    //           [conn](UpstreamLease lease) {
+    //               // ... perform the upstream request, build HttpResponse
+    //               HttpResponse final;
+    //               final.Status(200).Text("...");
+    //               conn->SetShutdownExempt(false);
+    //               conn->SendResponse(final);
+    //           },
+    //           [conn](int err) {
+    //               HttpResponse e;
+    //               e.Status(502).Text("Bad Gateway");
+    //               conn->SetShutdownExempt(false);
+    //               conn->SendResponse(e);
+    //           });
+    //   });
+    //
+    // Async handlers take precedence over sync handlers for the same
+    // method+path pair. Note: HTTP/1 pipelining is not supported for async
+    // handlers — additional pipelined requests on the same connection are
+    // deferred until the async response is sent and new client data arrives.
+    // For simplicity, async handlers should prefer Connection: close.
+    void GetAsync(const std::string& path, HttpRouter::AsyncHandler handler);
+    void PostAsync(const std::string& path, HttpRouter::AsyncHandler handler);
+    void PutAsync(const std::string& path, HttpRouter::AsyncHandler handler);
+    void DeleteAsync(const std::string& path, HttpRouter::AsyncHandler handler);
+    void RouteAsync(const std::string& method, const std::string& path,
+                    HttpRouter::AsyncHandler handler);
 
     // Server lifecycle.
     // NOTE: Start/Stop is one-shot — after Stop(), the internal dispatchers

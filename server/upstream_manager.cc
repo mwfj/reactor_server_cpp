@@ -149,14 +149,35 @@ UpstreamManager::~UpstreamManager() {
         }
     }
 
-    // Brief drain for outstanding connections
-    static constexpr int DTOR_DRAIN_MS = 100;
-    if (outstanding_conns_.load(std::memory_order_acquire) > 0) {
+    // Block until every outstanding connection (including checked-out leases
+    // and zombies held by leases) has been released. UpstreamLease stores a
+    // raw PoolPartition* and a raw UpstreamConnection*; destroying the pools
+    // while a lease is still live leaves those pointers dangling. Even the
+    // alive_ guard in UpstreamLease::Release only covers the partition —
+    // reads like lease->fd() still dereference the freed connection.
+    //
+    // In production (HttpServer::Stop) this wait is a no-op: the graceful
+    // drain + WaitForDrain + ForceCloseRemaining sequence has already pushed
+    // outstanding_conns_ to 0 (or moved active connections to zombies that
+    // are then cleaned up when leases release). In standalone tests/helpers
+    // the caller MUST release all leases before destroying the manager;
+    // otherwise we block indefinitely (a fatal programming error at this
+    // point — returning would cause UAF on later lease access). A periodic
+    // warning log surfaces the leak without silently hanging.
+    {
         std::unique_lock<std::mutex> lck(drain_mtx_);
-        drain_cv_.wait_for(lck, std::chrono::milliseconds(DTOR_DRAIN_MS),
-            [this]() {
-                return outstanding_conns_.load(std::memory_order_acquire) <= 0;
-            });
+        while (outstanding_conns_.load(std::memory_order_acquire) > 0) {
+            if (drain_cv_.wait_for(lck, std::chrono::seconds(5),
+                    [this]() {
+                        return outstanding_conns_.load(std::memory_order_acquire) <= 0;
+                    })) {
+                break;
+            }
+            logging::Get()->warn(
+                "~UpstreamManager blocked on {} outstanding lease(s); "
+                "destructor cannot safely return until all leases are released",
+                outstanding_conns_.load(std::memory_order_relaxed));
+        }
     }
     logging::Get()->debug("UpstreamManager destroyed");
 }
