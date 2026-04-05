@@ -301,7 +301,6 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
         } else {
             // No waiters, or connection is dead/expired — destroy it.
             // If waiters exist but connection is invalid, create a replacement.
-            bool has_waiters = !wait_queue_.empty();
             DestroyConnection(std::move(owned));
             PurgeExpiredWaitEntries();
             while (!shutting_down_ &&
@@ -953,11 +952,35 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
     if (!transport) return;
 
     // Reset borrower-installed request-level callbacks.
-    transport->SetOnMessageCb(nullptr);
     transport->SetCompletionCb(nullptr);
     transport->SetWriteProgressCb(nullptr);
     transport->SetConnectCompleteCallback(nullptr);
     transport->SetDeadlineTimeoutCb(nullptr);
+
+    // Install pool-owned idle read handler: any data received on an idle
+    // pooled connection is suspicious (late response chunk, protocol
+    // garbage, half-close preamble). Force-close instead of letting
+    // ConnectionHandler silently buffer the bytes — otherwise the next
+    // checkout would see stale data prepended to its own response.
+    UpstreamConnection* raw_conn_idle = conn;
+    std::weak_ptr<std::atomic<bool>> alive_weak_idle = alive_;
+    transport->SetOnMessageCb(
+        [raw_conn_idle, alive_weak_idle]
+        (std::shared_ptr<ConnectionHandler> handler, std::string&) {
+            auto alive = alive_weak_idle.lock();
+            if (!alive || !alive->load(std::memory_order_acquire)) return;
+            // Only poison if still idle (not mid-checkout — borrower's
+            // on_message_callback is installed during checkout).
+            // raw_conn_idle->IsIdle() would be ideal, but by this point
+            // the borrower has overridden the callback. Any data here
+            // means no borrower callback — treat as poison.
+            logging::Get()->debug("Idle upstream connection received "
+                                  "unexpected data fd={}, force-closing",
+                                  handler ? handler->fd() : -1);
+            if (handler && !handler->IsClosing()) {
+                handler->ForceClose();
+            }
+        });
 
     // Re-wire pool-owned close + error callbacks. These handle pool
     // bookkeeping AND notify the borrower (if checked out) by firing

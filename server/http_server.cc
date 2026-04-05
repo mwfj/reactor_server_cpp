@@ -410,14 +410,18 @@ void HttpServer::Stop() {
     // accepted in the gap would miss the 1001 "Going Away" close frame.
     net_server_.StopAccepting();
 
-    // Signal upstream pools to stop accepting new checkouts immediately.
-    // This runs BEFORE NetServer::Stop()'s CloseAfterWrite sweep so handlers
-    // that haven't called CheckoutAsync yet get CHECKOUT_SHUTTING_DOWN instead
-    // of starting new upstream work. In-flight leases (already checked out)
-    // continue normally — WaitForDrain in pre_stop_drain_cb lets them finish.
-    if (upstream_manager_) {
-        upstream_manager_->InitiateShutdown();
-    }
+    // NOTE: upstream_manager_->InitiateShutdown() is NOT called here.
+    // It is deferred to pre_stop_drain_cb (after H2/WS/H1 protocol drain)
+    // so that proxy handlers dispatched during the drain window can still
+    // call CheckoutAsync() successfully. Calling InitiateShutdown too early
+    // would reject checkouts from already-accepted requests that only reach
+    // their upstream call late in the drain phase.
+    //
+    // Known pre-existing limitation: accepted HTTP/1 proxy handlers with no
+    // buffered client response at the time of the close sweep are still
+    // force-closed by NetServer's CloseAfterWrite pass. Addressing this
+    // requires exempting proxy-holding connections from the sweep (like
+    // H2/WS use the draining set), which is out of scope for this PR.
 
     // Collect WS connections while holding the lock, then send close frames
     // AFTER releasing. Sending under the lock would deadlock: a failed inline
@@ -644,14 +648,15 @@ void HttpServer::Stop() {
                     WaitForH2Drain();
                 }
             }
-            // Upstream shutdown — after H2/WS/H1 protocol drains.
-            // Upstream drain — InitiateShutdown was called before the close
-            // sweep (rejects new checkouts). In-flight leases from H2 handlers
-            // drain normally. H1 handlers that have buffered output drain via
-            // CloseAfterWrite. H1 handlers with no buffered output yet are
-            // force-closed by the sweep — this is inherent to the shutdown
-            // model (designed for synchronous handlers).
+            // Upstream shutdown — deferred until AFTER H2/WS/H1 protocol
+            // drains so proxy handlers dispatched during the drain window
+            // can still call CheckoutAsync() successfully. Initiating here
+            // sets the reject-new-checkouts flag, then WaitForDrain waits
+            // for in-flight leases to complete. H1 handlers with no buffered
+            // output are force-closed by the sweep above — inherent to the
+            // shutdown model (designed for synchronous handlers).
             if (upstream_manager_) {
+                upstream_manager_->InitiateShutdown();
                 upstream_manager_->WaitForDrain(
                     std::chrono::seconds(shutdown_drain_timeout_sec_.load(
                         std::memory_order_relaxed)));
@@ -776,9 +781,11 @@ void HttpServer::Stop() {
                     }
                 }
             }
-            // Upstream drain — InitiateShutdown was called early (before
-            // the close sweep). Now wait for in-flight leases to complete.
+            // Upstream drain — initiate AFTER protocol drains so late
+            // proxy handlers can still check out. Then poll with task pump
+            // until leases are returned, and force-close stragglers.
             if (upstream_manager_) {
+                upstream_manager_->InitiateShutdown();
                 static constexpr int UP_PUMP_MS = 200;
                 auto up_deadline = std::chrono::steady_clock::now() +
                     std::chrono::seconds(shutdown_drain_timeout_sec_.load(
