@@ -119,13 +119,18 @@ void HttpConnectionHandler::StashDeferredBytes(const std::string& data) {
     if (data.empty()) return;
     // Bound memory while an async response is pending so a client
     // pipelining gigabytes against a slow async handler can't OOM us.
-    // Honor the server-configured body/header caps: treat 0 as "unlimited"
-    // per docs so `max_body_size_ = 0` means no stash cap at all, and
-    // apply whichever field IS set so e.g. max_body_size = 64 KiB with
-    // max_header_size = 0 still enforces the 64 KiB body budget (previously
-    // fell back to a hard-coded 1 MiB, which both bypassed a tight body
-    // cap and spuriously force-closed "unlimited" configs at 1 MiB).
-    if (max_body_size_ != 0 || max_header_size_ != 0) {
+    //
+    // Honor the documented "0 = unlimited" semantic for BOTH
+    // max_body_size_ and max_header_size_: either zero means a single
+    // request on this connection can itself be arbitrarily large, so no
+    // finite stash cap can both respect the operator's config and prevent
+    // the in-flight request from exceeding it. Treating 0 as contributing
+    // zero bytes (as the previous version did) force-closed keep-alive
+    // clients whose next pipelined body grew past ~max_header_size + 8 KiB
+    // on servers configured for unlimited uploads. If any limit is 0, we
+    // append without a cap — matching the synchronous parser's behavior.
+    // Only when BOTH limits are explicitly set do we apply a finite cap.
+    if (max_body_size_ > 0 && max_header_size_ > 0) {
         const size_t cap = max_body_size_ + max_header_size_
                            + DEFERRED_STASH_OVERHEAD;
         if (deferred_pending_buf_.size() + data.size() > cap) {
@@ -139,9 +144,6 @@ void HttpConnectionHandler::StashDeferredBytes(const std::string& data) {
             return;
         }
     }
-    // Both limits unlimited: the user has opted out of memory caps. Append
-    // without a cap — consistent with how unlimited max_body_size is
-    // handled in the synchronous request path.
     deferred_pending_buf_.append(data);
 }
 

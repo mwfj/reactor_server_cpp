@@ -1105,17 +1105,21 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
     UpstreamConnection* raw_conn = conn;
     transport->SetCloseCb(
         [this, raw_conn](std::shared_ptr<ConnectionHandler> handler) {
-            // Save the borrower's callback BEFORE pool cleanup, because
-            // OnConnectionClosed zombifies the connection and the borrower's
-            // on_message_callback release (in the notification below) may
-            // trigger ReturnConnection which can destroy raw_conn.
+            // Hoist captures to stack locals BEFORE OnConnectionClosed.
+            // That helper calls ClearTransportCallbacks which null-assigns
+            // this very SetCloseCb std::function, destroying the closure
+            // while operator() is still executing. Post-cleanup access
+            // must go through locals, not the now-freed captures.
+            PoolPartition* self = this;
+            UpstreamConnection* conn = raw_conn;
+            // Save the borrower's on_message_callback BEFORE pool cleanup —
+            // the notification below may trigger ReturnConnection which
+            // could destroy the connection.
             CALLBACKS_NAMESPACE::ConnOnMsgCallback borrower_cb;
-            if (raw_conn->IsInUse() && handler) {
+            if (conn->IsInUse() && handler) {
                 borrower_cb = handler->GetOnMessageCb();
             }
-            // Pool cleanup first — safe ordering: raw_conn is zombified
-            // (kept alive) not destroyed, so the notification below is safe.
-            OnConnectionClosed(raw_conn);
+            self->OnConnectionClosed(conn);
             // Notify borrower of upstream disconnect. Empty data = EOF.
             if (borrower_cb && handler) {
                 std::string empty;
@@ -1124,11 +1128,14 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
         });
     transport->SetErrorCb(
         [this, raw_conn](std::shared_ptr<ConnectionHandler> handler) {
+            // Same capture-hoist rationale as SetCloseCb above.
+            PoolPartition* self = this;
+            UpstreamConnection* conn = raw_conn;
             CALLBACKS_NAMESPACE::ConnOnMsgCallback borrower_cb;
-            if (raw_conn->IsInUse() && handler) {
+            if (conn->IsInUse() && handler) {
                 borrower_cb = handler->GetOnMessageCb();
             }
-            OnConnectionClosed(raw_conn);
+            self->OnConnectionClosed(conn);
             if (borrower_cb && handler) {
                 std::string empty;
                 try { borrower_cb(handler, empty); } catch (...) {}

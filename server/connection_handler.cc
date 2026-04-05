@@ -681,8 +681,15 @@ void ConnectionHandler::CallWriteCb(){
                 connect_state_ = ConnectState::CONNECTED;
                 client_channel_->EnableReadMode();
                 if (connect_complete_callback_) {
-                    connect_complete_callback_(shared_from_this());
-                    connect_complete_callback_ = nullptr;  // one-shot
+                    // Move the callable onto the stack BEFORE invoking.
+                    // The pool's WirePoolCallbacks (called from inside this
+                    // callback on a successful checkout) does
+                    // SetConnectCompleteCallback(nullptr), which destroys
+                    // the std::function that's currently executing. The
+                    // local `cb` keeps the target alive until it returns,
+                    // and the move leaves the member empty (one-shot).
+                    auto cb = std::move(connect_complete_callback_);
+                    cb(shared_from_this());
                 }
                 // CRITICAL: If callback set tls_state_ = HANDSHAKE, fall through
                 // to the existing TLS handshake block. With ET mode, returning
