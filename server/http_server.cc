@@ -417,11 +417,13 @@ void HttpServer::Stop() {
     // would reject checkouts from already-accepted requests that only reach
     // their upstream call late in the drain phase.
     //
-    // Known pre-existing limitation: accepted HTTP/1 proxy handlers with no
-    // buffered client response at the time of the close sweep are still
-    // force-closed by NetServer's CloseAfterWrite pass. Addressing this
-    // requires exempting proxy-holding connections from the sweep (like
-    // H2/WS use the draining set), which is out of scope for this PR.
+    // HTTP/1 proxy handlers with no buffered client response at the time of
+    // the close sweep are protected by opting in via
+    // HttpConnectionHandler::SetShutdownExempt(true). The scan below (after
+    // the WS/H2 draining set is assembled) adds those connections to
+    // draining_conn_ptrs, exempting them from the CloseAfterWrite sweep until
+    // the handler sets the flag back to false (typically right before the
+    // final SendResponse).
 
     // Collect WS connections while holding the lock, then send close frames
     // AFTER releasing. Sending under the lock would deadlock: a failed inline
@@ -566,6 +568,24 @@ void HttpServer::Stop() {
     // Merge WS draining set into H2 draining set — both are exempt from
     // the generic close sweep in NetServer::Stop().
     draining_conn_ptrs.insert(ws_draining.begin(), ws_draining.end());
+
+    // Exempt HTTP/1 connections whose handlers have opted out of the sweep
+    // (e.g. proxy handlers with in-flight upstream work). Without this,
+    // NetServer::Stop()'s generic CloseAfterWrite pass force-closes the
+    // client transport BEFORE the deferred upstream drain runs, dropping
+    // the in-flight proxied request even though the PR's upstream graceful-
+    // shutdown phase would otherwise give it time to complete. The opt-in
+    // is intentional: only handlers that know they're doing async work need
+    // (or want) the exemption; idle keep-alive connections are still closed
+    // by the sweep as before.
+    {
+        std::lock_guard<std::mutex> lck(conn_mtx_);
+        for (auto& [fd, http_conn] : http_connections_) {
+            if (!http_conn || !http_conn->IsShutdownExempt()) continue;
+            auto c = http_conn->GetConnection();
+            if (c) draining_conn_ptrs.insert(c.get());
+        }
+    }
 
     // Note: pending_detection_ connections are NOT exempted from the close
     // sweep. If one becomes H2 late, DetectAndRouteProtocol's late drain

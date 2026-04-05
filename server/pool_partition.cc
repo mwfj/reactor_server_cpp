@@ -17,11 +17,19 @@ UpstreamLease::~UpstreamLease() {
 }
 
 void UpstreamLease::Release() {
-    if (conn_ && partition_) {
+    // Skip the return if the partition was already destroyed — ~PoolPartition
+    // stores false to alive_ BEFORE freeing any member, and the partition's
+    // own destructor walk already nulls transport callbacks for the connections
+    // it owns (including zombies). Without this guard, a lease that outlives
+    // its partition (standalone UpstreamManager teardown with an outstanding
+    // lease) would dereference freed memory via partition_->ReturnConnection.
+    if (conn_ && partition_ && alive_ &&
+        alive_->load(std::memory_order_acquire)) {
         partition_->ReturnConnection(conn_);
     }
     conn_ = nullptr;
     partition_ = nullptr;
+    alive_.reset();
 }
 
 // ── PoolPartition ──────────────────────────────────────────────────────
@@ -188,7 +196,7 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
             std::chrono::steady_clock::now() + FAR_FUTURE_CHECKOUT);
         UpstreamConnection* raw = conn.get();
         active_conns_.push_back(std::move(conn));
-        ready_cb(UpstreamLease(raw, this));
+        ready_cb(UpstreamLease(raw, this, alive_));
         return;
     }
 
@@ -221,6 +229,12 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
 
 void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     if (!conn) return;
+
+    // Hoist alive_ onto the stack — the waiter retry loops below call
+    // CreateNewConnection, which can synchronously invoke a user error_cb
+    // on inline connect failures. A user callback that tears down the
+    // pool/manager would free `this` mid-loop.
+    auto alive = alive_;
 
     // Find in active_conns_ and extract
     auto owned = ExtractFromActive(conn);
@@ -267,6 +281,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
         // synchronous CreateNewConnection failures (e.g., ECONNREFUSED)
         // don't strand remaining waiters.
         PurgeExpiredWaitEntries();
+        if (!alive->load(std::memory_order_acquire)) return;
         while (!shutting_down_ &&
                !manager_shutting_down_.load(std::memory_order_acquire) &&
                !wait_queue_.empty() &&
@@ -276,6 +291,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
             size_t count_before = TotalCount();
             CreateNewConnection(std::move(entry.ready_callback),
                                 std::move(entry.error_callback));
+            if (!alive->load(std::memory_order_acquire)) return;
             if (TotalCount() > count_before) break;
         }
         return;
@@ -287,6 +303,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     // just freed.
     if (idle_conns_.size() >= static_cast<size_t>(config_.max_idle_connections)) {
         PurgeExpiredWaitEntries();
+        if (!alive->load(std::memory_order_acquire)) return;
         if (!wait_queue_.empty() && ValidateConnection(owned.get())) {
             // Hand directly to the next waiter (validated — not dead/expired)
             static constexpr auto FAR_FUTURE_HANDOFF = std::chrono::hours(24 * 365);
@@ -297,12 +314,16 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
             active_conns_.push_back(std::move(owned));
             auto entry = std::move(wait_queue_.front());
             wait_queue_.pop_front();
-            entry.ready_callback(UpstreamLease(raw, this));
+            entry.ready_callback(UpstreamLease(raw, this, alive_));
+            // No member access follows (function returns), but keep the
+            // check for defense-in-depth against future refactors.
+            if (!alive->load(std::memory_order_acquire)) return;
         } else {
             // No waiters, or connection is dead/expired — destroy it.
             // If waiters exist but connection is invalid, create a replacement.
             DestroyConnection(std::move(owned));
             PurgeExpiredWaitEntries();
+            if (!alive->load(std::memory_order_acquire)) return;
             while (!shutting_down_ &&
                    !manager_shutting_down_.load(std::memory_order_acquire) &&
                    !wait_queue_.empty() &&
@@ -312,6 +333,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
                 size_t count_before = TotalCount();
                 CreateNewConnection(std::move(entry.ready_callback),
                                     std::move(entry.error_callback));
+                if (!alive->load(std::memory_order_acquire)) return;
                 if (TotalCount() > count_before) break;
             }
         }
@@ -367,9 +389,15 @@ void PoolPartition::EvictExpired() {
 }
 
 void PoolPartition::InitiateShutdown() {
+    // Hoist alive_ onto the stack — ForceClose on connecting sockets fires
+    // the close callback which invokes the waiter's user error_callback,
+    // and the wait-queue rejection loop below invokes error_callback directly.
+    // Either may synchronously tear down the pool/manager.
+    auto alive = alive_;
+
     shutting_down_ = true;
 
-    // Close all idle connections
+    // Close all idle connections (no user callbacks — pool-owned)
     while (!idle_conns_.empty()) {
         auto conn = std::move(idle_conns_.front());
         idle_conns_.pop_front();
@@ -388,6 +416,7 @@ void PoolPartition::InitiateShutdown() {
         auto& conn = connecting_conns_.front();
         if (conn && conn->GetTransport() && !conn->GetTransport()->IsClosing()) {
             conn->GetTransport()->ForceClose();
+            if (!alive->load(std::memory_order_acquire)) return;
         } else {
             // Transport already closing or null — extract and destroy manually
             auto orphan = std::move(connecting_conns_.front());
@@ -404,6 +433,7 @@ void PoolPartition::InitiateShutdown() {
         auto entry = std::move(wait_queue_.front());
         wait_queue_.pop_front();
         entry.error_callback(CHECKOUT_SHUTTING_DOWN);
+        if (!alive->load(std::memory_order_acquire)) return;
     }
 
     // Active connections will be destroyed when returned via ReturnConnection
@@ -734,7 +764,7 @@ void PoolPartition::OnConnectComplete(UpstreamConnection* conn,
     logging::Get()->debug("Upstream connection ready fd={} {}:{}",
                           raw->fd(), upstream_host_, upstream_port_);
 
-    ready_cb(UpstreamLease(raw, this));
+    ready_cb(UpstreamLease(raw, this, alive_));
 }
 
 void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
@@ -809,8 +839,17 @@ bool PoolPartition::ValidateConnection(UpstreamConnection* conn) {
 }
 
 void PoolPartition::ServiceWaitQueue() {
-    // Purge expired entries first so we don't hand connections to stale waiters
+    // Hoist alive_ onto the stack: a waiter's ready_callback / error_callback
+    // may synchronously tear down the pool/manager (e.g., reacting to a first
+    // checkout failure by calling HttpServer::Stop()), which frees this
+    // PoolPartition. After that, touching any member (wait_queue_, idle_conns_,
+    // TotalCount()) is UAF. The hoisted copy keeps the atomic<bool> alive
+    // independently of the partition; we check it after each callback and
+    // return immediately if the partition has been destroyed.
+    auto alive = alive_;
+
     PurgeExpiredWaitEntries();
+    if (!alive->load(std::memory_order_acquire)) return;
 
     while (!wait_queue_.empty() && !idle_conns_.empty()) {
         // Validate the idle connection
@@ -833,7 +872,8 @@ void PoolPartition::ServiceWaitQueue() {
 
         auto entry = std::move(wait_queue_.front());
         wait_queue_.pop_front();
-        entry.ready_callback(UpstreamLease(raw, this));
+        entry.ready_callback(UpstreamLease(raw, this, alive_));
+        if (!alive->load(std::memory_order_acquire)) return;
     }
 
     // If idle connections ran out (all stale) but waiters remain and capacity
@@ -842,8 +882,12 @@ void PoolPartition::ServiceWaitQueue() {
     while (!wait_queue_.empty() && TotalCount() < partition_max_connections_) {
         auto entry = std::move(wait_queue_.front());
         wait_queue_.pop_front();
+        // CreateNewConnection may synchronously invoke error_cb on inline
+        // failures (inet_addr, socket(), ::connect non-EINPROGRESS), which
+        // also counts as a callback that may tear the partition down.
         CreateNewConnection(std::move(entry.ready_callback),
                             std::move(entry.error_callback));
+        if (!alive->load(std::memory_order_acquire)) return;
     }
 }
 
@@ -920,6 +964,9 @@ void PoolPartition::ScheduleWaitQueuePurge() {
 }
 
 void PoolPartition::PurgeExpiredWaitEntries() {
+    // Hoist alive_ onto the stack — see ServiceWaitQueue for rationale.
+    // A waiter's error_callback may synchronously tear down the partition.
+    auto alive = alive_;
     auto now = std::chrono::steady_clock::now();
     while (!wait_queue_.empty()) {
         auto& entry = wait_queue_.front();
@@ -929,6 +976,7 @@ void PoolPartition::PurgeExpiredWaitEntries() {
             auto error_cb = std::move(entry.error_callback);
             wait_queue_.pop_front();
             error_cb(CHECKOUT_QUEUE_TIMEOUT);
+            if (!alive->load(std::memory_order_acquire)) return;
         } else {
             break;  // Queue is ordered by time — stop at first non-expired
         }

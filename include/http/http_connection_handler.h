@@ -51,6 +51,27 @@ public:
     // Called when raw data arrives (set as NetServer's on_message callback)
     void OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data);
 
+    // Graceful-shutdown exemption.
+    //
+    // Application handlers that dispatch async work (e.g. upstream proxy via
+    // UpstreamManager::CheckoutAsync) have a window where the request has
+    // been parsed but no client response bytes have been buffered yet. Without
+    // opting in, NetServer::Stop()'s generic CloseAfterWrite sweep will
+    // force-close the client transport during that window, dropping the
+    // in-flight request even though the PR's upstream drain phase would
+    // otherwise give it time to complete.
+    //
+    // Handlers should call SetShutdownExempt(true) before starting async
+    // work and SetShutdownExempt(false) after the final response has been
+    // handed to SendResponse(). HttpServer::Stop() walks the connection map
+    // and exempts any connection whose flag is set.
+    void SetShutdownExempt(bool exempt) {
+        shutdown_exempt_.store(exempt, std::memory_order_release);
+    }
+    bool IsShutdownExempt() const {
+        return shutdown_exempt_.load(std::memory_order_acquire);
+    }
+
 private:
     size_t max_body_size_ = 0;    // 0 = unlimited
     size_t max_header_size_ = 0;  // 0 = unlimited
@@ -84,4 +105,9 @@ private:
     HTTP_CALLBACKS_NAMESPACE::HttpConnCallbacks callbacks_;
     bool upgraded_ = false;
     std::unique_ptr<WebSocketConnection> ws_conn_;
+
+    // Set by handlers doing async work (e.g. upstream proxy) to opt out of
+    // the shutdown close sweep. Atomic because it's written on the dispatcher
+    // thread (in handlers) and read on the stopper thread (in HttpServer::Stop).
+    std::atomic<bool> shutdown_exempt_{false};
 };

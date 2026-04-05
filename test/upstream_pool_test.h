@@ -711,7 +711,7 @@ void TestUpstreamLeaseMoveSematics() {
         auto uc_owner = std::make_unique<UpstreamConnection>(conn_handler, "127.0.0.1", 9999);
         UpstreamConnection* raw_conn = uc_owner.get();
 
-        UpstreamLease src(raw_conn, nullptr);
+        UpstreamLease src(raw_conn, nullptr, nullptr);
 
         bool pass = true;
         std::string err;
@@ -757,7 +757,7 @@ void TestUpstreamLeaseExplicitRelease() {
         auto uc_owner = std::make_unique<UpstreamConnection>(conn_handler, "127.0.0.1", 9999);
         UpstreamConnection* raw_conn = uc_owner.get();
 
-        UpstreamLease lease(raw_conn, nullptr);
+        UpstreamLease lease(raw_conn, nullptr, nullptr);
         bool pass = true;
         std::string err;
 
@@ -790,7 +790,7 @@ void TestUpstreamLeaseMoveAssignment() {
         auto uc_owner = std::make_unique<UpstreamConnection>(conn_handler, "127.0.0.1", 9999);
         UpstreamConnection* raw_conn = uc_owner.get();
 
-        UpstreamLease src(raw_conn, nullptr);
+        UpstreamLease src(raw_conn, nullptr, nullptr);
         UpstreamLease dst;
 
         bool pass = true;
