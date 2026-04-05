@@ -398,6 +398,16 @@ void PoolPartition::ScheduleInitiateShutdown() {
         InitiateShutdown();
         return;
     }
+    // Dispatcher already stopped (threads joined) — EnQueue would silently
+    // drop the lambda, leaving idle/connecting connections alive and the
+    // outstanding_conns_ counter stuck above zero, which would hang
+    // ~UpstreamManager's drain wait forever. Run inline: no dispatcher
+    // thread exists to race with container mutations, so touching
+    // idle_conns_/connecting_conns_ from the stopper thread is safe.
+    if (dispatcher_->was_stopped()) {
+        InitiateShutdown();
+        return;
+    }
     // Off-thread: enqueue and track via MakeInflightGuard so ~PoolPartition
     // blocks until the lambda has executed (or been dropped by a stopped
     // dispatcher). Guarded by alive_weak so a task that somehow races past
@@ -791,6 +801,13 @@ void PoolPartition::OnConnectComplete(UpstreamConnection* conn,
 }
 
 void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
+    // Hoist alive_ — the retry loop below calls CreateNewConnection which
+    // can synchronously fire a waiter's error_cb on inline failures
+    // (socket(), inet_addr, immediate connect, epoll registration).
+    // A user callback may tear down the pool/manager, after which touching
+    // wait_queue_/TotalCount()/MaybeSignalDrain would be UAF.
+    auto alive = alive_;
+
     // Safe from double-decrement with DestroyConnection because both paths
     // run on the dispatcher thread (single-threaded). OnConnectionClosed
     // extracts from containers; DestroyConnection clears callbacks before
@@ -834,6 +851,7 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
         // ECONNREFUSED), TotalCount() stays low and the next waiter should
         // also get a chance instead of stalling until queue timeout.
         PurgeExpiredWaitEntries();
+        if (!alive->load(std::memory_order_acquire)) return;
         while (!shutting_down_ &&
                !manager_shutting_down_.load(std::memory_order_acquire) &&
                !wait_queue_.empty() &&
@@ -843,6 +861,9 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
             size_t count_before = TotalCount();
             CreateNewConnection(std::move(entry.ready_callback),
                                 std::move(entry.error_callback));
+            // A synchronous inline failure may have delivered error_cb,
+            // which a user can use to destroy the pool/manager.
+            if (!alive->load(std::memory_order_acquire)) return;
             // If CreateNewConnection increased TotalCount, it succeeded
             // (async connect started). Stop — the next waiter will be
             // serviced when this connection completes or returns.

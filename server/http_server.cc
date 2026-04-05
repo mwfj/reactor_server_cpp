@@ -42,14 +42,20 @@ bool HttpServer::HasPendingH1Output() {
     std::lock_guard<std::mutex> lck(conn_mtx_);
     for (const auto& [fd, http_conn] : http_connections_) {
         auto conn = http_conn->GetConnection();
+        if (!conn || conn->IsClosing()) continue;
         // Use atomic flags as a race-free proxy for "output buffer not empty":
         // close_after_write is set by the close sweep, and cleared (via
         // ForceClose → IsClosing) when the buffer drains to zero. Reading
         // OutputBufferSize() directly would be UB (non-atomic std::string
         // read while dispatcher threads write).
-        if (conn && conn->IsCloseDeferred() && !conn->IsClosing()) {
-            return true;
-        }
+        if (conn->IsCloseDeferred()) return true;
+        // Deferred async responses (HTTP/1 async routes waiting on upstream
+        // or other external work) are exempt from the close sweep. Their
+        // completion callbacks still need to run and write their response,
+        // so HttpServer::Stop()'s H1 drain loop must stay alive for them
+        // too — otherwise the drain exits early, the event loops stop,
+        // and the deferred response is silently dropped.
+        if (conn->IsShutdownExempt()) return true;
     }
     return false;
 }

@@ -501,6 +501,16 @@ void ConnectionHandler::CloseAfterWrite(){
         std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
         event_dispatcher_->EnQueue([weak_self]() {
             if (auto self = weak_self.lock()) {
+                // Re-check shutdown exemption here on the dispatcher
+                // thread: a request can enter its async handler (which
+                // flips shutdown_exempt_ in BeginAsyncResponse) between
+                // the stopper thread calling CloseAfterWrite() and this
+                // lambda running. Without this recheck, an exempt
+                // connection with an empty buffer would be force-closed
+                // under the deferred async response. The close_after_write_
+                // flag stays set so CompleteAsyncResponse sees shutdown
+                // in progress and forces Connection: close on its reply.
+                if (self->IsShutdownExempt()) return;
                 if (self->output_bf_.Size() > 0) {
                     self->client_channel_->EnableWriteMode();
                 } else {
@@ -510,7 +520,9 @@ void ConnectionHandler::CloseAfterWrite(){
         });
         return;
     }
-    // Dispatcher stopped — execute inline as last resort
+    // Dispatcher stopped — execute inline as last resort. Still honor the
+    // exemption flag so stop-from-handler paths can't race the sweep.
+    if (IsShutdownExempt()) return;
     if (output_bf_.Size() > 0) {
         client_channel_ -> EnableWriteMode();
     } else {

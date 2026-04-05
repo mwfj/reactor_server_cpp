@@ -151,8 +151,21 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     }
 
     const bool was_head = deferred_was_head_;
+    // If shutdown has started (either signaled by the server-wide check
+    // callback, or observed via close_after_write_ already set by the
+    // generic close sweep before exempt was flipped), force Connection:
+    // close on the reply regardless of the client's keep-alive preference.
+    // The synchronous request path does the same via SetupHandlers' lambda;
+    // deferred completions must not leave the socket reusable during
+    // shutdown, otherwise CompleteAsyncResponse could resume parsing
+    // buffered pipeline bytes while the server is tearing down.
+    const bool shutting_down =
+        (callbacks_.shutdown_check_callback &&
+         callbacks_.shutdown_check_callback()) ||
+        (conn_ && conn_->IsCloseDeferred());
+    const bool effective_keep_alive = deferred_keep_alive_ && !shutting_down;
     const bool should_close = NormalizeOutgoingResponse(
-        response, deferred_keep_alive_, current_http_minor_);
+        response, effective_keep_alive, current_http_minor_);
 
     response.Version(1, current_http_minor_);
     std::string wire = response.Serialize();
