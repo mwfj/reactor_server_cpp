@@ -846,6 +846,14 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
         logging::Get()->error("Exception in HTTP/2 request handler: {}", e.what());
         response = HttpResponse::InternalError();
     }
+    // Async handler path: the framework has dispatched an async route and
+    // will submit the real response on this stream later via
+    // Http2ConnectionHandler::SubmitStreamResponse. Skipping here leaves the
+    // stream open; the H2 graceful-shutdown drain already waits on open
+    // streams, so in-flight async work is naturally protected.
+    if (response.IsDeferred()) {
+        return;
+    }
     SubmitResponse(stream_id, response);
 }
 

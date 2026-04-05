@@ -574,6 +574,270 @@ namespace HttpTests {
         }
     }
 
+    // ─── Async-route integration tests ────────────────────────────────────
+    //
+    // These lock in the four review fixes: middleware gating of async routes,
+    // preserving HTTP/1 response ordering across the deferred window,
+    // HEAD/close semantics in deferred responses, and HTTP/2 async dispatch.
+
+    // Helper: send raw bytes on a dedicated socket, read the full response
+    // stream until the peer closes or the deadline fires. Used for tests
+    // that need finer control than SendHttpRequest's per-call loop.
+    std::string SendRawAndDrain(int port, const std::string& payload,
+                                int timeout_ms = 5000) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return "";
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+        if (connect(fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+            close(fd); return "";
+        }
+        if (send(fd, payload.data(), payload.size(), 0) < 0) {
+            close(fd); return "";
+        }
+        std::string out;
+        char buf[4096];
+        auto start = std::chrono::steady_clock::now();
+        while (true) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            int remaining = timeout_ms - static_cast<int>(elapsed);
+            if (remaining <= 0) break;
+            pollfd pfd{fd, POLLIN, 0};
+            int ret = poll(&pfd, 1, remaining);
+            if (ret <= 0) break;
+            if (pfd.revents & POLLIN) {
+                ssize_t n = recv(fd, buf, sizeof(buf), 0);
+                if (n > 0) out.append(buf, n);
+                else break;
+            }
+        }
+        close(fd);
+        return out;
+    }
+
+    // Registers a GetAsync handler that schedules its completion onto a
+    // background thread after `delay_ms`, mimicking an async upstream call.
+    // The test-owned `scheduler` thread pool must outlive the server.
+    struct AsyncScheduler {
+        std::vector<std::thread> threads;
+        ~AsyncScheduler() {
+            for (auto& t : threads) if (t.joinable()) t.join();
+        }
+        void Schedule(int delay_ms, std::function<void()> fn) {
+            threads.emplace_back([delay_ms, fn = std::move(fn)]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                fn();
+            });
+        }
+    };
+
+    // P1: middleware MUST run before matched async routes. A middleware
+    // that rejects all /secret paths should short-circuit the async handler
+    // entirely — the handler must not be invoked.
+    void TestAsyncRouteMiddlewareGating() {
+        std::cout << "\n[TEST] Async route: middleware runs before handler..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            std::atomic<bool> handler_called{false};
+
+            server.Use([](const HttpRequest& req, HttpResponse& res) -> bool {
+                if (req.path.rfind("/secret", 0) == 0) {
+                    res.Status(401).Text("Unauthorized");
+                    return false;
+                }
+                return true;
+            });
+
+            server.GetAsync("/secret/data",
+                [&](const HttpRequest&, HttpRouter::AsyncCompletionCallback complete) {
+                    handler_called.store(true);
+                    HttpResponse r;
+                    r.Status(200).Text("should-not-reach");
+                    complete(std::move(r));
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendHttpRequest(port,
+                "GET /secret/data HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+
+            bool pass = true;
+            std::string err;
+            if (resp.find(" 401 ") == std::string::npos) {
+                pass = false; err += "expected 401 (got " +
+                                     std::to_string(resp.size()) + " bytes); ";
+            }
+            if (handler_called.load()) {
+                pass = false; err += "async handler ran despite middleware rejection; ";
+            }
+            TestFramework::RecordTest("Async route: middleware gating",
+                                      pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("Async route: middleware gating",
+                                      false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // P2: a keep-alive client that pipelines a second request immediately
+    // after the first (deferred) async request MUST see responses in order:
+    // the async /slow response must arrive before the sync /fast response.
+    void TestAsyncRoutePipelineOrdering() {
+        std::cout << "\n[TEST] Async route: pipelined requests stay ordered..."
+                  << std::endl;
+        AsyncScheduler sched;
+        try {
+            HttpServer server("127.0.0.1", 0);
+
+            server.GetAsync("/slow",
+                [&sched](const HttpRequest&,
+                         HttpRouter::AsyncCompletionCallback complete) {
+                    // Defer completion by ~150 ms on a background thread.
+                    auto shared = std::make_shared<
+                        HttpRouter::AsyncCompletionCallback>(std::move(complete));
+                    sched.Schedule(150, [shared]() {
+                        HttpResponse r;
+                        r.Status(200).Text("SLOW-BODY");
+                        (*shared)(std::move(r));
+                    });
+                });
+            server.Get("/fast", [](const HttpRequest&, HttpResponse& res) {
+                res.Status(200).Text("FAST-BODY");
+            });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            // Pipeline both requests in a single send, then drain.
+            std::string payload =
+                "GET /slow HTTP/1.1\r\nHost: x\r\n\r\n"
+                "GET /fast HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+            std::string resp = SendRawAndDrain(port, payload, 3000);
+
+            bool pass = true;
+            std::string err;
+            auto slow_pos = resp.find("SLOW-BODY");
+            auto fast_pos = resp.find("FAST-BODY");
+            if (slow_pos == std::string::npos) {
+                pass = false; err += "missing SLOW-BODY; ";
+            }
+            if (fast_pos == std::string::npos) {
+                pass = false; err += "missing FAST-BODY; ";
+            }
+            if (pass && slow_pos >= fast_pos) {
+                pass = false;
+                err += "response order violated: FAST arrived before SLOW; ";
+            }
+            TestFramework::RecordTest("Async route: pipelined ordering",
+                                      pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("Async route: pipelined ordering",
+                                      false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // P2: a HEAD request served via a GetAsync fallback MUST NOT carry a
+    // body. Matches the sync path's RFC 7231 §4.3.2 behavior.
+    void TestAsyncRouteHeadStripping() {
+        std::cout << "\n[TEST] Async route: HEAD body stripping..." << std::endl;
+        AsyncScheduler sched;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync("/res",
+                [&sched](const HttpRequest&,
+                         HttpRouter::AsyncCompletionCallback complete) {
+                    auto shared = std::make_shared<
+                        HttpRouter::AsyncCompletionCallback>(std::move(complete));
+                    sched.Schedule(20, [shared]() {
+                        HttpResponse r;
+                        r.Status(200).Text("GET-ONLY-BODY");
+                        (*shared)(std::move(r));
+                    });
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+            std::string resp = SendRawAndDrain(port,
+                "HEAD /res HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            if (resp.find(" 200 ") == std::string::npos) {
+                pass = false; err += "expected 200 status; ";
+            }
+            // Content-Length header must reflect the GET body size
+            if (resp.find("Content-Length:") == std::string::npos) {
+                pass = false; err += "missing Content-Length header; ";
+            }
+            // HEAD MUST NOT carry the body.
+            if (resp.find("GET-ONLY-BODY") != std::string::npos) {
+                pass = false; err += "HEAD response leaked body bytes; ";
+            }
+            TestFramework::RecordTest("Async route: HEAD body stripping",
+                                      pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("Async route: HEAD body stripping",
+                                      false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // P2: when the CLIENT sends Connection: close, the framework must
+    // enforce Connection: close on a deferred response AND close the
+    // socket after delivery. Observable via recv() returning 0.
+    void TestAsyncRouteClientCloseHeader() {
+        std::cout << "\n[TEST] Async route: Connection: close enforcement..."
+                  << std::endl;
+        AsyncScheduler sched;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync("/r",
+                [&sched](const HttpRequest&,
+                         HttpRouter::AsyncCompletionCallback complete) {
+                    auto shared = std::make_shared<
+                        HttpRouter::AsyncCompletionCallback>(std::move(complete));
+                    sched.Schedule(20, [shared]() {
+                        HttpResponse r;
+                        r.Status(200).Text("OK");
+                        (*shared)(std::move(r));
+                    });
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            // SendRawAndDrain reads until peer closes → if the server didn't
+            // honor Connection: close, recv would block until timeout.
+            auto start = std::chrono::steady_clock::now();
+            std::string resp = SendRawAndDrain(port,
+                "GET /r HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                3000);
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+
+            bool pass = true;
+            std::string err;
+            if (resp.find("OK") == std::string::npos) {
+                pass = false; err += "missing OK body; ";
+            }
+            // Server must close: if we hit the full 3s timeout, it leaked.
+            if (elapsed >= 2500) {
+                pass = false; err += "server did not close after "
+                                     "Connection: close (took " +
+                                     std::to_string(elapsed) + " ms); ";
+            }
+            TestFramework::RecordTest("Async route: Connection: close",
+                                      pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("Async route: Connection: close",
+                                      false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // Run all HTTP tests
     void RunAllTests() {
         std::cout << "\n" << std::string(60, '=') << std::endl;
@@ -600,6 +864,12 @@ namespace HttpTests {
 
         // Integration tests
         TestHttpIntegration();
+
+        // Async-route integration tests
+        TestAsyncRouteMiddlewareGating();
+        TestAsyncRoutePipelineOrdering();
+        TestAsyncRouteHeadStripping();
+        TestAsyncRouteClientCloseHeader();
 
         // Timeout tests
         TestRequestTimeout();

@@ -92,11 +92,7 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     // Run middleware chain — params are already populated for matched routes.
     for (const auto& mw : middlewares_) {
         if (!mw(request, response)) {
-            if (response.GetStatusCode() == 200 &&
-                response.GetBody().empty() &&
-                response.GetHeaders().empty()) {
-                response.Status(403).Text("Forbidden");
-            }
+            FillDefaultRejectionResponse(response);
             logging::Get()->debug("Middleware rejected request: {} {}",
                                   request.method, logging::SanitizePath(request.path));
             return true;
@@ -163,6 +159,14 @@ bool HttpRouter::RunMiddleware(const HttpRequest& request, HttpResponse& respons
         }
     }
     return true;
+}
+
+void HttpRouter::FillDefaultRejectionResponse(HttpResponse& response) {
+    if (response.GetStatusCode() == 200 &&
+        response.GetBody().empty() &&
+        response.GetHeaders().empty()) {
+        response.Status(403).Text("Forbidden");
+    }
 }
 
 bool HttpRouter::HasWebSocketRoute(const std::string& path) const {

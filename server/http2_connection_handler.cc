@@ -324,6 +324,17 @@ void Http2ConnectionHandler::SetDrainCompleteCallback(DrainCompleteCallback cb) 
     drain_complete_cb_ = std::move(cb);
 }
 
+void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
+                                                  const HttpResponse& response) {
+    if (!session_) {
+        logging::Get()->warn(
+            "SubmitStreamResponse called on destroyed H2 session (stream={})",
+            stream_id);
+        return;
+    }
+    session_->SubmitResponse(stream_id, response);
+}
+
 void Http2ConnectionHandler::NotifyDrainComplete() {
     if (drain_notified_) return;
     drain_notified_ = true;

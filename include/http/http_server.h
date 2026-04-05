@@ -60,34 +60,43 @@ public:
     void Use(HttpRouter::Middleware middleware);
 
     // Route registration — asynchronous handlers.
-    // The handler receives a shared_ptr<HttpConnectionHandler> and is
-    // responsible for calling conn->SendResponse() from its async completion
-    // callback. The framework will NOT auto-send any response after the
-    // handler returns. Typical pattern for an upstream proxy handler:
     //
-    //   server.GetAsync("/proxy", [this](auto conn, const HttpRequest& req) {
-    //       conn->SetShutdownExempt(true);  // protect during graceful shutdown
+    // The handler receives the request plus a protocol-agnostic completion
+    // callback. Invoke `complete(final_response)` once when the async work
+    // finishes; the framework handles response delivery for both HTTP/1
+    // and HTTP/2 transparently. Typical pattern for an upstream proxy:
+    //
+    //   server.GetAsync("/proxy", [this](const HttpRequest& req, auto complete) {
     //       upstream_->CheckoutAsync("svc", req.dispatcher_index,
-    //           [conn](UpstreamLease lease) {
-    //               // ... perform the upstream request, build HttpResponse
+    //           [complete](UpstreamLease lease) {
+    //               // ... perform the upstream request ...
     //               HttpResponse final;
     //               final.Status(200).Text("...");
-    //               conn->SetShutdownExempt(false);
-    //               conn->SendResponse(final);
+    //               complete(std::move(final));
     //           },
-    //           [conn](int err) {
+    //           [complete](int /*err*/) {
     //               HttpResponse e;
     //               e.Status(502).Text("Bad Gateway");
-    //               conn->SetShutdownExempt(false);
-    //               conn->SendResponse(e);
+    //               complete(std::move(e));
     //           });
     //   });
     //
-    // Async handlers take precedence over sync handlers for the same
-    // method+path pair. Note: HTTP/1 pipelining is not supported for async
-    // handlers — additional pipelined requests on the same connection are
-    // deferred until the async response is sent and new client data arrives.
-    // For simplicity, async handlers should prefer Connection: close.
+    // Framework guarantees while the async response is pending:
+    //   - Middleware (auth, CORS, rate limiting) has already run before the
+    //     handler is invoked; rejection responses never reach the handler.
+    //   - The connection is exempt from the graceful-shutdown close sweep
+    //     (HTTP/1) or tracked in the H2 stream drain (HTTP/2).
+    //   - HTTP/1 pipelined bytes arriving after the deferred request are
+    //     buffered and parsed only after complete() fires, preserving
+    //     response ordering.
+    //   - complete() applies HEAD body-stripping and Connection close /
+    //     keep-alive normalization automatically, using the original
+    //     request's metadata.
+    //
+    // Async routes take precedence over sync routes for the same
+    // method+path. The completion callback MUST be invoked on the
+    // dispatcher thread that owns the request connection; upstream pool
+    // callbacks naturally run on the right dispatcher.
     void GetAsync(const std::string& path, HttpRouter::AsyncHandler handler);
     void PostAsync(const std::string& path, HttpRouter::AsyncHandler handler);
     void PutAsync(const std::string& path, HttpRouter::AsyncHandler handler);

@@ -954,24 +954,68 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
             RequestGuard guard{active_requests_};
 
             // Async routes take precedence over sync routes for the same
-            // path. An async handler is responsible for building and sending
-            // its own response via conn->SendResponse() from an async
-            // completion callback — the framework marks the response as
-            // deferred so HandleCompleteRequest skips the auto-send.
+            // path. The framework dispatches async handlers as follows:
+            //   1. Run middleware (auth, CORS, rate limiting). If it
+            //      rejects, fall through to the sync send path with the
+            //      rejection response — NEVER invoke the async handler.
+            //   2. Otherwise, call BeginAsyncResponse to save request
+            //      context + block the parser + mark shutdown-exempt, mark
+            //      the response deferred (so HandleCompleteRequest skips
+            //      auto-send), and invoke the user handler with a
+            //      protocol-agnostic completion callback.
+            //   3. The user invokes complete(final_response); the captured
+            //      weak_ptr re-locks the handler and CompleteAsyncResponse
+            //      performs normalization, sends the bytes, and either
+            //      closes or resumes parsing pipelined data.
             auto async_handler = router_.GetAsyncHandler(request);
             if (async_handler) {
+                bool mw_ok = router_.RunMiddleware(request, response);
+                if (!mw_ok) {
+                    HttpRouter::FillDefaultRejectionResponse(response);
+                    if (!server_ready_.load(std::memory_order_acquire)) {
+                        response.Header("Connection", "close");
+                    }
+                    return;  // Sync send path below runs auto-send
+                }
+
                 response.Defer();
+                self->BeginAsyncResponse(request);
+
+                // Capture weak_ptr so a leaked completion callback cannot
+                // keep the connection alive past its natural shutdown.
+                // Route the actual CompleteAsyncResponse work through the
+                // dispatcher via RunOnDispatcher: users may call complete()
+                // from any thread (their upstream library's worker pool,
+                // a background thread, etc.), and parser_ / OnRawData /
+                // deferred_pending_buf_ are all dispatcher-thread-only.
+                // shared_ptr<HttpResponse> is required because std::function
+                // targets must be copy-constructible — we can't capture a
+                // moved HttpResponse by value into a copyable lambda.
+                std::weak_ptr<HttpConnectionHandler> weak_self = self;
+                HttpRouter::AsyncCompletionCallback complete =
+                    [weak_self](HttpResponse final_resp) {
+                        auto s = weak_self.lock();
+                        if (!s) return;
+                        auto conn = s->GetConnection();
+                        if (!conn) return;
+                        auto shared_resp = std::make_shared<HttpResponse>(
+                            std::move(final_resp));
+                        conn->RunOnDispatcher([s, shared_resp]() {
+                            s->CompleteAsyncResponse(std::move(*shared_resp));
+                        });
+                    };
+
                 try {
-                    async_handler(self, request);
+                    async_handler(request, std::move(complete));
                 } catch (const std::exception& e) {
-                    // Handler threw before scheduling async work. Recover by
-                    // sending a generic 500 directly — do NOT leak e.what()
-                    // (may contain stack traces, file paths, credentials).
+                    // Handler threw before scheduling async work. Recover
+                    // by completing synchronously with a 500. Never leak
+                    // e.what() to the client.
                     logging::Get()->error("Exception in async request handler: {}",
                                           e.what());
                     HttpResponse err = HttpResponse::InternalError();
                     err.Header("Connection", "close");
-                    self->SendResponse(err);
+                    self->CompleteAsyncResponse(std::move(err));
                 }
                 return;
             }
@@ -1543,12 +1587,59 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     });
 
     h2_conn->SetRequestCallback(
-        [this](std::shared_ptr<Http2ConnectionHandler> /*self*/,
-               int32_t /*stream_id*/,
+        [this](std::shared_ptr<Http2ConnectionHandler> self,
+               int32_t stream_id,
                const HttpRequest& request,
                HttpResponse& response) {
             active_requests_.fetch_add(1, std::memory_order_relaxed);
             RequestGuard guard{active_requests_};
+
+            // Async route dispatch — mirrors the HTTP/1 path. Middleware
+            // runs first (auth, CORS, rate limiting) and can reject before
+            // we invoke the async handler. On success we mark the response
+            // deferred (Http2Session::OnRequest returns early on IsDeferred)
+            // and hand the user a completion callback that captures
+            // stream_id + a weak_ptr to the H2 connection handler. H2's
+            // graceful-shutdown drain already waits on open streams, so
+            // the async operation is naturally protected during shutdown
+            // without needing shutdown_exempt_ bookkeeping.
+            auto async_handler = router_.GetAsyncHandler(request);
+            if (async_handler) {
+                if (!router_.RunMiddleware(request, response)) {
+                    HttpRouter::FillDefaultRejectionResponse(response);
+                    return;
+                }
+                response.Defer();
+
+                // Route the completion through the dispatcher for the
+                // same thread-safety reason as the HTTP/1 path above:
+                // Http2Session::SubmitResponse mutates nghttp2 state that
+                // is not thread-safe. User code may call complete() from
+                // any thread (their upstream library's worker pool, etc).
+                std::weak_ptr<Http2ConnectionHandler> weak_self = self;
+                HttpRouter::AsyncCompletionCallback complete =
+                    [weak_self, stream_id](HttpResponse final_resp) {
+                        auto s = weak_self.lock();
+                        if (!s) return;
+                        auto conn = s->GetConnection();
+                        if (!conn) return;
+                        auto shared_resp = std::make_shared<HttpResponse>(
+                            std::move(final_resp));
+                        conn->RunOnDispatcher([s, stream_id, shared_resp]() {
+                            s->SubmitStreamResponse(stream_id, *shared_resp);
+                        });
+                    };
+
+                try {
+                    async_handler(request, std::move(complete));
+                } catch (const std::exception& e) {
+                    logging::Get()->error("Exception in async H2 handler: {}",
+                                          e.what());
+                    HttpResponse err = HttpResponse::InternalError();
+                    self->SubmitStreamResponse(stream_id, err);
+                }
+                return;
+            }
 
             if (!router_.Dispatch(request, response)) {
                 response.Status(404).Text("Not Found");

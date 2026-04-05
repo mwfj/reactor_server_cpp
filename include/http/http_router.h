@@ -18,21 +18,34 @@ public:
         HttpResponse& response
     )>;
 
+    // Completion callback handed to async handlers. When invoked it delivers
+    // the final HttpResponse to the client. Protocol-agnostic — the framework
+    // binds protocol-specific plumbing (HTTP/1 client transport or HTTP/2
+    // stream submission) at dispatch time so the user handler is the same
+    // regardless of whether the request arrived over H1 or H2.
+    //
+    // Thread safety: the completion callback MUST be invoked on the
+    // dispatcher thread that owns the request's connection. Async work
+    // (e.g. upstream pool CheckoutAsync) naturally routes callbacks back
+    // to that dispatcher. If your async work runs elsewhere, route the
+    // completion via EnQueue.
+    using AsyncCompletionCallback = std::function<void(HttpResponse)>;
+
     // Async handler for HTTP requests. Used when the request handler needs to
     // dispatch async work (e.g. upstream proxy via UpstreamManager::CheckoutAsync)
-    // and deliver the response later. The framework skips the automatic
-    // post-dispatch send for async handlers — the handler is responsible for
-    // calling conn->SendResponse() from its completion callback.
-    //
-    // The handler receives the HttpConnectionHandler shared_ptr so it can:
-    //   1. Call conn->SetShutdownExempt(true) to protect the connection from
-    //      the graceful-shutdown close sweep while the async work is pending
-    //   2. Capture the shared_ptr into the async completion callback
-    //   3. Call conn->SendResponse(final_response) when the reply is ready
-    //      (and conn->SetShutdownExempt(false) beforehand)
+    // and deliver the response later. The handler receives the request plus
+    // a completion callback and is responsible for invoking `complete(resp)`
+    // exactly once. The framework:
+    //   - Runs middleware before invoking the async handler (auth, CORS, etc.)
+    //   - Blocks the HTTP/1 parser from accepting new requests until the
+    //     completion fires, preserving response ordering on keep-alive
+    //   - Marks the connection as shutdown-exempt while the async work is
+    //     pending so graceful shutdown waits for the reply
+    //   - Applies Connection: close / keep-alive / HEAD body-stripping to
+    //     the completion response using the original request's metadata
     using AsyncHandler = std::function<void(
-        std::shared_ptr<HttpConnectionHandler> conn,
-        const HttpRequest& request
+        const HttpRequest& request,
+        AsyncCompletionCallback complete
     )>;
 
     // Middleware -- return true to continue, false to stop
@@ -74,6 +87,13 @@ public:
     // Run middleware chain only (for WebSocket upgrades that need auth/CORS/etc.)
     // Returns true if all middleware passed, false if any short-circuited.
     bool RunMiddleware(const HttpRequest& request, HttpResponse& response);
+
+    // Ensure a middleware-rejected response carries a meaningful payload:
+    // if middleware returned false but left the response untouched, fill
+    // it with 403 Forbidden. Called from all middleware-rejection sites
+    // (sync Dispatch, async H1 dispatch, async H2 dispatch) so the default
+    // is consistent.
+    static void FillDefaultRejectionResponse(HttpResponse& response);
 
     // WebSocket route lookup
     bool HasWebSocketRoute(const std::string& path) const;

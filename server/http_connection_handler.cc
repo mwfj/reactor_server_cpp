@@ -3,6 +3,16 @@
 #include "log/log_utils.h"
 #include <sstream>
 
+namespace {
+// Overhead budget above max_body_size_ + max_header_size_ for any extra
+// request-line, headers, and framing bytes that may accumulate while an
+// async response is pending on a pipelined keep-alive connection.
+constexpr size_t DEFERRED_STASH_OVERHEAD = 8192;
+// Fallback cap when the connection has no configured body/header limits
+// (standalone/test usage). Matches a common "one small request" budget.
+constexpr size_t DEFERRED_STASH_DEFAULT_CAP = 1 * 1024 * 1024;  // 1 MB
+}  // namespace
+
 HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn)
     : conn_(std::move(conn)) {}
 
@@ -47,6 +57,132 @@ void HttpConnectionHandler::SetRequestTimeout(int seconds) {
     // Don't arm deadline here — for TLS connections, the handshake hasn't
     // completed yet. The deadline is armed on the first OnRawData call
     // (which only fires after TLS handshake completes).
+}
+
+bool HttpConnectionHandler::NormalizeOutgoingResponse(HttpResponse& response,
+                                                      bool client_keep_alive,
+                                                      int /*client_http_minor*/) {
+    // Scan all Connection headers for a "close" token (RFC 7230 §6.1).
+    bool resp_close = false;
+    for (const auto& hdr : response.GetHeaders()) {
+        std::string key = hdr.first;
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        if (key != "connection") continue;
+        std::string val = hdr.second;
+        std::transform(val.begin(), val.end(), val.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        std::istringstream ss(val);
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+            while (!token.empty() && (token.front() == ' ' || token.front() == '\t'))
+                token.erase(token.begin());
+            while (!token.empty() && (token.back() == ' ' || token.back() == '\t'))
+                token.pop_back();
+            if (token == "close") resp_close = true;
+        }
+    }
+
+    // HTTP/1.0 persistence requires explicit Connection: keep-alive in the
+    // response; without it a compliant 1.0 client treats the response as
+    // close-delimited.
+    if (current_http_minor_ == 0 && client_keep_alive && !resp_close) {
+        response.Header("Connection", "keep-alive");
+    }
+    // When the client did not request keep-alive, echo Connection: close so
+    // the wire semantics match the server's intent to tear down the socket.
+    if (!client_keep_alive && !resp_close) {
+        response.Header("Connection", "close");
+        resp_close = true;
+    }
+    return !client_keep_alive || resp_close;
+}
+
+void HttpConnectionHandler::StripResponseBodyForHead(std::string& wire) {
+    auto header_end = wire.find("\r\n\r\n");
+    if (header_end != std::string::npos) {
+        wire.resize(header_end + 4);
+    }
+}
+
+void HttpConnectionHandler::BeginAsyncResponse(const HttpRequest& req) {
+    deferred_response_pending_ = true;
+    deferred_was_head_ = (req.method == "HEAD");
+    deferred_keep_alive_ = req.keep_alive;
+    // current_http_minor_ was updated by the parser when headers completed
+    // and persists across the deferred window, so no separate capture is
+    // needed. Exempt the connection from the shutdown close sweep until
+    // CompleteAsyncResponse runs.
+    shutdown_exempt_.store(true, std::memory_order_release);
+}
+
+void HttpConnectionHandler::StashDeferredBytes(const std::string& data) {
+    if (data.empty()) return;
+    // Cap the stash to the same ceiling as a single request body, plus the
+    // header limit, to bound memory while an async response is pending.
+    // A malicious client that pipelines gigabytes against a slow async
+    // handler is otherwise an OOM DoS vector. When exceeded we force-close
+    // the connection — the in-flight async completion will see
+    // IsClosing() and bail out.
+    const size_t cap = (max_body_size_ > 0 && max_header_size_ > 0)
+        ? (max_body_size_ + max_header_size_ + DEFERRED_STASH_OVERHEAD)
+        : DEFERRED_STASH_DEFAULT_CAP;
+    if (deferred_pending_buf_.size() + data.size() > cap) {
+        logging::Get()->warn(
+            "Deferred pipeline buffer cap exceeded fd={} ({} + {} > {}), "
+            "force-closing connection",
+            conn_ ? conn_->fd() : -1, deferred_pending_buf_.size(),
+            data.size(), cap);
+        deferred_pending_buf_.clear();
+        if (conn_ && !conn_->IsClosing()) conn_->ForceClose();
+        return;
+    }
+    deferred_pending_buf_.append(data);
+}
+
+void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
+    if (!deferred_response_pending_) {
+        logging::Get()->warn(
+            "CompleteAsyncResponse called without a pending deferred response "
+            "(fd={})", conn_ ? conn_->fd() : -1);
+        return;
+    }
+
+    const bool was_head = deferred_was_head_;
+    const bool should_close = NormalizeOutgoingResponse(
+        response, deferred_keep_alive_, current_http_minor_);
+
+    response.Version(1, current_http_minor_);
+    std::string wire = response.Serialize();
+    if (was_head) StripResponseBodyForHead(wire);
+    conn_->SendRaw(wire.data(), wire.size());
+
+    // Clear deferred state BEFORE resuming parsing/closing — subsequent
+    // OnRawData or CloseConnection calls must see the connection as idle.
+    deferred_response_pending_ = false;
+    deferred_was_head_ = false;
+    deferred_keep_alive_ = true;
+    shutdown_exempt_.store(false, std::memory_order_release);
+
+    if (conn_->IsClosing()) {
+        deferred_pending_buf_.clear();
+        return;
+    }
+    if (should_close) {
+        deferred_pending_buf_.clear();
+        CloseConnection();
+        return;
+    }
+
+    // Resume parsing any pipelined bytes that arrived during the deferred
+    // window. Move out of the member first so a nested BeginAsyncResponse
+    // triggered by the next parsed async request can cleanly re-populate
+    // deferred_pending_buf_ without stomping our state.
+    if (!deferred_pending_buf_.empty()) {
+        std::string pending = std::move(deferred_pending_buf_);
+        deferred_pending_buf_.clear();
+        OnRawData(conn_, pending);
+    }
 }
 
 void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
@@ -366,81 +502,39 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             return false;
         }
 
-        // Async handler path: the handler marked the response as deferred
-        // and is expected to drive SendResponse itself when the async work
-        // completes. Skip the auto-send, reset per-request state, and
-        // stop the pipelining loop — the connection remains alive until
-        // the async response is sent (or shutdown/idle timeout tears it down).
-        // Additional pipelined requests on the same connection will be
-        // processed by the next OnRawData call (triggered by new client
-        // data or the async SendResponse path resuming the parser).
+        // Async handler path: the framework marked the response as deferred
+        // before invoking the async handler (BeginAsyncResponse captured
+        // request context). Any bytes after `consumed` belong to pipelined
+        // requests that MUST NOT be parsed until the deferred response has
+        // been sent — otherwise HTTP/1 response ordering is violated.
+        // Route them through StashDeferredBytes so the same size cap and
+        // force-close-on-overflow logic as OnRawData's top-level stash
+        // applies.
         if (response.IsDeferred()) {
             request_in_progress_ = false;
             conn_->ClearDeadline();
             conn_->SetDeadlineTimeoutCb(nullptr);
             buf += consumed;
             remaining -= consumed;
+            if (remaining > 0) {
+                StashDeferredBytes(std::string(buf, remaining));
+            }
             parser_.Reset();
             sent_100_continue_ = false;
             return false;
         }
 
-        // Determine if response sets Connection: close (needed for
-        // keep-alive logic AND the close decision after sending).
-        // Scan ALL Connection headers and parse each as a comma-separated
-        // token list (RFC 7230 §6.1). Values like "keep-alive, close" or
-        // "upgrade, close" must be recognized, not just exact "close".
-        bool resp_close = false;
-        for (const auto& hdr : response.GetHeaders()) {
-            std::string key = hdr.first;
-            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c); });
-            if (key == "connection") {
-                std::string val = hdr.second;
-                std::transform(val.begin(), val.end(), val.begin(), [](unsigned char c){ return std::tolower(c); });
-                std::istringstream ss(val);
-                std::string token;
-                while (std::getline(ss, token, ',')) {
-                    while (!token.empty() && (token.front() == ' ' || token.front() == '\t'))
-                        token.erase(token.begin());
-                    while (!token.empty() && (token.back() == ' ' || token.back() == '\t'))
-                        token.pop_back();
-                    if (token == "close") {
-                        resp_close = true;
-                    }
-                }
-            }
-        }
+        const bool should_close = NormalizeOutgoingResponse(
+            response, req.keep_alive, req.http_minor);
 
-        // HTTP/1.0 persistence requires explicit Connection: keep-alive
-        // in the response. Without it, a compliant 1.0 client treats the
-        // response as close-delimited and closes its end, while the server
-        // keeps waiting — stranding the connection until idle timeout.
-        if (req.http_minor == 0 && req.keep_alive && !resp_close) {
-            response.Header("Connection", "keep-alive");
-        }
-
-        // If the server will close after this response (client sent
-        // Connection: close, or HTTP/1.0 without keep-alive), the response
-        // must include Connection: close so the wire semantics match.
-        // Without this, an HTTP/1.1 response implies persistence but the
-        // server tears the socket down immediately after sending.
-        if (!req.keep_alive && !resp_close) {
-            response.Header("Connection", "close");
-        }
-
-        // RFC 7231 §4.3.2: HEAD responses MUST NOT include a body,
-        // but MUST include the same headers as the GET response (including
-        // Content-Length reflecting the GET body size).
+        // RFC 7231 §4.3.2: HEAD responses carry the GET headers (including
+        // Content-Length) but MUST NOT include a body. Serialize first so
+        // the framework's auto-computed Content-Length is preserved, then
+        // strip the body from the wire.
         if (req.method == "HEAD") {
-            // Serialize the full response to get auto-computed Content-Length,
-            // then strip the body from the wire output.
             response.Version(1, current_http_minor_);
             std::string wire = response.Serialize();
-            // Find the end of headers (blank line)
-            auto header_end = wire.find("\r\n\r\n");
-            if (header_end != std::string::npos) {
-                wire = wire.substr(0, header_end + 4);  // Include the blank line
-            }
+            StripResponseBodyForHead(wire);
             conn_->SendRaw(wire.data(), wire.size());
         } else {
             SendResponse(response);
@@ -452,7 +546,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             return false;
         }
 
-        if (!req.keep_alive || resp_close) {
+        if (should_close) {
             CloseConnection();
             return false;
         }
@@ -617,6 +711,20 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
     // If upgraded to WebSocket, forward raw bytes to WebSocketConnection
     if (upgraded_ && ws_conn_) {
         HandleUpgradedData(data);
+        return;
+    }
+
+    // If an async response is still pending, buffer the incoming bytes
+    // instead of parsing new requests. This preserves HTTP/1 response
+    // ordering on keep-alive connections: a pipelined request MUST NOT
+    // be answered before the deferred response in front of it has been
+    // sent. CompleteAsyncResponse feeds this buffer back through
+    // OnRawData once the deferred response is delivered.
+    //
+    // NetServer clears the input buffer after on_message_callback returns,
+    // so without this stash the pipelined bytes would be lost entirely.
+    if (deferred_response_pending_) {
+        StashDeferredBytes(data);
         return;
     }
 

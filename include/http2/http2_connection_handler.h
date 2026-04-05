@@ -57,6 +57,13 @@ public:
     // Access the session (for stream count, alive check, etc.)
     Http2Session* GetSession() { return session_.get(); }
 
+    // Submit a response to a specific stream. Used by async route handlers
+    // to deliver a deferred response from the dispatcher thread after an
+    // async operation completes. Safe to call with a stream_id that has
+    // already closed (e.g. due to client RST_STREAM or connection drop) —
+    // Http2Session handles the missing-stream case internally.
+    void SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
+
     // Check if session is still active
     bool IsAlive() const { return session_ && session_->IsAlive(); }
 

@@ -51,20 +51,36 @@ public:
     // Called when raw data arrives (set as NetServer's on_message callback)
     void OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data);
 
+    // Begin an async-response cycle. Called by the framework when an async
+    // route handler is about to run. Saves the request context needed to
+    // normalize the final response (HEAD body stripping, Connection: close,
+    // HTTP/1.0 keep-alive signaling) and blocks the parser from accepting
+    // new requests until CompleteAsyncResponse runs — preserving HTTP/1
+    // response ordering on keep-alive connections.
+    void BeginAsyncResponse(const HttpRequest& req);
+
+    // Complete an async-response cycle. Called from the async completion
+    // callback (on the dispatcher thread). Applies post-dispatch
+    // normalization using the context saved by BeginAsyncResponse, writes
+    // the response, and either closes the connection or resumes parsing
+    // any pipelined bytes that arrived during the deferred window.
+    void CompleteAsyncResponse(HttpResponse response);
+
+    // Append bytes that arrived while an async response was pending.
+    // Called by OnRawData. Separated from OnRawData so that the framework's
+    // own "resume after deferred" path can feed buffered bytes back in
+    // without recursion surprises.
+    void StashDeferredBytes(const std::string& data);
+
+    // True if an async response is currently pending delivery.
+    bool IsAsyncResponsePending() const { return deferred_response_pending_; }
+
     // Graceful-shutdown exemption.
     //
-    // Application handlers that dispatch async work (e.g. upstream proxy via
-    // UpstreamManager::CheckoutAsync) have a window where the request has
-    // been parsed but no client response bytes have been buffered yet. Without
-    // opting in, NetServer::Stop()'s generic CloseAfterWrite sweep will
-    // force-close the client transport during that window, dropping the
-    // in-flight request even though the PR's upstream drain phase would
-    // otherwise give it time to complete.
-    //
-    // Handlers should call SetShutdownExempt(true) before starting async
-    // work and SetShutdownExempt(false) after the final response has been
-    // handed to SendResponse(). HttpServer::Stop() walks the connection map
-    // and exempts any connection whose flag is set.
+    // Set automatically by BeginAsyncResponse/CompleteAsyncResponse for the
+    // async route API. Also exposed publicly so advanced users implementing
+    // custom async patterns outside the AsyncHandler API can still mark
+    // their connections exempt from HttpServer::Stop()'s close sweep.
     void SetShutdownExempt(bool exempt) {
         shutdown_exempt_.store(exempt, std::memory_order_release);
     }
@@ -100,6 +116,22 @@ private:
     bool HandleCompleteRequest(const char*& buf, size_t& remaining, size_t consumed);
     void HandleIncompleteRequest();
 
+    // Shared response normalization used by both the sync request loop and
+    // the async deferred completion path. Scans Connection headers for a
+    // "close" token (RFC 7230 §6.1 comma-separated list), injects an
+    // HTTP/1.0 Connection: keep-alive if the client asked for persistence
+    // on HTTP/1.0, and enforces Connection: close when the client did not
+    // request keep-alive. Returns the final "should close after send"
+    // decision so the caller can CloseConnection() after writing.
+    bool NormalizeOutgoingResponse(HttpResponse& response,
+                                   bool client_keep_alive,
+                                   int client_http_minor);
+
+    // Strip the body from a serialized wire response for HEAD requests
+    // (RFC 7231 §4.3.2). Truncates `wire` at the blank line that
+    // terminates the header block, preserving the Content-Length header.
+    static void StripResponseBodyForHead(std::string& wire);
+
     std::shared_ptr<ConnectionHandler> conn_;
     HttpParser parser_;
     HTTP_CALLBACKS_NAMESPACE::HttpConnCallbacks callbacks_;
@@ -110,4 +142,18 @@ private:
     // the shutdown close sweep. Atomic because it's written on the dispatcher
     // thread (in handlers) and read on the stopper thread (in HttpServer::Stop).
     std::atomic<bool> shutdown_exempt_{false};
+
+    // Deferred-response state — dispatcher-thread only, no atomics needed.
+    // Populated by BeginAsyncResponse and consumed by CompleteAsyncResponse.
+    // While deferred_response_pending_ is true, OnRawData buffers new bytes
+    // into deferred_pending_buf_ instead of parsing them, preventing
+    // out-of-order responses on pipelined HTTP/1 keep-alive connections.
+    // deferred_http_minor_ is intentionally NOT stored: current_http_minor_
+    // is updated by the parser at header-completion time and persists
+    // across the deferred window (no new requests are parsed until the
+    // completion runs), so it serves as the canonical version field.
+    bool deferred_response_pending_ = false;
+    bool deferred_was_head_ = false;
+    bool deferred_keep_alive_ = true;
+    std::string deferred_pending_buf_;
 };
