@@ -6,6 +6,7 @@
 #include "tls/tls_connection.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
+#include <future>
 
 // ── UpstreamLease out-of-line definitions ──────────────────────────────
 // These live here because the destructor/Release need the complete
@@ -66,15 +67,52 @@ static void ClearTransportCallbacks(UpstreamConnection* conn) {
 }
 
 PoolPartition::~PoolPartition() {
-    // Signal deferred purge tasks to stop — they capture alive_ by shared_ptr
-    *alive_ = false;
+    // Critical state changes must happen on the dispatcher thread to
+    // serialize with in-flight lambdas. The dispatcher is single-threaded,
+    // so a task we enqueue runs to completion before/after other tasks —
+    // never concurrently. Without this, a lambda mid-execution (having
+    // read *alive_=true) can race with our *alive_=false write and
+    // subsequent ClearTransportCallbacks on ConnectionHandler callback
+    // slots (std::function, not thread-safe).
+    auto finalize = [this]() {
+        *alive_ = false;
+        // Clear callbacks on-loop — safe because dispatcher is single-threaded
+        // and no concurrent lambda can be touching these std::function fields.
+        for (auto& c : idle_conns_)       ClearTransportCallbacks(c.get());
+        for (auto& c : active_conns_)     ClearTransportCallbacks(c.get());
+        for (auto& c : connecting_conns_) ClearTransportCallbacks(c.get());
+        for (auto& c : zombie_conns_)     ClearTransportCallbacks(c.get());
+    };
+
+    if (dispatcher_ && !dispatcher_->was_stopped() &&
+        !dispatcher_->is_on_loop_thread()) {
+        // Off dispatcher thread with a live dispatcher — enqueue the
+        // finalize and wait for completion. This serializes with any
+        // lambdas already in-flight on the dispatcher.
+        auto p = std::make_shared<std::promise<void>>();
+        auto f = p->get_future();
+        dispatcher_->EnQueue([finalize, p]() {
+            finalize();
+            p->set_value();
+        });
+        // Bounded wait. If dispatcher is hung, we have bigger problems.
+        if (f.wait_for(std::chrono::milliseconds(500)) !=
+            std::future_status::ready) {
+            logging::Get()->warn("PoolPartition destructor finalize timed out");
+            // Force inline as fallback — at this point the dispatcher
+            // appears unresponsive so the race window is low but real.
+            finalize();
+        }
+    } else {
+        // On dispatcher thread OR dispatcher stopped — safe to run inline.
+        // Dispatcher-stopped case: no lambdas can run, no race.
+        // On-thread case: we ARE the dispatcher, no race.
+        finalize();
+    }
 
     // Do NOT call ForceClose() here — destructor may run on the main thread
     // and ForceClose() does cross-thread epoll operations (UB).
     // SocketHandler::~SocketHandler() will close the fd naturally.
-    for (auto& c : idle_conns_)       ClearTransportCallbacks(c.get());
-    for (auto& c : active_conns_)     ClearTransportCallbacks(c.get());
-    for (auto& c : connecting_conns_) ClearTransportCallbacks(c.get());
 }
 
 void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb) {
