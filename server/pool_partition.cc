@@ -559,21 +559,23 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
                     logging::Get()->error("TLS setup failed for {}:{}: {}",
                                           upstream_host_, upstream_port_,
                                           e.what());
-                    (*error_cb_copy)(CHECKOUT_CONNECT_FAILED);
-                    // Capture fd BEFORE ForceClose — ForceClose releases it
-                    // (fd becomes -1), so OnConnectionClosed wouldn't be able
-                    // to remove the handler from the dispatcher's timer map.
-                    int pre_close_fd = handler ? handler->fd() : -1;
-                    ClearTransportCallbacks(raw_conn);
-                    // Remove from timer map BEFORE ForceClose while fd is valid
-                    if (pre_close_fd >= 0 && handler) {
-                        dispatcher_->RemoveTimerConnectionIfMatch(
-                            pre_close_fd, handler);
+                    // Clean up partition state BEFORE invoking user callback.
+                    // An embedder may tear down the pool/manager from error_cb
+                    // (e.g. reacting to repeated checkout failures), which
+                    // would free this PoolPartition. Any dispatcher_ or
+                    // raw_conn access after the callback would be UAF.
+                    //
+                    // Hoist the shared_ptr onto the stack FIRST: DestroyConnection
+                    // calls ClearTransportCallbacks which nulls the
+                    // SetConnectCompleteCallback holding this very lambda,
+                    // destroying its captures while it's still executing. Any
+                    // capture access post-cleanup must go through a stack copy.
+                    auto error_cb_local = error_cb_copy;
+                    auto owned = ExtractFromConnecting(raw_conn);
+                    if (owned) {
+                        DestroyConnection(std::move(owned));
                     }
-                    if (handler && !handler->IsClosing()) {
-                        handler->ForceClose();
-                    }
-                    OnConnectionClosed(raw_conn);
+                    (*error_cb_local)(CHECKOUT_CONNECT_FAILED);
                     return;
                 }
                 // Don't deliver ready — TLS handshake still in progress.
@@ -589,27 +591,17 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
     conn_handler->SetCloseCb(
         [this, raw_conn, error_cb_copy, timed_out]
         (std::shared_ptr<ConnectionHandler>) {
-            if (raw_conn->IsConnecting()) {
-                int code;
-                if (shutting_down_) {
-                    code = CHECKOUT_SHUTTING_DOWN;
-                } else if (*timed_out) {
-                    code = CHECKOUT_CONNECT_TIMEOUT;
-                } else {
-                    code = CHECKOUT_CONNECT_FAILED;
-                }
-                (*error_cb_copy)(code);
-            }
-            OnConnectionClosed(raw_conn);
-        });
-
-    // Wire error callback for EPOLLERR events (async reset, local error).
-    // Use the same timeout/shutdown distinction as the close callback.
-    conn_handler->SetErrorCb(
-        [this, raw_conn, error_cb_copy, timed_out]
-        (std::shared_ptr<ConnectionHandler>) {
-            if (raw_conn->IsConnecting()) {
-                int code;
+            // Snapshot notification decision BEFORE cleanup. OnConnectionClosed
+            // will destroy raw_conn for the connecting case (unique_ptr drops
+            // out of scope). Check both partition-local and manager-wide
+            // shutdown flags — if UpstreamManager::InitiateShutdown() set the
+            // global flag before this partition's queued InitiateShutdown()
+            // ran, we still report CHECKOUT_SHUTTING_DOWN deterministically
+            // instead of CHECKOUT_CONNECT_FAILED/TIMEOUT (matches the
+            // error-callback path).
+            int code = 0;
+            bool should_notify = raw_conn->IsConnecting();
+            if (should_notify) {
                 if (shutting_down_ ||
                     manager_shutting_down_.load(std::memory_order_acquire)) {
                     code = CHECKOUT_SHUTTING_DOWN;
@@ -618,9 +610,52 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
                 } else {
                     code = CHECKOUT_CONNECT_FAILED;
                 }
-                (*error_cb_copy)(code);
             }
+            // Clean up partition state BEFORE invoking the user callback.
+            // An embedder may tear down the pool/manager from error_cb,
+            // freeing this PoolPartition. Dispatcher/state access after the
+            // callback would then be UAF.
+            //
+            // Hoist error_cb_copy onto the stack FIRST: OnConnectionClosed
+            // calls ClearTransportCallbacks which nulls the SetCloseCb
+            // std::function holding this very lambda, destroying its
+            // captures while still executing. The stack copy keeps the
+            // target alive across the cleanup.
+            auto error_cb_local = should_notify
+                ? error_cb_copy
+                : std::shared_ptr<ErrorCallback>{};
             OnConnectionClosed(raw_conn);
+            if (error_cb_local) {
+                (*error_cb_local)(code);
+            }
+        });
+
+    // Wire error callback for EPOLLERR events (async reset, local error).
+    // Use the same timeout/shutdown distinction as the close callback.
+    conn_handler->SetErrorCb(
+        [this, raw_conn, error_cb_copy, timed_out]
+        (std::shared_ptr<ConnectionHandler>) {
+            // Same safe-ordering rationale as SetCloseCb above: snapshot
+            // notification state, hoist captures, clean up, invoke callback.
+            int code = 0;
+            bool should_notify = raw_conn->IsConnecting();
+            if (should_notify) {
+                if (shutting_down_ ||
+                    manager_shutting_down_.load(std::memory_order_acquire)) {
+                    code = CHECKOUT_SHUTTING_DOWN;
+                } else if (*timed_out) {
+                    code = CHECKOUT_CONNECT_TIMEOUT;
+                } else {
+                    code = CHECKOUT_CONNECT_FAILED;
+                }
+            }
+            auto error_cb_local = should_notify
+                ? error_cb_copy
+                : std::shared_ptr<ErrorCallback>{};
+            OnConnectionClosed(raw_conn);
+            if (error_cb_local) {
+                (*error_cb_local)(code);
+            }
         });
 
     // Wire message callback for TLS handshake completion

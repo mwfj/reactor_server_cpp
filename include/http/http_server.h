@@ -86,8 +86,20 @@ public:
 
     // Access the upstream pool manager for proxy handlers.
     // Returns nullptr if no upstreams configured, not started, or stopped.
+    // Reachable while ready OR during the graceful shutdown drain window.
+    // Stop() clears server_ready_ immediately but defers
+    // UpstreamManager::InitiateShutdown() until after H2/WS/H1 protocol
+    // drain completes. During that window, already-accepted proxy handlers
+    // must still be able to reach the pool to do their upstream calls, so
+    // we keep GetUpstreamManager() live while shutting_down_started_ is set.
+    // shutting_down_started_ is cleared at the end of Stop(), before
+    // ~HttpServer() destroys upstream_manager_, so the returned pointer
+    // remains valid as long as the getter is non-null.
     UpstreamManager* GetUpstreamManager() const {
-        if (!server_ready_.load(std::memory_order_acquire)) return nullptr;
+        if (!server_ready_.load(std::memory_order_acquire) &&
+            !shutting_down_started_.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
         return upstream_manager_.get();
     }
 
