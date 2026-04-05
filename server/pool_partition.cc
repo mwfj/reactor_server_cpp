@@ -740,24 +740,42 @@ void PoolPartition::ServiceWaitQueue() {
 
 void PoolPartition::ScheduleWaitQueuePurge() {
     if (!dispatcher_ || shutting_down_) return;
-    // Capture alive_ by shared_ptr — survives partition destruction.
-    // All lambdas check *alive before touching `this`.
+    // Dedupe: one chain is enough even when many waiters are queued.
+    // Without this, every queued checkout spawns its own chain, burning
+    // CPU under saturation exactly when the pool is back-pressured.
+    if (purge_chain_active_) return;
+    purge_chain_active_ = true;
+
+    // Capture alive_ by weak_ptr — survives partition destruction.
     std::weak_ptr<bool> alive_weak = alive_;
     dispatcher_->EnQueue([this, alive_weak]() {
         auto alive = alive_weak.lock();
-        if (!alive || !*alive || shutting_down_) return;
-        PurgeExpiredWaitEntries();
-        if (!wait_queue_.empty() && !shutting_down_ && dispatcher_) {
-            std::weak_ptr<bool> inner_alive = alive_;
-            dispatcher_->EnQueueDeferred([this, inner_alive]() {
-                auto alive2 = inner_alive.lock();
-                if (!alive2 || !*alive2 || shutting_down_) return;
-                PurgeExpiredWaitEntries();
-                if (!wait_queue_.empty() && !shutting_down_) {
-                    ScheduleWaitQueuePurge();
-                }
-            });
+        if (!alive || !*alive || shutting_down_) {
+            if (alive && *alive) purge_chain_active_ = false;
+            return;
         }
+        PurgeExpiredWaitEntries();
+        if (wait_queue_.empty() || shutting_down_ || !dispatcher_) {
+            purge_chain_active_ = false;
+            return;
+        }
+        std::weak_ptr<bool> inner_alive = alive_;
+        dispatcher_->EnQueueDeferred([this, inner_alive]() {
+            auto alive2 = inner_alive.lock();
+            if (!alive2 || !*alive2 || shutting_down_) {
+                if (alive2 && *alive2) purge_chain_active_ = false;
+                return;
+            }
+            PurgeExpiredWaitEntries();
+            if (wait_queue_.empty() || shutting_down_) {
+                purge_chain_active_ = false;
+                return;
+            }
+            // Clear the flag before rescheduling so the next call can
+            // set it again — the chain continues as a single logical unit.
+            purge_chain_active_ = false;
+            ScheduleWaitQueuePurge();
+        });
     });
 }
 

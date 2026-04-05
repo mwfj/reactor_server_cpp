@@ -111,6 +111,11 @@ private:
     // Shared flag cleared in destructor. Captured by deferred purge tasks
     // to detect partition destruction and avoid use-after-free.
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
+
+    // True when a self-rescheduling wait-queue purge chain is already
+    // scheduled. Prevents spawning duplicate chains per queued waiter.
+    // Cleared when the chain terminates (queue empty or shutdown).
+    bool purge_chain_active_ = false;
     bool shutting_down_ = false;
 
     // Internal helpers

@@ -117,25 +117,36 @@ UpstreamManager::~UpstreamManager() {
         InitiateShutdown();
     }
 
-    // Wait for enqueued InitiateShutdown tasks to execute on each dispatcher.
-    // Without this, pools_ destruction frees PoolPartition objects while
-    // the enqueued lambdas still hold raw partition pointers → use-after-free.
-    // Use a per-dispatcher barrier: enqueue a no-op and wait for it to complete.
-    // If dispatchers are already stopped (production path), EnQueue is a no-op.
+    // Wait for enqueued InitiateShutdown tasks to execute on each live
+    // dispatcher. Without this, pools_ destruction frees PoolPartition
+    // objects while the enqueued lambdas still hold raw partition pointers.
+    //
+    // In production (HttpServer::Stop), dispatchers are already stopped by
+    // net_server_.Stop() before this destructor runs — EnQueue is a no-op
+    // and no barrier is needed. Only standalone usage with live dispatchers
+    // requires the barrier.
     {
-        auto barrier = std::make_shared<std::atomic<int>>(
-            static_cast<int>(dispatchers_.size()));
-        auto done = std::make_shared<std::promise<void>>();
-        auto fut = done->get_future();
+        std::vector<std::shared_ptr<Dispatcher>> live_dispatchers;
         for (auto& disp : dispatchers_) {
-            disp->EnQueue([barrier, done]() {
-                if (barrier->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    done->set_value();
-                }
-            });
+            if (disp && !disp->was_stopped()) {
+                live_dispatchers.push_back(disp);
+            }
         }
-        // Wait with timeout — dispatchers may be stopped already
-        fut.wait_for(std::chrono::milliseconds(500));
+        if (!live_dispatchers.empty()) {
+            auto barrier = std::make_shared<std::atomic<int>>(
+                static_cast<int>(live_dispatchers.size()));
+            auto done = std::make_shared<std::promise<void>>();
+            auto fut = done->get_future();
+            for (auto& disp : live_dispatchers) {
+                disp->EnQueue([barrier, done]() {
+                    if (barrier->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        done->set_value();
+                    }
+                });
+            }
+            // Bounded wait — even live dispatchers may stop mid-wait
+            fut.wait_for(std::chrono::milliseconds(500));
+        }
     }
 
     // Brief drain for outstanding connections
