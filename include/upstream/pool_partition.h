@@ -65,7 +65,13 @@ public:
     void ScheduleInitiateShutdown();
 
     // Force-close all active connections. Called after drain timeout.
+    // Must run on the partition's dispatcher thread.
     void ForceCloseActive();
+
+    // Cross-thread safe variant: enqueues ForceCloseActive on the owning
+    // dispatcher, tracked by inflight_tasks_ so ~PoolPartition blocks on
+    // completion. Same pattern as ScheduleInitiateShutdown.
+    void ScheduleForceCloseActive();
 
     bool IsShuttingDown() const { return shutting_down_; }
 

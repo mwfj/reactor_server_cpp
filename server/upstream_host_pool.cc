@@ -23,27 +23,44 @@ UpstreamHostPool::UpstreamHostPool(
     size_t num_dispatchers = dispatchers.size();
     partitions_.reserve(num_dispatchers);
 
+    // Guard against negative limits from direct API callers that bypass
+    // ConfigLoader::Validate. The static_cast<size_t> below would wrap
+    // -1 to SIZE_MAX, silently disabling pool bounds.
+    if (config.max_connections < 0) {
+        throw std::invalid_argument(
+            "upstream '" + service_name + "': pool.max_connections (" +
+            std::to_string(config.max_connections) + ") must not be negative");
+    }
+    if (config.max_idle_connections < 0) {
+        throw std::invalid_argument(
+            "upstream '" + service_name + "': pool.max_idle_connections (" +
+            std::to_string(config.max_idle_connections) + ") must not be negative");
+    }
+
     // Distribute limits across partitions using floor division + remainder.
     // The first R partitions get floor+1, the rest get floor. This ensures
     // the aggregate never exceeds the configured global cap.
     // Example: max_connections=5 over 4 dispatchers → [2, 1, 1, 1] (sum=5).
     size_t total_conn = static_cast<size_t>(config.max_connections);
     size_t total_idle = static_cast<size_t>(config.max_idle_connections);
+
+    // Every partition needs at least 1 connection. If the configured cap is
+    // below the dispatcher count (common when using the default 64 on a
+    // >64-core host with auto-detect workers), inflate to num_dispatchers
+    // and log a warning. Throwing here would break valid default configs
+    // on larger machines.
+    if (num_dispatchers > 0 && total_conn < num_dispatchers) {
+        logging::Get()->warn(
+            "upstream '{}': pool.max_connections ({}) < worker_threads ({}), "
+            "auto-inflating to {} so every dispatcher partition gets at least 1",
+            service_name, total_conn, num_dispatchers, num_dispatchers);
+        total_conn = num_dispatchers;
+    }
+
     size_t conn_floor = (num_dispatchers > 0) ? total_conn / num_dispatchers : total_conn;
     size_t conn_remainder = (num_dispatchers > 0) ? total_conn % num_dispatchers : 0;
     size_t idle_floor = (num_dispatchers > 0) ? total_idle / num_dispatchers : total_idle;
     size_t idle_remainder = (num_dispatchers > 0) ? total_idle % num_dispatchers : 0;
-
-    // max_connections must be >= num_dispatchers so every partition gets at
-    // least 1. Zero-capacity partitions would silently fail all checkouts on
-    // that dispatcher (dispatcher-affine, no cross-partition fallback).
-    // Inflating 0→1 would violate the operator's configured cap.
-    if (total_conn < num_dispatchers) {
-        throw std::invalid_argument(
-            "upstream '" + service_name + "': pool.max_connections (" +
-            std::to_string(config.max_connections) + ") must be >= worker_threads (" +
-            std::to_string(num_dispatchers) + ")");
-    }
 
     for (size_t i = 0; i < num_dispatchers; ++i) {
         UpstreamPoolConfig partition_config = config;

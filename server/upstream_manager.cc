@@ -238,16 +238,16 @@ bool UpstreamManager::AllDrained() const {
 
 void UpstreamManager::ForceCloseRemaining() {
     logging::Get()->warn("Force-closing remaining upstream connections");
-    // InitiateShutdown() was already called for all partitions. Active connections
-    // that weren't returned before the drain timeout are still alive. Force-close
-    // them by enqueuing ForceCloseActive() on each partition's dispatcher thread.
+    // Route through ScheduleForceCloseActive so the enqueue is tracked by
+    // the partition's inflight_tasks_ counter. Without this, the raw
+    // partition* capture can outlive ~UpstreamManager in standalone usage
+    // and dereference freed memory — the same race ScheduleInitiateShutdown
+    // was introduced to close.
     for (auto& [name, pool] : pools_) {
         for (size_t i = 0; i < pool->partition_count(); ++i) {
             auto* partition = pool->GetPartition(i);
             if (partition) {
-                dispatchers_[i]->EnQueue([partition]() {
-                    partition->ForceCloseActive();
-                });
+                partition->ScheduleForceCloseActive();
             }
         }
     }

@@ -421,6 +421,28 @@ void PoolPartition::ScheduleInitiateShutdown() {
     });
 }
 
+void PoolPartition::ScheduleForceCloseActive() {
+    if (!dispatcher_) {
+        ForceCloseActive();
+        return;
+    }
+    if (dispatcher_->is_dispatcher_thread()) {
+        ForceCloseActive();
+        return;
+    }
+    if (dispatcher_->was_stopped()) {
+        ForceCloseActive();
+        return;
+    }
+    auto guard = MakeInflightGuard();
+    std::weak_ptr<std::atomic<bool>> alive_weak = alive_;
+    dispatcher_->EnQueue([this, alive_weak, guard]() {
+        auto alive = alive_weak.lock();
+        if (!alive || !alive->load(std::memory_order_acquire)) return;
+        ForceCloseActive();
+    });
+}
+
 void PoolPartition::InitiateShutdown() {
     // Hoist alive_ onto the stack — ForceClose on connecting sockets fires
     // the close callback which invokes the waiter's user error_callback,
