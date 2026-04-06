@@ -41,20 +41,24 @@ UpstreamHostPool::UpstreamHostPool(
     // The first R partitions get floor+1, the rest get floor. This ensures
     // the aggregate never exceeds the configured global cap.
     // Example: max_connections=5 over 4 dispatchers → [2, 1, 1, 1] (sum=5).
+    //
+    // When max_connections < num_dispatchers (e.g. default 64 on a 96-core
+    // host), some partitions get 0 capacity. Requests dispatched to those
+    // partitions queue and time out — a degraded but correct behavior that
+    // respects the operator's configured backpressure limit. Silently
+    // inflating the cap would defeat that limit and risk overloading the
+    // upstream backend. A warning surfaces the mismatch so operators can
+    // increase pool.max_connections if needed.
     size_t total_conn = static_cast<size_t>(config.max_connections);
     size_t total_idle = static_cast<size_t>(config.max_idle_connections);
 
-    // Every partition needs at least 1 connection. If the configured cap is
-    // below the dispatcher count (common when using the default 64 on a
-    // >64-core host with auto-detect workers), inflate to num_dispatchers
-    // and log a warning. Throwing here would break valid default configs
-    // on larger machines.
     if (num_dispatchers > 0 && total_conn < num_dispatchers) {
         logging::Get()->warn(
-            "upstream '{}': pool.max_connections ({}) < worker_threads ({}), "
-            "auto-inflating to {} so every dispatcher partition gets at least 1",
-            service_name, total_conn, num_dispatchers, num_dispatchers);
-        total_conn = num_dispatchers;
+            "upstream '{}': pool.max_connections ({}) < worker_threads ({}); "
+            "{} dispatcher partition(s) will have zero capacity — increase "
+            "pool.max_connections to at least {} for full coverage",
+            service_name, total_conn, num_dispatchers,
+            num_dispatchers - total_conn, num_dispatchers);
     }
 
     size_t conn_floor = (num_dispatchers > 0) ? total_conn / num_dispatchers : total_conn;
