@@ -1001,22 +1001,25 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
 
                 std::weak_ptr<HttpConnectionHandler> weak_self = self;
                 auto active_counter = active_requests_;
-                // One-shot guard: if the handler stores complete() and
-                // then throws, RequestGuard decrements during unwind and
-                // the stored callback could fire later → double decrement.
-                // The catch block marks completed so the callback is a no-op.
+                // Two guards for the complete-then-throw edge case:
+                //   completed: one-shot entry — prevents duplicate callback
+                //              invocations (handler calls complete twice).
+                //   cancelled: set by the catch block — prevents the INNER
+                //              RunOnDispatcher lambda from running after the
+                //              outer catch already sent a 500. Without this,
+                //              a handler that calls complete() synchronously
+                //              and then throws would double-finish: the
+                //              enqueued lambda runs CompleteAsyncResponse +
+                //              decrements, and the guard also decrements.
                 auto completed = std::make_shared<std::atomic<bool>>(false);
+                auto cancelled = std::make_shared<std::atomic<bool>>(false);
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, active_counter,
-                     mw_headers, completed](HttpResponse final_resp) {
+                     mw_headers, completed, cancelled](HttpResponse final_resp) {
                         if (completed->exchange(true)) return;
-                        // Merge middleware + handler headers with correct
-                        // sync-route ordering: middleware first, handler
-                        // second. HttpResponse::Header() replaces non-
-                        // repeatable headers (handler wins) and appends
-                        // repeatable ones (middleware appears before handler,
-                        // matching the sync path where middleware runs first
-                        // on the same HttpResponse object).
+                        // Merge middleware + handler headers: middleware
+                        // first (base), handler second (overrides for
+                        // non-repeatable, appends for repeatable).
                         HttpResponse merged;
                         merged.Status(final_resp.GetStatusCode());
                         merged.Body(final_resp.GetBody());
@@ -1038,7 +1041,9 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         }
                         auto shared_resp = std::make_shared<HttpResponse>(
                             std::move(merged));
-                        conn->RunOnDispatcher([s, shared_resp, active_counter]() {
+                        conn->RunOnDispatcher(
+                            [s, shared_resp, active_counter, cancelled]() {
+                            if (cancelled->load(std::memory_order_acquire)) return;
                             s->CompleteAsyncResponse(std::move(*shared_resp));
                             active_counter->fetch_sub(1, std::memory_order_relaxed);
                         });
@@ -1061,10 +1066,13 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         async_handler(request, std::move(complete));
                     }
                 } catch (...) {
-                    // Mark completed so a stored callback can't double-
-                    // finish, then clear deferred state so the outer
-                    // catch's 500 + CloseConnection works normally.
+                    // Mark both flags: completed stops a stored callback
+                    // from re-entering; cancelled stops any already-queued
+                    // RunOnDispatcher lambda from running (handles the
+                    // complete-then-throw case). CancelAsyncResponse clears
+                    // deferred state so the outer catch's 500 + close works.
                     completed->store(true, std::memory_order_relaxed);
+                    cancelled->store(true, std::memory_order_release);
                     self->CancelAsyncResponse();
                     throw;  // outer catch sends 500 + closes
                 }
@@ -1678,9 +1686,10 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 // decrement of active_requests_. The catch path below
                 // marks `completed` so the callback becomes a no-op.
                 auto completed = std::make_shared<std::atomic<bool>>(false);
+                auto cancelled = std::make_shared<std::atomic<bool>>(false);
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, stream_id, active_counter,
-                     mw_headers, completed](HttpResponse final_resp) {
+                     mw_headers, completed, cancelled](HttpResponse final_resp) {
                         if (completed->exchange(true)) return;
                         // Same merge as H1: middleware first, handler second.
                         HttpResponse merged;
@@ -1704,15 +1713,14 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         }
                         auto shared_resp = std::make_shared<HttpResponse>(
                             std::move(merged));
-                        conn->RunOnDispatcher([s, stream_id, shared_resp, active_counter]() {
+                        conn->RunOnDispatcher(
+                            [s, stream_id, shared_resp, active_counter, cancelled]() {
+                            if (cancelled->load(std::memory_order_acquire)) return;
                             s->SubmitStreamResponse(stream_id, *shared_resp);
                             active_counter->fetch_sub(1, std::memory_order_relaxed);
                         });
                     };
 
-                // Same pattern as H1: don't release guard until the
-                // handler returns without throwing. The catch marks
-                // `completed` so a stored callback can't double-submit.
                 try {
                     if (async_head_fallback) {
                         HttpRequest get_req = request;
@@ -1722,9 +1730,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         async_handler(request, std::move(complete));
                     }
                 } catch (...) {
-                    // Mark completed so the stored callback (if any) is
-                    // a no-op — the outer catch will send the 500 response.
                     completed->store(true, std::memory_order_relaxed);
+                    cancelled->store(true, std::memory_order_release);
                     throw;
                 }
                 guard.release();
