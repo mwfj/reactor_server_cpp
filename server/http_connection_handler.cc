@@ -8,6 +8,14 @@ namespace {
 // request-line, headers, and framing bytes that may accumulate while an
 // async response is pending on a pipelined keep-alive connection.
 constexpr size_t DEFERRED_STASH_OVERHEAD = 8192;
+// Fallback cap when one or both request-size axes is 0 ("unlimited").
+// The sync parser only buffers one request body at a time, so unlimited
+// body size doesn't cause OOM there. But the deferred stash accumulates
+// raw bytes from ALL pipelined requests across read cycles without
+// parsing. A generous-but-finite safety valve prevents OOM while still
+// accepting large uploads (the parser enforces the real per-request
+// limits when it processes the buffered bytes after the async response).
+constexpr size_t DEFERRED_STASH_FALLBACK_CAP = 64 * 1024 * 1024;  // 64 MiB
 }  // namespace
 
 HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn)
@@ -128,22 +136,16 @@ void HttpConnectionHandler::StashDeferredBytes(const std::string& data) {
     // Bound memory while an async response is pending so a client
     // pipelining bytes behind a deferred response can't OOM us.
     //
-    // Cap only when BOTH max_body_size_ AND max_header_size_ are non-zero.
-    // If either is 0 ("unlimited"), a single valid request on that axis
-    // can be arbitrarily large — any finite cap would force-close requests
-    // the synchronous parser accepts (e.g. a 64 KiB upload with
-    // max_body_size=0 and max_header_size=8192). Operators who set 0
-    // explicitly accept the corresponding memory risk; the sync parser
-    // handles that identically.
-    //
-    // When both are finite, allow several pipelined requests: the base
-    // budget is one request (body + header), but the stash can hold
-    // multiple valid requests queued behind the front async response.
-    // Without a multiplier, two individually-valid 600 KiB POSTs
-    // (default 1 MiB body limit) would exceed cap and ForceClose before
-    // parsing resumes.
+    // When both limits are set: cap = (body + header) * pipeline_depth.
+    // When one or both is 0 ("unlimited"): use a generous fallback cap.
+    // The sync parser only buffers one request body at a time so unlimited
+    // body size doesn't cause OOM there, but the deferred stash accumulates
+    // raw bytes from ALL pipelined requests across read cycles without
+    // parsing. The fallback safety valve prevents OOM while still accepting
+    // the vast majority of legitimate uploads; the parser enforces the
+    // real per-request limits when it processes the buffered bytes.
     static constexpr size_t PIPELINE_DEPTH = 4;
-    size_t cap = 0;
+    size_t cap;
     if (max_body_size_ > 0 && max_header_size_ > 0) {
         size_t one_request = max_body_size_ + max_header_size_;
         if (one_request < max_body_size_) {
@@ -156,9 +158,11 @@ void HttpConnectionHandler::StashDeferredBytes(const std::string& data) {
         if (cap <= SIZE_MAX - DEFERRED_STASH_OVERHEAD) {
             cap += DEFERRED_STASH_OVERHEAD;
         }
+    } else {
+        // One or both axes unlimited — use the fallback safety valve.
+        cap = DEFERRED_STASH_FALLBACK_CAP;
     }
-    if (cap > 0 &&
-        deferred_pending_buf_.size() + data.size() > cap) {
+    if (deferred_pending_buf_.size() + data.size() > cap) {
         logging::Get()->warn(
             "Deferred pipeline buffer cap exceeded fd={} ({} + {} > {}), "
             "force-closing connection",

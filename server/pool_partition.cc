@@ -169,9 +169,14 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
         return;
     }
 
+    // Hoist alive_ — PurgeExpiredWaitEntries may fire a waiter's error_cb
+    // that tears down the pool/manager, destroying this partition.
+    auto alive = alive_;
+
     // Purge expired wait queue entries inline — ensures queue timeouts
     // fire even without external EvictExpired calls (standalone usage).
     PurgeExpiredWaitEntries();
+    if (!alive->load(std::memory_order_acquire)) return;
 
     if (shutting_down_) {
         error_cb(CHECKOUT_SHUTTING_DOWN);
@@ -353,6 +358,10 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
 }
 
 void PoolPartition::EvictExpired() {
+    // Hoist alive_ — PurgeExpiredWaitEntries/ServiceWaitQueue can fire user
+    // callbacks that tear down the pool/manager.
+    auto alive_local = alive_;
+
     // Evict expired idle connections from back (LRU)
     auto now = std::chrono::steady_clock::now();
 
@@ -383,6 +392,7 @@ void PoolPartition::EvictExpired() {
     }
 
     PurgeExpiredWaitEntries();
+    if (!alive_local->load(std::memory_order_acquire)) return;
 
     // Eviction freed capacity — retry queued checkouts.
     ServiceWaitQueue();
@@ -990,6 +1000,7 @@ void PoolPartition::ScheduleWaitQueuePurge() {
             return;
         }
         PurgeExpiredWaitEntries();
+        if (!alive->load(std::memory_order_acquire)) return;
         if (wait_queue_.empty() || shutting_down_ || !dispatcher_) {
             purge_chain_active_ = false;
             return;
@@ -1013,6 +1024,7 @@ void PoolPartition::ScheduleWaitQueuePurge() {
                 return;
             }
             PurgeExpiredWaitEntries();
+            if (!alive2->load(std::memory_order_acquire)) return;
             if (wait_queue_.empty() || shutting_down_) {
                 purge_chain_active_ = false;
                 return;
