@@ -1004,18 +1004,33 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, active_counter,
                      mw_headers](HttpResponse final_resp) {
-                        // Unconditionally add every middleware header. The
-                        // previous "skip if present" check used raw string
-                        // equality, which broke case-insensitive matching
-                        // and dropped repeatable headers like Set-Cookie or
-                        // WWW-Authenticate when the user also set one.
-                        // Unconditional add preserves all middleware headers
-                        // alongside the user's. For non-repeatable headers,
-                        // HTTP parsers typically use the last value, and
-                        // the user's headers (already in final_resp) appear
-                        // before these appended middleware headers.
+                        // Merge middleware headers into the async response,
+                        // matching sync-route semantics: handler wins for
+                        // non-repeatable headers (Content-Type, Cache-Control,
+                        // Location), both coexist for repeatable headers
+                        // (Set-Cookie, WWW-Authenticate). HttpResponse::Header()
+                        // replaces non-repeatable headers case-insensitively,
+                        // so we must skip those the handler already set.
                         for (const auto& mh : mw_headers) {
-                            final_resp.Header(mh.first, mh.second);
+                            std::string lower = mh.first;
+                            std::transform(lower.begin(), lower.end(), lower.begin(),
+                                           [](unsigned char c){ return std::tolower(c); });
+                            bool repeatable = (lower == "set-cookie" ||
+                                               lower == "www-authenticate");
+                            if (repeatable) {
+                                final_resp.Header(mh.first, mh.second);
+                            } else {
+                                bool handler_set = false;
+                                for (const auto& fh : final_resp.GetHeaders()) {
+                                    std::string fl = fh.first;
+                                    std::transform(fl.begin(), fl.end(), fl.begin(),
+                                                   [](unsigned char c){ return std::tolower(c); });
+                                    if (fl == lower) { handler_set = true; break; }
+                                }
+                                if (!handler_set) {
+                                    final_resp.Header(mh.first, mh.second);
+                                }
+                            }
                         }
                         auto s = weak_self.lock();
                         if (!s) {
@@ -1658,11 +1673,38 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 auto mw_headers = response.GetHeaders();
                 std::weak_ptr<Http2ConnectionHandler> weak_self = self;
                 auto active_counter = active_requests_;
+                // Guard against double-submit: if the handler stores the
+                // callback and then throws, the outer catch in OnRequest
+                // synthesizes a 500 on the same stream. Without this flag,
+                // the stored callback fires later → double submit + double
+                // decrement of active_requests_. The catch path below
+                // marks `completed` so the callback becomes a no-op.
+                auto completed = std::make_shared<std::atomic<bool>>(false);
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, stream_id, active_counter,
-                     mw_headers](HttpResponse final_resp) {
+                     mw_headers, completed](HttpResponse final_resp) {
+                        if (completed->exchange(true)) return;
+                        // Same merge logic as H1: handler wins for non-repeatable.
                         for (const auto& mh : mw_headers) {
-                            final_resp.Header(mh.first, mh.second);
+                            std::string lower = mh.first;
+                            std::transform(lower.begin(), lower.end(), lower.begin(),
+                                           [](unsigned char c){ return std::tolower(c); });
+                            bool repeatable = (lower == "set-cookie" ||
+                                               lower == "www-authenticate");
+                            if (repeatable) {
+                                final_resp.Header(mh.first, mh.second);
+                            } else {
+                                bool handler_set = false;
+                                for (const auto& fh : final_resp.GetHeaders()) {
+                                    std::string fl = fh.first;
+                                    std::transform(fl.begin(), fl.end(), fl.begin(),
+                                                   [](unsigned char c){ return std::tolower(c); });
+                                    if (fl == lower) { handler_set = true; break; }
+                                }
+                                if (!handler_set) {
+                                    final_resp.Header(mh.first, mh.second);
+                                }
+                            }
                         }
                         auto s = weak_self.lock();
                         if (!s) {
@@ -1683,14 +1725,21 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     };
 
                 // Same pattern as H1: don't release guard until the
-                // handler returns without throwing. Exceptions propagate
-                // to Http2Session::OnRequest's outer try/catch.
-                if (async_head_fallback) {
-                    HttpRequest get_req = request;
-                    get_req.method = "GET";
-                    async_handler(get_req, std::move(complete));
-                } else {
-                    async_handler(request, std::move(complete));
+                // handler returns without throwing. The catch marks
+                // `completed` so a stored callback can't double-submit.
+                try {
+                    if (async_head_fallback) {
+                        HttpRequest get_req = request;
+                        get_req.method = "GET";
+                        async_handler(get_req, std::move(complete));
+                    } else {
+                        async_handler(request, std::move(complete));
+                    }
+                } catch (...) {
+                    // Mark completed so the stored callback (if any) is
+                    // a no-op — the outer catch will send the 500 response.
+                    completed->store(true, std::memory_order_relaxed);
+                    throw;
                 }
                 guard.release();
                 return;
