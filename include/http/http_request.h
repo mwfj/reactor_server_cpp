@@ -22,6 +22,11 @@ struct HttpRequest {
     // Mutable because routing is an output of dispatch, not parser input.
     mutable std::unordered_map<std::string, std::string> params;
 
+    // Index of the dispatcher (event loop) handling this request's connection.
+    // Set by the connection handler; used for upstream pool partition affinity.
+    // Mutable because it's set at dispatch time, not parser time.
+    mutable int dispatcher_index = -1;
+
     // Case-insensitive header lookup
     std::string GetHeader(const std::string& name) const {
         std::string lower = name;
@@ -52,5 +57,6 @@ struct HttpRequest {
         headers_complete = false;
         complete = false;
         params.clear();
+        dispatcher_index = -1;
     }
 };

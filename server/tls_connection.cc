@@ -1,4 +1,6 @@
 #include "tls/tls_connection.h"
+#include "tls/tls_client_context.h"
+#include "log/logger.h"
 #include <openssl/err.h>
 
 TlsConnection::TlsConnection(TlsContext& ctx, int fd) {
@@ -16,6 +18,43 @@ TlsConnection::TlsConnection(TlsContext& ctx, int fd) {
     // Allow retrying SSL_write with a different buffer address.
     // Our output_bf_ can reallocate between the original write and the retry.
     SSL_set_mode(ssl_, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_ENABLE_PARTIAL_WRITE);
+}
+
+TlsConnection::TlsConnection(TlsClientContext& ctx, int fd, const std::string& sni_hostname) {
+    ssl_ = SSL_new(ctx.GetCtx());
+    if (!ssl_) {
+        throw std::runtime_error("Failed to create client SSL object");
+    }
+    if (SSL_set_fd(ssl_, fd) != 1) {
+        SSL_free(ssl_);
+        ssl_ = nullptr;
+        throw std::runtime_error("Failed to set client SSL file descriptor");
+    }
+    SSL_set_connect_state(ssl_);  // Client-side
+
+    // Set SNI hostname for virtual hosting — server uses this to select certificate
+    if (!sni_hostname.empty()) {
+        if (SSL_set_tlsext_host_name(ssl_, sni_hostname.c_str()) != 1) {
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+            throw std::runtime_error("Failed to set SNI hostname: " + sni_hostname);
+        }
+        // Enable hostname verification — SSL_VERIFY_PEER (set on the CTX) validates
+        // chain trust, but SSL_set1_host() is required to verify the certificate's
+        // CN/SAN matches the expected hostname, preventing MITM attacks.
+        if (SSL_set1_host(ssl_, sni_hostname.c_str()) != 1) {
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+            throw std::runtime_error(
+                "Failed to enable hostname verification for: " + sni_hostname);
+        }
+        logging::Get()->debug("TlsConnection client: SNI + hostname verification set to {}", sni_hostname);
+    }
+
+    // Allow retrying SSL_write with a different buffer address (same as server mode)
+    SSL_set_mode(ssl_, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_ENABLE_PARTIAL_WRITE);
+
+    logging::Get()->debug("TlsConnection client: created fd={}", fd);
 }
 
 TlsConnection::~TlsConnection() {
@@ -51,6 +90,17 @@ int TlsConnection::Read(char* buf, size_t len) {
     if (err == SSL_ERROR_WANT_READ) return TLS_COMPLETE;      // Need more read data
     if (err == SSL_ERROR_WANT_WRITE) return TLS_CROSS_RW;     // Need write readiness (renegotiation)
     if (err == SSL_ERROR_ZERO_RETURN) return TLS_PEER_CLOSED;  // Peer closed cleanly
+    return TLS_ERROR;
+}
+
+int TlsConnection::Peek(char* buf, size_t len) {
+    int ret = SSL_peek(ssl_, buf, static_cast<int>(len));
+    if (ret > 0) return ret;  // Application data is buffered
+
+    int err = SSL_get_error(ssl_, ret);
+    if (err == SSL_ERROR_WANT_READ) return TLS_COMPLETE;       // No app data (benign record consumed)
+    if (err == SSL_ERROR_WANT_WRITE) return TLS_COMPLETE;      // Benign: TLS needs to send (e.g., KeyUpdate ack)
+    if (err == SSL_ERROR_ZERO_RETURN) return TLS_PEER_CLOSED;  // close_notify received
     return TLS_ERROR;
 }
 

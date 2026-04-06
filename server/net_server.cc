@@ -236,6 +236,13 @@ void NetServer::Stop(){
             std::lock_guard<std::mutex> dlck(draining_conns_mtx_);
             if (draining_conns_.count(conn.get())) continue;
         }
+        // Live check: a request that just entered an async handler (via
+        // HttpConnectionHandler::BeginAsyncResponse) flips this flag on
+        // the transport. A pre-sweep snapshot in HttpServer::Stop cannot
+        // close the race — this check races only against the single
+        // dispatcher thread that owns the connection, which is the only
+        // place BeginAsyncResponse runs.
+        if (conn->IsShutdownExempt()) continue;
         conn->CloseAfterWrite();
     }
     // Do NOT clear conns_to_close here. The shared_ptrs must keep

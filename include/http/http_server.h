@@ -16,6 +16,9 @@
 #include <set>
 #include <string>
 
+// Forward declaration for upstream pool
+class UpstreamManager;
+
 class HttpServer {
 public:
     // Snapshot of server runtime statistics. All values are approximate
@@ -44,7 +47,10 @@ public:
 
     ~HttpServer();
 
-    // Route registration (delegates to router)
+    // Route registration (delegates to router) — synchronous handlers.
+    // The framework serializes the response and closes out the request when
+    // the handler returns. Use the *Async variants for handlers that need
+    // to dispatch async work (e.g. upstream proxy) and send the response later.
     void Get(const std::string& path, HttpRouter::Handler handler);
     void Post(const std::string& path, HttpRouter::Handler handler);
     void Put(const std::string& path, HttpRouter::Handler handler);
@@ -52,6 +58,51 @@ public:
     void Route(const std::string& method, const std::string& path, HttpRouter::Handler handler);
     void WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler);
     void Use(HttpRouter::Middleware middleware);
+
+    // Route registration — asynchronous handlers.
+    //
+    // The handler receives the request plus a protocol-agnostic completion
+    // callback. Invoke `complete(final_response)` once when the async work
+    // finishes; the framework handles response delivery for both HTTP/1
+    // and HTTP/2 transparently. Typical pattern for an upstream proxy:
+    //
+    //   server.GetAsync("/proxy", [this](const HttpRequest& req, auto complete) {
+    //       upstream_->CheckoutAsync("svc", req.dispatcher_index,
+    //           [complete](UpstreamLease lease) {
+    //               // ... perform the upstream request ...
+    //               HttpResponse final;
+    //               final.Status(200).Text("...");
+    //               complete(std::move(final));
+    //           },
+    //           [complete](int /*err*/) {
+    //               HttpResponse e;
+    //               e.Status(502).Text("Bad Gateway");
+    //               complete(std::move(e));
+    //           });
+    //   });
+    //
+    // Framework guarantees while the async response is pending:
+    //   - Middleware (auth, CORS, rate limiting) has already run before the
+    //     handler is invoked; rejection responses never reach the handler.
+    //   - The connection is exempt from the graceful-shutdown close sweep
+    //     (HTTP/1) or tracked in the H2 stream drain (HTTP/2).
+    //   - HTTP/1 pipelined bytes arriving after the deferred request are
+    //     buffered and parsed only after complete() fires, preserving
+    //     response ordering.
+    //   - complete() applies HEAD body-stripping and Connection close /
+    //     keep-alive normalization automatically, using the original
+    //     request's metadata.
+    //
+    // Async routes take precedence over sync routes for the same
+    // method+path. The completion callback MUST be invoked on the
+    // dispatcher thread that owns the request connection; upstream pool
+    // callbacks naturally run on the right dispatcher.
+    void GetAsync(const std::string& path, HttpRouter::AsyncHandler handler);
+    void PostAsync(const std::string& path, HttpRouter::AsyncHandler handler);
+    void PutAsync(const std::string& path, HttpRouter::AsyncHandler handler);
+    void DeleteAsync(const std::string& path, HttpRouter::AsyncHandler handler);
+    void RouteAsync(const std::string& method, const std::string& path,
+                    HttpRouter::AsyncHandler handler);
 
     // Server lifecycle.
     // NOTE: Start/Stop is one-shot — after Stop(), the internal dispatchers
@@ -80,6 +131,25 @@ public:
 
     // Returns the actual port the server is listening on.
     int GetBoundPort() const;
+
+    // Access the upstream pool manager for proxy handlers.
+    // Returns nullptr if no upstreams configured, not started, or stopped.
+    // Reachable while ready OR during the graceful shutdown drain window.
+    // Stop() clears server_ready_ immediately but defers
+    // UpstreamManager::InitiateShutdown() until after H2/WS/H1 protocol
+    // drain completes. During that window, already-accepted proxy handlers
+    // must still be able to reach the pool to do their upstream calls, so
+    // we keep GetUpstreamManager() live while shutting_down_started_ is set.
+    // shutting_down_started_ is cleared at the end of Stop(), before
+    // ~HttpServer() destroys upstream_manager_, so the returned pointer
+    // remains valid as long as the getter is non-null.
+    UpstreamManager* GetUpstreamManager() const {
+        if (!server_ready_.load(std::memory_order_acquire) &&
+            !shutting_down_started_.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+        return upstream_manager_.get();
+    }
 
 private:
     NetServer net_server_;
@@ -155,7 +225,11 @@ private:
     std::atomic<int64_t> active_h2_streams_{0};
     std::atomic<int64_t> total_accepted_{0};
     std::atomic<int64_t> total_requests_{0};
-    std::atomic<int64_t> active_requests_{0};
+    // Heap-allocated so async completion callbacks that capture a shared_ptr
+    // copy keep the atomic alive past ~HttpServer. A late callback firing
+    // after shutdown would otherwise dereference a freed stack member.
+    std::shared_ptr<std::atomic<int64_t>> active_requests_ =
+        std::make_shared<std::atomic<int64_t>>(0);
 
     // Server start time for uptime calculation. Set by the ready callback
     // when the server actually starts accepting connections, not at construction.
@@ -194,4 +268,8 @@ private:
     // race path where HandleMessage runs before HandleNewConnection.
     bool DetectAndRouteProtocol(std::shared_ptr<ConnectionHandler> conn,
                                 std::string& message, bool already_counted);
+
+    // Upstream connection pool
+    std::vector<UpstreamConfig> upstream_configs_;
+    std::unique_ptr<UpstreamManager> upstream_manager_;
 };

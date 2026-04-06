@@ -50,6 +50,8 @@ private:
 
     // Manage the connection in a dispatcher(Eventloop)
     std::map<int, std::shared_ptr<ConnectionHandler>> connections_;
+
+    std::atomic<int> dispatcher_index_{-1};
 public:
     Dispatcher();
     Dispatcher(bool, int = 60, std::chrono::seconds = std::chrono::seconds(30));
@@ -70,6 +72,9 @@ public:
     }
     bool is_dispatcher_thread() const { return is_on_loop_thread(); }
     bool is_sock_dispatcher() const { return is_sock_dispatcher_.load(); }
+
+    void SetDispatcherIndex(int idx) { dispatcher_index_.store(idx, std::memory_order_release); }
+    int dispatcher_index() const { return dispatcher_index_.load(std::memory_order_acquire); }
 
     void UpdateChannel(std::shared_ptr<Channel>);
     void RemoveChannel(std::shared_ptr<Channel>);
@@ -99,6 +104,9 @@ public:
     // Update idle timeout duration at runtime. Must be called on the
     // dispatcher thread (via EnQueue) to avoid racing with TimerHandler.
     void SetTimeout(std::chrono::seconds timeout) { timeout_ = timeout; }
+
+    // Get the current timer scan interval (seconds).
+    int GetTimerInterval() const { return end_t_; }
 
     // Update timer scan interval at runtime and re-arm the timerfd so the
     // new cadence takes effect immediately (not deferred to the next fire).

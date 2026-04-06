@@ -46,6 +46,46 @@ int SocketHandler::CreateSocket() {
     return listenfd;
 }
 
+int SocketHandler::CreateClientSocket() {
+#if defined(__linux__)
+    int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd == -1) {
+        int saved_errno = errno;
+        logging::Get()->error("Failed to create client socket: {}", logging::SafeStrerror(saved_errno));
+        return -1;
+    }
+#else
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == -1) {
+        int saved_errno = errno;
+        logging::Get()->error("Failed to create client socket: {}", logging::SafeStrerror(saved_errno));
+        return -1;
+    }
+    // Set non-blocking
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        int saved_errno = errno;
+        logging::Get()->error("Failed to set client socket non-blocking: {}", logging::SafeStrerror(saved_errno));
+        ::close(fd);
+        return -1;
+    }
+    // Set close-on-exec
+    int fd_flags = fcntl(fd, F_GETFD);
+    if (fd_flags != -1) {
+        fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC);
+    }
+    // Suppress SIGPIPE per-socket on macOS (MSG_NOSIGNAL not available)
+#ifdef SO_NOSIGPIPE
+    int set = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set)) < 0) {
+        int saved_errno = errno;
+        logging::Get()->warn("Failed to set SO_NOSIGPIPE on client socket: {}", logging::SafeStrerror(saved_errno));
+    }
+#endif
+#endif
+    return fd;
+}
+
 void SocketHandler::Bind(const InetAddr& _servAddr){
     if(::bind(fd_, _servAddr.Addr(), sizeof(sockaddr_in)) < 0){
         int saved_errno = errno;  // Save errno before any other calls

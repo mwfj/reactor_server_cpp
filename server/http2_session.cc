@@ -810,6 +810,11 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
 
     const HttpRequest& req = stream->GetRequest();
 
+    // Propagate dispatcher index for upstream pool partition affinity
+    if (conn_) {
+        req.dispatcher_index = conn_->dispatcher_index();
+    }
+
     // RFC 9110 Section 8.6: If content-length is declared, the actual body
     // size must match. A mismatch means the message is malformed.
     if (req.content_length > 0 &&
@@ -840,6 +845,14 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
     } catch (const std::exception& e) {
         logging::Get()->error("Exception in HTTP/2 request handler: {}", e.what());
         response = HttpResponse::InternalError();
+    }
+    // Async handler path: the framework has dispatched an async route and
+    // will submit the real response on this stream later via
+    // Http2ConnectionHandler::SubmitStreamResponse. Skipping here leaves the
+    // stream open; the H2 graceful-shutdown drain already waits on open
+    // streams, so in-flight async work is naturally protected.
+    if (response.IsDeferred()) {
+        return;
     }
     SubmitResponse(stream_id, response);
 }

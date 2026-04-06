@@ -49,6 +49,75 @@ void ConnectionHandler::RegisterCallbacks(){
     client_channel_ -> EnableReadMode();
 }
 
+void ConnectionHandler::RegisterOutboundCallbacks(){
+    // Use weak_ptr to avoid keeping ConnectionHandler alive via callbacks
+    std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
+
+    client_channel_ -> SetReadCallBackFn([weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->OnMessage();
+        }
+    });
+
+    client_channel_ -> SetCloseCallBackFn([weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->CallCloseCb();
+        }
+    });
+
+    client_channel_ -> SetErrorCallBackFn([weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->CallErroCb();
+        }
+    });
+
+    client_channel_ -> SetWriteCallBackFn([weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->CallWriteCb();
+        }
+    });
+
+    connect_state_ = ConnectState::CONNECTING;
+    client_channel_ -> EnableETMode();
+    // Enable ONLY write mode — EPOLLOUT fires when connect() completes.
+    // Read mode is enabled later in CallWriteCb after connect succeeds.
+    client_channel_ -> EnableWriteMode();
+}
+
+int ConnectionHandler::FinishConnect(){
+    int err = 0;
+    socklen_t len = sizeof(err);
+    int ret;
+    do {
+        ret = ::getsockopt(fd(), SOL_SOCKET, SO_ERROR, &err, &len);
+    } while (ret == -1 && errno == EINTR);
+    if (ret < 0) {
+        logging::Get()->warn("getsockopt(SO_ERROR) failed fd={}: {} (errno={})",
+                             fd(), logging::SafeStrerror(errno), errno);
+        return SocketHandler::CONNECT_ERROR;
+    }
+    if (err != 0) {
+        logging::Get()->warn("Outbound connect SO_ERROR fd={}: {} (errno={})",
+                             fd(), logging::SafeStrerror(err), err);
+        return SocketHandler::CONNECT_ERROR;
+    }
+    return SocketHandler::CONNECT_SUCCESS;
+}
+
+void ConnectionHandler::SetConnectCompleteCallback(ConnectCompleteCallback cb) {
+    connect_complete_callback_ = std::move(cb);
+}
+
+int ConnectionHandler::TlsPeek(char* buf, size_t len) {
+    if (tls_state_ != TlsState::READY || !tls_) {
+        return TlsConnection::TLS_ERROR;
+    }
+    return tls_->Peek(buf, len);
+}
+
+int ConnectionHandler::dispatcher_index() const {
+    return event_dispatcher_ ? event_dispatcher_->dispatcher_index() : -1;
+}
 
 void ConnectionHandler::OnMessage(){
     if(client_channel_ -> is_channel_closed()){
@@ -186,8 +255,14 @@ void ConnectionHandler::OnMessage(){
     // Also fire on TLS handshake completion without data ONLY when ALPN negotiated h2,
     // so the upper layer can send the server SETTINGS preface immediately.
     // For HTTP/1.x, skip the empty callback to avoid arming request timeout prematurely.
-    bool alpn_h2_ready = tls_just_ready && input_bf_.Size() == 0 &&
-                         tls_ && GetAlpnProtocol() == "h2";
+    // Fire on TLS handshake completion for h2 (to send SETTINGS preface) and
+    // for outbound connections (connect_state_ == CONNECTED) regardless of ALPN
+    // so the upstream pool's checkout completes for HTTP/1.1 upstreams too.
+    // Inbound connections always have connect_state_ == NONE, so this doesn't
+    // affect the server-side path.
+    bool alpn_h2_ready = tls_just_ready && input_bf_.Size() == 0 && tls_ &&
+                         (GetAlpnProtocol() == "h2" ||
+                          connect_state_ == ConnectState::CONNECTED);
     bool callback_ran = false;
     if((input_bf_.Size() > 0 || alpn_h2_ready) && callbacks_.on_message_callback){
         std::string message(input_bf_.Data(), input_bf_.Size());
@@ -426,6 +501,16 @@ void ConnectionHandler::CloseAfterWrite(){
         std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
         event_dispatcher_->EnQueue([weak_self]() {
             if (auto self = weak_self.lock()) {
+                // Re-check shutdown exemption here on the dispatcher
+                // thread: a request can enter its async handler (which
+                // flips shutdown_exempt_ in BeginAsyncResponse) between
+                // the stopper thread calling CloseAfterWrite() and this
+                // lambda running. Without this recheck, an exempt
+                // connection with an empty buffer would be force-closed
+                // under the deferred async response. The close_after_write_
+                // flag stays set so CompleteAsyncResponse sees shutdown
+                // in progress and forces Connection: close on its reply.
+                if (self->IsShutdownExempt()) return;
                 if (self->output_bf_.Size() > 0) {
                     self->client_channel_->EnableWriteMode();
                 } else {
@@ -435,7 +520,9 @@ void ConnectionHandler::CloseAfterWrite(){
         });
         return;
     }
-    // Dispatcher stopped — execute inline as last resort
+    // Dispatcher stopped — execute inline as last resort. Still honor the
+    // exemption flag so stop-from-handler paths can't race the sweep.
+    if (IsShutdownExempt()) return;
     if (output_bf_.Size() > 0) {
         client_channel_ -> EnableWriteMode();
     } else {
@@ -570,6 +657,60 @@ void ConnectionHandler::CallWriteCb(){
     // Check if channel is closed or write mode disabled (can happen during shutdown)
     if(!client_channel_ || client_channel_->is_channel_closed() || !client_channel_->isEnableWriteMode()) {
         return; // Silently ignore - channel is closing or already closed
+    }
+
+    // Outbound connect completion: the first EPOLLOUT after connect(EINPROGRESS)
+    // signals that the TCP handshake finished. Must be checked before any TLS
+    // or write logic — the socket isn't usable until connect succeeds.
+    if (connect_state_ == ConnectState::CONNECTING) {
+        // If close_after_write was set (e.g., deadline timeout fired in the
+        // same epoll batch), skip connect completion — the connection is
+        // already doomed. Fall through to the write/close logic below.
+        if (close_after_write_.load(std::memory_order_acquire)) {
+            // Do NOT change connect_state_ — leave it as CONNECTING so the
+            // close callback (which checks IsConnecting()) fires the error_cb
+            // with CHECKOUT_CONNECT_TIMEOUT / CHECKOUT_SHUTTING_DOWN.
+            // Changing to CONNECTED here would make the close callback skip
+            // the error delivery, leaving the caller hanging.
+            connect_complete_callback_ = nullptr;
+            // Fall through — the output-buffer-empty check below will
+            // see close_after_write_ and ForceClose.
+        } else {
+            int result = FinishConnect();
+            if (result == SocketHandler::CONNECT_SUCCESS) {
+                connect_state_ = ConnectState::CONNECTED;
+                client_channel_->EnableReadMode();
+                if (connect_complete_callback_) {
+                    // Move the callable onto the stack BEFORE invoking.
+                    // The pool's WirePoolCallbacks (called from inside this
+                    // callback on a successful checkout) does
+                    // SetConnectCompleteCallback(nullptr), which destroys
+                    // the std::function that's currently executing. The
+                    // local `cb` keeps the target alive until it returns,
+                    // and the move leaves the member empty (one-shot).
+                    auto cb = std::move(connect_complete_callback_);
+                    cb(shared_from_this());
+                }
+                // CRITICAL: If callback set tls_state_ = HANDSHAKE, fall through
+                // to the existing TLS handshake block. With ET mode, returning
+                // here would stall — no new EPOLLOUT fires on an already-writable
+                // socket.
+                if (tls_state_ == TlsState::HANDSHAKE) {
+                    // Fall through to existing TLS handshake handler below
+                } else if (output_bf_.Size() > 0) {
+                    // The connect-complete callback sent data. Fall through to
+                    // the write logic to flush it — returning would consume the
+                    // EPOLLOUT edge and stall the buffered request.
+                } else {
+                    client_channel_->DisableWriteMode();
+                    return;
+                }
+            } else {
+                logging::Get()->warn("Outbound connect failed fd={}", fd());
+                CallCloseCb();
+                return;
+            }
+        }
     }
 
     // If a previous SSL_read returned WANT_WRITE, the next writable event

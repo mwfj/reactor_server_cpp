@@ -199,6 +199,15 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
             session_->SendPendingFrames();
         }
         if (session_->ActiveStreamCount() == 0) {
+            // Flush deferred output BEFORE arming CloseAfterWrite.
+            // If the initial request's response or the GOAWAY write hit
+            // nghttp2's high-water mark, SendPendingFrames left deferred
+            // output queued. CloseAfterWrite suppresses OnSendComplete,
+            // so those deferred frames would never be resumed and the
+            // tail of a large first response would be silently dropped.
+            if (session_->HasDeferredOutput()) {
+                session_->ResumeOutput();
+            }
             conn_->CloseAfterWrite();
         }
     }
@@ -322,6 +331,25 @@ void Http2ConnectionHandler::RequestShutdown() {
 
 void Http2ConnectionHandler::SetDrainCompleteCallback(DrainCompleteCallback cb) {
     drain_complete_cb_ = std::move(cb);
+}
+
+void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
+                                                  const HttpResponse& response) {
+    if (!session_) {
+        logging::Get()->warn(
+            "SubmitStreamResponse called on destroyed H2 session (stream={})",
+            stream_id);
+        return;
+    }
+    session_->SubmitResponse(stream_id, response);
+    // Flush nghttp2's outgoing frame queue onto the transport. The sync H2
+    // path hits the SendPendingFrames call at the tail of OnRawData after
+    // ReceiveData → OnRequest → SubmitResponse returns. Async completions
+    // come from outside that loop (user code via RunOnDispatcher), so if
+    // we don't flush here the response sits queued until some unrelated
+    // inbound frame, shutdown, or timeout happens to flush it — hanging
+    // any async H2 route.
+    session_->SendPendingFrames();
 }
 
 void Http2ConnectionHandler::NotifyDrainComplete() {
