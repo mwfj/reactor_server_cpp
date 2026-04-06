@@ -1001,36 +1001,30 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
 
                 std::weak_ptr<HttpConnectionHandler> weak_self = self;
                 auto active_counter = active_requests_;
+                // One-shot guard: if the handler stores complete() and
+                // then throws, RequestGuard decrements during unwind and
+                // the stored callback could fire later → double decrement.
+                // The catch block marks completed so the callback is a no-op.
+                auto completed = std::make_shared<std::atomic<bool>>(false);
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, active_counter,
-                     mw_headers](HttpResponse final_resp) {
-                        // Merge middleware headers into the async response,
-                        // matching sync-route semantics: handler wins for
-                        // non-repeatable headers (Content-Type, Cache-Control,
-                        // Location), both coexist for repeatable headers
-                        // (Set-Cookie, WWW-Authenticate). HttpResponse::Header()
-                        // replaces non-repeatable headers case-insensitively,
-                        // so we must skip those the handler already set.
+                     mw_headers, completed](HttpResponse final_resp) {
+                        if (completed->exchange(true)) return;
+                        // Merge middleware + handler headers with correct
+                        // sync-route ordering: middleware first, handler
+                        // second. HttpResponse::Header() replaces non-
+                        // repeatable headers (handler wins) and appends
+                        // repeatable ones (middleware appears before handler,
+                        // matching the sync path where middleware runs first
+                        // on the same HttpResponse object).
+                        HttpResponse merged;
+                        merged.Status(final_resp.GetStatusCode());
+                        merged.Body(final_resp.GetBody());
                         for (const auto& mh : mw_headers) {
-                            std::string lower = mh.first;
-                            std::transform(lower.begin(), lower.end(), lower.begin(),
-                                           [](unsigned char c){ return std::tolower(c); });
-                            bool repeatable = (lower == "set-cookie" ||
-                                               lower == "www-authenticate");
-                            if (repeatable) {
-                                final_resp.Header(mh.first, mh.second);
-                            } else {
-                                bool handler_set = false;
-                                for (const auto& fh : final_resp.GetHeaders()) {
-                                    std::string fl = fh.first;
-                                    std::transform(fl.begin(), fl.end(), fl.begin(),
-                                                   [](unsigned char c){ return std::tolower(c); });
-                                    if (fl == lower) { handler_set = true; break; }
-                                }
-                                if (!handler_set) {
-                                    final_resp.Header(mh.first, mh.second);
-                                }
-                            }
+                            merged.Header(mh.first, mh.second);
+                        }
+                        for (const auto& fh : final_resp.GetHeaders()) {
+                            merged.Header(fh.first, fh.second);
                         }
                         auto s = weak_self.lock();
                         if (!s) {
@@ -1043,7 +1037,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                             return;
                         }
                         auto shared_resp = std::make_shared<HttpResponse>(
-                            std::move(final_resp));
+                            std::move(merged));
                         conn->RunOnDispatcher([s, shared_resp, active_counter]() {
                             s->CompleteAsyncResponse(std::move(*shared_resp));
                             active_counter->fetch_sub(1, std::memory_order_relaxed);
@@ -1067,6 +1061,10 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         async_handler(request, std::move(complete));
                     }
                 } catch (...) {
+                    // Mark completed so a stored callback can't double-
+                    // finish, then clear deferred state so the outer
+                    // catch's 500 + CloseConnection works normally.
+                    completed->store(true, std::memory_order_relaxed);
                     self->CancelAsyncResponse();
                     throw;  // outer catch sends 500 + closes
                 }
@@ -1684,27 +1682,15 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     [weak_self, stream_id, active_counter,
                      mw_headers, completed](HttpResponse final_resp) {
                         if (completed->exchange(true)) return;
-                        // Same merge logic as H1: handler wins for non-repeatable.
+                        // Same merge as H1: middleware first, handler second.
+                        HttpResponse merged;
+                        merged.Status(final_resp.GetStatusCode());
+                        merged.Body(final_resp.GetBody());
                         for (const auto& mh : mw_headers) {
-                            std::string lower = mh.first;
-                            std::transform(lower.begin(), lower.end(), lower.begin(),
-                                           [](unsigned char c){ return std::tolower(c); });
-                            bool repeatable = (lower == "set-cookie" ||
-                                               lower == "www-authenticate");
-                            if (repeatable) {
-                                final_resp.Header(mh.first, mh.second);
-                            } else {
-                                bool handler_set = false;
-                                for (const auto& fh : final_resp.GetHeaders()) {
-                                    std::string fl = fh.first;
-                                    std::transform(fl.begin(), fl.end(), fl.begin(),
-                                                   [](unsigned char c){ return std::tolower(c); });
-                                    if (fl == lower) { handler_set = true; break; }
-                                }
-                                if (!handler_set) {
-                                    final_resp.Header(mh.first, mh.second);
-                                }
-                            }
+                            merged.Header(mh.first, mh.second);
+                        }
+                        for (const auto& fh : final_resp.GetHeaders()) {
+                            merged.Header(fh.first, fh.second);
                         }
                         auto s = weak_self.lock();
                         if (!s) {
@@ -1717,7 +1703,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                             return;
                         }
                         auto shared_resp = std::make_shared<HttpResponse>(
-                            std::move(final_resp));
+                            std::move(merged));
                         conn->RunOnDispatcher([s, stream_id, shared_resp, active_counter]() {
                             s->SubmitStreamResponse(stream_id, *shared_resp);
                             active_counter->fetch_sub(1, std::memory_order_relaxed);
@@ -1788,11 +1774,19 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         validation_copy.bind_port = 8080;          // always valid
         validation_copy.worker_threads = 1;        // always valid
         validation_copy.tls.enabled = false;       // skip TLS path checks
-        // Validate H2 sub-settings only when the running server uses H2.
-        // When H2 is disabled at startup, Reload() copies sub-settings to
-        // h2_settings_ but they're never used (no H2 sessions are created),
-        // so invalid placeholder values are harmless and should not block reload.
-        validation_copy.http2.enabled = http2_enabled_;
+        // Validate H2 sub-settings only when the running server currently
+        // has H2 enabled AND the new config keeps it enabled. Two cases
+        // skip validation:
+        //   1. H2 disabled at startup (http2_enabled_=false): sub-settings
+        //      are never used, so placeholders are harmless.
+        //   2. H2 currently enabled but new config stages a disable
+        //      (new_config.http2.enabled=false): http2.enabled is restart-
+        //      only, so the disable won't take effect until restart. The
+        //      operator may be staging the disable alongside placeholder
+        //      H2 tuning; rejecting the reload would block live-safe
+        //      field changes (timeouts, limits, log level).
+        validation_copy.http2.enabled =
+            http2_enabled_ && new_config.http2.enabled;
         // Upstream configs are restart-only — clear them so staged edits
         // in the config file don't block live-safe field reloads.
         validation_copy.upstreams.clear();
