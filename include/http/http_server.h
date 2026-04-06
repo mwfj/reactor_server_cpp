@@ -225,7 +225,11 @@ private:
     std::atomic<int64_t> active_h2_streams_{0};
     std::atomic<int64_t> total_accepted_{0};
     std::atomic<int64_t> total_requests_{0};
-    std::atomic<int64_t> active_requests_{0};
+    // Heap-allocated so async completion callbacks that capture a shared_ptr
+    // copy keep the atomic alive past ~HttpServer. A late callback firing
+    // after shutdown would otherwise dereference a freed stack member.
+    std::shared_ptr<std::atomic<int64_t>> active_requests_ =
+        std::make_shared<std::atomic<int64_t>>(0);
 
     // Server start time for uptime calculation. Set by the ready callback
     // when the server actually starts accepting connections, not at construction.

@@ -199,6 +199,15 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
             session_->SendPendingFrames();
         }
         if (session_->ActiveStreamCount() == 0) {
+            // Flush deferred output BEFORE arming CloseAfterWrite.
+            // If the initial request's response or the GOAWAY write hit
+            // nghttp2's high-water mark, SendPendingFrames left deferred
+            // output queued. CloseAfterWrite suppresses OnSendComplete,
+            // so those deferred frames would never be resumed and the
+            // tail of a large first response would be silently dropped.
+            if (session_->HasDeferredOutput()) {
+                session_->ResumeOutput();
+            }
             conn_->CloseAfterWrite();
         }
     }

@@ -9,10 +9,12 @@
 
 // RAII guard: decrements an atomic counter on scope exit. Used in request
 // dispatch callbacks to ensure active_requests_ is decremented even on throw.
+// Takes the shared_ptr by reference so the guard doesn't extend the atomic's
+// lifetime on its own — only the async completion callback needs that.
 struct RequestGuard {
-    std::atomic<int64_t>& counter;
+    std::shared_ptr<std::atomic<int64_t>>& counter;
     bool armed = true;
-    ~RequestGuard() { if (armed) counter.fetch_sub(1, std::memory_order_relaxed); }
+    ~RequestGuard() { if (armed) counter->fetch_sub(1, std::memory_order_relaxed); }
     // Disarm so the decrement does NOT fire on scope exit. Used by async
     // routes: the request is logically still in-flight after the handler
     // returns, and active_requests_ must stay elevated until the
@@ -951,7 +953,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
         [this](std::shared_ptr<HttpConnectionHandler> self,
                const HttpRequest& request,
                HttpResponse& response) {
-            active_requests_.fetch_add(1, std::memory_order_relaxed);
+            active_requests_->fetch_add(1, std::memory_order_relaxed);
             RequestGuard guard{active_requests_};
 
             // Async routes take precedence over sync routes for the same
@@ -1006,16 +1008,18 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 // targets must be copy-constructible — we can't capture a
                 // moved HttpResponse by value into a copyable lambda.
                 std::weak_ptr<HttpConnectionHandler> weak_self = self;
-                auto* active_counter = &active_requests_;
+                // Capture the shared_ptr to the atomic (not a raw pointer) so
+                // the counter outlives ~HttpServer. A late callback firing
+                // after shutdown safely decrements the heap-allocated atomic
+                // instead of dereferencing freed stack memory.
+                auto active_counter = active_requests_;
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, active_counter](HttpResponse final_resp) {
                         auto s = weak_self.lock();
                         if (!s) {
                             // Connection gone (client disconnect or server
-                            // stopped). The counter lives on HttpServer,
-                            // which outlives all connections, so it's still
-                            // safe to decrement. Without this, a normal
-                            // client abort permanently leaks +1 in /stats.
+                            // stopped). The shared_ptr keeps the atomic
+                            // alive, so this decrement is always safe.
                             active_counter->fetch_sub(1, std::memory_order_relaxed);
                             return;
                         }
@@ -1055,7 +1059,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     HttpResponse err = HttpResponse::InternalError();
                     err.Header("Connection", "close");
                     self->CompleteAsyncResponse(std::move(err));
-                    active_requests_.fetch_sub(1, std::memory_order_relaxed);
+                    active_requests_->fetch_sub(1, std::memory_order_relaxed);
                 }
                 return;
             }
@@ -1631,7 +1635,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                int32_t stream_id,
                const HttpRequest& request,
                HttpResponse& response) {
-            active_requests_.fetch_add(1, std::memory_order_relaxed);
+            active_requests_->fetch_add(1, std::memory_order_relaxed);
             RequestGuard guard{active_requests_};
 
             // Async route dispatch — mirrors the HTTP/1 path. Middleware
@@ -1660,7 +1664,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 // is not thread-safe. User code may call complete() from
                 // any thread (their upstream library's worker pool, etc).
                 std::weak_ptr<Http2ConnectionHandler> weak_self = self;
-                auto* active_counter = &active_requests_;
+                auto active_counter = active_requests_;  // shared_ptr copy
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, stream_id, active_counter](HttpResponse final_resp) {
                         auto s = weak_self.lock();
@@ -1694,7 +1698,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                                           e.what());
                     HttpResponse err = HttpResponse::InternalError();
                     self->SubmitStreamResponse(stream_id, err);
-                    active_requests_.fetch_sub(1, std::memory_order_relaxed);
+                    active_requests_->fetch_sub(1, std::memory_order_relaxed);
                 }
                 return;
             }
@@ -1879,7 +1883,7 @@ HttpServer::ServerStats HttpServer::GetStats() const {
         active_h2_streams_.load(std::memory_order_relaxed));
     stats.total_accepted          = total_accepted_.load(std::memory_order_relaxed);
     stats.total_requests          = total_requests_.load(std::memory_order_relaxed);
-    stats.active_requests         = active_requests_.load(std::memory_order_relaxed);
+    stats.active_requests         = active_requests_->load(std::memory_order_relaxed);
     stats.max_connections     = net_server_.GetMaxConnections();
     stats.idle_timeout_sec    = static_cast<int>(net_server_.GetConnectionTimeout().count());
     stats.request_timeout_sec = request_timeout_sec_.load(std::memory_order_relaxed);
