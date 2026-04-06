@@ -11,7 +11,13 @@
 // dispatch callbacks to ensure active_requests_ is decremented even on throw.
 struct RequestGuard {
     std::atomic<int64_t>& counter;
-    ~RequestGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
+    bool armed = true;
+    ~RequestGuard() { if (armed) counter.fetch_sub(1, std::memory_order_relaxed); }
+    // Disarm so the decrement does NOT fire on scope exit. Used by async
+    // routes: the request is logically still in-flight after the handler
+    // returns, and active_requests_ must stay elevated until the
+    // completion callback fires. The callback path handles the decrement.
+    void release() { armed = false; }
     RequestGuard(const RequestGuard&) = delete;
     RequestGuard& operator=(const RequestGuard&) = delete;
 };
@@ -982,6 +988,13 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 response.Defer();
                 self->BeginAsyncResponse(request);
 
+                // Keep active_requests_ elevated until the async completion
+                // fires — disarm the RAII guard so it doesn't decrement
+                // when this lambda returns. The completion callback below
+                // handles the decrement, ensuring /stats reports in-flight
+                // async work and shutdown drain sees the real pressure.
+                guard.release();
+
                 // Capture weak_ptr so a leaked completion callback cannot
                 // keep the connection alive past its natural shutdown.
                 // Route the actual CompleteAsyncResponse work through the
@@ -993,16 +1006,22 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 // targets must be copy-constructible — we can't capture a
                 // moved HttpResponse by value into a copyable lambda.
                 std::weak_ptr<HttpConnectionHandler> weak_self = self;
+                auto* active_counter = &active_requests_;
                 HttpRouter::AsyncCompletionCallback complete =
-                    [weak_self](HttpResponse final_resp) {
+                    [weak_self, active_counter](HttpResponse final_resp) {
                         auto s = weak_self.lock();
-                        if (!s) return;
+                        if (!s) {
+                            // Connection gone (server stopped). Safe to
+                            // skip the decrement — the counter is dead.
+                            return;
+                        }
                         auto conn = s->GetConnection();
                         if (!conn) return;
                         auto shared_resp = std::make_shared<HttpResponse>(
                             std::move(final_resp));
-                        conn->RunOnDispatcher([s, shared_resp]() {
+                        conn->RunOnDispatcher([s, shared_resp, active_counter]() {
                             s->CompleteAsyncResponse(std::move(*shared_resp));
+                            active_counter->fetch_sub(1, std::memory_order_relaxed);
                         });
                     };
 
@@ -1029,6 +1048,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     HttpResponse err = HttpResponse::InternalError();
                     err.Header("Connection", "close");
                     self->CompleteAsyncResponse(std::move(err));
+                    active_requests_.fetch_sub(1, std::memory_order_relaxed);
                 }
                 return;
             }
@@ -1625,6 +1645,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     return;
                 }
                 response.Defer();
+                guard.release();  // decrement in completion, not on return
 
                 // Route the completion through the dispatcher for the
                 // same thread-safety reason as the HTTP/1 path above:
@@ -1632,16 +1653,18 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 // is not thread-safe. User code may call complete() from
                 // any thread (their upstream library's worker pool, etc).
                 std::weak_ptr<Http2ConnectionHandler> weak_self = self;
+                auto* active_counter = &active_requests_;
                 HttpRouter::AsyncCompletionCallback complete =
-                    [weak_self, stream_id](HttpResponse final_resp) {
+                    [weak_self, stream_id, active_counter](HttpResponse final_resp) {
                         auto s = weak_self.lock();
                         if (!s) return;
                         auto conn = s->GetConnection();
                         if (!conn) return;
                         auto shared_resp = std::make_shared<HttpResponse>(
                             std::move(final_resp));
-                        conn->RunOnDispatcher([s, stream_id, shared_resp]() {
+                        conn->RunOnDispatcher([s, stream_id, shared_resp, active_counter]() {
                             s->SubmitStreamResponse(stream_id, *shared_resp);
+                            active_counter->fetch_sub(1, std::memory_order_relaxed);
                         });
                     };
 
@@ -1658,6 +1681,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                                           e.what());
                     HttpResponse err = HttpResponse::InternalError();
                     self->SubmitStreamResponse(stream_id, err);
+                    active_requests_.fetch_sub(1, std::memory_order_relaxed);
                 }
                 return;
             }

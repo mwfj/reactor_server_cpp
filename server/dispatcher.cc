@@ -401,14 +401,43 @@ void Dispatcher::SetTimeOutTriggerCB(CALLBACKS_NAMESPACE::DispatcherTOTriggerCal
 
 void Dispatcher::SetTimerInterval(int interval) {
     end_t_ = interval;
-    // Re-arm the timer immediately so a downward reload takes effect
-    // without waiting for the old (potentially much longer) interval to fire.
+    if (interval <= 0) return;
+
+    // Create the timer if one was never set up (Init() skips timer creation
+    // for non-socket dispatchers or when end_t_ was 0 at construction).
+    // Standalone upstream-pool usage hits this path: the user constructs a
+    // plain Dispatcher, UpstreamManager later calls SetTimerInterval via
+    // EnQueue on the dispatcher thread. Without a timer, deadline-based
+    // connect timeouts are never scanned and black-holed upstreams hang.
 #if defined(__linux__)
-    if (timer_fd_ >= 0 && interval > 0) {
+    if (timer_fd_ < 0) {
+        timer_fd_ = TimeStamp::GenTimerFd(
+            std::chrono::seconds(interval), std::chrono::nanoseconds(0));
+        if (timer_fd_ >= 0) {
+            timer_channel_ = std::make_shared<Channel>(
+                shared_from_this(), timer_fd_);
+            timer_channel_->SetReadCallBackFn(
+                std::bind(&Dispatcher::TimerHandler, this));
+            timer_channel_->EnableETMode();
+            timer_channel_->SetEvent(
+                timer_channel_->Event() | EVENT_READ | EVENT_RDHUP);
+            UpdateChannelInLoop(timer_channel_);
+            // Mark as socket dispatcher so TimerHandler's connection scan
+            // and macOS ConsumeTimerFired check both activate. Semantically
+            // correct: this dispatcher now hosts timed socket connections.
+            is_sock_dispatcher_.store(true, std::memory_order_relaxed);
+        }
+    } else {
+        // Timer already exists — re-arm so a downward reload takes effect
+        // without waiting for the old (potentially much longer) interval.
         TimeStamp::ResetTimerFd(timer_fd_, interval);
     }
 #elif defined(__APPLE__) || defined(__MACH__)
-    if (interval > 0) {
+    if (!is_sock_dispatcher_.load(std::memory_order_relaxed)) {
+        // First timer creation on a non-socket dispatcher.
+        ep_->RegisterTimer(interval);
+        is_sock_dispatcher_.store(true, std::memory_order_relaxed);
+    } else {
         ep_->ResetTimer(interval);
     }
 #endif
@@ -479,4 +508,14 @@ void Dispatcher::TimerHandler(){
             callbacks_.timeout_trigger_callback(shared_from_this());
         }
     }
+
+    // Drain any queued tasks (including EnQueueDeferred tasks) on each
+    // timer tick. Under sustained I/O where epoll_wait always returns
+    // channel events (never channels.size()==0), and no EnQueue calls
+    // trigger a WakeUp, deferred tasks would be stranded indefinitely.
+    // The timer tick gives them a bounded-latency execution path:
+    // worst-case delay = one timer interval (typically 1–5 s).
+    // This is critical for the upstream pool's ScheduleWaitQueuePurge
+    // chain, which uses EnQueueDeferred to avoid hot-spinning.
+    ProcessPendingTasks();
 }
