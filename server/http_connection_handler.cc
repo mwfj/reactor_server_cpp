@@ -118,19 +118,37 @@ void HttpConnectionHandler::BeginAsyncResponse(const HttpRequest& req) {
 void HttpConnectionHandler::StashDeferredBytes(const std::string& data) {
     if (data.empty()) return;
     // Bound memory while an async response is pending so a client
-    // pipelining gigabytes against a slow async handler can't OOM us.
+    // pipelining bytes behind a deferred response can't OOM us.
     //
-    // Only cap when BOTH max_body_size_ AND max_header_size_ are non-zero
-    // (i.e. the operator set an explicit limit on each). If either is 0
-    // ("unlimited"), a single pipelined request on that axis can be
-    // arbitrarily large — capping the stash to the other axis's finite
-    // limit would force-close valid requests that the synchronous parser
-    // would accept (e.g. a large upload behind a deferred response when
-    // max_body_size=0). Matching the sync parser: unlimited on any axis
-    // means the stash is unbounded.
+    // Mirror ComputeInputCap()'s per-axis fallback:
+    //   both > 0 → cap = body + header
+    //   one  > 0 → cap = the non-zero limit
+    //   both = 0 → no cap (truly unlimited)
+    //
+    // Even though the unlimited axis can hold arbitrarily large data in
+    // the synchronous parser, the deferred stash accumulates raw bytes
+    // across read cycles without parsing — ComputeInputCap limits each
+    // individual read chunk, but the stash grows across chunks. Using
+    // the bounded axis as a cap prevents OOM for the common case
+    // (max_body_size=0 + finite max_header_size, or vice versa) while
+    // keeping the stash unbounded only when the operator has explicitly
+    // set both limits to unlimited.
+    size_t cap = 0;
     if (max_body_size_ > 0 && max_header_size_ > 0) {
-        const size_t cap = max_body_size_ + max_header_size_
-                           + DEFERRED_STASH_OVERHEAD;
+        cap = max_body_size_ + max_header_size_;
+        if (cap < max_body_size_) cap = SIZE_MAX;  // overflow guard
+    } else if (max_body_size_ > 0) {
+        cap = max_body_size_;
+    } else if (max_header_size_ > 0) {
+        cap = max_header_size_;
+    }
+    if (cap > 0) {
+        // Add overhead for request-line framing, guarding against wrap.
+        if (cap <= SIZE_MAX - DEFERRED_STASH_OVERHEAD) {
+            cap += DEFERRED_STASH_OVERHEAD;
+        }
+        // else: cap is already near SIZE_MAX — no room to add overhead,
+        // but the huge cap is still a usable bound.
         if (deferred_pending_buf_.size() + data.size() > cap) {
             logging::Get()->warn(
                 "Deferred pipeline buffer cap exceeded fd={} ({} + {} > {}), "
