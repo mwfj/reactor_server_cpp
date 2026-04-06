@@ -38,6 +38,7 @@ public:
 
     // Accessors
     int GetStatusCode() const { return status_code_; }
+    const std::string& GetStatusReason() const { return status_reason_; }
     const std::string& GetBody() const { return body_; }
     const std::vector<std::pair<std::string, std::string>>& GetHeaders() const { return headers_; }
 

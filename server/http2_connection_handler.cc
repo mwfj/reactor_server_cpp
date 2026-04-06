@@ -366,7 +366,18 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
         if (session_->HasDeferredOutput()) {
             session_->ResumeOutput();
         }
-        if (!session_->HasDeferredOutput() && !session_->WantWrite()) {
+        // Only signal drain completion if the transport output buffer is
+        // also empty. SendPendingFrames may have written response/GOAWAY
+        // bytes that haven't been flushed to the kernel yet (slow client,
+        // backpressure). NotifyDrainComplete fires drain_complete_cb_
+        // which releases WaitForH2Drain → NetServer::Stop proceeds →
+        // StopEventLoop can run before the buffered bytes are written.
+        // When the buffer IS non-empty, OnSendComplete will fire once
+        // the write completes and re-check this same condition — at that
+        // point OutputBufferSize() is guaranteed 0 because OnSendComplete
+        // only fires on a fully-drained buffer.
+        if (!session_->HasDeferredOutput() && !session_->WantWrite() &&
+            conn_->OutputBufferSize() == 0) {
             NotifyDrainComplete();
         }
     }

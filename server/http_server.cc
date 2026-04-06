@@ -1021,7 +1021,8 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         // first (base), handler second (overrides for
                         // non-repeatable, appends for repeatable).
                         HttpResponse merged;
-                        merged.Status(final_resp.GetStatusCode());
+                        merged.Status(final_resp.GetStatusCode(),
+                                      final_resp.GetStatusReason());
                         merged.Body(final_resp.GetBody());
                         for (const auto& mh : mw_headers) {
                             merged.Header(mh.first, mh.second);
@@ -1693,7 +1694,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         if (completed->exchange(true)) return;
                         // Same merge as H1: middleware first, handler second.
                         HttpResponse merged;
-                        merged.Status(final_resp.GetStatusCode());
+                        merged.Status(final_resp.GetStatusCode(),
+                                      final_resp.GetStatusReason());
                         merged.Body(final_resp.GetBody());
                         for (const auto& mh : mw_headers) {
                             merged.Header(mh.first, mh.second);
