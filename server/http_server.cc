@@ -1011,12 +1011,19 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     [weak_self, active_counter](HttpResponse final_resp) {
                         auto s = weak_self.lock();
                         if (!s) {
-                            // Connection gone (server stopped). Safe to
-                            // skip the decrement — the counter is dead.
+                            // Connection gone (client disconnect or server
+                            // stopped). The counter lives on HttpServer,
+                            // which outlives all connections, so it's still
+                            // safe to decrement. Without this, a normal
+                            // client abort permanently leaks +1 in /stats.
+                            active_counter->fetch_sub(1, std::memory_order_relaxed);
                             return;
                         }
                         auto conn = s->GetConnection();
-                        if (!conn) return;
+                        if (!conn) {
+                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                            return;
+                        }
                         auto shared_resp = std::make_shared<HttpResponse>(
                             std::move(final_resp));
                         conn->RunOnDispatcher([s, shared_resp, active_counter]() {
@@ -1657,9 +1664,15 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, stream_id, active_counter](HttpResponse final_resp) {
                         auto s = weak_self.lock();
-                        if (!s) return;
+                        if (!s) {
+                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                            return;
+                        }
                         auto conn = s->GetConnection();
-                        if (!conn) return;
+                        if (!conn) {
+                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                            return;
+                        }
                         auto shared_resp = std::make_shared<HttpResponse>(
                             std::move(final_resp));
                         conn->RunOnDispatcher([s, stream_id, shared_resp, active_counter]() {
