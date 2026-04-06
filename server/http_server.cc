@@ -991,36 +991,29 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 response.Defer();
                 self->BeginAsyncResponse(request);
 
-                // Keep active_requests_ elevated until the async completion
-                // fires — disarm the RAII guard so it doesn't decrement
-                // when this lambda returns. The completion callback below
-                // handles the decrement, ensuring /stats reports in-flight
-                // async work and shutdown drain sees the real pressure.
-                guard.release();
+                // Capture middleware-stamped headers (CORS, trace IDs,
+                // cookies) so the completion callback can merge them into
+                // the user's final response. Rejected requests already keep
+                // these headers (the sync send path serializes `response`),
+                // but successful async completions build a new HttpResponse
+                // from scratch and would lose them without this capture.
+                auto mw_headers = response.GetHeaders();
 
-                // Capture weak_ptr so a leaked completion callback cannot
-                // keep the connection alive past its natural shutdown.
-                // Route the actual CompleteAsyncResponse work through the
-                // dispatcher via RunOnDispatcher: users may call complete()
-                // from any thread (their upstream library's worker pool,
-                // a background thread, etc.), and parser_ / OnRawData /
-                // deferred_pending_buf_ are all dispatcher-thread-only.
-                // shared_ptr<HttpResponse> is required because std::function
-                // targets must be copy-constructible — we can't capture a
-                // moved HttpResponse by value into a copyable lambda.
                 std::weak_ptr<HttpConnectionHandler> weak_self = self;
-                // Capture the shared_ptr to the atomic (not a raw pointer) so
-                // the counter outlives ~HttpServer. A late callback firing
-                // after shutdown safely decrements the heap-allocated atomic
-                // instead of dereferencing freed stack memory.
                 auto active_counter = active_requests_;
                 HttpRouter::AsyncCompletionCallback complete =
-                    [weak_self, active_counter](HttpResponse final_resp) {
+                    [weak_self, active_counter,
+                     mw_headers](HttpResponse final_resp) {
+                        // Merge middleware headers the user didn't override.
+                        for (const auto& mh : mw_headers) {
+                            bool present = false;
+                            for (const auto& fh : final_resp.GetHeaders()) {
+                                if (fh.first == mh.first) { present = true; break; }
+                            }
+                            if (!present) final_resp.Header(mh.first, mh.second);
+                        }
                         auto s = weak_self.lock();
                         if (!s) {
-                            // Connection gone (client disconnect or server
-                            // stopped). The shared_ptr keeps the atomic
-                            // alive, so this decrement is always safe.
                             active_counter->fetch_sub(1, std::memory_order_relaxed);
                             return;
                         }
@@ -1037,31 +1030,25 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         });
                     };
 
-                try {
-                    if (async_head_fallback) {
-                        // HEAD → GET fallback: hand the handler a cloned
-                        // request with method rewritten to "GET" so user
-                        // code sees a GET (matches sync Dispatch semantics).
-                        // The original HEAD method is already captured in
-                        // deferred_was_head_ so CompleteAsyncResponse will
-                        // strip the body on send.
-                        HttpRequest get_req = request;
-                        get_req.method = "GET";
-                        async_handler(get_req, std::move(complete));
-                    } else {
-                        async_handler(request, std::move(complete));
-                    }
-                } catch (const std::exception& e) {
-                    // Handler threw before scheduling async work. Recover
-                    // by completing synchronously with a 500. Never leak
-                    // e.what() to the client.
-                    logging::Get()->error("Exception in async request handler: {}",
-                                          e.what());
-                    HttpResponse err = HttpResponse::InternalError();
-                    err.Header("Connection", "close");
-                    self->CompleteAsyncResponse(std::move(err));
-                    active_requests_->fetch_sub(1, std::memory_order_relaxed);
+                // Don't release the guard until the handler returns
+                // successfully. If the handler throws, the guard fires
+                // during stack unwinding and decrements active_requests_.
+                // The exception then propagates to HandleCompleteRequest's
+                // outer try/catch, which sends a 500 and closes the
+                // connection. This avoids the double-finish bug where the
+                // catch block calls CompleteAsyncResponse while a stored
+                // copy of `complete` can also fire later.
+                if (async_head_fallback) {
+                    HttpRequest get_req = request;
+                    get_req.method = "GET";
+                    async_handler(get_req, std::move(complete));
+                } else {
+                    async_handler(request, std::move(complete));
                 }
+                // Handler returned without throwing — it owns the
+                // completion callback and is responsible for invoking it.
+                // Disarm the guard so the callback handles the decrement.
+                guard.release();
                 return;
             }
 
@@ -1657,17 +1644,20 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     return;
                 }
                 response.Defer();
-                guard.release();  // decrement in completion, not on return
 
-                // Route the completion through the dispatcher for the
-                // same thread-safety reason as the HTTP/1 path above:
-                // Http2Session::SubmitResponse mutates nghttp2 state that
-                // is not thread-safe. User code may call complete() from
-                // any thread (their upstream library's worker pool, etc).
+                auto mw_headers = response.GetHeaders();
                 std::weak_ptr<Http2ConnectionHandler> weak_self = self;
-                auto active_counter = active_requests_;  // shared_ptr copy
+                auto active_counter = active_requests_;
                 HttpRouter::AsyncCompletionCallback complete =
-                    [weak_self, stream_id, active_counter](HttpResponse final_resp) {
+                    [weak_self, stream_id, active_counter,
+                     mw_headers](HttpResponse final_resp) {
+                        for (const auto& mh : mw_headers) {
+                            bool present = false;
+                            for (const auto& fh : final_resp.GetHeaders()) {
+                                if (fh.first == mh.first) { present = true; break; }
+                            }
+                            if (!present) final_resp.Header(mh.first, mh.second);
+                        }
                         auto s = weak_self.lock();
                         if (!s) {
                             active_counter->fetch_sub(1, std::memory_order_relaxed);
@@ -1686,21 +1676,17 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         });
                     };
 
-                try {
-                    if (async_head_fallback) {
-                        HttpRequest get_req = request;
-                        get_req.method = "GET";
-                        async_handler(get_req, std::move(complete));
-                    } else {
-                        async_handler(request, std::move(complete));
-                    }
-                } catch (const std::exception& e) {
-                    logging::Get()->error("Exception in async H2 handler: {}",
-                                          e.what());
-                    HttpResponse err = HttpResponse::InternalError();
-                    self->SubmitStreamResponse(stream_id, err);
-                    active_requests_->fetch_sub(1, std::memory_order_relaxed);
+                // Same pattern as H1: don't release guard until the
+                // handler returns without throwing. Exceptions propagate
+                // to Http2Session::OnRequest's outer try/catch.
+                if (async_head_fallback) {
+                    HttpRequest get_req = request;
+                    get_req.method = "GET";
+                    async_handler(get_req, std::move(complete));
+                } else {
+                    async_handler(request, std::move(complete));
                 }
+                guard.release();
                 return;
             }
 

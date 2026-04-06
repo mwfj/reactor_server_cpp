@@ -34,8 +34,16 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
     auto it = async_method_tries_.find(request.method);
     bool fallback = false;
     if (it == async_method_tries_.end()) {
-        // HEAD fallback to GET for async routes (consistent with sync path).
+        // HEAD fallback to async GET, but ONLY if no explicit sync HEAD
+        // route exists for this path. The sync Dispatch path only falls
+        // back to GET after failing to match HEAD, so we must not steal
+        // the request from an explicit Route("HEAD", ...) handler.
         if (request.method != "HEAD") return nullptr;
+        auto sync_head = method_tries_.find("HEAD");
+        if (sync_head != method_tries_.end() &&
+            sync_head->second.HasMatch(request.path)) {
+            return nullptr;  // let sync Dispatch handle explicit HEAD
+        }
         it = async_method_tries_.find("GET");
         if (it == async_method_tries_.end()) return nullptr;
         fallback = true;
