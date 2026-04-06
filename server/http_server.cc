@@ -1004,13 +1004,18 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, active_counter,
                      mw_headers](HttpResponse final_resp) {
-                        // Merge middleware headers the user didn't override.
+                        // Unconditionally add every middleware header. The
+                        // previous "skip if present" check used raw string
+                        // equality, which broke case-insensitive matching
+                        // and dropped repeatable headers like Set-Cookie or
+                        // WWW-Authenticate when the user also set one.
+                        // Unconditional add preserves all middleware headers
+                        // alongside the user's. For non-repeatable headers,
+                        // HTTP parsers typically use the last value, and
+                        // the user's headers (already in final_resp) appear
+                        // before these appended middleware headers.
                         for (const auto& mh : mw_headers) {
-                            bool present = false;
-                            for (const auto& fh : final_resp.GetHeaders()) {
-                                if (fh.first == mh.first) { present = true; break; }
-                            }
-                            if (!present) final_resp.Header(mh.first, mh.second);
+                            final_resp.Header(mh.first, mh.second);
                         }
                         auto s = weak_self.lock();
                         if (!s) {
@@ -1033,17 +1038,22 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 // Don't release the guard until the handler returns
                 // successfully. If the handler throws, the guard fires
                 // during stack unwinding and decrements active_requests_.
-                // The exception then propagates to HandleCompleteRequest's
-                // outer try/catch, which sends a 500 and closes the
-                // connection. This avoids the double-finish bug where the
-                // catch block calls CompleteAsyncResponse while a stored
-                // copy of `complete` can also fire later.
-                if (async_head_fallback) {
-                    HttpRequest get_req = request;
-                    get_req.method = "GET";
-                    async_handler(get_req, std::move(complete));
-                } else {
-                    async_handler(request, std::move(complete));
+                // The inner catch clears deferred state before rethrowing
+                // so the outer catch in HandleCompleteRequest can send a
+                // 500 and close normally (CloseAfterWrite won't be blocked
+                // by shutdown_exempt_, and OnRawData won't buffer into
+                // the deferred stash).
+                try {
+                    if (async_head_fallback) {
+                        HttpRequest get_req = request;
+                        get_req.method = "GET";
+                        async_handler(get_req, std::move(complete));
+                    } else {
+                        async_handler(request, std::move(complete));
+                    }
+                } catch (...) {
+                    self->CancelAsyncResponse();
+                    throw;  // outer catch sends 500 + closes
                 }
                 // Handler returned without throwing — it owns the
                 // completion callback and is responsible for invoking it.
@@ -1652,11 +1662,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     [weak_self, stream_id, active_counter,
                      mw_headers](HttpResponse final_resp) {
                         for (const auto& mh : mw_headers) {
-                            bool present = false;
-                            for (const auto& fh : final_resp.GetHeaders()) {
-                                if (fh.first == mh.first) { present = true; break; }
-                            }
-                            if (!present) final_resp.Header(mh.first, mh.second);
+                            final_resp.Header(mh.first, mh.second);
                         }
                         auto s = weak_self.lock();
                         if (!s) {

@@ -31,29 +31,45 @@ void HttpRouter::RouteAsync(const std::string& method, const std::string& path,
 HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
     const HttpRequest& request, bool* head_fallback_out) const {
     if (head_fallback_out) *head_fallback_out = false;
+
+    // 1. Try exact method match in the async trie.
     auto it = async_method_tries_.find(request.method);
-    bool fallback = false;
-    if (it == async_method_tries_.end()) {
-        // HEAD fallback to async GET, but ONLY if no explicit sync HEAD
-        // route exists for this path. The sync Dispatch path only falls
-        // back to GET after failing to match HEAD, so we must not steal
-        // the request from an explicit Route("HEAD", ...) handler.
-        if (request.method != "HEAD") return nullptr;
+    if (it != async_method_tries_.end()) {
+        std::unordered_map<std::string, std::string> params;
+        auto result = it->second.Search(request.path, params);
+        if (result.handler) {
+            request.params = std::move(params);
+            return *result.handler;
+        }
+        // Path miss — fall through to HEAD→GET fallback below.
+    }
+
+    // 2. HEAD fallback to async GET (mirrors sync Dispatch behavior).
+    //    Only attempt if the exact method search above failed OR the path
+    //    didn't match — this handles the case where an unrelated async HEAD
+    //    route exists (e.g. /health) but the requested path (e.g. /items)
+    //    is only registered via GetAsync.
+    //    Skip the fallback if a sync HEAD route explicitly matches this
+    //    path — Dispatch should handle that with the operator's HEAD handler.
+    if (request.method == "HEAD") {
         auto sync_head = method_tries_.find("HEAD");
         if (sync_head != method_tries_.end() &&
             sync_head->second.HasMatch(request.path)) {
             return nullptr;  // let sync Dispatch handle explicit HEAD
         }
-        it = async_method_tries_.find("GET");
-        if (it == async_method_tries_.end()) return nullptr;
-        fallback = true;
+        auto get_it = async_method_tries_.find("GET");
+        if (get_it != async_method_tries_.end()) {
+            std::unordered_map<std::string, std::string> params;
+            auto result = get_it->second.Search(request.path, params);
+            if (result.handler) {
+                request.params = std::move(params);
+                if (head_fallback_out) *head_fallback_out = true;
+                return *result.handler;
+            }
+        }
     }
-    std::unordered_map<std::string, std::string> params;
-    auto result = it->second.Search(request.path, params);
-    if (!result.handler) return nullptr;
-    request.params = std::move(params);
-    if (head_fallback_out) *head_fallback_out = fallback;
-    return *result.handler;
+
+    return nullptr;
 }
 
 void HttpRouter::WebSocket(const std::string& path, WsUpgradeHandler handler) {

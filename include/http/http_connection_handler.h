@@ -66,6 +66,12 @@ public:
     // any pipelined bytes that arrived during the deferred window.
     void CompleteAsyncResponse(HttpResponse response);
 
+    // Cancel a deferred async-response cycle that was started by
+    // BeginAsyncResponse but whose handler threw before handing off the
+    // completion callback. Resets deferred state + shutdown exemption so
+    // the outer exception handler can send a 500 and close normally.
+    void CancelAsyncResponse();
+
     // Append bytes that arrived while an async response was pending.
     // Called by OnRawData. Separated from OnRawData so that the framework's
     // own "resume after deferred" path can feed buffered bytes back in

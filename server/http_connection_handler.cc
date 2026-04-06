@@ -115,6 +115,14 @@ void HttpConnectionHandler::BeginAsyncResponse(const HttpRequest& req) {
     if (conn_) conn_->SetShutdownExempt(true);
 }
 
+void HttpConnectionHandler::CancelAsyncResponse() {
+    deferred_response_pending_ = false;
+    deferred_was_head_ = false;
+    deferred_keep_alive_ = true;
+    deferred_pending_buf_.clear();
+    if (conn_) conn_->SetShutdownExempt(false);
+}
+
 void HttpConnectionHandler::StashDeferredBytes(const std::string& data) {
     if (data.empty()) return;
     // Bound memory while an async response is pending so a client
