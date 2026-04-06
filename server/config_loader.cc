@@ -574,19 +574,12 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name + "'): pool.max_connections must be >= 1");
             }
-            // When worker_threads is explicit (> 0), max_connections must be
-            // at least that many so every dispatcher gets >= 1 connection slot.
-            // With worker_threads=0 (auto), this is checked at runtime in
-            // UpstreamHostPool constructor after the thread count is resolved.
-            if (config.worker_threads > 0 &&
-                u.pool.max_connections < config.worker_threads) {
-                throw std::invalid_argument(
-                    idx + " ('" + u.name +
-                    "'): pool.max_connections (" +
-                    std::to_string(u.pool.max_connections) +
-                    ") must be >= worker_threads (" +
-                    std::to_string(config.worker_threads) + ")");
-            }
+            // When max_connections < worker_threads, some dispatcher
+            // partitions will have zero capacity (requests queue and time
+            // out). This is intentional for deployments that cap upstream
+            // concurrency tightly (e.g., 4 backend connections across 8
+            // workers). UpstreamHostPool logs a warning at construction;
+            // validation does not reject the config.
             if (u.pool.max_idle_connections < 0 ||
                 u.pool.max_idle_connections > u.pool.max_connections) {
                 throw std::invalid_argument(

@@ -207,20 +207,34 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
 
     // Clear deferred state BEFORE resuming parsing/closing — subsequent
     // OnRawData or CloseConnection calls must see the connection as idle.
+    // BUT: delay clearing shutdown_exempt_ until AFTER CloseConnection
+    // arms close_after_write_. During graceful shutdown, HasPendingH1Output
+    // polls both IsShutdownExempt() and IsCloseDeferred(). If we clear
+    // exempt before close_after_write_ is armed, a brief window where both
+    // flags are false causes the drain loop to exit and stop the event
+    // loop, truncating the response bytes we just queued with SendRaw.
     deferred_response_pending_ = false;
     deferred_was_head_ = false;
     deferred_keep_alive_ = true;
-    if (conn_) conn_->SetShutdownExempt(false);
 
     if (conn_->IsClosing()) {
+        if (conn_) conn_->SetShutdownExempt(false);
         deferred_pending_buf_.clear();
         return;
     }
     if (should_close) {
         deferred_pending_buf_.clear();
+        // CloseConnection arms close_after_write_ — clear exempt AFTER
+        // so HasPendingH1Output always sees at least one flag true.
         CloseConnection();
+        if (conn_) conn_->SetShutdownExempt(false);
         return;
     }
+
+    // Connection stays open (keep-alive) — clear exempt now. No drain-loop
+    // race: the response bytes are already buffered and the connection
+    // is not closing.
+    if (conn_) conn_->SetShutdownExempt(false);
 
     // Resume parsing any pipelined bytes that arrived during the deferred
     // window. Move out of the member first so a nested BeginAsyncResponse
