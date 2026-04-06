@@ -688,17 +688,19 @@ void HttpServer::Stop() {
                     std::chrono::seconds(shutdown_drain_timeout_sec_.load(
                         std::memory_order_relaxed)));
             }
-            // Post-upstream H1 flush window: an async (exempt) HTTP/1 proxy
-            // handler whose upstream reply arrives during the upstream drain
-            // above only starts writing its client response AFTER the first
-            // H1 drain loop has already finished. Without a second flush
-            // window here, NetServer::Stop()'s post-drain barrier runs
-            // straight into StopEventLoop with at most one writable
-            // iteration — truncating slow or chunked responses. Give those
-            // late responses the same H1_DRAIN_TIMEOUT_SEC budget to flush.
+            // Post-upstream H1 flush window: an async (exempt) HTTP/1 handler
+            // whose completion fires during the upstream drain (or that takes
+            // longer than the first H1 drain loop) only starts writing its
+            // client response after the earlier H1 drain has finished. Use
+            // the operator-configured shutdown_drain_timeout_sec_ instead of
+            // the hard-coded H1_DRAIN_TIMEOUT_SEC: any async H1 route that
+            // doesn't go through UpstreamManager (or simply takes longer than
+            // 2s before it starts writing) would otherwise be cut off when
+            // StopEventLoop runs.
             {
                 auto h1_deadline = std::chrono::steady_clock::now() +
-                                   std::chrono::seconds(H1_DRAIN_TIMEOUT_SEC);
+                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
+                        std::memory_order_relaxed));
                 while (std::chrono::steady_clock::now() < h1_deadline) {
                     if (!HasPendingH1Output()) break;
                     std::this_thread::sleep_for(
@@ -845,13 +847,12 @@ void HttpServer::Stop() {
                 }
                 upstream_manager_->ForceCloseRemaining();
             }
-            // Post-upstream H1 flush window: async proxy responses that
-            // arrive during the upstream drain need time to write their
-            // client bytes before StopEventLoop. Same rationale as the
-            // off-thread branch above — matches H1_DRAIN_TIMEOUT_SEC budget.
+            // Post-upstream H1 flush window: use the configured drain budget
+            // so async H1 routes that take longer than 2s aren't cut off.
             {
                 auto h1_deadline = std::chrono::steady_clock::now() +
-                                   std::chrono::seconds(H1_DRAIN_TIMEOUT_SEC);
+                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
+                        std::memory_order_relaxed));
                 while (std::chrono::steady_clock::now() < h1_deadline) {
                     net_server_.ProcessSelfDispatcherTasks();
                     if (!HasPendingH1Output()) break;

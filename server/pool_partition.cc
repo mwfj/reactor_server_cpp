@@ -135,8 +135,17 @@ PoolPartition::~PoolPartition() {
     // No timeout — we MUST wait. A stale task firing after the destructor
     // returns would dereference freed members. inflight_tasks_ is a
     // shared_ptr<atomic>, so it outlives the partition safely.
+    //
+    // If this destructor is running ON the dispatcher thread (standalone
+    // teardown from a pool callback), the queued tasks cannot drain by
+    // themselves — the loop thread is us, blocked here. Drain them
+    // inline via ProcessPendingTasks. Without this, the destructor
+    // deadlocks under load whenever a purge/shutdown task is still queued.
     int iteration = 0;
     while (inflight_tasks_->load(std::memory_order_acquire) > 0) {
+        if (dispatcher_ && dispatcher_->is_on_loop_thread()) {
+            dispatcher_->ProcessPendingTasks();
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         if (++iteration == 500) {  // ~5 second warning threshold
             logging::Get()->warn("PoolPartition destructor waiting on {} "

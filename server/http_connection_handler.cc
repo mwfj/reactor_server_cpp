@@ -120,25 +120,17 @@ void HttpConnectionHandler::StashDeferredBytes(const std::string& data) {
     // Bound memory while an async response is pending so a client
     // pipelining gigabytes against a slow async handler can't OOM us.
     //
-    // Mirror ComputeInputCap()'s logic: use whichever non-zero limit is
-    // configured. "0 = unlimited" means that specific axis is uncapped,
-    // but the OTHER axis's limit still applies. Only when BOTH are 0 is
-    // the stash truly unbounded (matching the synchronous parser). This
-    // prevents unbounded memory growth when e.g. max_body_size=0 (uploads
-    // unlimited) but max_header_size is set, while still honoring the
-    // "unlimited" semantic on the uncapped axis by not contributing it
-    // to the sum.
-    size_t cap = 0;
+    // Only cap when BOTH max_body_size_ AND max_header_size_ are non-zero
+    // (i.e. the operator set an explicit limit on each). If either is 0
+    // ("unlimited"), a single pipelined request on that axis can be
+    // arbitrarily large — capping the stash to the other axis's finite
+    // limit would force-close valid requests that the synchronous parser
+    // would accept (e.g. a large upload behind a deferred response when
+    // max_body_size=0). Matching the sync parser: unlimited on any axis
+    // means the stash is unbounded.
     if (max_body_size_ > 0 && max_header_size_ > 0) {
-        cap = max_body_size_ + max_header_size_;
-    } else if (max_body_size_ > 0) {
-        cap = max_body_size_;
-    } else if (max_header_size_ > 0) {
-        cap = max_header_size_;
-    }
-    // cap == 0 means both are unlimited — no stash bound.
-    if (cap > 0) {
-        cap += DEFERRED_STASH_OVERHEAD;
+        const size_t cap = max_body_size_ + max_header_size_
+                           + DEFERRED_STASH_OVERHEAD;
         if (deferred_pending_buf_.size() + data.size() > cap) {
             logging::Get()->warn(
                 "Deferred pipeline buffer cap exceeded fd={} ({} + {} > {}), "
