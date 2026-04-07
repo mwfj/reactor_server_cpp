@@ -27,8 +27,9 @@ server.Start();
 
 | Component | Header | Role |
 |-----------|--------|------|
-| `TlsContext` | `include/tls/tls_context.h` | Server-wide RAII wrapper around `SSL_CTX` |
-| `TlsConnection` | `include/tls/tls_connection.h` | Per-connection RAII wrapper around `SSL` |
+| `TlsContext` | `include/tls/tls_context.h` | Server-wide RAII wrapper around `SSL_CTX` (server mode) |
+| `TlsClientContext` | `include/tls/tls_client_context.h` | Client-mode `SSL_CTX` for upstream connections |
+| `TlsConnection` | `include/tls/tls_connection.h` | Per-connection RAII wrapper around `SSL` (server + client) |
 
 ## TlsContext
 
@@ -45,6 +46,21 @@ TlsContext(const std::string& cert_file, const std::string& key_file);
 - `SetAlpnProtocols({"h2", "http/1.1"})` — registers ALPN selection callback for HTTP/2 negotiation
 - Non-copyable, non-movable
 - **Shared ownership**: `HttpServer` creates via `make_shared`, passes to `NetServer` — guarantees context outlives both regardless of destruction order
+
+## TlsClientContext
+
+Client-mode `SSL_CTX` for outbound upstream connections. Created by `UpstreamHostPool` when `upstream.tls.enabled == true`, shared across all `PoolPartition` instances for that service.
+
+```cpp
+TlsClientContext(const UpstreamTlsConfig& config);
+```
+
+- **Peer verification**: `SSL_VERIFY_PEER` enabled by default (`verify_peer = true`). Loads CA bundle from `ca_file`.
+- **SNI**: Sets `sni_hostname` on each `SSL` object via `SSL_set_tlsext_host_name()` so virtual-hosted upstreams route correctly.
+- **Minimum version**: Same `min_version` support as server-mode (`"1.2"` or `"1.3"`).
+- **Shared ownership**: `shared_ptr<TlsClientContext>` shared across PoolPartitions — outlives any single partition.
+
+Key difference from `TlsContext` (server mode): no certificate/key loading (client doesn't present a cert), no ALPN advertisement (upstream is HTTP/1.1 only for now).
 
 ## TlsConnection
 
