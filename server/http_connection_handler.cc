@@ -77,9 +77,24 @@ void HttpConnectionHandler::UpdateSizeLimits(size_t body, size_t header,
 
 void HttpConnectionHandler::SetRequestTimeout(int seconds) {
     request_timeout_sec_ = seconds;
-    // Don't arm deadline here — for TLS connections, the handshake hasn't
-    // completed yet. The deadline is armed on the first OnRawData call
-    // (which only fires after TLS handshake completes).
+    // Don't arm deadline at initialization — for TLS connections, the
+    // handshake hasn't completed yet. The deadline is armed on the first
+    // OnRawData call (which only fires after TLS handshake completes).
+    //
+    // During reload (request_in_progress_ == true), reconcile the already-
+    // armed deadline with the new timeout. Without this, the old deadline
+    // fires at the wrong time: too early if the operator extended it, or
+    // at all when the operator disabled timeouts (sending 408 on a valid
+    // in-flight request).
+    if (request_in_progress_) {
+        if (seconds > 0) {
+            conn_->SetDeadline(request_start_ +
+                               std::chrono::seconds(seconds));
+        } else {
+            conn_->ClearDeadline();
+            conn_->SetDeadlineTimeoutCb(nullptr);
+        }
+    }
 }
 
 bool HttpConnectionHandler::NormalizeOutgoingResponse(HttpResponse& response,

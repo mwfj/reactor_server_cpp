@@ -25,7 +25,7 @@ public:
     // Set request limits (applied per-stream)
     void SetMaxBodySize(size_t max);
     void SetMaxHeaderSize(size_t max);
-    void SetRequestTimeout(int seconds) { request_timeout_sec_ = seconds; }
+    void SetRequestTimeout(int seconds);
 
     // Called when raw data arrives from the reactor (entry point)
     void OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data);

@@ -53,6 +53,24 @@ void Http2ConnectionHandler::SetMaxHeaderSize(size_t max) {
     }
 }
 
+void Http2ConnectionHandler::SetRequestTimeout(int seconds) {
+    request_timeout_sec_ = seconds;
+    // Reconcile deadline state with the new timeout value. At
+    // initialization time deadline_armed_ is false, so this is a no-op.
+    // During live reload, stale deadlines must be updated:
+    if (seconds <= 0 && deadline_armed_) {
+        // Timeout disabled — clear the stale deadline so the connection
+        // reverts to idle-timeout behavior instead of staying stuck on
+        // an expired deadline with deadline_armed_ = true forever.
+        conn_->ClearDeadline();
+        deadline_armed_ = false;
+    } else if (seconds > 0 && deadline_armed_ && session_) {
+        // Timeout value changed — recompute from the oldest stream's
+        // start time using the new value.
+        UpdateDeadline();
+    }
+}
+
 void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
     if (initialized_) {
         logging::Get()->debug("H2 Initialize called twice fd={}", conn_ ? conn_->fd() : -1);
