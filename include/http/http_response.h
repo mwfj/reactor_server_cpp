@@ -30,7 +30,9 @@ public:
     static HttpResponse Forbidden();
     static HttpResponse MethodNotAllowed();
     static HttpResponse InternalError(const std::string& message = "Internal Server Error");
+    static HttpResponse BadGateway();
     static HttpResponse ServiceUnavailable();
+    static HttpResponse GatewayTimeout();
     static HttpResponse PayloadTooLarge();
     static HttpResponse HeaderTooLarge();
     static HttpResponse RequestTimeout();

@@ -219,6 +219,47 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 upstream.pool.max_requests_per_conn = pool.value("max_requests_per_conn", 0);
             }
 
+            if (item.contains("proxy")) {
+                if (!item["proxy"].is_object())
+                    throw std::runtime_error("upstream proxy must be an object");
+                auto& proxy = item["proxy"];
+                upstream.proxy.route_prefix = proxy.value("route_prefix", "");
+                upstream.proxy.strip_prefix = proxy.value("strip_prefix", false);
+                upstream.proxy.response_timeout_ms = proxy.value("response_timeout_ms", 30000);
+
+                if (proxy.contains("methods")) {
+                    if (!proxy["methods"].is_array())
+                        throw std::runtime_error("upstream proxy methods must be an array");
+                    for (const auto& m : proxy["methods"]) {
+                        if (!m.is_string())
+                            throw std::runtime_error("upstream proxy method must be a string");
+                        upstream.proxy.methods.push_back(m.get<std::string>());
+                    }
+                }
+
+                if (proxy.contains("header_rewrite")) {
+                    if (!proxy["header_rewrite"].is_object())
+                        throw std::runtime_error("upstream proxy header_rewrite must be an object");
+                    auto& hr = proxy["header_rewrite"];
+                    upstream.proxy.header_rewrite.set_x_forwarded_for = hr.value("set_x_forwarded_for", true);
+                    upstream.proxy.header_rewrite.set_x_forwarded_proto = hr.value("set_x_forwarded_proto", true);
+                    upstream.proxy.header_rewrite.set_via_header = hr.value("set_via_header", true);
+                    upstream.proxy.header_rewrite.rewrite_host = hr.value("rewrite_host", true);
+                }
+
+                if (proxy.contains("retry")) {
+                    if (!proxy["retry"].is_object())
+                        throw std::runtime_error("upstream proxy retry must be an object");
+                    auto& r = proxy["retry"];
+                    upstream.proxy.retry.max_retries = r.value("max_retries", 0);
+                    upstream.proxy.retry.retry_on_connect_failure = r.value("retry_on_connect_failure", true);
+                    upstream.proxy.retry.retry_on_5xx = r.value("retry_on_5xx", false);
+                    upstream.proxy.retry.retry_on_timeout = r.value("retry_on_timeout", false);
+                    upstream.proxy.retry.retry_on_disconnect = r.value("retry_on_disconnect", true);
+                    upstream.proxy.retry.retry_non_idempotent = r.value("retry_non_idempotent", false);
+                }
+            }
+
             config.upstreams.push_back(std::move(upstream));
         }
     }
@@ -608,6 +649,31 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     "'): pool.max_requests_per_conn must be >= 0 (0 = unlimited)");
             }
 
+            // Proxy config validation
+            if (!u.proxy.route_prefix.empty()) {
+                if (u.proxy.response_timeout_ms <= 0) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): proxy.response_timeout_ms must be > 0");
+                }
+                if (u.proxy.retry.max_retries < 0 || u.proxy.retry.max_retries > 10) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): proxy.retry.max_retries must be >= 0 and <= 10");
+                }
+                // Validate method names
+                static const std::unordered_set<std::string> valid_methods = {
+                    "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"
+                };
+                for (const auto& m : u.proxy.methods) {
+                    if (valid_methods.find(m) == valid_methods.end()) {
+                        throw std::invalid_argument(
+                            idx + " ('" + u.name +
+                            "'): proxy.methods contains invalid method: " + m);
+                    }
+                }
+            }
+
             // Upstream TLS validation
             if (u.tls.enabled) {
                 if (u.tls.min_version != "1.2" && u.tls.min_version != "1.3") {
@@ -699,6 +765,31 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
         uj["pool"]["idle_timeout_sec"]     = u.pool.idle_timeout_sec;
         uj["pool"]["max_lifetime_sec"]     = u.pool.max_lifetime_sec;
         uj["pool"]["max_requests_per_conn"]= u.pool.max_requests_per_conn;
+        if (!u.proxy.route_prefix.empty()) {
+            nlohmann::json pj;
+            pj["route_prefix"] = u.proxy.route_prefix;
+            pj["strip_prefix"] = u.proxy.strip_prefix;
+            pj["response_timeout_ms"] = u.proxy.response_timeout_ms;
+            pj["methods"] = u.proxy.methods;
+
+            nlohmann::json hrj;
+            hrj["set_x_forwarded_for"] = u.proxy.header_rewrite.set_x_forwarded_for;
+            hrj["set_x_forwarded_proto"] = u.proxy.header_rewrite.set_x_forwarded_proto;
+            hrj["set_via_header"] = u.proxy.header_rewrite.set_via_header;
+            hrj["rewrite_host"] = u.proxy.header_rewrite.rewrite_host;
+            pj["header_rewrite"] = hrj;
+
+            nlohmann::json rj;
+            rj["max_retries"] = u.proxy.retry.max_retries;
+            rj["retry_on_connect_failure"] = u.proxy.retry.retry_on_connect_failure;
+            rj["retry_on_5xx"] = u.proxy.retry.retry_on_5xx;
+            rj["retry_on_timeout"] = u.proxy.retry.retry_on_timeout;
+            rj["retry_on_disconnect"] = u.proxy.retry.retry_on_disconnect;
+            rj["retry_non_idempotent"] = u.proxy.retry.retry_non_idempotent;
+            pj["retry"] = rj;
+
+            uj["proxy"] = pj;
+        }
         j["upstreams"].push_back(uj);
     }
 

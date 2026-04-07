@@ -360,6 +360,12 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
     // Propagate dispatcher index for upstream pool partition affinity
     req.dispatcher_index = conn_->dispatcher_index();
 
+    // Propagate peer connection metadata for proxy header rewriting
+    // (X-Forwarded-For, X-Forwarded-Proto) and log correlation (client_fd).
+    req.client_ip = conn_->ip_addr();
+    req.client_tls = conn_->HasTls();
+    req.client_fd = conn_->fd();
+
     // Count every completed request parse — dispatched, rejected, or upgraded.
     if (callbacks_.request_count_callback) {
         callbacks_.request_count_callback();

@@ -272,6 +272,29 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
         return;
     }
 
+    // Early-response poison: if the borrower marked this connection as closing
+    // (e.g., upstream sent a response before the request write completed, leaving
+    // stale request bytes in the transport's output buffer), destroy it instead
+    // of returning to idle.
+    if (owned->IsClosing()) {
+        DestroyConnection(std::move(owned));
+        PurgeExpiredWaitEntries();
+        if (!alive->load(std::memory_order_acquire)) return;
+        while (!shutting_down_ &&
+               !manager_shutting_down_.load(std::memory_order_acquire) &&
+               !wait_queue_.empty() &&
+               TotalCount() < partition_max_connections_) {
+            auto entry = std::move(wait_queue_.front());
+            wait_queue_.pop_front();
+            size_t count_before = TotalCount();
+            CreateNewConnection(std::move(entry.ready_callback),
+                                std::move(entry.error_callback));
+            if (!alive->load(std::memory_order_acquire)) return;
+            if (TotalCount() > count_before) break;
+        }
+        return;
+    }
+
     owned->IncrementRequestCount();
     owned->MarkIdle();
 

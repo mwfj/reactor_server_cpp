@@ -813,6 +813,11 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
     // Propagate dispatcher index for upstream pool partition affinity
     if (conn_) {
         req.dispatcher_index = conn_->dispatcher_index();
+        // Propagate peer connection metadata for proxy header rewriting
+        // (X-Forwarded-For, X-Forwarded-Proto) and log correlation (client_fd).
+        req.client_ip = conn_->ip_addr();
+        req.client_tls = conn_->HasTls();
+        req.client_fd = conn_->fd();
     }
 
     // RFC 9110 Section 8.6: If content-length is declared, the actual body

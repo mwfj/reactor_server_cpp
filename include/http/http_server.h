@@ -16,8 +16,9 @@
 #include <set>
 #include <string>
 
-// Forward declaration for upstream pool
+// Forward declarations for upstream pool and proxy
 class UpstreamManager;
+class ProxyHandler;
 
 class HttpServer {
 public:
@@ -103,6 +104,13 @@ public:
     void DeleteAsync(const std::string& path, HttpRouter::AsyncHandler handler);
     void RouteAsync(const std::string& method, const std::string& path,
                     HttpRouter::AsyncHandler handler);
+
+    // Proxy route registration: forward all requests matching route_pattern
+    // to the named upstream service. The upstream must be configured in the
+    // server config's upstreams array. The proxy config comes from the
+    // upstream's proxy section in the config.
+    void Proxy(const std::string& route_pattern,
+               const std::string& upstream_service_name);
 
     // Server lifecycle.
     // NOTE: Start/Stop is one-shot — after Stop(), the internal dispatchers
@@ -281,4 +289,10 @@ private:
     // Upstream connection pool
     std::vector<UpstreamConfig> upstream_configs_;
     std::unique_ptr<UpstreamManager> upstream_manager_;
+
+    // Proxy handlers (one per upstream with proxy config)
+    std::unordered_map<std::string, std::unique_ptr<ProxyHandler>> proxy_handlers_;
+
+    // Auto-register proxy routes from upstream configs at Start() time
+    void RegisterProxyRoutes();
 };

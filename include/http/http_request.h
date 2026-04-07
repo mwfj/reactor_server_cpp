@@ -27,6 +27,12 @@ struct HttpRequest {
     // Mutable because it's set at dispatch time, not parser time.
     mutable int dispatcher_index = -1;
 
+    // Peer connection metadata -- set by the connection handler at dispatch time.
+    // Mutable because they are populated during dispatch, not during parsing.
+    mutable std::string client_ip;    // Peer remote address (from ConnectionHandler::ip_addr())
+    mutable bool client_tls = false;  // True if downstream connection has TLS
+    mutable int client_fd = -1;       // Client socket fd (for log correlation)
+
     // Case-insensitive header lookup
     std::string GetHeader(const std::string& name) const {
         std::string lower = name;
@@ -58,5 +64,8 @@ struct HttpRequest {
         complete = false;
         params.clear();
         dispatcher_index = -1;
+        client_ip.clear();
+        client_tls = false;
+        client_fd = -1;
     }
 };

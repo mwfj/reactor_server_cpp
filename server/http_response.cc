@@ -182,8 +182,16 @@ HttpResponse HttpResponse::InternalError(const std::string& message) {
     return HttpResponse().Status(500).Text(message);
 }
 
+HttpResponse HttpResponse::BadGateway() {
+    return HttpResponse().Status(502).Text("Bad Gateway");
+}
+
 HttpResponse HttpResponse::ServiceUnavailable() {
     return HttpResponse().Status(503).Text("Service Unavailable");
+}
+
+HttpResponse HttpResponse::GatewayTimeout() {
+    return HttpResponse().Status(504).Text("Gateway Timeout");
 }
 
 HttpResponse HttpResponse::PayloadTooLarge() {

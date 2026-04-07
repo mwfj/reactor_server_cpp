@@ -3,6 +3,7 @@
 #include "ws/websocket_frame.h"
 #include "http2/http2_constants.h"
 #include "upstream/upstream_manager.h"
+#include "upstream/proxy_handler.h"
 #include "log/logger.h"
 #include <algorithm>
 #include <set>
@@ -117,6 +118,9 @@ void HttpServer::MarkServerReady() {
             }
         }
     }
+
+    // Auto-register proxy routes from upstream configs
+    RegisterProxyRoutes();
 
     start_time_ = std::chrono::steady_clock::now();
     server_ready_.store(true, std::memory_order_release);
@@ -398,6 +402,133 @@ void HttpServer::PostAsync(const std::string& path, HttpRouter::AsyncHandler han
 void HttpServer::PutAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { router_.RouteAsync("PUT",    path, std::move(handler)); }
 void HttpServer::DeleteAsync(const std::string& path, HttpRouter::AsyncHandler handler) { router_.RouteAsync("DELETE", path, std::move(handler)); }
 void HttpServer::RouteAsync(const std::string& method, const std::string& path, HttpRouter::AsyncHandler handler) { router_.RouteAsync(method, path, std::move(handler)); }
+
+void HttpServer::Proxy(const std::string& route_pattern,
+                       const std::string& upstream_service_name) {
+    // Find the upstream config
+    const UpstreamConfig* found = nullptr;
+    for (const auto& u : upstream_configs_) {
+        if (u.name == upstream_service_name) {
+            found = &u;
+            break;
+        }
+    }
+    if (!found) {
+        logging::Get()->error("Proxy: upstream service '{}' not configured",
+                              upstream_service_name);
+        return;
+    }
+
+    if (!upstream_manager_) {
+        logging::Get()->error("Proxy: upstream manager not initialized "
+                              "(call Proxy after Start)");
+        return;
+    }
+
+    // Create ProxyHandler for this upstream
+    auto handler = std::make_unique<ProxyHandler>(
+        upstream_service_name,
+        found->proxy,
+        found->host,
+        found->port,
+        upstream_manager_.get());
+
+    // Capture raw pointer -- ProxyHandler is owned by proxy_handlers_ and
+    // outlives all route dispatches (cleared only in Stop/destructor).
+    ProxyHandler* handler_ptr = handler.get();
+
+    // Determine methods to register
+    std::vector<std::string> methods = found->proxy.methods;
+    if (methods.empty()) {
+        // All standard methods
+        methods = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"};
+    }
+
+    // Register async routes for each method
+    for (const auto& method : methods) {
+        router_.RouteAsync(method, route_pattern,
+            [handler_ptr](const HttpRequest& request,
+                          HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
+                handler_ptr->Handle(request, std::move(complete));
+            });
+    }
+
+    logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
+                         route_pattern, upstream_service_name,
+                         found->host, found->port);
+
+    proxy_handlers_[upstream_service_name] = std::move(handler);
+}
+
+void HttpServer::RegisterProxyRoutes() {
+    if (!upstream_manager_) {
+        return;
+    }
+
+    for (const auto& upstream : upstream_configs_) {
+        if (upstream.proxy.route_prefix.empty()) {
+            continue;  // No proxy config for this upstream
+        }
+
+        // Create ONE ProxyHandler per upstream. Both route patterns (exact
+        // prefix + catch-all) share the same handler_ptr. Calling Proxy()
+        // twice for the same upstream.name would destroy the first handler
+        // via proxy_handlers_[name] = move(handler2), leaving the first
+        // route's lambda with a dangling pointer.
+        auto handler = std::make_unique<ProxyHandler>(
+            upstream.name,
+            upstream.proxy,
+            upstream.host,
+            upstream.port,
+            upstream_manager_.get());
+        ProxyHandler* handler_ptr = handler.get();
+
+        static const std::vector<std::string> DEFAULT_PROXY_METHODS =
+            {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"};
+        const auto& methods = upstream.proxy.methods.empty()
+            ? DEFAULT_PROXY_METHODS : upstream.proxy.methods;
+
+        auto register_route = [&](const std::string& pattern) {
+            for (const auto& method : methods) {
+                router_.RouteAsync(method, pattern,
+                    [handler_ptr](const HttpRequest& request,
+                                  HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
+                        handler_ptr->Handle(request, std::move(complete));
+                    });
+            }
+            logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
+                                 pattern, upstream.name,
+                                 upstream.host, upstream.port);
+        };
+
+        // Check if the route_prefix already has a catch-all segment
+        std::string route_pattern = upstream.proxy.route_prefix;
+        bool has_catch_all = false;
+        auto star_pos = route_pattern.rfind('*');
+        if (star_pos != std::string::npos) {
+            auto last_slash = route_pattern.rfind('/');
+            if (last_slash != std::string::npos && star_pos > last_slash) {
+                has_catch_all = true;
+            }
+        }
+
+        if (!has_catch_all) {
+            // Register the exact prefix to handle requests that match it
+            // without a trailing path (e.g., /api/users).
+            register_route(upstream.proxy.route_prefix);
+
+            // Also register the catch-all variant for sub-paths.
+            if (route_pattern.back() != '/') {
+                route_pattern += '/';
+            }
+            route_pattern += "*proxy_path";
+        }
+
+        register_route(route_pattern);
+
+        proxy_handlers_[upstream.name] = std::move(handler);
+    }
+}
 
 void HttpServer::Start() {
     logging::Get()->info("HttpServer starting");
@@ -882,6 +1013,12 @@ void HttpServer::Stop() {
         h2_connections_.clear();
         pending_detection_.clear();
     }
+    // Clear proxy handlers after upstream shutdown. ProxyHandlers hold raw
+    // UpstreamManager* pointers, but upstream_manager_ is still alive here
+    // (destroyed in ~HttpServer). Clearing here prevents any stale route
+    // callback from reaching a proxy handler after Stop().
+    proxy_handlers_.clear();
+
     // Clear one-shot drain state (Stop may be called from destructor too)
     {
         std::lock_guard<std::mutex> dlck(drain_mtx_);
