@@ -3,6 +3,9 @@
 #include "tls/tls_context.h"
 // <string>, <stdexcept> provided by common.h (via tls_context.h)
 
+// Forward declaration — avoids pulling tls_client_context.h into every includer
+class TlsClientContext;
+
 class TlsConnection {
 public:
     // TLS operation return codes
@@ -13,7 +16,12 @@ public:
     static constexpr int TLS_PEER_CLOSED = -2;  // Peer sent close_notify (Read only)
     static constexpr int TLS_CROSS_RW    = -3;  // Read needs write / Write needs read (renegotiation)
 
+    // Server-mode constructor (existing)
     TlsConnection(TlsContext& ctx, int fd);
+
+    // Client-mode constructor — uses TLS_client_method context.
+    // If sni_hostname is non-empty, sets SNI (Server Name Indication) for virtual hosting.
+    TlsConnection(TlsClientContext& ctx, int fd, const std::string& sni_hostname = "");
     ~TlsConnection();
 
     // Non-copyable and non-movable (SSL* ownership must not be transferred)
@@ -27,6 +35,11 @@ public:
 
     // Returns: >0 bytes read, TLS_COMPLETE (would_block), TLS_CROSS_RW, TLS_PEER_CLOSED, or TLS_ERROR
     int Read(char* buf, size_t len);
+
+    // Non-destructive peek: returns >0 if application data is buffered,
+    // TLS_COMPLETE if no app data (benign TLS record consumed internally),
+    // TLS_PEER_CLOSED if close_notify, or TLS_ERROR.
+    int Peek(char* buf, size_t len);
 
     // Returns: >0 bytes written, TLS_COMPLETE (would_block), TLS_CROSS_RW, or TLS_ERROR
     int Write(const char* buf, size_t len);

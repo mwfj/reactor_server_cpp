@@ -9,6 +9,14 @@ The server uses a 3-layer callback chain for separation of concerns. All callbac
   - `ChannelCallbacks` — Channel: read, write, close, error
   - `NetSrvCallbacks` — NetServer: new connection, close, error, message, send complete, timer
   - `DispatcherCallbacks` — Dispatcher: timeout trigger, timer handler
+- **`include/http/http_callbacks.h`** — HTTP/WS protocol callbacks (`HTTP_CALLBACKS_NAMESPACE`)
+  - `HttpConnCallbacks` — HttpConnectionHandler: request, route check, middleware, upgrade, request count, shutdown check
+  - `WsCallbacks` — WebSocketConnection: message, close, ping, error
+  - `AsyncCompletionCallback` — Delivers final HttpResponse to client (async routes)
+  - `AsyncHandler` — Async request handler receiving request + completion callback
+- **`include/upstream/upstream_callbacks.h`** — Upstream pool callbacks (`UPSTREAM_CALLBACKS_NAMESPACE`)
+  - `ReadyCallback` — Delivers a valid UpstreamLease on successful checkout
+  - `ErrorCallback` — Delivers a PoolPartition error code on checkout failure
 
 ## Layer 1: Channel (fd event dispatch)
 
@@ -86,3 +94,27 @@ All callbacks must handle partial reads/writes (EAGAIN/EWOULDBLOCK). Read loops 
 |------|-----------|---------|
 | `DispatcherTOTriggerCallback` | `void(shared_ptr<Dispatcher>)` | Timeout trigger |
 | `DispatcherTimerCallback` | `void(int)` | Timer handler |
+
+### HTTP Async Callbacks (`HTTP_CALLBACKS_NAMESPACE`)
+
+| Type | Signature | Purpose |
+|------|-----------|---------|
+| `AsyncCompletionCallback` | `void(HttpResponse)` | Deliver async response to client |
+| `AsyncHandler` | `void(const HttpRequest&, AsyncCompletionCallback)` | Async request handler |
+
+### Upstream Pool Callbacks (`UPSTREAM_CALLBACKS_NAMESPACE`)
+
+| Type | Signature | Purpose |
+|------|-----------|---------|
+| `ReadyCallback` | `void(UpstreamLease)` | Successful checkout — delivers RAII lease |
+| `ErrorCallback` | `void(int error_code)` | Failed checkout — delivers error code |
+
+**Checkout error codes** (defined on `PoolPartition`):
+
+| Code | Constant | Meaning |
+|------|----------|---------|
+| -1 | `CHECKOUT_POOL_EXHAUSTED` | All connections busy, wait queue full |
+| -2 | `CHECKOUT_CONNECT_FAILED` | TCP connect error |
+| -3 | `CHECKOUT_CONNECT_TIMEOUT` | Connect deadline expired |
+| -4 | `CHECKOUT_SHUTTING_DOWN` | Pool is shutting down |
+| -5 | `CHECKOUT_QUEUE_TIMEOUT` | Wait queue entry expired |

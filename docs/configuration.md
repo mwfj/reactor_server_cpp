@@ -135,6 +135,72 @@ Environment variables take precedence over JSON file values:
 | `REACTOR_HTTP2_MAX_FRAME_SIZE` | `http2.max_frame_size` | int |
 | `REACTOR_HTTP2_MAX_HEADER_LIST_SIZE` | `http2.max_header_list_size` | int |
 
+### Upstream Configuration
+
+Upstream connection pools are configured via the `upstreams` array in the JSON config. Each entry defines a named backend service with its own pool and optional TLS settings.
+
+```json
+{
+    "upstreams": [
+        {
+            "name": "api-backend",
+            "host": "10.0.1.5",
+            "port": 8080,
+            "tls": {
+                "enabled": false
+            },
+            "pool": {
+                "max_connections": 64,
+                "max_idle_connections": 16,
+                "connect_timeout_ms": 5000,
+                "idle_timeout_sec": 90,
+                "max_lifetime_sec": 3600,
+                "max_requests_per_conn": 0
+            }
+        },
+        {
+            "name": "auth-service",
+            "host": "auth.internal",
+            "port": 443,
+            "tls": {
+                "enabled": true,
+                "ca_file": "/etc/ssl/ca-bundle.crt",
+                "verify_peer": true,
+                "sni_hostname": "auth.internal",
+                "min_version": "1.2"
+            },
+            "pool": {
+                "max_connections": 32,
+                "connect_timeout_ms": 3000
+            }
+        }
+    ]
+}
+```
+
+**Pool fields** (`pool.*`):
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_connections` | 64 | Total connections per service (split across dispatchers) |
+| `max_idle_connections` | 16 | Max idle connections to keep warm |
+| `connect_timeout_ms` | 5000 | TCP connect timeout in milliseconds |
+| `idle_timeout_sec` | 90 | Close idle connections after this many seconds |
+| `max_lifetime_sec` | 3600 | Max connection age before forced rotation (0 = unlimited) |
+| `max_requests_per_conn` | 0 | Max requests per connection before rotation (0 = unlimited) |
+
+**Upstream TLS fields** (`tls.*`):
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | false | Enable TLS for upstream connections |
+| `ca_file` | "" | CA certificate bundle for peer verification |
+| `verify_peer` | true | Verify upstream server certificate |
+| `sni_hostname` | "" | SNI hostname for TLS handshake |
+| `min_version` | "1.2" | Minimum TLS version ("1.2" or "1.3") |
+
+**Note:** Upstream configuration changes require a server restart — pools are built once during `Start()` and cannot be rebuilt at runtime.
+
 ### Validation
 
 `ConfigLoader::Validate()` checks:

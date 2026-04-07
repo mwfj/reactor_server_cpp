@@ -2,15 +2,24 @@
 #include "config/config_loader.h"
 #include "ws/websocket_frame.h"
 #include "http2/http2_constants.h"
+#include "upstream/upstream_manager.h"
 #include "log/logger.h"
 #include <algorithm>
 #include <set>
 
 // RAII guard: decrements an atomic counter on scope exit. Used in request
 // dispatch callbacks to ensure active_requests_ is decremented even on throw.
+// Takes the shared_ptr by reference so the guard doesn't extend the atomic's
+// lifetime on its own — only the async completion callback needs that.
 struct RequestGuard {
-    std::atomic<int64_t>& counter;
-    ~RequestGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
+    std::shared_ptr<std::atomic<int64_t>>& counter;
+    bool armed = true;
+    ~RequestGuard() { if (armed) counter->fetch_sub(1, std::memory_order_relaxed); }
+    // Disarm so the decrement does NOT fire on scope exit. Used by async
+    // routes: the request is logically still in-flight after the handler
+    // returns, and active_requests_ must stay elevated until the
+    // completion callback fires. The callback path handles the decrement.
+    void release() { armed = false; }
     RequestGuard(const RequestGuard&) = delete;
     RequestGuard& operator=(const RequestGuard&) = delete;
 };
@@ -41,19 +50,74 @@ bool HttpServer::HasPendingH1Output() {
     std::lock_guard<std::mutex> lck(conn_mtx_);
     for (const auto& [fd, http_conn] : http_connections_) {
         auto conn = http_conn->GetConnection();
+        if (!conn || conn->IsClosing()) continue;
         // Use atomic flags as a race-free proxy for "output buffer not empty":
         // close_after_write is set by the close sweep, and cleared (via
         // ForceClose → IsClosing) when the buffer drains to zero. Reading
         // OutputBufferSize() directly would be UB (non-atomic std::string
         // read while dispatcher threads write).
-        if (conn && conn->IsCloseDeferred() && !conn->IsClosing()) {
-            return true;
-        }
+        if (conn->IsCloseDeferred()) return true;
+        // Deferred async responses (HTTP/1 async routes waiting on upstream
+        // or other external work) are exempt from the close sweep. Their
+        // completion callbacks still need to run and write their response,
+        // so HttpServer::Stop()'s H1 drain loop must stay alive for them
+        // too — otherwise the drain exits early, the event loops stop,
+        // and the deferred response is silently dropped.
+        if (conn->IsShutdownExempt()) return true;
     }
     return false;
 }
 
 void HttpServer::MarkServerReady() {
+    // Assign dispatcher indices for upstream pool partition affinity
+    const auto& dispatchers = net_server_.GetSocketDispatchers();
+    for (size_t i = 0; i < dispatchers.size(); ++i) {
+        dispatchers[i]->SetDispatcherIndex(static_cast<int>(i));
+    }
+
+    // Create upstream pool manager if upstreams are configured.
+    // This is fatal: if upstreams are explicitly configured, the server
+    // cannot serve proxy traffic without them. On failure, stop the server
+    // (dispatchers are already running) and rethrow so the caller sees the
+    // error instead of silently starting without upstream pools.
+    if (!upstream_configs_.empty()) {
+        try {
+            upstream_manager_ = std::make_unique<UpstreamManager>(
+                upstream_configs_, dispatchers);
+        } catch (...) {
+            logging::Get()->error("Upstream pool init failed, stopping server");
+            net_server_.Stop();
+            throw;
+        }
+
+        // Ensure the timer cadence is fast enough for upstream connect timeouts.
+        // SetDeadline stores a ms-precision deadline, but TimerHandler only fires
+        // at the timer scan interval. If connect_timeout_ms < current interval,
+        // timeouts would fire late. Reduce the interval if needed.
+        int min_upstream_sec = std::numeric_limits<int>::max();
+        for (const auto& u : upstream_configs_) {
+            // ceil division: ensures the timer fires within 1 interval of the
+            // deadline, minimizing overshoot. Floor would let deadlines fire
+            // up to (interval - 1)s late in the worst case.
+            int connect_sec = std::max(
+                (u.pool.connect_timeout_ms + 999) / 1000, 1);
+            min_upstream_sec = std::min(min_upstream_sec, connect_sec);
+            // Also consider idle timeout for eviction cadence
+            if (u.pool.idle_timeout_sec > 0) {
+                min_upstream_sec = std::min(min_upstream_sec,
+                                            u.pool.idle_timeout_sec);
+            }
+        }
+        if (min_upstream_sec < std::numeric_limits<int>::max()) {
+            int current_interval = net_server_.GetTimerInterval();
+            if (min_upstream_sec < current_interval) {
+                net_server_.SetTimerInterval(min_upstream_sec);
+                logging::Get()->debug("Timer interval reduced to {}s for "
+                                      "upstream timeouts", min_upstream_sec);
+            }
+        }
+    }
+
     start_time_ = std::chrono::steady_clock::now();
     server_ready_.store(true, std::memory_order_release);
 }
@@ -158,6 +222,22 @@ void HttpServer::WireNetServerCallbacks() {
             }
             if (h2_conn) {
                 h2_conn->OnWriteProgress(remaining);
+            }
+        });
+
+    // Wire timer callback for upstream pool idle eviction.
+    // Fires periodically on each dispatcher thread (via TimerHandler
+    // and epoll_wait timeout) — calls EvictExpired on the partition
+    // for that dispatcher's index.
+    // Guard with server_ready_ to avoid racing with MarkServerReady()
+    // which writes upstream_manager_ from the main thread. The acquire
+    // load synchronizes with the release store in MarkServerReady().
+    net_server_.SetTimerCb(
+        [this](std::shared_ptr<Dispatcher> disp) {
+            if (server_ready_.load(std::memory_order_acquire) &&
+                upstream_manager_ && disp->dispatcher_index() >= 0) {
+                upstream_manager_->EvictExpired(
+                    static_cast<size_t>(disp->dispatcher_index()));
             }
         });
 }
@@ -267,6 +347,9 @@ HttpServer::HttpServer(const ServerConfig& config)
     h2_settings_.initial_window_size    = config.http2.initial_window_size;
     h2_settings_.max_frame_size         = config.http2.max_frame_size;
     h2_settings_.max_header_list_size   = config.http2.max_header_list_size;
+
+    // Store upstream configurations for pool creation in Start()
+    upstream_configs_ = config.upstreams;
 }
 
 size_t HttpServer::ComputeInputCap() const {
@@ -310,6 +393,12 @@ void HttpServer::Route(const std::string& method, const std::string& path, HttpR
 void HttpServer::WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler) { router_.WebSocket(path, std::move(handler)); }
 void HttpServer::Use(HttpRouter::Middleware middleware) { router_.Use(std::move(middleware)); }
 
+void HttpServer::GetAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { router_.RouteAsync("GET",    path, std::move(handler)); }
+void HttpServer::PostAsync(const std::string& path, HttpRouter::AsyncHandler handler)   { router_.RouteAsync("POST",   path, std::move(handler)); }
+void HttpServer::PutAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { router_.RouteAsync("PUT",    path, std::move(handler)); }
+void HttpServer::DeleteAsync(const std::string& path, HttpRouter::AsyncHandler handler) { router_.RouteAsync("DELETE", path, std::move(handler)); }
+void HttpServer::RouteAsync(const std::string& method, const std::string& path, HttpRouter::AsyncHandler handler) { router_.RouteAsync(method, path, std::move(handler)); }
+
 void HttpServer::Start() {
     logging::Get()->info("HttpServer starting");
     net_server_.Start();
@@ -340,6 +429,21 @@ void HttpServer::Stop() {
     // between the WS snapshot and the H2 drain snapshot. Without this, a WS
     // accepted in the gap would miss the 1001 "Going Away" close frame.
     net_server_.StopAccepting();
+
+    // NOTE: upstream_manager_->InitiateShutdown() is NOT called here.
+    // It is deferred to pre_stop_drain_cb (after H2/WS/H1 protocol drain)
+    // so that proxy handlers dispatched during the drain window can still
+    // call CheckoutAsync() successfully. Calling InitiateShutdown too early
+    // would reject checkouts from already-accepted requests that only reach
+    // their upstream call late in the drain phase.
+    //
+    // HTTP/1 proxy handlers with no buffered client response at the time of
+    // the close sweep are protected by opting in via
+    // HttpConnectionHandler::SetShutdownExempt(true). The scan below (after
+    // the WS/H2 draining set is assembled) adds those connections to
+    // draining_conn_ptrs, exempting them from the CloseAfterWrite sweep until
+    // the handler sets the flag back to false (typically right before the
+    // final SendResponse).
 
     // Collect WS connections while holding the lock, then send close frames
     // AFTER releasing. Sending under the lock would deadlock: a failed inline
@@ -485,12 +589,19 @@ void HttpServer::Stop() {
     // the generic close sweep in NetServer::Stop().
     draining_conn_ptrs.insert(ws_draining.begin(), ws_draining.end());
 
+    // HTTP/1 async handlers (proxy / deferred responses) mark their transport
+    // exempt via ConnectionHandler::SetShutdownExempt, which NetServer's
+    // sweep live-checks per iteration. A pre-sweep snapshot here would be
+    // UNSAFE: a request that enters its async handler after the snapshot
+    // but before the sweep would be dropped by CloseAfterWrite on an empty
+    // output buffer. The live check closes that race.
+
     // Note: pending_detection_ connections are NOT exempted from the close
-    // sweep. If one becomes H2 late, DetectAndRouteProtocol's late drain
-    // path sends GOAWAY via RequestShutdown — the GOAWAY bytes drain through
-    // CloseAfterWrite's write path before ForceClose. Exempting all pending
-    // connections would leave unclassified/HTTP/1 sockets open with no drain
-    // tracking, bypassing shutdown teardown entirely.
+    // sweep here. If one becomes H2 late, DetectAndRouteProtocol's late
+    // drain path clears the pre-armed CloseAfterWrite and sets shutdown-
+    // exempt to block the stale lambda, then hands the connection to the
+    // H2 drain mechanism. Exempting all pending connections upfront would
+    // leave unclassified/HTTP/1 sockets open with no drain tracking.
 
     if (!draining_conn_ptrs.empty()) {
         net_server_.SetDrainingConns(std::move(draining_conn_ptrs));
@@ -564,6 +675,36 @@ void HttpServer::Stop() {
                 if (!h2_draining_.empty()) {
                     lck.unlock();
                     WaitForH2Drain();
+                }
+            }
+            // Upstream shutdown — deferred until AFTER H2/WS/H1 protocol
+            // drains so proxy handlers dispatched during the drain window
+            // can still call CheckoutAsync() successfully. Initiating here
+            // sets the reject-new-checkouts flag, then WaitForDrain waits
+            // for in-flight leases to complete.
+            if (upstream_manager_) {
+                upstream_manager_->InitiateShutdown();
+                upstream_manager_->WaitForDrain(
+                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
+                        std::memory_order_relaxed)));
+            }
+            // Post-upstream H1 flush window: an async (exempt) HTTP/1 handler
+            // whose completion fires during the upstream drain (or that takes
+            // longer than the first H1 drain loop) only starts writing its
+            // client response after the earlier H1 drain has finished. Use
+            // the operator-configured shutdown_drain_timeout_sec_ instead of
+            // the hard-coded H1_DRAIN_TIMEOUT_SEC: any async H1 route that
+            // doesn't go through UpstreamManager (or simply takes longer than
+            // 2s before it starts writing) would otherwise be cut off when
+            // StopEventLoop runs.
+            {
+                auto h1_deadline = std::chrono::steady_clock::now() +
+                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
+                        std::memory_order_relaxed));
+                while (std::chrono::steady_clock::now() < h1_deadline) {
+                    if (!HasPendingH1Output()) break;
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(PUMP_INTERVAL_MS));
                 }
             }
         });
@@ -686,10 +827,55 @@ void HttpServer::Stop() {
                     }
                 }
             }
+            // Upstream drain — initiate AFTER protocol drains so late
+            // proxy handlers can still check out. Then poll with task pump
+            // until leases are returned, and force-close stragglers.
+            // Followed by a second H1 flush window so async proxy
+            // responses that arrive DURING the upstream drain still have
+            // time to write their client bytes before the event loop stops.
+            if (upstream_manager_) {
+                upstream_manager_->InitiateShutdown();
+                static constexpr int UP_PUMP_MS = 200;
+                auto up_deadline = std::chrono::steady_clock::now() +
+                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
+                        std::memory_order_relaxed));
+                while (std::chrono::steady_clock::now() < up_deadline) {
+                    net_server_.ProcessSelfDispatcherTasks();
+                    if (upstream_manager_->AllDrained()) break;
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(UP_PUMP_MS));
+                }
+                upstream_manager_->ForceCloseRemaining();
+            }
+            // Post-upstream H1 flush window: use the configured drain budget
+            // so async H1 routes that take longer than 2s aren't cut off.
+            {
+                auto h1_deadline = std::chrono::steady_clock::now() +
+                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
+                        std::memory_order_relaxed));
+                while (std::chrono::steady_clock::now() < h1_deadline) {
+                    net_server_.ProcessSelfDispatcherTasks();
+                    if (!HasPendingH1Output()) break;
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(PUMP_INTERVAL_MS));
+                }
+            }
         });
     }
 
+    // Upstream shutdown is handled inside pre_stop_drain_cb (below),
+    // which runs AFTER H2 stream drain, WS close handshake, and H1 flush.
+    // This ensures in-flight proxy requests from all protocol paths complete
+    // before upstream checkouts are rejected.
+
     net_server_.Stop();
+
+    // Do NOT reset upstream_manager_ here. In the stop-from-handler case,
+    // the calling handler is still on the stack and may hold an UpstreamLease
+    // that destructs when the handler unwinds. upstream_manager_ must outlive
+    // all handler stack frames. It is destroyed naturally by ~HttpServer()
+    // after Stop() returns and all stack frames have unwound.
+
     {
         std::lock_guard<std::mutex> lck(conn_mtx_);
         http_connections_.clear();
@@ -702,6 +888,9 @@ void HttpServer::Stop() {
         h2_draining_.clear();
         ws_draining_.clear();
     }
+    // Clear shutdown flag so GetStats() stops reporting uptime.
+    // Without this, uptime keeps increasing after Stop() completes.
+    shutting_down_started_.store(false, std::memory_order_release);
 }
 
 void HttpServer::OnH2DrainComplete(ConnectionHandler* conn_ptr) {
@@ -765,8 +954,135 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
         [this](std::shared_ptr<HttpConnectionHandler> self,
                const HttpRequest& request,
                HttpResponse& response) {
-            active_requests_.fetch_add(1, std::memory_order_relaxed);
+            active_requests_->fetch_add(1, std::memory_order_relaxed);
             RequestGuard guard{active_requests_};
+
+            // Async routes take precedence over sync routes for the same
+            // path. The framework dispatches async handlers as follows:
+            //   1. Run middleware (auth, CORS, rate limiting). If it
+            //      rejects, fall through to the sync send path with the
+            //      rejection response — NEVER invoke the async handler.
+            //   2. Otherwise, call BeginAsyncResponse to save request
+            //      context + block the parser + mark shutdown-exempt, mark
+            //      the response deferred (so HandleCompleteRequest skips
+            //      auto-send), and invoke the user handler with a
+            //      protocol-agnostic completion callback.
+            //   3. The user invokes complete(final_response); the captured
+            //      weak_ptr re-locks the handler and CompleteAsyncResponse
+            //      performs normalization, sends the bytes, and either
+            //      closes or resumes parsing pipelined data.
+            bool async_head_fallback = false;
+            auto async_handler = router_.GetAsyncHandler(
+                request, &async_head_fallback);
+            if (async_handler) {
+                bool mw_ok = router_.RunMiddleware(request, response);
+                if (!mw_ok) {
+                    HttpRouter::FillDefaultRejectionResponse(response);
+                    if (!server_ready_.load(std::memory_order_acquire)) {
+                        response.Header("Connection", "close");
+                    }
+                    return;  // Sync send path below runs auto-send
+                }
+
+                // BeginAsyncResponse must see the ORIGINAL request so
+                // deferred_was_head_ captures the real client method —
+                // CompleteAsyncResponse uses it to strip the body at send
+                // time (RFC 7231 §4.3.2), mirroring the sync HEAD path.
+                response.Defer();
+                self->BeginAsyncResponse(request);
+
+                // Capture middleware-stamped headers (CORS, trace IDs,
+                // cookies) so the completion callback can merge them into
+                // the user's final response. Rejected requests already keep
+                // these headers (the sync send path serializes `response`),
+                // but successful async completions build a new HttpResponse
+                // from scratch and would lose them without this capture.
+                auto mw_headers = response.GetHeaders();
+
+                std::weak_ptr<HttpConnectionHandler> weak_self = self;
+                auto active_counter = active_requests_;
+                // Two guards for the complete-then-throw edge case:
+                //   completed: one-shot entry — prevents duplicate callback
+                //              invocations (handler calls complete twice).
+                //   cancelled: set by the catch block — prevents the INNER
+                //              RunOnDispatcher lambda from running after the
+                //              outer catch already sent a 500. Without this,
+                //              a handler that calls complete() synchronously
+                //              and then throws would double-finish: the
+                //              enqueued lambda runs CompleteAsyncResponse +
+                //              decrements, and the guard also decrements.
+                auto completed = std::make_shared<std::atomic<bool>>(false);
+                auto cancelled = std::make_shared<std::atomic<bool>>(false);
+                HttpRouter::AsyncCompletionCallback complete =
+                    [weak_self, active_counter,
+                     mw_headers, completed, cancelled](HttpResponse final_resp) {
+                        if (completed->exchange(true)) return;
+                        // Merge middleware + handler headers: middleware
+                        // first (base), handler second (overrides for
+                        // non-repeatable, appends for repeatable).
+                        HttpResponse merged;
+                        merged.Status(final_resp.GetStatusCode(),
+                                      final_resp.GetStatusReason());
+                        merged.Body(final_resp.GetBody());
+                        for (const auto& mh : mw_headers) {
+                            merged.Header(mh.first, mh.second);
+                        }
+                        for (const auto& fh : final_resp.GetHeaders()) {
+                            merged.Header(fh.first, fh.second);
+                        }
+                        auto s = weak_self.lock();
+                        if (!s) {
+                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                            return;
+                        }
+                        auto conn = s->GetConnection();
+                        if (!conn) {
+                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                            return;
+                        }
+                        auto shared_resp = std::make_shared<HttpResponse>(
+                            std::move(merged));
+                        conn->RunOnDispatcher(
+                            [s, shared_resp, active_counter, cancelled]() {
+                            if (cancelled->load(std::memory_order_acquire)) return;
+                            s->CompleteAsyncResponse(std::move(*shared_resp));
+                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                        });
+                    };
+
+                // Don't release the guard until the handler returns
+                // successfully. If the handler throws, the guard fires
+                // during stack unwinding and decrements active_requests_.
+                // The inner catch clears deferred state before rethrowing
+                // so the outer catch in HandleCompleteRequest can send a
+                // 500 and close normally (CloseAfterWrite won't be blocked
+                // by shutdown_exempt_, and OnRawData won't buffer into
+                // the deferred stash).
+                try {
+                    if (async_head_fallback) {
+                        HttpRequest get_req = request;
+                        get_req.method = "GET";
+                        async_handler(get_req, std::move(complete));
+                    } else {
+                        async_handler(request, std::move(complete));
+                    }
+                } catch (...) {
+                    // Mark both flags: completed stops a stored callback
+                    // from re-entering; cancelled stops any already-queued
+                    // RunOnDispatcher lambda from running (handles the
+                    // complete-then-throw case). CancelAsyncResponse clears
+                    // deferred state so the outer catch's 500 + close works.
+                    completed->store(true, std::memory_order_relaxed);
+                    cancelled->store(true, std::memory_order_release);
+                    self->CancelAsyncResponse();
+                    throw;  // outer catch sends 500 + closes
+                }
+                // Handler returned without throwing — it owns the
+                // completion callback and is responsible for invoking it.
+                // Disarm the guard so the callback handles the decrement.
+                guard.release();
+                return;
+            }
 
             if (!router_.Dispatch(request, response)) {
                 response.Status(404).Text("Not Found");
@@ -1230,6 +1546,16 @@ bool HttpServer::DetectAndRouteProtocol(
             SetupH2Handlers(h2_conn);
             h2_connections_[conn->fd()] = h2_conn;
         }
+        // Late H2 detection during shutdown: clear any pre-armed close flag
+        // BEFORE Initialize — Initialize sends the server preface and may
+        // dispatch/send the buffered request, whose DoSendRaw/CallWriteCb
+        // would honor the stale close_after_write_ and ForceClose on the
+        // first empty-buffer moment, truncating the request this drain path
+        // is trying to preserve.
+        if (!server_ready_.load(std::memory_order_acquire)) {
+            conn->ClearCloseAfterWrite();
+            conn->SetShutdownExempt(true);
+        }
         h2_conn->Initialize(message);
         // Late H2 detection during shutdown: full drain bookkeeping so
         // WaitForH2Drain() tracks this session and NetServer::Stop() exempts
@@ -1237,9 +1563,14 @@ bool HttpServer::DetectAndRouteProtocol(
         // Initialize processes buffered data — requests already in the packet
         // are honored (drained), not refused.
         if (!server_ready_.load(std::memory_order_acquire)) {
-            h2_conn->RequestShutdown();
             ConnectionHandler* conn_ptr = conn.get();
-            h2_conn->SetDrainCompleteCallback([this, conn_ptr]() {
+            std::weak_ptr<ConnectionHandler> conn_weak = conn;
+            h2_conn->SetDrainCompleteCallback([this, conn_ptr, conn_weak]() {
+                // Clear exemption before NotifyDrainComplete's CloseAfterWrite
+                // fires — it was only needed to block the stale pre-armed lambda.
+                if (auto c = conn_weak.lock()) {
+                    c->SetShutdownExempt(false);
+                }
                 OnH2DrainComplete(conn_ptr);
             });
             {
@@ -1335,12 +1666,94 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     });
 
     h2_conn->SetRequestCallback(
-        [this](std::shared_ptr<Http2ConnectionHandler> /*self*/,
-               int32_t /*stream_id*/,
+        [this](std::shared_ptr<Http2ConnectionHandler> self,
+               int32_t stream_id,
                const HttpRequest& request,
                HttpResponse& response) {
-            active_requests_.fetch_add(1, std::memory_order_relaxed);
+            active_requests_->fetch_add(1, std::memory_order_relaxed);
             RequestGuard guard{active_requests_};
+
+            // Async route dispatch — mirrors the HTTP/1 path. Middleware
+            // runs first (auth, CORS, rate limiting) and can reject before
+            // we invoke the async handler. On success we mark the response
+            // deferred (Http2Session::OnRequest returns early on IsDeferred)
+            // and hand the user a completion callback that captures
+            // stream_id + a weak_ptr to the H2 connection handler. H2's
+            // graceful-shutdown drain already waits on open streams, so
+            // the async operation is naturally protected during shutdown
+            // without needing shutdown_exempt_ bookkeeping.
+            bool async_head_fallback = false;
+            auto async_handler = router_.GetAsyncHandler(
+                request, &async_head_fallback);
+            if (async_handler) {
+                if (!router_.RunMiddleware(request, response)) {
+                    HttpRouter::FillDefaultRejectionResponse(response);
+                    return;
+                }
+                response.Defer();
+
+                auto mw_headers = response.GetHeaders();
+                std::weak_ptr<Http2ConnectionHandler> weak_self = self;
+                auto active_counter = active_requests_;
+                // Guard against double-submit: if the handler stores the
+                // callback and then throws, the outer catch in OnRequest
+                // synthesizes a 500 on the same stream. Without this flag,
+                // the stored callback fires later → double submit + double
+                // decrement of active_requests_. The catch path below
+                // marks `completed` so the callback becomes a no-op.
+                auto completed = std::make_shared<std::atomic<bool>>(false);
+                auto cancelled = std::make_shared<std::atomic<bool>>(false);
+                HttpRouter::AsyncCompletionCallback complete =
+                    [weak_self, stream_id, active_counter,
+                     mw_headers, completed, cancelled](HttpResponse final_resp) {
+                        if (completed->exchange(true)) return;
+                        // Same merge as H1: middleware first, handler second.
+                        HttpResponse merged;
+                        merged.Status(final_resp.GetStatusCode(),
+                                      final_resp.GetStatusReason());
+                        merged.Body(final_resp.GetBody());
+                        for (const auto& mh : mw_headers) {
+                            merged.Header(mh.first, mh.second);
+                        }
+                        for (const auto& fh : final_resp.GetHeaders()) {
+                            merged.Header(fh.first, fh.second);
+                        }
+                        auto s = weak_self.lock();
+                        if (!s) {
+                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                            return;
+                        }
+                        auto conn = s->GetConnection();
+                        if (!conn) {
+                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                            return;
+                        }
+                        auto shared_resp = std::make_shared<HttpResponse>(
+                            std::move(merged));
+                        conn->RunOnDispatcher(
+                            [s, stream_id, shared_resp, active_counter, cancelled]() {
+                            if (cancelled->load(std::memory_order_acquire)) return;
+                            s->SubmitStreamResponse(stream_id, *shared_resp);
+                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                        });
+                    };
+
+                try {
+                    if (async_head_fallback) {
+                        HttpRequest get_req = request;
+                        get_req.method = "GET";
+                        async_handler(get_req, std::move(complete));
+                    } else {
+                        async_handler(request, std::move(complete));
+                    }
+                } catch (...) {
+                    completed->store(true, std::memory_order_relaxed);
+                    cancelled->store(true, std::memory_order_release);
+                    throw;
+                }
+                guard.release();
+                return;
+            }
 
             if (!router_.Dispatch(request, response)) {
                 response.Status(404).Text("Not Found");
@@ -1367,6 +1780,24 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     );
 }
 
+HttpServer::ConnectionSnapshot HttpServer::SnapshotConnections() {
+    ConnectionSnapshot snap;
+    std::lock_guard<std::mutex> lck(conn_mtx_);
+    snap.h1.reserve(http_connections_.size());
+    for (auto& [fd, hconn] : http_connections_) {
+        snap.h1.push_back(hconn);
+    }
+    snap.h2.reserve(h2_connections_.size());
+    for (auto& [fd, h2conn] : h2_connections_) {
+        snap.h2.push_back(h2conn);
+    }
+    snap.pending.reserve(pending_detection_.size());
+    for (auto& [fd, pd] : pending_detection_) {
+        snap.pending.push_back(pd.conn);
+    }
+    return snap;
+}
+
 bool HttpServer::Reload(const ServerConfig& new_config) {
     // Gate on server readiness — socket_dispatchers_ is built during Start()
     // and must not be walked until construction is complete.
@@ -1385,11 +1816,22 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         validation_copy.bind_port = 8080;          // always valid
         validation_copy.worker_threads = 1;        // always valid
         validation_copy.tls.enabled = false;       // skip TLS path checks
-        // Validate H2 sub-settings only when the running server uses H2.
-        // When H2 is disabled at startup, Reload() copies sub-settings to
-        // h2_settings_ but they're never used (no H2 sessions are created),
-        // so invalid placeholder values are harmless and should not block reload.
-        validation_copy.http2.enabled = http2_enabled_;
+        // Validate H2 sub-settings only when the running server currently
+        // has H2 enabled AND the new config keeps it enabled. Two cases
+        // skip validation:
+        //   1. H2 disabled at startup (http2_enabled_=false): sub-settings
+        //      are never used, so placeholders are harmless.
+        //   2. H2 currently enabled but new config stages a disable
+        //      (new_config.http2.enabled=false): http2.enabled is restart-
+        //      only, so the disable won't take effect until restart. The
+        //      operator may be staging the disable alongside placeholder
+        //      H2 tuning; rejecting the reload would block live-safe
+        //      field changes (timeouts, limits, log level).
+        validation_copy.http2.enabled =
+            http2_enabled_ && new_config.http2.enabled;
+        // Upstream configs are restart-only — clear them so staged edits
+        // in the config file don't block live-safe field reloads.
+        validation_copy.upstreams.clear();
         try {
             ConfigLoader::Validate(validation_copy);
         } catch (const std::invalid_argument& e) {
@@ -1438,6 +1880,40 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);
         max_ws_message_size_.store(new_config.max_ws_message_size, std::memory_order_relaxed);
         net_server_.SetMaxInputSize(final_cap);
+
+        // Push updated limits to existing connections. Per-connection limits
+        // are dispatcher-thread-only fields (plain size_t, not atomic), so
+        // enqueue updates through each connection's dispatcher.
+        {
+            auto snap = SnapshotConnections();
+            size_t body = new_config.max_body_size;
+            size_t header = new_config.max_header_size;
+            size_t ws_msg = new_config.max_ws_message_size;
+
+            for (auto& hconn : snap.h1) {
+                auto conn = hconn->GetConnection();
+                if (!conn) continue;
+                conn->RunOnDispatcher([hconn, body, header, ws_msg, final_cap]() {
+                    hconn->UpdateSizeLimits(body, header, ws_msg, final_cap);
+                });
+            }
+            for (auto& h2conn : snap.h2) {
+                auto conn = h2conn->GetConnection();
+                if (!conn) continue;
+                conn->RunOnDispatcher([h2conn, conn, body, final_cap]() {
+                    h2conn->SetMaxBodySize(body);
+                    conn->SetMaxInputSize(final_cap);
+                });
+            }
+            // Pending-detection connections have no protocol handler yet —
+            // only the transport-level input cap needs updating.
+            for (auto& conn : snap.pending) {
+                if (!conn) continue;
+                conn->RunOnDispatcher([conn, final_cap]() {
+                    conn->SetMaxInputSize(final_cap);
+                });
+            }
+        }
     }
 
     // Update the remaining reload-safe fields
@@ -1445,6 +1921,44 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     shutdown_drain_timeout_sec_.store(new_config.shutdown_drain_timeout_sec,
                                      std::memory_order_relaxed);
     net_server_.SetMaxConnections(new_config.max_connections);
+
+    // Push updated request timeout to existing connections. Like size limits,
+    // request_timeout_sec_ is a plain int on each handler, snapshotted at
+    // accept time. Without this, long-lived keep-alive/H2 sessions use the
+    // old Slowloris deadline after a reload.
+    {
+        int timeout = new_config.request_timeout_sec;
+        auto snap = SnapshotConnections();
+
+        for (auto& hconn : snap.h1) {
+            auto conn = hconn->GetConnection();
+            if (!conn) continue;
+            conn->RunOnDispatcher([hconn, timeout]() {
+                hconn->SetRequestTimeout(timeout);
+            });
+        }
+        for (auto& h2conn : snap.h2) {
+            auto conn = h2conn->GetConnection();
+            if (!conn) continue;
+            conn->RunOnDispatcher([h2conn, timeout]() {
+                h2conn->SetRequestTimeout(timeout);
+            });
+        }
+        // Pending-detection connections have no protocol handler yet, but
+        // they may have partial data buffered (Slowloris on the preface).
+        // Set/clear a transport-level deadline to match the new timeout.
+        for (auto& conn : snap.pending) {
+            if (!conn) continue;
+            conn->RunOnDispatcher([conn, timeout]() {
+                if (timeout > 0) {
+                    conn->SetDeadline(std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(timeout));
+                } else {
+                    conn->ClearDeadline();
+                }
+            });
+        }
+    }
 
     // Update idle timeout via EnQueue to dispatcher threads
     net_server_.SetConnectionTimeout(
@@ -1457,9 +1971,21 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     // with old deadlines may see detection delayed by at most one extra
     // scan cycle when the interval grows, which is acceptable (timeout
     // changes are documented as applying to new connections).
-    net_server_.SetTimerInterval(
-        ComputeTimerInterval(new_config.idle_timeout_sec,
-                             new_config.request_timeout_sec));
+    {
+        int new_interval = ComputeTimerInterval(new_config.idle_timeout_sec,
+                                                 new_config.request_timeout_sec);
+        // Preserve upstream timeout cadence — upstream configs are restart-only,
+        // but the timer interval must not widen past the shortest upstream timeout.
+        for (const auto& u : upstream_configs_) {
+            int connect_sec = std::max(
+                (u.pool.connect_timeout_ms + 999) / 1000, 1);
+            new_interval = std::min(new_interval, connect_sec);
+            if (u.pool.idle_timeout_sec > 0) {
+                new_interval = std::min(new_interval, u.pool.idle_timeout_sec);
+            }
+        }
+        net_server_.SetTimerInterval(new_interval);
+    }
 
     // Update HTTP/2 settings for NEW connections only (under conn_mtx_).
     // Existing sessions keep their negotiated SETTINGS values — submitting
@@ -1475,6 +2001,14 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         h2_settings_.max_frame_size         = new_config.http2.max_frame_size;
         h2_settings_.max_header_list_size   = new_config.http2.max_header_list_size;
     }
+
+    // Upstream pool changes require a restart — pools are built once in Start()
+    // and cannot be rebuilt at runtime without a full drain cycle.
+    if (new_config.upstreams != upstream_configs_) {
+        logging::Get()->warn("Reload: upstream configuration changes require a "
+                             "restart to take effect (ignored)");
+    }
+
     return true;
 }
 
@@ -1499,7 +2033,7 @@ HttpServer::ServerStats HttpServer::GetStats() const {
         active_h2_streams_.load(std::memory_order_relaxed));
     stats.total_accepted          = total_accepted_.load(std::memory_order_relaxed);
     stats.total_requests          = total_requests_.load(std::memory_order_relaxed);
-    stats.active_requests         = active_requests_.load(std::memory_order_relaxed);
+    stats.active_requests         = active_requests_->load(std::memory_order_relaxed);
     stats.max_connections     = net_server_.GetMaxConnections();
     stats.idle_timeout_sec    = static_cast<int>(net_server_.GetConnectionTimeout().count());
     stats.request_timeout_sec = request_timeout_sec_.load(std::memory_order_relaxed);

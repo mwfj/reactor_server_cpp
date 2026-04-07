@@ -23,6 +23,55 @@ void HttpRouter::Route(const std::string& method, const std::string& path, Handl
     method_tries_[method].Insert(path, std::move(handler));
 }
 
+void HttpRouter::RouteAsync(const std::string& method, const std::string& path,
+                            AsyncHandler handler) {
+    async_method_tries_[method].Insert(path, std::move(handler));
+}
+
+HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
+    const HttpRequest& request, bool* head_fallback_out) const {
+    if (head_fallback_out) *head_fallback_out = false;
+
+    // 1. Try exact method match in the async trie.
+    auto it = async_method_tries_.find(request.method);
+    if (it != async_method_tries_.end()) {
+        std::unordered_map<std::string, std::string> params;
+        auto result = it->second.Search(request.path, params);
+        if (result.handler) {
+            request.params = std::move(params);
+            return *result.handler;
+        }
+        // Path miss — fall through to HEAD→GET fallback below.
+    }
+
+    // 2. HEAD fallback to async GET (mirrors sync Dispatch behavior).
+    //    Only attempt if the exact method search above failed OR the path
+    //    didn't match — this handles the case where an unrelated async HEAD
+    //    route exists (e.g. /health) but the requested path (e.g. /items)
+    //    is only registered via GetAsync.
+    //    Skip the fallback if a sync HEAD route explicitly matches this
+    //    path — Dispatch should handle that with the operator's HEAD handler.
+    if (request.method == "HEAD") {
+        auto sync_head = method_tries_.find("HEAD");
+        if (sync_head != method_tries_.end() &&
+            sync_head->second.HasMatch(request.path)) {
+            return nullptr;  // let sync Dispatch handle explicit HEAD
+        }
+        auto get_it = async_method_tries_.find("GET");
+        if (get_it != async_method_tries_.end()) {
+            std::unordered_map<std::string, std::string> params;
+            auto result = get_it->second.Search(request.path, params);
+            if (result.handler) {
+                request.params = std::move(params);
+                if (head_fallback_out) *head_fallback_out = true;
+                return *result.handler;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
 void HttpRouter::WebSocket(const std::string& path, WsUpgradeHandler handler) {
     ws_trie_.Insert(path, std::move(handler));
 }
@@ -72,11 +121,7 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     // Run middleware chain — params are already populated for matched routes.
     for (const auto& mw : middlewares_) {
         if (!mw(request, response)) {
-            if (response.GetStatusCode() == 200 &&
-                response.GetBody().empty() &&
-                response.GetHeaders().empty()) {
-                response.Status(403).Text("Forbidden");
-            }
+            FillDefaultRejectionResponse(response);
             logging::Get()->debug("Middleware rejected request: {} {}",
                                   request.method, logging::SanitizePath(request.path));
             return true;
@@ -100,20 +145,31 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
         return true;
     }
 
-    // Check if path exists with different method (405 vs 404)
+    // Check if path exists with different method (405 vs 404). Must consult
+    // BOTH the sync and async trees — a path registered exclusively via
+    // PostAsync would otherwise return 404 for a mismatched GET instead of
+    // advertising the allowed POST.
     std::vector<std::string> allowed_methods;
     bool has_get = false;
     bool has_head = false;
+    auto record = [&](const std::string& method) {
+        if (method == request.method) return;
+        if (std::find(allowed_methods.begin(), allowed_methods.end(), method)
+                != allowed_methods.end()) return;
+        allowed_methods.push_back(method);
+        if (method == "GET") has_get = true;
+        if (method == "HEAD") has_head = true;
+    };
     for (const auto& [method, trie] : method_tries_) {
         if (method == request.method) continue;
-        if (trie.HasMatch(request.path)) {
-            allowed_methods.push_back(method);
-            if (method == "GET") has_get = true;
-            if (method == "HEAD") has_head = true;
-        }
+        if (trie.HasMatch(request.path)) record(method);
+    }
+    for (const auto& [method, trie] : async_method_tries_) {
+        if (method == request.method) continue;
+        if (trie.HasMatch(request.path)) record(method);
     }
     if (has_get && !has_head) {
-        allowed_methods.push_back("HEAD");
+        record("HEAD");
     }
     if (!allowed_methods.empty()) {
         std::sort(allowed_methods.begin(), allowed_methods.end());
@@ -143,6 +199,20 @@ bool HttpRouter::RunMiddleware(const HttpRequest& request, HttpResponse& respons
         }
     }
     return true;
+}
+
+void HttpRouter::FillDefaultRejectionResponse(HttpResponse& response) {
+    // Upgrade to 403 when middleware rejected (returned false) but left
+    // the status code unchanged from the HttpResponse default (200). The
+    // headers check used to be part of this guard, but middleware that
+    // legitimately adds CORS / request-id / auth headers before rejecting
+    // would then leave a 200 status on what is supposed to be a failure
+    // response, and the client would silently succeed. We keep the empty-
+    // body check so a middleware that explicitly populated a 200-status
+    // body (unusual but well-defined) is still preserved.
+    if (response.GetStatusCode() == 200 && response.GetBody().empty()) {
+        response.Status(403).Text("Forbidden");
+    }
 }
 
 bool HttpRouter::HasWebSocketRoute(const std::string& path) const {

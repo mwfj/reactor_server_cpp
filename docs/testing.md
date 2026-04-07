@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all tests (211 tests across 13 suites)
+make test               # Build and run all tests (252 tests across 14 suites)
 ./test_runner                   # Run all tests directly (after building)
 
 # Individual test suites
@@ -18,6 +18,7 @@ make test               # Build and run all tests (211 tests across 13 suites)
 ./test_runner http2             # HTTP/2 protocol tests (or: ./test_runner -2)
 ./test_runner cli               # CLI entry point tests (or: ./test_runner -C)
 ./test_runner route             # Route trie/pattern matching tests (or: ./test_runner -R)
+./test_runner upstream          # Upstream connection pool tests (or: ./test_runner -U)
 ./test_runner kqueue            # macOS kqueue platform tests (or: ./test_runner -K)
 ./test_runner help              # Show all options
 
@@ -48,6 +49,7 @@ make test_cli           # Build and run CLI tests
 | HTTP/2 | 37 | ephemeral | `test/http2_test.h` | `./test_runner http2` |
 | CLI | 79 | N/A | `test/cli_test.h` | `./test_runner cli` |
 | Route | 44 | ephemeral | `test/route_test.h` | `./test_runner route` |
+| Upstream Pool | 30 | ephemeral | `test/upstream_pool_test.h` | `./test_runner upstream` |
 | Kqueue | 7 | ephemeral | `test/kqueue_test.h` | `./test_runner kqueue` (macOS only, skipped on Linux) |
 
 ### Basic Tests
@@ -89,6 +91,12 @@ RC-5 is the most critical test -- it directly prevents the segfault (`Channel::H
 - Error responses (400, 404, 405, 413, 417, 505)
 - HEAD method handling
 - Response serialization
+- Async route middleware gating and rejection with headers
+- Async route pipeline ordering on keep-alive connections
+- Async HEAD fallback rewriting method to GET
+- Async 405 includes async methods in Allow header
+- Async HEAD body stripping
+- Async route client Connection: close header handling
 
 ### WebSocket Tests
 - Handshake validation (RFC 6455)
@@ -118,6 +126,14 @@ RC-5 is the most critical test -- it directly prevents the segfault (`Channel::H
 **Race Conditions (2 tests):** Concurrent HTTP/2 clients, mixed HTTP/1.1 + HTTP/2 clients.
 
 Uses `Http2TestClient` -- a test helper wrapping nghttp2 in client mode with `mem_recv`/`mem_send` for frame-level control.
+
+### Upstream Pool Tests
+
+**Unit Tests (13 tests):** SocketHandler connect-refused behavior, UpstreamConnection state transitions (CONNECTING→READY→IN_USE), expiration by lifetime/request count, IsAlive checks, fd() with null transport, UpstreamLease default/move/release semantics, PoolPartition error code constants, UpstreamHostPool partition-per-dispatcher and accessors.
+
+**Integration Tests (11 tests):** HasUpstream lookup, checkout from unknown service, shutdown drain, EvictExpired no-crash, CheckoutAsync valid connection, connection reuse (same fd after return), connect failure fires error callback, wait-queue overflow (POOL_EXHAUSTED), upstream drops connection while lease held, multi-dispatcher concurrency.
+
+Uses a real `HttpServer` instance as the upstream backend with ephemeral ports. Tests validate the full lifecycle: checkout → use → return → reuse, including error paths and graceful shutdown.
 
 ### Kqueue Tests (macOS only)
 - EVFILT_TIMER idle timeout verification

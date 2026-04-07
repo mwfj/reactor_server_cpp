@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <algorithm>
+#include <unordered_set>
 
 using json = nlohmann::json;
 
@@ -183,6 +184,45 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
         }
     }
 
+    // Upstreams section
+    if (j.contains("upstreams")) {
+        if (!j["upstreams"].is_array())
+            throw std::runtime_error("upstreams must be an array");
+        for (const auto& item : j["upstreams"]) {
+            if (!item.is_object())
+                throw std::runtime_error("each upstream entry must be an object");
+            UpstreamConfig upstream;
+            upstream.name = item.value("name", "");
+            upstream.host = item.value("host", "");
+            upstream.port = item.value("port", 80);
+
+            if (item.contains("tls")) {
+                if (!item["tls"].is_object())
+                    throw std::runtime_error("upstream tls must be an object");
+                auto& tls = item["tls"];
+                upstream.tls.enabled = tls.value("enabled", false);
+                upstream.tls.ca_file = tls.value("ca_file", "");
+                upstream.tls.verify_peer = tls.value("verify_peer", true);
+                upstream.tls.sni_hostname = tls.value("sni_hostname", "");
+                upstream.tls.min_version = tls.value("min_version", "1.2");
+            }
+
+            if (item.contains("pool")) {
+                if (!item["pool"].is_object())
+                    throw std::runtime_error("upstream pool must be an object");
+                auto& pool = item["pool"];
+                upstream.pool.max_connections = pool.value("max_connections", 64);
+                upstream.pool.max_idle_connections = pool.value("max_idle_connections", 16);
+                upstream.pool.connect_timeout_ms = pool.value("connect_timeout_ms", 5000);
+                upstream.pool.idle_timeout_sec = pool.value("idle_timeout_sec", 90);
+                upstream.pool.max_lifetime_sec = pool.value("max_lifetime_sec", 3600);
+                upstream.pool.max_requests_per_conn = pool.value("max_requests_per_conn", 0);
+            }
+
+            config.upstreams.push_back(std::move(upstream));
+        }
+    }
+
     return config;
 }
 
@@ -300,6 +340,10 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
             "REACTOR_HTTP2_MAX_HEADER_LIST_SIZE must be non-negative");
         config.http2.max_header_list_size = static_cast<uint32_t>(v);
     }
+
+    // No per-upstream environment variable overrides. Upstream configuration
+    // is complex (array of named objects) and best managed through the JSON
+    // config file. Individual upstream settings are not overridable via env.
 }
 
 void ConfigLoader::Validate(const ServerConfig& config) {
@@ -489,6 +533,123 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                 "' (must be '1.2' or '1.3')");
         }
     }
+
+    // Upstream validation
+    {
+        std::unordered_set<std::string> seen_names;
+        for (size_t i = 0; i < config.upstreams.size(); ++i) {
+            const auto& u = config.upstreams[i];
+            const std::string idx = "upstreams[" + std::to_string(i) + "]";
+
+            if (u.name.empty()) {
+                throw std::invalid_argument(idx + ".name must not be empty");
+            }
+            if (!seen_names.insert(u.name).second) {
+                throw std::invalid_argument(
+                    "Duplicate upstream name: '" + u.name + "'");
+            }
+            if (u.host.empty()) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name + "'): host must not be empty");
+            }
+            // Upstream host must be a dotted-quad IPv4 address (no hostnames).
+            // Hostnames would pass validation but fail at connect time with
+            // inet_addr() returning INADDR_NONE. Reject early with a clear error.
+            {
+                struct in_addr upstream_addr{};
+                if (inet_pton(AF_INET, u.host.c_str(), &upstream_addr) != 1) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name + "'): host must be a valid IPv4 address, got '" +
+                        u.host + "'");
+                }
+            }
+            if (u.port < 1 || u.port > 65535) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name + "'): port must be 1-65535, got " +
+                    std::to_string(u.port));
+            }
+
+            // Pool constraints
+            if (u.pool.max_connections < 1) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name + "'): pool.max_connections must be >= 1");
+            }
+            // When max_connections < worker_threads, some dispatcher
+            // partitions will have zero capacity (requests queue and time
+            // out). This is intentional for deployments that cap upstream
+            // concurrency tightly (e.g., 4 backend connections across 8
+            // workers). UpstreamHostPool logs a warning at construction;
+            // validation does not reject the config.
+            if (u.pool.max_idle_connections < 0 ||
+                u.pool.max_idle_connections > u.pool.max_connections) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): pool.max_idle_connections must be 0 to pool.max_connections (" +
+                    std::to_string(u.pool.max_connections) + ")");
+            }
+            if (u.pool.connect_timeout_ms < 1000) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): pool.connect_timeout_ms must be >= 1000 (timer resolution is 1s)");
+            }
+            if (u.pool.idle_timeout_sec < 1) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): pool.idle_timeout_sec must be >= 1");
+            }
+            if (u.pool.max_lifetime_sec < 0) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): pool.max_lifetime_sec must be >= 0 (0 = unlimited)");
+            }
+            if (u.pool.max_requests_per_conn < 0) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): pool.max_requests_per_conn must be >= 0 (0 = unlimited)");
+            }
+
+            // Upstream TLS validation
+            if (u.tls.enabled) {
+                if (u.tls.min_version != "1.2" && u.tls.min_version != "1.3") {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): tls.min_version must be '1.2' or '1.3', got '" +
+                        u.tls.min_version + "'");
+                }
+                // When verify_peer is true, sni_hostname must be set so
+                // SSL_set1_host() can verify the certificate's CN/SAN.
+                // Without it, only CA trust is checked — any trusted cert passes.
+                if (u.tls.verify_peer && u.tls.sni_hostname.empty()) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): tls.sni_hostname is required when verify_peer is true "
+                        "(upstream host is an IPv4 address, which cannot be verified "
+                        "against certificate CN/SAN)");
+                }
+                // CA file validation — only when TLS + verify_peer is enabled.
+                // When verify_peer=false, the runtime skips CA loading, so a
+                // stale ca_file path should not block startup/reload.
+                if (u.tls.verify_peer && !u.tls.ca_file.empty()) {
+                    struct stat st{};
+                    if (stat(u.tls.ca_file.c_str(), &st) != 0) {
+                        if (errno == EACCES) {
+                            // Can't traverse path — skip check, runtime handles it
+                        } else {
+                            throw std::invalid_argument(
+                                idx + " ('" + u.name +
+                                "'): tls.ca_file not found: '" + u.tls.ca_file +
+                                "' (" + std::strerror(errno) + ")");
+                        }
+                    } else if (!S_ISREG(st.st_mode)) {
+                        throw std::invalid_argument(
+                            idx + " ('" + u.name +
+                            "'): tls.ca_file is not a regular file: '" +
+                            u.tls.ca_file + "'");
+                    }
+                }
+            }  // if (u.tls.enabled)
+        }
+    }
 }
 
 ServerConfig ConfigLoader::Default() {
@@ -520,5 +681,26 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
     j["http2"]["initial_window_size"]    = config.http2.initial_window_size;
     j["http2"]["max_frame_size"]         = config.http2.max_frame_size;
     j["http2"]["max_header_list_size"]   = config.http2.max_header_list_size;
+
+    j["upstreams"] = nlohmann::json::array();
+    for (const auto& u : config.upstreams) {
+        nlohmann::json uj;
+        uj["name"] = u.name;
+        uj["host"] = u.host;
+        uj["port"] = u.port;
+        uj["tls"]["enabled"]      = u.tls.enabled;
+        uj["tls"]["ca_file"]      = u.tls.ca_file;
+        uj["tls"]["verify_peer"]  = u.tls.verify_peer;
+        uj["tls"]["sni_hostname"] = u.tls.sni_hostname;
+        uj["tls"]["min_version"]  = u.tls.min_version;
+        uj["pool"]["max_connections"]      = u.pool.max_connections;
+        uj["pool"]["max_idle_connections"] = u.pool.max_idle_connections;
+        uj["pool"]["connect_timeout_ms"]   = u.pool.connect_timeout_ms;
+        uj["pool"]["idle_timeout_sec"]     = u.pool.idle_timeout_sec;
+        uj["pool"]["max_lifetime_sec"]     = u.pool.max_lifetime_sec;
+        uj["pool"]["max_requests_per_conn"]= u.pool.max_requests_per_conn;
+        j["upstreams"].push_back(uj);
+    }
+
     return j.dump(4);
 }

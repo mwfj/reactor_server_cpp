@@ -44,12 +44,67 @@ public:
     void SetMaxHeaderSize(size_t max);
     void SetMaxWsMessageSize(size_t max) { max_ws_message_size_ = max; }
 
+    // Update all size limits on an existing connection during live reload.
+    // Must be called on the connection's dispatcher thread (via RunOnDispatcher).
+    // Handles both HTTP-mode and WS-mode connections:
+    //   HTTP: updates parser limits + transport input cap
+    //   WS:   updates parser + message limits + transport input cap (ws-specific)
+    void UpdateSizeLimits(size_t body, size_t header, size_t ws,
+                          size_t http_input_cap);
+
     // Set request timeout (Slowloris protection).
     // Deadline is armed on first OnRawData call (after TLS handshake completes for TLS connections).
     void SetRequestTimeout(int seconds);
 
     // Called when raw data arrives (set as NetServer's on_message callback)
     void OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data);
+
+    // Begin an async-response cycle. Called by the framework when an async
+    // route handler is about to run. Saves the request context needed to
+    // normalize the final response (HEAD body stripping, Connection: close,
+    // HTTP/1.0 keep-alive signaling) and blocks the parser from accepting
+    // new requests until CompleteAsyncResponse runs — preserving HTTP/1
+    // response ordering on keep-alive connections.
+    void BeginAsyncResponse(const HttpRequest& req);
+
+    // Complete an async-response cycle. Called from the async completion
+    // callback (on the dispatcher thread). Applies post-dispatch
+    // normalization using the context saved by BeginAsyncResponse, writes
+    // the response, and either closes the connection or resumes parsing
+    // any pipelined bytes that arrived during the deferred window.
+    void CompleteAsyncResponse(HttpResponse response);
+
+    // Cancel a deferred async-response cycle that was started by
+    // BeginAsyncResponse but whose handler threw before handing off the
+    // completion callback. Resets deferred state + shutdown exemption so
+    // the outer exception handler can send a 500 and close normally.
+    void CancelAsyncResponse();
+
+    // Append bytes that arrived while an async response was pending.
+    // Called by OnRawData. Separated from OnRawData so that the framework's
+    // own "resume after deferred" path can feed buffered bytes back in
+    // without recursion surprises.
+    void StashDeferredBytes(const std::string& data);
+
+    // True if an async response is currently pending delivery.
+    bool IsAsyncResponsePending() const { return deferred_response_pending_; }
+
+    // Graceful-shutdown exemption.
+    //
+    // Set automatically by BeginAsyncResponse/CompleteAsyncResponse for the
+    // async route API. Also exposed publicly so advanced users implementing
+    // custom async patterns outside the AsyncHandler API can still mark
+    // their connections exempt from HttpServer::Stop()'s close sweep.
+    //
+    // The flag lives on the underlying ConnectionHandler so NetServer's
+    // close sweep can check it live (a pre-sweep snapshot cannot close
+    // the race with a request that's just now entering an async handler).
+    void SetShutdownExempt(bool exempt) {
+        if (conn_) conn_->SetShutdownExempt(exempt);
+    }
+    bool IsShutdownExempt() const {
+        return conn_ && conn_->IsShutdownExempt();
+    }
 
 private:
     size_t max_body_size_ = 0;    // 0 = unlimited
@@ -79,9 +134,39 @@ private:
     bool HandleCompleteRequest(const char*& buf, size_t& remaining, size_t consumed);
     void HandleIncompleteRequest();
 
+    // Shared response normalization used by both the sync request loop and
+    // the async deferred completion path. Scans Connection headers for a
+    // "close" token (RFC 7230 §6.1 comma-separated list), injects an
+    // HTTP/1.0 Connection: keep-alive if the client asked for persistence
+    // on HTTP/1.0, and enforces Connection: close when the client did not
+    // request keep-alive. Returns the final "should close after send"
+    // decision so the caller can CloseConnection() after writing.
+    bool NormalizeOutgoingResponse(HttpResponse& response,
+                                   bool client_keep_alive,
+                                   int client_http_minor);
+
+    // Strip the body from a serialized wire response for HEAD requests
+    // (RFC 7231 §4.3.2). Truncates `wire` at the blank line that
+    // terminates the header block, preserving the Content-Length header.
+    static void StripResponseBodyForHead(std::string& wire);
+
     std::shared_ptr<ConnectionHandler> conn_;
     HttpParser parser_;
     HTTP_CALLBACKS_NAMESPACE::HttpConnCallbacks callbacks_;
     bool upgraded_ = false;
     std::unique_ptr<WebSocketConnection> ws_conn_;
+
+    // Deferred-response state — dispatcher-thread only, no atomics needed.
+    // Populated by BeginAsyncResponse and consumed by CompleteAsyncResponse.
+    // While deferred_response_pending_ is true, OnRawData buffers new bytes
+    // into deferred_pending_buf_ instead of parsing them, preventing
+    // out-of-order responses on pipelined HTTP/1 keep-alive connections.
+    // deferred_http_minor_ is intentionally NOT stored: current_http_minor_
+    // is updated by the parser at header-completion time and persists
+    // across the deferred window (no new requests are parsed until the
+    // completion runs), so it serves as the canonical version field.
+    bool deferred_response_pending_ = false;
+    bool deferred_was_head_ = false;
+    bool deferred_keep_alive_ = true;
+    std::string deferred_pending_buf_;
 };

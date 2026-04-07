@@ -26,6 +26,14 @@ private:
     std::atomic<bool> is_closing_{false};
     std::atomic<bool> close_after_write_{false};
 
+    // Opt-in flag for the graceful-shutdown close sweep in NetServer::Stop().
+    // A higher layer (e.g. HttpConnectionHandler during an async response
+    // cycle) sets this to true so the sweep skips CloseAfterWrite and lets
+    // the in-flight async work complete. Live-checked at sweep time so a
+    // request that enters its async handler just before the sweep cannot
+    // race a stale snapshot.
+    std::atomic<bool> shutdown_exempt_{false};
+
     TimeStamp ts_; // Each connection owns a timestamp to manage
     bool has_deadline_ = false;
     std::chrono::steady_clock::time_point deadline_;
@@ -37,6 +45,12 @@ private:
     // Atomic because the off-thread path reads it (to capture a snapshot)
     // while the on-thread path writes it — plain unsigned would be UB.
     std::atomic<unsigned> deadline_generation_{0};
+
+    // Outbound connect support (for upstream/proxy connections)
+    enum class ConnectState { NONE, CONNECTING, CONNECTED };
+    ConnectState connect_state_ = ConnectState::NONE;
+    using ConnectCompleteCallback = std::function<void(std::shared_ptr<ConnectionHandler>)>;
+    ConnectCompleteCallback connect_complete_callback_ = nullptr;
 
     // TLS support
     bool tls_ready_from_write_ = false;  // TLS handshake completed via CallWriteCb
@@ -63,10 +77,26 @@ public:
 
     // Two-phase initialization: must be called after object is wrapped in shared_ptr
     void RegisterCallbacks();
+    // Outbound variant: registers callbacks for connect-in-progress sockets.
+    // Enables ET + write-only mode (EPOLLOUT detects connect completion).
+    void RegisterOutboundCallbacks();
+    void SetConnectCompleteCallback(ConnectCompleteCallback cb);
+    int FinishConnect();  // Check SO_ERROR via getsockopt; returns CONNECT_SUCCESS or CONNECT_ERROR
+    int dispatcher_index() const;
 
     int fd() const{ return sock_ ? sock_ -> fd() : -1; }
     bool IsClosing() const { return is_closing_.load(std::memory_order_acquire); }
     bool IsCloseDeferred() const { return close_after_write_.load(std::memory_order_acquire); }
+    // Clear a previously-armed CloseAfterWrite. Used when a higher layer
+    // (e.g., H2 drain) takes over the connection lifecycle after
+    // NetServer::Stop()'s generic close sweep already armed it.
+    void ClearCloseAfterWrite() { close_after_write_.store(false, std::memory_order_release); }
+    bool IsShutdownExempt() const {
+        return shutdown_exempt_.load(std::memory_order_acquire);
+    }
+    void SetShutdownExempt(bool exempt) {
+        shutdown_exempt_.store(exempt, std::memory_order_release);
+    }
     const std::string& ip_addr() const { return sock_ -> ip_addr(); }
     int port() const { return sock_ -> port(); }
 
@@ -85,6 +115,10 @@ public:
     void CallWriteCb();
 
     void SetOnMessageCb(CALLBACKS_NAMESPACE::ConnOnMsgCallback);
+    // Get the current on-message callback (for upstream pool disconnect notification).
+    const CALLBACKS_NAMESPACE::ConnOnMsgCallback& GetOnMessageCb() const {
+        return callbacks_.on_message_callback;
+    }
     void SetCompletionCb(CALLBACKS_NAMESPACE::ConnCompleteCallback);
     void SetWriteProgressCb(CALLBACKS_NAMESPACE::ConnWriteProgressCallback);
     void SetCloseCb(CALLBACKS_NAMESPACE::ConnCloseCallback);
@@ -96,6 +130,13 @@ public:
 
     // Returns true if this connection has TLS (any state: handshake or ready).
     bool HasTls() const { return tls_state_ != TlsState::NONE; }
+    // Returns true if TLS is fully established (handshake complete).
+    bool IsTlsReady() const { return tls_state_ == TlsState::READY; }
+
+    // Non-destructive TLS peek for idle connection validation.
+    // Returns: >0 (app data buffered — stale), TLS_COMPLETE (clean — benign
+    // record consumed), TLS_PEER_CLOSED, TLS_ERROR. Only valid when IsTlsReady().
+    int TlsPeek(char* buf, size_t len);
 
     // Enqueue a task to run on this connection's dispatcher thread.
     // Thread-safe. Used by protocol layers that need dispatcher-thread

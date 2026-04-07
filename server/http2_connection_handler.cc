@@ -53,6 +53,26 @@ void Http2ConnectionHandler::SetMaxHeaderSize(size_t max) {
     }
 }
 
+void Http2ConnectionHandler::SetRequestTimeout(int seconds) {
+    request_timeout_sec_ = seconds;
+    // Reconcile deadline state with the new timeout value. At
+    // initialization time deadline_armed_ is false, so this is a no-op.
+    // During live reload, stale deadlines must be updated:
+    if (seconds <= 0 && deadline_armed_) {
+        // Timeout disabled — clear the stale deadline so the connection
+        // reverts to idle-timeout behavior instead of staying stuck on
+        // an expired deadline with deadline_armed_ = true forever.
+        conn_->ClearDeadline();
+        deadline_armed_ = false;
+    } else if (seconds > 0 && session_) {
+        // Timeout changed or newly enabled — recompute from the oldest
+        // stream's start time. Handles both deadline_armed_==true (value
+        // change) and false (timeout was previously 0, so no deadline was
+        // ever installed for existing streams).
+        UpdateDeadline();
+    }
+}
+
 void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
     if (initialized_) {
         logging::Get()->debug("H2 Initialize called twice fd={}", conn_ ? conn_->fd() : -1);
@@ -199,6 +219,15 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
             session_->SendPendingFrames();
         }
         if (session_->ActiveStreamCount() == 0) {
+            // Flush deferred output BEFORE arming CloseAfterWrite.
+            // If the initial request's response or the GOAWAY write hit
+            // nghttp2's high-water mark, SendPendingFrames left deferred
+            // output queued. CloseAfterWrite suppresses OnSendComplete,
+            // so those deferred frames would never be resumed and the
+            // tail of a large first response would be silently dropped.
+            if (session_->HasDeferredOutput()) {
+                session_->ResumeOutput();
+            }
             conn_->CloseAfterWrite();
         }
     }
@@ -322,6 +351,67 @@ void Http2ConnectionHandler::RequestShutdown() {
 
 void Http2ConnectionHandler::SetDrainCompleteCallback(DrainCompleteCallback cb) {
     drain_complete_cb_ = std::move(cb);
+}
+
+void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
+                                                  const HttpResponse& response) {
+    if (!session_) {
+        logging::Get()->warn(
+            "SubmitStreamResponse called on destroyed H2 session (stream={})",
+            stream_id);
+        return;
+    }
+    session_->SubmitResponse(stream_id, response);
+    // Flush nghttp2's outgoing frame queue onto the transport. The sync H2
+    // path hits the SendPendingFrames call at the tail of OnRawData after
+    // ReceiveData → OnRequest → SubmitResponse returns. Async completions
+    // come from outside that loop (user code via RunOnDispatcher), so if
+    // we don't flush here the response sits queued until some unrelated
+    // inbound frame, shutdown, or timeout happens to flush it — hanging
+    // any async H2 route.
+    session_->SendPendingFrames();
+
+    // Check if this async response was the last active stream during a
+    // graceful shutdown drain. The normal drain check in OnRawData runs
+    // after ReceiveData, but async completions arrive via RunOnDispatcher
+    // — no inbound data triggers OnRawData. OnSendComplete can also miss
+    // this: it fires when the output buffer empties, but the stream close
+    // callback inside nghttp2_session_send (called by SendPendingFrames)
+    // fires during the send, before FlushDeferredRemovals updates
+    // ActiveStreamCount. By the time SendPendingFrames returns, the count
+    // IS updated, but OnSendComplete already ran and saw a stale count.
+    // Without this check, the connection waits until the drain timeout.
+    if (shutdown_requested_.load(std::memory_order_acquire) &&
+        session_->ActiveStreamCount() == 0 && !drain_notified_) {
+        // Do NOT call UpdateDeadline() here. Clearing has_deadline_ during
+        // shutdown drain would expose the connection to idle-timeout closure
+        // while response/GOAWAY bytes are still buffered to a slow client.
+        // The existing deadline keeps has_deadline_ true, which suppresses
+        // idle timeout in IsTimeOut(). NotifyDrainComplete → CloseAfterWrite
+        // takes over the connection lifecycle once all bytes are flushed.
+        if (session_->HasDeferredOutput()) {
+            session_->ResumeOutput();
+        }
+        // Only signal drain completion if the transport output buffer is
+        // also empty. SendPendingFrames may have written response/GOAWAY
+        // bytes that haven't been flushed to the kernel yet (slow client,
+        // backpressure). NotifyDrainComplete fires drain_complete_cb_
+        // which releases WaitForH2Drain → NetServer::Stop proceeds →
+        // StopEventLoop can run before the buffered bytes are written.
+        // When the buffer IS non-empty, OnSendComplete will fire once
+        // the write completes and re-check this same condition — at that
+        // point OutputBufferSize() is guaranteed 0 because OnSendComplete
+        // only fires on a fully-drained buffer.
+        if (!session_->HasDeferredOutput() && !session_->WantWrite() &&
+            conn_->OutputBufferSize() == 0) {
+            NotifyDrainComplete();
+        }
+    } else {
+        // Normal operation or shutdown with active streams remaining:
+        // recompute deadline so it tracks the oldest incomplete stream,
+        // or clears it when no streams remain (idle keep-alive).
+        UpdateDeadline();
+    }
 }
 
 void Http2ConnectionHandler::NotifyDrainComplete() {

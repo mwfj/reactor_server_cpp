@@ -137,6 +137,58 @@ The router supports non-origin-form request targets used by CONNECT and OPTIONS 
 
 These are registered as exact-match patterns in the `RouteTrie`.
 
+## Async Route Registration
+
+Async routes are for handlers that need to perform async work (e.g., upstream proxy, database queries) and deliver the response later via a completion callback.
+
+```cpp
+#include "http/http_server.h"
+
+HttpServer server(config);
+
+// Async route — receives request + completion callback
+server.GetAsync("/proxy/users", [&](const HttpRequest& req,
+                                     HttpRouter::AsyncCompletionCallback complete) {
+    // Checkout an upstream connection (non-blocking)
+    upstream_manager->CheckoutAsync("api-backend", dispatcher_index,
+        [complete](UpstreamLease lease) {
+            // ... forward request to upstream, get response ...
+            HttpResponse resp;
+            resp.Status(200).Json(upstream_body);
+            complete(std::move(resp));  // delivers response to client
+        },
+        [complete](int error_code) {
+            complete(HttpResponse::ServiceUnavailable());
+        });
+});
+
+// Method-specific async helpers
+server.PostAsync("/proxy/data", async_handler);
+server.PutAsync("/proxy/data", async_handler);
+server.DeleteAsync("/proxy/data", async_handler);
+server.RouteAsync("PATCH", "/proxy/data", async_handler);
+```
+
+### Async Handler Signature
+
+```cpp
+using AsyncCompletionCallback = std::function<void(HttpResponse)>;
+using AsyncHandler = std::function<void(const HttpRequest& request,
+                                         AsyncCompletionCallback complete)>;
+```
+
+The handler receives a const request reference and a completion callback. Call `complete(response)` exactly once to deliver the response. Both types are defined in `include/http/http_callbacks.h` (`HTTP_CALLBACKS_NAMESPACE`).
+
+### Async Route Behavior
+
+- **Middleware runs first** — same as sync routes (auth, CORS, logging all apply)
+- **Parser blocked** — HTTP/1 parser pauses until completion fires, preserving pipeline response ordering
+- **Shutdown-exempt** — the connection is marked exempt from graceful shutdown's close sweep while async work is pending
+- **HEAD fallback** — if no async HEAD handler is registered, async GET handler is used (same as sync)
+- **405 Allow** — async routes are included in the `Allow` header for 405 responses
+- **Thread safety** — the completion callback MUST be invoked on the dispatcher thread that owns the connection. Upstream pool `CheckoutAsync` naturally routes callbacks to the correct dispatcher.
+- **HTTP/2 support** — async routes work identically for H2 streams; the framework binds `SubmitStreamResponse` internally
+
 ## Middleware
 
 ```cpp
