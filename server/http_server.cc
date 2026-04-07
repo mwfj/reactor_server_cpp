@@ -1546,6 +1546,16 @@ bool HttpServer::DetectAndRouteProtocol(
             SetupH2Handlers(h2_conn);
             h2_connections_[conn->fd()] = h2_conn;
         }
+        // Late H2 detection during shutdown: clear any pre-armed close flag
+        // BEFORE Initialize — Initialize sends the server preface and may
+        // dispatch/send the buffered request, whose DoSendRaw/CallWriteCb
+        // would honor the stale close_after_write_ and ForceClose on the
+        // first empty-buffer moment, truncating the request this drain path
+        // is trying to preserve.
+        if (!server_ready_.load(std::memory_order_acquire)) {
+            conn->ClearCloseAfterWrite();
+            conn->SetShutdownExempt(true);
+        }
         h2_conn->Initialize(message);
         // Late H2 detection during shutdown: full drain bookkeeping so
         // WaitForH2Drain() tracks this session and NetServer::Stop() exempts
@@ -1553,17 +1563,6 @@ bool HttpServer::DetectAndRouteProtocol(
         // Initialize processes buffered data — requests already in the packet
         // are honored (drained), not refused.
         if (!server_ready_.load(std::memory_order_acquire)) {
-            // This connection was in pending_detection_ when NetServer::Stop()
-            // ran its close sweep, so CloseAfterWrite was already armed. Clear
-            // it so H2 response writes don't trigger ForceClose on the first
-            // empty-buffer moment (DoSendRaw/CallWriteCb check the flag).
-            // Also set shutdown-exempt so the already-enqueued CloseAfterWrite
-            // lambda (which checks IsShutdownExempt) skips this connection.
-            // The H2 drain mechanism (NotifyDrainComplete → CloseAfterWrite)
-            // takes over the connection lifecycle once all streams complete.
-            conn->ClearCloseAfterWrite();
-            conn->SetShutdownExempt(true);
-
             ConnectionHandler* conn_ptr = conn.get();
             std::weak_ptr<ConnectionHandler> conn_weak = conn;
             h2_conn->SetDrainCompleteCallback([this, conn_ptr, conn_weak]() {
@@ -1870,6 +1869,7 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         {
             std::vector<std::shared_ptr<HttpConnectionHandler>> h1_snap;
             std::vector<std::shared_ptr<Http2ConnectionHandler>> h2_snap;
+            std::vector<std::shared_ptr<ConnectionHandler>> pd_snap;
             {
                 std::lock_guard<std::mutex> lck(conn_mtx_);
                 h1_snap.reserve(http_connections_.size());
@@ -1879,6 +1879,10 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
                 h2_snap.reserve(h2_connections_.size());
                 for (auto& [fd, h2conn] : h2_connections_) {
                     h2_snap.push_back(h2conn);
+                }
+                pd_snap.reserve(pending_detection_.size());
+                for (auto& [fd, pd] : pending_detection_) {
+                    pd_snap.push_back(pd.conn);
                 }
             }
 
@@ -1901,6 +1905,14 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
                     conn->SetMaxInputSize(final_cap);
                 });
             }
+            // Pending-detection connections have no protocol handler yet —
+            // only the transport-level input cap needs updating.
+            for (auto& conn : pd_snap) {
+                if (!conn) continue;
+                conn->RunOnDispatcher([conn, final_cap]() {
+                    conn->SetMaxInputSize(final_cap);
+                });
+            }
         }
     }
 
@@ -1909,6 +1921,41 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     shutdown_drain_timeout_sec_.store(new_config.shutdown_drain_timeout_sec,
                                      std::memory_order_relaxed);
     net_server_.SetMaxConnections(new_config.max_connections);
+
+    // Push updated request timeout to existing connections. Like size limits,
+    // request_timeout_sec_ is a plain int on each handler, snapshotted at
+    // accept time. Without this, long-lived keep-alive/H2 sessions use the
+    // old Slowloris deadline after a reload.
+    {
+        int timeout = new_config.request_timeout_sec;
+        std::vector<std::shared_ptr<HttpConnectionHandler>> h1_snap;
+        std::vector<std::shared_ptr<Http2ConnectionHandler>> h2_snap;
+        {
+            std::lock_guard<std::mutex> lck(conn_mtx_);
+            h1_snap.reserve(http_connections_.size());
+            for (auto& [fd, hconn] : http_connections_) {
+                h1_snap.push_back(hconn);
+            }
+            h2_snap.reserve(h2_connections_.size());
+            for (auto& [fd, h2conn] : h2_connections_) {
+                h2_snap.push_back(h2conn);
+            }
+        }
+        for (auto& hconn : h1_snap) {
+            auto conn = hconn->GetConnection();
+            if (!conn) continue;
+            conn->RunOnDispatcher([hconn, timeout]() {
+                hconn->SetRequestTimeout(timeout);
+            });
+        }
+        for (auto& h2conn : h2_snap) {
+            auto conn = h2conn->GetConnection();
+            if (!conn) continue;
+            conn->RunOnDispatcher([h2conn, timeout]() {
+                h2conn->SetRequestTimeout(timeout);
+            });
+        }
+    }
 
     // Update idle timeout via EnQueue to dispatcher threads
     net_server_.SetConnectionTimeout(
