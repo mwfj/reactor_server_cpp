@@ -363,6 +363,12 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
     // Without this check, the connection waits until the drain timeout.
     if (shutdown_requested_.load(std::memory_order_acquire) &&
         session_->ActiveStreamCount() == 0 && !drain_notified_) {
+        // Do NOT call UpdateDeadline() here. Clearing has_deadline_ during
+        // shutdown drain would expose the connection to idle-timeout closure
+        // while response/GOAWAY bytes are still buffered to a slow client.
+        // The existing deadline keeps has_deadline_ true, which suppresses
+        // idle timeout in IsTimeOut(). NotifyDrainComplete → CloseAfterWrite
+        // takes over the connection lifecycle once all bytes are flushed.
         if (session_->HasDeferredOutput()) {
             session_->ResumeOutput();
         }
@@ -380,6 +386,11 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
             conn_->OutputBufferSize() == 0) {
             NotifyDrainComplete();
         }
+    } else {
+        // Normal operation or shutdown with active streams remaining:
+        // recompute deadline so it tracks the oldest incomplete stream,
+        // or clears it when no streams remain (idle keep-alive).
+        UpdateDeadline();
     }
 }
 
