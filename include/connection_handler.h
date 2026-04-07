@@ -87,6 +87,10 @@ public:
     int fd() const{ return sock_ ? sock_ -> fd() : -1; }
     bool IsClosing() const { return is_closing_.load(std::memory_order_acquire); }
     bool IsCloseDeferred() const { return close_after_write_.load(std::memory_order_acquire); }
+    // Clear a previously-armed CloseAfterWrite. Used when a higher layer
+    // (e.g., H2 drain) takes over the connection lifecycle after
+    // NetServer::Stop()'s generic close sweep already armed it.
+    void ClearCloseAfterWrite() { close_after_write_.store(false, std::memory_order_release); }
     bool IsShutdownExempt() const {
         return shutdown_exempt_.load(std::memory_order_acquire);
     }

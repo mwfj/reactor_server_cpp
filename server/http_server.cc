@@ -597,11 +597,11 @@ void HttpServer::Stop() {
     // output buffer. The live check closes that race.
 
     // Note: pending_detection_ connections are NOT exempted from the close
-    // sweep. If one becomes H2 late, DetectAndRouteProtocol's late drain
-    // path sends GOAWAY via RequestShutdown — the GOAWAY bytes drain through
-    // CloseAfterWrite's write path before ForceClose. Exempting all pending
-    // connections would leave unclassified/HTTP/1 sockets open with no drain
-    // tracking, bypassing shutdown teardown entirely.
+    // sweep here. If one becomes H2 late, DetectAndRouteProtocol's late
+    // drain path clears the pre-armed CloseAfterWrite and sets shutdown-
+    // exempt to block the stale lambda, then hands the connection to the
+    // H2 drain mechanism. Exempting all pending connections upfront would
+    // leave unclassified/HTTP/1 sockets open with no drain tracking.
 
     if (!draining_conn_ptrs.empty()) {
         net_server_.SetDrainingConns(std::move(draining_conn_ptrs));
@@ -1553,9 +1553,25 @@ bool HttpServer::DetectAndRouteProtocol(
         // Initialize processes buffered data — requests already in the packet
         // are honored (drained), not refused.
         if (!server_ready_.load(std::memory_order_acquire)) {
-            h2_conn->RequestShutdown();
+            // This connection was in pending_detection_ when NetServer::Stop()
+            // ran its close sweep, so CloseAfterWrite was already armed. Clear
+            // it so H2 response writes don't trigger ForceClose on the first
+            // empty-buffer moment (DoSendRaw/CallWriteCb check the flag).
+            // Also set shutdown-exempt so the already-enqueued CloseAfterWrite
+            // lambda (which checks IsShutdownExempt) skips this connection.
+            // The H2 drain mechanism (NotifyDrainComplete → CloseAfterWrite)
+            // takes over the connection lifecycle once all streams complete.
+            conn->ClearCloseAfterWrite();
+            conn->SetShutdownExempt(true);
+
             ConnectionHandler* conn_ptr = conn.get();
-            h2_conn->SetDrainCompleteCallback([this, conn_ptr]() {
+            std::weak_ptr<ConnectionHandler> conn_weak = conn;
+            h2_conn->SetDrainCompleteCallback([this, conn_ptr, conn_weak]() {
+                // Clear exemption before NotifyDrainComplete's CloseAfterWrite
+                // fires — it was only needed to block the stale pre-armed lambda.
+                if (auto c = conn_weak.lock()) {
+                    c->SetShutdownExempt(false);
+                }
                 OnH2DrainComplete(conn_ptr);
             });
             {
