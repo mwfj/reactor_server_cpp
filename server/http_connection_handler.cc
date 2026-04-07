@@ -90,6 +90,20 @@ void HttpConnectionHandler::SetRequestTimeout(int seconds) {
         if (seconds > 0) {
             conn_->SetDeadline(request_start_ +
                                std::chrono::seconds(seconds));
+            // (Re-)install the 408 callback. When the previous timeout was 0,
+            // no callback was ever installed for this in-flight request —
+            // without this, expiry produces a bare close instead of 408.
+            // When the previous timeout was >0, reinstalling is a cheap no-op
+            // (same lambda shape).
+            std::weak_ptr<HttpConnectionHandler> weak_self = shared_from_this();
+            conn_->SetDeadlineTimeoutCb([weak_self]() -> bool {
+                if (auto self = weak_self.lock()) {
+                    HttpResponse timeout_resp = HttpResponse::RequestTimeout();
+                    timeout_resp.Header("Connection", "close");
+                    self->SendResponse(timeout_resp);
+                }
+                return false;
+            });
         } else {
             conn_->ClearDeadline();
             conn_->SetDeadlineTimeoutCb(nullptr);

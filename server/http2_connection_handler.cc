@@ -64,9 +64,11 @@ void Http2ConnectionHandler::SetRequestTimeout(int seconds) {
         // an expired deadline with deadline_armed_ = true forever.
         conn_->ClearDeadline();
         deadline_armed_ = false;
-    } else if (seconds > 0 && deadline_armed_ && session_) {
-        // Timeout value changed — recompute from the oldest stream's
-        // start time using the new value.
+    } else if (seconds > 0 && session_) {
+        // Timeout changed or newly enabled — recompute from the oldest
+        // stream's start time. Handles both deadline_armed_==true (value
+        // change) and false (timeout was previously 0, so no deadline was
+        // ever installed for existing streams).
         UpdateDeadline();
     }
 }

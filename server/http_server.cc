@@ -1930,6 +1930,7 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         int timeout = new_config.request_timeout_sec;
         std::vector<std::shared_ptr<HttpConnectionHandler>> h1_snap;
         std::vector<std::shared_ptr<Http2ConnectionHandler>> h2_snap;
+        std::vector<std::shared_ptr<ConnectionHandler>> pd_snap;
         {
             std::lock_guard<std::mutex> lck(conn_mtx_);
             h1_snap.reserve(http_connections_.size());
@@ -1939,6 +1940,10 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
             h2_snap.reserve(h2_connections_.size());
             for (auto& [fd, h2conn] : h2_connections_) {
                 h2_snap.push_back(h2conn);
+            }
+            pd_snap.reserve(pending_detection_.size());
+            for (auto& [fd, pd] : pending_detection_) {
+                pd_snap.push_back(pd.conn);
             }
         }
         for (auto& hconn : h1_snap) {
@@ -1953,6 +1958,20 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
             if (!conn) continue;
             conn->RunOnDispatcher([h2conn, timeout]() {
                 h2conn->SetRequestTimeout(timeout);
+            });
+        }
+        // Pending-detection connections have no protocol handler yet, but
+        // they may have partial data buffered (Slowloris on the preface).
+        // Set/clear a transport-level deadline to match the new timeout.
+        for (auto& conn : pd_snap) {
+            if (!conn) continue;
+            conn->RunOnDispatcher([conn, timeout]() {
+                if (timeout > 0) {
+                    conn->SetDeadline(std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(timeout));
+                } else {
+                    conn->ClearDeadline();
+                }
             });
         }
     }
