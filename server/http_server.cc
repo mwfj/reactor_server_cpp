@@ -1847,6 +1847,45 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         max_header_size_.store(new_config.max_header_size, std::memory_order_relaxed);
         max_ws_message_size_.store(new_config.max_ws_message_size, std::memory_order_relaxed);
         net_server_.SetMaxInputSize(final_cap);
+
+        // Push updated limits to existing connections. Per-connection limits
+        // are dispatcher-thread-only fields (plain size_t, not atomic), so
+        // enqueue updates through each connection's dispatcher.
+        {
+            std::vector<std::shared_ptr<HttpConnectionHandler>> h1_snap;
+            std::vector<std::shared_ptr<Http2ConnectionHandler>> h2_snap;
+            {
+                std::lock_guard<std::mutex> lck(conn_mtx_);
+                h1_snap.reserve(http_connections_.size());
+                for (auto& [fd, hconn] : http_connections_) {
+                    h1_snap.push_back(hconn);
+                }
+                h2_snap.reserve(h2_connections_.size());
+                for (auto& [fd, h2conn] : h2_connections_) {
+                    h2_snap.push_back(h2conn);
+                }
+            }
+
+            size_t body = new_config.max_body_size;
+            size_t header = new_config.max_header_size;
+            size_t ws_msg = new_config.max_ws_message_size;
+
+            for (auto& hconn : h1_snap) {
+                auto conn = hconn->GetConnection();
+                if (!conn) continue;
+                conn->RunOnDispatcher([hconn, body, header, ws_msg, final_cap]() {
+                    hconn->UpdateSizeLimits(body, header, ws_msg, final_cap);
+                });
+            }
+            for (auto& h2conn : h2_snap) {
+                auto conn = h2conn->GetConnection();
+                if (!conn) continue;
+                conn->RunOnDispatcher([h2conn, conn, body, final_cap]() {
+                    h2conn->SetMaxBodySize(body);
+                    conn->SetMaxInputSize(final_cap);
+                });
+            }
+        }
     }
 
     // Update the remaining reload-safe fields

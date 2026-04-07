@@ -44,6 +44,14 @@ public:
     void SetMaxHeaderSize(size_t max);
     void SetMaxWsMessageSize(size_t max) { max_ws_message_size_ = max; }
 
+    // Update all size limits on an existing connection during live reload.
+    // Must be called on the connection's dispatcher thread (via RunOnDispatcher).
+    // Handles both HTTP-mode and WS-mode connections:
+    //   HTTP: updates parser limits + transport input cap
+    //   WS:   updates parser + message limits + transport input cap (ws-specific)
+    void UpdateSizeLimits(size_t body, size_t header, size_t ws,
+                          size_t http_input_cap);
+
     // Set request timeout (Slowloris protection).
     // Deadline is armed on first OnRawData call (after TLS handshake completes for TLS connections).
     void SetRequestTimeout(int seconds);

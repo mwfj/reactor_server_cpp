@@ -57,6 +57,24 @@ void HttpConnectionHandler::SetMaxHeaderSize(size_t max) {
     parser_.SetMaxHeaderSize(max);
 }
 
+void HttpConnectionHandler::UpdateSizeLimits(size_t body, size_t header,
+                                              size_t ws, size_t http_input_cap) {
+    SetMaxBodySize(body);
+    SetMaxHeaderSize(header);
+    max_ws_message_size_ = ws;
+
+    if (upgraded_ && ws_conn_) {
+        // WS-upgraded connection: update parser + message limits, and switch
+        // transport cap to the WS-specific value (0 = unlimited).
+        ws_conn_->GetParser().SetMaxPayloadSize(ws);
+        ws_conn_->SetMaxMessageSize(ws);
+        conn_->SetMaxInputSize(ws);
+    } else {
+        // HTTP-mode connection: use the composite HTTP input cap.
+        conn_->SetMaxInputSize(http_input_cap);
+    }
+}
+
 void HttpConnectionHandler::SetRequestTimeout(int seconds) {
     request_timeout_sec_ = seconds;
     // Don't arm deadline here — for TLS connections, the handshake hasn't
@@ -385,10 +403,14 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         HttpResponse mw_response;
         if (callbacks_.middleware_callback) {
             if (!callbacks_.middleware_callback(req, mw_response)) {
-                // Middleware rejected — default to 403 if nothing was set.
+                // Middleware rejected — default to 403 if status is still the
+                // HttpResponse default (200) and no body was set. The headers
+                // check was intentionally removed: middleware that stamps CORS
+                // or auth headers before rejecting should still produce 403,
+                // not leak a 200 OK on a denied WebSocket upgrade. Matches
+                // the async HTTP path (FillDefaultRejectionResponse).
                 if (mw_response.GetStatusCode() == 200 &&
-                    mw_response.GetBody().empty() &&
-                    mw_response.GetHeaders().empty()) {
+                    mw_response.GetBody().empty()) {
                     mw_response.Status(403).Text("Forbidden");
                 }
                 logging::Get()->debug("WebSocket upgrade rejected by middleware fd={} path={}",
