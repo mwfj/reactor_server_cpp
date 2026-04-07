@@ -4,6 +4,7 @@
 #include "dispatcher.h"
 #include "upstream/upstream_connection.h"
 #include "upstream/upstream_lease.h"
+#include "upstream/upstream_callbacks.h"
 #include "config/server_config.h"
 #include <condition_variable>
 // <memory>, <functional>, <deque>, <vector>, <chrono>, <atomic>, <mutex> provided by common.h
@@ -13,9 +14,10 @@ class TlsClientContext;
 
 class PoolPartition {
 public:
-    // Checkout callbacks — invoked on the dispatcher thread
-    using ReadyCallback = std::function<void(UpstreamLease)>;
-    using ErrorCallback = std::function<void(int error_code)>;
+    // Checkout callback aliases — defined in upstream_callbacks.h,
+    // aliased here for backward compatibility with existing call sites.
+    using ReadyCallback = UPSTREAM_CALLBACKS_NAMESPACE::ReadyCallback;
+    using ErrorCallback = UPSTREAM_CALLBACKS_NAMESPACE::ErrorCallback;
 
     // Checkout error codes
     static constexpr int CHECKOUT_POOL_EXHAUSTED  = -1;

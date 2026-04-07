@@ -1780,6 +1780,24 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     );
 }
 
+HttpServer::ConnectionSnapshot HttpServer::SnapshotConnections() {
+    ConnectionSnapshot snap;
+    std::lock_guard<std::mutex> lck(conn_mtx_);
+    snap.h1.reserve(http_connections_.size());
+    for (auto& [fd, hconn] : http_connections_) {
+        snap.h1.push_back(hconn);
+    }
+    snap.h2.reserve(h2_connections_.size());
+    for (auto& [fd, h2conn] : h2_connections_) {
+        snap.h2.push_back(h2conn);
+    }
+    snap.pending.reserve(pending_detection_.size());
+    for (auto& [fd, pd] : pending_detection_) {
+        snap.pending.push_back(pd.conn);
+    }
+    return snap;
+}
+
 bool HttpServer::Reload(const ServerConfig& new_config) {
     // Gate on server readiness — socket_dispatchers_ is built during Start()
     // and must not be walked until construction is complete.
@@ -1867,37 +1885,19 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // are dispatcher-thread-only fields (plain size_t, not atomic), so
         // enqueue updates through each connection's dispatcher.
         {
-            std::vector<std::shared_ptr<HttpConnectionHandler>> h1_snap;
-            std::vector<std::shared_ptr<Http2ConnectionHandler>> h2_snap;
-            std::vector<std::shared_ptr<ConnectionHandler>> pd_snap;
-            {
-                std::lock_guard<std::mutex> lck(conn_mtx_);
-                h1_snap.reserve(http_connections_.size());
-                for (auto& [fd, hconn] : http_connections_) {
-                    h1_snap.push_back(hconn);
-                }
-                h2_snap.reserve(h2_connections_.size());
-                for (auto& [fd, h2conn] : h2_connections_) {
-                    h2_snap.push_back(h2conn);
-                }
-                pd_snap.reserve(pending_detection_.size());
-                for (auto& [fd, pd] : pending_detection_) {
-                    pd_snap.push_back(pd.conn);
-                }
-            }
-
+            auto snap = SnapshotConnections();
             size_t body = new_config.max_body_size;
             size_t header = new_config.max_header_size;
             size_t ws_msg = new_config.max_ws_message_size;
 
-            for (auto& hconn : h1_snap) {
+            for (auto& hconn : snap.h1) {
                 auto conn = hconn->GetConnection();
                 if (!conn) continue;
                 conn->RunOnDispatcher([hconn, body, header, ws_msg, final_cap]() {
                     hconn->UpdateSizeLimits(body, header, ws_msg, final_cap);
                 });
             }
-            for (auto& h2conn : h2_snap) {
+            for (auto& h2conn : snap.h2) {
                 auto conn = h2conn->GetConnection();
                 if (!conn) continue;
                 conn->RunOnDispatcher([h2conn, conn, body, final_cap]() {
@@ -1907,7 +1907,7 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
             }
             // Pending-detection connections have no protocol handler yet —
             // only the transport-level input cap needs updating.
-            for (auto& conn : pd_snap) {
+            for (auto& conn : snap.pending) {
                 if (!conn) continue;
                 conn->RunOnDispatcher([conn, final_cap]() {
                     conn->SetMaxInputSize(final_cap);
@@ -1928,32 +1928,16 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     // old Slowloris deadline after a reload.
     {
         int timeout = new_config.request_timeout_sec;
-        std::vector<std::shared_ptr<HttpConnectionHandler>> h1_snap;
-        std::vector<std::shared_ptr<Http2ConnectionHandler>> h2_snap;
-        std::vector<std::shared_ptr<ConnectionHandler>> pd_snap;
-        {
-            std::lock_guard<std::mutex> lck(conn_mtx_);
-            h1_snap.reserve(http_connections_.size());
-            for (auto& [fd, hconn] : http_connections_) {
-                h1_snap.push_back(hconn);
-            }
-            h2_snap.reserve(h2_connections_.size());
-            for (auto& [fd, h2conn] : h2_connections_) {
-                h2_snap.push_back(h2conn);
-            }
-            pd_snap.reserve(pending_detection_.size());
-            for (auto& [fd, pd] : pending_detection_) {
-                pd_snap.push_back(pd.conn);
-            }
-        }
-        for (auto& hconn : h1_snap) {
+        auto snap = SnapshotConnections();
+
+        for (auto& hconn : snap.h1) {
             auto conn = hconn->GetConnection();
             if (!conn) continue;
             conn->RunOnDispatcher([hconn, timeout]() {
                 hconn->SetRequestTimeout(timeout);
             });
         }
-        for (auto& h2conn : h2_snap) {
+        for (auto& h2conn : snap.h2) {
             auto conn = h2conn->GetConnection();
             if (!conn) continue;
             conn->RunOnDispatcher([h2conn, timeout]() {
@@ -1963,7 +1947,7 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // Pending-detection connections have no protocol handler yet, but
         // they may have partial data buffered (Slowloris on the preface).
         // Set/clear a transport-level deadline to match the new timeout.
-        for (auto& conn : pd_snap) {
+        for (auto& conn : snap.pending) {
             if (!conn) continue;
             conn->RunOnDispatcher([conn, timeout]() {
                 if (timeout > 0) {

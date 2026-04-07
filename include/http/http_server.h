@@ -162,6 +162,15 @@ private:
     void HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn);
     void HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message);
 
+    // Snapshot of all active connection handlers, taken under conn_mtx_.
+    // Used by Reload() to push updated config to existing connections.
+    struct ConnectionSnapshot {
+        std::vector<std::shared_ptr<HttpConnectionHandler>> h1;
+        std::vector<std::shared_ptr<Http2ConnectionHandler>> h2;
+        std::vector<std::shared_ptr<ConnectionHandler>> pending;
+    };
+    ConnectionSnapshot SnapshotConnections();
+
     // Helper: set up request + upgrade handlers on an HttpConnectionHandler
     void SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn);
     // Helper: wire NetServer callbacks to this HttpServer
