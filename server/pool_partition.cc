@@ -924,6 +924,16 @@ bool PoolPartition::ValidateConnection(UpstreamConnection* conn) {
 }
 
 void PoolPartition::ServiceWaitQueue() {
+    // If shutdown has started (partition-local or manager-wide), don't hand
+    // out or create connections. Pending waiters will be drained with
+    // CHECKOUT_SHUTTING_DOWN by the partition's InitiateShutdown(). Without
+    // this, a connection return between the manager flag flip and the
+    // enqueued InitiateShutdown task can still service waiters, creating new
+    // upstream work after Stop() has begun and extending shutdown.
+    if (shutting_down_ || manager_shutting_down_.load(std::memory_order_acquire)) {
+        return;
+    }
+
     // Hoist alive_ onto the stack: a waiter's ready_callback / error_callback
     // may synchronously tear down the pool/manager (e.g., reacting to a first
     // checkout failure by calling HttpServer::Stop()), which frees this
