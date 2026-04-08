@@ -889,7 +889,11 @@ void ConnectionHandler::SetDeadlineTimeoutCb(DeadlineTimeoutCb cb) {
 
 bool ConnectionHandler::CallDeadlineTimeoutCb() {
     if (deadline_timeout_cb_) {
-        return deadline_timeout_cb_();
+        // Move to stack local before invoking: the callback may call
+        // ClearResponseTimeout → SetDeadlineTimeoutCb(nullptr), which
+        // destroys the std::function while it's executing (UB).
+        auto cb = std::move(deadline_timeout_cb_);
+        return cb();
     }
     return false;
 }

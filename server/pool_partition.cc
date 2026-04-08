@@ -1047,9 +1047,10 @@ void PoolPartition::CreateForWaiters() {
         CreateNewConnection(std::move(entry.ready_callback),
                             std::move(entry.error_callback));
         if (!alive->load(std::memory_order_acquire)) return;
-        // If CreateNewConnection failed synchronously (count didn't increase),
-        // continue trying for remaining waiters — the next attempt may
-        // succeed on a different upstream address.
+        // If CreateNewConnection succeeded (async connect started), stop —
+        // the next waiter will be serviced when this connection completes.
+        // On synchronous failure (count didn't increase), try the next
+        // waiter — transient errors (e.g., fd exhaustion) may clear.
         if (TotalCount() > count_before) break;
     }
 }

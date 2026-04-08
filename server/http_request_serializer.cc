@@ -29,13 +29,16 @@ std::string HttpRequestSerializer::Serialize(
         result += "\r\n";
     }
 
-    // Always emit Content-Length — even "Content-Length: 0" for empty bodies.
-    // RFC 7230 §3.3.2 recommends including it when no Transfer-Encoding is
-    // sent, and some strict upstream servers reject or hang on bodyless
-    // POST/PUT/PATCH requests without it.
-    result += "Content-Length: ";
-    result += std::to_string(body.size());
-    result += "\r\n";
+    // RFC 7230 §3.3.2: include Content-Length when the body is non-empty,
+    // or when the method semantics anticipate a body (POST/PUT/PATCH).
+    // Omit for GET/HEAD/DELETE/OPTIONS — some strict servers and WAFs
+    // reject "Content-Length: 0" on methods that don't expect a body.
+    if (!body.empty() ||
+        method == "POST" || method == "PUT" || method == "PATCH") {
+        result += "Content-Length: ";
+        result += std::to_string(body.size());
+        result += "\r\n";
+    }
 
     result += "\r\n";
 
