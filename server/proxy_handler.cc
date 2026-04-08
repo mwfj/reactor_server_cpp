@@ -79,6 +79,18 @@ void ProxyHandler::Handle(
                           service_name_, request.client_fd,
                           request.method, request.path);
 
+    // Extract catch-all route param for strip_prefix. RegisterProxyRoutes
+    // registers the catch-all as "*proxy_path", so the router populates
+    // request.params["proxy_path"] with the matched tail. This correctly
+    // handles dynamic route patterns (e.g., /api/:version/*proxy_path).
+    std::string upstream_path_override;
+    if (config_.strip_prefix) {
+        auto it = request.params.find("proxy_path");
+        if (it != request.params.end()) {
+            upstream_path_override = it->second;
+        }
+    }
+
     auto txn = std::make_shared<ProxyTransaction>(
         service_name_,
         request,
@@ -90,6 +102,7 @@ void ProxyHandler::Handle(
         upstream_tls_,
         upstream_host_,
         upstream_port_,
+        upstream_path_override,
         static_prefix_);
 
     txn->Start();

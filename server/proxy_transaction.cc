@@ -18,6 +18,7 @@ ProxyTransaction::ProxyTransaction(
     bool upstream_tls,
     const std::string& upstream_host,
     int upstream_port,
+    const std::string& upstream_path_override,
     const std::string& static_prefix)
     : service_name_(service_name),
       method_(client_request.method),
@@ -32,6 +33,7 @@ ProxyTransaction::ProxyTransaction(
       upstream_tls_(upstream_tls),
       upstream_host_(upstream_host),
       upstream_port_(upstream_port),
+      upstream_path_override_(upstream_path_override),
       static_prefix_(static_prefix),
       upstream_manager_(upstream_manager),
       config_(config),
@@ -64,9 +66,19 @@ void ProxyTransaction::Start() {
         upstream_tls_,
         upstream_host_, upstream_port_);
 
-    // Apply strip_prefix using precomputed static_prefix_ from ProxyHandler
+    // Compute upstream path with strip_prefix support.
+    // Prefer upstream_path_override_ (extracted from catch-all route param by
+    // ProxyHandler) — it captures the exact tail matched by the router, which
+    // correctly handles dynamic route patterns like /api/:version/*path.
+    // Fall back to static_prefix_ string stripping for backward compatibility
+    // with routes that don't use catch-all params.
     std::string upstream_path = path_;
-    if (!static_prefix_.empty()) {
+    if (!upstream_path_override_.empty()) {
+        upstream_path = upstream_path_override_;
+        if (upstream_path.empty() || upstream_path[0] != '/') {
+            upstream_path = "/" + upstream_path;
+        }
+    } else if (!static_prefix_.empty()) {
         if (path_.size() >= static_prefix_.size() &&
             path_.compare(0, static_prefix_.size(), static_prefix_) == 0) {
             upstream_path = path_.substr(static_prefix_.size());

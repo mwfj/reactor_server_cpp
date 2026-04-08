@@ -38,6 +38,7 @@ public:
                      bool upstream_tls,
                      const std::string& upstream_host,
                      int upstream_port,
+                     const std::string& upstream_path_override,
                      const std::string& static_prefix);
     ~ProxyTransaction();
 
@@ -80,7 +81,8 @@ private:
     bool upstream_tls_;
     std::string upstream_host_;
     int upstream_port_;
-    std::string static_prefix_;  // Precomputed by ProxyHandler for strip_prefix
+    std::string upstream_path_override_;  // If non-empty, use as upstream path (from catch-all param)
+    std::string static_prefix_;  // Fallback: precomputed by ProxyHandler for strip_prefix
 
     // Rewritten headers and serialized request (cached for retry)
     std::map<std::string, std::string> rewritten_headers_;

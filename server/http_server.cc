@@ -412,16 +412,35 @@ void HttpServer::RouteAsync(const std::string& method, const std::string& path, 
 void HttpServer::Proxy(const std::string& route_pattern,
                        const std::string& upstream_service_name) {
     // Validate that the upstream service exists in config (can check eagerly)
-    bool found = false;
+    const UpstreamConfig* found = nullptr;
     for (const auto& u : upstream_configs_) {
         if (u.name == upstream_service_name) {
-            found = true;
+            found = &u;
             break;
         }
     }
     if (!found) {
         logging::Get()->error("Proxy: upstream service '{}' not configured",
                               upstream_service_name);
+        return;
+    }
+
+    // Validate proxy config eagerly — fail fast for code-registered routes
+    // that bypass config_loader validation (which only runs for JSON-loaded
+    // configs with non-empty route_prefix).
+    if (found->proxy.response_timeout_ms <= 0) {
+        logging::Get()->error("Proxy: upstream '{}' has invalid "
+                              "response_timeout_ms={} (must be > 0)",
+                              upstream_service_name,
+                              found->proxy.response_timeout_ms);
+        return;
+    }
+    if (found->proxy.retry.max_retries < 0 ||
+        found->proxy.retry.max_retries > 10) {
+        logging::Get()->error("Proxy: upstream '{}' has invalid "
+                              "max_retries={} (must be 0-10)",
+                              upstream_service_name,
+                              found->proxy.retry.max_retries);
         return;
     }
 
@@ -448,24 +467,15 @@ void HttpServer::Proxy(const std::string& route_pattern,
         return;
     }
 
-    // Find the upstream config again (need the full struct for handler creation)
-    const UpstreamConfig* uc = nullptr;
-    for (const auto& u : upstream_configs_) {
-        if (u.name == upstream_service_name) {
-            uc = &u;
-            break;
-        }
-    }
-
-    // Create ProxyHandler for this upstream
-    ProxyConfig handler_config = uc->proxy;
+    // Create ProxyHandler for this upstream (reuse `found` from validation above)
+    ProxyConfig handler_config = found->proxy;
     handler_config.route_prefix = route_pattern;
     auto handler = std::make_unique<ProxyHandler>(
         upstream_service_name,
         handler_config,
-        uc->tls.enabled,
-        uc->host,
-        uc->port,
+        found->tls.enabled,
+        found->host,
+        found->port,
         upstream_manager_.get());
 
     // Capture raw pointer -- ProxyHandler is owned by proxy_handlers_ and
@@ -473,7 +483,7 @@ void HttpServer::Proxy(const std::string& route_pattern,
     ProxyHandler* handler_ptr = handler.get();
 
     // Determine methods to register
-    std::vector<std::string> methods = uc->proxy.methods;
+    std::vector<std::string> methods = found->proxy.methods;
     if (methods.empty()) {
         // All standard methods
         methods = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
@@ -490,7 +500,7 @@ void HttpServer::Proxy(const std::string& route_pattern,
 
     logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                          route_pattern, upstream_service_name,
-                         uc->host, uc->port);
+                         found->host, found->port);
 
     proxy_handlers_[upstream_service_name] = std::move(handler);
 }
@@ -1912,17 +1922,45 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, stream_id, active_counter,
                      mw_headers, completed, cancelled](HttpResponse final_resp) {
+                        auto is_repeatable_header = [](const std::string& name) {
+                            std::string lower = name;
+                            std::transform(
+                                lower.begin(), lower.end(), lower.begin(),
+                                [](unsigned char c) { return std::tolower(c); });
+                            return lower == "set-cookie" ||
+                                   lower == "www-authenticate";
+                        };
                         if (completed->exchange(true)) return;
                         // Same merge as H1: middleware first, handler second.
+                        // Use AppendHeader to preserve repeated upstream
+                        // headers (Cache-Control, Link, Via, etc.).
                         HttpResponse merged;
                         merged.Status(final_resp.GetStatusCode(),
                                       final_resp.GetStatusReason());
                         merged.Body(final_resp.GetBody());
+                        std::set<std::string> final_non_repeatable;
+                        for (const auto& fh : final_resp.GetHeaders()) {
+                            if (!is_repeatable_header(fh.first)) {
+                                std::string lower = fh.first;
+                                std::transform(
+                                    lower.begin(), lower.end(), lower.begin(),
+                                    [](unsigned char c) { return std::tolower(c); });
+                                final_non_repeatable.insert(std::move(lower));
+                            }
+                        }
                         for (const auto& mh : mw_headers) {
-                            merged.Header(mh.first, mh.second);
+                            std::string lower = mh.first;
+                            std::transform(
+                                lower.begin(), lower.end(), lower.begin(),
+                                [](unsigned char c) { return std::tolower(c); });
+                            if (!is_repeatable_header(mh.first) &&
+                                final_non_repeatable.count(lower)) {
+                                continue;
+                            }
+                            merged.AppendHeader(mh.first, mh.second);
                         }
                         for (const auto& fh : final_resp.GetHeaders()) {
-                            merged.Header(fh.first, fh.second);
+                            merged.AppendHeader(fh.first, fh.second);
                         }
                         auto s = weak_self.lock();
                         if (!s) {
