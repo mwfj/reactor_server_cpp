@@ -45,5 +45,6 @@ private:
     UpstreamManager* upstream_manager_;
     HeaderRewriter header_rewriter_;
     RetryPolicy retry_policy_;
-    std::string static_prefix_;  // Precomputed from route_prefix for strip_prefix
+    std::string static_prefix_;      // Precomputed from route_prefix for strip_prefix
+    std::string catch_all_param_;    // Name of the catch-all route param (e.g., "proxy_path" or "rest")
 };

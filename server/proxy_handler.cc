@@ -42,14 +42,25 @@ ProxyHandler::ProxyHandler(
     // the raw matched path. Users needing full dynamic-prefix stripping
     // should structure their routes with static prefixes.
     if (config_.strip_prefix && !config_.route_prefix.empty()) {
+        // Extract catch-all param name from route_prefix (e.g., "*proxy_path"
+        // → "proxy_path", "*rest" → "rest"). Used in Handle() to look up the
+        // router-extracted tail instead of doing string prefix stripping.
+        auto star_pos = config_.route_prefix.rfind('*');
+        if (star_pos != std::string::npos) {
+            catch_all_param_ = config_.route_prefix.substr(star_pos + 1);
+        }
+
+        // Precompute static_prefix as fallback for exact-match routes
+        // (no catch-all param available). Only the leading static segment
+        // is stripped; dynamic segments like :version are left intact.
         static_prefix_ = config_.route_prefix;
         auto colon_pos = static_prefix_.find(':');
-        auto star_pos = static_prefix_.find('*');
+        auto star_pos2 = static_prefix_.find('*');
         size_t cut_pos = std::string::npos;
         if (colon_pos != std::string::npos) cut_pos = colon_pos;
-        if (star_pos != std::string::npos &&
-            (cut_pos == std::string::npos || star_pos < cut_pos)) {
-            cut_pos = star_pos;
+        if (star_pos2 != std::string::npos &&
+            (cut_pos == std::string::npos || star_pos2 < cut_pos)) {
+            cut_pos = star_pos2;
         }
         if (cut_pos != std::string::npos) {
             static_prefix_ = static_prefix_.substr(0, cut_pos);
@@ -79,13 +90,13 @@ void ProxyHandler::Handle(
                           service_name_, request.client_fd,
                           request.method, request.path);
 
-    // Extract catch-all route param for strip_prefix. RegisterProxyRoutes
-    // registers the catch-all as "*proxy_path", so the router populates
-    // request.params["proxy_path"] with the matched tail. This correctly
-    // handles dynamic route patterns (e.g., /api/:version/*proxy_path).
+    // Extract catch-all route param for strip_prefix. The param name is
+    // determined by the route pattern: auto-generated routes use "proxy_path",
+    // user-defined patterns may use any name (e.g., "*rest" → "rest").
+    // catch_all_param_ is extracted from route_prefix at construction time.
     std::string upstream_path_override;
-    if (config_.strip_prefix) {
-        auto it = request.params.find("proxy_path");
+    if (config_.strip_prefix && !catch_all_param_.empty()) {
+        auto it = request.params.find(catch_all_param_);
         if (it != request.params.end()) {
             upstream_path_override = it->second;
         }

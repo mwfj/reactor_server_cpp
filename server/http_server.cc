@@ -455,21 +455,47 @@ void HttpServer::Proxy(const std::string& route_pattern,
         return;
     }
 
-    // Post-Start path (called from MarkServerReady or SetReadyCallback)
-    // Guard: calling Proxy() twice for the same upstream replaces the handler
-    // in proxy_handlers_, destroying the previous one while routes still hold
-    // a dangling raw handler_ptr. Reject re-registration.
-    if (proxy_handlers_.count(upstream_service_name)) {
-        logging::Get()->error("Proxy: handler for upstream '{}' already "
-                              "registered — cannot re-register without "
-                              "dangling route pointers",
-                              upstream_service_name);
+    // Post-Start path (called from MarkServerReady or SetReadyCallback).
+    // Guard: reject exact duplicate {pattern, upstream} to prevent
+    // dangling handler_ptr in route lambdas. Multiple different patterns
+    // for the same upstream are allowed (e.g., /v1 and /v2 both → "svc").
+    std::string handler_key = upstream_service_name + "\t" + route_pattern;
+    if (proxy_handlers_.count(handler_key)) {
+        logging::Get()->error("Proxy: route '{}' -> '{}' already registered",
+                              route_pattern, upstream_service_name);
         return;
     }
 
-    // Create ProxyHandler for this upstream (reuse `found` from validation above)
+    // Build ProxyConfig with the caller's route_pattern. The catch-all
+    // registration below may append "*proxy_path", and ProxyHandler extracts
+    // the catch-all param name from route_prefix at construction time.
+    // Detect whether the pattern already contains a catch-all segment.
+    std::string effective_prefix = route_pattern;
+    bool has_catch_all = false;
+    {
+        auto star_pos = effective_prefix.rfind('*');
+        if (star_pos != std::string::npos) {
+            auto last_slash = effective_prefix.rfind('/');
+            if (last_slash != std::string::npos && star_pos > last_slash) {
+                has_catch_all = true;
+            }
+        }
+    }
+
+    // If no catch-all, build the full route_prefix that includes the
+    // auto-generated "*proxy_path" so ProxyHandler knows the param name.
+    std::string config_prefix = route_pattern;
+    if (!has_catch_all) {
+        std::string catch_all_pattern = route_pattern;
+        if (catch_all_pattern.back() != '/') {
+            catch_all_pattern += '/';
+        }
+        catch_all_pattern += "*proxy_path";
+        config_prefix = catch_all_pattern;
+    }
+
     ProxyConfig handler_config = found->proxy;
-    handler_config.route_prefix = route_pattern;
+    handler_config.route_prefix = config_prefix;
     auto handler = std::make_unique<ProxyHandler>(
         upstream_service_name,
         handler_config,
@@ -478,31 +504,36 @@ void HttpServer::Proxy(const std::string& route_pattern,
         found->port,
         upstream_manager_.get());
 
-    // Capture raw pointer -- ProxyHandler is owned by proxy_handlers_ and
-    // outlives all route dispatches (cleared only in Stop/destructor).
     ProxyHandler* handler_ptr = handler.get();
 
     // Determine methods to register
-    std::vector<std::string> methods = found->proxy.methods;
-    if (methods.empty()) {
-        // All standard methods
-        methods = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
+    static const std::vector<std::string> DEFAULT_PROXY_METHODS =
+        {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
+    const auto& methods = found->proxy.methods.empty()
+        ? DEFAULT_PROXY_METHODS : found->proxy.methods;
+
+    auto register_route = [&](const std::string& pattern) {
+        for (const auto& method : methods) {
+            router_.RouteAsync(method, pattern,
+                [handler_ptr](const HttpRequest& request,
+                              HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
+                    handler_ptr->Handle(request, std::move(complete));
+                });
+        }
+        logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
+                             pattern, upstream_service_name,
+                             found->host, found->port);
+    };
+
+    // Register exact prefix + catch-all variant (same as RegisterProxyRoutes)
+    if (!has_catch_all) {
+        register_route(route_pattern);
+        register_route(config_prefix);
+    } else {
+        register_route(route_pattern);
     }
 
-    // Register async routes for each method
-    for (const auto& method : methods) {
-        router_.RouteAsync(method, route_pattern,
-            [handler_ptr](const HttpRequest& request,
-                          HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
-                handler_ptr->Handle(request, std::move(complete));
-            });
-    }
-
-    logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
-                         route_pattern, upstream_service_name,
-                         found->host, found->port);
-
-    proxy_handlers_[upstream_service_name] = std::move(handler);
+    proxy_handlers_[handler_key] = std::move(handler);
 }
 
 void HttpServer::RegisterProxyRoutes() {
@@ -515,21 +546,43 @@ void HttpServer::RegisterProxyRoutes() {
             continue;  // No proxy config for this upstream
         }
 
-        // Skip if a handler was already registered via manual Proxy() call.
-        // Re-registration would destroy the existing handler and leave its
-        // route lambdas with dangling raw pointers.
-        if (proxy_handlers_.count(upstream.name)) {
-            logging::Get()->warn("RegisterProxyRoutes: handler for upstream "
-                                 "'{}' already exists, skipping auto-registration",
-                                 upstream.name);
+        // Skip if a handler was already registered for this exact
+        // {upstream, route_prefix} via manual Proxy() call.
+        std::string handler_key = upstream.name + "\t" + upstream.proxy.route_prefix;
+        if (proxy_handlers_.count(handler_key)) {
+            logging::Get()->warn("RegisterProxyRoutes: route '{}' -> '{}' "
+                                 "already registered, skipping",
+                                 upstream.proxy.route_prefix, upstream.name);
             continue;
         }
 
-        // Create ONE ProxyHandler per upstream. Both route patterns (exact
-        // prefix + catch-all) share the same handler_ptr.
+        // Check if the route_prefix already has a catch-all segment
+        std::string route_pattern = upstream.proxy.route_prefix;
+        bool has_catch_all = false;
+        auto star_pos = route_pattern.rfind('*');
+        if (star_pos != std::string::npos) {
+            auto last_slash = route_pattern.rfind('/');
+            if (last_slash != std::string::npos && star_pos > last_slash) {
+                has_catch_all = true;
+            }
+        }
+
+        // Build effective route_prefix that includes the catch-all segment
+        // so ProxyHandler can extract the catch-all param name.
+        std::string config_prefix = route_pattern;
+        if (!has_catch_all) {
+            if (config_prefix.back() != '/') {
+                config_prefix += '/';
+            }
+            config_prefix += "*proxy_path";
+        }
+
+        // Create ProxyHandler with the full catch-all-aware route_prefix.
+        ProxyConfig handler_config = upstream.proxy;
+        handler_config.route_prefix = config_prefix;
         auto handler = std::make_unique<ProxyHandler>(
             upstream.name,
-            upstream.proxy,
+            handler_config,
             upstream.tls.enabled,
             upstream.host,
             upstream.port,
@@ -554,32 +607,15 @@ void HttpServer::RegisterProxyRoutes() {
                                  upstream.host, upstream.port);
         };
 
-        // Check if the route_prefix already has a catch-all segment
-        std::string route_pattern = upstream.proxy.route_prefix;
-        bool has_catch_all = false;
-        auto star_pos = route_pattern.rfind('*');
-        if (star_pos != std::string::npos) {
-            auto last_slash = route_pattern.rfind('/');
-            if (last_slash != std::string::npos && star_pos > last_slash) {
-                has_catch_all = true;
-            }
-        }
-
         if (!has_catch_all) {
             // Register the exact prefix to handle requests that match it
             // without a trailing path (e.g., /api/users).
             register_route(upstream.proxy.route_prefix);
-
-            // Also register the catch-all variant for sub-paths.
-            if (route_pattern.back() != '/') {
-                route_pattern += '/';
-            }
-            route_pattern += "*proxy_path";
         }
+        // Register the catch-all variant (auto-generated or user-provided)
+        register_route(config_prefix);
 
-        register_route(route_pattern);
-
-        proxy_handlers_[upstream.name] = std::move(handler);
+        proxy_handlers_[handler_key] = std::move(handler);
     }
 }
 
