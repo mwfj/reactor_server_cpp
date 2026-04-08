@@ -27,6 +27,7 @@ public:
         const std::map<std::string, std::string>& client_headers,
         const std::string& client_ip,
         bool client_tls,
+        bool upstream_tls,
         const std::string& upstream_host,
         int upstream_port) const;
 

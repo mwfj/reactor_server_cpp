@@ -7,11 +7,13 @@
 ProxyHandler::ProxyHandler(
     const std::string& service_name,
     const ProxyConfig& config,
+    bool upstream_tls,
     const std::string& upstream_host,
     int upstream_port,
     UpstreamManager* upstream_manager)
     : service_name_(service_name),
       config_(config),
+      upstream_tls_(upstream_tls),
       upstream_host_(upstream_host),
       upstream_port_(upstream_port),
       upstream_manager_(upstream_manager),
@@ -85,6 +87,7 @@ void ProxyHandler::Handle(
         config_,
         header_rewriter_,
         retry_policy_,
+        upstream_tls_,
         upstream_host_,
         upstream_port_,
         static_prefix_);

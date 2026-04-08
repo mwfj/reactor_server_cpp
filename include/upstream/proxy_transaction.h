@@ -35,6 +35,7 @@ public:
                      const ProxyConfig& config,
                      const HeaderRewriter& header_rewriter,
                      const RetryPolicy& retry_policy,
+                     bool upstream_tls,
                      const std::string& upstream_host,
                      int upstream_port,
                      const std::string& static_prefix);
@@ -76,6 +77,7 @@ private:
     std::string client_ip_;
     bool client_tls_;
     int client_fd_;
+    bool upstream_tls_;
     std::string upstream_host_;
     int upstream_port_;
     std::string static_prefix_;  // Precomputed by ProxyHandler for strip_prefix

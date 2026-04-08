@@ -16,6 +16,7 @@ struct UpstreamResponse {
     // Matches HttpResponse's storage model (vector<pair>).
     std::vector<std::pair<std::string, std::string>> headers;  // lowercase keys
     std::string body;
+    bool keep_alive = true;
     bool headers_complete = false;
     bool complete = false;
 
@@ -27,6 +28,7 @@ struct UpstreamResponse {
         http_minor = 1;
         headers.clear();
         body.clear();
+        keep_alive = true;
         headers_complete = false;
         complete = false;
     }

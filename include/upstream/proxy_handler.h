@@ -15,6 +15,7 @@ class ProxyHandler {
 public:
     ProxyHandler(const std::string& service_name,
                  const ProxyConfig& config,
+                 bool upstream_tls,
                  const std::string& upstream_host,
                  int upstream_port,
                  UpstreamManager* upstream_manager);
@@ -38,6 +39,7 @@ public:
 private:
     std::string service_name_;
     ProxyConfig config_;          // stored by value — not a reference
+    bool upstream_tls_ = false;
     std::string upstream_host_;
     int upstream_port_;
     UpstreamManager* upstream_manager_;

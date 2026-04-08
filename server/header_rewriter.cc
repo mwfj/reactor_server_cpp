@@ -11,9 +11,13 @@ bool HeaderRewriter::IsHopByHopHeader(const std::string& name) {
     // RFC 7230 Section 6.1: hop-by-hop headers.
     // "proxy-connection" is non-standard (legacy from old proxy implementations)
     // but included defensively — it should never be forwarded end-to-end.
+    // Proxy-Authorization / Proxy-Authenticate are scoped to the next proxy
+    // hop, not the origin server / final client, so strip them as well.
     return name == "connection"
         || name == "keep-alive"
         || name == "proxy-connection"
+        || name == "proxy-authenticate"
+        || name == "proxy-authorization"
         || name == "transfer-encoding"
         || name == "te"
         || name == "trailer"
@@ -26,7 +30,8 @@ std::vector<std::string> HeaderRewriter::ParseConnectionHeader(
     size_t start = 0;
     while (start < value.size()) {
         // Skip leading whitespace
-        while (start < value.size() && value[start] == ' ') {
+        while (start < value.size() &&
+               (value[start] == ' ' || value[start] == '\t')) {
             ++start;
         }
         if (start >= value.size()) {
@@ -39,7 +44,8 @@ std::vector<std::string> HeaderRewriter::ParseConnectionHeader(
 
         // Trim trailing whitespace
         size_t token_end = end;
-        while (token_end > start && value[token_end - 1] == ' ') {
+        while (token_end > start &&
+               (value[token_end - 1] == ' ' || value[token_end - 1] == '\t')) {
             --token_end;
         }
 
@@ -60,6 +66,7 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
     const std::map<std::string, std::string>& client_headers,
     const std::string& client_ip,
     bool client_tls,
+    bool upstream_tls,
     const std::string& upstream_host,
     int upstream_port) const {
 
@@ -108,8 +115,10 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
 
     // Host: rewrite to upstream address
     if (config_.rewrite_host) {
-        // Omit port for default ports (80 and 443)
-        if (upstream_port == 80 || upstream_port == 443) {
+        // Omit the port only when it matches the upstream scheme's default.
+        bool omit_port = (!upstream_tls && upstream_port == 80) ||
+                         (upstream_tls && upstream_port == 443);
+        if (omit_port) {
             output["host"] = upstream_host;
         } else {
             output["host"] = upstream_host + ":"

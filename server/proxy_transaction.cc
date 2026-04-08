@@ -15,6 +15,7 @@ ProxyTransaction::ProxyTransaction(
     const ProxyConfig& config,
     const HeaderRewriter& header_rewriter,
     const RetryPolicy& retry_policy,
+    bool upstream_tls,
     const std::string& upstream_host,
     int upstream_port,
     const std::string& static_prefix)
@@ -28,6 +29,7 @@ ProxyTransaction::ProxyTransaction(
       client_ip_(client_request.client_ip),
       client_tls_(client_request.client_tls),
       client_fd_(client_request.client_fd),
+      upstream_tls_(upstream_tls),
       upstream_host_(upstream_host),
       upstream_port_(upstream_port),
       static_prefix_(static_prefix),
@@ -59,6 +61,7 @@ void ProxyTransaction::Start() {
     // Compute rewritten headers (strip hop-by-hop, add X-Forwarded-For, etc.)
     rewritten_headers_ = header_rewriter_.RewriteRequest(
         client_headers_, client_ip_, client_tls_,
+        upstream_tls_,
         upstream_host_, upstream_port_);
 
     // Apply strip_prefix using precomputed static_prefix_ from ProxyHandler
@@ -246,6 +249,13 @@ void ProxyTransaction::OnUpstreamData(
 
     // Handle early response (upstream responds while we're still sending)
     if (state_ == State::SENDING_REQUEST) {
+        // Any upstream bytes arriving before the request write completes
+        // mean the response phase has already started. Arm the timeout now:
+        // if the upstream only sends a partial status line / headers and then
+        // stalls while the request body is still backpressured, the normal
+        // write-complete path never runs and the transaction would hang.
+        ArmResponseTimeout();
+
         if (response.complete) {
             // Full response received before request write completed
             poison_connection_ = true;
@@ -328,6 +338,9 @@ void ProxyTransaction::OnResponseComplete() {
     ClearResponseTimeout();
 
     const auto& response = codec_.GetResponse();
+    if (!response.keep_alive) {
+        poison_connection_ = true;
+    }
 
     // Check for 5xx and retry if policy allows — before setting COMPLETE.
     // COMPLETE is terminal; resetting it back to INIT after setting it would

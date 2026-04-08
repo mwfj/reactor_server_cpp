@@ -406,6 +406,54 @@ void TestCodecRepeatedSetCookiePreserved() {
     }
 }
 
+// Connection keep-alive semantics must be tracked so the pool doesn't reuse
+// responses that explicitly close the TCP connection.
+void TestCodecConnectionCloseDisablesReuse() {
+    std::cout << "\n[TEST] Codec: Connection close disables keep-alive..." << std::endl;
+    try {
+        UpstreamHttpCodec codec;
+        const std::string raw =
+            "HTTP/1.1 200 OK\r\n"
+            "Connection: close\r\n"
+            "Content-Length: 2\r\n"
+            "\r\n"
+            "ok";
+
+        codec.Parse(raw.data(), raw.size());
+
+        bool pass = !codec.HasError() &&
+                    codec.GetResponse().complete &&
+                    !codec.GetResponse().keep_alive;
+        std::string err = pass ? "" : "expected keep_alive=false";
+        TestFramework::RecordTest("Codec: Connection close disables keep-alive", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("Codec: Connection close disables keep-alive", false, e.what());
+    }
+}
+
+// HTTP/1.0 responses are non-persistent unless they explicitly opt in.
+void TestCodecHttp10DefaultsToClose() {
+    std::cout << "\n[TEST] Codec: HTTP/1.0 defaults to connection close..." << std::endl;
+    try {
+        UpstreamHttpCodec codec;
+        const std::string raw =
+            "HTTP/1.0 200 OK\r\n"
+            "Content-Length: 2\r\n"
+            "\r\n"
+            "ok";
+
+        codec.Parse(raw.data(), raw.size());
+
+        bool pass = !codec.HasError() &&
+                    codec.GetResponse().complete &&
+                    !codec.GetResponse().keep_alive;
+        std::string err = pass ? "" : "expected HTTP/1.0 response to be non-persistent";
+        TestFramework::RecordTest("Codec: HTTP/1.0 defaults to connection close", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("Codec: HTTP/1.0 defaults to connection close", false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Section 2: HttpRequestSerializer unit tests
 // ---------------------------------------------------------------------------
@@ -543,7 +591,7 @@ void TestRewriterXffAppend() {
             {"x-forwarded-for", "10.0.0.1"},
             {"host", "example.com"}
         };
-        auto out = rewriter.RewriteRequest(in, "192.168.1.5", false, "backend", 8080);
+        auto out = rewriter.RewriteRequest(in, "192.168.1.5", false, false, "backend", 8080);
 
         bool pass = true;
         std::string err;
@@ -569,7 +617,7 @@ void TestRewriterXffCreated() {
         HeaderRewriter rewriter(cfg);
 
         std::map<std::string, std::string> in{{"host", "example.com"}};
-        auto out = rewriter.RewriteRequest(in, "1.2.3.4", false, "backend", 9000);
+        auto out = rewriter.RewriteRequest(in, "1.2.3.4", false, false, "backend", 9000);
 
         bool pass = out.count("x-forwarded-for") && out.at("x-forwarded-for") == "1.2.3.4";
         std::string err = pass ? "" : "x-forwarded-for not created or wrong value: " +
@@ -588,7 +636,7 @@ void TestRewriterXfpHttps() {
         HeaderRewriter rewriter(cfg);
 
         std::map<std::string, std::string> in{{"host", "secure.example.com"}};
-        auto out = rewriter.RewriteRequest(in, "5.6.7.8", true /*tls*/, "backend", 443);
+        auto out = rewriter.RewriteRequest(in, "5.6.7.8", true /*client tls*/, false, "backend", 443);
 
         bool pass = out.count("x-forwarded-proto") && out.at("x-forwarded-proto") == "https";
         std::string err = pass ? "" : "x-forwarded-proto = '" +
@@ -609,7 +657,7 @@ void TestRewriterHostRewrite() {
         HeaderRewriter rewriter(cfg);
 
         std::map<std::string, std::string> in{{"host", "client-facing.com"}};
-        auto out = rewriter.RewriteRequest(in, "1.1.1.1", false, "10.0.1.10", 8081);
+        auto out = rewriter.RewriteRequest(in, "1.1.1.1", false, false, "10.0.1.10", 8081);
 
         bool pass = true;
         std::string err;
@@ -635,7 +683,7 @@ void TestRewriterHostPort80Omitted() {
         HeaderRewriter rewriter(cfg);
 
         std::map<std::string, std::string> in{{"host", "client.com"}};
-        auto out = rewriter.RewriteRequest(in, "1.1.1.1", false, "backend.internal", 80);
+        auto out = rewriter.RewriteRequest(in, "1.1.1.1", false, false, "backend.internal", 80);
 
         bool pass = true;
         std::string err;
@@ -655,6 +703,56 @@ void TestRewriterHostPort80Omitted() {
     }
 }
 
+// Port 443 must NOT be omitted for plain HTTP upstreams.
+void TestRewriterHostPort443RetainedForHttp() {
+    std::cout << "\n[TEST] HeaderRewriter: port 443 retained for plain HTTP upstream..." << std::endl;
+    try {
+        HeaderRewriter::Config cfg;
+        cfg.rewrite_host = true;
+        HeaderRewriter rewriter(cfg);
+
+        std::map<std::string, std::string> in{{"host", "client.com"}};
+        auto out = rewriter.RewriteRequest(
+            in, "1.1.1.1", false, false, "backend.internal", 443);
+
+        bool pass = out.count("host") && out.at("host") == "backend.internal:443";
+        std::string err = pass ? "" :
+            ("expected backend.internal:443, got: " +
+             (out.count("host") ? out.at("host") : "(absent)"));
+        TestFramework::RecordTest(
+            "HeaderRewriter: port 443 retained for plain HTTP upstream", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "HeaderRewriter: port 443 retained for plain HTTP upstream",
+            false, e.what());
+    }
+}
+
+// Port 80 must NOT be omitted for HTTPS upstreams on a non-default port.
+void TestRewriterHostPort80RetainedForHttps() {
+    std::cout << "\n[TEST] HeaderRewriter: port 80 retained for HTTPS upstream..." << std::endl;
+    try {
+        HeaderRewriter::Config cfg;
+        cfg.rewrite_host = true;
+        HeaderRewriter rewriter(cfg);
+
+        std::map<std::string, std::string> in{{"host", "client.com"}};
+        auto out = rewriter.RewriteRequest(
+            in, "1.1.1.1", false, true, "secure.backend", 80);
+
+        bool pass = out.count("host") && out.at("host") == "secure.backend:80";
+        std::string err = pass ? "" :
+            ("expected secure.backend:80, got: " +
+             (out.count("host") ? out.at("host") : "(absent)"));
+        TestFramework::RecordTest(
+            "HeaderRewriter: port 80 retained for HTTPS upstream", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "HeaderRewriter: port 80 retained for HTTPS upstream",
+            false, e.what());
+    }
+}
+
 // Hop-by-hop headers must be stripped from the forwarded request.
 void TestRewriterHopByHopStripped() {
     std::cout << "\n[TEST] HeaderRewriter: hop-by-hop headers stripped from request..." << std::endl;
@@ -666,18 +764,20 @@ void TestRewriterHopByHopStripped() {
             {"host", "example.com"},
             {"connection", "keep-alive"},
             {"keep-alive", "timeout=5"},
+            {"proxy-authorization", "Basic ZXhhbXBsZQ=="},
             {"transfer-encoding", "chunked"},
             {"te", "trailers"},
             {"trailer", "X-Checksum"},
             {"upgrade", "websocket"},
             {"x-custom", "preserved"}
         };
-        auto out = rewriter.RewriteRequest(in, "1.1.1.1", false, "backend", 9000);
+        auto out = rewriter.RewriteRequest(in, "1.1.1.1", false, false, "backend", 9000);
 
         bool pass = true;
         std::string err;
         // Hop-by-hop must be absent
-        for (const char* hop : {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade"}) {
+        for (const char* hop : {"connection", "keep-alive", "proxy-authorization",
+                                "transfer-encoding", "te", "trailer", "upgrade"}) {
             if (out.count(hop)) { pass = false; err += std::string(hop) + " not stripped; "; }
         }
         // Application headers must be preserved
@@ -704,7 +804,7 @@ void TestRewriterConnectionListedHeadersStripped() {
             {"x-special-proxy-header", "secret"},
             {"x-application-data", "keep-me"}
         };
-        auto out = rewriter.RewriteRequest(in, "1.1.1.1", false, "backend", 9000);
+        auto out = rewriter.RewriteRequest(in, "1.1.1.1", false, false, "backend", 9000);
 
         bool pass = true;
         std::string err;
@@ -728,6 +828,7 @@ void TestRewriterResponseHopByHopStripped() {
             {"content-type", "application/json"},
             {"connection", "keep-alive"},
             {"keep-alive", "timeout=5"},
+            {"proxy-authenticate", "Basic realm=\"upstream\""},
             {"transfer-encoding", "chunked"},
             {"x-backend-id", "node-3"}
         };
@@ -740,7 +841,8 @@ void TestRewriterResponseHopByHopStripped() {
         for (const auto& p : out) names.insert(p.first);
 
         // Hop-by-hop must be gone
-        for (const char* hop : {"connection", "keep-alive", "transfer-encoding"}) {
+        for (const char* hop : {"connection", "keep-alive", "proxy-authenticate",
+                                "transfer-encoding"}) {
             if (names.count(hop)) { pass = false; err += std::string(hop) + " not stripped from response; "; }
         }
         // Application headers preserved
@@ -1664,6 +1766,8 @@ void RunAllTests() {
     TestCodecResetAndReuse();
     TestCodecBodyCapEnforced();
     TestCodecRepeatedSetCookiePreserved();
+    TestCodecConnectionCloseDisablesReuse();
+    TestCodecHttp10DefaultsToClose();
 
     // Section 2: HttpRequestSerializer
     TestSerializerGetNoBody();
@@ -1678,6 +1782,8 @@ void RunAllTests() {
     TestRewriterXfpHttps();
     TestRewriterHostRewrite();
     TestRewriterHostPort80Omitted();
+    TestRewriterHostPort443RetainedForHttp();
+    TestRewriterHostPort80RetainedForHttps();
     TestRewriterHopByHopStripped();
     TestRewriterConnectionListedHeadersStripped();
     TestRewriterResponseHopByHopStripped();

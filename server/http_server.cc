@@ -458,9 +458,12 @@ void HttpServer::Proxy(const std::string& route_pattern,
     }
 
     // Create ProxyHandler for this upstream
+    ProxyConfig handler_config = uc->proxy;
+    handler_config.route_prefix = route_pattern;
     auto handler = std::make_unique<ProxyHandler>(
         upstream_service_name,
-        uc->proxy,
+        handler_config,
+        uc->tls.enabled,
         uc->host,
         uc->port,
         upstream_manager_.get());
@@ -473,7 +476,7 @@ void HttpServer::Proxy(const std::string& route_pattern,
     std::vector<std::string> methods = uc->proxy.methods;
     if (methods.empty()) {
         // All standard methods
-        methods = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"};
+        methods = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
     }
 
     // Register async routes for each method
@@ -517,13 +520,14 @@ void HttpServer::RegisterProxyRoutes() {
         auto handler = std::make_unique<ProxyHandler>(
             upstream.name,
             upstream.proxy,
+            upstream.tls.enabled,
             upstream.host,
             upstream.port,
             upstream_manager_.get());
         ProxyHandler* handler_ptr = handler.get();
 
         static const std::vector<std::string> DEFAULT_PROXY_METHODS =
-            {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"};
+            {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
         const auto& methods = upstream.proxy.methods.empty()
             ? DEFAULT_PROXY_METHODS : upstream.proxy.methods;
 
@@ -1192,6 +1196,14 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, active_counter,
                      mw_headers, completed, cancelled](HttpResponse final_resp) {
+                        auto is_repeatable_header = [](const std::string& name) {
+                            std::string lower = name;
+                            std::transform(
+                                lower.begin(), lower.end(), lower.begin(),
+                                [](unsigned char c) { return std::tolower(c); });
+                            return lower == "set-cookie" ||
+                                   lower == "www-authenticate";
+                        };
                         if (completed->exchange(true)) return;
                         // Merge middleware + handler headers: middleware
                         // first (base), handler second (overrides for
@@ -1200,11 +1212,29 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         merged.Status(final_resp.GetStatusCode(),
                                       final_resp.GetStatusReason());
                         merged.Body(final_resp.GetBody());
+                        std::set<std::string> final_non_repeatable;
+                        for (const auto& fh : final_resp.GetHeaders()) {
+                            if (!is_repeatable_header(fh.first)) {
+                                std::string lower = fh.first;
+                                std::transform(
+                                    lower.begin(), lower.end(), lower.begin(),
+                                    [](unsigned char c) { return std::tolower(c); });
+                                final_non_repeatable.insert(std::move(lower));
+                            }
+                        }
                         for (const auto& mh : mw_headers) {
-                            merged.Header(mh.first, mh.second);
+                            std::string lower = mh.first;
+                            std::transform(
+                                lower.begin(), lower.end(), lower.begin(),
+                                [](unsigned char c) { return std::tolower(c); });
+                            if (!is_repeatable_header(mh.first) &&
+                                final_non_repeatable.count(lower)) {
+                                continue;
+                            }
+                            merged.AppendHeader(mh.first, mh.second);
                         }
                         for (const auto& fh : final_resp.GetHeaders()) {
-                            merged.Header(fh.first, fh.second);
+                            merged.AppendHeader(fh.first, fh.second);
                         }
                         auto s = weak_self.lock();
                         if (!s) {

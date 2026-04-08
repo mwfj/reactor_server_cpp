@@ -76,6 +76,7 @@ static int on_headers_complete(llhttp_t* parser) {
     // Extract version
     self->response_.http_major = parser->http_major;
     self->response_.http_minor = parser->http_minor;
+    self->response_.keep_alive = llhttp_should_keep_alive(parser) != 0;
 
     self->response_.headers_complete = true;
     // Reset parsing state so trailer fields (which reuse on_header_field/value
