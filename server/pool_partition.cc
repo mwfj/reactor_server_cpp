@@ -278,20 +278,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     // of returning to idle.
     if (owned->IsClosing()) {
         DestroyConnection(std::move(owned));
-        PurgeExpiredWaitEntries();
-        if (!alive->load(std::memory_order_acquire)) return;
-        while (!shutting_down_ &&
-               !manager_shutting_down_.load(std::memory_order_acquire) &&
-               !wait_queue_.empty() &&
-               TotalCount() < partition_max_connections_) {
-            auto entry = std::move(wait_queue_.front());
-            wait_queue_.pop_front();
-            size_t count_before = TotalCount();
-            CreateNewConnection(std::move(entry.ready_callback),
-                                std::move(entry.error_callback));
-            if (!alive->load(std::memory_order_acquire)) return;
-            if (TotalCount() > count_before) break;
-        }
+        CreateForWaiters();
         return;
     }
 
@@ -305,23 +292,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     // Check if expired
     if (owned->IsExpired(config_.max_lifetime_sec, config_.max_requests_per_conn)) {
         DestroyConnection(std::move(owned));
-        // Retry all queued waiters while capacity is available. Loop so
-        // synchronous CreateNewConnection failures (e.g., ECONNREFUSED)
-        // don't strand remaining waiters.
-        PurgeExpiredWaitEntries();
-        if (!alive->load(std::memory_order_acquire)) return;
-        while (!shutting_down_ &&
-               !manager_shutting_down_.load(std::memory_order_acquire) &&
-               !wait_queue_.empty() &&
-               TotalCount() < partition_max_connections_) {
-            auto entry = std::move(wait_queue_.front());
-            wait_queue_.pop_front();
-            size_t count_before = TotalCount();
-            CreateNewConnection(std::move(entry.ready_callback),
-                                std::move(entry.error_callback));
-            if (!alive->load(std::memory_order_acquire)) return;
-            if (TotalCount() > count_before) break;
-        }
+        CreateForWaiters();
         return;
     }
 
@@ -350,20 +321,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
             // No waiters, or connection is dead/expired — destroy it.
             // If waiters exist but connection is invalid, create a replacement.
             DestroyConnection(std::move(owned));
-            PurgeExpiredWaitEntries();
-            if (!alive->load(std::memory_order_acquire)) return;
-            while (!shutting_down_ &&
-                   !manager_shutting_down_.load(std::memory_order_acquire) &&
-                   !wait_queue_.empty() &&
-                   TotalCount() < partition_max_connections_) {
-                auto entry = std::move(wait_queue_.front());
-                wait_queue_.pop_front();
-                size_t count_before = TotalCount();
-                CreateNewConnection(std::move(entry.ready_callback),
-                                    std::move(entry.error_callback));
-                if (!alive->load(std::memory_order_acquire)) return;
-                if (TotalCount() > count_before) break;
-            }
+            CreateForWaiters();
         }
         return;
     }
@@ -910,30 +868,9 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
             outstanding_conns_.fetch_sub(1, std::memory_order_release);
         }
 
-        // A slot just freed — retry queued checkouts (purge expired first).
-        // Use a loop: if CreateNewConnection fails synchronously (e.g.,
-        // ECONNREFUSED), TotalCount() stays low and the next waiter should
-        // also get a chance instead of stalling until queue timeout.
-        PurgeExpiredWaitEntries();
+        // A slot just freed — retry queued checkouts
+        CreateForWaiters();
         if (!alive->load(std::memory_order_acquire)) return;
-        while (!shutting_down_ &&
-               !manager_shutting_down_.load(std::memory_order_acquire) &&
-               !wait_queue_.empty() &&
-               TotalCount() < partition_max_connections_) {
-            auto entry = std::move(wait_queue_.front());
-            wait_queue_.pop_front();
-            size_t count_before = TotalCount();
-            CreateNewConnection(std::move(entry.ready_callback),
-                                std::move(entry.error_callback));
-            // A synchronous inline failure may have delivered error_cb,
-            // which a user can use to destroy the pool/manager.
-            if (!alive->load(std::memory_order_acquire)) return;
-            // If CreateNewConnection increased TotalCount, it succeeded
-            // (async connect started). Stop — the next waiter will be
-            // serviced when this connection completes or returns.
-            if (TotalCount() > count_before) break;
-            // Otherwise it failed synchronously — try the next waiter.
-        }
 
         MaybeSignalDrain();
     }
@@ -1088,6 +1025,32 @@ void PoolPartition::PurgeExpiredWaitEntries() {
         } else {
             break;  // Queue is ordered by time — stop at first non-expired
         }
+    }
+}
+
+void PoolPartition::CreateForWaiters() {
+    // Hoist alive_ — CreateNewConnection may synchronously invoke error_cb
+    // (e.g., inet_addr / socket() / ::connect non-EINPROGRESS failures),
+    // which could tear down the partition.
+    auto alive = alive_;
+
+    PurgeExpiredWaitEntries();
+    if (!alive->load(std::memory_order_acquire)) return;
+
+    while (!shutting_down_ &&
+           !manager_shutting_down_.load(std::memory_order_acquire) &&
+           !wait_queue_.empty() &&
+           TotalCount() < partition_max_connections_) {
+        auto entry = std::move(wait_queue_.front());
+        wait_queue_.pop_front();
+        size_t count_before = TotalCount();
+        CreateNewConnection(std::move(entry.ready_callback),
+                            std::move(entry.error_callback));
+        if (!alive->load(std::memory_order_acquire)) return;
+        // If CreateNewConnection failed synchronously (count didn't increase),
+        // continue trying for remaining waiters — the next attempt may
+        // succeed on a different upstream address.
+        if (TotalCount() > count_before) break;
     }
 }
 

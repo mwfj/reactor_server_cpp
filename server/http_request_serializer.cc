@@ -29,11 +29,13 @@ std::string HttpRequestSerializer::Serialize(
         result += "\r\n";
     }
 
-    if (!body.empty()) {
-        result += "Content-Length: ";
-        result += std::to_string(body.size());
-        result += "\r\n";
-    }
+    // Always emit Content-Length — even "Content-Length: 0" for empty bodies.
+    // RFC 7230 §3.3.2 recommends including it when no Transfer-Encoding is
+    // sent, and some strict upstream servers reject or hang on bodyless
+    // POST/PUT/PATCH requests without it.
+    result += "Content-Length: ";
+    result += std::to_string(body.size());
+    result += "\r\n";
 
     result += "\r\n";
 

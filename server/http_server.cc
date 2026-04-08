@@ -425,6 +425,17 @@ void HttpServer::Proxy(const std::string& route_pattern,
         return;
     }
 
+    // Guard: calling Proxy() twice for the same upstream replaces the handler
+    // in proxy_handlers_, destroying the previous one while routes still hold
+    // a dangling raw handler_ptr. Reject re-registration.
+    if (proxy_handlers_.count(upstream_service_name)) {
+        logging::Get()->error("Proxy: handler for upstream '{}' already "
+                              "registered — cannot re-register without "
+                              "dangling route pointers",
+                              upstream_service_name);
+        return;
+    }
+
     // Create ProxyHandler for this upstream
     auto handler = std::make_unique<ProxyHandler>(
         upstream_service_name,
@@ -470,11 +481,18 @@ void HttpServer::RegisterProxyRoutes() {
             continue;  // No proxy config for this upstream
         }
 
+        // Skip if a handler was already registered via manual Proxy() call.
+        // Re-registration would destroy the existing handler and leave its
+        // route lambdas with dangling raw pointers.
+        if (proxy_handlers_.count(upstream.name)) {
+            logging::Get()->warn("RegisterProxyRoutes: handler for upstream "
+                                 "'{}' already exists, skipping auto-registration",
+                                 upstream.name);
+            continue;
+        }
+
         // Create ONE ProxyHandler per upstream. Both route patterns (exact
-        // prefix + catch-all) share the same handler_ptr. Calling Proxy()
-        // twice for the same upstream.name would destroy the first handler
-        // via proxy_handlers_[name] = move(handler2), leaving the first
-        // route's lambda with a dangling pointer.
+        // prefix + catch-all) share the same handler_ptr.
         auto handler = std::make_unique<ProxyHandler>(
             upstream.name,
             upstream.proxy,

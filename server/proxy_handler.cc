@@ -32,6 +32,13 @@ ProxyHandler::ProxyHandler(
 {
     // Precompute static_prefix for strip_prefix path rewriting.
     // This avoids re-parsing route_prefix on every request.
+    //
+    // For dynamic route patterns (e.g., "/api/:version/users/*path"),
+    // only the leading static segment ("/api") is stripped. This is by
+    // design: dynamic segments are resolved at match time and the router
+    // captures them as parameters, but the proxy serializer operates on
+    // the raw matched path. Users needing full dynamic-prefix stripping
+    // should structure their routes with static prefixes.
     if (config_.strip_prefix && !config_.route_prefix.empty()) {
         static_prefix_ = config_.route_prefix;
         auto colon_pos = static_prefix_.find(':');

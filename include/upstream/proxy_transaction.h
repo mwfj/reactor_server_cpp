@@ -5,6 +5,7 @@
 #include "upstream/upstream_lease.h"
 #include "upstream/header_rewriter.h"
 #include "upstream/retry_policy.h"
+#include "config/server_config.h"        // ProxyConfig (stored by value)
 #include "http/http_callbacks.h"
 #include "http/http_response.h"
 // <string>, <map>, <unordered_map>, <memory>, <functional>, <chrono> provided by common.h
@@ -12,7 +13,6 @@
 // Forward declarations
 class UpstreamManager;
 class ConnectionHandler;
-struct ProxyConfig;
 
 class ProxyTransaction : public std::enable_shared_from_this<ProxyTransaction> {
 public:
@@ -84,11 +84,11 @@ private:
     std::map<std::string, std::string> rewritten_headers_;
     std::string serialized_request_;
 
-    // Dependencies (non-owning, outlive the transaction)
-    UpstreamManager* upstream_manager_;
-    const ProxyConfig& config_;
-    const HeaderRewriter& header_rewriter_;
-    const RetryPolicy& retry_policy_;
+    // Dependencies
+    UpstreamManager* upstream_manager_;   // non-owning, outlives the transaction
+    ProxyConfig config_;                  // stored by value — decoupled from ProxyHandler lifetime
+    HeaderRewriter header_rewriter_;      // stored by value — small (4 bools config)
+    RetryPolicy retry_policy_;            // stored by value — small (1 int + 5 bools config)
 
     // Completion callback
     HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete_cb_;
@@ -98,11 +98,15 @@ private:
     UpstreamLease lease_;
     UpstreamHttpCodec codec_;
 
-    // Early response flag: set when upstream sends response data while the
-    // request write is still incomplete (state == SENDING_REQUEST). When true,
-    // Cleanup() calls MarkClosing() on the UpstreamConnection before releasing
-    // the lease, ensuring the connection is destroyed (not returned to idle).
-    bool early_response_ = false;
+    // Connection poisoning flag: set when the upstream connection must NOT be
+    // returned to the idle pool. Reasons include:
+    //   - Early response: upstream responded while request write was still in
+    //     progress, leaving stale request bytes in the output buffer.
+    //   - Response timeout: upstream may have sent partial response data that
+    //     would corrupt the next transaction if the connection were reused.
+    // When true, Cleanup() calls MarkClosing() on the UpstreamConnection
+    // before releasing the lease, ensuring the connection is destroyed.
+    bool poison_connection_ = false;
 
     // Timing
     std::chrono::steady_clock::time_point start_time_;

@@ -8,7 +8,9 @@ HeaderRewriter::HeaderRewriter(const Config& config)
 }
 
 bool HeaderRewriter::IsHopByHopHeader(const std::string& name) {
-    // RFC 7230 section 6.1: hop-by-hop headers
+    // RFC 7230 Section 6.1: hop-by-hop headers.
+    // "proxy-connection" is non-standard (legacy from old proxy implementations)
+    // but included defensively — it should never be forwarded end-to-end.
     return name == "connection"
         || name == "keep-alive"
         || name == "proxy-connection"

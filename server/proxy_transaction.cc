@@ -3,7 +3,7 @@
 #include "upstream/upstream_connection.h"
 #include "upstream/http_request_serializer.h"
 #include "connection_handler.h"
-#include "config/server_config.h"
+// config/server_config.h provided by proxy_transaction.h (ProxyConfig stored by value)
 #include "http/http_request.h"
 #include "log/logger.h"
 
@@ -246,7 +246,7 @@ void ProxyTransaction::OnUpstreamData(
     if (state_ == State::SENDING_REQUEST) {
         if (response.complete) {
             // Full response received before request write completed
-            early_response_ = true;
+            poison_connection_ = true;
             int upstream_fd = conn ? conn->fd() : -1;
             logging::Get()->debug("ProxyTransaction early response (complete) "
                                   "client_fd={} service={} upstream_fd={} "
@@ -259,7 +259,7 @@ void ProxyTransaction::OnUpstreamData(
         if (response.headers_complete) {
             // Headers arrived but body still incoming -- transition to
             // RECEIVING_BODY. The write-complete callback will be a no-op.
-            early_response_ = true;
+            poison_connection_ = true;
             state_ = State::RECEIVING_BODY;
             int upstream_fd = conn ? conn->fd() : -1;
             logging::Get()->debug("ProxyTransaction early response (headers) "
@@ -364,13 +364,19 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                              client_fd_, service_name_, attempt_,
                              static_cast<int>(condition));
 
-        // Release old lease, clear callbacks, poison if early response
+        // Release old lease, clear callbacks, poison if tainted
         Cleanup();
         codec_.Reset();
-        early_response_ = false;
+        poison_connection_ = false;
 
-        // v1: immediate retry (no backoff). Timer-based deferred retry queue
-        // with jittered exponential backoff is a future enhancement.
+        // v1: immediate retry (no backoff delay). RetryPolicy::BackoffDelay()
+        // is implemented but not wired in yet because sleeping on the
+        // dispatcher thread would block the event loop (same class of problem
+        // as the accept-retry backoff pitfall in DEVELOPMENT_RULES.md).
+        // A timer-based deferred retry via EnQueueDeferred() or dispatcher
+        // timer is the correct approach and is planned for a future version.
+        // Under max_retries > 0, tight retry loops are bounded to at most
+        // 10 retries (validation cap) per transaction.
         AttemptCheckout();
         return;
     }
@@ -445,15 +451,16 @@ void ProxyTransaction::Cleanup() {
             // the request write was still in progress. The transport's output
             // buffer may still contain unsent request bytes that would corrupt
             // the next request if the connection were returned to idle.
-            if (early_response_) {
+            if (poison_connection_) {
                 conn->MarkClosing();
             }
         }
         lease_.Release();
     }
-    if (complete_cb_ && !complete_cb_invoked_) {
-        complete_cb_ = nullptr;
-    }
+    // NOTE: complete_cb_ is intentionally NOT cleared here. Cleanup() is
+    // called by MaybeRetry() between retry attempts, and the callback must
+    // survive across retries so DeliverResponse() can eventually invoke it.
+    // DeliverResponse() itself moves + nulls complete_cb_ after invocation.
 }
 
 HttpResponse ProxyTransaction::BuildClientResponse() {
@@ -508,10 +515,12 @@ void ProxyTransaction::ArmResponseTimeout() {
             "attempt={}",
             self->client_fd_, self->service_name_, self->attempt_);
 
-        // Reset state so MaybeRetry can operate, then try retry
+        // Poison the connection: it may have received partial response data
+        // that would corrupt the next transaction if returned to idle.
+        self->poison_connection_ = true;
+
         if (self->state_ == State::AWAITING_RESPONSE ||
             self->state_ == State::RECEIVING_BODY) {
-            self->state_ = State::INIT;
             self->MaybeRetry(RetryPolicy::RetryCondition::RESPONSE_TIMEOUT);
         } else {
             self->OnError(RESULT_RESPONSE_TIMEOUT, "Response timeout");

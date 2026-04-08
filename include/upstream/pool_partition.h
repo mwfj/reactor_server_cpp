@@ -153,6 +153,10 @@ private:
     bool ValidateConnection(UpstreamConnection* conn);
     void ServiceWaitQueue();
     void PurgeExpiredWaitEntries();
+    // Create new connections for queued waiters after a pool slot opens.
+    // Loops while capacity is available and waiters remain. Checks alive_
+    // after each callback (user callbacks may tear down the partition).
+    void CreateForWaiters();
     void ScheduleWaitQueuePurge();
     void DestroyConnection(std::unique_ptr<UpstreamConnection> conn);
 
