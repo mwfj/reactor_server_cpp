@@ -38,6 +38,11 @@ private:
     bool has_deadline_ = false;
     std::chrono::steady_clock::time_point deadline_;
     std::function<bool()> deadline_timeout_cb_;
+    // Generation counter for deadline callback. Incremented by
+    // SetDeadlineTimeoutCb(). Used by CallDeadlineTimeoutCb() to detect
+    // whether the callback explicitly re-installed or cleared itself
+    // during invocation (proxy clears; H2 doesn't touch it).
+    unsigned deadline_cb_generation_ = 0;
     // Monotonic counter incremented on every on-thread deadline write/clear.
     // Off-thread SetDeadline captures the generation at queue time and only
     // applies the deadline if the generation hasn't changed, preventing stale

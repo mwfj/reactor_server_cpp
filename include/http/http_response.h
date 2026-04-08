@@ -11,6 +11,11 @@ public:
     HttpResponse& Status(int code, const std::string& reason);
     HttpResponse& Version(int major, int minor);
     HttpResponse& Header(const std::string& key, const std::string& value);
+    // Append-only header insertion: always adds a new header entry, never
+    // replaces existing ones. Used by the proxy path to faithfully forward
+    // repeated upstream headers (Cache-Control, Link, Via, etc.) that
+    // Header()'s set-semantics would collapse.
+    HttpResponse& AppendHeader(const std::string& key, const std::string& value);
     HttpResponse& Body(const std::string& content);
     HttpResponse& Body(const std::string& content, const std::string& content_type);
 

@@ -293,6 +293,11 @@ private:
     // Proxy handlers (one per upstream with proxy config)
     std::unordered_map<std::string, std::unique_ptr<ProxyHandler>> proxy_handlers_;
 
+    // Pending manual Proxy() registrations — stored when Proxy() is called
+    // before Start(), processed in MarkServerReady() after upstream_manager_
+    // is created. Each entry is {route_pattern, upstream_service_name}.
+    std::vector<std::pair<std::string, std::string>> pending_proxy_routes_;
+
     // Auto-register proxy routes from upstream configs at Start() time
     void RegisterProxyRoutes();
 };

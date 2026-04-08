@@ -231,8 +231,10 @@ void ProxyTransaction::OnUpstreamData(
     // Parse upstream response data
     codec_.Parse(data.data(), data.size());
 
-    // Check for parse error
+    // Check for parse error — the HTTP stream is desynchronized and the
+    // connection must not be returned to the idle pool.
     if (codec_.HasError()) {
+        poison_connection_ = true;
         int upstream_fd = conn ? conn->fd() : -1;
         OnError(RESULT_PARSE_ERROR,
                 "Upstream response parse error: " + codec_.GetError() +
@@ -267,6 +269,10 @@ void ProxyTransaction::OnUpstreamData(
                                   "status={}",
                                   client_fd_, service_name_, upstream_fd,
                                   response.status_code);
+            // Arm timeout: without this, a stalled body after early headers
+            // hangs forever (OnUpstreamWriteComplete is a no-op once state
+            // has advanced past SENDING_REQUEST).
+            ArmResponseTimeout();
             return;
         }
         // Partial data, not enough to determine -- stay in SENDING_REQUEST
@@ -281,6 +287,22 @@ void ProxyTransaction::OnUpstreamData(
 
     if (state_ == State::AWAITING_RESPONSE && response.headers_complete) {
         state_ = State::RECEIVING_BODY;
+    }
+
+    // Refresh deadline on body progress: response_timeout_ms guards the wait
+    // for headers, but once body data is flowing, a slow download that makes
+    // forward progress should not timeout. Re-arm the deadline from now so
+    // only stalls (no data for response_timeout_ms) trigger a timeout.
+    if (state_ == State::RECEIVING_BODY && config_.response_timeout_ms > 0) {
+        auto* upstream_conn = lease_.Get();
+        if (upstream_conn) {
+            auto transport = upstream_conn->GetTransport();
+            if (transport) {
+                transport->SetDeadline(
+                    std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(config_.response_timeout_ms));
+            }
+        }
     }
 }
 
@@ -469,10 +491,12 @@ HttpResponse ProxyTransaction::BuildClientResponse() {
     HttpResponse response;
     response.Status(upstream_resp.status_code, upstream_resp.status_reason);
 
-    // Rewrite response headers (strip hop-by-hop, add Via)
+    // Rewrite response headers (strip hop-by-hop, add Via).
+    // Use AppendHeader to preserve repeated upstream headers (Cache-Control,
+    // Link, Via, etc.) that Header()'s set-semantics would collapse.
     auto rewritten = header_rewriter_.RewriteResponse(upstream_resp.headers);
     for (const auto& [name, value] : rewritten) {
-        response.Header(name, value);
+        response.AppendHeader(name, value);
     }
 
     // Move body to avoid copying potentially large payloads (up to 64MB)

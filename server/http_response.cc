@@ -58,6 +58,18 @@ HttpResponse& HttpResponse::Header(const std::string& key, const std::string& va
     return *this;
 }
 
+HttpResponse& HttpResponse::AppendHeader(const std::string& key, const std::string& value) {
+    // Same sanitization as Header() — prevent response splitting
+    std::string safe_key = key;
+    std::string safe_value = value;
+    safe_key.erase(std::remove(safe_key.begin(), safe_key.end(), '\r'), safe_key.end());
+    safe_key.erase(std::remove(safe_key.begin(), safe_key.end(), '\n'), safe_key.end());
+    safe_value.erase(std::remove(safe_value.begin(), safe_value.end(), '\r'), safe_value.end());
+    safe_value.erase(std::remove(safe_value.begin(), safe_value.end(), '\n'), safe_value.end());
+    headers_.emplace_back(std::move(safe_key), std::move(safe_value));
+    return *this;
+}
+
 HttpResponse& HttpResponse::Body(const std::string& content) {
     body_ = content;
     return *this;

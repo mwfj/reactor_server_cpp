@@ -119,6 +119,12 @@ void HttpServer::MarkServerReady() {
         }
     }
 
+    // Process deferred Proxy() calls (registered before Start)
+    for (const auto& [pattern, name] : pending_proxy_routes_) {
+        Proxy(pattern, name);
+    }
+    pending_proxy_routes_.clear();
+
     // Auto-register proxy routes from upstream configs
     RegisterProxyRoutes();
 
@@ -405,11 +411,11 @@ void HttpServer::RouteAsync(const std::string& method, const std::string& path, 
 
 void HttpServer::Proxy(const std::string& route_pattern,
                        const std::string& upstream_service_name) {
-    // Find the upstream config
-    const UpstreamConfig* found = nullptr;
+    // Validate that the upstream service exists in config (can check eagerly)
+    bool found = false;
     for (const auto& u : upstream_configs_) {
         if (u.name == upstream_service_name) {
-            found = &u;
+            found = true;
             break;
         }
     }
@@ -420,11 +426,17 @@ void HttpServer::Proxy(const std::string& route_pattern,
     }
 
     if (!upstream_manager_) {
-        logging::Get()->error("Proxy: upstream manager not initialized "
-                              "(call Proxy after Start)");
+        // Pre-Start call: defer until MarkServerReady() when upstream_manager_
+        // is created. Routes are registered before the server accepts
+        // connections, so there's no race with live lookups.
+        pending_proxy_routes_.emplace_back(route_pattern, upstream_service_name);
+        logging::Get()->debug("Proxy: deferred registration {} -> {} "
+                              "(upstream manager not yet initialized)",
+                              route_pattern, upstream_service_name);
         return;
     }
 
+    // Post-Start path (called from MarkServerReady or SetReadyCallback)
     // Guard: calling Proxy() twice for the same upstream replaces the handler
     // in proxy_handlers_, destroying the previous one while routes still hold
     // a dangling raw handler_ptr. Reject re-registration.
@@ -436,12 +448,21 @@ void HttpServer::Proxy(const std::string& route_pattern,
         return;
     }
 
+    // Find the upstream config again (need the full struct for handler creation)
+    const UpstreamConfig* uc = nullptr;
+    for (const auto& u : upstream_configs_) {
+        if (u.name == upstream_service_name) {
+            uc = &u;
+            break;
+        }
+    }
+
     // Create ProxyHandler for this upstream
     auto handler = std::make_unique<ProxyHandler>(
         upstream_service_name,
-        found->proxy,
-        found->host,
-        found->port,
+        uc->proxy,
+        uc->host,
+        uc->port,
         upstream_manager_.get());
 
     // Capture raw pointer -- ProxyHandler is owned by proxy_handlers_ and
@@ -449,7 +470,7 @@ void HttpServer::Proxy(const std::string& route_pattern,
     ProxyHandler* handler_ptr = handler.get();
 
     // Determine methods to register
-    std::vector<std::string> methods = found->proxy.methods;
+    std::vector<std::string> methods = uc->proxy.methods;
     if (methods.empty()) {
         // All standard methods
         methods = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"};
@@ -466,7 +487,7 @@ void HttpServer::Proxy(const std::string& route_pattern,
 
     logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                          route_pattern, upstream_service_name,
-                         found->host, found->port);
+                         uc->host, uc->port);
 
     proxy_handlers_[upstream_service_name] = std::move(handler);
 }

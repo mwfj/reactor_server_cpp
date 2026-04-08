@@ -885,15 +885,27 @@ std::string ConnectionHandler::GetAlpnProtocol() const {
 
 void ConnectionHandler::SetDeadlineTimeoutCb(DeadlineTimeoutCb cb) {
     deadline_timeout_cb_ = std::move(cb);
+    ++deadline_cb_generation_;
 }
 
 bool ConnectionHandler::CallDeadlineTimeoutCb() {
     if (deadline_timeout_cb_) {
         // Move to stack local before invoking: the callback may call
-        // ClearResponseTimeout → SetDeadlineTimeoutCb(nullptr), which
-        // destroys the std::function while it's executing (UB).
+        // SetDeadlineTimeoutCb(nullptr) (e.g., proxy's ClearResponseTimeout),
+        // which would destroy the std::function while it's executing (UB).
+        //
+        // After invocation, restore the callback UNLESS the callback
+        // explicitly called SetDeadlineTimeoutCb() during invocation
+        // (detected by generation change). This supports both:
+        //   - One-shot callbacks (proxy): clear themselves → generation changed → no restore
+        //   - Recurring callbacks (H2): don't touch Set → generation unchanged → restored
+        auto gen_before = deadline_cb_generation_;
         auto cb = std::move(deadline_timeout_cb_);
-        return cb();
+        bool result = cb();
+        if (deadline_cb_generation_ == gen_before && !deadline_timeout_cb_) {
+            deadline_timeout_cb_ = std::move(cb);
+        }
+        return result;
     }
     return false;
 }
