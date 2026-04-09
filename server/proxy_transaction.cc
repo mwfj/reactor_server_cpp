@@ -561,6 +561,14 @@ HttpResponse ProxyTransaction::BuildClientResponse() {
         response.AppendHeader(name, value);
     }
 
+    // For HEAD responses, preserve the upstream's Content-Length header
+    // instead of auto-computing from body_.size() (which would be 0).
+    // RFC 7231 §4.3.2: HEAD responses carry the same Content-Length as
+    // the equivalent GET response.
+    if (method_ == "HEAD") {
+        response.PreserveContentLength();
+    }
+
     // Move body to avoid copying potentially large payloads (up to 64MB)
     if (!upstream_resp.body.empty()) {
         response.Body(std::move(upstream_resp.body));

@@ -50,6 +50,7 @@ ProxyHandler::ProxyHandler(
         for (size_t i = 0; i < config_.route_prefix.size(); ++i) {
             if (config_.route_prefix[i] == '*' &&
                 (i == 0 || config_.route_prefix[i - 1] == '/')) {
+                has_catch_all_in_prefix_ = true;
                 catch_all_param_ = config_.route_prefix.substr(i + 1);
                 break;
             }
@@ -127,14 +128,19 @@ void ProxyHandler::Handle(
                 // (request ended at the catch-all slash, e.g., /api/v1/).
                 // Either way, upstream path is "/" — the entire request
                 // path IS the prefix with nothing beyond it to forward.
-                // Exact-match hit (no catch-all segment matched) — upstream
-                // path is "/" since the entire request path IS the prefix.
                 upstream_path_override = "/";
             }
-        } else {
-            // No catch-all param configured at all — exact-match only route.
+        }
+        // When catch_all_param_ is empty, the route has either:
+        //   - An unnamed catch-all (/api/*) — no param captured, fall through
+        //     to static_prefix_ stripping in ProxyTransaction::Start().
+        //   - No catch-all at all (exact-match only) — set "/" directly.
+        // Distinguish by checking if the route_prefix contains a catch-all.
+        else if (!has_catch_all_in_prefix_) {
+            // No catch-all in route at all — exact-match only route.
             upstream_path_override = "/";
         }
+        // else: unnamed catch-all → leave override empty, use static_prefix_
     }
 
     auto txn = std::make_shared<ProxyTransaction>(

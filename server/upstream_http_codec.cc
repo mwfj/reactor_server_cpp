@@ -227,11 +227,9 @@ bool UpstreamHttpCodec::Finish() {
         // on_message_complete may have fired during finish
         return response_.complete;
     }
-    // Don't treat finish errors as hard failures if we already have
-    // headers — the response is usable even if framing is ambiguous.
-    if (response_.headers_complete) {
-        response_.complete = true;
-        return true;
-    }
+    // llhttp_finish() returned an error — the response is incomplete
+    // (e.g., Content-Length: 10 but only 5 bytes received, or truncated
+    // chunked encoding). Do NOT mark as complete: the caller should
+    // retry or return 502 for truncated responses.
     return false;
 }

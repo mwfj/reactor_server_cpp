@@ -137,17 +137,32 @@ std::string HttpResponse::Serialize() const {
             }), hdrs.end());
         hdrs.emplace_back("Content-Length", "0");
     } else if (!bodyless_status) {
-        // Always strip caller-set Content-Length and auto-compute from body_.size().
-        // This prevents framing inconsistencies where the caller sets a Content-Length
-        // that doesn't match the body (e.g. Header("Content-Length","0").Text("hello")
-        // would produce CL: 0 with a 5-byte body, desyncing keep-alive clients).
-        hdrs.erase(std::remove_if(hdrs.begin(), hdrs.end(),
-            [](const std::pair<std::string, std::string>& kv) {
+        if (preserve_content_length_) {
+            // Proxy HEAD path: keep the upstream's Content-Length as-is.
+            // If no Content-Length was set by the caller, add one from body size.
+            bool has_cl = false;
+            for (const auto& kv : hdrs) {
                 std::string key = kv.first;
-                std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c); });
-                return key == "content-length";
-            }), hdrs.end());
-        hdrs.emplace_back("Content-Length", std::to_string(body_.size()));
+                std::transform(key.begin(), key.end(), key.begin(),
+                    [](unsigned char c){ return std::tolower(c); });
+                if (key == "content-length") { has_cl = true; break; }
+            }
+            if (!has_cl) {
+                hdrs.emplace_back("Content-Length", std::to_string(body_.size()));
+            }
+        } else {
+            // Auto-compute Content-Length from body_.size(). This prevents
+            // framing inconsistencies where the caller sets a Content-Length
+            // that doesn't match the body.
+            hdrs.erase(std::remove_if(hdrs.begin(), hdrs.end(),
+                [](const std::pair<std::string, std::string>& kv) {
+                    std::string key = kv.first;
+                    std::transform(key.begin(), key.end(), key.begin(),
+                        [](unsigned char c){ return std::tolower(c); });
+                    return key == "content-length";
+                }), hdrs.end());
+            hdrs.emplace_back("Content-Length", std::to_string(body_.size()));
+        }
     }
     for (const auto& kv : hdrs) {
         oss << kv.first << ": " << kv.second << "\r\n";

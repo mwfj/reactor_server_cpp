@@ -59,6 +59,13 @@ public:
     HttpResponse& Defer() { deferred_ = true; return *this; }
     bool IsDeferred() const { return deferred_; }
 
+    // Preserve caller-set Content-Length instead of auto-computing from
+    // body_.size(). Used by the proxy path for HEAD responses where the
+    // upstream's Content-Length (e.g., 1234) must be forwarded even though
+    // the response body is empty.
+    HttpResponse& PreserveContentLength() { preserve_content_length_ = true; return *this; }
+    bool IsContentLengthPreserved() const { return preserve_content_length_; }
+
 private:
     int status_code_;
     std::string status_reason_;
@@ -67,6 +74,7 @@ private:
     std::vector<std::pair<std::string, std::string>> headers_;
     std::string body_;
     bool deferred_ = false;
+    bool preserve_content_length_ = false;
 
     static std::string DefaultReason(int code);
 };

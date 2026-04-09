@@ -550,11 +550,27 @@ void HttpServer::Proxy(const std::string& route_pattern,
 
     ProxyHandler* handler_ptr = handler.get();
 
-    // Determine methods to register
+    // Determine methods to register. When GET is present, always include
+    // HEAD so HEAD requests are forwarded as HEAD to the upstream instead
+    // of falling through to the async GET fallback (which rewrites the
+    // method to GET and forces the upstream to generate a full body).
     static const std::vector<std::string> DEFAULT_PROXY_METHODS =
         {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
-    const auto& methods = found->proxy.methods.empty()
-        ? DEFAULT_PROXY_METHODS : found->proxy.methods;
+    std::vector<std::string> effective_methods;
+    if (found->proxy.methods.empty()) {
+        effective_methods = DEFAULT_PROXY_METHODS;
+    } else {
+        effective_methods = found->proxy.methods;
+        bool has_get = false, has_head = false;
+        for (const auto& m : effective_methods) {
+            if (m == "GET") has_get = true;
+            if (m == "HEAD") has_head = true;
+        }
+        if (has_get && !has_head) {
+            effective_methods.push_back("HEAD");
+        }
+    }
+    const auto& methods = effective_methods;
 
     // Method-level conflict check BEFORE storing the handler. Storing first
     // would destroy any existing handler under the same key via operator=,
@@ -670,10 +686,24 @@ void HttpServer::RegisterProxyRoutes() {
             upstream_manager_.get());
         ProxyHandler* handler_ptr = handler.get();
 
+        // Same HEAD auto-registration as Proxy()
         static const std::vector<std::string> DEFAULT_PROXY_METHODS =
             {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
-        const auto& methods = upstream.proxy.methods.empty()
-            ? DEFAULT_PROXY_METHODS : upstream.proxy.methods;
+        std::vector<std::string> effective_methods;
+        if (upstream.proxy.methods.empty()) {
+            effective_methods = DEFAULT_PROXY_METHODS;
+        } else {
+            effective_methods = upstream.proxy.methods;
+            bool has_get = false, has_head = false;
+            for (const auto& m : effective_methods) {
+                if (m == "GET") has_get = true;
+                if (m == "HEAD") has_head = true;
+            }
+            if (has_get && !has_head) {
+                effective_methods.push_back("HEAD");
+            }
+        }
+        const auto& methods = effective_methods;
 
         // Method-level conflict check BEFORE storing (same as Proxy())
         auto& registered = proxy_route_methods_[dedup_prefix];
