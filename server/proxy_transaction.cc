@@ -247,6 +247,14 @@ void ProxyTransaction::SendUpstreamRequest() {
                           client_fd_, service_name_, transport->fd(),
                           serialized_request_.size());
 
+    // Arm the response timeout now — if the upstream stops reading our
+    // request body, OnUpstreamWriteComplete never fires and the transaction
+    // hangs forever with a far-future pool deadline. The timeout covers
+    // both the write phase and the response-header wait.
+    // OnUpstreamWriteComplete re-arms it (resetting the clock) if the
+    // write completes normally.
+    ArmResponseTimeout();
+
     transport->SendRaw(serialized_request_.data(),
                        serialized_request_.size());
 }
