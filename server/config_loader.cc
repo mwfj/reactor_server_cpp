@@ -651,10 +651,15 @@ void ConfigLoader::Validate(const ServerConfig& config) {
 
             // Proxy config validation
             if (!u.proxy.route_prefix.empty()) {
-                if (u.proxy.response_timeout_ms <= 0) {
+                // Minimum 1000ms: deadline checks run on the dispatcher's
+                // timer scan which has 1-second resolution. Sub-second
+                // values are accepted syntactically but can't be honored —
+                // reject them to avoid misleading fail-fast expectations.
+                if (u.proxy.response_timeout_ms < 1000) {
                     throw std::invalid_argument(
                         idx + " ('" + u.name +
-                        "'): proxy.response_timeout_ms must be > 0");
+                        "'): proxy.response_timeout_ms must be >= 1000 "
+                        "(timer scan resolution is 1s)");
                 }
                 if (u.proxy.retry.max_retries < 0 || u.proxy.retry.max_retries > 10) {
                     throw std::invalid_argument(

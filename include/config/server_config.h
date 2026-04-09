@@ -97,7 +97,8 @@ struct ProxyRetryConfig {
 
 struct ProxyConfig {
     // Response timeout: max time to wait for upstream response headers
-    // after request is fully sent. Must be > 0 (validated by ConfigLoader).
+    // after request is fully sent. Must be >= 1000 (timer scan has 1s
+    // resolution; sub-second values cannot be honored accurately).
     int response_timeout_ms = 30000;  // 30 seconds
 
     // Route pattern prefix to match (e.g., "/api/users")

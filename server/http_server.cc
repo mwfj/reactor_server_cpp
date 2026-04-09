@@ -436,9 +436,10 @@ void HttpServer::Proxy(const std::string& route_pattern,
     // Validate proxy config eagerly — fail fast for code-registered routes
     // that bypass config_loader validation (which only runs for JSON-loaded
     // configs with non-empty route_prefix).
-    if (found->proxy.response_timeout_ms <= 0) {
+    if (found->proxy.response_timeout_ms < 1000) {
         logging::Get()->error("Proxy: upstream '{}' has invalid "
-                              "response_timeout_ms={} (must be > 0)",
+                              "response_timeout_ms={} (must be >= 1000, "
+                              "timer scan resolution is 1s)",
                               upstream_service_name,
                               found->proxy.response_timeout_ms);
         return;
@@ -475,19 +476,6 @@ void HttpServer::Proxy(const std::string& route_pattern,
         return;
     }
 
-    // Guard: reject exact duplicate {pattern, upstream} to prevent
-    // dangling handler_ptr in route lambdas. Multiple different patterns
-    // for the same upstream are allowed (e.g., /v1 and /v2 both → "svc").
-    std::string handler_key = upstream_service_name + "\t" + route_pattern;
-    if (proxy_handlers_.count(handler_key)) {
-        logging::Get()->error("Proxy: route '{}' -> '{}' already registered",
-                              route_pattern, upstream_service_name);
-        return;
-    }
-
-    // Build ProxyConfig with the caller's route_pattern. The catch-all
-    // registration below may append "*proxy_path", and ProxyHandler extracts
-    // the catch-all param name from route_prefix at construction time.
     // Detect whether the pattern already contains a catch-all segment.
     std::string effective_prefix = route_pattern;
     bool has_catch_all = false;
@@ -511,6 +499,27 @@ void HttpServer::Proxy(const std::string& route_pattern,
         }
         catch_all_pattern += "*proxy_path";
         config_prefix = catch_all_pattern;
+    }
+
+    // Duplicate guard: key on {upstream, static_prefix} — the prefix up to
+    // the catch-all segment. This catches both exact duplicates AND
+    // equivalent patterns with different catch-all param names (e.g.,
+    // "/api" + auto-generated "/api/*proxy_path" vs explicit "/api/*rest").
+    // Strip the catch-all param name: "/api/*proxy_path" → "/api/*",
+    // "/api/*rest" → "/api/*". Patterns without catch-all use as-is.
+    std::string dedup_prefix = config_prefix;
+    {
+        auto star_pos = dedup_prefix.rfind('*');
+        if (star_pos != std::string::npos) {
+            dedup_prefix = dedup_prefix.substr(0, star_pos + 1);  // keep the '*'
+        }
+    }
+    std::string handler_key = upstream_service_name + "\t" + dedup_prefix;
+    if (proxy_handlers_.count(handler_key)) {
+        logging::Get()->error("Proxy: route '{}' -> '{}' conflicts with an "
+                              "already-registered pattern (effective: {})",
+                              route_pattern, upstream_service_name, dedup_prefix);
+        return;
     }
 
     ProxyConfig handler_config = found->proxy;
@@ -569,16 +578,6 @@ void HttpServer::RegisterProxyRoutes() {
             continue;  // No proxy config for this upstream
         }
 
-        // Skip if a handler was already registered for this exact
-        // {upstream, route_prefix} via manual Proxy() call.
-        std::string handler_key = upstream.name + "\t" + upstream.proxy.route_prefix;
-        if (proxy_handlers_.count(handler_key)) {
-            logging::Get()->warn("RegisterProxyRoutes: route '{}' -> '{}' "
-                                 "already registered, skipping",
-                                 upstream.proxy.route_prefix, upstream.name);
-            continue;
-        }
-
         // Check if the route_prefix already has a catch-all segment
         std::string route_pattern = upstream.proxy.route_prefix;
         bool has_catch_all = false;
@@ -598,6 +597,22 @@ void HttpServer::RegisterProxyRoutes() {
                 config_prefix += '/';
             }
             config_prefix += "*proxy_path";
+        }
+
+        // Same canonicalized duplicate guard as Proxy() — see comment there.
+        std::string dedup_prefix = config_prefix;
+        {
+            auto sp = dedup_prefix.rfind('*');
+            if (sp != std::string::npos) {
+                dedup_prefix = dedup_prefix.substr(0, sp + 1);
+            }
+        }
+        std::string handler_key = upstream.name + "\t" + dedup_prefix;
+        if (proxy_handlers_.count(handler_key)) {
+            logging::Get()->warn("RegisterProxyRoutes: route '{}' -> '{}' "
+                                 "conflicts with existing registration, skipping",
+                                 upstream.proxy.route_prefix, upstream.name);
+            continue;
         }
 
         // Create ProxyHandler with the full catch-all-aware route_prefix.

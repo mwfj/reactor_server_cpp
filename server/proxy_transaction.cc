@@ -263,12 +263,15 @@ void ProxyTransaction::OnUpstreamData(
 
     // Handle early response (upstream responds while we're still sending)
     if (state_ == State::SENDING_REQUEST) {
-        // Any upstream bytes arriving before the request write completes
-        // mean the response phase has already started. Arm the timeout now:
-        // if the upstream only sends a partial status line / headers and then
-        // stalls while the request body is still backpressured, the normal
-        // write-complete path never runs and the transaction would hang.
-        ArmResponseTimeout();
+        // Arm the response timeout only when a non-1xx response has begun.
+        // The codec discards standalone 1xx interim responses (e.g., 100
+        // Continue) and resets response_ to empty. If we armed the timeout
+        // unconditionally, large or back-pressured uploads that receive a
+        // 100 Continue would start the final-response deadline prematurely,
+        // causing false retries/504s before the request body is even sent.
+        if (response.status_code > 0 || response.headers_complete || response.complete) {
+            ArmResponseTimeout();
+        }
 
         if (response.complete) {
             // Full response received before request write completed
