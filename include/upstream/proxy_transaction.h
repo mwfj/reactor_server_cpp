@@ -18,11 +18,12 @@ class ProxyTransaction : public std::enable_shared_from_this<ProxyTransaction> {
 public:
     // Result codes for internal state tracking
     static constexpr int RESULT_SUCCESS            = 0;
-    static constexpr int RESULT_CHECKOUT_FAILED    = -1;
+    static constexpr int RESULT_CHECKOUT_FAILED    = -1;  // Upstream connect failure → 502
     static constexpr int RESULT_SEND_FAILED        = -2;
     static constexpr int RESULT_PARSE_ERROR        = -3;
     static constexpr int RESULT_RESPONSE_TIMEOUT   = -4;
     static constexpr int RESULT_UPSTREAM_DISCONNECT = -5;
+    static constexpr int RESULT_POOL_EXHAUSTED     = -6;  // Local capacity → 503
 
     // Constructor copies all needed fields from client_request (method, path,
     // query, headers, body, params, dispatcher_index, client_ip, client_tls,

@@ -212,8 +212,10 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
     if (error_code == CONNECT_FAILED || error_code == CONNECT_TIMEOUT) {
         MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
     } else {
-        OnError(RESULT_CHECKOUT_FAILED,
-                "Pool checkout failed (non-retryable error=" +
+        // Pool exhaustion, queue timeout, or shutdown — local capacity issue.
+        // Use RESULT_POOL_EXHAUSTED → 503 (not 502 which implies upstream failure).
+        OnError(RESULT_POOL_EXHAUSTED,
+                "Pool checkout failed (local capacity, error=" +
                 std::to_string(error_code) + ")");
     }
 }
@@ -654,6 +656,9 @@ void ProxyTransaction::ClearResponseTimeout() {
 HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
     if (result_code == RESULT_RESPONSE_TIMEOUT) {
         return HttpResponse::GatewayTimeout();
+    }
+    if (result_code == RESULT_POOL_EXHAUSTED) {
+        return HttpResponse::ServiceUnavailable();
     }
     if (result_code == RESULT_CHECKOUT_FAILED ||
         result_code == RESULT_SEND_FAILED ||

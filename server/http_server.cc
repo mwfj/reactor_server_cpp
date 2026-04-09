@@ -519,14 +519,20 @@ void HttpServer::Proxy(const std::string& route_pattern,
     }
 
     // If no catch-all, build the full route_prefix that includes the
-    // auto-generated "*proxy_path" so ProxyHandler knows the param name.
+    // auto-generated catch-all so ProxyHandler knows the param name.
+    // Use a name that doesn't collide with existing params in the pattern
+    // (e.g., /api/:proxy_path would conflict with *proxy_path).
     std::string config_prefix = route_pattern;
     if (!has_catch_all) {
+        std::string catch_all_name = "proxy_path";
+        if (route_pattern.find(":proxy_path") != std::string::npos) {
+            catch_all_name = "_proxy_tail";
+        }
         std::string catch_all_pattern = route_pattern;
         if (catch_all_pattern.back() != '/') {
             catch_all_pattern += '/';
         }
-        catch_all_pattern += "*proxy_path";
+        catch_all_pattern += "*" + catch_all_name;
         config_prefix = catch_all_pattern;
     }
 
@@ -663,12 +669,17 @@ void HttpServer::RegisterProxyRoutes() {
 
         // Build effective route_prefix that includes the catch-all segment
         // so ProxyHandler can extract the catch-all param name.
+        // Same collision-avoidance as Proxy().
         std::string config_prefix = route_pattern;
         if (!has_catch_all) {
+            std::string catch_all_name = "proxy_path";
+            if (route_pattern.find(":proxy_path") != std::string::npos) {
+                catch_all_name = "_proxy_tail";
+            }
             if (config_prefix.back() != '/') {
                 config_prefix += '/';
             }
-            config_prefix += "*proxy_path";
+            config_prefix += "*" + catch_all_name;
         }
 
         // Same canonicalized duplicate guard as Proxy() — see comment there.
