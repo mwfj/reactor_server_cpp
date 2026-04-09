@@ -514,13 +514,20 @@ void HttpServer::Proxy(const std::string& route_pattern,
             dedup_prefix = dedup_prefix.substr(0, star_pos + 1);  // keep the '*'
         }
     }
-    std::string handler_key = upstream_service_name + "\t" + dedup_prefix;
-    if (proxy_handlers_.count(handler_key)) {
-        logging::Get()->error("Proxy: route '{}' -> '{}' conflicts with an "
-                              "already-registered pattern (effective: {})",
-                              route_pattern, upstream_service_name, dedup_prefix);
-        return;
+    // Check for path conflict across ALL upstreams (not just same-name).
+    // Two upstreams both exposing /api would crash in RouteAsync otherwise.
+    for (const auto& [key, _] : proxy_handlers_) {
+        // Keys are "upstream\tdedup_prefix" — extract the path part
+        auto tab = key.find('\t');
+        if (tab != std::string::npos && key.substr(tab + 1) == dedup_prefix) {
+            logging::Get()->error("Proxy: route '{}' -> '{}' conflicts with "
+                                  "existing proxy route (effective path: {})",
+                                  route_pattern, upstream_service_name,
+                                  dedup_prefix);
+            return;
+        }
     }
+    std::string handler_key = upstream_service_name + "\t" + dedup_prefix;
 
     ProxyConfig handler_config = found->proxy;
     handler_config.route_prefix = config_prefix;
@@ -607,12 +614,22 @@ void HttpServer::RegisterProxyRoutes() {
                 dedup_prefix = dedup_prefix.substr(0, sp + 1);
             }
         }
+        // Check for path conflict across ALL upstreams (same as Proxy())
+        bool conflict = false;
+        for (const auto& [key, _] : proxy_handlers_) {
+            auto tab = key.find('\t');
+            if (tab != std::string::npos && key.substr(tab + 1) == dedup_prefix) {
+                logging::Get()->warn("RegisterProxyRoutes: route '{}' -> '{}' "
+                                     "conflicts with existing route, skipping",
+                                     upstream.proxy.route_prefix, upstream.name);
+                conflict = true;
+                break;
+            }
+        }
+        if (conflict) continue;
         std::string handler_key = upstream.name + "\t" + dedup_prefix;
         if (proxy_handlers_.count(handler_key)) {
-            logging::Get()->warn("RegisterProxyRoutes: route '{}' -> '{}' "
-                                 "conflicts with existing registration, skipping",
-                                 upstream.proxy.route_prefix, upstream.name);
-            continue;
+            continue;  // exact same {upstream, path} — already covered above
         }
 
         // Create ProxyHandler with the full catch-all-aware route_prefix.

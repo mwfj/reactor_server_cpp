@@ -188,15 +188,30 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
         return;
     }
 
-    // Map checkout error to retry condition
-    RetryPolicy::RetryCondition condition =
-        RetryPolicy::RetryCondition::CONNECT_FAILURE;
-
     logging::Get()->warn("ProxyTransaction checkout failed client_fd={} "
                          "service={} error={} attempt={}",
                          client_fd_, service_name_, error_code, attempt_);
 
-    MaybeRetry(condition);
+    // Only retry actual network connect failures. Pool saturation
+    // (POOL_EXHAUSTED, QUEUE_TIMEOUT) and shutdown should fail fast —
+    // retrying under backpressure amplifies load on an already-stressed
+    // pool and stretches client latency with no benefit.
+    // Import error codes from PoolPartition:
+    //   CHECKOUT_CONNECT_FAILED  = -2  → retryable
+    //   CHECKOUT_CONNECT_TIMEOUT = -3  → retryable
+    //   CHECKOUT_POOL_EXHAUSTED  = -1  → not retryable
+    //   CHECKOUT_QUEUE_TIMEOUT   = -5  → not retryable
+    //   CHECKOUT_SHUTTING_DOWN   = -4  → not retryable
+    static constexpr int CONNECT_FAILED  = -2;
+    static constexpr int CONNECT_TIMEOUT = -3;
+
+    if (error_code == CONNECT_FAILED || error_code == CONNECT_TIMEOUT) {
+        MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
+    } else {
+        OnError(RESULT_CHECKOUT_FAILED,
+                "Pool checkout failed (non-retryable error=" +
+                std::to_string(error_code) + ")");
+    }
 }
 
 void ProxyTransaction::SendUpstreamRequest() {

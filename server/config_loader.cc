@@ -1,5 +1,6 @@
 #include "config/config_loader.h"
 #include "http2/http2_constants.h"
+#include "http/route_trie.h"         // ParsePattern, ValidatePattern for proxy route_prefix
 #include "log/logger.h"
 #include "nlohmann/json.hpp"
 
@@ -651,6 +652,19 @@ void ConfigLoader::Validate(const ServerConfig& config) {
 
             // Proxy config validation
             if (!u.proxy.route_prefix.empty()) {
+                // Validate route_prefix is a well-formed route pattern.
+                // Catches double slashes, duplicate param names, catch-all
+                // not last, etc. — these would otherwise crash at startup
+                // when RegisterProxyRoutes calls RouteAsync.
+                try {
+                    auto segments = ROUTE_TRIE::ParsePattern(u.proxy.route_prefix);
+                    ROUTE_TRIE::ValidatePattern(u.proxy.route_prefix, segments);
+                } catch (const std::invalid_argument& e) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): proxy.route_prefix is invalid: " + e.what());
+                }
+
                 // Minimum 1000ms: deadline checks run on the dispatcher's
                 // timer scan which has 1-second resolution. Sub-second
                 // values are accepted syntactically but can't be honored —
@@ -666,15 +680,22 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                         idx + " ('" + u.name +
                         "'): proxy.retry.max_retries must be >= 0 and <= 10");
                 }
-                // Validate method names
+                // Validate method names — reject unknowns and duplicates.
+                // Duplicates would cause RouteAsync to throw at startup.
                 static const std::unordered_set<std::string> valid_methods = {
                     "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"
                 };
+                std::unordered_set<std::string> seen_methods;
                 for (const auto& m : u.proxy.methods) {
                     if (valid_methods.find(m) == valid_methods.end()) {
                         throw std::invalid_argument(
                             idx + " ('" + u.name +
                             "'): proxy.methods contains invalid method: " + m);
+                    }
+                    if (!seen_methods.insert(m).second) {
+                        throw std::invalid_argument(
+                            idx + " ('" + u.name +
+                            "'): proxy.methods contains duplicate method: " + m);
                     }
                 }
             }
