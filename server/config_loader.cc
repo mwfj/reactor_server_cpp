@@ -792,7 +792,12 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
         uj["pool"]["idle_timeout_sec"]     = u.pool.idle_timeout_sec;
         uj["pool"]["max_lifetime_sec"]     = u.pool.max_lifetime_sec;
         uj["pool"]["max_requests_per_conn"]= u.pool.max_requests_per_conn;
-        if (!u.proxy.route_prefix.empty()) {
+        // Always serialize proxy settings — an upstream may have non-default
+        // proxy config (methods, retry, header_rewrite, timeout) even when
+        // route_prefix is empty (exposed via programmatic Proxy() API).
+        // Skipping this block on empty route_prefix would silently reset
+        // those settings on a ToJson() / LoadFromString() round-trip.
+        if (u.proxy != ProxyConfig{}) {
             nlohmann::json pj;
             pj["route_prefix"] = u.proxy.route_prefix;
             pj["strip_prefix"] = u.proxy.strip_prefix;

@@ -17,6 +17,7 @@ public:
     // Header()'s set-semantics would collapse.
     HttpResponse& AppendHeader(const std::string& key, const std::string& value);
     HttpResponse& Body(const std::string& content);
+    HttpResponse& Body(std::string&& content);
     HttpResponse& Body(const std::string& content, const std::string& content_type);
 
     // Convenience builders

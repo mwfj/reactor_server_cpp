@@ -25,6 +25,49 @@ struct RequestGuard {
     RequestGuard& operator=(const RequestGuard&) = delete;
 };
 
+// Normalize a route pattern for dedup comparison by stripping all param
+// and catch-all names. E.g., "/api/:id/users/*rest" → "/api/:/users/*".
+// This way, semantically identical routes with different param names
+// (like /api/:id/*rest vs /api/:user/*tail) produce the same dedup key.
+static std::string NormalizeRouteForDedup(const std::string& pattern) {
+    std::string result;
+    result.reserve(pattern.size());
+    size_t i = 0;
+    while (i < pattern.size()) {
+        bool at_seg_start = (i == 0) || (result.back() == '/');
+        if (at_seg_start && pattern[i] == ':') {
+            result += ':';
+            ++i;
+            // Skip param name (until '/' or end)
+            while (i < pattern.size() && pattern[i] != '/') ++i;
+        } else if (at_seg_start && pattern[i] == '*') {
+            result += '*';
+            // Skip catch-all name (rest of string)
+            break;
+        } else {
+            result += pattern[i];
+            ++i;
+        }
+    }
+    return result;
+}
+
+// Generate a catch-all param name that doesn't collide with existing
+// param names in the route pattern. Starts with "proxy_path", falls
+// back to "_proxy_tail", then appends numeric suffixes.
+static std::string GenerateCatchAllName(const std::string& pattern) {
+    auto has_param = [&](const std::string& name) {
+        return pattern.find(":" + name) != std::string::npos;
+    };
+    if (!has_param("proxy_path")) return "proxy_path";
+    if (!has_param("_proxy_tail")) return "_proxy_tail";
+    for (int i = 0; i < 100; ++i) {
+        std::string candidate = "_pp" + std::to_string(i);
+        if (!has_param(candidate)) return candidate;
+    }
+    return "_proxy_fallback";  // extremely unlikely
+}
+
 int HttpServer::ComputeTimerInterval(int idle_timeout_sec, int request_timeout_sec) {
     int idle_iv = idle_timeout_sec > 0
         ? std::max(idle_timeout_sec / 6, 1) : 0;
@@ -532,14 +575,9 @@ void HttpServer::Proxy(const std::string& route_pattern,
 
     // If no catch-all, build the full route_prefix that includes the
     // auto-generated catch-all so ProxyHandler knows the param name.
-    // Use a name that doesn't collide with existing params in the pattern
-    // (e.g., /api/:proxy_path would conflict with *proxy_path).
     std::string config_prefix = route_pattern;
     if (!has_catch_all) {
-        std::string catch_all_name = "proxy_path";
-        if (route_pattern.find(":proxy_path") != std::string::npos) {
-            catch_all_name = "_proxy_tail";
-        }
+        std::string catch_all_name = GenerateCatchAllName(route_pattern);
         std::string catch_all_pattern = route_pattern;
         if (catch_all_pattern.back() != '/') {
             catch_all_pattern += '/';
@@ -548,19 +586,10 @@ void HttpServer::Proxy(const std::string& route_pattern,
         config_prefix = catch_all_pattern;
     }
 
-    // Duplicate guard: key on {upstream, static_prefix} — the prefix up to
-    // the catch-all segment. This catches both exact duplicates AND
-    // equivalent patterns with different catch-all param names (e.g.,
-    // "/api" + auto-generated "/api/*proxy_path" vs explicit "/api/*rest").
-    // Strip the catch-all param name: "/api/*proxy_path" → "/api/*",
-    // "/api/*rest" → "/api/*". Patterns without catch-all use as-is.
-    std::string dedup_prefix = config_prefix;
-    {
-        auto star_pos = dedup_prefix.rfind('*');
-        if (star_pos != std::string::npos) {
-            dedup_prefix = dedup_prefix.substr(0, star_pos + 1);  // keep the '*'
-        }
-    }
+    // Normalize the route for dedup: strip all param and catch-all names
+    // so semantically identical routes with different names produce the
+    // same key. E.g., /api/:id/*rest and /api/:user/*tail both → /api/:/*.
+    std::string dedup_prefix = NormalizeRouteForDedup(config_prefix);
     std::string handler_key = upstream_service_name + "\t" + dedup_prefix;
 
     ProxyConfig handler_config = found->proxy;
@@ -681,27 +710,17 @@ void HttpServer::RegisterProxyRoutes() {
 
         // Build effective route_prefix that includes the catch-all segment
         // so ProxyHandler can extract the catch-all param name.
-        // Same collision-avoidance as Proxy().
         std::string config_prefix = route_pattern;
         if (!has_catch_all) {
-            std::string catch_all_name = "proxy_path";
-            if (route_pattern.find(":proxy_path") != std::string::npos) {
-                catch_all_name = "_proxy_tail";
-            }
+            std::string catch_all_name = GenerateCatchAllName(route_pattern);
             if (config_prefix.back() != '/') {
                 config_prefix += '/';
             }
             config_prefix += "*" + catch_all_name;
         }
 
-        // Same canonicalized duplicate guard as Proxy() — see comment there.
-        std::string dedup_prefix = config_prefix;
-        {
-            auto sp = dedup_prefix.rfind('*');
-            if (sp != std::string::npos) {
-                dedup_prefix = dedup_prefix.substr(0, sp + 1);
-            }
-        }
+        // Same normalized dedup as Proxy()
+        std::string dedup_prefix = NormalizeRouteForDedup(config_prefix);
         std::string handler_key = upstream.name + "\t" + dedup_prefix;
 
         // Create ProxyHandler with the full catch-all-aware route_prefix.

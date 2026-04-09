@@ -75,6 +75,11 @@ HttpResponse& HttpResponse::Body(const std::string& content) {
     return *this;
 }
 
+HttpResponse& HttpResponse::Body(std::string&& content) {
+    body_ = std::move(content);
+    return *this;
+}
+
 HttpResponse& HttpResponse::Body(const std::string& content, const std::string& content_type) {
     body_ = content;
     Header("Content-Type", content_type);
