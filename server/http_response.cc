@@ -139,17 +139,9 @@ std::string HttpResponse::Serialize() const {
     } else if (!bodyless_status) {
         if (preserve_content_length_) {
             // Proxy HEAD path: keep the upstream's Content-Length as-is.
-            // If no Content-Length was set by the caller, add one from body size.
-            bool has_cl = false;
-            for (const auto& kv : hdrs) {
-                std::string key = kv.first;
-                std::transform(key.begin(), key.end(), key.begin(),
-                    [](unsigned char c){ return std::tolower(c); });
-                if (key == "content-length") { has_cl = true; break; }
-            }
-            if (!has_cl) {
-                hdrs.emplace_back("Content-Length", std::to_string(body_.size()));
-            }
+            // If the upstream didn't send Content-Length (resource size
+            // unknown), don't inject one — forwarding CL: 0 would be
+            // incorrect (tells the client the resource is empty).
         } else {
             // Auto-compute Content-Length from body_.size(). This prevents
             // framing inconsistencies where the caller sets a Content-Length

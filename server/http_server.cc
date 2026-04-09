@@ -419,6 +419,14 @@ void HttpServer::RouteAsync(const std::string& method, const std::string& path, 
 
 void HttpServer::Proxy(const std::string& route_pattern,
                        const std::string& upstream_service_name) {
+    // Reject empty route patterns — calling .back() on an empty string is UB,
+    // and an empty pattern is never a valid route.
+    if (route_pattern.empty()) {
+        logging::Get()->error("Proxy: route_pattern must not be empty "
+                              "(upstream '{}')", upstream_service_name);
+        return;
+    }
+
     // Validate that the upstream service exists in config (can check eagerly)
     const UpstreamConfig* found = nullptr;
     for (const auto& u : upstream_configs_) {
@@ -1402,6 +1410,10 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         merged.Status(final_resp.GetStatusCode(),
                                       final_resp.GetStatusReason());
                         merged.Body(final_resp.GetBody());
+                        // Preserve proxy HEAD Content-Length flag across merge
+                        if (final_resp.IsContentLengthPreserved()) {
+                            merged.PreserveContentLength();
+                        }
                         std::set<std::string> final_non_repeatable;
                         for (const auto& fh : final_resp.GetHeaders()) {
                             if (!is_repeatable_header(fh.first)) {
@@ -2118,6 +2130,9 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         merged.Status(final_resp.GetStatusCode(),
                                       final_resp.GetStatusReason());
                         merged.Body(final_resp.GetBody());
+                        if (final_resp.IsContentLengthPreserved()) {
+                            merged.PreserveContentLength();
+                        }
                         std::set<std::string> final_non_repeatable;
                         for (const auto& fh : final_resp.GetHeaders()) {
                             if (!is_repeatable_header(fh.first)) {
@@ -2406,6 +2421,12 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
             new_interval = std::min(new_interval, connect_sec);
             if (u.pool.idle_timeout_sec > 0) {
                 new_interval = std::min(new_interval, u.pool.idle_timeout_sec);
+            }
+            // Also preserve proxy response timeout cadence
+            if (u.proxy.response_timeout_ms > 0) {
+                int response_sec = std::max(
+                    (u.proxy.response_timeout_ms + 999) / 1000, 1);
+                new_interval = std::min(new_interval, response_sec);
             }
         }
         net_server_.SetTimerInterval(new_interval);
