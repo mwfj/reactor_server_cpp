@@ -206,3 +206,32 @@ void UpstreamHttpCodec::Reset() {
     llhttp_init(&impl_->parser, HTTP_RESPONSE, &impl_->settings);
     impl_->parser.data = this;
 }
+
+void UpstreamHttpCodec::SetRequestMethod(const std::string& method) {
+    // Tell llhttp the request method so it correctly handles HEAD
+    // responses (no body despite Content-Length/Transfer-Encoding).
+    if (method == "HEAD") {
+        impl_->parser.method = HTTP_HEAD;
+    }
+}
+
+bool UpstreamHttpCodec::Finish() {
+    // Signal EOF to llhttp. For connection-close framing (no Content-Length
+    // or Transfer-Encoding), the parser accumulates body data until EOF.
+    // llhttp_finish() marks the response as complete in that case.
+    if (has_error_ || response_.complete) {
+        return response_.complete;
+    }
+    llhttp_errno_t err = llhttp_finish(&impl_->parser);
+    if (err == HPE_OK || err == HPE_PAUSED) {
+        // on_message_complete may have fired during finish
+        return response_.complete;
+    }
+    // Don't treat finish errors as hard failures if we already have
+    // headers — the response is usable even if framing is ambiguous.
+    if (response_.headers_complete) {
+        response_.complete = true;
+        return true;
+    }
+    return false;
+}

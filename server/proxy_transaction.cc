@@ -62,6 +62,10 @@ ProxyTransaction::~ProxyTransaction() {
 }
 
 void ProxyTransaction::Start() {
+    // Tell the codec the request method so it handles HEAD correctly
+    // (no body despite Content-Length/Transfer-Encoding in response).
+    codec_.SetRequestMethod(method_);
+
     // Compute rewritten headers (strip hop-by-hop, add X-Forwarded-For, etc.)
     rewritten_headers_ = header_rewriter_.RewriteRequest(
         client_headers_, client_ip_, client_tls_,
@@ -253,9 +257,16 @@ void ProxyTransaction::OnUpstreamData(
     }
 
     // Empty data signals upstream disconnect (EOF) from the pool's close
-    // callback. The response timeout may not be armed yet (e.g., we're still
-    // in SENDING_REQUEST state), so we can't rely on a timeout to recover.
+    // callback. For connection-close framing (no Content-Length / TE),
+    // llhttp needs an EOF signal to finalize the response. Try Finish()
+    // first — if it completes the response, deliver it instead of retrying.
     if (data.empty()) {
+        if (codec_.Finish()) {
+            // EOF-delimited response completed successfully
+            poison_connection_ = true;  // connection-close: not reusable
+            OnResponseComplete();
+            return;
+        }
         int upstream_fd = conn ? conn->fd() : -1;
         logging::Get()->warn("ProxyTransaction upstream disconnect (EOF) "
                              "client_fd={} service={} upstream_fd={} "

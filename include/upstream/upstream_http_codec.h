@@ -18,9 +18,18 @@ public:
     UpstreamHttpCodec(const UpstreamHttpCodec&) = delete;
     UpstreamHttpCodec& operator=(const UpstreamHttpCodec&) = delete;
 
+    // Set the request method that produced this response. Must be called
+    // before Parse() so llhttp knows HEAD responses have no body.
+    void SetRequestMethod(const std::string& method);
+
     // Feed raw bytes from upstream. Returns bytes consumed.
     // After this call, check GetResponse().complete.
     size_t Parse(const char* data, size_t len);
+
+    // Signal EOF from the transport. For connection-close framing (no
+    // Content-Length / Transfer-Encoding), llhttp needs this to finalize
+    // the response. Returns true if the response was completed by EOF.
+    bool Finish();
 
     // Access the parsed response
     const UpstreamResponse& GetResponse() const { return response_; }

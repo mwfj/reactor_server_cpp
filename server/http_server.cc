@@ -497,14 +497,15 @@ void HttpServer::Proxy(const std::string& route_pattern,
     }
 
     // Detect whether the pattern already contains a catch-all segment.
-    std::string effective_prefix = route_pattern;
+    // RouteTrie only treats '*' as special at segment start (immediately
+    // after '/'), so mid-segment '*' like /file*name is literal.
     bool has_catch_all = false;
     {
-        auto star_pos = effective_prefix.rfind('*');
-        if (star_pos != std::string::npos) {
-            auto last_slash = effective_prefix.rfind('/');
-            if (last_slash != std::string::npos && star_pos > last_slash) {
+        for (size_t i = 0; i < route_pattern.size(); ++i) {
+            if (route_pattern[i] == '*' &&
+                (i == 0 || route_pattern[i - 1] == '/')) {
                 has_catch_all = true;
+                break;
             }
         }
     }
@@ -624,14 +625,15 @@ void HttpServer::RegisterProxyRoutes() {
             continue;  // No proxy config for this upstream
         }
 
-        // Check if the route_prefix already has a catch-all segment
+        // Check if the route_prefix already has a catch-all segment.
+        // Same segment-start rule as RouteTrie (only after '/').
         std::string route_pattern = upstream.proxy.route_prefix;
         bool has_catch_all = false;
-        auto star_pos = route_pattern.rfind('*');
-        if (star_pos != std::string::npos) {
-            auto last_slash = route_pattern.rfind('/');
-            if (last_slash != std::string::npos && star_pos > last_slash) {
+        for (size_t i = 0; i < route_pattern.size(); ++i) {
+            if (route_pattern[i] == '*' &&
+                (i == 0 || route_pattern[i - 1] == '/')) {
                 has_catch_all = true;
+                break;
             }
         }
 
