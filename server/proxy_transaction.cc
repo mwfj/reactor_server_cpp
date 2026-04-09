@@ -570,7 +570,11 @@ void ProxyTransaction::ArmResponseTimeout() {
         // that would corrupt the next transaction if returned to idle.
         self->poison_connection_ = true;
 
-        if (self->state_ == State::AWAITING_RESPONSE ||
+        // SENDING_REQUEST is retryable: a timeout can fire during an early
+        // response where ArmResponseTimeout() ran but state hasn't advanced
+        // past SENDING_REQUEST yet (upstream sent partial headers then stalled).
+        if (self->state_ == State::SENDING_REQUEST ||
+            self->state_ == State::AWAITING_RESPONSE ||
             self->state_ == State::RECEIVING_BODY) {
             self->MaybeRetry(RetryPolicy::RetryCondition::RESPONSE_TIMEOUT);
         } else {

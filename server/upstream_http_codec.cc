@@ -31,13 +31,19 @@ static int on_status(llhttp_t* parser, const char* at, size_t length) {
 static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<UpstreamHttpCodec*>(parser->data);
 
-    // If we were reading a value, flush the previous header.
+    // If we were reading a value, flush the previous header — but only
+    // if we're still in the header phase. After headers_complete, llhttp
+    // reuses these callbacks for trailers; we drop trailers to avoid
+    // promoting trailer-only fields (e.g., Digest) into the normal header
+    // block that BuildClientResponse() serializes to clients.
     if (self->parsing_header_value_) {
-        std::string key = self->current_header_field_;
-        std::transform(key.begin(), key.end(), key.begin(),
-                       [](unsigned char c){ return std::tolower(c); });
-        self->response_.headers.emplace_back(std::move(key),
-                                             std::move(self->current_header_value_));
+        if (!self->response_.headers_complete) {
+            std::string key = self->current_header_field_;
+            std::transform(key.begin(), key.end(), key.begin(),
+                           [](unsigned char c){ return std::tolower(c); });
+            self->response_.headers.emplace_back(std::move(key),
+                                                 std::move(self->current_header_value_));
+        }
         self->current_header_field_.clear();
         self->current_header_value_.clear();
     }

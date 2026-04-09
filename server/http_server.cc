@@ -453,9 +453,9 @@ void HttpServer::Proxy(const std::string& route_pattern,
     }
 
     if (!upstream_manager_) {
-        // Pre-Start call: defer until MarkServerReady() when upstream_manager_
-        // is created. Routes are registered before the server accepts
-        // connections, so there's no race with live lookups.
+        // Pre-Start or MarkServerReady hasn't run yet: defer registration.
+        // Routes are registered before the server accepts connections,
+        // so there's no race with live route lookups.
         pending_proxy_routes_.emplace_back(route_pattern, upstream_service_name);
         logging::Get()->debug("Proxy: deferred registration {} -> {} "
                               "(upstream manager not yet initialized)",
@@ -463,7 +463,18 @@ void HttpServer::Proxy(const std::string& route_pattern,
         return;
     }
 
-    // Post-Start path (called from MarkServerReady or SetReadyCallback).
+    // Reject registration once the server is live (accepting connections).
+    // RouteTrie is not thread-safe for concurrent insert + lookup. Routes
+    // must be registered before accept starts (MarkServerReady time is safe
+    // because server_ready_ is set AFTER route registration completes).
+    if (server_ready_.load(std::memory_order_acquire)) {
+        logging::Get()->error("Proxy: cannot register routes after server "
+                              "is live (route_pattern='{}', upstream='{}'). "
+                              "Call Proxy() before Start().",
+                              route_pattern, upstream_service_name);
+        return;
+    }
+
     // Guard: reject exact duplicate {pattern, upstream} to prevent
     // dangling handler_ptr in route lambdas. Multiple different patterns
     // for the same upstream are allowed (e.g., /v1 and /v2 both → "svc").
@@ -513,7 +524,12 @@ void HttpServer::Proxy(const std::string& route_pattern,
         found->tls.sni_hostname,
         upstream_manager_.get());
 
+    // Store handler in stable ownership BEFORE registering routes. Route
+    // lambdas capture handler_ptr (raw); if RouteAsync throws (e.g., pattern
+    // conflict), the handler must outlive any partially-inserted routes so
+    // they don't hold a dangling pointer during RouteTrie cleanup.
     ProxyHandler* handler_ptr = handler.get();
+    proxy_handlers_[handler_key] = std::move(handler);
 
     // Determine methods to register
     static const std::vector<std::string> DEFAULT_PROXY_METHODS =
@@ -541,8 +557,6 @@ void HttpServer::Proxy(const std::string& route_pattern,
     } else {
         register_route(route_pattern);
     }
-
-    proxy_handlers_[handler_key] = std::move(handler);
 }
 
 void HttpServer::RegisterProxyRoutes() {
@@ -597,7 +611,9 @@ void HttpServer::RegisterProxyRoutes() {
             upstream.port,
             upstream.tls.sni_hostname,
             upstream_manager_.get());
+        // Store handler BEFORE route inserts — see Proxy() comment for rationale.
         ProxyHandler* handler_ptr = handler.get();
+        proxy_handlers_[handler_key] = std::move(handler);
 
         static const std::vector<std::string> DEFAULT_PROXY_METHODS =
             {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
@@ -624,8 +640,6 @@ void HttpServer::RegisterProxyRoutes() {
         }
         // Register the catch-all variant (auto-generated or user-provided)
         register_route(config_prefix);
-
-        proxy_handlers_[handler_key] = std::move(handler);
     }
 }
 
