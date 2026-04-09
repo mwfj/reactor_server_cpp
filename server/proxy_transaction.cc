@@ -451,6 +451,10 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
         // Release old lease, clear callbacks, poison if tainted
         Cleanup();
         codec_.Reset();
+        // Re-apply request method after reset — llhttp_init() zeroes
+        // parser.method, so HEAD responses would be parsed as if they
+        // carry a body, causing the retried request to hang.
+        codec_.SetRequestMethod(method_);
         poison_connection_ = false;
 
         // v1: immediate retry (no backoff delay). RetryPolicy::BackoffDelay()
