@@ -225,8 +225,14 @@ void ProxyTransaction::SendUpstreamRequest() {
 
     auto transport = upstream_conn->GetTransport();
     if (!transport || transport->IsClosing()) {
-        OnError(RESULT_SEND_FAILED,
-                "Upstream transport closing before send");
+        // Stale keep-alive connection closed after checkout but before write.
+        // Treat as upstream disconnect so retry_on_disconnect can recover
+        // idempotent requests instead of failing immediately with 502.
+        poison_connection_ = true;
+        logging::Get()->warn("ProxyTransaction stale connection before send "
+                             "client_fd={} service={} attempt={}",
+                             client_fd_, service_name_, attempt_);
+        MaybeRetry(RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT);
         return;
     }
 

@@ -452,6 +452,26 @@ void HttpServer::Proxy(const std::string& route_pattern,
                               found->proxy.retry.max_retries);
         return;
     }
+    // Validate methods — reject unknowns and duplicates (same as config_loader).
+    // Without this, duplicates crash RouteAsync and unknowns bypass validation.
+    {
+        static const std::unordered_set<std::string> valid_methods = {
+            "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"
+        };
+        std::unordered_set<std::string> seen;
+        for (const auto& m : found->proxy.methods) {
+            if (valid_methods.find(m) == valid_methods.end()) {
+                logging::Get()->error("Proxy: upstream '{}' has invalid "
+                                      "method '{}'", upstream_service_name, m);
+                return;
+            }
+            if (!seen.insert(m).second) {
+                logging::Get()->error("Proxy: upstream '{}' has duplicate "
+                                      "method '{}'", upstream_service_name, m);
+                return;
+            }
+        }
+    }
 
     if (!upstream_manager_) {
         // Pre-Start or MarkServerReady hasn't run yet: defer registration.
@@ -514,19 +534,6 @@ void HttpServer::Proxy(const std::string& route_pattern,
             dedup_prefix = dedup_prefix.substr(0, star_pos + 1);  // keep the '*'
         }
     }
-    // Check for path conflict across ALL upstreams (not just same-name).
-    // Two upstreams both exposing /api would crash in RouteAsync otherwise.
-    for (const auto& [key, _] : proxy_handlers_) {
-        // Keys are "upstream\tdedup_prefix" — extract the path part
-        auto tab = key.find('\t');
-        if (tab != std::string::npos && key.substr(tab + 1) == dedup_prefix) {
-            logging::Get()->error("Proxy: route '{}' -> '{}' conflicts with "
-                                  "existing proxy route (effective path: {})",
-                                  route_pattern, upstream_service_name,
-                                  dedup_prefix);
-            return;
-        }
-    }
     std::string handler_key = upstream_service_name + "\t" + dedup_prefix;
 
     ProxyConfig handler_config = found->proxy;
@@ -552,6 +559,23 @@ void HttpServer::Proxy(const std::string& route_pattern,
         {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
     const auto& methods = found->proxy.methods.empty()
         ? DEFAULT_PROXY_METHODS : found->proxy.methods;
+
+    // Method-level conflict check: HttpRouter stores routes per-method, so
+    // disjoint method sets on the same path are legal (e.g., GET→svc-a,
+    // POST→svc-b). Only reject if any method overlaps.
+    auto& registered = proxy_route_methods_[dedup_prefix];
+    for (const auto& m : methods) {
+        if (registered.count(m)) {
+            logging::Get()->error("Proxy: method {} on path '{}' already "
+                                  "registered (upstream '{}')",
+                                  m, dedup_prefix, upstream_service_name);
+            proxy_handlers_.erase(handler_key);
+            return;
+        }
+    }
+    for (const auto& m : methods) {
+        registered.insert(m);
+    }
 
     auto register_route = [&](const std::string& pattern) {
         for (const auto& method : methods) {
@@ -614,23 +638,7 @@ void HttpServer::RegisterProxyRoutes() {
                 dedup_prefix = dedup_prefix.substr(0, sp + 1);
             }
         }
-        // Check for path conflict across ALL upstreams (same as Proxy())
-        bool conflict = false;
-        for (const auto& [key, _] : proxy_handlers_) {
-            auto tab = key.find('\t');
-            if (tab != std::string::npos && key.substr(tab + 1) == dedup_prefix) {
-                logging::Get()->warn("RegisterProxyRoutes: route '{}' -> '{}' "
-                                     "conflicts with existing route, skipping",
-                                     upstream.proxy.route_prefix, upstream.name);
-                conflict = true;
-                break;
-            }
-        }
-        if (conflict) continue;
         std::string handler_key = upstream.name + "\t" + dedup_prefix;
-        if (proxy_handlers_.count(handler_key)) {
-            continue;  // exact same {upstream, path} — already covered above
-        }
 
         // Create ProxyHandler with the full catch-all-aware route_prefix.
         ProxyConfig handler_config = upstream.proxy;
@@ -651,6 +659,26 @@ void HttpServer::RegisterProxyRoutes() {
             {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
         const auto& methods = upstream.proxy.methods.empty()
             ? DEFAULT_PROXY_METHODS : upstream.proxy.methods;
+
+        // Method-level conflict check (same logic as Proxy())
+        auto& registered = proxy_route_methods_[dedup_prefix];
+        bool conflict = false;
+        for (const auto& m : methods) {
+            if (registered.count(m)) {
+                logging::Get()->warn("RegisterProxyRoutes: method {} on '{}' "
+                                     "already registered, skipping upstream '{}'",
+                                     m, dedup_prefix, upstream.name);
+                conflict = true;
+                break;
+            }
+        }
+        if (conflict) {
+            proxy_handlers_.erase(handler_key);
+            continue;
+        }
+        for (const auto& m : methods) {
+            registered.insert(m);
+        }
 
         auto register_route = [&](const std::string& pattern) {
             for (const auto& method : methods) {
@@ -1163,6 +1191,7 @@ void HttpServer::Stop() {
     // (destroyed in ~HttpServer). Clearing here prevents any stale route
     // callback from reaching a proxy handler after Stop().
     proxy_handlers_.clear();
+    proxy_route_methods_.clear();
 
     // Clear one-shot drain state (Stop may be called from destructor too)
     {

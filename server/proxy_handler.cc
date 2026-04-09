@@ -110,11 +110,26 @@ void ProxyHandler::Handle(
     // determined by the route pattern: auto-generated routes use "proxy_path",
     // user-defined patterns may use any name (e.g., "*rest" → "rest").
     // catch_all_param_ is extracted from route_prefix at construction time.
+    //
+    // When strip_prefix is active, two route patterns are registered:
+    //   1. Exact prefix (e.g., /api/:version)     → no catch-all param
+    //   2. Catch-all    (e.g., /api/:version/*pp)  → catch-all param present
+    // For case 1, the entire matched prefix IS the route, so the upstream
+    // path should be "/" (nothing beyond the prefix to forward).
     std::string upstream_path_override;
-    if (config_.strip_prefix && !catch_all_param_.empty()) {
-        auto it = request.params.find(catch_all_param_);
-        if (it != request.params.end()) {
-            upstream_path_override = it->second;
+    if (config_.strip_prefix) {
+        if (!catch_all_param_.empty()) {
+            auto it = request.params.find(catch_all_param_);
+            if (it != request.params.end()) {
+                upstream_path_override = it->second;
+            } else {
+                // Exact-match hit (no catch-all segment matched) — upstream
+                // path is "/" since the entire request path IS the prefix.
+                upstream_path_override = "/";
+            }
+        } else {
+            // No catch-all param configured at all — exact-match only route.
+            upstream_path_override = "/";
         }
     }
 

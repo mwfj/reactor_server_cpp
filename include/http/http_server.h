@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <set>
 #include <string>
+#include <unordered_set>
 
 // Forward declarations for upstream pool and proxy
 class UpstreamManager;
@@ -292,6 +293,11 @@ private:
 
     // Proxy handlers (one per upstream with proxy config)
     std::unordered_map<std::string, std::unique_ptr<ProxyHandler>> proxy_handlers_;
+
+    // Tracks which methods are registered per canonical proxy path.
+    // Key: dedup_prefix (e.g., "/api/*"), Value: set of registered methods.
+    // Used to detect method-level conflicts before RouteAsync throws.
+    std::unordered_map<std::string, std::unordered_set<std::string>> proxy_route_methods_;
 
     // Pending manual Proxy() registrations — stored when Proxy() is called
     // before Start(), processed in MarkServerReady() after upstream_manager_
