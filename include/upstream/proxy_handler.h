@@ -18,6 +18,7 @@ public:
                  bool upstream_tls,
                  const std::string& upstream_host,
                  int upstream_port,
+                 const std::string& sni_hostname,
                  UpstreamManager* upstream_manager);
     ~ProxyHandler();
 
@@ -42,6 +43,7 @@ private:
     bool upstream_tls_ = false;
     std::string upstream_host_;
     int upstream_port_;
+    std::string sni_hostname_;  // Preferred Host value for TLS backends behind IPs
     UpstreamManager* upstream_manager_;
     HeaderRewriter header_rewriter_;
     RetryPolicy retry_policy_;

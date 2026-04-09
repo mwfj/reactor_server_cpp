@@ -38,6 +38,7 @@ public:
                      bool upstream_tls,
                      const std::string& upstream_host,
                      int upstream_port,
+                     const std::string& sni_hostname,
                      const std::string& upstream_path_override,
                      const std::string& static_prefix);
     ~ProxyTransaction();
@@ -81,6 +82,7 @@ private:
     bool upstream_tls_;
     std::string upstream_host_;
     int upstream_port_;
+    std::string sni_hostname_;  // Preferred Host value for TLS backends behind IPs
     std::string upstream_path_override_;  // If non-empty, use as upstream path (from catch-all param)
     std::string static_prefix_;  // Fallback: precomputed by ProxyHandler for strip_prefix
 

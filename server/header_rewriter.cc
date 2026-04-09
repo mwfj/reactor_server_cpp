@@ -68,7 +68,8 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
     bool client_tls,
     bool upstream_tls,
     const std::string& upstream_host,
-    int upstream_port) const {
+    int upstream_port,
+    const std::string& sni_hostname) const {
 
     // Collect additional hop-by-hop headers from Connection header value
     std::unordered_set<std::string> connection_listed;
@@ -113,15 +114,19 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
         }
     }
 
-    // Host: rewrite to upstream address
+    // Host: rewrite to upstream address (or SNI hostname when configured).
+    // When an HTTPS upstream is reached by IP with tls.sni_hostname set,
+    // the backend expects Host to match the SNI name for virtual-host
+    // routing, not the raw IP address.
     if (config_.rewrite_host) {
-        // Omit the port only when it matches the upstream scheme's default.
+        const std::string& host_value =
+            sni_hostname.empty() ? upstream_host : sni_hostname;
         bool omit_port = (!upstream_tls && upstream_port == 80) ||
                          (upstream_tls && upstream_port == 443);
         if (omit_port) {
-            output["host"] = upstream_host;
+            output["host"] = host_value;
         } else {
-            output["host"] = upstream_host + ":"
+            output["host"] = host_value + ":"
                            + std::to_string(upstream_port);
         }
     }

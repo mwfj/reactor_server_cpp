@@ -23,13 +23,16 @@ public:
     // client_tls: true if downstream connection has TLS
     // upstream_host: upstream address for Host header rewrite
     // upstream_port: upstream port for Host header rewrite
+    // sni_hostname: if non-empty, used as Host instead of upstream_host
+    //   (for TLS backends reached by IP with virtual-host routing)
     std::map<std::string, std::string> RewriteRequest(
         const std::map<std::string, std::string>& client_headers,
         const std::string& client_ip,
         bool client_tls,
         bool upstream_tls,
         const std::string& upstream_host,
-        int upstream_port) const;
+        int upstream_port,
+        const std::string& sni_hostname = "") const;
 
     // Rewrite response headers from upstream before relaying to client.
     // Strips hop-by-hop headers from the upstream response.

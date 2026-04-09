@@ -10,12 +10,14 @@ ProxyHandler::ProxyHandler(
     bool upstream_tls,
     const std::string& upstream_host,
     int upstream_port,
+    const std::string& sni_hostname,
     UpstreamManager* upstream_manager)
     : service_name_(service_name),
       config_(config),
       upstream_tls_(upstream_tls),
       upstream_host_(upstream_host),
       upstream_port_(upstream_port),
+      sni_hostname_(sni_hostname),
       upstream_manager_(upstream_manager),
       header_rewriter_(HeaderRewriter::Config{
           config.header_rewrite.set_x_forwarded_for,
@@ -42,25 +44,39 @@ ProxyHandler::ProxyHandler(
     // the raw matched path. Users needing full dynamic-prefix stripping
     // should structure their routes with static prefixes.
     if (config_.strip_prefix && !config_.route_prefix.empty()) {
-        // Extract catch-all param name from route_prefix (e.g., "*proxy_path"
-        // → "proxy_path", "*rest" → "rest"). Used in Handle() to look up the
-        // router-extracted tail instead of doing string prefix stripping.
-        auto star_pos = config_.route_prefix.rfind('*');
-        if (star_pos != std::string::npos) {
-            catch_all_param_ = config_.route_prefix.substr(star_pos + 1);
+        // Extract catch-all param name from route_prefix (e.g., "/*proxy_path"
+        // → "proxy_path", "/*rest" → "rest"). Only match '*' at segment start
+        // (after '/') — mid-segment '*' like /file*name is literal.
+        for (size_t i = 0; i < config_.route_prefix.size(); ++i) {
+            if (config_.route_prefix[i] == '*' &&
+                (i == 0 || config_.route_prefix[i - 1] == '/')) {
+                catch_all_param_ = config_.route_prefix.substr(i + 1);
+                break;
+            }
         }
 
         // Precompute static_prefix as fallback for exact-match routes
         // (no catch-all param available). Only the leading static segment
         // is stripped; dynamic segments like :version are left intact.
+        //
+        // The route trie only treats ':' and '*' as special at segment start
+        // (immediately after '/'). Mid-segment occurrences like /v1:beta or
+        // /file*name are literal. Match that behavior here to avoid
+        // incorrectly truncating literal route patterns.
         static_prefix_ = config_.route_prefix;
-        auto colon_pos = static_prefix_.find(':');
-        auto star_pos2 = static_prefix_.find('*');
         size_t cut_pos = std::string::npos;
-        if (colon_pos != std::string::npos) cut_pos = colon_pos;
-        if (star_pos2 != std::string::npos &&
-            (cut_pos == std::string::npos || star_pos2 < cut_pos)) {
-            cut_pos = star_pos2;
+        for (size_t i = 1; i < static_prefix_.size(); ++i) {
+            if (static_prefix_[i - 1] == '/' &&
+                (static_prefix_[i] == ':' || static_prefix_[i] == '*')) {
+                cut_pos = i;
+                break;
+            }
+        }
+        // Also handle leading ':' or '*' (pattern starts with param/catch-all)
+        if (cut_pos == std::string::npos &&
+            !static_prefix_.empty() &&
+            (static_prefix_[0] == ':' || static_prefix_[0] == '*')) {
+            cut_pos = 0;
         }
         if (cut_pos != std::string::npos) {
             static_prefix_ = static_prefix_.substr(0, cut_pos);
@@ -113,6 +129,7 @@ void ProxyHandler::Handle(
         upstream_tls_,
         upstream_host_,
         upstream_port_,
+        sni_hostname_,
         upstream_path_override,
         static_prefix_);
 

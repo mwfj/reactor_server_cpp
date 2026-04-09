@@ -108,6 +108,14 @@ void HttpServer::MarkServerReady() {
                 min_upstream_sec = std::min(min_upstream_sec,
                                             u.pool.idle_timeout_sec);
             }
+            // Also consider proxy response timeout — if configured,
+            // the timer scan must fire often enough to detect stalled
+            // upstream responses within one interval of the deadline.
+            if (u.proxy.response_timeout_ms > 0) {
+                int response_sec = std::max(
+                    (u.proxy.response_timeout_ms + 999) / 1000, 1);
+                min_upstream_sec = std::min(min_upstream_sec, response_sec);
+            }
         }
         if (min_upstream_sec < std::numeric_limits<int>::max()) {
             int current_interval = net_server_.GetTimerInterval();
@@ -502,6 +510,7 @@ void HttpServer::Proxy(const std::string& route_pattern,
         found->tls.enabled,
         found->host,
         found->port,
+        found->tls.sni_hostname,
         upstream_manager_.get());
 
     ProxyHandler* handler_ptr = handler.get();
@@ -586,6 +595,7 @@ void HttpServer::RegisterProxyRoutes() {
             upstream.tls.enabled,
             upstream.host,
             upstream.port,
+            upstream.tls.sni_hostname,
             upstream_manager_.get());
         ProxyHandler* handler_ptr = handler.get();
 

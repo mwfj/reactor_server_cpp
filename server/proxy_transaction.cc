@@ -18,6 +18,7 @@ ProxyTransaction::ProxyTransaction(
     bool upstream_tls,
     const std::string& upstream_host,
     int upstream_port,
+    const std::string& sni_hostname,
     const std::string& upstream_path_override,
     const std::string& static_prefix)
     : service_name_(service_name),
@@ -33,6 +34,7 @@ ProxyTransaction::ProxyTransaction(
       upstream_tls_(upstream_tls),
       upstream_host_(upstream_host),
       upstream_port_(upstream_port),
+      sni_hostname_(sni_hostname),
       upstream_path_override_(upstream_path_override),
       static_prefix_(static_prefix),
       upstream_manager_(upstream_manager),
@@ -64,7 +66,7 @@ void ProxyTransaction::Start() {
     rewritten_headers_ = header_rewriter_.RewriteRequest(
         client_headers_, client_ip_, client_tls_,
         upstream_tls_,
-        upstream_host_, upstream_port_);
+        upstream_host_, upstream_port_, sni_hostname_);
 
     // Compute upstream path with strip_prefix support.
     // Prefer upstream_path_override_ (extracted from catch-all route param by
