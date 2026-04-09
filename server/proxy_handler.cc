@@ -120,9 +120,13 @@ void ProxyHandler::Handle(
     if (config_.strip_prefix) {
         if (!catch_all_param_.empty()) {
             auto it = request.params.find(catch_all_param_);
-            if (it != request.params.end()) {
+            if (it != request.params.end() && !it->second.empty()) {
                 upstream_path_override = it->second;
             } else {
+                // Catch-all param absent (exact-prefix hit) or empty
+                // (request ended at the catch-all slash, e.g., /api/v1/).
+                // Either way, upstream path is "/" — the entire request
+                // path IS the prefix with nothing beyond it to forward.
                 // Exact-match hit (no catch-all segment matched) — upstream
                 // path is "/" since the entire request path IS the prefix.
                 upstream_path_override = "/";

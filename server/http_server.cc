@@ -547,12 +547,7 @@ void HttpServer::Proxy(const std::string& route_pattern,
         found->tls.sni_hostname,
         upstream_manager_.get());
 
-    // Store handler in stable ownership BEFORE registering routes. Route
-    // lambdas capture handler_ptr (raw); if RouteAsync throws (e.g., pattern
-    // conflict), the handler must outlive any partially-inserted routes so
-    // they don't hold a dangling pointer during RouteTrie cleanup.
     ProxyHandler* handler_ptr = handler.get();
-    proxy_handlers_[handler_key] = std::move(handler);
 
     // Determine methods to register
     static const std::vector<std::string> DEFAULT_PROXY_METHODS =
@@ -560,19 +555,23 @@ void HttpServer::Proxy(const std::string& route_pattern,
     const auto& methods = found->proxy.methods.empty()
         ? DEFAULT_PROXY_METHODS : found->proxy.methods;
 
-    // Method-level conflict check: HttpRouter stores routes per-method, so
-    // disjoint method sets on the same path are legal (e.g., GET→svc-a,
-    // POST→svc-b). Only reject if any method overlaps.
+    // Method-level conflict check BEFORE storing the handler. Storing first
+    // would destroy any existing handler under the same key via operator=,
+    // leaving its routes' raw handler_ptr dangling.
     auto& registered = proxy_route_methods_[dedup_prefix];
     for (const auto& m : methods) {
         if (registered.count(m)) {
             logging::Get()->error("Proxy: method {} on path '{}' already "
                                   "registered (upstream '{}')",
                                   m, dedup_prefix, upstream_service_name);
-            proxy_handlers_.erase(handler_key);
             return;
         }
     }
+
+    // Conflict check passed — now store in stable ownership BEFORE
+    // registering routes. If RouteAsync throws, the handler survives so
+    // any partially-inserted route lambdas don't hold dangling pointers.
+    proxy_handlers_[handler_key] = std::move(handler);
     for (const auto& m : methods) {
         registered.insert(m);
     }
@@ -590,12 +589,28 @@ void HttpServer::Proxy(const std::string& route_pattern,
                              found->host, found->port);
     };
 
-    // Register exact prefix + catch-all variant (same as RegisterProxyRoutes)
+    // Register exact prefix + catch-all variant (same as RegisterProxyRoutes).
+    // Both auto-generated and explicit catch-all routes need a companion
+    // exact-prefix registration so bare paths (e.g., /api/v1 without
+    // trailing slash) don't 404.
     if (!has_catch_all) {
-        register_route(route_pattern);
-        register_route(config_prefix);
+        register_route(route_pattern);       // exact prefix
+        register_route(config_prefix);       // auto-generated catch-all
     } else {
-        register_route(route_pattern);
+        // Explicit catch-all: extract the prefix before the catch-all
+        // segment and register it as the exact-match companion.
+        auto star_pos = route_pattern.rfind('*');
+        if (star_pos != std::string::npos) {
+            std::string exact_prefix = route_pattern.substr(0, star_pos);
+            // Remove trailing slash left by the catch-all separator
+            while (exact_prefix.size() > 1 && exact_prefix.back() == '/') {
+                exact_prefix.pop_back();
+            }
+            if (!exact_prefix.empty()) {
+                register_route(exact_prefix);
+            }
+        }
+        register_route(route_pattern);       // user-provided catch-all
     }
 }
 
@@ -651,16 +666,14 @@ void HttpServer::RegisterProxyRoutes() {
             upstream.port,
             upstream.tls.sni_hostname,
             upstream_manager_.get());
-        // Store handler BEFORE route inserts — see Proxy() comment for rationale.
         ProxyHandler* handler_ptr = handler.get();
-        proxy_handlers_[handler_key] = std::move(handler);
 
         static const std::vector<std::string> DEFAULT_PROXY_METHODS =
             {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
         const auto& methods = upstream.proxy.methods.empty()
             ? DEFAULT_PROXY_METHODS : upstream.proxy.methods;
 
-        // Method-level conflict check (same logic as Proxy())
+        // Method-level conflict check BEFORE storing (same as Proxy())
         auto& registered = proxy_route_methods_[dedup_prefix];
         bool conflict = false;
         for (const auto& m : methods) {
@@ -672,10 +685,10 @@ void HttpServer::RegisterProxyRoutes() {
                 break;
             }
         }
-        if (conflict) {
-            proxy_handlers_.erase(handler_key);
-            continue;
-        }
+        if (conflict) continue;
+
+        // Conflict check passed — store handler, then register routes
+        proxy_handlers_[handler_key] = std::move(handler);
         for (const auto& m : methods) {
             registered.insert(m);
         }
@@ -697,6 +710,20 @@ void HttpServer::RegisterProxyRoutes() {
             // Register the exact prefix to handle requests that match it
             // without a trailing path (e.g., /api/users).
             register_route(upstream.proxy.route_prefix);
+        } else {
+            // Explicit catch-all: register exact-prefix companion so bare
+            // paths (e.g., /api/v1) don't 404 (same as Proxy()).
+            auto sp = upstream.proxy.route_prefix.rfind('*');
+            if (sp != std::string::npos) {
+                std::string exact_prefix =
+                    upstream.proxy.route_prefix.substr(0, sp);
+                while (exact_prefix.size() > 1 && exact_prefix.back() == '/') {
+                    exact_prefix.pop_back();
+                }
+                if (!exact_prefix.empty()) {
+                    register_route(exact_prefix);
+                }
+            }
         }
         // Register the catch-all variant (auto-generated or user-provided)
         register_route(config_prefix);

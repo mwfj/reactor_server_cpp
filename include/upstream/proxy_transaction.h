@@ -83,8 +83,8 @@ private:
     std::string upstream_host_;
     int upstream_port_;
     std::string sni_hostname_;  // Preferred Host value for TLS backends behind IPs
-    std::string upstream_path_override_;  // If non-empty, use as upstream path (from catch-all param)
-    std::string static_prefix_;  // Fallback: precomputed by ProxyHandler for strip_prefix
+    std::string upstream_path_override_;  // If non-empty, use as upstream path (from catch-all param or "/" for exact match)
+    std::string static_prefix_;           // Fallback: precomputed by ProxyHandler for strip_prefix
 
     // Rewritten headers and serialized request (cached for retry)
     std::map<std::string, std::string> rewritten_headers_;
