@@ -138,10 +138,36 @@ std::string HttpResponse::Serialize() const {
         hdrs.emplace_back("Content-Length", "0");
     } else if (!bodyless_status) {
         if (preserve_content_length_) {
-            // Proxy HEAD path: keep the upstream's Content-Length as-is.
+            // Proxy HEAD path: keep the upstream's Content-Length value.
             // If the upstream didn't send Content-Length (resource size
             // unknown), don't inject one — forwarding CL: 0 would be
-            // incorrect (tells the client the resource is empty).
+            // incorrect. If the upstream sent duplicate/conflicting CL
+            // headers, collapse to a single value (the first one) to
+            // avoid malformed responses that confuse clients.
+            std::string first_cl;
+            bool found_cl = false;
+            for (const auto& kv : hdrs) {
+                std::string key = kv.first;
+                std::transform(key.begin(), key.end(), key.begin(),
+                    [](unsigned char c){ return std::tolower(c); });
+                if (key == "content-length") {
+                    if (!found_cl) {
+                        first_cl = kv.second;
+                        found_cl = true;
+                    }
+                }
+            }
+            if (found_cl) {
+                // Remove all CL headers, re-add the canonical single value
+                hdrs.erase(std::remove_if(hdrs.begin(), hdrs.end(),
+                    [](const std::pair<std::string, std::string>& kv) {
+                        std::string key = kv.first;
+                        std::transform(key.begin(), key.end(), key.begin(),
+                            [](unsigned char c){ return std::tolower(c); });
+                        return key == "content-length";
+                    }), hdrs.end());
+                hdrs.emplace_back("Content-Length", first_cl);
+            }
         } else {
             // Auto-compute Content-Length from body_.size(). This prevents
             // framing inconsistencies where the caller sets a Content-Length

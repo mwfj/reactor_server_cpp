@@ -426,6 +426,18 @@ void HttpServer::Proxy(const std::string& route_pattern,
                               "(upstream '{}')", upstream_service_name);
         return;
     }
+    // Validate the route pattern early — same as config_loader does for
+    // JSON-loaded routes. Without this, invalid patterns (duplicate params,
+    // catch-all not last, etc.) only fail inside RouteAsync after handler/
+    // method bookkeeping has been partially applied.
+    try {
+        auto segments = ROUTE_TRIE::ParsePattern(route_pattern);
+        ROUTE_TRIE::ValidatePattern(route_pattern, segments);
+    } catch (const std::invalid_argument& e) {
+        logging::Get()->error("Proxy: invalid route_pattern '{}': {}",
+                              route_pattern, e.what());
+        return;
+    }
 
     // Validate that the upstream service exists in config (can check eagerly)
     const UpstreamConfig* found = nullptr;
@@ -444,10 +456,10 @@ void HttpServer::Proxy(const std::string& route_pattern,
     // Validate proxy config eagerly — fail fast for code-registered routes
     // that bypass config_loader validation (which only runs for JSON-loaded
     // configs with non-empty route_prefix).
-    if (found->proxy.response_timeout_ms < 1000) {
+    if (found->proxy.response_timeout_ms != 0 &&
+        found->proxy.response_timeout_ms < 1000) {
         logging::Get()->error("Proxy: upstream '{}' has invalid "
-                              "response_timeout_ms={} (must be >= 1000, "
-                              "timer scan resolution is 1s)",
+                              "response_timeout_ms={} (must be 0 or >= 1000)",
                               upstream_service_name,
                               found->proxy.response_timeout_ms);
         return;
