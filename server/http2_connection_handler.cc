@@ -507,8 +507,24 @@ void Http2ConnectionHandler::UpdateDeadline() {
             deadline_armed_ = true;
             last_deadline_ = deadline;
         }
+    } else if (session_->ActiveStreamCount() > 0) {
+        // No incomplete streams (request parsing is done for all open
+        // streams) but active streams still exist — they're waiting for
+        // async handler work (e.g., proxy upstream response). Arm a
+        // rolling safety deadline from NOW to suppress idle_timeout
+        // without tying the per-stream timeout to stream creation time.
+        // The actual response-wait bound is enforced by the handler
+        // itself (proxy.response_timeout_ms for proxies). When this
+        // safety deadline fires and streams are still active, the
+        // timeout callback re-arms it — effectively a heartbeat.
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(request_timeout_sec_);
+        conn_->SetDeadline(deadline);
+        deadline_armed_ = true;
+        last_deadline_ = deadline;
     } else if (deadline_armed_ && session_->LastStreamId() > 0) {
-        // No incomplete streams (including rejected) — idle keep-alive
+        // No incomplete streams AND no active streams — idle keep-alive,
+        // let idle_timeout take over.
         conn_->ClearDeadline();
         deadline_armed_ = false;
     }

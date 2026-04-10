@@ -283,6 +283,15 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     // is not closing.
     if (conn_) conn_->SetShutdownExempt(false);
 
+    // Clear the async timeout deadline: the response has been delivered,
+    // so the connection should revert to idle_timeout_sec behavior until
+    // the next request arrives. Without this, the stale 504 callback
+    // would fire at the deferred deadline and close a healthy keep-alive
+    // connection (HandleCompleteRequest installed this deadline + callback
+    // when the response was marked deferred).
+    conn_->ClearDeadline();
+    conn_->SetDeadlineTimeoutCb(nullptr);
+
     // Resume parsing any pipelined bytes that arrived during the deferred
     // window. Move out of the member first so a nested BeginAsyncResponse
     // triggered by the next parsed async request can cleanly re-populate
@@ -631,12 +640,17 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         // applies.
         if (response.IsDeferred()) {
             request_in_progress_ = false;
-            // Keep the request deadline armed (don't clear it) so a
-            // long-running async handler — e.g., proxy waiting on a slow
-            // upstream — isn't dropped by the fallback idle timeout.
-            // Replace the 408 request-parsing callback with a 504 Gateway
-            // Timeout callback appropriate for deferred async processing.
+            // Re-arm the deadline from NOW so the async handler gets a
+            // fresh request_timeout_sec budget. Reusing the original
+            // request_start_ deadline would penalize slow uploads: most
+            // of the budget may already be consumed by the time the body
+            // is fully received, leaving the proxy/async handler almost
+            // no time. CompleteAsyncResponse clears this deadline on
+            // successful delivery so the next keep-alive request gets a
+            // clean slate (idle_timeout governs between requests).
             if (request_timeout_sec_ > 0) {
+                conn_->SetDeadline(std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(request_timeout_sec_));
                 std::weak_ptr<HttpConnectionHandler> weak_self =
                     shared_from_this();
                 conn_->SetDeadlineTimeoutCb([weak_self]() -> bool {

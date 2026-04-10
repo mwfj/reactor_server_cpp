@@ -660,16 +660,6 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
         return -1;
     }
 
-    // Async path: if the stream's counter wasn't decremented in
-    // DispatchStreamRequest (because the response was deferred), decrement
-    // it now so UpdateDeadline reflects the no-longer-incomplete state.
-    // Idempotent for the sync path where DispatchStreamRequest already
-    // decremented just before calling SubmitResponse.
-    if (!stream->IsCounterDecremented()) {
-        OnStreamNoLongerIncomplete();
-        stream->MarkCounterDecremented();
-    }
-
     int status_code = response.GetStatusCode();
 
     // 1xx informational responses must not come through SubmitResponse.
@@ -814,13 +804,16 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
         callbacks_.request_count_callback();
     }
 
-    // NOTE: counter decrement is deferred until either the content-length
-    // rejection, the sync SubmitResponse below, or the async SubmitResponse
-    // path. Keeping async streams counted as "incomplete" is what keeps the
-    // H2 connection deadline armed via UpdateDeadline while the async
-    // handler (e.g., proxy) is waiting on an upstream response. Without
-    // this, the deadline clears as soon as the request body is received
-    // and the transport reverts to idle_timeout_sec mid-flight.
+    // Request parsing is complete — decrement the "incomplete" counter so
+    // request_timeout_sec no longer applies to this stream. For async
+    // (deferred) responses, the connection is kept alive via
+    // Http2ConnectionHandler::UpdateDeadline's safety-deadline path (active
+    // streams with zero incomplete), NOT by leaving the stream counted as
+    // incomplete. That was tried but made request_timeout_sec cap the full
+    // async handler lifetime, RST'ing proxy streams whose upstream was
+    // still responding within the longer proxy.response_timeout_ms budget.
+    OnStreamNoLongerIncomplete();
+    stream->MarkCounterDecremented();
 
     const HttpRequest& req = stream->GetRequest();
 
@@ -842,10 +835,6 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
                              "declared={} actual={}",
                              stream_id, req.content_length,
                              stream->AccumulatedBodySize());
-        // Rejected — mark counter decremented so ResetExpiredStreams/
-        // UpdateDeadline don't keep the connection alive for this stream.
-        OnStreamNoLongerIncomplete();
-        stream->MarkCounterDecremented();
         nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
                                   stream_id, NGHTTP2_PROTOCOL_ERROR);
         stream->MarkRejected();
@@ -856,8 +845,6 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
         stream->AccumulatedBodySize() > 0) {
         logging::Get()->warn("HTTP/2 stream {} content-length:0 but body present",
                              stream_id);
-        OnStreamNoLongerIncomplete();
-        stream->MarkCounterDecremented();
         nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
                                   stream_id, NGHTTP2_PROTOCOL_ERROR);
         stream->MarkRejected();
@@ -873,18 +860,13 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
     }
     // Async handler path: the framework has dispatched an async route and
     // will submit the real response on this stream later via
-    // Http2ConnectionHandler::SubmitStreamResponse. Leave the stream
-    // counted as incomplete so UpdateDeadline keeps the connection
-    // deadline armed while waiting for the async completion — the counter
-    // is decremented inside SubmitResponse when the response arrives.
+    // Http2ConnectionHandler::SubmitStreamResponse. Skipping here leaves the
+    // stream open; H2's graceful-shutdown drain already waits on open
+    // streams, and Http2ConnectionHandler::UpdateDeadline arms a rolling
+    // safety deadline while active streams exist to suppress idle_timeout.
     if (response.IsDeferred()) {
         return;
     }
-    // Sync handler — decrement counter before submitting (SubmitResponse
-    // is idempotent on the decrement via its IsCounterDecremented check,
-    // but doing it here keeps the sync path's ordering explicit).
-    OnStreamNoLongerIncomplete();
-    stream->MarkCounterDecremented();
     SubmitResponse(stream_id, response);
 }
 

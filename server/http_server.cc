@@ -705,26 +705,38 @@ void HttpServer::Proxy(const std::string& route_pattern,
     // Method-level conflict check BEFORE storing the handler. Storing first
     // would destroy any existing handler under the same key via operator=,
     // leaving its routes' raw handler_ptr dangling.
+    // Partial overlaps are tolerated: skip conflicting methods (with a
+    // warn log) and register the rest. Callers expect non-conflicting
+    // methods to remain reachable instead of losing the entire route.
     auto& registered = proxy_route_methods_[dedup_prefix];
+    std::vector<std::string> accepted_methods;
+    accepted_methods.reserve(methods.size());
     for (const auto& m : methods) {
         if (registered.count(m)) {
-            logging::Get()->error("Proxy: method {} on path '{}' already "
-                                  "registered (upstream '{}')",
-                                  m, dedup_prefix, upstream_service_name);
-            return;
+            logging::Get()->warn("Proxy: method {} on path '{}' already "
+                                 "registered, skipping (upstream '{}')",
+                                 m, dedup_prefix, upstream_service_name);
+            continue;
         }
+        accepted_methods.push_back(m);
+    }
+    if (accepted_methods.empty()) {
+        logging::Get()->error("Proxy: no methods available for path '{}' "
+                              "(all conflicted, upstream '{}')",
+                              dedup_prefix, upstream_service_name);
+        return;
     }
 
-    // Conflict check passed — now store in stable ownership BEFORE
-    // registering routes. If RouteAsync throws, the handler survives so
-    // any partially-inserted route lambdas don't hold dangling pointers.
+    // Store in stable ownership BEFORE registering routes. If RouteAsync
+    // throws, the handler survives so any partially-inserted route lambdas
+    // don't hold dangling pointers.
     proxy_handlers_[handler_key] = std::move(handler);
-    for (const auto& m : methods) {
+    for (const auto& m : accepted_methods) {
         registered.insert(m);
     }
 
     auto register_route = [&](const std::string& pattern) {
-        for (const auto& method : methods) {
+        for (const auto& method : accepted_methods) {
             router_.RouteAsync(method, pattern,
                 [handler_ptr](const HttpRequest& request,
                               HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
@@ -870,28 +882,36 @@ void HttpServer::RegisterProxyRoutes() {
         const auto& methods = upstream.proxy.methods.empty()
             ? DEFAULT_PROXY_METHODS : upstream.proxy.methods;
 
-        // Method-level conflict check BEFORE storing (same as Proxy())
+        // Method-level conflict check BEFORE storing (same as Proxy()).
+        // Partial overlaps are tolerated: skip conflicting methods and
+        // register the rest.
         auto& registered = proxy_route_methods_[dedup_prefix];
-        bool conflict = false;
+        std::vector<std::string> accepted_methods;
+        accepted_methods.reserve(methods.size());
         for (const auto& m : methods) {
             if (registered.count(m)) {
                 logging::Get()->warn("RegisterProxyRoutes: method {} on '{}' "
-                                     "already registered, skipping upstream '{}'",
+                                     "already registered, skipping (upstream '{}')",
                                      m, dedup_prefix, upstream.name);
-                conflict = true;
-                break;
+                continue;
             }
+            accepted_methods.push_back(m);
         }
-        if (conflict) continue;
+        if (accepted_methods.empty()) {
+            logging::Get()->error("RegisterProxyRoutes: no methods available "
+                                  "for path '{}' (all conflicted, upstream '{}')",
+                                  dedup_prefix, upstream.name);
+            continue;
+        }
 
-        // Conflict check passed — store handler, then register routes
+        // Store handler, then register routes
         proxy_handlers_[handler_key] = std::move(handler);
-        for (const auto& m : methods) {
+        for (const auto& m : accepted_methods) {
             registered.insert(m);
         }
 
         auto register_route = [&](const std::string& pattern) {
-            for (const auto& method : methods) {
+            for (const auto& method : accepted_methods) {
                 router_.RouteAsync(method, pattern,
                     [handler_ptr](const HttpRequest& request,
                                   HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
