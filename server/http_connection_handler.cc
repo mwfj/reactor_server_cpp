@@ -631,8 +631,37 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         // applies.
         if (response.IsDeferred()) {
             request_in_progress_ = false;
-            conn_->ClearDeadline();
-            conn_->SetDeadlineTimeoutCb(nullptr);
+            // Keep the request deadline armed (don't clear it) so a
+            // long-running async handler — e.g., proxy waiting on a slow
+            // upstream — isn't dropped by the fallback idle timeout.
+            // Replace the 408 request-parsing callback with a 504 Gateway
+            // Timeout callback appropriate for deferred async processing.
+            if (request_timeout_sec_ > 0) {
+                std::weak_ptr<HttpConnectionHandler> weak_self =
+                    shared_from_this();
+                conn_->SetDeadlineTimeoutCb([weak_self]() -> bool {
+                    if (auto self = weak_self.lock()) {
+                        if (self->deferred_response_pending_) {
+                            // Clear deferred state before sending so a late
+                            // complete() call becomes a no-op (its enqueued
+                            // CompleteAsyncResponse bails on the warning
+                            // path when deferred_response_pending_ is false).
+                            self->CancelAsyncResponse();
+                            HttpResponse timeout_resp =
+                                HttpResponse::GatewayTimeout();
+                            timeout_resp.Header("Connection", "close");
+                            self->SendResponse(timeout_resp);
+                        }
+                    }
+                    return false;  // proceed with connection close
+                });
+            } else {
+                // No request_timeout configured: fall back to idle timeout.
+                // Pre-existing limitation — recommend setting
+                // request_timeout_sec_ if using async handlers.
+                conn_->ClearDeadline();
+                conn_->SetDeadlineTimeoutCb(nullptr);
+            }
             buf += consumed;
             remaining -= consumed;
             if (remaining > 0) {

@@ -302,15 +302,20 @@ void ProxyTransaction::OnUpstreamData(
 
     // Handle early response (upstream responds while we're still sending)
     if (state_ == State::SENDING_REQUEST) {
-        // Arm the response timeout only when a non-1xx response has begun.
-        // The codec discards standalone 1xx interim responses (e.g., 100
-        // Continue) and resets response_ to empty. If we armed the timeout
-        // unconditionally, large or back-pressured uploads that receive a
-        // 100 Continue would start the final-response deadline prematurely,
-        // causing false retries/504s before the request body is even sent.
-        if (response.status_code > 0 || response.headers_complete || response.complete) {
-            ArmResponseTimeout();
-        }
+        // Arm the response timeout as soon as ANY upstream bytes arrive —
+        // not only when the codec has committed to a non-1xx status line.
+        // A partial status line (e.g., "HTTP/1.1 500 Ser") consumed but not
+        // yet parseable would otherwise leave the transaction with no
+        // deadline if the upstream stalls: OnUpstreamWriteComplete may
+        // never fire while the request write is back-pressured by the
+        // stalled upstream, and the pool's far-future checkout deadline
+        // never trips. Subsequent events re-arm and reset the clock.
+        // NOTE: a misbehaving upstream that sends 100 Continue despite us
+        // stripping Expect would also start the clock here. The previous
+        // code guarded against this, but the partial-stall hang is the
+        // worse failure mode — operators can raise response_timeout_ms
+        // if a slow 1xx-sending upstream matters in practice.
+        ArmResponseTimeout();
 
         if (response.complete) {
             // Full response received before request write completed
@@ -335,10 +340,6 @@ void ProxyTransaction::OnUpstreamData(
                                   "status={}",
                                   client_fd_, service_name_, upstream_fd,
                                   response.status_code);
-            // Arm timeout: without this, a stalled body after early headers
-            // hangs forever (OnUpstreamWriteComplete is a no-op once state
-            // has advanced past SENDING_REQUEST).
-            ArmResponseTimeout();
             return;
         }
         // Partial data, not enough to determine -- stay in SENDING_REQUEST
