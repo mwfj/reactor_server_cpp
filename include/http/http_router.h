@@ -4,6 +4,7 @@
 #include "http/http_response.h"
 #include "http/http_callbacks.h"
 #include "http/route_trie.h"
+#include <unordered_set>
 // <string>, <vector>, <functional>, <memory>, <unordered_map> provided by
 // common.h (via http_request.h) and route_trie.h
 
@@ -84,6 +85,13 @@ public:
     // WebSocket route lookup with param extraction (populates request.params)
     WsUpgradeHandler GetWebSocketHandler(const HttpRequest& request) const;
 
+    // Disable the async HEAD→GET fallback for a specific registered
+    // pattern. Used by proxy routes that explicitly exclude HEAD from
+    // the accepted method list — without this, GetAsyncHandler would
+    // route HEAD requests through the matching async GET route, which
+    // bypasses the user's method filter.
+    void DisableHeadFallback(const std::string& pattern);
+
 private:
     // Per-method route tries (one trie per HTTP method)
     std::unordered_map<std::string, RouteTrie<Handler>> method_tries_;
@@ -96,4 +104,9 @@ private:
 
     // Middleware chain (unchanged)
     std::vector<Middleware> middlewares_;
+
+    // Async GET patterns that opt out of HEAD→GET fallback. Populated via
+    // DisableHeadFallback() — currently only by proxy routes whose
+    // proxy.methods explicitly exclude HEAD.
+    std::unordered_set<std::string> head_fallback_blocked_;
 };

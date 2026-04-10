@@ -61,12 +61,21 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
     //    path didn't match — this handles the case where an unrelated async
     //    HEAD route exists (e.g. /health) but the requested path (e.g.
     //    /items) is only registered via GetAsync.
+    //    Skip the fallback when the matched GET pattern opted out via
+    //    DisableHeadFallback() (currently used by proxy routes whose
+    //    proxy.methods explicitly exclude HEAD). Without this, the method
+    //    filter would be silently bypassed for HEAD requests.
     if (request.method == "HEAD") {
         auto get_it = async_method_tries_.find("GET");
         if (get_it != async_method_tries_.end()) {
             std::unordered_map<std::string, std::string> params;
             auto result = get_it->second.Search(request.path, params);
             if (result.handler) {
+                if (head_fallback_blocked_.count(result.matched_pattern)) {
+                    // Pattern opted out of HEAD fallback — let sync
+                    // Dispatch produce a 405 via its allowed-method scan.
+                    return nullptr;
+                }
                 request.params = std::move(params);
                 if (head_fallback_out) *head_fallback_out = true;
                 return *result.handler;
@@ -75,6 +84,10 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
     }
 
     return nullptr;
+}
+
+void HttpRouter::DisableHeadFallback(const std::string& pattern) {
+    head_fallback_blocked_.insert(pattern);
 }
 
 void HttpRouter::WebSocket(const std::string& path, WsUpgradeHandler handler) {

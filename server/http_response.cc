@@ -108,30 +108,40 @@ std::string HttpResponse::Serialize() const {
     // Headers
     auto hdrs = headers_;
 
-    // Determine if this status code must not have a body (RFC 7230/7231).
-    // For these statuses, any caller-set Content-Length is invalid and must
-    // be stripped/normalized to prevent keep-alive framing desync.
+    // Determine if this status code must not have a body (RFC 7230 §3.3.3).
+    // For all of these, the body is suppressed regardless of headers.
     bool bodyless_status = (status_code_ < 200 || status_code_ == 101 ||
                             status_code_ == 204 || status_code_ == 304);
+
+    // Statuses for which Content-Length must be stripped: 1xx/101/204
+    // per RFC 7230 §3.3.2. 304 is NOT in this set — RFC 7232 §4.1 allows
+    // a 304 to carry Content-Length as metadata for the selected
+    // representation, and RFC 7230 §3.3.3 says 304 is always terminated
+    // by the blank line (so CL doesn't affect framing). Stripping CL from
+    // 304 would lose information when proxying an upstream 304 reply.
+    bool strip_content_length_header =
+        (status_code_ < 200 || status_code_ == 101 || status_code_ == 204);
 
     // Strip Transfer-Encoding headers — this server does not implement chunked
     // encoding, so emitting Transfer-Encoding: chunked with an un-chunked body
     // produces malformed HTTP. Use Content-Length framing exclusively.
-    // Also strip Content-Length for bodyless statuses (1xx, 101, 204, 304)
-    // to prevent framing desync on keep-alive connections.
     hdrs.erase(std::remove_if(hdrs.begin(), hdrs.end(),
-        [bodyless_status](const std::pair<std::string, std::string>& kv) {
+        [strip_content_length_header](const std::pair<std::string, std::string>& kv) {
             std::string key = kv.first;
             std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c); });
             if (key == "transfer-encoding") return true;
-            if (key == "content-length" && bodyless_status) return true;
+            if (key == "content-length" && strip_content_length_header) return true;
             return false;
         }), hdrs.end());
 
     // Add Content-Length if not already set.
-    // Excluded: 1xx, 101, 204, 304 (bodyless — just stripped above).
-    // 205 Reset Content: force Content-Length: 0 for keep-alive framing
-    // regardless of what the caller set.
+    // - 1xx/101/204: stripped above, none added (CL prohibited).
+    // - 205 Reset Content: force CL: 0 regardless of caller (for framing).
+    // - 304 Not Modified: preserve caller's CL (representation metadata).
+    //   Canonicalize duplicates to a single value to avoid malformed
+    //   responses when proxying an upstream 304 that sent duplicate CLs.
+    //   No auto-compute from body_.size() — 304 never emits a body.
+    // - Other non-bodyless: preserve (proxy HEAD) or auto-compute.
     if (status_code_ == 205) {
         // Strip any caller-set Content-Length first, then force 0
         hdrs.erase(std::remove_if(hdrs.begin(), hdrs.end(),
@@ -141,6 +151,34 @@ std::string HttpResponse::Serialize() const {
                 return key == "content-length";
             }), hdrs.end());
         hdrs.emplace_back("Content-Length", "0");
+    } else if (status_code_ == 304) {
+        // 304: canonicalize duplicate Content-Length headers (keep the
+        // first value, drop the rest). If the caller didn't set any CL,
+        // don't inject one — the body is always suppressed, and injecting
+        // CL: 0 would lie about the representation size.
+        std::string first_cl;
+        bool found_cl = false;
+        for (const auto& kv : hdrs) {
+            std::string key = kv.first;
+            std::transform(key.begin(), key.end(), key.begin(),
+                [](unsigned char c){ return std::tolower(c); });
+            if (key == "content-length") {
+                if (!found_cl) {
+                    first_cl = kv.second;
+                    found_cl = true;
+                }
+            }
+        }
+        if (found_cl) {
+            hdrs.erase(std::remove_if(hdrs.begin(), hdrs.end(),
+                [](const std::pair<std::string, std::string>& kv) {
+                    std::string key = kv.first;
+                    std::transform(key.begin(), key.end(), key.begin(),
+                        [](unsigned char c){ return std::tolower(c); });
+                    return key == "content-length";
+                }), hdrs.end());
+            hdrs.emplace_back("Content-Length", first_cl);
+        }
     } else if (!bodyless_status) {
         if (preserve_content_length_) {
             // Proxy HEAD path: keep the upstream's Content-Length value.

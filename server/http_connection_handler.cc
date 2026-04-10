@@ -640,34 +640,37 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         // applies.
         if (response.IsDeferred()) {
             request_in_progress_ = false;
-            // Re-arm the deadline from NOW so the async handler gets a
-            // fresh request_timeout_sec budget. Reusing the original
-            // request_start_ deadline would penalize slow uploads: most
-            // of the budget may already be consumed by the time the body
-            // is fully received, leaving the proxy/async handler almost
-            // no time. CompleteAsyncResponse clears this deadline on
-            // successful delivery so the next keep-alive request gets a
-            // clean slate (idle_timeout governs between requests).
+            // Arm a ROLLING heartbeat deadline that re-arms itself on fire
+            // to suppress idle_timeout while the async handler runs,
+            // without capping the handler's lifetime at request_timeout_sec.
+            // The actual response-wait bound is enforced by the handler
+            // itself (e.g., proxy.response_timeout_ms), which may
+            // legitimately exceed request_timeout_sec. When this deadline
+            // fires and the response is still deferred, the callback
+            // re-arms and returns true (keep alive). CompleteAsyncResponse
+            // clears this deadline on successful delivery.
             if (request_timeout_sec_ > 0) {
                 conn_->SetDeadline(std::chrono::steady_clock::now() +
                                    std::chrono::seconds(request_timeout_sec_));
                 std::weak_ptr<HttpConnectionHandler> weak_self =
                     shared_from_this();
                 conn_->SetDeadlineTimeoutCb([weak_self]() -> bool {
-                    if (auto self = weak_self.lock()) {
-                        if (self->deferred_response_pending_) {
-                            // Clear deferred state before sending so a late
-                            // complete() call becomes a no-op (its enqueued
-                            // CompleteAsyncResponse bails on the warning
-                            // path when deferred_response_pending_ is false).
-                            self->CancelAsyncResponse();
-                            HttpResponse timeout_resp =
-                                HttpResponse::GatewayTimeout();
-                            timeout_resp.Header("Connection", "close");
-                            self->SendResponse(timeout_resp);
-                        }
+                    auto self = weak_self.lock();
+                    if (!self) return false;
+                    if (!self->deferred_response_pending_) {
+                        // Response already delivered; let the normal close
+                        // path run (callback shouldn't normally fire here
+                        // because CompleteAsyncResponse clears the deadline,
+                        // but handle defensively).
+                        return false;
                     }
-                    return false;  // proceed with connection close
+                    // Heartbeat: re-arm the deadline from now. The handler
+                    // (proxy, etc.) bounds its own work; this deadline just
+                    // keeps idle_timeout from closing the connection.
+                    self->conn_->SetDeadline(
+                        std::chrono::steady_clock::now() +
+                        std::chrono::seconds(self->request_timeout_sec_));
+                    return true;  // handled, keep connection alive
                 });
             } else {
                 // No request_timeout configured: fall back to idle timeout.

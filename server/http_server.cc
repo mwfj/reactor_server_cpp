@@ -735,6 +735,19 @@ void HttpServer::Proxy(const std::string& route_pattern,
         registered.insert(m);
     }
 
+    // If the user explicitly included GET but omitted HEAD, tell the
+    // router to opt this pattern out of HEAD→GET fallback. Otherwise
+    // HEAD requests would bypass the method filter by matching the GET
+    // route and invoking the proxy handler as GET (downloading the full
+    // upstream body just to discard it).
+    bool proxy_has_get = std::find(accepted_methods.begin(),
+                                    accepted_methods.end(), "GET")
+                         != accepted_methods.end();
+    bool proxy_has_head = std::find(accepted_methods.begin(),
+                                     accepted_methods.end(), "HEAD")
+                          != accepted_methods.end();
+    bool block_head_fallback = proxy_has_get && !proxy_has_head;
+
     auto register_route = [&](const std::string& pattern) {
         for (const auto& method : accepted_methods) {
             router_.RouteAsync(method, pattern,
@@ -742,6 +755,9 @@ void HttpServer::Proxy(const std::string& route_pattern,
                               HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                     handler_ptr->Handle(request, std::move(complete));
                 });
+        }
+        if (block_head_fallback) {
+            router_.DisableHeadFallback(pattern);
         }
         logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                              pattern, upstream_service_name,
@@ -910,6 +926,17 @@ void HttpServer::RegisterProxyRoutes() {
             registered.insert(m);
         }
 
+        // Same HEAD-fallback policy as Proxy(): opt out of HEAD→GET
+        // fallback when the explicit methods list includes GET but not
+        // HEAD, so HEAD requests don't silently bypass the method filter.
+        bool proxy_has_get = std::find(accepted_methods.begin(),
+                                        accepted_methods.end(), "GET")
+                             != accepted_methods.end();
+        bool proxy_has_head = std::find(accepted_methods.begin(),
+                                         accepted_methods.end(), "HEAD")
+                              != accepted_methods.end();
+        bool block_head_fallback = proxy_has_get && !proxy_has_head;
+
         auto register_route = [&](const std::string& pattern) {
             for (const auto& method : accepted_methods) {
                 router_.RouteAsync(method, pattern,
@@ -917,6 +944,9 @@ void HttpServer::RegisterProxyRoutes() {
                                   HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                         handler_ptr->Handle(request, std::move(complete));
                     });
+            }
+            if (block_head_fallback) {
+                router_.DisableHeadFallback(pattern);
             }
             logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                                  pattern, upstream.name,
