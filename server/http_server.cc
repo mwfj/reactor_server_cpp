@@ -29,6 +29,9 @@ struct RequestGuard {
 // and catch-all names. E.g., "/api/:id/users/*rest" → "/api/:/users/*".
 // This way, semantically identical routes with different param names
 // (like /api/:id/*rest vs /api/:user/*tail) produce the same dedup key.
+// Regex constraints like :id([0-9]+) are PRESERVED — the route trie treats
+// /users/:id([0-9]+) and /users/:name([a-z]+) as distinct routes, so the
+// dedup key must distinguish them too.
 static std::string NormalizeRouteForDedup(const std::string& pattern) {
     std::string result;
     result.reserve(pattern.size());
@@ -38,11 +41,33 @@ static std::string NormalizeRouteForDedup(const std::string& pattern) {
         if (at_seg_start && pattern[i] == ':') {
             result += ':';
             ++i;
-            // Skip param name (until '/' or end)
-            while (i < pattern.size() && pattern[i] != '/') ++i;
+            // Skip param name (until '/', '(' for regex constraint, or end)
+            while (i < pattern.size() && pattern[i] != '/' && pattern[i] != '(') {
+                ++i;
+            }
+            // Preserve regex constraint if present: "([0-9]+)".
+            // Balance nested parentheses, mirroring route_trie::ExtractConstraint.
+            if (i < pattern.size() && pattern[i] == '(') {
+                int depth = 0;
+                while (i < pattern.size()) {
+                    char c = pattern[i];
+                    // Handle backslash escapes like \( \) so they don't affect depth
+                    if (c == '\\' && i + 1 < pattern.size()) {
+                        result += c;
+                        result += pattern[i + 1];
+                        i += 2;
+                        continue;
+                    }
+                    if (c == '(') ++depth;
+                    else if (c == ')') --depth;
+                    result += c;
+                    ++i;
+                    if (depth == 0) break;
+                }
+            }
         } else if (at_seg_start && pattern[i] == '*') {
             result += '*';
-            // Skip catch-all name (rest of string)
+            // Skip catch-all name (rest of string — catch-all must be last)
             break;
         } else {
             result += pattern[i];
@@ -66,6 +91,75 @@ static std::string GenerateCatchAllName(const std::string& pattern) {
         if (!has_param(candidate)) return candidate;
     }
     return "_proxy_fallback";  // extremely unlikely
+}
+
+// Headers that can legitimately appear multiple times in a response. When
+// merging middleware + handler/upstream headers in the async completion
+// path, these names are preserved from BOTH sources (so middleware-added
+// caching/policy headers aren't silently dropped when the upstream also
+// emits the same name). All other headers are treated as single-value and
+// the handler/upstream wins (middleware copy is dropped to avoid invalid
+// duplicates like two Content-Type or two Location headers).
+//
+// Includes Set-Cookie / authenticate headers that literally cannot be
+// combined into one line (RFC 6265, RFC 7235) plus common list-based
+// response headers that often carry gateway/middleware-added values
+// alongside upstream values (Cache-Control, Link, Via, Vary, Warning,
+// Allow, Content-Language).
+static bool IsRepeatableResponseHeader(const std::string& name) {
+    std::string lower(name);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return lower == "set-cookie" ||
+           lower == "www-authenticate" ||
+           lower == "proxy-authenticate" ||
+           lower == "cache-control" ||
+           lower == "link" ||
+           lower == "via" ||
+           lower == "warning" ||
+           lower == "vary" ||
+           lower == "allow" ||
+           lower == "content-language";
+}
+
+// Ensure the pattern has a NAMED catch-all so ProxyHandler can extract the
+// strip_prefix tail from request.params. Handles three cases:
+//   1. No catch-all          → append "/*<generated>"
+//   2. Unnamed catch-all "*" → rewrite to "*<generated>" in place
+//   3. Already named "*name" → return unchanged
+// Without (2), patterns like /api/:version/* would leave catch_all_param_
+// empty in ProxyHandler, and strip_prefix would fall back to static_prefix_
+// stripping (only the leading static segment), misrouting every request.
+static std::string EnsureNamedCatchAll(const std::string& pattern) {
+    bool has_catch_all = false;
+    bool is_named = false;
+    size_t catch_all_pos = std::string::npos;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        if (pattern[i] == '*' && (i == 0 || pattern[i - 1] == '/')) {
+            has_catch_all = true;
+            catch_all_pos = i;
+            // Named if there's a character after '*' (catch-all must be last,
+            // so anything after '*' is the name).
+            is_named = (i + 1 < pattern.size());
+            break;
+        }
+    }
+
+    if (has_catch_all && is_named) {
+        return pattern;
+    }
+
+    std::string generated = GenerateCatchAllName(pattern);
+
+    if (!has_catch_all) {
+        std::string result = pattern;
+        if (result.empty() || result.back() != '/') result += '/';
+        result += "*" + generated;
+        return result;
+    }
+
+    // Unnamed catch-all: insert the generated name right after '*'.
+    return pattern.substr(0, catch_all_pos + 1) + generated;
 }
 
 int HttpServer::ComputeTimerInterval(int idle_timeout_sec, int request_timeout_sec) {
@@ -573,18 +667,12 @@ void HttpServer::Proxy(const std::string& route_pattern,
         }
     }
 
-    // If no catch-all, build the full route_prefix that includes the
-    // auto-generated catch-all so ProxyHandler knows the param name.
-    std::string config_prefix = route_pattern;
-    if (!has_catch_all) {
-        std::string catch_all_name = GenerateCatchAllName(route_pattern);
-        std::string catch_all_pattern = route_pattern;
-        if (catch_all_pattern.back() != '/') {
-            catch_all_pattern += '/';
-        }
-        catch_all_pattern += "*" + catch_all_name;
-        config_prefix = catch_all_pattern;
-    }
+    // Build the effective config_prefix with a NAMED catch-all. Handles:
+    //  - no catch-all            → appends "/*<generated>"
+    //  - unnamed catch-all "/*"  → rewrites to "/*<generated>" so
+    //                              ProxyHandler's strip_prefix can find it
+    //  - already-named "*name"   → unchanged
+    std::string config_prefix = EnsureNamedCatchAll(route_pattern);
 
     // Normalize the route for dedup: strip all param and catch-all names
     // so semantically identical routes with different names produce the
@@ -651,16 +739,19 @@ void HttpServer::Proxy(const std::string& route_pattern,
     // Register exact prefix + catch-all variant (same as RegisterProxyRoutes).
     // Both auto-generated and explicit catch-all routes need a companion
     // exact-prefix registration so bare paths (e.g., /api/v1 without
-    // trailing slash) don't 404.
+    // trailing slash) don't 404. The catch-all variant is always
+    // config_prefix (the NAMED form) so ProxyHandler's catch_all_param_
+    // matches the name registered with the trie.
     if (!has_catch_all) {
         register_route(route_pattern);       // exact prefix
         register_route(config_prefix);       // auto-generated catch-all
     } else {
-        // Explicit catch-all: extract the prefix before the catch-all
-        // segment and register it as the exact-match companion.
-        auto star_pos = route_pattern.rfind('*');
+        // Explicit catch-all (possibly rewritten from unnamed to named).
+        // Extract the prefix before the catch-all segment from config_prefix
+        // and register it as the exact-match companion.
+        auto star_pos = config_prefix.rfind('*');
         if (star_pos != std::string::npos) {
-            std::string exact_prefix = route_pattern.substr(0, star_pos);
+            std::string exact_prefix = config_prefix.substr(0, star_pos);
             // Remove trailing slash left by the catch-all separator
             while (exact_prefix.size() > 1 && exact_prefix.back() == '/') {
                 exact_prefix.pop_back();
@@ -669,7 +760,7 @@ void HttpServer::Proxy(const std::string& route_pattern,
                 register_route(exact_prefix);
             }
         }
-        register_route(route_pattern);       // user-provided catch-all
+        register_route(config_prefix);       // named catch-all variant
     }
 }
 
@@ -750,16 +841,11 @@ void HttpServer::RegisterProxyRoutes() {
             }
         }
 
-        // Build effective route_prefix that includes the catch-all segment
-        // so ProxyHandler can extract the catch-all param name.
-        std::string config_prefix = route_pattern;
-        if (!has_catch_all) {
-            std::string catch_all_name = GenerateCatchAllName(route_pattern);
-            if (config_prefix.back() != '/') {
-                config_prefix += '/';
-            }
-            config_prefix += "*" + catch_all_name;
-        }
+        // Build effective route_prefix with a NAMED catch-all. Handles
+        // no-catch-all, unnamed catch-all, and already-named cases.
+        // See EnsureNamedCatchAll for details on why unnamed catch-alls
+        // must be rewritten for strip_prefix to work correctly.
+        std::string config_prefix = EnsureNamedCatchAll(route_pattern);
 
         // Same normalized dedup as Proxy()
         std::string dedup_prefix = NormalizeRouteForDedup(config_prefix);
@@ -822,12 +908,14 @@ void HttpServer::RegisterProxyRoutes() {
             // without a trailing path (e.g., /api/users).
             register_route(upstream.proxy.route_prefix);
         } else {
-            // Explicit catch-all: register exact-prefix companion so bare
-            // paths (e.g., /api/v1) don't 404 (same as Proxy()).
-            auto sp = upstream.proxy.route_prefix.rfind('*');
+            // Explicit catch-all (possibly rewritten from unnamed to named):
+            // register exact-prefix companion so bare paths (e.g., /api/v1)
+            // don't 404 (same as Proxy()). Extract from config_prefix to
+            // account for the unnamed→named rewrite done by
+            // EnsureNamedCatchAll.
+            auto sp = config_prefix.rfind('*');
             if (sp != std::string::npos) {
-                std::string exact_prefix =
-                    upstream.proxy.route_prefix.substr(0, sp);
+                std::string exact_prefix = config_prefix.substr(0, sp);
                 while (exact_prefix.size() > 1 && exact_prefix.back() == '/') {
                     exact_prefix.pop_back();
                 }
@@ -836,7 +924,8 @@ void HttpServer::RegisterProxyRoutes() {
                 }
             }
         }
-        // Register the catch-all variant (auto-generated or user-provided)
+        // Register the catch-all variant (auto-generated or user-provided,
+        // always with named catch-all after EnsureNamedCatchAll).
         register_route(config_prefix);
     }
 }
@@ -1465,14 +1554,6 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, active_counter,
                      mw_headers, completed, cancelled](HttpResponse final_resp) {
-                        auto is_repeatable_header = [](const std::string& name) {
-                            std::string lower = name;
-                            std::transform(
-                                lower.begin(), lower.end(), lower.begin(),
-                                [](unsigned char c) { return std::tolower(c); });
-                            return lower == "set-cookie" ||
-                                   lower == "www-authenticate";
-                        };
                         if (completed->exchange(true)) return;
                         // Merge middleware + handler headers: middleware
                         // first (base), handler second (overrides for
@@ -1487,7 +1568,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         }
                         std::set<std::string> final_non_repeatable;
                         for (const auto& fh : final_resp.GetHeaders()) {
-                            if (!is_repeatable_header(fh.first)) {
+                            if (!IsRepeatableResponseHeader(fh.first)) {
                                 std::string lower = fh.first;
                                 std::transform(
                                     lower.begin(), lower.end(), lower.begin(),
@@ -1500,7 +1581,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                             std::transform(
                                 lower.begin(), lower.end(), lower.begin(),
                                 [](unsigned char c) { return std::tolower(c); });
-                            if (!is_repeatable_header(mh.first) &&
+                            if (!IsRepeatableResponseHeader(mh.first) &&
                                 final_non_repeatable.count(lower)) {
                                 continue;
                             }
@@ -2185,14 +2266,6 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, stream_id, active_counter,
                      mw_headers, completed, cancelled](HttpResponse final_resp) {
-                        auto is_repeatable_header = [](const std::string& name) {
-                            std::string lower = name;
-                            std::transform(
-                                lower.begin(), lower.end(), lower.begin(),
-                                [](unsigned char c) { return std::tolower(c); });
-                            return lower == "set-cookie" ||
-                                   lower == "www-authenticate";
-                        };
                         if (completed->exchange(true)) return;
                         // Same merge as H1: middleware first, handler second.
                         // Use AppendHeader to preserve repeated upstream
@@ -2206,7 +2279,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         }
                         std::set<std::string> final_non_repeatable;
                         for (const auto& fh : final_resp.GetHeaders()) {
-                            if (!is_repeatable_header(fh.first)) {
+                            if (!IsRepeatableResponseHeader(fh.first)) {
                                 std::string lower = fh.first;
                                 std::transform(
                                     lower.begin(), lower.end(), lower.begin(),
@@ -2219,7 +2292,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                             std::transform(
                                 lower.begin(), lower.end(), lower.begin(),
                                 [](unsigned char c) { return std::tolower(c); });
-                            if (!is_repeatable_header(mh.first) &&
+                            if (!IsRepeatableResponseHeader(mh.first) &&
                                 final_non_repeatable.count(lower)) {
                                 continue;
                             }
