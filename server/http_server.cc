@@ -682,7 +682,7 @@ void HttpServer::Proxy(const std::string& route_pattern,
 
     ProxyConfig handler_config = found->proxy;
     handler_config.route_prefix = config_prefix;
-    auto handler = std::make_unique<ProxyHandler>(
+    auto handler = std::make_shared<ProxyHandler>(
         upstream_service_name,
         handler_config,
         found->tls.enabled,
@@ -690,8 +690,6 @@ void HttpServer::Proxy(const std::string& route_pattern,
         found->port,
         found->tls.sni_hostname,
         upstream_manager_.get());
-
-    ProxyHandler* handler_ptr = handler.get();
 
     // Determine methods to register. HEAD is included so the proxy sends
     // HEAD upstream (not GET via fallback, which downloads the full body).
@@ -702,9 +700,7 @@ void HttpServer::Proxy(const std::string& route_pattern,
     const auto& methods = found->proxy.methods.empty()
         ? DEFAULT_PROXY_METHODS : found->proxy.methods;
 
-    // Method-level conflict check BEFORE storing the handler. Storing first
-    // would destroy any existing handler under the same key via operator=,
-    // leaving its routes' raw handler_ptr dangling.
+    // Method-level conflict check BEFORE storing the handler.
     // Partial overlaps are tolerated: skip conflicting methods (with a
     // warn log) and register the rest. Callers expect non-conflicting
     // methods to remain reachable instead of losing the entire route.
@@ -727,10 +723,13 @@ void HttpServer::Proxy(const std::string& route_pattern,
         return;
     }
 
-    // Store in stable ownership BEFORE registering routes. If RouteAsync
-    // throws, the handler survives so any partially-inserted route lambdas
-    // don't hold dangling pointers.
-    proxy_handlers_[handler_key] = std::move(handler);
+    // Store the handler. A subsequent Proxy()/RegisterProxyRoutes() call
+    // for the same handler_key (e.g., a partial-overlap registration that
+    // accepted only non-conflicting methods) will replace the entry, but
+    // existing route lambdas hold shared ownership of the old handler via
+    // shared_ptr capture below — it stays alive until the old routes are
+    // themselves replaced or the server is destroyed. No use-after-free.
+    proxy_handlers_[handler_key] = handler;
     for (const auto& m : accepted_methods) {
         registered.insert(m);
     }
@@ -750,10 +749,13 @@ void HttpServer::Proxy(const std::string& route_pattern,
 
     auto register_route = [&](const std::string& pattern) {
         for (const auto& method : accepted_methods) {
+            // Capture handler by shared_ptr so the lambda shares
+            // ownership — later overwrites of proxy_handlers_[handler_key]
+            // don't destroy this handler while this route is still live.
             router_.RouteAsync(method, pattern,
-                [handler_ptr](const HttpRequest& request,
-                              HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
-                    handler_ptr->Handle(request, std::move(complete));
+                [handler](const HttpRequest& request,
+                          HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
+                    handler->Handle(request, std::move(complete));
                 });
         }
         if (block_head_fallback) {
@@ -880,9 +882,11 @@ void HttpServer::RegisterProxyRoutes() {
         std::string handler_key = upstream.name + "\t" + dedup_prefix;
 
         // Create ProxyHandler with the full catch-all-aware route_prefix.
+        // shared_ptr so route lambdas can capture shared ownership and
+        // survive a later overwrite of proxy_handlers_[handler_key].
         ProxyConfig handler_config = upstream.proxy;
         handler_config.route_prefix = config_prefix;
-        auto handler = std::make_unique<ProxyHandler>(
+        auto handler = std::make_shared<ProxyHandler>(
             upstream.name,
             handler_config,
             upstream.tls.enabled,
@@ -890,7 +894,6 @@ void HttpServer::RegisterProxyRoutes() {
             upstream.port,
             upstream.tls.sni_hostname,
             upstream_manager_.get());
-        ProxyHandler* handler_ptr = handler.get();
 
         // Same HEAD policy as Proxy() — HEAD included for correct upstream semantics
         static const std::vector<std::string> DEFAULT_PROXY_METHODS =
@@ -920,8 +923,10 @@ void HttpServer::RegisterProxyRoutes() {
             continue;
         }
 
-        // Store handler, then register routes
-        proxy_handlers_[handler_key] = std::move(handler);
+        // Store handler, then register routes. shared_ptr so later
+        // overwrites (if any) don't destroy the handler while existing
+        // route lambdas still reference it.
+        proxy_handlers_[handler_key] = handler;
         for (const auto& m : accepted_methods) {
             registered.insert(m);
         }
@@ -939,10 +944,12 @@ void HttpServer::RegisterProxyRoutes() {
 
         auto register_route = [&](const std::string& pattern) {
             for (const auto& method : accepted_methods) {
+                // Capture handler by shared_ptr so the lambda shares
+                // ownership and survives any later overwrite.
                 router_.RouteAsync(method, pattern,
-                    [handler_ptr](const HttpRequest& request,
-                                  HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
-                        handler_ptr->Handle(request, std::move(complete));
+                    [handler](const HttpRequest& request,
+                              HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
+                        handler->Handle(request, std::move(complete));
                     });
             }
             if (block_head_fallback) {

@@ -134,8 +134,13 @@ private:
     // Build the final client-facing HttpResponse from the parsed upstream response
     HttpResponse BuildClientResponse();
 
-    // Arm response timeout on the upstream transport's deadline
-    void ArmResponseTimeout();
+    // Arm the upstream transport's deadline. When explicit_budget_ms > 0,
+    // use that value directly (bypassing config_.response_timeout_ms).
+    // Otherwise use config_.response_timeout_ms, which is a no-op when
+    // disabled (0). The explicit override is used by the send-phase stall
+    // timer to install a protective deadline even when response_timeout_ms
+    // is disabled — preventing an indefinite hang on a wedged upstream.
+    void ArmResponseTimeout(int explicit_budget_ms = 0);
     void ClearResponseTimeout();
 
     // Error response factory (maps result codes to HTTP responses)

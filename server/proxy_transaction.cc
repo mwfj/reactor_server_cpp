@@ -251,21 +251,29 @@ void ProxyTransaction::SendUpstreamRequest() {
     // that stops reading our request body would pin both the client and
     // the pooled connection indefinitely — OnUpstreamWriteComplete never
     // fires under back-pressure, and the pool's far-future checkout
-    // deadline never trips. The write-progress callback below refreshes
-    // this deadline on each partial write so large uploads making steady
-    // progress don't false-timeout; a true stall lets the deadline fire
-    // and the callback retries / returns 504. If response_timeout_ms is
-    // 0 (disabled), ArmResponseTimeout is a no-op and no protection is
-    // installed — that's the operator's explicit choice.
-    ArmResponseTimeout();
+    // deadline never trips.
+    //
+    // The stall budget uses response_timeout_ms when configured, else
+    // a hardcoded fallback. Unlike the response-wait phase, the stall
+    // phase is ALWAYS protected — the refresh-on-progress callback
+    // prevents false positives on large uploads making steady progress,
+    // so using a fallback here doesn't penalize any legitimate traffic.
+    // Config "disabled" (response_timeout_ms == 0) opts out of the
+    // response-wait timeout, NOT the hang protection.
+    static constexpr int SEND_STALL_FALLBACK_MS = 30000;  // 30s
+    const int stall_budget_ms = config_.response_timeout_ms > 0
+                              ? config_.response_timeout_ms
+                              : SEND_STALL_FALLBACK_MS;
+    ArmResponseTimeout(stall_budget_ms);
 
-    // Install write-progress callback to refresh the stall deadline.
-    // Cleared in OnUpstreamWriteComplete when the write finishes; the
-    // response-wait phase uses a hard (unrefreshed) deadline.
-    if (config_.response_timeout_ms > 0) {
+    // Install write-progress callback to refresh the stall deadline on
+    // each partial write. Cleared in OnUpstreamWriteComplete (and in
+    // Cleanup) when the write finishes; the response-wait phase uses a
+    // hard (unrefreshed) deadline with the normal budget.
+    {
         std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
         transport->SetWriteProgressCb(
-            [weak_self](std::shared_ptr<ConnectionHandler>, size_t) {
+            [weak_self, stall_budget_ms](std::shared_ptr<ConnectionHandler>, size_t) {
                 auto self = weak_self.lock();
                 if (!self) return;
                 // Refresh only while we're still writing the request.
@@ -273,7 +281,7 @@ void ProxyTransaction::SendUpstreamRequest() {
                 // AWAITING_RESPONSE/RECEIVING_BODY are ignored so the
                 // response-wait deadline stays a hard budget.
                 if (self->state_ == State::SENDING_REQUEST) {
-                    self->ArmResponseTimeout();
+                    self->ArmResponseTimeout(stall_budget_ms);
                 }
             });
     }
@@ -630,8 +638,14 @@ HttpResponse ProxyTransaction::BuildClientResponse() {
     return response;
 }
 
-void ProxyTransaction::ArmResponseTimeout() {
-    if (config_.response_timeout_ms <= 0) {
+void ProxyTransaction::ArmResponseTimeout(int explicit_budget_ms) {
+    // Determine the budget: explicit override wins, else use config.
+    // Both == 0 means "no timeout configured AND no explicit override" →
+    // silently skip.
+    int budget_ms = explicit_budget_ms > 0
+                  ? explicit_budget_ms
+                  : config_.response_timeout_ms;
+    if (budget_ms <= 0) {
         return;
     }
 
@@ -642,7 +656,7 @@ void ProxyTransaction::ArmResponseTimeout() {
     if (!transport) return;
 
     auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(config_.response_timeout_ms);
+                    std::chrono::milliseconds(budget_ms);
     transport->SetDeadline(deadline);
 
     // Use weak_ptr to avoid reference cycle: the deadline callback is stored
@@ -683,7 +697,7 @@ void ProxyTransaction::ArmResponseTimeout() {
 
     logging::Get()->debug("ProxyTransaction armed response timeout {}ms "
                           "client_fd={} service={} upstream_fd={}",
-                          config_.response_timeout_ms, client_fd_,
+                          budget_ms, client_fd_,
                           service_name_, transport->fd());
 }
 

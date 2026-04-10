@@ -291,8 +291,15 @@ private:
     std::vector<UpstreamConfig> upstream_configs_;
     std::unique_ptr<UpstreamManager> upstream_manager_;
 
-    // Proxy handlers (one per upstream with proxy config)
-    std::unordered_map<std::string, std::unique_ptr<ProxyHandler>> proxy_handlers_;
+    // Proxy handlers keyed by (upstream_service_name + normalized prefix).
+    // shared_ptr (not unique_ptr) so that route lambdas capture shared
+    // ownership — if a later Proxy()/RegisterProxyRoutes() call replaces
+    // the entry under the same key (e.g., partial method overlap adding
+    // new methods), existing route lambdas still hold the old handler
+    // alive until they are themselves replaced or destroyed, avoiding
+    // a use-after-free when the handler_ptr inside those lambdas would
+    // otherwise dangle.
+    std::unordered_map<std::string, std::shared_ptr<ProxyHandler>> proxy_handlers_;
 
     // Tracks which methods are registered per canonical proxy path.
     // Key: dedup_prefix (e.g., "/api/*"), Value: set of registered methods.
