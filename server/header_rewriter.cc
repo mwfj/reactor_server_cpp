@@ -79,10 +79,14 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
         connection_listed.insert(parsed.begin(), parsed.end());
     }
 
-    // Build output map: copy all headers except hop-by-hop and connection-listed
+    // Build output map: copy all headers except hop-by-hop and connection-listed.
+    // Also strip Expect — the proxy has already handled 100-continue locally
+    // and buffered the full body, so forwarding it would cause the upstream to
+    // reply 417 or emit a spurious 100 Continue alongside the body.
     std::map<std::string, std::string> output;
     for (const auto& [name, value] : client_headers) {
-        if (IsHopByHopHeader(name) || connection_listed.count(name)) {
+        if (IsHopByHopHeader(name) || connection_listed.count(name)
+            || name == "expect") {
             continue;
         }
         output[name] = value;

@@ -605,14 +605,15 @@ void HttpServer::Proxy(const std::string& route_pattern,
 
     ProxyHandler* handler_ptr = handler.get();
 
-    // Determine methods to register. When GET is present, always include
-    // Don't auto-register HEAD alongside GET. The router's existing
-    // GET→HEAD fallback handles HEAD correctly: it rewrites method to GET,
-    // the proxy sends GET upstream, and CompleteAsyncResponse strips the
-    // body. Auto-registering HEAD would shadow any explicit Head()/
-    // Route("HEAD") handler the app registered on the same path.
+    // Determine methods to register. HEAD is intentionally excluded —
+    // the router's async GET→HEAD fallback handles it correctly (rewrites
+    // method to GET, proxy sends GET upstream, CompleteAsyncResponse strips
+    // the body). Registering HEAD explicitly would shadow any explicit
+    // Head()/Route("HEAD") handler the app registered on the same path,
+    // because GetAsyncHandler() resolves exact async matches before
+    // checking sync HEAD routes.
     static const std::vector<std::string> DEFAULT_PROXY_METHODS =
-        {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
+        {"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE"};
     const auto& methods = found->proxy.methods.empty()
         ? DEFAULT_PROXY_METHODS : found->proxy.methods;
 
@@ -725,9 +726,9 @@ void HttpServer::RegisterProxyRoutes() {
             upstream_manager_.get());
         ProxyHandler* handler_ptr = handler.get();
 
-        // Same HEAD policy as Proxy() — don't auto-register HEAD
+        // Same HEAD policy as Proxy() — HEAD excluded from defaults
         static const std::vector<std::string> DEFAULT_PROXY_METHODS =
-            {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
+            {"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE"};
         const auto& methods = upstream.proxy.methods.empty()
             ? DEFAULT_PROXY_METHODS : upstream.proxy.methods;
 
