@@ -25,7 +25,18 @@ void HttpRouter::Route(const std::string& method, const std::string& path, Handl
 
 void HttpRouter::RouteAsync(const std::string& method, const std::string& path,
                             AsyncHandler handler) {
+    // Insert into the trie first so any duplicate-pattern exception
+    // surfaces before we mirror it into async_patterns_. If the trie
+    // throws, async_patterns_ stays consistent.
     async_method_tries_[method].Insert(path, std::move(handler));
+    async_patterns_[method].insert(path);
+}
+
+bool HttpRouter::HasAsyncRoute(const std::string& method,
+                                const std::string& pattern) const {
+    auto it = async_patterns_.find(method);
+    if (it == async_patterns_.end()) return false;
+    return it->second.count(pattern) > 0;
 }
 
 HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(

@@ -92,6 +92,15 @@ public:
     // bypasses the user's method filter.
     void DisableHeadFallback(const std::string& pattern);
 
+    // Check whether an async route for the given method+pattern is
+    // already registered. Used by proxy registration to pre-validate all
+    // (method, pattern) combinations in a batch so a multi-method insert
+    // can bail atomically before any RouteAsync call mutates the trie —
+    // avoiding partial-commit state where some methods are live in the
+    // router but bookkeeping is skipped.
+    bool HasAsyncRoute(const std::string& method,
+                       const std::string& pattern) const;
+
 private:
     // Per-method route tries (one trie per HTTP method)
     std::unordered_map<std::string, RouteTrie<Handler>> method_tries_;
@@ -109,4 +118,11 @@ private:
     // DisableHeadFallback() — currently only by proxy routes whose
     // proxy.methods explicitly exclude HEAD.
     std::unordered_set<std::string> head_fallback_blocked_;
+
+    // Literal async patterns registered per method. Mirrors
+    // async_method_tries_ at the "exact pattern" level so callers can
+    // pre-check whether RouteAsync would throw on a duplicate without
+    // actually attempting the insert. Populated in RouteAsync.
+    std::unordered_map<std::string, std::unordered_set<std::string>>
+        async_patterns_;
 };
