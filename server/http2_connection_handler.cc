@@ -493,19 +493,19 @@ void Http2ConnectionHandler::OnWriteProgress(size_t remaining_bytes) {
 
 
 void Http2ConnectionHandler::UpdateDeadline() {
-    if (request_timeout_sec_ <= 0 || !session_) return;
+    if (!session_) return;
 
     auto oldest = session_->OldestIncompleteStreamStart();
     if (oldest != std::chrono::steady_clock::time_point::max()) {
-        // Set deadline based on the oldest incomplete stream's start time.
-        // New streams cannot extend the deadline for older stalled streams.
-        auto deadline = oldest + std::chrono::seconds(request_timeout_sec_);
-        // Only call SetDeadline when the value actually changes to avoid
-        // unnecessary atomic operations on every frame batch.
-        if (!deadline_armed_ || deadline != last_deadline_) {
-            conn_->SetDeadline(deadline);
-            deadline_armed_ = true;
-            last_deadline_ = deadline;
+        // Per-stream request-parsing timeout — only if configured.
+        // request_timeout_sec == 0 means "no parse timeout."
+        if (request_timeout_sec_ > 0) {
+            auto deadline = oldest + std::chrono::seconds(request_timeout_sec_);
+            if (!deadline_armed_ || deadline != last_deadline_) {
+                conn_->SetDeadline(deadline);
+                deadline_armed_ = true;
+                last_deadline_ = deadline;
+            }
         }
     } else if (session_->ActiveStreamCount() > 0) {
         // No incomplete streams (request parsing is done for all open
@@ -517,8 +517,17 @@ void Http2ConnectionHandler::UpdateDeadline() {
         // itself (proxy.response_timeout_ms for proxies). When this
         // safety deadline fires and streams are still active, the
         // timeout callback re-arms it — effectively a heartbeat.
+        //
+        // When request_timeout_sec == 0, still install the heartbeat
+        // using a fallback interval — otherwise idle_timeout would
+        // close quiet async work mid-flight, which is a supported
+        // configuration per the validator.
+        static constexpr int ASYNC_HEARTBEAT_FALLBACK_SEC = 60;
+        int heartbeat_sec = request_timeout_sec_ > 0
+                          ? request_timeout_sec_
+                          : ASYNC_HEARTBEAT_FALLBACK_SEC;
         auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::seconds(request_timeout_sec_);
+                        std::chrono::seconds(heartbeat_sec);
         conn_->SetDeadline(deadline);
         deadline_armed_ = true;
         last_deadline_ = deadline;

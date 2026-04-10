@@ -247,10 +247,36 @@ void ProxyTransaction::SendUpstreamRequest() {
                           client_fd_, service_name_, transport->fd(),
                           serialized_request_.size());
 
-    // Response timeout is armed in OnUpstreamWriteComplete (after the
-    // request is fully written) — not here. Arming here would penalize
-    // large uploads: a slow upstream receiver that is still making read
-    // progress would be timed out before the write buffer drains.
+    // Arm a send-phase stall deadline. Without this, a wedged upstream
+    // that stops reading our request body would pin both the client and
+    // the pooled connection indefinitely — OnUpstreamWriteComplete never
+    // fires under back-pressure, and the pool's far-future checkout
+    // deadline never trips. The write-progress callback below refreshes
+    // this deadline on each partial write so large uploads making steady
+    // progress don't false-timeout; a true stall lets the deadline fire
+    // and the callback retries / returns 504. If response_timeout_ms is
+    // 0 (disabled), ArmResponseTimeout is a no-op and no protection is
+    // installed — that's the operator's explicit choice.
+    ArmResponseTimeout();
+
+    // Install write-progress callback to refresh the stall deadline.
+    // Cleared in OnUpstreamWriteComplete when the write finishes; the
+    // response-wait phase uses a hard (unrefreshed) deadline.
+    if (config_.response_timeout_ms > 0) {
+        std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
+        transport->SetWriteProgressCb(
+            [weak_self](std::shared_ptr<ConnectionHandler>, size_t) {
+                auto self = weak_self.lock();
+                if (!self) return;
+                // Refresh only while we're still writing the request.
+                // Progress events after the transition to
+                // AWAITING_RESPONSE/RECEIVING_BODY are ignored so the
+                // response-wait deadline stays a hard budget.
+                if (self->state_ == State::SENDING_REQUEST) {
+                    self->ArmResponseTimeout();
+                }
+            });
+    }
 
     transport->SendRaw(serialized_request_.data(),
                        serialized_request_.size());
@@ -302,20 +328,16 @@ void ProxyTransaction::OnUpstreamData(
 
     // Handle early response (upstream responds while we're still sending)
     if (state_ == State::SENDING_REQUEST) {
-        // Arm the response timeout as soon as ANY upstream bytes arrive —
-        // not only when the codec has committed to a non-1xx status line.
-        // A partial status line (e.g., "HTTP/1.1 500 Ser") consumed but not
-        // yet parseable would otherwise leave the transaction with no
-        // deadline if the upstream stalls: OnUpstreamWriteComplete may
-        // never fire while the request write is back-pressured by the
-        // stalled upstream, and the pool's far-future checkout deadline
-        // never trips. Subsequent events re-arm and reset the clock.
-        // NOTE: a misbehaving upstream that sends 100 Continue despite us
-        // stripping Expect would also start the clock here. The previous
-        // code guarded against this, but the partial-stall hang is the
-        // worse failure mode — operators can raise response_timeout_ms
-        // if a slow 1xx-sending upstream matters in practice.
-        ArmResponseTimeout();
+        // Arm the response timeout only when a non-1xx response has begun.
+        // The codec discards standalone 1xx interim responses (100/102/103)
+        // and resets response_ to empty — status_code stays 0 in that case.
+        // Arming unconditionally would consume the final-response budget
+        // during a valid 1xx + long upload, causing false retries/504s.
+        // The partial-stall hang is handled by the send-phase stall timer
+        // installed in SendUpstreamRequest (refreshed on write progress).
+        if (response.status_code > 0 || response.headers_complete || response.complete) {
+            ArmResponseTimeout();
+        }
 
         if (response.complete) {
             // Full response received before request write completed
@@ -375,8 +397,19 @@ void ProxyTransaction::OnUpstreamData(
 
 void ProxyTransaction::OnUpstreamWriteComplete(
     std::shared_ptr<ConnectionHandler> conn) {
+    // Clear the send-phase write-progress callback installed in
+    // SendUpstreamRequest. The response-wait phase uses a hard
+    // (unrefreshed) deadline. Done regardless of state so an early
+    // response path that already transitioned past SENDING_REQUEST
+    // also stops refreshing.
+    if (auto* upstream_conn = lease_.Get()) {
+        if (auto transport = upstream_conn->GetTransport()) {
+            transport->SetWriteProgressCb(nullptr);
+        }
+    }
+
     // If state already advanced past SENDING_REQUEST (due to early response),
-    // this is a no-op.
+    // the response deadline is already armed — nothing more to do.
     if (state_ != State::SENDING_REQUEST) {
         return;
     }
@@ -388,6 +421,7 @@ void ProxyTransaction::OnUpstreamWriteComplete(
                           "service={} upstream_fd={} attempt={}",
                           client_fd_, service_name_, upstream_fd, attempt_);
 
+    // Re-anchor the deadline from now for the response-wait phase.
     ArmResponseTimeout();
 }
 
@@ -541,6 +575,13 @@ void ProxyTransaction::Cleanup() {
             if (transport) {
                 transport->SetOnMessageCb(nullptr);
                 transport->SetCompletionCb(nullptr);
+                // Clear the send-phase write-progress callback in case
+                // Cleanup runs mid-write (retry / error before
+                // OnUpstreamWriteComplete). The pool's WirePoolCallbacks
+                // also clears it on return, but being explicit avoids
+                // any window where the callback can still fire on a
+                // transaction that's being torn down.
+                transport->SetWriteProgressCb(nullptr);
                 ClearResponseTimeout();
             }
             // Poison the connection if an early response was received while

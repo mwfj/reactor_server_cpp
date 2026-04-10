@@ -649,36 +649,38 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             // fires and the response is still deferred, the callback
             // re-arms and returns true (keep alive). CompleteAsyncResponse
             // clears this deadline on successful delivery.
-            if (request_timeout_sec_ > 0) {
-                conn_->SetDeadline(std::chrono::steady_clock::now() +
-                                   std::chrono::seconds(request_timeout_sec_));
-                std::weak_ptr<HttpConnectionHandler> weak_self =
-                    shared_from_this();
-                conn_->SetDeadlineTimeoutCb([weak_self]() -> bool {
-                    auto self = weak_self.lock();
-                    if (!self) return false;
-                    if (!self->deferred_response_pending_) {
-                        // Response already delivered; let the normal close
-                        // path run (callback shouldn't normally fire here
-                        // because CompleteAsyncResponse clears the deadline,
-                        // but handle defensively).
-                        return false;
-                    }
-                    // Heartbeat: re-arm the deadline from now. The handler
-                    // (proxy, etc.) bounds its own work; this deadline just
-                    // keeps idle_timeout from closing the connection.
-                    self->conn_->SetDeadline(
-                        std::chrono::steady_clock::now() +
-                        std::chrono::seconds(self->request_timeout_sec_));
-                    return true;  // handled, keep connection alive
-                });
-            } else {
-                // No request_timeout configured: fall back to idle timeout.
-                // Pre-existing limitation — recommend setting
-                // request_timeout_sec_ if using async handlers.
-                conn_->ClearDeadline();
-                conn_->SetDeadlineTimeoutCb(nullptr);
-            }
+            //
+            // When request_timeout_sec == 0 ("disabled" per config),
+            // still install the heartbeat using a fallback interval —
+            // otherwise idle_timeout would close quiet async work
+            // mid-flight, which is a supported configuration per the
+            // validator.
+            static constexpr int ASYNC_HEARTBEAT_FALLBACK_SEC = 60;
+            int heartbeat_sec = request_timeout_sec_ > 0
+                              ? request_timeout_sec_
+                              : ASYNC_HEARTBEAT_FALLBACK_SEC;
+            conn_->SetDeadline(std::chrono::steady_clock::now() +
+                               std::chrono::seconds(heartbeat_sec));
+            std::weak_ptr<HttpConnectionHandler> weak_self =
+                shared_from_this();
+            conn_->SetDeadlineTimeoutCb([weak_self, heartbeat_sec]() -> bool {
+                auto self = weak_self.lock();
+                if (!self) return false;
+                if (!self->deferred_response_pending_) {
+                    // Response already delivered; let the normal close
+                    // path run (callback shouldn't normally fire here
+                    // because CompleteAsyncResponse clears the deadline,
+                    // but handle defensively).
+                    return false;
+                }
+                // Heartbeat: re-arm the deadline from now. The handler
+                // (proxy, etc.) bounds its own work; this deadline just
+                // keeps idle_timeout from closing the connection.
+                self->conn_->SetDeadline(
+                    std::chrono::steady_clock::now() +
+                    std::chrono::seconds(heartbeat_sec));
+                return true;  // handled, keep connection alive
+            });
             buf += consumed;
             remaining -= consumed;
             if (remaining > 0) {
