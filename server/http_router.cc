@@ -32,6 +32,18 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
     const HttpRequest& request, bool* head_fallback_out) const {
     if (head_fallback_out) *head_fallback_out = false;
 
+    // For HEAD requests, an explicit sync HEAD handler takes priority over
+    // any async HEAD handler (including proxy catch-all routes). Check sync
+    // HEAD BEFORE async lookup so that user-registered Head() handlers are
+    // not shadowed by proxy's async HEAD registration.
+    if (request.method == "HEAD") {
+        auto sync_head = method_tries_.find("HEAD");
+        if (sync_head != method_tries_.end() &&
+            sync_head->second.HasMatch(request.path)) {
+            return nullptr;  // let sync Dispatch handle explicit HEAD
+        }
+    }
+
     // 1. Try exact method match in the async trie.
     auto it = async_method_tries_.find(request.method);
     if (it != async_method_tries_.end()) {
@@ -45,18 +57,11 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
     }
 
     // 2. HEAD fallback to async GET (mirrors sync Dispatch behavior).
-    //    Only attempt if the exact method search above failed OR the path
-    //    didn't match — this handles the case where an unrelated async HEAD
-    //    route exists (e.g. /health) but the requested path (e.g. /items)
-    //    is only registered via GetAsync.
-    //    Skip the fallback if a sync HEAD route explicitly matches this
-    //    path — Dispatch should handle that with the operator's HEAD handler.
+    //    Only attempt if the exact async HEAD search above failed OR the
+    //    path didn't match — this handles the case where an unrelated async
+    //    HEAD route exists (e.g. /health) but the requested path (e.g.
+    //    /items) is only registered via GetAsync.
     if (request.method == "HEAD") {
-        auto sync_head = method_tries_.find("HEAD");
-        if (sync_head != method_tries_.end() &&
-            sync_head->second.HasMatch(request.path)) {
-            return nullptr;  // let sync Dispatch handle explicit HEAD
-        }
         auto get_it = async_method_tries_.find("GET");
         if (get_it != async_method_tries_.end()) {
             std::unordered_map<std::string, std::string> params;

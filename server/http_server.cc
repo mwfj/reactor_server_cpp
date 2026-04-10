@@ -605,15 +605,12 @@ void HttpServer::Proxy(const std::string& route_pattern,
 
     ProxyHandler* handler_ptr = handler.get();
 
-    // Determine methods to register. HEAD is intentionally excluded —
-    // the router's async GET→HEAD fallback handles it correctly (rewrites
-    // method to GET, proxy sends GET upstream, CompleteAsyncResponse strips
-    // the body). Registering HEAD explicitly would shadow any explicit
-    // Head()/Route("HEAD") handler the app registered on the same path,
-    // because GetAsyncHandler() resolves exact async matches before
-    // checking sync HEAD routes.
+    // Determine methods to register. HEAD is included so the proxy sends
+    // HEAD upstream (not GET via fallback, which downloads the full body).
+    // Explicit sync Head() handlers are not shadowed because GetAsyncHandler
+    // checks sync HEAD routes before async HEAD matches.
     static const std::vector<std::string> DEFAULT_PROXY_METHODS =
-        {"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE"};
+        {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
     const auto& methods = found->proxy.methods.empty()
         ? DEFAULT_PROXY_METHODS : found->proxy.methods;
 
@@ -686,6 +683,61 @@ void HttpServer::RegisterProxyRoutes() {
             continue;  // No proxy config for this upstream
         }
 
+        // Validate proxy config — same checks as Proxy(). ServerConfig built
+        // programmatically bypasses config_loader validation, so invalid
+        // values here would cause RouteAsync to throw after dispatchers start.
+        try {
+            auto segments = ROUTE_TRIE::ParsePattern(upstream.proxy.route_prefix);
+            ROUTE_TRIE::ValidatePattern(upstream.proxy.route_prefix, segments);
+        } catch (const std::invalid_argument& e) {
+            logging::Get()->error("RegisterProxyRoutes: invalid route_prefix "
+                                  "'{}': {}", upstream.proxy.route_prefix,
+                                  e.what());
+            continue;
+        }
+        if (upstream.proxy.response_timeout_ms != 0 &&
+            upstream.proxy.response_timeout_ms < 1000) {
+            logging::Get()->error("RegisterProxyRoutes: upstream '{}' has "
+                                  "invalid response_timeout_ms={} (must be "
+                                  "0 or >= 1000)",
+                                  upstream.name,
+                                  upstream.proxy.response_timeout_ms);
+            continue;
+        }
+        if (upstream.proxy.retry.max_retries < 0 ||
+            upstream.proxy.retry.max_retries > 10) {
+            logging::Get()->error("RegisterProxyRoutes: upstream '{}' has "
+                                  "invalid max_retries={} (must be 0-10)",
+                                  upstream.name,
+                                  upstream.proxy.retry.max_retries);
+            continue;
+        }
+        {
+            static const std::unordered_set<std::string> valid_methods = {
+                "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD",
+                "OPTIONS", "TRACE"
+            };
+            std::unordered_set<std::string> seen;
+            bool invalid = false;
+            for (const auto& m : upstream.proxy.methods) {
+                if (valid_methods.find(m) == valid_methods.end()) {
+                    logging::Get()->error("RegisterProxyRoutes: upstream '{}' "
+                                          "has invalid method '{}'",
+                                          upstream.name, m);
+                    invalid = true;
+                    break;
+                }
+                if (!seen.insert(m).second) {
+                    logging::Get()->error("RegisterProxyRoutes: upstream '{}' "
+                                          "has duplicate method '{}'",
+                                          upstream.name, m);
+                    invalid = true;
+                    break;
+                }
+            }
+            if (invalid) continue;
+        }
+
         // Check if the route_prefix already has a catch-all segment.
         // Same segment-start rule as RouteTrie (only after '/').
         std::string route_pattern = upstream.proxy.route_prefix;
@@ -726,9 +778,9 @@ void HttpServer::RegisterProxyRoutes() {
             upstream_manager_.get());
         ProxyHandler* handler_ptr = handler.get();
 
-        // Same HEAD policy as Proxy() — HEAD excluded from defaults
+        // Same HEAD policy as Proxy() — HEAD included for correct upstream semantics
         static const std::vector<std::string> DEFAULT_PROXY_METHODS =
-            {"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE"};
+            {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
         const auto& methods = upstream.proxy.methods.empty()
             ? DEFAULT_PROXY_METHODS : upstream.proxy.methods;
 
