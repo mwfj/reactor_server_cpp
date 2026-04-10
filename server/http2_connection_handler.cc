@@ -496,33 +496,43 @@ void Http2ConnectionHandler::UpdateDeadline() {
     if (!session_) return;
 
     auto oldest = session_->OldestIncompleteStreamStart();
-    if (oldest != std::chrono::steady_clock::time_point::max()) {
-        // Per-stream request-parsing timeout — only if configured.
-        // request_timeout_sec == 0 means "no parse timeout."
-        if (request_timeout_sec_ > 0) {
-            auto deadline = oldest + std::chrono::seconds(request_timeout_sec_);
-            if (!deadline_armed_ || deadline != last_deadline_) {
-                conn_->SetDeadline(deadline);
-                deadline_armed_ = true;
-                last_deadline_ = deadline;
-            }
+    bool has_incomplete =
+        (oldest != std::chrono::steady_clock::time_point::max());
+    bool has_active = (session_->ActiveStreamCount() > 0);
+
+    // Fallback heartbeat interval used when request_timeout_sec is disabled
+    // (0) but active streams still need idle_timeout suppression.
+    static constexpr int ASYNC_HEARTBEAT_FALLBACK_SEC = 60;
+
+    if (has_incomplete && request_timeout_sec_ > 0) {
+        // Per-stream request-parsing timeout — anchor at the oldest
+        // incomplete stream's creation time. New streams cannot extend
+        // the deadline for older stalled streams.
+        auto deadline = oldest + std::chrono::seconds(request_timeout_sec_);
+        if (!deadline_armed_ || deadline != last_deadline_) {
+            conn_->SetDeadline(deadline);
+            deadline_armed_ = true;
+            last_deadline_ = deadline;
         }
-    } else if (session_->ActiveStreamCount() > 0) {
-        // No incomplete streams (request parsing is done for all open
-        // streams) but active streams still exist — they're waiting for
-        // async handler work (e.g., proxy upstream response). Arm a
-        // rolling safety deadline from NOW to suppress idle_timeout
-        // without tying the per-stream timeout to stream creation time.
-        // The actual response-wait bound is enforced by the handler
-        // itself (proxy.response_timeout_ms for proxies). When this
-        // safety deadline fires and streams are still active, the
-        // timeout callback re-arms it — effectively a heartbeat.
+    } else if (has_active) {
+        // Either:
+        //  (a) has_incomplete && request_timeout_sec_ == 0 — no hard parse
+        //      timeout, but we still need to suppress idle_timeout so
+        //      slow-but-legitimate parses aren't dropped.
+        //  (b) !has_incomplete — all streams are past parsing and waiting
+        //      on async handler work (e.g., proxy upstream response).
+        // In both cases, arm a rolling heartbeat deadline from NOW. The
+        // actual response-wait bound is enforced by the handler itself
+        // (proxy.response_timeout_ms for proxies). When this heartbeat
+        // fires and streams are still active, the timeout callback
+        // re-arms it — effectively a keep-alive.
         //
-        // When request_timeout_sec == 0, still install the heartbeat
-        // using a fallback interval — otherwise idle_timeout would
-        // close quiet async work mid-flight, which is a supported
-        // configuration per the validator.
-        static constexpr int ASYNC_HEARTBEAT_FALLBACK_SEC = 60;
+        // NOTE: This branch is ALSO reached when request_timeout_sec_ == 0
+        // and has_incomplete is true. Without this, a stale heartbeat
+        // from a prior "all-active" state could expire and keep firing
+        // the callback every scan tick, because the incomplete branch
+        // above wouldn't touch the deadline — creating a tight retry
+        // loop where the deadline stays in the past.
         int heartbeat_sec = request_timeout_sec_ > 0
                           ? request_timeout_sec_
                           : ASYNC_HEARTBEAT_FALLBACK_SEC;
@@ -532,8 +542,8 @@ void Http2ConnectionHandler::UpdateDeadline() {
         deadline_armed_ = true;
         last_deadline_ = deadline;
     } else if (deadline_armed_ && session_->LastStreamId() > 0) {
-        // No incomplete streams AND no active streams — idle keep-alive,
-        // let idle_timeout take over.
+        // No active streams at all — idle keep-alive, let idle_timeout
+        // take over.
         conn_->ClearDeadline();
         deadline_armed_ = false;
     }

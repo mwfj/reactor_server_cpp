@@ -121,14 +121,20 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
     // Host: rewrite to upstream address (or SNI hostname when configured).
     // When an HTTPS upstream is reached by IP with tls.sni_hostname set,
     // the backend expects Host to match the SNI name for virtual-host
-    // routing, not the raw IP address.
+    // routing, not the raw IP address. SNI is a TLS-layer concept and
+    // has no meaning for plain HTTP upstreams; config validation doesn't
+    // reject tls.sni_hostname on non-TLS upstreams, so guard here to
+    // avoid rewriting Host to an unintended name that would misroute
+    // the request on the backend.
     // Rewrite Host, or ensure it's present for HTTP/1.1 compliance.
     // When rewrite_host is false (passthrough), we still must add Host if
     // the client omitted it (HTTP/1.0) — an HTTP/1.1 request without Host
     // is invalid and many backends reject it with 400.
     if (config_.rewrite_host || output.find("host") == output.end()) {
         const std::string& host_value =
-            sni_hostname.empty() ? upstream_host : sni_hostname;
+            (upstream_tls && !sni_hostname.empty())
+                ? sni_hostname
+                : upstream_host;
         bool omit_port = (!upstream_tls && upstream_port == 80) ||
                          (upstream_tls && upstream_port == 443);
         if (omit_port) {

@@ -186,8 +186,36 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
         if (method == request.method) continue;
         if (trie.HasMatch(request.path)) record(method);
     }
+    // Infer HEAD from GET (RFC 7231 §4.3.2) only when HEAD→GET fallback
+    // would actually succeed for this path:
+    //   - Sync GET: HEAD fallback is unconditional (see line 125).
+    //   - Async GET: only when the matched pattern is NOT in
+    //     head_fallback_blocked_ (proxies with GET but no HEAD opt out
+    //     via DisableHeadFallback). Advertising HEAD when it's blocked
+    //     would tell clients a method is allowed that actually returns
+    //     405, creating inconsistent method discovery.
     if (has_get && !has_head) {
-        record("HEAD");
+        bool head_would_succeed = false;
+        auto sync_get_it = method_tries_.find("GET");
+        if (sync_get_it != method_tries_.end() &&
+            sync_get_it->second.HasMatch(request.path)) {
+            head_would_succeed = true;
+        }
+        if (!head_would_succeed) {
+            auto async_get_it = async_method_tries_.find("GET");
+            if (async_get_it != async_method_tries_.end()) {
+                std::unordered_map<std::string, std::string> dummy_params;
+                auto result = async_get_it->second.Search(
+                    request.path, dummy_params);
+                if (result.handler &&
+                    !head_fallback_blocked_.count(result.matched_pattern)) {
+                    head_would_succeed = true;
+                }
+            }
+        }
+        if (head_would_succeed) {
+            record("HEAD");
+        }
     }
     if (!allowed_methods.empty()) {
         std::sort(allowed_methods.begin(), allowed_methods.end());
