@@ -336,15 +336,27 @@ void ProxyTransaction::OnUpstreamData(
 
     // Handle early response (upstream responds while we're still sending)
     if (state_ == State::SENDING_REQUEST) {
-        // Arm the response timeout only when a non-1xx response has begun.
-        // The codec discards standalone 1xx interim responses (100/102/103)
-        // and resets response_ to empty — status_code stays 0 in that case.
-        // Arming unconditionally would consume the final-response budget
-        // during a valid 1xx + long upload, causing false retries/504s.
-        // The partial-stall hang is handled by the send-phase stall timer
-        // installed in SendUpstreamRequest (refreshed on write progress).
+        // Transition from send-phase (with the fallback stall deadline)
+        // to response-wait-phase, but only when a non-1xx response has
+        // begun. The codec discards standalone 1xx interim responses
+        // (100/102/103) and resets response_ to empty — status_code
+        // stays 0 in that case. The partial-stall hang is handled by
+        // the send-phase stall timer installed in SendUpstreamRequest
+        // (refreshed on write progress).
+        //
+        // When response_timeout_ms > 0: re-anchor the deadline at now
+        // with the configured response budget (overwrites the stall
+        // deadline via SetDeadline).
+        // When response_timeout_ms == 0 (explicitly disabled): clear
+        // the fallback stall deadline so legitimately slow responses
+        // aren't capped at the fallback — honoring the documented
+        // "disabled" semantic for the response-wait phase.
         if (response.status_code > 0 || response.headers_complete || response.complete) {
-            ArmResponseTimeout();
+            if (config_.response_timeout_ms > 0) {
+                ArmResponseTimeout();
+            } else {
+                ClearResponseTimeout();
+            }
         }
 
         if (response.complete) {
@@ -429,8 +441,18 @@ void ProxyTransaction::OnUpstreamWriteComplete(
                           "service={} upstream_fd={} attempt={}",
                           client_fd_, service_name_, upstream_fd, attempt_);
 
-    // Re-anchor the deadline from now for the response-wait phase.
-    ArmResponseTimeout();
+    // Transition from send-phase (with the fallback stall deadline)
+    // to response-wait-phase. When response_timeout_ms > 0, re-anchor
+    // the deadline at now with the configured budget (overwrites the
+    // stall deadline). When response_timeout_ms == 0 (disabled), clear
+    // the fallback stall deadline explicitly — otherwise a slow but
+    // legitimate response would be capped at SEND_STALL_FALLBACK_MS
+    // (30s), contradicting the documented "disabled" semantic.
+    if (config_.response_timeout_ms > 0) {
+        ArmResponseTimeout();
+    } else {
+        ClearResponseTimeout();
+    }
 }
 
 void ProxyTransaction::OnResponseComplete() {

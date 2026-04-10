@@ -723,17 +723,6 @@ void HttpServer::Proxy(const std::string& route_pattern,
         return;
     }
 
-    // Store the handler. A subsequent Proxy()/RegisterProxyRoutes() call
-    // for the same handler_key (e.g., a partial-overlap registration that
-    // accepted only non-conflicting methods) will replace the entry, but
-    // existing route lambdas hold shared ownership of the old handler via
-    // shared_ptr capture below — it stays alive until the old routes are
-    // themselves replaced or the server is destroyed. No use-after-free.
-    proxy_handlers_[handler_key] = handler;
-    for (const auto& m : accepted_methods) {
-        registered.insert(m);
-    }
-
     // If the user explicitly included GET but omitted HEAD, tell the
     // router to opt this pattern out of HEAD→GET fallback. Otherwise
     // HEAD requests would bypass the method filter by matching the GET
@@ -747,16 +736,26 @@ void HttpServer::Proxy(const std::string& route_pattern,
                           != accepted_methods.end();
     bool block_head_fallback = proxy_has_get && !proxy_has_head;
 
-    auto register_route = [&](const std::string& pattern) {
+    // register_route returns false on the first RouteAsync throw so the
+    // caller can bail without updating bookkeeping. The handler shared_ptr
+    // is captured into any successfully-registered lambdas, which keep it
+    // alive; failed attempts don't leak it because the local `handler`
+    // shared_ptr is destroyed on exit if no route took a reference.
+    auto register_route = [&](const std::string& pattern) -> bool {
         for (const auto& method : accepted_methods) {
-            // Capture handler by shared_ptr so the lambda shares
-            // ownership — later overwrites of proxy_handlers_[handler_key]
-            // don't destroy this handler while this route is still live.
-            router_.RouteAsync(method, pattern,
-                [handler](const HttpRequest& request,
-                          HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
-                    handler->Handle(request, std::move(complete));
-                });
+            try {
+                router_.RouteAsync(method, pattern,
+                    [handler](const HttpRequest& request,
+                              HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
+                        handler->Handle(request, std::move(complete));
+                    });
+            } catch (const std::exception& e) {
+                logging::Get()->error(
+                    "Proxy: RouteAsync failed for method={} pattern='{}' "
+                    "upstream='{}': {}",
+                    method, pattern, upstream_service_name, e.what());
+                return false;
+            }
         }
         if (block_head_fallback) {
             router_.DisableHeadFallback(pattern);
@@ -764,17 +763,26 @@ void HttpServer::Proxy(const std::string& route_pattern,
         logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                              pattern, upstream_service_name,
                              found->host, found->port);
+        return true;
     };
 
-    // Register exact prefix + catch-all variant (same as RegisterProxyRoutes).
-    // Both auto-generated and explicit catch-all routes need a companion
-    // exact-prefix registration so bare paths (e.g., /api/v1 without
-    // trailing slash) don't 404. The catch-all variant is always
-    // config_prefix (the NAMED form) so ProxyHandler's catch_all_param_
-    // matches the name registered with the trie.
+    // Register exact prefix + catch-all variant. Both auto-generated and
+    // explicit catch-all routes need a companion exact-prefix registration
+    // so bare paths (e.g., /api/v1 without trailing slash) don't 404. The
+    // catch-all variant is always config_prefix (the NAMED form) so
+    // ProxyHandler's catch_all_param_ matches the trie's registered name.
+    //
+    // If any RouteAsync throws (e.g., the app pre-registered an async
+    // route for the same method+pattern), bail WITHOUT updating
+    // proxy_handlers_ / proxy_route_methods_. Leaving bookkeeping
+    // unmodified means a later retry (or another upstream) can register
+    // on the same dedup_prefix without being falsely marked as conflicted.
+    bool registration_ok = true;
     if (!has_catch_all) {
-        register_route(route_pattern);       // exact prefix
-        register_route(config_prefix);       // auto-generated catch-all
+        registration_ok = register_route(route_pattern);       // exact prefix
+        if (registration_ok) {
+            registration_ok = register_route(config_prefix);   // auto catch-all
+        }
     } else {
         // Explicit catch-all (possibly rewritten from unnamed to named).
         // Extract the prefix before the catch-all segment from config_prefix
@@ -787,10 +795,28 @@ void HttpServer::Proxy(const std::string& route_pattern,
                 exact_prefix.pop_back();
             }
             if (!exact_prefix.empty()) {
-                register_route(exact_prefix);
+                registration_ok = register_route(exact_prefix);
             }
         }
-        register_route(config_prefix);       // named catch-all variant
+        if (registration_ok) {
+            registration_ok = register_route(config_prefix);   // named catch-all
+        }
+    }
+
+    if (!registration_ok) {
+        logging::Get()->error("Proxy: route registration aborted for "
+                              "upstream='{}' pattern='{}'",
+                              upstream_service_name, route_pattern);
+        return;
+    }
+
+    // All routes registered successfully — commit bookkeeping. The
+    // handler shared_ptr is captured by the lambdas above (keeping it
+    // alive even if proxy_handlers_ is later overwritten), so this is
+    // just for future Proxy() lookups and conflict detection.
+    proxy_handlers_[handler_key] = handler;
+    for (const auto& m : accepted_methods) {
+        registered.insert(m);
     }
 }
 
@@ -923,14 +949,6 @@ void HttpServer::RegisterProxyRoutes() {
             continue;
         }
 
-        // Store handler, then register routes. shared_ptr so later
-        // overwrites (if any) don't destroy the handler while existing
-        // route lambdas still reference it.
-        proxy_handlers_[handler_key] = handler;
-        for (const auto& m : accepted_methods) {
-            registered.insert(m);
-        }
-
         // Same HEAD-fallback policy as Proxy(): opt out of HEAD→GET
         // fallback when the explicit methods list includes GET but not
         // HEAD, so HEAD requests don't silently bypass the method filter.
@@ -942,15 +960,26 @@ void HttpServer::RegisterProxyRoutes() {
                               != accepted_methods.end();
         bool block_head_fallback = proxy_has_get && !proxy_has_head;
 
-        auto register_route = [&](const std::string& pattern) {
+        // register_route returns false on the first RouteAsync throw so
+        // the caller can bail without updating bookkeeping. Matches the
+        // exception-safety pattern in HttpServer::Proxy.
+        auto register_route = [&](const std::string& pattern) -> bool {
             for (const auto& method : accepted_methods) {
-                // Capture handler by shared_ptr so the lambda shares
-                // ownership and survives any later overwrite.
-                router_.RouteAsync(method, pattern,
-                    [handler](const HttpRequest& request,
-                              HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
-                        handler->Handle(request, std::move(complete));
-                    });
+                try {
+                    // Capture handler by shared_ptr so the lambda shares
+                    // ownership and survives any later overwrite.
+                    router_.RouteAsync(method, pattern,
+                        [handler](const HttpRequest& request,
+                                  HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
+                            handler->Handle(request, std::move(complete));
+                        });
+                } catch (const std::exception& e) {
+                    logging::Get()->error(
+                        "RegisterProxyRoutes: RouteAsync failed for "
+                        "method={} pattern='{}' upstream='{}': {}",
+                        method, pattern, upstream.name, e.what());
+                    return false;
+                }
             }
             if (block_head_fallback) {
                 router_.DisableHeadFallback(pattern);
@@ -958,12 +987,20 @@ void HttpServer::RegisterProxyRoutes() {
             logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                                  pattern, upstream.name,
                                  upstream.host, upstream.port);
+            return true;
         };
 
+        // Register exact prefix (if applicable) + catch-all variant.
+        // If any RouteAsync throws (e.g., the app already registered an
+        // async route for the same method+pattern before MarkServerReady
+        // dispatched the auto-registration), bail WITHOUT updating
+        // proxy_handlers_/proxy_route_methods_ — startup keeps going
+        // for other upstreams rather than aborting via uncaught exception.
+        bool registration_ok = true;
         if (!has_catch_all) {
             // Register the exact prefix to handle requests that match it
             // without a trailing path (e.g., /api/users).
-            register_route(upstream.proxy.route_prefix);
+            registration_ok = register_route(upstream.proxy.route_prefix);
         } else {
             // Explicit catch-all (possibly rewritten from unnamed to named):
             // register exact-prefix companion so bare paths (e.g., /api/v1)
@@ -977,13 +1014,30 @@ void HttpServer::RegisterProxyRoutes() {
                     exact_prefix.pop_back();
                 }
                 if (!exact_prefix.empty()) {
-                    register_route(exact_prefix);
+                    registration_ok = register_route(exact_prefix);
                 }
             }
         }
         // Register the catch-all variant (auto-generated or user-provided,
         // always with named catch-all after EnsureNamedCatchAll).
-        register_route(config_prefix);
+        if (registration_ok) {
+            registration_ok = register_route(config_prefix);
+        }
+
+        if (!registration_ok) {
+            logging::Get()->error("RegisterProxyRoutes: route registration "
+                                  "aborted for upstream='{}' "
+                                  "(pre-existing async route conflict?); "
+                                  "skipping bookkeeping",
+                                  upstream.name);
+            continue;
+        }
+
+        // All routes registered successfully — commit bookkeeping.
+        proxy_handlers_[handler_key] = handler;
+        for (const auto& m : accepted_methods) {
+            registered.insert(m);
+        }
     }
 }
 
