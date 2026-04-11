@@ -6,15 +6,31 @@
 // Reduce a route pattern to its semantic shape for conflict detection.
 // Two patterns that produce the same key will collide in the same trie
 // (matching RouteTrie's insert-time equivalence: param/catch-all names
-// don't matter, but segment STRUCTURE does). Regex constraints are
-// stripped too because any two different constraints at the same PARAM
-// position throw in RouteTrie::InsertSegments — so treating them all as
-// a single "has param here" marker is conservative and safe for
-// atomicity: an aggressive match prevents partial-commit, and false
-// positives only affect the rare case of two different-constraint
-// routes on the same prefix.
+// don't matter, but segment STRUCTURE does).
 //
-// Examples:
+// Two modes, selected by `preserve_constraints`:
+//
+//   preserve_constraints=false (async same-trie check, default):
+//     Regex constraints are stripped — any two different constraints
+//     at the same PARAM position throw in RouteTrie::InsertSegments,
+//     so collapsing all constraints to a single "has param here"
+//     marker is CONSERVATIVE (catches more as conflict) and keeps
+//     proxy multi-method registration atomic — the pre-check bails
+//     before RouteAsync would throw mid-loop, leaving a partial
+//     commit. Used by HasAsyncRouteConflict.
+//
+//   preserve_constraints=true (sync cross-trie check):
+//     Regex constraints are preserved in the key, so disjoint routes
+//     like /users/:id([0-9]+) and /users/:slug([a-z]+) get different
+//     keys. Used by HasSyncRouteConflict, which runs across tries
+//     (sync vs async), so the same-trie atomicity argument does not
+//     apply — and a false positive there would drop a valid proxy
+//     bare-prefix companion, leaving otherwise-reachable paths on
+//     404 (e.g. a proxy /users/:slug([a-z]+)/*path skipping its
+//     /users/:slug([a-z]+) companion because a sync
+//     /users/:id([0-9]+) route exists with a disjoint regex).
+//
+// Examples (preserve_constraints=false):
 //   "/users/:id"            -> "/users/:"
 //   "/users/:user"          -> "/users/:"        (same key -> conflict)
 //   "/users/:id([0-9]+)"    -> "/users/:"        (constraint stripped)
@@ -22,7 +38,14 @@
 //   "/users/:name/b"        -> "/users/:/b"      (different tail -> no conflict)
 //   "/api/*rest"            -> "/api/*"
 //   "/api/*tail"            -> "/api/*"          (same key -> conflict)
-static std::string NormalizePatternKey(const std::string& pattern) {
+//
+// Examples (preserve_constraints=true):
+//   "/users/:id([0-9]+)"    -> "/users/:([0-9]+)"
+//   "/users/:slug([a-z]+)"  -> "/users/:([a-z]+)" (distinct -> no conflict)
+//   "/users/:id"            -> "/users/:"
+//   "/users/:user"          -> "/users/:"        (same key -> conflict)
+static std::string NormalizePatternKey(const std::string& pattern,
+                                       bool preserve_constraints) {
     std::string result;
     result.reserve(pattern.size());
     size_t i = 0;
@@ -35,17 +58,22 @@ static std::string NormalizePatternKey(const std::string& pattern) {
             while (i < pattern.size() && pattern[i] != '/' && pattern[i] != '(') {
                 ++i;
             }
-            // Skip the entire balanced constraint block if present.
+            // Handle the balanced constraint block if present.
             if (i < pattern.size() && pattern[i] == '(') {
                 int depth = 0;
                 while (i < pattern.size()) {
                     char c = pattern[i];
                     if (c == '\\' && i + 1 < pattern.size()) {
+                        if (preserve_constraints) {
+                            result += c;
+                            result += pattern[i + 1];
+                        }
                         i += 2;
                         continue;
                     }
                     if (c == '(') ++depth;
                     else if (c == ')') --depth;
+                    if (preserve_constraints) result += c;
                     ++i;
                     if (depth == 0) break;
                 }
@@ -83,7 +111,12 @@ void HttpRouter::Route(const std::string& method, const std::string& path, Handl
     // surfaces before we mirror it into sync_pattern_keys_. If the trie
     // throws, the tracking set stays consistent.
     method_tries_[method].Insert(path, std::move(handler));
-    sync_pattern_keys_[method].insert(NormalizePatternKey(path));
+    // sync_pattern_keys_ is consulted by HasSyncRouteConflict, a
+    // cross-trie check used by proxy registration. Use a
+    // constraint-PRESERVING key so disjoint-regex routes like
+    // /users/:id([0-9]+) and /users/:slug([a-z]+) don't collide.
+    sync_pattern_keys_[method].insert(
+        NormalizePatternKey(path, /*preserve_constraints=*/true));
 }
 
 void HttpRouter::RouteAsync(const std::string& method, const std::string& path,
@@ -92,21 +125,31 @@ void HttpRouter::RouteAsync(const std::string& method, const std::string& path,
     // surfaces before we mirror it into async_pattern_keys_. If the trie
     // throws, async_pattern_keys_ stays consistent.
     async_method_tries_[method].Insert(path, std::move(handler));
-    async_pattern_keys_[method].insert(NormalizePatternKey(path));
+    // async_pattern_keys_ is consulted by HasAsyncRouteConflict, a
+    // same-trie pre-check used to make multi-method proxy
+    // registration atomic. Use a constraint-STRIPPING key here so
+    // different-constraint routes at the same param position are
+    // flagged conservatively — the trie throws on them, and we want
+    // the pre-check to bail before RouteAsync would throw mid-loop
+    // and leave a partial commit.
+    async_pattern_keys_[method].insert(
+        NormalizePatternKey(path, /*preserve_constraints=*/false));
 }
 
 bool HttpRouter::HasAsyncRouteConflict(const std::string& method,
                                         const std::string& pattern) const {
     auto it = async_pattern_keys_.find(method);
     if (it == async_pattern_keys_.end()) return false;
-    return it->second.count(NormalizePatternKey(pattern)) > 0;
+    return it->second.count(
+        NormalizePatternKey(pattern, /*preserve_constraints=*/false)) > 0;
 }
 
 bool HttpRouter::HasSyncRouteConflict(const std::string& method,
                                         const std::string& pattern) const {
     auto it = sync_pattern_keys_.find(method);
     if (it == sync_pattern_keys_.end()) return false;
-    return it->second.count(NormalizePatternKey(pattern)) > 0;
+    return it->second.count(
+        NormalizePatternKey(pattern, /*preserve_constraints=*/true)) > 0;
 }
 
 HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
@@ -142,20 +185,23 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
         //
         //  (a) Explicit sync Head() match → always yield.
         //
-        //  (b) Winning async GET is a DIFFERENT pattern → drop the
-        //      proxy-default HEAD and fall through to the async
-        //      HEAD→GET fallback below. That ensures HEAD is served
-        //      by the SAME async handler GET resolves to (e.g., a
-        //      broader async GET catch-all that otherwise overlaps
-        //      with the exact proxy HEAD companion).
+        //  (b) Proxy does NOT own GET for this pattern (either
+        //      because the proxy's GET was filtered out by the
+        //      async-conflict pre-check, or because another handler
+        //      on a different pattern matches first at request time)
+        //      → drop the proxy-default HEAD and fall through to the
+        //      async HEAD→GET fallback below. That ensures HEAD is
+        //      served by the SAME async handler GET resolves to,
+        //      instead of silently routing HEAD to the proxy while
+        //      GET goes to a different owner.
         //
-        //  (c) Winning async GET is the SAME pattern as the
-        //      proxy-default HEAD → keep the proxy HEAD (GET and
-        //      HEAD both go to the same route — the proxy).
+        //  (c) Proxy owns GET for this pattern AND the winning async
+        //      GET at request time IS that same pattern → keep the
+        //      proxy HEAD (GET and HEAD both go to the same route).
         //
-        //  (d) No async GET match: sync Head()/HEAD→GET fallback
-        //      takes priority if a sync handler matches; otherwise
-        //      keep the proxy-default HEAD.
+        //  (d) No async GET match at request time: sync Head()/
+        //      HEAD→GET fallback takes priority if a sync handler
+        //      matches; otherwise keep the proxy-default HEAD.
         auto sync_head = method_tries_.find("HEAD");
         if (sync_head != method_tries_.end() &&
             sync_head->second.HasMatch(request.path)) {
@@ -178,14 +224,25 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
         }
 
         if (async_get_matches) {
-            if (async_get_pattern != exact_match_pattern) {
-                // Different async route owns GET — drop the
-                // proxy-default HEAD and fall through so the async
-                // HEAD→GET fallback dispatches HEAD to the same
-                // route as GET.
+            // HEAD should follow GET's OWNER. Two conditions must hold
+            // to keep the proxy HEAD:
+            //   1. The proxy owns GET for this exact pattern (so GET
+            //      and HEAD are both implemented by the proxy).
+            //   2. The winning async GET at request time IS the same
+            //      pattern (so a broader async GET catch-all that
+            //      overlaps with this proxy's HEAD pattern doesn't
+            //      steal GET while HEAD stays on the proxy).
+            // If either condition fails, drop the proxy HEAD and let
+            // the async HEAD→GET fallback route HEAD through the same
+            // handler GET resolves to.
+            bool proxy_owns_get =
+                proxy_owned_get_patterns_.count(exact_match_pattern) > 0;
+            if (!proxy_owns_get ||
+                async_get_pattern != exact_match_pattern) {
                 exact_match_handler = nullptr;
             }
-            // else: same pattern — keep exact_match_handler.
+            // else: proxy owns BOTH on this pattern and it's also the
+            // runtime winner — keep exact_match_handler.
         } else {
             // No async GET match. Sync HEAD→GET fallback owns the
             // path if a sync GET matches; yield in that case.
@@ -256,6 +313,10 @@ void HttpRouter::DisableHeadFallback(const std::string& pattern) {
 
 void HttpRouter::MarkProxyDefaultHead(const std::string& pattern) {
     proxy_default_head_patterns_.insert(pattern);
+}
+
+void HttpRouter::MarkProxyOwnedGet(const std::string& pattern) {
+    proxy_owned_get_patterns_.insert(pattern);
 }
 
 void HttpRouter::WebSocket(const std::string& path, WsUpgradeHandler handler) {

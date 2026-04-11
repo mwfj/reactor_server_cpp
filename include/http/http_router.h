@@ -103,6 +103,18 @@ public:
     // GetAsyncHandler() — see the HEAD-handling branch.
     void MarkProxyDefaultHead(const std::string& pattern);
 
+    // Mark a pattern as having its async GET method owned by a proxy
+    // handler (i.e. the proxy successfully registered GET for this
+    // pattern during its registration pass). Used by GetAsyncHandler's
+    // HEAD precedence logic so HEAD follows the **owner** of GET, not
+    // just "some route with the same pattern string." When a proxy
+    // registers HEAD by default but its GET gets filtered out by the
+    // conflict check (because an earlier async GET for the same path
+    // already exists), the proxy's HEAD is kept in
+    // proxy_default_head_patterns_ but NOT in this set — so the HEAD
+    // lookup can detect that and yield to the async GET owner.
+    void MarkProxyOwnedGet(const std::string& pattern);
+
     // Check whether an async route for the given method+pattern would
     // conflict with an already-registered async route on the same trie.
     // This is a SEMANTIC conflict check, not a literal string match:
@@ -151,6 +163,15 @@ private:
     // precedence over the async default — elsewhere the normal
     // async-over-sync contract is preserved.
     std::unordered_set<std::string> proxy_default_head_patterns_;
+
+    // Async GET patterns that are actually owned by a proxy handler.
+    // Populated whenever a proxy's GET registration succeeds (i.e. the
+    // method-level conflict pre-check did not filter it out). Used by
+    // GetAsyncHandler's proxy-default HEAD precedence logic to decide
+    // whether the proxy also owns GET for a matched HEAD pattern: if
+    // not, the HEAD match is dropped so HEAD follows the async GET
+    // OWNER rather than just "whatever matches the same pattern string."
+    std::unordered_set<std::string> proxy_owned_get_patterns_;
 
     // Normalized-pattern keys for async routes, tracked per method.
     // Each registered pattern is reduced to a "semantic shape" key

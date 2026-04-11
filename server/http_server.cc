@@ -1031,6 +1031,14 @@ void HttpServer::Proxy(const std::string& route_pattern,
                           HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                     handler->Handle(request, std::move(complete));
                 });
+            // Track GET ownership per-pattern so GetAsyncHandler's
+            // HEAD precedence logic can decide whether HEAD should
+            // stay on this proxy or follow a different async GET
+            // owner. See HttpRouter::MarkProxyOwnedGet and the
+            // HEAD branch in GetAsyncHandler.
+            if (mr.method == "GET") {
+                router_.MarkProxyOwnedGet(pattern);
+            }
         }
     }
     for (const auto& pattern : registered_patterns) {
@@ -1402,6 +1410,13 @@ void HttpServer::RegisterProxyRoutes() {
                               HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                         handler->Handle(request, std::move(complete));
                     });
+                // Track GET ownership per-pattern so the HEAD
+                // precedence logic knows whether the proxy owns GET
+                // for this pattern. See HttpServer::Proxy for the
+                // rationale.
+                if (mr.method == "GET") {
+                    router_.MarkProxyOwnedGet(pattern);
+                }
             }
         }
         for (const auto& pattern : registered_patterns) {
