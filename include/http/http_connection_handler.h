@@ -56,6 +56,16 @@ public:
     // Deadline is armed on first OnRawData call (after TLS handshake completes for TLS connections).
     void SetRequestTimeout(int seconds);
 
+    // Set the absolute safety cap (in seconds) for a deferred async
+    // response window. When set > 0, the heartbeat callback aborts the
+    // deferred state after this elapsed time — releasing the connection
+    // even if an async handler forgets to call complete() or a proxy
+    // talking to a hung upstream never completes. 0 disables the cap
+    // entirely (no absolute bound; honors operator "disabled" configs).
+    // HttpServer computes this from upstream configs at MarkServerReady
+    // (see HttpServer::max_async_deferred_sec_).
+    void SetMaxAsyncDeferredSec(int sec);
+
     // Called when raw data arrives (set as NetServer's on_message callback)
     void OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data);
 
@@ -111,6 +121,7 @@ private:
     size_t max_header_size_ = 0;  // 0 = unlimited
     size_t max_ws_message_size_ = 0; // 0 = unlimited
     int request_timeout_sec_ = 0; // 0 = disabled
+    int max_async_deferred_sec_ = 0;  // 0 = disabled (no safety cap)
 
     // Slowloris protection: tracks when the current incomplete request started
     bool request_in_progress_ = false;

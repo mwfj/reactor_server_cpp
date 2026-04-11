@@ -26,6 +26,11 @@ public:
     void SetMaxBodySize(size_t max);
     void SetMaxHeaderSize(size_t max);
     void SetRequestTimeout(int seconds);
+    // Absolute safety cap for async (counter-decremented) streams that
+    // never submit a response. Computed by HttpServer from upstream
+    // configs so it honors the largest configured proxy.response_timeout_ms.
+    // 0 = disabled (no cap). See HttpServer::max_async_deferred_sec_.
+    void SetMaxAsyncDeferredSec(int sec);
 
     // Called when raw data arrives from the reactor (entry point)
     void OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data);
@@ -95,6 +100,7 @@ private:
     size_t max_body_size_ = 0;
     size_t max_header_size_ = 0;
     int request_timeout_sec_ = 0;
+    int max_async_deferred_sec_ = 0;  // 0 = disabled (no safety cap)
 
     bool initialized_ = false;
     bool initializing_ = false;  // true during Initialize(), suppresses premature drain

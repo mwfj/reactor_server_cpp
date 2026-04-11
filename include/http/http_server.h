@@ -226,6 +226,17 @@ private:
     std::atomic<size_t> max_ws_message_size_{16777216}; // 16 MB
     std::atomic<int> request_timeout_sec_{30};         // Slowloris protection
 
+    // Safety cap for deferred async requests that never call complete().
+    // Computed from config at MarkServerReady: max of (DEFAULT_MIN,
+    // max upstream.proxy.response_timeout_ms/1000 + buffer). Set to 0
+    // (disabled) when ANY upstream has response_timeout_ms == 0
+    // (explicitly disabled) — in that mode operators accept the hang
+    // risk for stuck handlers in exchange for unbounded async lifetime.
+    // Propagated to HttpConnectionHandler / Http2ConnectionHandler so
+    // the per-connection heartbeat / stream-reset paths can enforce it
+    // without overriding operator-configured timeouts.
+    std::atomic<int> max_async_deferred_sec_{3600};    // 1 hour default
+
     // HTTP/2 support
     bool http2_enabled_ = true;
     Http2Session::Settings h2_settings_;

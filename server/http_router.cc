@@ -123,63 +123,88 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
     //    per-pattern via proxy_default_head_patterns_ so user-registered
     //    async HEAD routes retain normal async-over-sync precedence.
     auto it = async_method_tries_.find(request.method);
+    const AsyncHandler* exact_match_handler = nullptr;
+    std::unordered_map<std::string, std::string> exact_match_params;
+    std::string exact_match_pattern;
     if (it != async_method_tries_.end()) {
-        std::unordered_map<std::string, std::string> params;
-        auto result = it->second.Search(request.path, params);
+        auto result = it->second.Search(request.path, exact_match_params);
         if (result.handler) {
-            if (request.method == "HEAD" &&
-                proxy_default_head_patterns_.count(result.matched_pattern)) {
-                // Proxy-default HEAD match. Yield to sync Dispatch when:
-                //
-                //  (a) An explicit sync Head() handler matches this path.
-                //      Always yields regardless of what else matches —
-                //      the user explicitly told us how to serve HEAD
-                //      for this path.
-                //
-                //  (b) A sync Get() handler matches AND no async GET
-                //      also matches. Sync Dispatch's HEAD→GET fallback
-                //      (RFC 7231 §4.3.2) would serve the request via
-                //      the sync GET handler.
-                //      The "no async GET match" guard is critical: if
-                //      the proxy also owns async GET for this path,
-                //      GET goes to the proxy and HEAD MUST follow for
-                //      routing consistency — yielding would make HEAD
-                //      /foo hit the sync handler while GET /foo still
-                //      hits the async proxy (inconsistent routing, and
-                //      a broad sync catch-all could hijack HEAD across
-                //      every proxied path).
-                auto sync_head = method_tries_.find("HEAD");
-                if (sync_head != method_tries_.end() &&
-                    sync_head->second.HasMatch(request.path)) {
-                    return nullptr;  // explicit sync HEAD always wins
-                }
-                auto sync_get = method_tries_.find("GET");
-                if (sync_get != method_tries_.end() &&
-                    sync_get->second.HasMatch(request.path)) {
-                    // Verify no async GET match exists for the same
-                    // path before yielding. If the proxy owns GET,
-                    // keep HEAD with the proxy for GET/HEAD routing
-                    // consistency.
-                    bool async_get_matches = false;
-                    auto async_get_it = async_method_tries_.find("GET");
-                    if (async_get_it != async_method_tries_.end()) {
-                        async_get_matches =
-                            async_get_it->second.HasMatch(request.path);
-                    }
-                    if (!async_get_matches) {
-                        return nullptr;  // sync HEAD→GET fallback owns this path
-                    }
-                    // else: proxy owns async GET — fall through and
-                    // return the proxy-default HEAD handler below.
-                }
-                // No sync handler would serve this path — fall through
-                // and return the proxy-default HEAD handler below.
-            }
-            request.params = std::move(params);
-            return *result.handler;
+            exact_match_handler = result.handler;
+            exact_match_pattern = result.matched_pattern;
         }
-        // Path miss — fall through to HEAD→GET fallback below.
     }
+
+    if (exact_match_handler && request.method == "HEAD" &&
+        proxy_default_head_patterns_.count(exact_match_pattern)) {
+        // Proxy-default HEAD match. Decide whether to keep this
+        // handler or yield so HEAD follows whichever route actually
+        // owns GET for this path.
+        //
+        //  (a) Explicit sync Head() match → always yield.
+        //
+        //  (b) Winning async GET is a DIFFERENT pattern → drop the
+        //      proxy-default HEAD and fall through to the async
+        //      HEAD→GET fallback below. That ensures HEAD is served
+        //      by the SAME async handler GET resolves to (e.g., a
+        //      broader async GET catch-all that otherwise overlaps
+        //      with the exact proxy HEAD companion).
+        //
+        //  (c) Winning async GET is the SAME pattern as the
+        //      proxy-default HEAD → keep the proxy HEAD (GET and
+        //      HEAD both go to the same route — the proxy).
+        //
+        //  (d) No async GET match: sync Head()/HEAD→GET fallback
+        //      takes priority if a sync handler matches; otherwise
+        //      keep the proxy-default HEAD.
+        auto sync_head = method_tries_.find("HEAD");
+        if (sync_head != method_tries_.end() &&
+            sync_head->second.HasMatch(request.path)) {
+            return nullptr;  // explicit sync HEAD always wins
+        }
+
+        // Probe the async GET trie to find the actual winning pattern
+        // for this path (not just "some pattern matches").
+        bool async_get_matches = false;
+        std::string async_get_pattern;
+        auto async_get_it = async_method_tries_.find("GET");
+        if (async_get_it != async_method_tries_.end()) {
+            std::unordered_map<std::string, std::string> tmp;
+            auto async_get_result =
+                async_get_it->second.Search(request.path, tmp);
+            if (async_get_result.handler) {
+                async_get_matches = true;
+                async_get_pattern = async_get_result.matched_pattern;
+            }
+        }
+
+        if (async_get_matches) {
+            if (async_get_pattern != exact_match_pattern) {
+                // Different async route owns GET — drop the
+                // proxy-default HEAD and fall through so the async
+                // HEAD→GET fallback dispatches HEAD to the same
+                // route as GET.
+                exact_match_handler = nullptr;
+            }
+            // else: same pattern — keep exact_match_handler.
+        } else {
+            // No async GET match. Sync HEAD→GET fallback owns the
+            // path if a sync GET matches; yield in that case.
+            auto sync_get = method_tries_.find("GET");
+            if (sync_get != method_tries_.end() &&
+                sync_get->second.HasMatch(request.path)) {
+                return nullptr;  // sync HEAD→GET fallback owns this path
+            }
+            // No sync GET either — keep exact_match_handler (proxy
+            // HEAD is the only thing that would serve this path).
+        }
+    }
+
+    if (exact_match_handler) {
+        request.params = std::move(exact_match_params);
+        return *exact_match_handler;
+    }
+    // Path miss (or proxy-default HEAD deliberately dropped above) —
+    // fall through to HEAD→GET fallback below.
 
     // 2. HEAD fallback to async GET (mirrors sync Dispatch behavior).
     //    Only attempt if the exact async HEAD search above failed OR the

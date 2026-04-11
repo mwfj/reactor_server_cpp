@@ -281,6 +281,44 @@ void HttpServer::MarkServerReady() {
     // Auto-register proxy routes from upstream configs
     RegisterProxyRoutes();
 
+    // Compute the async-deferred safety cap from upstream configs.
+    // The cap is a last-resort abort timer for deferred async
+    // responses that never call complete() (e.g., a proxy talking to
+    // a genuinely wedged upstream with response_timeout_ms configured,
+    // or a custom RouteAsync handler with a bug). To avoid overriding
+    // operator-configured timeouts, the cap is sized to be strictly
+    // larger than the longest configured proxy.response_timeout_ms.
+    //
+    // When ANY upstream has proxy.response_timeout_ms == 0 (operator
+    // explicitly disabled the response timeout), the cap is also
+    // disabled (0 sentinel): the operator has opted for unbounded
+    // async lifetime on those routes and we should not second-guess
+    // them.
+    //
+    // Default floor: 3600s (1 hour). Generous enough for most custom
+    // async handlers and most realistic proxy response timeouts; the
+    // computation below raises it when a proxy config demands more.
+    {
+        static constexpr int DEFAULT_MIN_CAP_SEC = 3600;
+        static constexpr int BUFFER_SEC = 60;
+        bool any_disabled = false;
+        int computed_sec = DEFAULT_MIN_CAP_SEC;
+        for (const auto& u : upstream_configs_) {
+            if (u.proxy.route_prefix.empty()) continue;
+            if (u.proxy.response_timeout_ms == 0) {
+                any_disabled = true;
+                break;
+            }
+            int sec = (u.proxy.response_timeout_ms + 999) / 1000
+                    + BUFFER_SEC;
+            computed_sec = std::max(computed_sec, sec);
+        }
+        int new_cap = any_disabled ? 0 : computed_sec;
+        max_async_deferred_sec_.store(new_cap, std::memory_order_relaxed);
+        logging::Get()->debug("HttpServer async deferred safety cap: {}s "
+                              "(0 = disabled)", new_cap);
+    }
+
     start_time_ = std::chrono::steady_clock::now();
     server_ready_.store(true, std::memory_order_release);
 }
@@ -1785,6 +1823,8 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetMaxHeaderSize(max_header_size_.load(std::memory_order_relaxed));
     http_conn->SetMaxWsMessageSize(max_ws_message_size_.load(std::memory_order_relaxed));
     http_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
+    http_conn->SetMaxAsyncDeferredSec(
+        max_async_deferred_sec_.load(std::memory_order_relaxed));
 
     // Count every completed HTTP parse — dispatched, rejected (400/413/etc), or
     // upgraded. Fires from HandleCompleteRequest before dispatch or rejection.
@@ -2538,6 +2578,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     // h2_settings_.max_header_list_size (Http2Config, default 64KB), which is
     // already baked into the session settings and advertised via SETTINGS frame.
     h2_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
+    h2_conn->SetMaxAsyncDeferredSec(
+        max_async_deferred_sec_.load(std::memory_order_relaxed));
 
     // Set request callback: dispatch through HttpRouter (same as HTTP/1.x).
     // total_requests_ is counted in stream_open_callback (below), which fires

@@ -950,25 +950,44 @@ std::chrono::steady_clock::time_point Http2Session::OldestIncompleteStreamStart(
     return std::chrono::steady_clock::time_point::max();
 }
 
-size_t Http2Session::ResetExpiredStreams(int timeout_sec) {
+size_t Http2Session::ResetExpiredStreams(int parse_timeout_sec,
+                                          int async_cap_sec) {
     auto now = std::chrono::steady_clock::now();
-    auto limit = std::chrono::seconds(timeout_sec);
+    auto parse_limit = std::chrono::seconds(parse_timeout_sec);
+    auto async_limit = std::chrono::seconds(async_cap_sec);
     size_t count = 0;
 
     for (auto& [id, stream] : streams_) {
-        // Async (counter-decremented) streams are NOT subject to this
-        // timeout — their lifetime is bounded by the handler's own
-        // mechanism (proxy.response_timeout_ms for proxies, custom
-        // deadlines for other async handlers). Capping them here would
-        // override configured operator timeouts; clients that forget
-        // to call complete() are a handler bug, not a concern for the
-        // request-parse timeout path.
-        if (stream->IsCounterDecremented()) continue;
+        if (stream->IsCounterDecremented()) {
+            // Async (counter-decremented) streams: normally bounded
+            // by the handler's own timeout (proxy.response_timeout_ms,
+            // custom deadlines). The async_cap_sec here is an
+            // absolute safety net for stuck handlers that never
+            // submit a response. Honor only when > 0 (0 = caller
+            // opted out, e.g. proxy.response_timeout_ms=0 present).
+            // The caller is expected to size async_cap_sec to respect
+            // the longest configured handler timeout — don't override
+            // operator config from inside the trie.
+            if (async_cap_sec > 0 &&
+                now - stream->CreatedAt() > async_limit) {
+                logging::Get()->warn(
+                    "HTTP/2 async stream {} exceeded async cap ({}s) "
+                    "without completion; RST'ing to release slot",
+                    id, async_cap_sec);
+                stream->MarkRejected();
+                nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
+                                          id, NGHTTP2_CANCEL);
+                ++count;
+            }
+            continue;
+        }
+        // Incomplete stream parse timeout — only when configured.
+        if (parse_timeout_sec <= 0) continue;
         // Check incomplete AND rejected-but-not-closed streams.
         // Rejected streams (e.g. 417 Expect) may be half-open on the client
         // side — RST them to free nghttp2 max_concurrent_streams slots.
-        if (now - stream->CreatedAt() > limit) {
-            logging::Get()->warn("HTTP/2 stream {} timed out ({}s)", id, timeout_sec);
+        if (now - stream->CreatedAt() > parse_limit) {
+            logging::Get()->warn("HTTP/2 stream {} timed out ({}s)", id, parse_timeout_sec);
             stream->MarkRejected();
             nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
                                       id, NGHTTP2_CANCEL);

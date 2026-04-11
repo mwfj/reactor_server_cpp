@@ -53,6 +53,10 @@ void Http2ConnectionHandler::SetMaxHeaderSize(size_t max) {
     }
 }
 
+void Http2ConnectionHandler::SetMaxAsyncDeferredSec(int sec) {
+    max_async_deferred_sec_ = sec;
+}
+
 void Http2ConnectionHandler::SetRequestTimeout(int seconds) {
     request_timeout_sec_ = seconds;
     // Reconcile deadline state with the new timeout value. At
@@ -121,10 +125,19 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
             auto self = weak_self.lock();
             if (!self || !self->session_) return false;
 
+            // ResetExpiredStreams enforces two independent caps:
+            //   - parse_timeout: request_timeout_sec (0 = skip).
+            //   - async_cap: max_async_deferred_sec (0 = skip). This
+            //     is a last-resort safety net for async streams whose
+            //     handler never submits a response.
+            // Run whenever either is set so the async cap still applies
+            // when request_timeout_sec is disabled.
             size_t reset = 0;
-            if (self->request_timeout_sec_ > 0) {
+            if (self->request_timeout_sec_ > 0 ||
+                self->max_async_deferred_sec_ > 0) {
                 reset = self->session_->ResetExpiredStreams(
-                    self->request_timeout_sec_);
+                    self->request_timeout_sec_,
+                    self->max_async_deferred_sec_);
                 if (reset > 0) {
                     self->session_->SendPendingFrames();
                 }
