@@ -968,8 +968,18 @@ size_t Http2Session::ResetExpiredStreams(int parse_timeout_sec,
             // The caller is expected to size async_cap_sec to respect
             // the longest configured handler timeout — don't override
             // operator config from inside the trie.
+            //
+            // Anchor the check at DispatchedAt() (when the stream
+            // transitioned from "being parsed" to "awaiting async
+            // response"), NOT CreatedAt(). Uploads on slow links can
+            // consume minutes before DispatchStreamRequest fires; using
+            // CreatedAt() would cause the cap to trip immediately after
+            // dispatch even though the handler has barely started its
+            // work. DispatchedAt() == time_point::max() when the stream
+            // has not been dispatched — and in that case IsCounterDecremented
+            // is false, so we never hit this branch with the sentinel.
             if (async_cap_sec > 0 &&
-                now - stream->CreatedAt() > async_limit) {
+                now - stream->DispatchedAt() > async_limit) {
                 logging::Get()->warn(
                     "HTTP/2 async stream {} exceeded async cap ({}s) "
                     "without completion; RST'ing to release slot",

@@ -329,6 +329,20 @@ private:
     // is created. Each entry is {route_pattern, upstream_service_name}.
     std::vector<std::pair<std::string, std::string>> pending_proxy_routes_;
 
+    // Names of upstream services actually referenced by at least one
+    // successfully-registered proxy route (either from
+    // RegisterProxyRoutes' JSON auto-registration OR from programmatic
+    // HttpServer::Proxy() calls). Used by MarkServerReady to size the
+    // async-deferred safety cap: upstreams not referenced here cannot
+    // affect request lifetimes and must not be folded into the cap, and
+    // upstreams referenced here must be, regardless of whether their
+    // JSON config has proxy.route_prefix set.
+    std::unordered_set<std::string> proxy_referenced_upstreams_;
+
+    // Recomputes max_async_deferred_sec_ from proxy_referenced_upstreams_.
+    // Called from MarkServerReady after all proxy routes are registered.
+    void RecomputeAsyncDeferredCap();
+
     // Auto-register proxy routes from upstream configs at Start() time
     void RegisterProxyRoutes();
 };

@@ -281,43 +281,12 @@ void HttpServer::MarkServerReady() {
     // Auto-register proxy routes from upstream configs
     RegisterProxyRoutes();
 
-    // Compute the async-deferred safety cap from upstream configs.
-    // The cap is a last-resort abort timer for deferred async
-    // responses that never call complete() (e.g., a proxy talking to
-    // a genuinely wedged upstream with response_timeout_ms configured,
-    // or a custom RouteAsync handler with a bug). To avoid overriding
-    // operator-configured timeouts, the cap is sized to be strictly
-    // larger than the longest configured proxy.response_timeout_ms.
-    //
-    // When ANY upstream has proxy.response_timeout_ms == 0 (operator
-    // explicitly disabled the response timeout), the cap is also
-    // disabled (0 sentinel): the operator has opted for unbounded
-    // async lifetime on those routes and we should not second-guess
-    // them.
-    //
-    // Default floor: 3600s (1 hour). Generous enough for most custom
-    // async handlers and most realistic proxy response timeouts; the
-    // computation below raises it when a proxy config demands more.
-    {
-        static constexpr int DEFAULT_MIN_CAP_SEC = 3600;
-        static constexpr int BUFFER_SEC = 60;
-        bool any_disabled = false;
-        int computed_sec = DEFAULT_MIN_CAP_SEC;
-        for (const auto& u : upstream_configs_) {
-            if (u.proxy.route_prefix.empty()) continue;
-            if (u.proxy.response_timeout_ms == 0) {
-                any_disabled = true;
-                break;
-            }
-            int sec = (u.proxy.response_timeout_ms + 999) / 1000
-                    + BUFFER_SEC;
-            computed_sec = std::max(computed_sec, sec);
-        }
-        int new_cap = any_disabled ? 0 : computed_sec;
-        max_async_deferred_sec_.store(new_cap, std::memory_order_relaxed);
-        logging::Get()->debug("HttpServer async deferred safety cap: {}s "
-                              "(0 = disabled)", new_cap);
-    }
+    // Compute the async-deferred safety cap from all upstream configs
+    // referenced by successfully-registered proxy routes (both the
+    // auto-registration path via RegisterProxyRoutes and the
+    // programmatic HttpServer::Proxy() API). See RecomputeAsyncDeferredCap
+    // for the sizing logic and opt-out sentinel.
+    RecomputeAsyncDeferredCap();
 
     start_time_ = std::chrono::steady_clock::now();
     server_ready_.store(true, std::memory_order_release);
@@ -975,6 +944,66 @@ void HttpServer::Proxy(const std::string& route_pattern,
     for (const auto& m : accepted_methods) {
         registered.insert(m);
     }
+    // Track the upstream name so the async-deferred safety cap
+    // computed in MarkServerReady folds it in (otherwise manual
+    // proxies with response_timeout_ms=0 would still inherit the
+    // 3600s default — see RecomputeAsyncDeferredCap).
+    proxy_referenced_upstreams_.insert(upstream_service_name);
+}
+
+void HttpServer::RecomputeAsyncDeferredCap() {
+    // Compute the async-deferred safety cap from all upstream configs
+    // referenced by successfully-registered proxy routes.
+    //
+    // The cap is a last-resort abort timer for deferred async
+    // responses that never call complete() (e.g., a proxy talking to
+    // a genuinely wedged upstream with response_timeout_ms configured,
+    // or a custom RouteAsync handler with a bug). To avoid overriding
+    // operator-configured timeouts, the cap is sized to be strictly
+    // larger than the longest configured proxy.response_timeout_ms.
+    //
+    // When ANY referenced upstream has proxy.response_timeout_ms == 0
+    // (operator explicitly disabled the response timeout), the cap is
+    // also disabled (0 sentinel): the operator has opted for unbounded
+    // async lifetime on those routes and we should not second-guess
+    // them — enforcing a 3600s default would turn intentional long /
+    // unbounded waits into spurious 504s, while the downstream side
+    // closes even though the proxy transaction is still waiting on
+    // the upstream with its own timeout disabled.
+    //
+    // Default floor: 3600s (1 hour). Generous enough for most custom
+    // async handlers and most realistic proxy response timeouts; the
+    // computation below raises it when a proxy config demands more.
+    //
+    // Iterates proxy_referenced_upstreams_ rather than upstream_configs_
+    // directly, so programmatic HttpServer::Proxy() calls are included
+    // even when the upstream's JSON proxy.route_prefix is empty.
+    static constexpr int DEFAULT_MIN_CAP_SEC = 3600;
+    static constexpr int BUFFER_SEC = 60;
+    bool any_disabled = false;
+    int computed_sec = DEFAULT_MIN_CAP_SEC;
+    for (const auto& name : proxy_referenced_upstreams_) {
+        const UpstreamConfig* found = nullptr;
+        for (const auto& u : upstream_configs_) {
+            if (u.name == name) {
+                found = &u;
+                break;
+            }
+        }
+        if (!found) continue;  // Should not happen — defensive
+        if (found->proxy.response_timeout_ms == 0) {
+            any_disabled = true;
+            break;
+        }
+        int sec = (found->proxy.response_timeout_ms + 999) / 1000
+                + BUFFER_SEC;
+        computed_sec = std::max(computed_sec, sec);
+    }
+    int new_cap = any_disabled ? 0 : computed_sec;
+    max_async_deferred_sec_.store(new_cap, std::memory_order_relaxed);
+    logging::Get()->debug("HttpServer async deferred safety cap: {}s "
+                          "(0 = disabled, referenced upstreams={})",
+                          new_cap, proxy_referenced_upstreams_.size());
 }
 
 void HttpServer::RegisterProxyRoutes() {
@@ -1270,6 +1299,10 @@ void HttpServer::RegisterProxyRoutes() {
         for (const auto& m : accepted_methods) {
             registered.insert(m);
         }
+        // Track the upstream so the async-deferred safety cap
+        // considers its response_timeout_ms — same rationale as
+        // the programmatic Proxy() path.
+        proxy_referenced_upstreams_.insert(upstream.name);
     }
 }
 

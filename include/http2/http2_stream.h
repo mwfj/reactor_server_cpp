@@ -81,8 +81,14 @@ public:
 
     // Track whether the incomplete-stream counter was already decremented
     // for this stream (by DispatchStreamRequest). Prevents double-decrement
-    // in OnStreamCloseCallback.
-    void MarkCounterDecremented() { counter_decremented_ = true; }
+    // in OnStreamCloseCallback. Also anchors the async-deferred safety
+    // cap timer — the moment a stream transitions from "being parsed"
+    // to "awaiting async response", so that slow uploads do not eat
+    // into the handler's own response budget.
+    void MarkCounterDecremented() {
+        counter_decremented_ = true;
+        dispatched_at_ = std::chrono::steady_clock::now();
+    }
     bool IsCounterDecremented() const { return counter_decremented_; }
 
     // Pseudo-header presence tracking (required for validation)
@@ -99,6 +105,12 @@ public:
 
     // When this stream was created (for oldest-incomplete-stream timeout)
     std::chrono::steady_clock::time_point CreatedAt() const { return created_at_; }
+
+    // When this stream was dispatched (counter decremented) — used as the
+    // baseline for the async-deferred safety cap so that slow upload time
+    // does not count against the handler's response budget. Returns
+    // steady_clock::time_point::max() if the stream was never dispatched.
+    std::chrono::steady_clock::time_point DispatchedAt() const { return dispatched_at_; }
 
     // Owns the ResponseDataSource for this stream's response body.
     // nghttp2 holds a raw pointer to it via nghttp2_data_source.ptr;
@@ -129,4 +141,9 @@ private:
     std::string authority_;
     std::unique_ptr<ResponseDataSource> data_source_;
     std::chrono::steady_clock::time_point created_at_;
+    // Sentinel = max() when the stream has not been dispatched yet.
+    // Anchors the async-deferred safety cap so body-upload time is not
+    // counted against the handler's response budget.
+    std::chrono::steady_clock::time_point dispatched_at_ =
+        std::chrono::steady_clock::time_point::max();
 };
