@@ -170,10 +170,9 @@ private:
     bool deferred_keep_alive_ = true;
     std::string deferred_pending_buf_;
 
-    // Absolute start time of the current deferred-response window.
-    // Used by the heartbeat callback to cap total async deferred
-    // duration: a stuck or forgotten complete() callback must not pin
-    // the connection forever. Set when the deferred path arms the
-    // heartbeat and cleared on completion / cancellation.
+    // Start time of the current deferred-response window. Currently
+    // only used for diagnostic / logging purposes; the heartbeat
+    // deadline is unbounded so handlers' own timeouts govern the
+    // overall request lifetime.
     std::chrono::steady_clock::time_point deferred_start_{};
 };

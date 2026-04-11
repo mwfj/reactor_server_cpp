@@ -642,22 +642,19 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         // applies.
         if (response.IsDeferred()) {
             request_in_progress_ = false;
-            // Arm a ROLLING heartbeat deadline that re-arms itself on fire
-            // to suppress idle_timeout while the async handler runs,
-            // without capping the handler's lifetime at request_timeout_sec.
-            // The actual response-wait bound is enforced by the handler
-            // itself (e.g., proxy.response_timeout_ms), which may
-            // legitimately exceed request_timeout_sec.
-            //
-            // The heartbeat is NOT open-ended: it bails out after an
-            // absolute MAX_ASYNC_DEFERRED_SEC cap from the moment the
-            // response first became deferred, so a stalled or forgotten
-            // complete() doesn't pin the connection indefinitely. When
-            // the cap fires, the response is cancelled, a 504 is sent,
-            // and the connection is closed — clients that legitimately
-            // need longer should raise the cap (currently hardcoded to
-            // give proxies/custom handlers generous headroom while
-            // still bounding the blast radius of a bug).
+            // Arm a ROLLING heartbeat deadline that re-arms itself on
+            // fire to suppress idle_timeout while the async handler
+            // runs, without capping the handler's lifetime. The actual
+            // response-wait bound is enforced by the handler itself
+            // (e.g., proxy.response_timeout_ms), which may legitimately
+            // exceed request_timeout_sec — or be explicitly disabled.
+            // The heartbeat is intentionally unbounded so operator
+            // config (request_timeout_sec, proxy.response_timeout_ms,
+            // custom handler deadlines) is the sole authority on when
+            // the request times out. Stuck/forgotten complete() calls
+            // are a handler bug; the heartbeat will re-arm until the
+            // client disconnects or the connection is closed for
+            // another reason (shutdown, protocol error).
             //
             // When request_timeout_sec == 0 ("disabled" per config),
             // still install the heartbeat using a fallback interval —
@@ -665,7 +662,6 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             // mid-flight, which is a supported configuration per the
             // validator.
             static constexpr int ASYNC_HEARTBEAT_FALLBACK_SEC = 60;
-            static constexpr int MAX_ASYNC_DEFERRED_SEC = 300;  // 5 min absolute cap
             int heartbeat_sec = request_timeout_sec_ > 0
                               ? request_timeout_sec_
                               : ASYNC_HEARTBEAT_FALLBACK_SEC;
@@ -684,32 +680,12 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                     // but handle defensively).
                     return false;
                 }
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                    now - self->deferred_start_).count();
-                if (elapsed >= MAX_ASYNC_DEFERRED_SEC) {
-                    // Absolute cap reached — stalled or forgotten
-                    // complete(). Cancel the deferred state so any late
-                    // completion becomes a no-op, then send 504 and
-                    // close the connection. Return false so the
-                    // dispatcher proceeds with CloseAfterWrite.
-                    logging::Get()->warn(
-                        "HTTP/1 async deferred response exceeded "
-                        "MAX_ASYNC_DEFERRED_SEC ({}s) without "
-                        "completion fd={}; aborting and sending 504",
-                        MAX_ASYNC_DEFERRED_SEC,
-                        self->conn_ ? self->conn_->fd() : -1);
-                    self->CancelAsyncResponse();
-                    HttpResponse timeout_resp = HttpResponse::GatewayTimeout();
-                    timeout_resp.Header("Connection", "close");
-                    self->SendResponse(timeout_resp);
-                    return false;
-                }
                 // Heartbeat: re-arm the deadline from now. The handler
                 // (proxy, etc.) bounds its own work; this deadline just
                 // keeps idle_timeout from closing the connection.
                 self->conn_->SetDeadline(
-                    now + std::chrono::seconds(heartbeat_sec));
+                    std::chrono::steady_clock::now() +
+                    std::chrono::seconds(heartbeat_sec));
                 return true;  // handled, keep connection alive
             });
             buf += consumed;

@@ -769,7 +769,15 @@ void HttpServer::Proxy(const std::string& route_pattern,
     std::string derived_companion;  // non-empty only for has_catch_all with a derived companion
     if (!has_catch_all) {
         patterns_to_register.push_back(route_pattern);    // exact prefix (user-specified)
-        patterns_to_register.push_back(config_prefix);    // auto catch-all
+        // Skip the catch-all variant when EnsureNamedCatchAll produced
+        // the same string as route_pattern (e.g., non-origin-form "*"
+        // for OPTIONS *, which is an exact static route — not a
+        // rewritable catch-all). Pushing both would attempt a duplicate
+        // RouteAsync insert after partial mutation, since the pre-check
+        // only consults routes already in the router.
+        if (config_prefix != route_pattern) {
+            patterns_to_register.push_back(config_prefix);  // auto catch-all
+        }
     } else {
         // Explicit catch-all (possibly rewritten from unnamed to named).
         // Extract the prefix before the catch-all segment.
@@ -1097,7 +1105,14 @@ void HttpServer::RegisterProxyRoutes() {
         }
         // Register the catch-all variant (auto-generated or user-provided,
         // always with named catch-all after EnsureNamedCatchAll).
-        patterns_to_register.push_back(config_prefix);
+        // Skip when it duplicates the exact-prefix we already pushed
+        // (non-origin-form like "*" where EnsureNamedCatchAll returns
+        // the input unchanged) — otherwise RouteAsync would throw a
+        // duplicate-route exception on the second insert.
+        if (patterns_to_register.empty() ||
+            patterns_to_register.back() != config_prefix) {
+            patterns_to_register.push_back(config_prefix);
+        }
 
         // PRE-CHECK PER METHOD: build a per-method list of patterns
         // considering both async conflicts (drop the method entirely)

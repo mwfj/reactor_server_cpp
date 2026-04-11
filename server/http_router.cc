@@ -186,11 +186,25 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
     //    path didn't match — this handles the case where an unrelated async
     //    HEAD route exists (e.g. /health) but the requested path (e.g.
     //    /items) is only registered via GetAsync.
-    //    Skip the fallback when the matched GET pattern opted out via
-    //    DisableHeadFallback() (currently used by proxy routes whose
-    //    proxy.methods explicitly exclude HEAD). Without this, the method
-    //    filter would be silently bypassed for HEAD requests.
+    //
+    //    Before falling back to async GET, yield to an explicit sync
+    //    Head() handler on the same path. Otherwise, a path with
+    //    Head(path, sync) + GetAsync(path, async) would dispatch HEAD
+    //    through the async GET route (invisible to the sync HEAD
+    //    handler) — and for proxied async GETs it would turn a cheap
+    //    HEAD into a full forwarded GET.
+    //
+    //    Skip the async fallback when the matched GET pattern opted
+    //    out via DisableHeadFallback() (currently used by proxy routes
+    //    whose proxy.methods explicitly exclude HEAD). Without this,
+    //    the method filter would be silently bypassed for HEAD requests.
     if (request.method == "HEAD") {
+        // Explicit sync HEAD wins over async GET fallback.
+        auto sync_head_it = method_tries_.find("HEAD");
+        if (sync_head_it != method_tries_.end() &&
+            sync_head_it->second.HasMatch(request.path)) {
+            return nullptr;  // let sync Dispatch handle the explicit HEAD
+        }
         auto get_it = async_method_tries_.find("GET");
         if (get_it != async_method_tries_.end()) {
             std::unordered_map<std::string, std::string> params;
@@ -342,26 +356,45 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     //     would tell clients a method is allowed that actually returns
     //     405, creating inconsistent method discovery.
     if (has_get && !has_head) {
-        bool head_would_succeed = false;
-        auto sync_get_it = method_tries_.find("GET");
-        if (sync_get_it != method_tries_.end() &&
-            sync_get_it->second.HasMatch(request.path)) {
-            head_would_succeed = true;
-        }
-        if (!head_would_succeed) {
-            auto async_get_it = async_method_tries_.find("GET");
-            if (async_get_it != async_method_tries_.end()) {
-                std::unordered_map<std::string, std::string> dummy_params;
-                auto result = async_get_it->second.Search(
-                    request.path, dummy_params);
-                if (result.handler &&
-                    !head_fallback_blocked_.count(result.matched_pattern)) {
-                    head_would_succeed = true;
+        // First, check whether the async GET route for this path is
+        // in head_fallback_blocked_ (proxy with GET but no HEAD). If
+        // it is, BOTH the async HEAD→GET and sync HEAD→GET fallbacks
+        // are suppressed for this path — so an actual HEAD request
+        // will return 405. Don't advertise HEAD in the Allow header
+        // in that case, even if a sync GET otherwise matches. The
+        // goal is Allow-header/dispatch consistency: we only claim a
+        // method is allowed if the dispatch path will actually serve
+        // it.
+        bool async_get_blocks_head = false;
+        bool async_get_matches = false;
+        auto async_get_it = async_method_tries_.find("GET");
+        if (async_get_it != async_method_tries_.end()) {
+            std::unordered_map<std::string, std::string> dummy_params;
+            auto result = async_get_it->second.Search(
+                request.path, dummy_params);
+            if (result.handler) {
+                async_get_matches = true;
+                if (head_fallback_blocked_.count(result.matched_pattern)) {
+                    async_get_blocks_head = true;
                 }
             }
         }
-        if (head_would_succeed) {
-            record("HEAD");
+
+        if (!async_get_blocks_head) {
+            bool head_would_succeed = false;
+            auto sync_get_it = method_tries_.find("GET");
+            if (sync_get_it != method_tries_.end() &&
+                sync_get_it->second.HasMatch(request.path)) {
+                head_would_succeed = true;
+            }
+            if (!head_would_succeed && async_get_matches) {
+                // async GET matched above and is not blocked — the
+                // async HEAD→GET fallback would serve it.
+                head_would_succeed = true;
+            }
+            if (head_would_succeed) {
+                record("HEAD");
+            }
         }
     }
     if (!allowed_methods.empty()) {
