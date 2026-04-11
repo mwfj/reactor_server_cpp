@@ -115,6 +115,22 @@ public:
         stream_abort_hooks_.erase(it);
         if (hook) hook();
     }
+    // Fire ALL remaining stream-abort hooks. Called from
+    // HttpServer::RemoveConnection when a connection is being torn
+    // down abruptly: ~Http2Session's nghttp2_session_del will fire
+    // on_stream_close for each stream, but OnStreamCloseCallback
+    // locks weak Owner() — which is already null when the handler
+    // is destroying — so the stream-close callback is NOT invoked
+    // on the teardown path. Without this, a client-side disconnect
+    // while async routes are deferred would leak active_requests_
+    // permanently for any wedged handler.
+    void FireAllStreamAbortHooks() {
+        auto hooks = std::move(stream_abort_hooks_);
+        stream_abort_hooks_.clear();
+        for (auto& [id, hook] : hooks) {
+            if (hook) hook();
+        }
+    }
 
 private:
     std::shared_ptr<ConnectionHandler> conn_;

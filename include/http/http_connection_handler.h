@@ -102,6 +102,17 @@ public:
         async_abort_hook_ = std::move(hook);
     }
 
+    // Fire the async-abort hook if one is installed, then clear it.
+    // Idempotent via the hook's internal one-shot exchange. Called
+    // from HttpServer::RemoveConnection when the downstream client
+    // drops the socket while a request is still deferred — without
+    // this, the heartbeat timer dies with the connection and a stuck
+    // handler would leak active_requests_ permanently.
+    void TripAsyncAbortHook() {
+        auto hook = std::move(async_abort_hook_);
+        if (hook) hook();
+    }
+
     // Append bytes that arrived while an async response was pending.
     // Called by OnRawData. Separated from OnRawData so that the framework's
     // own "resume after deferred" path can feed buffered bytes back in

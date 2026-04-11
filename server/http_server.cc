@@ -358,6 +358,18 @@ void HttpServer::RemoveConnection(std::shared_ptr<ConnectionHandler> conn) {
     if (was_h2) {
         active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
         CompensateH2Streams(h2_handler);
+        // Fire any pending per-stream abort hooks before releasing the
+        // handler. When the h2 handler destructs, ~Http2Session calls
+        // nghttp2_session_del which dispatches on_stream_close for each
+        // stream — but OnStreamCloseCallback locks the weak Owner(),
+        // which is null during destruction, so the server-level
+        // SetStreamCloseCallback NEVER runs on the teardown path. Without
+        // this explicit fire, a client-side disconnect with deferred
+        // async streams would leak active_requests_ for any wedged
+        // handler (matches the HTTP/1 TripAsyncAbortHook fix below).
+        if (h2_handler) {
+            h2_handler->FireAllStreamAbortHooks();
+        }
         OnH2DrainComplete(conn.get());
         return;
     }
@@ -367,6 +379,16 @@ void HttpServer::RemoveConnection(std::shared_ptr<ConnectionHandler> conn) {
         if (!http_conn->IsUpgraded()) {
             active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
+        // If the downstream client dropped while an async request was
+        // still deferred, the heartbeat timer dies with the connection
+        // and the stored complete() closure is the only thing that
+        // would have decremented active_requests_. A wedged handler
+        // (stuck proxy upstream, bugged custom async route) would
+        // therefore leak the counter permanently. Fire the abort hook
+        // before releasing the handler — it is one-shot (internal
+        // exchange on `completed`) so firing when the handler is
+        // already racing complete() is safe.
+        http_conn->TripAsyncAbortHook();
     }
     SafeNotifyWsClose(http_conn);
     OnWsDrainComplete(conn.get());
@@ -2853,13 +2875,17 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                int32_t stream_id, uint32_t /*error_code*/) {
             active_h2_streams_.fetch_sub(1, std::memory_order_relaxed);
             self->DecrementLocalStreamCount();
-            // Release any abort hook left over for this stream. On the
-            // normal path the complete closure already ran and did the
-            // decrement; the hook is a no-op but its shared_ptr captures
-            // should be freed. On the async-cap path the hook was
-            // already fired+erased from the timer callback, so this is
-            // a no-op erase.
-            self->EraseStreamAbortHook(stream_id);
+            // FIRE the abort hook — do NOT merely erase it. A client-side
+            // RST_STREAM, peer disconnect, or connection-level GOAWAY
+            // can close a pending async stream BEFORE the handler ever
+            // calls complete(). If we only erased, a stuck handler
+            // would never decrement active_requests_ and /stats would
+            // stay permanently elevated. Firing is idempotent: the
+            // hook's one-shot `completed` exchange(true) returns true
+            // on the normal-complete path (closure already fired the
+            // decrement), so the hook is a no-op on clean close and
+            // releases bookkeeping on early close.
+            self->FireAndEraseStreamAbortHook(stream_id);
         }
     );
 }

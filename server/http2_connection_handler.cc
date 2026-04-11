@@ -151,11 +151,19 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
                     self->request_timeout_sec_,
                     self->max_async_deferred_sec_,
                     &async_cap_reset_ids);
-                if (reset > 0) {
-                    self->session_->SendPendingFrames();
-                }
+                // Fire abort hooks BEFORE flushing frames. SendPendingFrames
+                // can synchronously drive nghttp2's on_stream_close callback,
+                // which fires our stream-close callback, which also fires
+                // the abort hook. The hook is one-shot (internal exchange
+                // on `completed`), so double-firing is safe, but we must
+                // not MISS firing it — if SendPendingFrames erased the
+                // hook before we ran the loop, active_requests_ would be
+                // permanently leaked for the stuck handler.
                 for (int32_t id : async_cap_reset_ids) {
                     self->FireAndEraseStreamAbortHook(id);
+                }
+                if (reset > 0) {
+                    self->session_->SendPendingFrames();
                 }
             }
             // Handle graceful shutdown on dispatcher thread
