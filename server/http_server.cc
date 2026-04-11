@@ -539,20 +539,37 @@ HttpServer::~HttpServer() {
     Stop();
 }
 
-// Route registration delegates
-void HttpServer::Get(const std::string& path, HttpRouter::Handler handler)    { router_.Get(path, std::move(handler)); }
-void HttpServer::Post(const std::string& path, HttpRouter::Handler handler)   { router_.Post(path, std::move(handler)); }
-void HttpServer::Put(const std::string& path, HttpRouter::Handler handler)    { router_.Put(path, std::move(handler)); }
-void HttpServer::Delete(const std::string& path, HttpRouter::Handler handler) { router_.Delete(path, std::move(handler)); }
-void HttpServer::Route(const std::string& method, const std::string& path, HttpRouter::Handler handler) { router_.Route(method, path, std::move(handler)); }
-void HttpServer::WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler) { router_.WebSocket(path, std::move(handler)); }
-void HttpServer::Use(HttpRouter::Middleware middleware) { router_.Use(std::move(middleware)); }
+// Route / middleware mutation is gated by RejectIfServerLive() so a
+// call from SetReadyCallback or a worker thread after Start() can't
+// race the dispatch path on the non-thread-safe RouteTrie / middleware
+// chain. Proxy() has the same guard — see the block near its top.
+bool HttpServer::RejectIfServerLive(const char* op,
+                                     const std::string& path) const {
+    if (server_ready_.load(std::memory_order_acquire)) {
+        logging::Get()->error(
+            "{}: cannot register route/middleware after server is live "
+            "(path='{}'). RouteTrie is not safe for concurrent "
+            "insert+lookup — register before Start().",
+            op, path);
+        return true;
+    }
+    return false;
+}
 
-void HttpServer::GetAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { router_.RouteAsync("GET",    path, std::move(handler)); }
-void HttpServer::PostAsync(const std::string& path, HttpRouter::AsyncHandler handler)   { router_.RouteAsync("POST",   path, std::move(handler)); }
-void HttpServer::PutAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { router_.RouteAsync("PUT",    path, std::move(handler)); }
-void HttpServer::DeleteAsync(const std::string& path, HttpRouter::AsyncHandler handler) { router_.RouteAsync("DELETE", path, std::move(handler)); }
-void HttpServer::RouteAsync(const std::string& method, const std::string& path, HttpRouter::AsyncHandler handler) { router_.RouteAsync(method, path, std::move(handler)); }
+// Route registration delegates
+void HttpServer::Get(const std::string& path, HttpRouter::Handler handler)    { if (RejectIfServerLive("Get", path)) return; router_.Get(path, std::move(handler)); }
+void HttpServer::Post(const std::string& path, HttpRouter::Handler handler)   { if (RejectIfServerLive("Post", path)) return; router_.Post(path, std::move(handler)); }
+void HttpServer::Put(const std::string& path, HttpRouter::Handler handler)    { if (RejectIfServerLive("Put", path)) return; router_.Put(path, std::move(handler)); }
+void HttpServer::Delete(const std::string& path, HttpRouter::Handler handler) { if (RejectIfServerLive("Delete", path)) return; router_.Delete(path, std::move(handler)); }
+void HttpServer::Route(const std::string& method, const std::string& path, HttpRouter::Handler handler) { if (RejectIfServerLive("Route", path)) return; router_.Route(method, path, std::move(handler)); }
+void HttpServer::WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler) { if (RejectIfServerLive("WebSocket", path)) return; router_.WebSocket(path, std::move(handler)); }
+void HttpServer::Use(HttpRouter::Middleware middleware) { if (RejectIfServerLive("Use", "<middleware>")) return; router_.Use(std::move(middleware)); }
+
+void HttpServer::GetAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { if (RejectIfServerLive("GetAsync", path)) return; router_.RouteAsync("GET",    path, std::move(handler)); }
+void HttpServer::PostAsync(const std::string& path, HttpRouter::AsyncHandler handler)   { if (RejectIfServerLive("PostAsync", path)) return; router_.RouteAsync("POST",   path, std::move(handler)); }
+void HttpServer::PutAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { if (RejectIfServerLive("PutAsync", path)) return; router_.RouteAsync("PUT",    path, std::move(handler)); }
+void HttpServer::DeleteAsync(const std::string& path, HttpRouter::AsyncHandler handler) { if (RejectIfServerLive("DeleteAsync", path)) return; router_.RouteAsync("DELETE", path, std::move(handler)); }
+void HttpServer::RouteAsync(const std::string& method, const std::string& path, HttpRouter::AsyncHandler handler) { if (RejectIfServerLive("RouteAsync", path)) return; router_.RouteAsync(method, path, std::move(handler)); }
 
 void HttpServer::Proxy(const std::string& route_pattern,
                        const std::string& upstream_service_name) {
@@ -730,9 +747,17 @@ void HttpServer::Proxy(const std::string& route_pattern,
     // so bare paths (e.g., /api/v1 without trailing slash) don't 404. The
     // catch-all variant is always config_prefix (the NAMED form) so
     // ProxyHandler's catch_all_param_ matches the trie's registered name.
+    //
+    // Track the "derived companion" separately: only in the has_catch_all
+    // case, the exact-prefix companion is derived from the user's
+    // catch-all pattern (the user wrote /api/*rest and we implicitly
+    // also register /api). This pattern gets an extra sync-conflict
+    // check below, so a pre-existing sync handler on the bare prefix
+    // isn't silently hijacked by the async companion.
     std::vector<std::string> patterns_to_register;
+    std::string derived_companion;  // non-empty only for has_catch_all with a derived companion
     if (!has_catch_all) {
-        patterns_to_register.push_back(route_pattern);    // exact prefix
+        patterns_to_register.push_back(route_pattern);    // exact prefix (user-specified)
         patterns_to_register.push_back(config_prefix);    // auto catch-all
     } else {
         // Explicit catch-all (possibly rewritten from unnamed to named).
@@ -744,50 +769,92 @@ void HttpServer::Proxy(const std::string& route_pattern,
                 exact_prefix.pop_back();
             }
             if (!exact_prefix.empty()) {
+                derived_companion = exact_prefix;
                 patterns_to_register.push_back(exact_prefix);
             }
         }
         patterns_to_register.push_back(config_prefix);    // named catch-all
     }
 
-    // PRE-CHECK PER METHOD: filter out any method that conflicts with a
-    // live async route on ANY of the patterns we're about to register.
-    // Unlike the proxy_route_methods_ filter above (which only sees prior
-    // proxy registrations), this also catches direct RouteAsync calls
-    // (GetAsync/PostAsync/etc.) made outside the proxy path. We drop the
-    // whole method (not per-pattern) so each surviving method registers
-    // symmetrically on all patterns. Atomic in the sense that the set of
-    // methods actually registered is fully conflict-free BEFORE any
+    // PRE-CHECK PER METHOD: build a per-method list of patterns where
+    // registration is allowed, considering BOTH async and sync conflicts.
+    //
+    // Async conflict on any pattern → drop the method ENTIRELY (from all
+    // patterns). Two async routes on semantically equivalent patterns
+    // cannot coexist in the same trie.
+    //
+    // Sync conflict on the DERIVED companion pattern → drop just that
+    // (method, pattern) pair, not the whole method. The companion is
+    // implicit (user wrote /api/*rest; /api is derived). If the user
+    // already has a sync handler serving the bare prefix, the companion
+    // would silently hijack it via async-over-sync precedence — so we
+    // skip the companion registration for that method and let the sync
+    // handler keep serving bare-prefix requests. Non-companion patterns
+    // aren't touched by the sync check (they're the user's explicit
+    // Proxy target and they accepted the implications).
+    //
+    // Atomic in the sense that the set of (method, pattern) pairs that
+    // will actually register is fully conflict-free BEFORE any
     // RouteAsync call mutates the router.
-    std::vector<std::string> atomic_methods;
-    atomic_methods.reserve(accepted_methods.size());
+    struct MethodRegistration {
+        std::string method;
+        std::vector<std::string> patterns;
+    };
+    std::vector<MethodRegistration> to_register;
+    to_register.reserve(accepted_methods.size());
     for (const auto& method : accepted_methods) {
-        bool conflicts_somewhere = false;
-        std::string conflicting_pattern;
+        bool async_conflict = false;
+        std::string async_conflict_pattern;
         for (const auto& pattern : patterns_to_register) {
             if (router_.HasAsyncRouteConflict(method, pattern)) {
-                conflicts_somewhere = true;
-                conflicting_pattern = pattern;
+                async_conflict = true;
+                async_conflict_pattern = pattern;
                 break;
             }
         }
-        if (conflicts_somewhere) {
+        if (async_conflict) {
             logging::Get()->warn(
                 "Proxy: async route '{} {}' already registered on the "
                 "router, skipping method for upstream '{}'",
-                method, conflicting_pattern, upstream_service_name);
+                method, async_conflict_pattern, upstream_service_name);
             continue;
         }
-        atomic_methods.push_back(method);
+
+        MethodRegistration mr;
+        mr.method = method;
+        mr.patterns.reserve(patterns_to_register.size());
+        for (const auto& pattern : patterns_to_register) {
+            if (!derived_companion.empty() && pattern == derived_companion &&
+                router_.HasSyncRouteMatching(method, pattern)) {
+                logging::Get()->warn(
+                    "Proxy: sync route '{} {}' matches bare-prefix "
+                    "companion; NOT registering async companion to "
+                    "avoid hijacking existing handler (upstream '{}'). "
+                    "Catch-all '{}' is still registered.",
+                    method, pattern, upstream_service_name, config_prefix);
+                continue;
+            }
+            mr.patterns.push_back(pattern);
+        }
+        if (!mr.patterns.empty()) {
+            to_register.push_back(std::move(mr));
+        }
     }
-    if (atomic_methods.empty()) {
+    if (to_register.empty()) {
         logging::Get()->error(
-            "Proxy: no methods available after live-router conflict "
-            "check for upstream '{}' pattern '{}'",
+            "Proxy: no (method, pattern) pairs available after live-"
+            "router conflict check for upstream '{}' pattern '{}'",
             upstream_service_name, route_pattern);
         return;
     }
-    accepted_methods = std::move(atomic_methods);
+
+    // Rebuild accepted_methods from to_register (stable order) so the
+    // HEAD-flag computation and bookkeeping below see the final set.
+    accepted_methods.clear();
+    accepted_methods.reserve(to_register.size());
+    for (const auto& mr : to_register) {
+        accepted_methods.push_back(mr.method);
+    }
 
     // Now that the final method set is known, compute HEAD-related flags.
     // block_head_fallback: user explicitly included GET but omitted HEAD,
@@ -804,21 +871,34 @@ void HttpServer::Proxy(const std::string& route_pattern,
     bool block_head_fallback = proxy_has_get && !proxy_has_head;
     bool head_from_defaults = methods_from_defaults && proxy_has_head;
 
-    // Perform the actual registration. Any exception here is unexpected
-    // (e.g., std::bad_alloc) and is propagated; the common
-    // "duplicate/conflicting pattern" case was caught by the per-method
-    // pre-check above.
-    for (const auto& pattern : patterns_to_register) {
-        for (const auto& method : accepted_methods) {
+    // Collect the union of patterns actually registered, so pattern-level
+    // per-pattern flags (DisableHeadFallback / MarkProxyDefaultHead) can
+    // be applied consistently regardless of which individual (method,
+    // pattern) pairs survived the sync-conflict filter above.
+    std::unordered_set<std::string> registered_patterns;
+    for (const auto& mr : to_register) {
+        for (const auto& p : mr.patterns) {
+            registered_patterns.insert(p);
+        }
+    }
+
+    // Perform the actual registration per-method per-pattern. Any
+    // exception here is unexpected (e.g., std::bad_alloc) and is
+    // propagated; the common "duplicate/conflicting pattern" case was
+    // caught by the per-method pre-check above.
+    for (const auto& mr : to_register) {
+        for (const auto& pattern : mr.patterns) {
             // Capture handler by shared_ptr so the lambda shares
             // ownership — later overwrites of proxy_handlers_[handler_key]
             // don't destroy this handler while this route is still live.
-            router_.RouteAsync(method, pattern,
+            router_.RouteAsync(mr.method, pattern,
                 [handler](const HttpRequest& request,
                           HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                     handler->Handle(request, std::move(complete));
                 });
         }
+    }
+    for (const auto& pattern : registered_patterns) {
         if (block_head_fallback) {
             router_.DisableHeadFallback(pattern);
         }
@@ -972,10 +1052,16 @@ void HttpServer::RegisterProxyRoutes() {
         }
 
         // Build the list of patterns to register. Same layout as Proxy().
+        // Track `derived_companion` separately (see HttpServer::Proxy for
+        // the rationale — the derived bare-prefix companion gets an
+        // extra sync-conflict check so it doesn't silently hijack a
+        // pre-existing sync handler).
         std::vector<std::string> patterns_to_register;
+        std::string derived_companion;
         if (!has_catch_all) {
             // Register the exact prefix to handle requests without a
-            // trailing path (e.g., /api/users).
+            // trailing path (e.g., /api/users). Not a "derived"
+            // companion — the user wrote this pattern directly.
             patterns_to_register.push_back(upstream.proxy.route_prefix);
         } else {
             // Explicit catch-all (possibly rewritten from unnamed to named):
@@ -989,6 +1075,7 @@ void HttpServer::RegisterProxyRoutes() {
                     exact_prefix.pop_back();
                 }
                 if (!exact_prefix.empty()) {
+                    derived_companion = exact_prefix;
                     patterns_to_register.push_back(exact_prefix);
                 }
             }
@@ -997,43 +1084,73 @@ void HttpServer::RegisterProxyRoutes() {
         // always with named catch-all after EnsureNamedCatchAll).
         patterns_to_register.push_back(config_prefix);
 
-        // PRE-CHECK PER METHOD: filter out any method that conflicts
-        // with a live async route on ANY of the patterns. Drops the
-        // whole method (not per-pattern) so surviving methods register
-        // symmetrically on all patterns. Mirrors the filter logic in
-        // HttpServer::Proxy — partial overlaps are tolerated so that
-        // startup doesn't drop non-conflicting methods along with the
-        // conflicting ones.
-        std::vector<std::string> atomic_methods;
-        atomic_methods.reserve(accepted_methods.size());
+        // PRE-CHECK PER METHOD: build a per-method list of patterns
+        // considering both async conflicts (drop the method entirely)
+        // and sync conflicts on the derived companion (drop just that
+        // (method, pattern) to avoid hijacking a pre-existing sync
+        // handler). See HttpServer::Proxy for the detailed rationale.
+        struct MethodRegistration {
+            std::string method;
+            std::vector<std::string> patterns;
+        };
+        std::vector<MethodRegistration> to_register;
+        to_register.reserve(accepted_methods.size());
         for (const auto& method : accepted_methods) {
-            bool conflicts_somewhere = false;
-            std::string conflicting_pattern;
+            bool async_conflict = false;
+            std::string async_conflict_pattern;
             for (const auto& pattern : patterns_to_register) {
                 if (router_.HasAsyncRouteConflict(method, pattern)) {
-                    conflicts_somewhere = true;
-                    conflicting_pattern = pattern;
+                    async_conflict = true;
+                    async_conflict_pattern = pattern;
                     break;
                 }
             }
-            if (conflicts_somewhere) {
+            if (async_conflict) {
                 logging::Get()->warn(
                     "RegisterProxyRoutes: async route '{} {}' already "
                     "registered on the router, skipping method for "
                     "upstream '{}'",
-                    method, conflicting_pattern, upstream.name);
+                    method, async_conflict_pattern, upstream.name);
                 continue;
             }
-            atomic_methods.push_back(method);
+
+            MethodRegistration mr;
+            mr.method = method;
+            mr.patterns.reserve(patterns_to_register.size());
+            for (const auto& pattern : patterns_to_register) {
+                if (!derived_companion.empty() &&
+                    pattern == derived_companion &&
+                    router_.HasSyncRouteMatching(method, pattern)) {
+                    logging::Get()->warn(
+                        "RegisterProxyRoutes: sync route '{} {}' matches "
+                        "bare-prefix companion; NOT registering async "
+                        "companion to avoid hijacking existing handler "
+                        "(upstream '{}'). Catch-all '{}' is still "
+                        "registered.",
+                        method, pattern, upstream.name, config_prefix);
+                    continue;
+                }
+                mr.patterns.push_back(pattern);
+            }
+            if (!mr.patterns.empty()) {
+                to_register.push_back(std::move(mr));
+            }
         }
-        if (atomic_methods.empty()) {
+        if (to_register.empty()) {
             logging::Get()->error(
-                "RegisterProxyRoutes: no methods available after "
-                "live-router conflict check for upstream '{}'",
+                "RegisterProxyRoutes: no (method, pattern) pairs "
+                "available after live-router conflict check for "
+                "upstream '{}'",
                 upstream.name);
             continue;
         }
-        accepted_methods = std::move(atomic_methods);
+
+        // Rebuild accepted_methods (stable order) from to_register.
+        accepted_methods.clear();
+        accepted_methods.reserve(to_register.size());
+        for (const auto& mr : to_register) {
+            accepted_methods.push_back(mr.method);
+        }
 
         // Now that the final method set is known, compute HEAD flags.
         // See HttpServer::Proxy for the detailed rationale.
@@ -1046,17 +1163,29 @@ void HttpServer::RegisterProxyRoutes() {
         bool block_head_fallback = proxy_has_get && !proxy_has_head;
         bool head_from_defaults = methods_from_defaults && proxy_has_head;
 
-        // Perform the actual registration.
-        for (const auto& pattern : patterns_to_register) {
-            for (const auto& method : accepted_methods) {
+        // Collect the union of patterns actually registered so per-pattern
+        // flags apply consistently regardless of which (method, pattern)
+        // pairs survived the sync-conflict filter.
+        std::unordered_set<std::string> registered_patterns;
+        for (const auto& mr : to_register) {
+            for (const auto& p : mr.patterns) {
+                registered_patterns.insert(p);
+            }
+        }
+
+        // Perform the actual registration per-method per-pattern.
+        for (const auto& mr : to_register) {
+            for (const auto& pattern : mr.patterns) {
                 // Capture handler by shared_ptr so the lambda shares
                 // ownership and survives any later overwrite.
-                router_.RouteAsync(method, pattern,
+                router_.RouteAsync(mr.method, pattern,
                     [handler](const HttpRequest& request,
                               HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                         handler->Handle(request, std::move(complete));
                     });
             }
+        }
+        for (const auto& pattern : registered_patterns) {
             if (block_head_fallback) {
                 router_.DisableHeadFallback(pattern);
             }

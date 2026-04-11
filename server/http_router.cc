@@ -98,6 +98,13 @@ bool HttpRouter::HasAsyncRouteConflict(const std::string& method,
     return it->second.count(NormalizeAsyncPatternKey(pattern)) > 0;
 }
 
+bool HttpRouter::HasSyncRouteMatching(const std::string& method,
+                                        const std::string& path) const {
+    auto it = method_tries_.find(method);
+    if (it == method_tries_.end()) return false;
+    return it->second.HasMatch(path);
+}
+
 HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
     const HttpRequest& request, bool* head_fallback_out) const {
     if (head_fallback_out) *head_fallback_out = false;

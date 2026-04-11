@@ -171,6 +171,13 @@ private:
     void HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn);
     void HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message);
 
+    // Reject any route / middleware mutation once the server has been
+    // marked ready. RouteTrie (and the middleware chain) are not safe
+    // for concurrent insert + lookup, so calls from SetReadyCallback
+    // or any worker thread after Start() must be refused. Returns
+    // true if the operation should be rejected (server is live).
+    bool RejectIfServerLive(const char* op, const std::string& path) const;
+
     // Snapshot of all active connection handlers, taken under conn_mtx_.
     // Used by Reload() to push updated config to existing connections.
     struct ConnectionSnapshot {

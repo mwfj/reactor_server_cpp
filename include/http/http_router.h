@@ -115,6 +115,19 @@ public:
     bool HasAsyncRouteConflict(const std::string& method,
                                 const std::string& pattern) const;
 
+    // Check whether a SYNC route exists for the given method that would
+    // be served for the given path. Used by proxy registration to avoid
+    // silently hijacking a pre-existing sync handler on a bare-prefix
+    // companion pattern (derived from an explicit catch-all like
+    // /api/*rest → companion /api). Because async routes win over sync
+    // routes at dispatch time, registering an async companion on top of
+    // a sync handler for the same path would reroute the request
+    // through the proxy. This checker uses RouteTrie::HasMatch which
+    // walks the sync trie and returns true if any registered sync
+    // pattern would match the literal path.
+    bool HasSyncRouteMatching(const std::string& method,
+                               const std::string& path) const;
+
 private:
     // Per-method route tries (one trie per HTTP method)
     std::unordered_map<std::string, RouteTrie<Handler>> method_tries_;
