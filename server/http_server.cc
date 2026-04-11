@@ -40,6 +40,27 @@ struct InternalRegistrationScope {
     InternalRegistrationScope& operator=(const InternalRegistrationScope&) = delete;
 };
 
+// Ceiling division: convert a timeout in milliseconds to whole seconds,
+// rounding up so the timer scan fires within one interval of the real
+// deadline. The naive `(ms + 999) / 1000` on plain int overflows for
+// ms values near INT_MAX — ConfigLoader::Validate does not currently
+// cap these fields, so an operator typo like response_timeout_ms=
+// 2147483647 would drive the result negative and poison the dispatcher
+// timer interval. Promoting to int64_t and saturating to INT_MAX keeps
+// the rounding safe and the result monotonic in the input.
+//
+// Returns at least 1 (matches the historic `std::max(..., 1)` pattern
+// at call sites) and at most INT_MAX.
+static int CeilMsToSec(int ms) {
+    if (ms <= 0) return 1;
+    int64_t sec64 = (static_cast<int64_t>(ms) + 999) / 1000;
+    if (sec64 > std::numeric_limits<int>::max()) {
+        return std::numeric_limits<int>::max();
+    }
+    if (sec64 < 1) return 1;
+    return static_cast<int>(sec64);
+}
+
 // Normalize a route pattern for dedup comparison by stripping all param
 // and catch-all names. E.g., "/api/:id/users/*rest" → "/api/:/users/*".
 // This way, semantically identical routes with different param names
@@ -265,11 +286,9 @@ void HttpServer::MarkServerReady() {
         // timeouts would fire late. Reduce the interval if needed.
         int min_upstream_sec = std::numeric_limits<int>::max();
         for (const auto& u : upstream_configs_) {
-            // ceil division: ensures the timer fires within 1 interval of the
-            // deadline, minimizing overshoot. Floor would let deadlines fire
-            // up to (interval - 1)s late in the worst case.
-            int connect_sec = std::max(
-                (u.pool.connect_timeout_ms + 999) / 1000, 1);
+            // CeilMsToSec rounds up and saturates to avoid int overflow
+            // on misconfigured INT_MAX-range timeouts.
+            int connect_sec = CeilMsToSec(u.pool.connect_timeout_ms);
             min_upstream_sec = std::min(min_upstream_sec, connect_sec);
             // Also consider idle timeout for eviction cadence
             if (u.pool.idle_timeout_sec > 0) {
@@ -280,8 +299,7 @@ void HttpServer::MarkServerReady() {
             // the timer scan must fire often enough to detect stalled
             // upstream responses within one interval of the deadline.
             if (u.proxy.response_timeout_ms > 0) {
-                int response_sec = std::max(
-                    (u.proxy.response_timeout_ms + 999) / 1000, 1);
+                int response_sec = CeilMsToSec(u.proxy.response_timeout_ms);
                 min_upstream_sec = std::min(min_upstream_sec, response_sec);
             }
         }
@@ -1053,8 +1071,17 @@ void HttpServer::RecomputeAsyncDeferredCap() {
             any_disabled = true;
             break;
         }
-        int sec = (found->proxy.response_timeout_ms + 999) / 1000
-                + BUFFER_SEC;
+        // 64-bit ceil division + saturating add to keep the cap
+        // monotonic in the input and safe against operator typos
+        // near INT_MAX (ConfigLoader::Validate does not currently
+        // cap this field).
+        int base_sec = CeilMsToSec(found->proxy.response_timeout_ms);
+        int sec;
+        if (base_sec > std::numeric_limits<int>::max() - BUFFER_SEC) {
+            sec = std::numeric_limits<int>::max();
+        } else {
+            sec = base_sec + BUFFER_SEC;
+        }
         computed_sec = std::max(computed_sec, sec);
     }
     int new_cap = any_disabled ? 0 : computed_sec;
@@ -3087,16 +3114,14 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // Preserve upstream timeout cadence — upstream configs are restart-only,
         // but the timer interval must not widen past the shortest upstream timeout.
         for (const auto& u : upstream_configs_) {
-            int connect_sec = std::max(
-                (u.pool.connect_timeout_ms + 999) / 1000, 1);
+            int connect_sec = CeilMsToSec(u.pool.connect_timeout_ms);
             new_interval = std::min(new_interval, connect_sec);
             if (u.pool.idle_timeout_sec > 0) {
                 new_interval = std::min(new_interval, u.pool.idle_timeout_sec);
             }
             // Also preserve proxy response timeout cadence
             if (u.proxy.response_timeout_ms > 0) {
-                int response_sec = std::max(
-                    (u.proxy.response_timeout_ms + 999) / 1000, 1);
+                int response_sec = CeilMsToSec(u.proxy.response_timeout_ms);
                 new_interval = std::min(new_interval, response_sec);
             }
         }

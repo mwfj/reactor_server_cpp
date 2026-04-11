@@ -98,6 +98,47 @@ HttpResponse& HttpResponse::Html(const std::string& html_body) {
     return Body(html_body, "text/html");
 }
 
+std::optional<std::string>
+HttpResponse::ComputeWireContentLength(int status_code) const {
+    // Mirrors the CL rules applied inline in Serialize() so the HTTP/2
+    // response submission path — which assembles nghttp2 nva entries
+    // directly — gets identical semantics. Any change here MUST stay
+    // in lockstep with Serialize()'s Content-Length handling.
+
+    // 1xx, 101, 204: Content-Length MUST be stripped (RFC 7230 §3.3.2).
+    if (status_code < 200 || status_code == 101 || status_code == 204) {
+        return std::nullopt;
+    }
+    // 205 Reset Content: force CL=0 regardless of caller.
+    if (status_code == 205) return std::string("0");
+
+    // Find the first caller-set Content-Length (case-insensitive).
+    // Used for 304 passthrough and PreserveContentLength paths.
+    auto first_caller_cl = [this]() -> std::optional<std::string> {
+        for (const auto& kv : headers_) {
+            std::string key = kv.first;
+            std::transform(key.begin(), key.end(), key.begin(),
+                [](unsigned char c) { return std::tolower(c); });
+            if (key == "content-length") return kv.second;
+        }
+        return std::nullopt;
+    };
+
+    // 304 Not Modified: RFC 7232 §4.1 allows CL as metadata for the
+    // selected representation. Preserve caller's first value; if none
+    // set, don't inject one (injecting CL: 0 would lie about the
+    // representation size).
+    if (status_code == 304) return first_caller_cl();
+
+    // Non-bodyless statuses (200, HEAD replies, proxy passthrough, ...).
+    // If the handler or proxy has asked for preservation, keep the
+    // caller-set value (first one wins — collapses duplicates).
+    // Otherwise auto-compute from body_.size() to prevent framing
+    // inconsistencies where a stale caller-set CL disagrees with body.
+    if (preserve_content_length_) return first_caller_cl();
+    return std::to_string(body_.size());
+}
+
 std::string HttpResponse::Serialize() const {
     std::ostringstream oss;
 

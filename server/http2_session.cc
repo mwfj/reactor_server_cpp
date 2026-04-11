@@ -715,17 +715,15 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
             key == "transfer-encoding" || key == "upgrade") {
             continue;
         }
-        // Skip content-length — we compute the correct value below to
-        // prevent mismatches between declared and actual body size.
-        // Exception: for HEAD with empty body, preserve the caller-supplied
-        // content-length (the handler knows the representation size).
-        if (key == "content-length") {
-            if (req.method == "HEAD" && response.GetBody().empty()) {
-                // Keep it — the handler explicitly set the representation length
-            } else {
-                continue;
-            }
-        }
+        // Always strip caller-set content-length — we compute the
+        // authoritative value below via HttpResponse::ComputeWireContentLength
+        // (which mirrors the HTTP/1 Serialize() rules: 304 metadata
+        // preservation, 205 zeroing, HEAD auto-compute vs. preserve flag).
+        // The previous "HEAD && empty body keeps caller value" special-case
+        // let stale CL headers leak into HEAD responses without any
+        // PreserveContentLength opt-in, and silently dropped 304 CL
+        // metadata that HTTP/1 preserves.
+        if (key == "content-length") continue;
         lowered_names.push_back(std::move(key));
         nva.push_back({
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(lowered_names.back().c_str())),
@@ -739,14 +737,21 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     const std::string& raw_body = response.GetBody();
     bool has_body = !raw_body.empty() && !suppress_body;
 
-    // Compute correct content-length. Always server-managed to prevent
-    // mismatches between declared length and actual body size.
-    // HEAD: content-length reflects the GET body size (RFC 9110 §9.3.2)
-    // 204/205/304: no content-length (body suppressed)
-    // Normal: content-length = actual body size
+    // Compute the Content-Length header via the shared helper so HTTP/2
+    // stays in lockstep with HTTP/1 Serialize():
+    //   - 1xx/101/204: no CL
+    //   - 205:         CL = "0"
+    //   - 304:         preserve first caller-set CL, else no CL
+    //   - otherwise:   PreserveContentLength → first caller-set CL,
+    //                  else auto-compute from body_.size()
+    // For HEAD the helper returns body_.size() (auto) or the preserved
+    // value — matching HTTP/1 which also computes CL from body_ before
+    // stripping the body on the wire. `content_length_str` must live
+    // until nghttp2_submit_response2 returns because nva holds raw
+    // pointers into its storage.
     std::string content_length_str;
-    if (!raw_body.empty() && (!suppress_body || req.method == "HEAD")) {
-        content_length_str = std::to_string(raw_body.size());
+    if (auto effective_cl = response.ComputeWireContentLength(status_code)) {
+        content_length_str = std::move(*effective_cl);
         nva.push_back({
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("content-length")),
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(content_length_str.c_str())),
