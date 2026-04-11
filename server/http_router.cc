@@ -129,15 +129,51 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
         if (result.handler) {
             if (request.method == "HEAD" &&
                 proxy_default_head_patterns_.count(result.matched_pattern)) {
-                // Proxy-default HEAD match — yield to sync Head() if the
-                // user registered one that also matches this path.
+                // Proxy-default HEAD match. Yield to sync Dispatch when:
+                //
+                //  (a) An explicit sync Head() handler matches this path.
+                //      Always yields regardless of what else matches —
+                //      the user explicitly told us how to serve HEAD
+                //      for this path.
+                //
+                //  (b) A sync Get() handler matches AND no async GET
+                //      also matches. Sync Dispatch's HEAD→GET fallback
+                //      (RFC 7231 §4.3.2) would serve the request via
+                //      the sync GET handler.
+                //      The "no async GET match" guard is critical: if
+                //      the proxy also owns async GET for this path,
+                //      GET goes to the proxy and HEAD MUST follow for
+                //      routing consistency — yielding would make HEAD
+                //      /foo hit the sync handler while GET /foo still
+                //      hits the async proxy (inconsistent routing, and
+                //      a broad sync catch-all could hijack HEAD across
+                //      every proxied path).
                 auto sync_head = method_tries_.find("HEAD");
                 if (sync_head != method_tries_.end() &&
                     sync_head->second.HasMatch(request.path)) {
-                    return nullptr;  // let sync Dispatch handle it
+                    return nullptr;  // explicit sync HEAD always wins
                 }
-                // No sync HEAD for this path — fall through and return
-                // the proxy-default HEAD handler below.
+                auto sync_get = method_tries_.find("GET");
+                if (sync_get != method_tries_.end() &&
+                    sync_get->second.HasMatch(request.path)) {
+                    // Verify no async GET match exists for the same
+                    // path before yielding. If the proxy owns GET,
+                    // keep HEAD with the proxy for GET/HEAD routing
+                    // consistency.
+                    bool async_get_matches = false;
+                    auto async_get_it = async_method_tries_.find("GET");
+                    if (async_get_it != async_method_tries_.end()) {
+                        async_get_matches =
+                            async_get_it->second.HasMatch(request.path);
+                    }
+                    if (!async_get_matches) {
+                        return nullptr;  // sync HEAD→GET fallback owns this path
+                    }
+                    // else: proxy owns async GET — fall through and
+                    // return the proxy-default HEAD handler below.
+                }
+                // No sync handler would serve this path — fall through
+                // and return the proxy-default HEAD handler below.
             }
             request.params = std::move(params);
             return *result.handler;
