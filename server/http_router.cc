@@ -23,44 +23,111 @@ void HttpRouter::Route(const std::string& method, const std::string& path, Handl
     method_tries_[method].Insert(path, std::move(handler));
 }
 
+// Reduce a route pattern to its semantic shape for conflict detection.
+// Two patterns that produce the same key will collide in the same trie
+// (matching RouteTrie's insert-time equivalence: param/catch-all names
+// don't matter, but segment STRUCTURE does). Regex constraints are
+// stripped too because any two different constraints at the same PARAM
+// position throw in RouteTrie::InsertSegments — so treating them all as
+// a single "has param here" marker is conservative and safe for
+// atomicity: an aggressive match prevents partial-commit, and false
+// positives only affect the rare case of two different-constraint
+// routes on the same prefix.
+//
+// Examples:
+//   "/users/:id"            -> "/users/:"
+//   "/users/:user"          -> "/users/:"        (same key -> conflict)
+//   "/users/:id([0-9]+)"    -> "/users/:"        (constraint stripped)
+//   "/users/:id/a"          -> "/users/:/a"
+//   "/users/:name/b"        -> "/users/:/b"      (different tail -> no conflict)
+//   "/api/*rest"            -> "/api/*"
+//   "/api/*tail"            -> "/api/*"          (same key -> conflict)
+static std::string NormalizeAsyncPatternKey(const std::string& pattern) {
+    std::string result;
+    result.reserve(pattern.size());
+    size_t i = 0;
+    while (i < pattern.size()) {
+        bool at_seg_start = (i == 0) || (result.back() == '/');
+        if (at_seg_start && pattern[i] == ':') {
+            result += ':';
+            ++i;
+            // Skip param name until '/', '(' (constraint), or end
+            while (i < pattern.size() && pattern[i] != '/' && pattern[i] != '(') {
+                ++i;
+            }
+            // Skip the entire balanced constraint block if present.
+            if (i < pattern.size() && pattern[i] == '(') {
+                int depth = 0;
+                while (i < pattern.size()) {
+                    char c = pattern[i];
+                    if (c == '\\' && i + 1 < pattern.size()) {
+                        i += 2;
+                        continue;
+                    }
+                    if (c == '(') ++depth;
+                    else if (c == ')') --depth;
+                    ++i;
+                    if (depth == 0) break;
+                }
+            }
+        } else if (at_seg_start && pattern[i] == '*') {
+            // Catch-all is always the last segment per trie validator.
+            result += '*';
+            break;
+        } else {
+            result += pattern[i];
+            ++i;
+        }
+    }
+    return result;
+}
+
 void HttpRouter::RouteAsync(const std::string& method, const std::string& path,
                             AsyncHandler handler) {
     // Insert into the trie first so any duplicate-pattern exception
-    // surfaces before we mirror it into async_patterns_. If the trie
-    // throws, async_patterns_ stays consistent.
+    // surfaces before we mirror it into async_pattern_keys_. If the trie
+    // throws, async_pattern_keys_ stays consistent.
     async_method_tries_[method].Insert(path, std::move(handler));
-    async_patterns_[method].insert(path);
+    async_pattern_keys_[method].insert(NormalizeAsyncPatternKey(path));
 }
 
-bool HttpRouter::HasAsyncRoute(const std::string& method,
-                                const std::string& pattern) const {
-    auto it = async_patterns_.find(method);
-    if (it == async_patterns_.end()) return false;
-    return it->second.count(pattern) > 0;
+bool HttpRouter::HasAsyncRouteConflict(const std::string& method,
+                                        const std::string& pattern) const {
+    auto it = async_pattern_keys_.find(method);
+    if (it == async_pattern_keys_.end()) return false;
+    return it->second.count(NormalizeAsyncPatternKey(pattern)) > 0;
 }
 
 HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
     const HttpRequest& request, bool* head_fallback_out) const {
     if (head_fallback_out) *head_fallback_out = false;
 
-    // For HEAD requests, an explicit sync HEAD handler takes priority over
-    // any async HEAD handler (including proxy catch-all routes). Check sync
-    // HEAD BEFORE async lookup so that user-registered Head() handlers are
-    // not shadowed by proxy's async HEAD registration.
-    if (request.method == "HEAD") {
-        auto sync_head = method_tries_.find("HEAD");
-        if (sync_head != method_tries_.end() &&
-            sync_head->second.HasMatch(request.path)) {
-            return nullptr;  // let sync Dispatch handle explicit HEAD
-        }
-    }
-
     // 1. Try exact method match in the async trie.
+    //    Contract: async routes win over sync routes for the same
+    //    method/path. The one narrow exception is HEAD routes that the
+    //    proxy registered as DEFAULTS (not via the user's explicit
+    //    proxy.methods) — for those, an explicit sync Head() handler on
+    //    the same path takes precedence so that catch-all proxies don't
+    //    silently shadow user-registered sync HEAD handlers. Checked
+    //    per-pattern via proxy_default_head_patterns_ so user-registered
+    //    async HEAD routes retain normal async-over-sync precedence.
     auto it = async_method_tries_.find(request.method);
     if (it != async_method_tries_.end()) {
         std::unordered_map<std::string, std::string> params;
         auto result = it->second.Search(request.path, params);
         if (result.handler) {
+            if (request.method == "HEAD" &&
+                proxy_default_head_patterns_.count(result.matched_pattern)) {
+                // Proxy-default HEAD match — yield to sync Head() if the
+                // user registered one that also matches this path.
+                auto sync_head = method_tries_.find("HEAD");
+                if (sync_head != method_tries_.end() &&
+                    sync_head->second.HasMatch(request.path)) {
+                    return nullptr;  // let sync Dispatch handle it
+                }
+                // No sync HEAD for this path — fall through and return
+                // the proxy-default HEAD handler below.
+            }
             request.params = std::move(params);
             return *result.handler;
         }
@@ -99,6 +166,10 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
 
 void HttpRouter::DisableHeadFallback(const std::string& pattern) {
     head_fallback_blocked_.insert(pattern);
+}
+
+void HttpRouter::MarkProxyDefaultHead(const std::string& pattern) {
+    proxy_default_head_patterns_.insert(pattern);
 }
 
 void HttpRouter::WebSocket(const std::string& path, WsUpgradeHandler handler) {

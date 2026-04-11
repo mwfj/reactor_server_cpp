@@ -319,7 +319,7 @@ void ProxyTransaction::OnUpstreamData(
     }
 
     // Parse upstream response data
-    codec_.Parse(data.data(), data.size());
+    size_t consumed = codec_.Parse(data.data(), data.size());
 
     // Check for parse error — the HTTP stream is desynchronized and the
     // connection must not be returned to the idle pool.
@@ -333,6 +333,24 @@ void ProxyTransaction::OnUpstreamData(
     }
 
     const auto& response = codec_.GetResponse();
+
+    // If a complete response was parsed but the read buffer still has
+    // unconsumed bytes, the upstream sent trailing data after the
+    // response boundary (garbage, an unexpected second response, or
+    // pipelined data that violates our outbound one-request-per-wire
+    // contract). The socket state is indeterminate — poison the lease
+    // so it won't be returned to the idle pool even if keep_alive is
+    // true, preventing the next borrower from seeing desynchronized
+    // data on the same wire.
+    if (response.complete && consumed < data.size()) {
+        poison_connection_ = true;
+        int upstream_fd = conn ? conn->fd() : -1;
+        logging::Get()->warn(
+            "ProxyTransaction upstream sent {} trailing bytes after "
+            "response client_fd={} service={} upstream_fd={} status={}",
+            data.size() - consumed, client_fd_, service_name_,
+            upstream_fd, response.status_code);
+    }
 
     // Handle early response (upstream responds while we're still sending)
     if (state_ == State::SENDING_REQUEST) {

@@ -92,14 +92,28 @@ public:
     // bypasses the user's method filter.
     void DisableHeadFallback(const std::string& pattern);
 
-    // Check whether an async route for the given method+pattern is
-    // already registered. Used by proxy registration to pre-validate all
-    // (method, pattern) combinations in a batch so a multi-method insert
-    // can bail atomically before any RouteAsync call mutates the trie —
-    // avoiding partial-commit state where some methods are live in the
-    // router but bookkeeping is skipped.
-    bool HasAsyncRoute(const std::string& method,
-                       const std::string& pattern) const;
+    // Mark an async HEAD route as "installed by proxy defaults" so a
+    // user-registered sync Head() handler on the same path wins. The
+    // router's normal contract is async-over-sync for the same
+    // method/path; this marker carves out a narrow exception ONLY for
+    // proxy routes that got HEAD via default_methods (not via the
+    // user's explicit proxy.methods list), so that an explicit sync
+    // Head() handler isn't silently shadowed by a catch-all proxy
+    // default. Patterns registered here are consulted in
+    // GetAsyncHandler() — see the HEAD-handling branch.
+    void MarkProxyDefaultHead(const std::string& pattern);
+
+    // Check whether an async route for the given method+pattern would
+    // conflict with an already-registered async route on the same trie.
+    // This is a SEMANTIC conflict check, not a literal string match:
+    // /users/:id and /users/:user map to the same key because RouteTrie
+    // rejects both at the same PARAM leaf. Used by proxy registration
+    // to pre-validate all (method, pattern) combinations so a
+    // multi-method insert can bail atomically before any RouteAsync
+    // call mutates the trie — avoiding partial-commit state where some
+    // methods are live in the router but bookkeeping is skipped.
+    bool HasAsyncRouteConflict(const std::string& method,
+                                const std::string& pattern) const;
 
 private:
     // Per-method route tries (one trie per HTTP method)
@@ -119,10 +133,21 @@ private:
     // proxy.methods explicitly exclude HEAD.
     std::unordered_set<std::string> head_fallback_blocked_;
 
-    // Literal async patterns registered per method. Mirrors
-    // async_method_tries_ at the "exact pattern" level so callers can
-    // pre-check whether RouteAsync would throw on a duplicate without
-    // actually attempting the insert. Populated in RouteAsync.
+    // Async HEAD patterns installed by proxy defaults (user did not
+    // explicitly include HEAD in proxy.methods). For these specific
+    // patterns, an explicit sync Head() handler on the same path takes
+    // precedence over the async default — elsewhere the normal
+    // async-over-sync contract is preserved.
+    std::unordered_set<std::string> proxy_default_head_patterns_;
+
+    // Normalized-pattern keys for async routes, tracked per method.
+    // Each registered pattern is reduced to a "semantic shape" key
+    // (param/catch-all names and regex constraints stripped) that
+    // matches the equivalence relation RouteTrie uses for conflict
+    // detection. Pre-checked by HasAsyncRouteConflict() so a multi-
+    // method proxy insert can bail atomically on any conflict — whether
+    // the collision is a literal string duplicate OR a semantically
+    // equivalent pattern like /users/:id vs /users/:user.
     std::unordered_map<std::string, std::unordered_set<std::string>>
-        async_patterns_;
+        async_pattern_keys_;
 };

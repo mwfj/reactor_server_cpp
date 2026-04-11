@@ -697,7 +697,8 @@ void HttpServer::Proxy(const std::string& route_pattern,
     // checks sync HEAD routes before async HEAD matches.
     static const std::vector<std::string> DEFAULT_PROXY_METHODS =
         {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
-    const auto& methods = found->proxy.methods.empty()
+    const bool methods_from_defaults = found->proxy.methods.empty();
+    const auto& methods = methods_from_defaults
         ? DEFAULT_PROXY_METHODS : found->proxy.methods;
 
     // Method-level conflict check BEFORE storing the handler.
@@ -710,7 +711,8 @@ void HttpServer::Proxy(const std::string& route_pattern,
     for (const auto& m : methods) {
         if (registered.count(m)) {
             logging::Get()->warn("Proxy: method {} on path '{}' already "
-                                 "registered, skipping (upstream '{}')",
+                                 "registered by proxy, skipping "
+                                 "(upstream '{}')",
                                  m, dedup_prefix, upstream_service_name);
             continue;
         }
@@ -722,19 +724,6 @@ void HttpServer::Proxy(const std::string& route_pattern,
                               dedup_prefix, upstream_service_name);
         return;
     }
-
-    // If the user explicitly included GET but omitted HEAD, tell the
-    // router to opt this pattern out of HEAD→GET fallback. Otherwise
-    // HEAD requests would bypass the method filter by matching the GET
-    // route and invoking the proxy handler as GET (downloading the full
-    // upstream body just to discard it).
-    bool proxy_has_get = std::find(accepted_methods.begin(),
-                                    accepted_methods.end(), "GET")
-                         != accepted_methods.end();
-    bool proxy_has_head = std::find(accepted_methods.begin(),
-                                     accepted_methods.end(), "HEAD")
-                          != accepted_methods.end();
-    bool block_head_fallback = proxy_has_get && !proxy_has_head;
 
     // Build the list of patterns to register. Both auto-generated and
     // explicit catch-all routes need a companion exact-prefix registration
@@ -761,26 +750,64 @@ void HttpServer::Proxy(const std::string& route_pattern,
         patterns_to_register.push_back(config_prefix);    // named catch-all
     }
 
-    // PRE-CHECK: atomically validate that every (method, pattern) pair
-    // would succeed before mutating the router. Without this, a RouteAsync
-    // throw midway through the loop would leave earlier methods registered
-    // in the trie but bookkeeping skipped — a hidden partial-commit state
-    // where live routes are untracked by proxy_route_methods_.
-    for (const auto& pattern : patterns_to_register) {
-        for (const auto& method : accepted_methods) {
-            if (router_.HasAsyncRoute(method, pattern)) {
-                logging::Get()->error(
-                    "Proxy: async route '{} {}' already registered "
-                    "(upstream '{}'); aborting atomically",
-                    method, pattern, upstream_service_name);
-                return;  // no router state modified, no bookkeeping committed
+    // PRE-CHECK PER METHOD: filter out any method that conflicts with a
+    // live async route on ANY of the patterns we're about to register.
+    // Unlike the proxy_route_methods_ filter above (which only sees prior
+    // proxy registrations), this also catches direct RouteAsync calls
+    // (GetAsync/PostAsync/etc.) made outside the proxy path. We drop the
+    // whole method (not per-pattern) so each surviving method registers
+    // symmetrically on all patterns. Atomic in the sense that the set of
+    // methods actually registered is fully conflict-free BEFORE any
+    // RouteAsync call mutates the router.
+    std::vector<std::string> atomic_methods;
+    atomic_methods.reserve(accepted_methods.size());
+    for (const auto& method : accepted_methods) {
+        bool conflicts_somewhere = false;
+        std::string conflicting_pattern;
+        for (const auto& pattern : patterns_to_register) {
+            if (router_.HasAsyncRouteConflict(method, pattern)) {
+                conflicts_somewhere = true;
+                conflicting_pattern = pattern;
+                break;
             }
         }
+        if (conflicts_somewhere) {
+            logging::Get()->warn(
+                "Proxy: async route '{} {}' already registered on the "
+                "router, skipping method for upstream '{}'",
+                method, conflicting_pattern, upstream_service_name);
+            continue;
+        }
+        atomic_methods.push_back(method);
     }
+    if (atomic_methods.empty()) {
+        logging::Get()->error(
+            "Proxy: no methods available after live-router conflict "
+            "check for upstream '{}' pattern '{}'",
+            upstream_service_name, route_pattern);
+        return;
+    }
+    accepted_methods = std::move(atomic_methods);
 
-    // Pre-check passed — perform the actual registration. Any exception
-    // here is unexpected (e.g., std::bad_alloc) and is propagated; the
-    // common "duplicate pattern" case was caught by the pre-check above.
+    // Now that the final method set is known, compute HEAD-related flags.
+    // block_head_fallback: user explicitly included GET but omitted HEAD,
+    // so HEAD→GET fallback on this pattern would leak the method filter.
+    // head_from_defaults: HEAD was added by default_methods (not the
+    // user's explicit list) — mark the pattern so an explicit sync
+    // Head() handler on the same path wins, per the HEAD precedence fix.
+    bool proxy_has_get = std::find(accepted_methods.begin(),
+                                    accepted_methods.end(), "GET")
+                         != accepted_methods.end();
+    bool proxy_has_head = std::find(accepted_methods.begin(),
+                                     accepted_methods.end(), "HEAD")
+                          != accepted_methods.end();
+    bool block_head_fallback = proxy_has_get && !proxy_has_head;
+    bool head_from_defaults = methods_from_defaults && proxy_has_head;
+
+    // Perform the actual registration. Any exception here is unexpected
+    // (e.g., std::bad_alloc) and is propagated; the common
+    // "duplicate/conflicting pattern" case was caught by the per-method
+    // pre-check above.
     for (const auto& pattern : patterns_to_register) {
         for (const auto& method : accepted_methods) {
             // Capture handler by shared_ptr so the lambda shares
@@ -794,6 +821,9 @@ void HttpServer::Proxy(const std::string& route_pattern,
         }
         if (block_head_fallback) {
             router_.DisableHeadFallback(pattern);
+        }
+        if (head_from_defaults) {
+            router_.MarkProxyDefaultHead(pattern);
         }
         logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                              pattern, upstream_service_name,
@@ -914,7 +944,8 @@ void HttpServer::RegisterProxyRoutes() {
         // Same HEAD policy as Proxy() — HEAD included for correct upstream semantics
         static const std::vector<std::string> DEFAULT_PROXY_METHODS =
             {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
-        const auto& methods = upstream.proxy.methods.empty()
+        const bool methods_from_defaults = upstream.proxy.methods.empty();
+        const auto& methods = methods_from_defaults
             ? DEFAULT_PROXY_METHODS : upstream.proxy.methods;
 
         // Method-level conflict check BEFORE storing (same as Proxy()).
@@ -926,7 +957,8 @@ void HttpServer::RegisterProxyRoutes() {
         for (const auto& m : methods) {
             if (registered.count(m)) {
                 logging::Get()->warn("RegisterProxyRoutes: method {} on '{}' "
-                                     "already registered, skipping (upstream '{}')",
+                                     "already registered by proxy, skipping "
+                                     "(upstream '{}')",
                                      m, dedup_prefix, upstream.name);
                 continue;
             }
@@ -938,17 +970,6 @@ void HttpServer::RegisterProxyRoutes() {
                                   dedup_prefix, upstream.name);
             continue;
         }
-
-        // Same HEAD-fallback policy as Proxy(): opt out of HEAD→GET
-        // fallback when the explicit methods list includes GET but not
-        // HEAD, so HEAD requests don't silently bypass the method filter.
-        bool proxy_has_get = std::find(accepted_methods.begin(),
-                                        accepted_methods.end(), "GET")
-                             != accepted_methods.end();
-        bool proxy_has_head = std::find(accepted_methods.begin(),
-                                         accepted_methods.end(), "HEAD")
-                              != accepted_methods.end();
-        bool block_head_fallback = proxy_has_get && !proxy_has_head;
 
         // Build the list of patterns to register. Same layout as Proxy().
         std::vector<std::string> patterns_to_register;
@@ -976,34 +997,56 @@ void HttpServer::RegisterProxyRoutes() {
         // always with named catch-all after EnsureNamedCatchAll).
         patterns_to_register.push_back(config_prefix);
 
-        // PRE-CHECK: atomically validate all (method, pattern) pairs
-        // before mutating the router. Mirrors the exception-safety
-        // pattern in HttpServer::Proxy. Without this, a mid-loop
-        // RouteAsync throw would leave earlier methods live in the
-        // router while this upstream is marked as aborted — hidden
-        // partial-commit state that makes conflict detection unreliable
-        // for subsequent Proxy() calls on the same prefix.
-        bool has_conflict = false;
-        for (const auto& pattern : patterns_to_register) {
-            for (const auto& method : accepted_methods) {
-                if (router_.HasAsyncRoute(method, pattern)) {
-                    logging::Get()->error(
-                        "RegisterProxyRoutes: async route '{} {}' already "
-                        "registered (upstream '{}'); aborting atomically",
-                        method, pattern, upstream.name);
-                    has_conflict = true;
+        // PRE-CHECK PER METHOD: filter out any method that conflicts
+        // with a live async route on ANY of the patterns. Drops the
+        // whole method (not per-pattern) so surviving methods register
+        // symmetrically on all patterns. Mirrors the filter logic in
+        // HttpServer::Proxy — partial overlaps are tolerated so that
+        // startup doesn't drop non-conflicting methods along with the
+        // conflicting ones.
+        std::vector<std::string> atomic_methods;
+        atomic_methods.reserve(accepted_methods.size());
+        for (const auto& method : accepted_methods) {
+            bool conflicts_somewhere = false;
+            std::string conflicting_pattern;
+            for (const auto& pattern : patterns_to_register) {
+                if (router_.HasAsyncRouteConflict(method, pattern)) {
+                    conflicts_somewhere = true;
+                    conflicting_pattern = pattern;
                     break;
                 }
             }
-            if (has_conflict) break;
+            if (conflicts_somewhere) {
+                logging::Get()->warn(
+                    "RegisterProxyRoutes: async route '{} {}' already "
+                    "registered on the router, skipping method for "
+                    "upstream '{}'",
+                    method, conflicting_pattern, upstream.name);
+                continue;
+            }
+            atomic_methods.push_back(method);
         }
-        if (has_conflict) {
-            // Nothing registered, no bookkeeping committed — startup keeps
-            // going for other upstreams rather than aborting.
+        if (atomic_methods.empty()) {
+            logging::Get()->error(
+                "RegisterProxyRoutes: no methods available after "
+                "live-router conflict check for upstream '{}'",
+                upstream.name);
             continue;
         }
+        accepted_methods = std::move(atomic_methods);
 
-        // Pre-check passed — perform the actual registration.
+        // Now that the final method set is known, compute HEAD flags.
+        // See HttpServer::Proxy for the detailed rationale.
+        bool proxy_has_get = std::find(accepted_methods.begin(),
+                                        accepted_methods.end(), "GET")
+                             != accepted_methods.end();
+        bool proxy_has_head = std::find(accepted_methods.begin(),
+                                         accepted_methods.end(), "HEAD")
+                              != accepted_methods.end();
+        bool block_head_fallback = proxy_has_get && !proxy_has_head;
+        bool head_from_defaults = methods_from_defaults && proxy_has_head;
+
+        // Perform the actual registration.
         for (const auto& pattern : patterns_to_register) {
             for (const auto& method : accepted_methods) {
                 // Capture handler by shared_ptr so the lambda shares
@@ -1016,6 +1059,9 @@ void HttpServer::RegisterProxyRoutes() {
             }
             if (block_head_fallback) {
                 router_.DisableHeadFallback(pattern);
+            }
+            if (head_from_defaults) {
+                router_.MarkProxyDefaultHead(pattern);
             }
             logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                                  pattern, upstream.name,
