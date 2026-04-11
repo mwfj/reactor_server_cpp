@@ -185,6 +185,12 @@ void HttpConnectionHandler::CancelAsyncResponse() {
     deferred_keep_alive_ = true;
     deferred_pending_buf_.clear();
     deferred_start_ = std::chrono::steady_clock::time_point{};
+    // Release the abort hook's captured shared_ptrs so the request's
+    // atomic flags and active_counter handle can be freed. The throw
+    // path that calls CancelAsyncResponse already has its own
+    // bookkeeping (the RequestGuard still fires on stack unwinding),
+    // so we do NOT invoke the hook here.
+    async_abort_hook_ = nullptr;
     if (conn_) conn_->SetShutdownExempt(false);
 }
 
@@ -274,6 +280,10 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     deferred_was_head_ = false;
     deferred_keep_alive_ = true;
     deferred_start_ = std::chrono::steady_clock::time_point{};
+    // Release the abort hook's captures — by the time CompleteAsyncResponse
+    // runs on the normal path, the complete closure already owns the
+    // bookkeeping and the safety cap no longer needs to fire.
+    async_abort_hook_ = nullptr;
 
     if (conn_->IsClosing()) {
         if (conn_) conn_->SetShutdownExempt(false);
@@ -712,6 +722,22 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                             "aborting and sending 504",
                             cap_sec,
                             self->conn_ ? self->conn_->fd() : -1);
+                        // Fire the abort hook FIRST. It short-circuits
+                        // the stored complete() closure (flipping its
+                        // one-shot completed/cancelled atomics) and
+                        // decrements active_requests exactly once,
+                        // regardless of whether the real handler
+                        // eventually calls complete(). Without this
+                        // the /stats.requests.active counter stays
+                        // permanently elevated after a stuck handler.
+                        //
+                        // Move to a local first so CompleteAsyncResponse
+                        // (which clears async_abort_hook_) cannot
+                        // destroy the std::function while we're
+                        // invoking it.
+                        auto abort_hook =
+                            std::move(self->async_abort_hook_);
+                        if (abort_hook) abort_hook();
                         // Route through CompleteAsyncResponse so HEAD
                         // body stripping, shutdown-exempt clearing, and
                         // pipelined-buffer handling all run. Do NOT

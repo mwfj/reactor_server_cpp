@@ -90,6 +90,18 @@ public:
     // the outer exception handler can send a 500 and close normally.
     void CancelAsyncResponse();
 
+    // Install a one-shot "abort the async cycle" hook. Used by the
+    // deferred-heartbeat safety-cap path to short-circuit the stored
+    // AsyncCompletionCallback closure (flipping its completed/cancelled
+    // atomics) and release its active_requests bookkeeping exactly
+    // once, even if the real handler never calls complete(). The hook
+    // is installed by the server-level request dispatcher after the
+    // complete closure is built; the handler owns it for the lifetime
+    // of the deferred window. Cleared by Complete/CancelAsyncResponse.
+    void SetAsyncAbortHook(std::function<void()> hook) {
+        async_abort_hook_ = std::move(hook);
+    }
+
     // Append bytes that arrived while an async response was pending.
     // Called by OnRawData. Separated from OnRawData so that the framework's
     // own "resume after deferred" path can feed buffered bytes back in
@@ -186,4 +198,7 @@ private:
     // deadline is unbounded so handlers' own timeouts govern the
     // overall request lifetime.
     std::chrono::steady_clock::time_point deferred_start_{};
+
+    // Safety-cap abort hook. See SetAsyncAbortHook.
+    std::function<void()> async_abort_hook_;
 };

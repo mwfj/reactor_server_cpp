@@ -25,6 +25,21 @@ struct RequestGuard {
     RequestGuard& operator=(const RequestGuard&) = delete;
 };
 
+// Thread-local scope flag that lets MarkServerReady's internal
+// registration pass (pending_proxy_routes_ + RegisterProxyRoutes) call
+// back through the public entry points without tripping the startup
+// gate. Only MarkServerReady sets this — and only on its own dispatcher
+// thread — so user-threaded Post()/Proxy() calls on other threads still
+// see the gate closed.
+static thread_local bool tls_internal_registration_pass = false;
+
+struct InternalRegistrationScope {
+    InternalRegistrationScope() { tls_internal_registration_pass = true; }
+    ~InternalRegistrationScope() { tls_internal_registration_pass = false; }
+    InternalRegistrationScope(const InternalRegistrationScope&) = delete;
+    InternalRegistrationScope& operator=(const InternalRegistrationScope&) = delete;
+};
+
 // Normalize a route pattern for dedup comparison by stripping all param
 // and catch-all names. E.g., "/api/:id/users/*rest" → "/api/:/users/*".
 // This way, semantically identical routes with different param names
@@ -215,6 +230,14 @@ bool HttpServer::HasPendingH1Output() {
 }
 
 void HttpServer::MarkServerReady() {
+    // Bypass RejectIfServerLive for the internal registration pass below.
+    // MarkServerReady runs on the dispatcher thread and is the ONLY
+    // legitimate mutator of router_/pending_proxy_routes_ between Start()
+    // and server_ready_ = true. The thread-local scope is narrow so a
+    // user-threaded Post()/Proxy() call on another thread still sees the
+    // gate closed (as intended).
+    InternalRegistrationScope scope;
+
     // Assign dispatcher indices for upstream pool partition affinity
     const auto& dispatchers = net_server_.GetSocketDispatchers();
     for (size_t i = 0; i < dispatchers.size(); ++i) {
@@ -557,13 +580,21 @@ HttpServer::~HttpServer() {
 // Route / middleware mutation is gated by RejectIfServerLive() so a
 // call from SetReadyCallback or a worker thread after Start() can't
 // race the dispatch path on the non-thread-safe RouteTrie / middleware
-// chain. Proxy() has the same guard — see the block near its top.
+// chain. The gate trips as soon as Start() is called (startup_begun_)
+// — NOT just once server_ready_ flips true — because MarkServerReady
+// mutates router_ on the dispatcher thread during the window between
+// those two events. Proxy() has the same guard — see the block near
+// its top. MarkServerReady bypasses the check via
+// tls_internal_registration_pass so its internal reprocessing of
+// pending_proxy_routes_ and RegisterProxyRoutes still works.
 bool HttpServer::RejectIfServerLive(const char* op,
                                      const std::string& path) const {
-    if (server_ready_.load(std::memory_order_acquire)) {
+    if (tls_internal_registration_pass) return false;
+    if (startup_begun_.load(std::memory_order_acquire) ||
+        server_ready_.load(std::memory_order_acquire)) {
         logging::Get()->error(
-            "{}: cannot register route/middleware after server is live "
-            "(path='{}'). RouteTrie is not safe for concurrent "
+            "{}: cannot register route/middleware after Start() has been "
+            "called (path='{}'). RouteTrie is not safe for concurrent "
             "insert+lookup — register before Start().",
             op, path);
         return true;
@@ -588,6 +619,21 @@ void HttpServer::RouteAsync(const std::string& method, const std::string& path, 
 
 void HttpServer::Proxy(const std::string& route_pattern,
                        const std::string& upstream_service_name) {
+    // Gate external callers. MarkServerReady bypasses this via
+    // tls_internal_registration_pass when replaying the pending list.
+    // The check covers BOTH the deferred (!upstream_manager_) branch
+    // — pending_proxy_routes_ is a plain vector and would race an
+    // in-progress MarkServerReady — and the live-registration branch.
+    if (!tls_internal_registration_pass &&
+        (startup_begun_.load(std::memory_order_acquire) ||
+         server_ready_.load(std::memory_order_acquire))) {
+        logging::Get()->error(
+            "Proxy: cannot register routes after Start() has been called "
+            "(route_pattern='{}', upstream='{}'). Call Proxy() before "
+            "Start().",
+            route_pattern, upstream_service_name);
+        return;
+    }
     // Reject empty route patterns — calling .back() on an empty string is UB,
     // and an empty pattern is never a valid route.
     if (route_pattern.empty()) {
@@ -663,24 +709,14 @@ void HttpServer::Proxy(const std::string& route_pattern,
     }
 
     if (!upstream_manager_) {
-        // Pre-Start or MarkServerReady hasn't run yet: defer registration.
-        // Routes are registered before the server accepts connections,
-        // so there's no race with live route lookups.
+        // Pre-Start: defer registration. pending_proxy_routes_ mutation
+        // is safe here because the startup gate above ensures we are
+        // either before Start() (single-threaded user code) or inside
+        // MarkServerReady's internal pass (dispatcher thread, exclusive
+        // owner of pending_proxy_routes_).
         pending_proxy_routes_.emplace_back(route_pattern, upstream_service_name);
         logging::Get()->debug("Proxy: deferred registration {} -> {} "
                               "(upstream manager not yet initialized)",
-                              route_pattern, upstream_service_name);
-        return;
-    }
-
-    // Reject registration once the server is live (accepting connections).
-    // RouteTrie is not thread-safe for concurrent insert + lookup. Routes
-    // must be registered before accept starts (MarkServerReady time is safe
-    // because server_ready_ is set AFTER route registration completes).
-    if (server_ready_.load(std::memory_order_acquire)) {
-        logging::Get()->error("Proxy: cannot register routes after server "
-                              "is live (route_pattern='{}', upstream='{}'). "
-                              "Call Proxy() before Start().",
                               route_pattern, upstream_service_name);
         return;
     }
@@ -1308,6 +1344,13 @@ void HttpServer::RegisterProxyRoutes() {
 
 void HttpServer::Start() {
     logging::Get()->info("HttpServer starting");
+    // Close the registration window AS SOON AS Start() is called, not
+    // when server_ready_ flips true later. RouteTrie is not thread-safe
+    // for concurrent insert + lookup, and MarkServerReady runs on the
+    // dispatcher thread while user code may still be on the caller
+    // thread. Without this flag, a late Post() on the caller thread
+    // could race with MarkServerReady's RegisterProxyRoutes inserts.
+    startup_begun_.store(true, std::memory_order_release);
     net_server_.Start();
 }
 
@@ -2035,7 +2078,24 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 }
                 // Handler returned without throwing — it owns the
                 // completion callback and is responsible for invoking it.
-                // Disarm the guard so the callback handles the decrement.
+                // Install a safety-cap abort hook so the deferred
+                // heartbeat (which may fire 504 on a stuck handler) can
+                // short-circuit the stored complete closure and release
+                // the active_requests bookkeeping exactly once. Uses the
+                // same one-shot `completed` atomic as the complete
+                // closure so abort + complete races decrement at most
+                // once.
+                self->SetAsyncAbortHook(
+                    [completed, cancelled, active_counter]() {
+                        if (!completed->exchange(true,
+                                                 std::memory_order_acq_rel)) {
+                            cancelled->store(true, std::memory_order_release);
+                            active_counter->fetch_sub(
+                                1, std::memory_order_relaxed);
+                        }
+                    });
+                // Disarm the guard so the callback (or the abort hook)
+                // handles the decrement.
                 guard.release();
                 return;
             }
@@ -2750,6 +2810,24 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     cancelled->store(true, std::memory_order_release);
                     throw;
                 }
+                // Handler returned without throwing — install a
+                // per-stream abort hook for the safety-cap path.
+                // When ResetExpiredStreams RSTs a stuck stream, the
+                // hook flips the stored complete closure's one-shot
+                // completed/cancelled atomics and decrements
+                // active_requests exactly once, avoiding the
+                // bookkeeping leak that would otherwise occur when
+                // the real handler never calls complete().
+                self->SetStreamAbortHook(
+                    stream_id,
+                    [completed, cancelled, active_counter]() {
+                        if (!completed->exchange(true,
+                                                 std::memory_order_acq_rel)) {
+                            cancelled->store(true, std::memory_order_release);
+                            active_counter->fetch_sub(
+                                1, std::memory_order_relaxed);
+                        }
+                    });
                 guard.release();
                 return;
             }
@@ -2772,9 +2850,16 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     );
     h2_conn->SetStreamCloseCallback(
         [this](std::shared_ptr<Http2ConnectionHandler> self,
-               int32_t /*stream_id*/, uint32_t /*error_code*/) {
+               int32_t stream_id, uint32_t /*error_code*/) {
             active_h2_streams_.fetch_sub(1, std::memory_order_relaxed);
             self->DecrementLocalStreamCount();
+            // Release any abort hook left over for this stream. On the
+            // normal path the complete closure already ran and did the
+            // decrement; the hook is a no-op but its shared_ptr captures
+            // should be freed. On the async-cap path the hook was
+            // already fired+erased from the timer callback, so this is
+            // a no-op erase.
+            self->EraseStreamAbortHook(stream_id);
         }
     );
 }

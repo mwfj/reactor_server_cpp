@@ -275,6 +275,17 @@ private:
     // Needed because auto mode (worker_threads=0) resolves inside ThreadPool.
     int resolved_worker_threads_ = 0;
 
+    // Set at the entry of Start() — before any dispatcher spins up
+    // and before MarkServerReady mutates router_/proxy state. Closes
+    // the gap between "user called Start()" and "server_ready_ = true":
+    // during that window MarkServerReady runs unsynchronized inserts
+    // into RouteTrie from the dispatcher thread, so any concurrent
+    // Post()/Proxy()/RegisterProxyRoutes-style call from another
+    // thread would race those inserts. RejectIfServerLive and Proxy()
+    // check this flag in addition to server_ready_, and MarkServerReady
+    // bypasses the check via an internal thread-local scope guard.
+    std::atomic<bool> startup_begun_{false};
+
     // Set by the ready callback after Start() finishes building dispatchers.
     // Reload() checks this to avoid walking socket_dispatchers_ during startup.
     std::atomic<bool> server_ready_{false};

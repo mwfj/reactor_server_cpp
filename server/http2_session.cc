@@ -951,7 +951,8 @@ std::chrono::steady_clock::time_point Http2Session::OldestIncompleteStreamStart(
 }
 
 size_t Http2Session::ResetExpiredStreams(int parse_timeout_sec,
-                                          int async_cap_sec) {
+                                          int async_cap_sec,
+                                          std::vector<int32_t>* async_cap_reset_ids) {
     auto now = std::chrono::steady_clock::now();
     auto parse_limit = std::chrono::seconds(parse_timeout_sec);
     auto async_limit = std::chrono::seconds(async_cap_sec);
@@ -996,6 +997,9 @@ size_t Http2Session::ResetExpiredStreams(int parse_timeout_sec,
                 stream->MarkRejected();
                 nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
                                           id, NGHTTP2_CANCEL);
+                if (async_cap_reset_ids) {
+                    async_cap_reset_ids->push_back(id);
+                }
                 ++count;
             }
             continue;

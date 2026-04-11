@@ -138,15 +138,24 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
             //     is a last-resort safety net for async streams whose
             //     handler never submits a response.
             // Run whenever either is set so the async cap still applies
-            // when request_timeout_sec is disabled.
+            // when request_timeout_sec is disabled. The async-cap-reset
+            // stream IDs are captured so we can fire per-stream abort
+            // hooks — without that, a stuck handler's stored complete()
+            // closure would keep active_requests_ elevated even after
+            // the stream has been RST'd off the wire.
             size_t reset = 0;
+            std::vector<int32_t> async_cap_reset_ids;
             if (self->request_timeout_sec_ > 0 ||
                 self->max_async_deferred_sec_ > 0) {
                 reset = self->session_->ResetExpiredStreams(
                     self->request_timeout_sec_,
-                    self->max_async_deferred_sec_);
+                    self->max_async_deferred_sec_,
+                    &async_cap_reset_ids);
                 if (reset > 0) {
                     self->session_->SendPendingFrames();
+                }
+                for (int32_t id : async_cap_reset_ids) {
+                    self->FireAndEraseStreamAbortHook(id);
                 }
             }
             // Handle graceful shutdown on dispatcher thread

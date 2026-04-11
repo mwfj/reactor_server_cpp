@@ -132,7 +132,13 @@ public:
     //     so it doesn't override operator config.
     // Returns the number of streams reset. Caller should call
     // SendPendingFrames() and UpdateDeadline() after this.
-    size_t ResetExpiredStreams(int parse_timeout_sec, int async_cap_sec = 0);
+    //
+    // If async_cap_reset_ids is non-null, the IDs of streams RST'd by
+    // the async_cap_sec branch (and only that branch) are appended so
+    // the caller can fire per-stream abort hooks that release the
+    // stored handler-side bookkeeping (e.g., active_requests decrement).
+    size_t ResetExpiredStreams(int parse_timeout_sec, int async_cap_sec = 0,
+                               std::vector<int32_t>* async_cap_reset_ids = nullptr);
 
     // Body size limit (set from config, checked during data ingestion)
     void SetMaxBodySize(size_t max) { max_body_size_ = max; }

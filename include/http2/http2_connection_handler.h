@@ -92,6 +92,30 @@ public:
         return shutdown_requested_.load(std::memory_order_acquire);
     }
 
+    // Per-stream async-abort hooks. Installed by the server's async
+    // request dispatcher after the complete() closure is built for a
+    // deferred stream. Fired by the deadline-driven safety-cap path
+    // when ResetExpiredStreams RSTs a stuck stream, so the stored
+    // completion closure's one-shot completed/cancelled atomics flip
+    // and active_requests is decremented exactly once. Also cleared
+    // on normal stream close.
+    //
+    // Dispatcher-thread-only — no synchronization.
+    void SetStreamAbortHook(int32_t stream_id,
+                            std::function<void()> hook) {
+        stream_abort_hooks_[stream_id] = std::move(hook);
+    }
+    void EraseStreamAbortHook(int32_t stream_id) {
+        stream_abort_hooks_.erase(stream_id);
+    }
+    void FireAndEraseStreamAbortHook(int32_t stream_id) {
+        auto it = stream_abort_hooks_.find(stream_id);
+        if (it == stream_abort_hooks_.end()) return;
+        auto hook = std::move(it->second);
+        stream_abort_hooks_.erase(it);
+        if (hook) hook();
+    }
+
 private:
     std::shared_ptr<ConnectionHandler> conn_;
     std::unique_ptr<Http2Session> session_;
@@ -128,4 +152,7 @@ private:
     StreamCloseCallback pending_stream_close_cb_;
     StreamOpenCallback pending_stream_open_cb_;
     HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback pending_request_count_cb_;
+
+    // Per-stream safety-cap abort hooks. See SetStreamAbortHook.
+    std::unordered_map<int32_t, std::function<void()>> stream_abort_hooks_;
 };
