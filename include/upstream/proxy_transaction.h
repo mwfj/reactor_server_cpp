@@ -52,6 +52,22 @@ public:
     // Uses shared_from_this() for callback captures.
     void Start();
 
+    // Cancel the transaction. Called from the framework's async abort
+    // hook when the client-facing request has been aborted (client
+    // disconnect, deferred-response safety cap, HTTP/2 stream RST).
+    //
+    // Releases the upstream lease back to the pool, clears transport
+    // callbacks so in-flight upstream I/O cannot land on a torn-down
+    // transaction, and short-circuits any pending retry logic. The
+    // stored completion callback is dropped without invocation — the
+    // framework's abort hook has already released the client-side
+    // bookkeeping, and delivering a response to a disconnected client
+    // is pointless.
+    //
+    // Idempotent and dispatcher-thread-only (invoked via the connection
+    // handler's abort hook, which always runs on the dispatcher).
+    void Cancel();
+
 private:
     // State machine states
     enum class State {
@@ -66,6 +82,10 @@ private:
 
     State state_ = State::INIT;
     int attempt_ = 0;  // Current attempt number (0 = first try)
+    // Set by Cancel() — short-circuits checkout / retry / response
+    // delivery paths so the transaction is torn down even if an
+    // upstream response is mid-flight. Dispatcher-thread only.
+    bool cancelled_ = false;
 
     // Request context (all copied at construction -- the original HttpRequest
     // is INVALIDATED by parser_.Reset() immediately after the async handler

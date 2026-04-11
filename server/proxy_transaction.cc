@@ -127,6 +127,14 @@ void ProxyTransaction::AttemptCheckout() {
 }
 
 void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
+    if (cancelled_) {
+        // Client disconnected / safety cap fired while the checkout was
+        // in flight. Release the lease immediately so the connection
+        // returns to the pool for another request to use, instead of
+        // sitting idle attached to a torn-down transaction.
+        lease.Release();
+        return;
+    }
     if (state_ != State::CHECKOUT_PENDING) {
         // Transaction was cancelled or already completed (shouldn't happen
         // in normal flow, but guard defensively).
@@ -188,6 +196,7 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
 }
 
 void ProxyTransaction::OnCheckoutError(int error_code) {
+    if (cancelled_) return;
     if (state_ != State::CHECKOUT_PENDING) {
         return;
     }
@@ -293,6 +302,7 @@ void ProxyTransaction::SendUpstreamRequest() {
 void ProxyTransaction::OnUpstreamData(
     std::shared_ptr<ConnectionHandler> conn, std::string& data) {
     // Guard against callbacks after completion/failure
+    if (cancelled_) return;
     if (state_ == State::COMPLETE || state_ == State::FAILED) {
         return;
     }
@@ -435,6 +445,7 @@ void ProxyTransaction::OnUpstreamData(
 
 void ProxyTransaction::OnUpstreamWriteComplete(
     std::shared_ptr<ConnectionHandler> conn) {
+    if (cancelled_) return;
     // Clear the send-phase write-progress callback installed in
     // SendUpstreamRequest. The response-wait phase uses a hard
     // (unrefreshed) deadline. Done regardless of state so an early
@@ -528,6 +539,9 @@ void ProxyTransaction::OnError(int result_code,
 }
 
 void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
+    // Short-circuit on cancellation — no point retrying against a
+    // disconnected client.
+    if (cancelled_) return;
     // In v1 (buffered), headers_sent is always false -- no response data
     // has been sent to the client yet.
     if (retry_policy_.ShouldRetry(attempt_, method_, condition, false)) {
@@ -613,6 +627,27 @@ void ProxyTransaction::DeliverResponse(HttpResponse response) {
         complete_cb_ = nullptr;
         cb(std::move(response));
     }
+}
+
+void ProxyTransaction::Cancel() {
+    if (cancelled_ || complete_cb_invoked_) {
+        return;
+    }
+    logging::Get()->debug("ProxyTransaction::Cancel client_fd={} service={} "
+                          "state={}", client_fd_, service_name_,
+                          static_cast<int>(state_));
+    cancelled_ = true;
+    // Mark the completion callback as "already invoked" so any late
+    // DeliverResponse path triggered by an in-flight upstream reply
+    // becomes a no-op. The framework's abort hook has already handled
+    // the client-side bookkeeping; delivering a response to a
+    // disconnected client would be pointless and confuses the complete-
+    // closure's one-shot completed/cancelled contract.
+    complete_cb_invoked_ = true;
+    complete_cb_ = nullptr;
+    // Release the upstream lease back to the pool and clear transport
+    // callbacks so any in-flight upstream bytes land harmlessly.
+    Cleanup();
 }
 
 void ProxyTransaction::Cleanup() {

@@ -937,28 +937,28 @@ void HttpServer::Proxy(const std::string& route_pattern,
     };
     std::vector<MethodRegistration> to_register;
     to_register.reserve(accepted_methods.size());
+    // PRE-CHECK PER (METHOD, PATTERN): filter individual collisions
+    // rather than dropping the whole method on the first conflict.
+    // Without this, a proxy on /api/*rest whose bare-prefix companion
+    // /api collides with an existing async GET /api would drop GET
+    // entirely — even though the catch-all /api/*rest would still
+    // coexist in the trie and serve /api/foo.
     for (const auto& method : accepted_methods) {
-        bool async_conflict = false;
-        std::string async_conflict_pattern;
-        for (const auto& pattern : patterns_to_register) {
-            if (router_.HasAsyncRouteConflict(method, pattern)) {
-                async_conflict = true;
-                async_conflict_pattern = pattern;
-                break;
-            }
-        }
-        if (async_conflict) {
-            logging::Get()->warn(
-                "Proxy: async route '{} {}' already registered on the "
-                "router, skipping method for upstream '{}'",
-                method, async_conflict_pattern, upstream_service_name);
-            continue;
-        }
-
         MethodRegistration mr;
         mr.method = method;
         mr.patterns.reserve(patterns_to_register.size());
         for (const auto& pattern : patterns_to_register) {
+            // Async conflict: the pre-check subsumes the trie's
+            // own throw condition for this specific pattern, so
+            // skipping just this pattern is safe.
+            if (router_.HasAsyncRouteConflict(method, pattern)) {
+                logging::Get()->warn(
+                    "Proxy: async route '{} {}' already registered on the "
+                    "router, skipping pattern for upstream '{}'",
+                    method, pattern, upstream_service_name);
+                continue;
+            }
+            // Sync conflict on the derived bare-prefix companion.
             if (!derived_companion.empty() && pattern == derived_companion &&
                 router_.HasSyncRouteConflict(method, pattern)) {
                 logging::Get()->warn(
@@ -1311,11 +1311,16 @@ void HttpServer::RegisterProxyRoutes() {
             patterns_to_register.push_back(config_prefix);
         }
 
-        // PRE-CHECK PER METHOD: build a per-method list of patterns
-        // considering both async conflicts (drop the method entirely)
-        // and sync conflicts on the derived companion (drop just that
-        // (method, pattern) to avoid hijacking a pre-existing sync
-        // handler). See HttpServer::Proxy for the detailed rationale.
+        // PRE-CHECK PER (METHOD, PATTERN): build a per-method list of
+        // patterns, filtering out individual collisions rather than
+        // dropping the entire method on the first conflict. Previously
+        // an async conflict on ANY pattern (e.g. an existing async GET
+        // /api overlapping with the bare-prefix companion of a proxy
+        // on /api/*rest) dropped GET for the whole proxy — even though
+        // the catch-all /api/*rest would still coexist in the trie.
+        // The sync-companion branch below already does this per-pattern;
+        // async is now symmetric. See HttpServer::Proxy for the
+        // same fix applied to the programmatic path.
         struct MethodRegistration {
             std::string method;
             std::vector<std::string> patterns;
@@ -1323,28 +1328,25 @@ void HttpServer::RegisterProxyRoutes() {
         std::vector<MethodRegistration> to_register;
         to_register.reserve(accepted_methods.size());
         for (const auto& method : accepted_methods) {
-            bool async_conflict = false;
-            std::string async_conflict_pattern;
-            for (const auto& pattern : patterns_to_register) {
-                if (router_.HasAsyncRouteConflict(method, pattern)) {
-                    async_conflict = true;
-                    async_conflict_pattern = pattern;
-                    break;
-                }
-            }
-            if (async_conflict) {
-                logging::Get()->warn(
-                    "RegisterProxyRoutes: async route '{} {}' already "
-                    "registered on the router, skipping method for "
-                    "upstream '{}'",
-                    method, async_conflict_pattern, upstream.name);
-                continue;
-            }
-
             MethodRegistration mr;
             mr.method = method;
             mr.patterns.reserve(patterns_to_register.size());
             for (const auto& pattern : patterns_to_register) {
+                // Async conflict: the pre-check subsumes the trie's
+                // own throw condition for this specific pattern, so
+                // skipping just this pattern is safe (the remaining
+                // patterns in this method cannot trigger a mid-loop
+                // RouteAsync throw).
+                if (router_.HasAsyncRouteConflict(method, pattern)) {
+                    logging::Get()->warn(
+                        "RegisterProxyRoutes: async route '{} {}' already "
+                        "registered on the router, skipping pattern for "
+                        "upstream '{}'",
+                        method, pattern, upstream.name);
+                    continue;
+                }
+                // Sync conflict on the derived bare-prefix companion:
+                // skip this one pattern so the async catch-all remains.
                 if (!derived_companion.empty() &&
                     pattern == derived_companion &&
                     router_.HasSyncRouteConflict(method, pattern)) {
@@ -2073,6 +2075,14 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 //              decrements, and the guard also decrements.
                 auto completed = std::make_shared<std::atomic<bool>>(false);
                 auto cancelled = std::make_shared<std::atomic<bool>>(false);
+                // Allocate a cancel slot for handler-installed cleanup
+                // (e.g., ProxyHandler registers tx->Cancel() here).
+                // Fired by the async abort hook below. Populated BEFORE
+                // invoking async_handler so the handler can install its
+                // cancel callback inline.
+                auto cancel_slot =
+                    std::make_shared<std::function<void()>>();
+                request.async_cancel_slot = cancel_slot;
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, active_counter,
                      mw_headers, completed, cancelled](HttpResponse final_resp) {
@@ -2185,14 +2195,31 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 // the active_requests bookkeeping exactly once. Uses the
                 // same one-shot `completed` atomic as the complete
                 // closure so abort + complete races decrement at most
-                // once.
+                // once. Also fires the handler-installed cancel_slot
+                // (e.g. ProxyHandler's tx->Cancel()) so upstream work
+                // can release pool capacity instead of running to
+                // completion against a disconnected client.
                 self->SetAsyncAbortHook(
-                    [completed, cancelled, active_counter]() {
+                    [completed, cancelled, active_counter, cancel_slot]() {
                         if (!completed->exchange(true,
                                                  std::memory_order_acq_rel)) {
                             cancelled->store(true, std::memory_order_release);
                             active_counter->fetch_sub(
                                 1, std::memory_order_relaxed);
+                            // Fire handler cancel (if any) — one-shot.
+                            // Move out first so a throwing cancel hook
+                            // cannot be re-entered and the captures are
+                            // released even on failure.
+                            if (cancel_slot && *cancel_slot) {
+                                auto local = std::move(*cancel_slot);
+                                *cancel_slot = nullptr;
+                                try { local(); }
+                                catch (const std::exception& e) {
+                                    logging::Get()->error(
+                                        "Async cancel hook threw: {}",
+                                        e.what());
+                                }
+                            }
                         }
                     });
                 // Disarm the guard so the callback (or the abort hook)
@@ -2822,6 +2849,13 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 // marks `completed` so the callback becomes a no-op.
                 auto completed = std::make_shared<std::atomic<bool>>(false);
                 auto cancelled = std::make_shared<std::atomic<bool>>(false);
+                // Handler-installed cancel slot — mirrors HTTP/1.
+                // Populated before async_handler runs; fired by the
+                // per-stream abort hook on client-side abort (stream
+                // RST, close callback, or the async safety cap).
+                auto cancel_slot =
+                    std::make_shared<std::function<void()>>();
+                request.async_cancel_slot = cancel_slot;
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, stream_id, active_counter,
                      mw_headers, completed, cancelled](HttpResponse final_resp) {
@@ -2918,15 +2952,28 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 // completed/cancelled atomics and decrements
                 // active_requests exactly once, avoiding the
                 // bookkeeping leak that would otherwise occur when
-                // the real handler never calls complete().
+                // the real handler never calls complete(). It also
+                // fires the handler-installed cancel_slot (e.g.
+                // ProxyHandler's tx->Cancel()) so upstream work is
+                // released back to the pool on client-side abort.
                 self->SetStreamAbortHook(
                     stream_id,
-                    [completed, cancelled, active_counter]() {
+                    [completed, cancelled, active_counter, cancel_slot]() {
                         if (!completed->exchange(true,
                                                  std::memory_order_acq_rel)) {
                             cancelled->store(true, std::memory_order_release);
                             active_counter->fetch_sub(
                                 1, std::memory_order_relaxed);
+                            if (cancel_slot && *cancel_slot) {
+                                auto local = std::move(*cancel_slot);
+                                *cancel_slot = nullptr;
+                                try { local(); }
+                                catch (const std::exception& e) {
+                                    logging::Get()->error(
+                                        "Async cancel hook threw: {}",
+                                        e.what());
+                                }
+                            }
                         }
                     });
                 guard.release();

@@ -158,6 +158,23 @@ void ProxyHandler::Handle(
         upstream_path_override,
         static_prefix_);
 
+    // Install a cancel hook on the framework's per-request async cancel
+    // slot so client disconnects / safety-cap timeouts / HTTP/2 stream
+    // RSTs can tell this transaction to release its upstream lease
+    // immediately. Without this, queued checkout callbacks and upstream
+    // transport callbacks keep the transaction alive against a slow or
+    // hung upstream — occupying pool capacity even though the client
+    // is gone. Captured as weak_ptr so this hook does not extend the
+    // transaction's lifetime past its normal shared_ptr chain.
+    if (request.async_cancel_slot) {
+        std::weak_ptr<ProxyTransaction> weak_txn = txn;
+        *request.async_cancel_slot = [weak_txn]() {
+            if (auto t = weak_txn.lock()) {
+                t->Cancel();
+            }
+        };
+    }
+
     txn->Start();
     // txn stays alive via shared_ptr captured in async callbacks
 }

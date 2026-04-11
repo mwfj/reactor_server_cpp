@@ -33,6 +33,30 @@ struct HttpRequest {
     mutable bool client_tls = false;  // True if downstream connection has TLS
     mutable int client_fd = -1;       // Client socket fd (for log correlation)
 
+    // Cancel channel for async handlers.
+    //
+    // The framework allocates this before dispatching to an async
+    // handler and stashes the shared_ptr in the per-request abort
+    // hook's capture set. A handler (e.g. ProxyHandler) may install a
+    // cancel callback on the slot that will be fired AT MOST ONCE
+    // when the request's async cycle is aborted:
+    //   - client disconnect (RemoveConnection → TripAsyncAbortHook)
+    //   - deferred-response safety cap (HTTP/1 heartbeat)
+    //   - stream-close / async-cap RST (HTTP/2)
+    //
+    // For proxy routes this is the only reliable way to tell a
+    // ProxyTransaction to stop: transport callbacks and queued
+    // checkout completions all hold shared_ptrs to the transaction,
+    // so without an explicit Cancel() signal a disconnected client
+    // would leave the transaction running against a slow/hung upstream
+    // until that upstream responds or times out — starving the pool
+    // under a burst of disconnects.
+    //
+    // Dispatcher-thread only: both Set() (from the handler) and Fire()
+    // (from the abort hook) run on the connection's dispatcher, so
+    // no synchronization is needed. Null on sync routes.
+    mutable std::shared_ptr<std::function<void()>> async_cancel_slot;
+
     // Case-insensitive header lookup
     std::string GetHeader(const std::string& name) const {
         std::string lower = name;
@@ -67,5 +91,6 @@ struct HttpRequest {
         client_ip.clear();
         client_tls = false;
         client_fd = -1;
+        async_cancel_slot.reset();
     }
 };
