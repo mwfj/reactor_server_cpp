@@ -175,6 +175,20 @@ void ProxyHandler::Handle(
         };
     }
 
+    // Honor the operator's "disabled" intent: when response_timeout_ms
+    // is 0 this upstream is allowed unbounded response lifetime
+    // (SSE, long-poll, intentionally unbounded backends). The global
+    // async-deferred safety cap would otherwise abort this request
+    // after the default floor (~1 hour), contradicting the configured
+    // behavior advertised by response_timeout_ms=0. Writing 0 into
+    // the per-request override tells the framework's deferred
+    // heartbeat (HTTP/1) and ResetExpiredStreams (HTTP/2) to skip
+    // the safety-cap check for THIS request only — unrelated routes
+    // on the same server still get their normal global cap.
+    if (config_.response_timeout_ms == 0) {
+        request.async_cap_sec_override = 0;
+    }
+
     txn->Start();
     // txn stays alive via shared_ptr captured in async callbacks
 }

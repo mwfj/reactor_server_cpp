@@ -687,7 +687,16 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             int heartbeat_sec = request_timeout_sec_ > 0
                               ? request_timeout_sec_
                               : ASYNC_HEARTBEAT_FALLBACK_SEC;
-            int cap_sec = max_async_deferred_sec_;  // 0 = no cap
+            // Per-request override takes precedence over the global cap.
+            // A handler (e.g. ProxyHandler with response_timeout_ms=0)
+            // may set req.async_cap_sec_override to 0 to disable the
+            // cap for unbounded requests (SSE, long-poll) without
+            // affecting unrelated routes on the same connection. See
+            // HttpRequest::async_cap_sec_override for the full
+            // rationale and sentinel semantics.
+            int cap_sec = (req.async_cap_sec_override >= 0)
+                        ? req.async_cap_sec_override
+                        : max_async_deferred_sec_;  // 0 = no cap
             deferred_start_ = std::chrono::steady_clock::now();
             conn_->SetDeadline(deferred_start_ +
                                std::chrono::seconds(heartbeat_sec));

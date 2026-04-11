@@ -57,6 +57,36 @@ struct HttpRequest {
     // no synchronization is needed. Null on sync routes.
     mutable std::shared_ptr<std::function<void()>> async_cancel_slot;
 
+    // Per-request override for the async-deferred safety cap.
+    //
+    //   -1 (default): use HttpConnectionHandler::max_async_deferred_sec_
+    //                 / Http2ConnectionHandler::max_async_deferred_sec_
+    //                 (the global cap computed by RecomputeAsyncDeferredCap
+    //                 from proxy.response_timeout_ms + buffer).
+    //    0         : DISABLE the safety cap for this specific request —
+    //                 the deferred heartbeat / ResetExpiredStreams will
+    //                 not abort it on cap expiry. Used by proxy handlers
+    //                 whose upstream has response_timeout_ms=0 (SSE,
+    //                 long-poll, intentionally unbounded backends).
+    //   >0         : use this many seconds as the cap for this request.
+    //
+    // Rationale: a single global cap cannot satisfy both "protect
+    // unrelated routes from stuck handlers" and "honor the configured
+    // 'disabled' semantic for specific proxies." Per-request override
+    // lets the handler pick the right behavior for its own request:
+    //   - Custom async handlers that don't set this → global cap applies.
+    //   - Proxies with response_timeout_ms > 0 → don't set this; global
+    //     cap still provides the last-resort abort above the per-request
+    //     upstream deadline.
+    //   - Proxies with response_timeout_ms == 0 → set to 0; the operator
+    //     has explicitly opted out of timeouts and expects unbounded
+    //     lifetime for the request.
+    //
+    // Mutable because, like async_cancel_slot / params, it is populated
+    // by the handler during dispatch through a const HttpRequest&.
+    // Dispatcher-thread only.
+    mutable int async_cap_sec_override = -1;
+
     // Case-insensitive header lookup
     std::string GetHeader(const std::string& name) const {
         std::string lower = name;
@@ -92,5 +122,6 @@ struct HttpRequest {
         client_tls = false;
         client_fd = -1;
         async_cancel_slot.reset();
+        async_cap_sec_override = -1;
     }
 };

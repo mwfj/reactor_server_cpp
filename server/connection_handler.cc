@@ -263,7 +263,6 @@ void ConnectionHandler::OnMessage(){
     bool alpn_h2_ready = tls_just_ready && input_bf_.Size() == 0 && tls_ &&
                          (GetAlpnProtocol() == "h2" ||
                           connect_state_ == ConnectState::CONNECTED);
-    bool callback_ran = false;
     if((input_bf_.Size() > 0 || alpn_h2_ready) && callbacks_.on_message_callback){
         std::string message(input_bf_.Data(), input_bf_.Size());
         callbacks_.on_message_callback(shared_from_this(), message);
@@ -271,7 +270,6 @@ void ConnectionHandler::OnMessage(){
         ts_ = TimeStamp::Now();
         // Clear the input buffer after processing
         input_bf_.Clear();
-        callback_ran = true;
     }
 
     // If peer sent EOF and connection isn't already closing (the sync fast-path
@@ -281,19 +279,31 @@ void ConnectionHandler::OnMessage(){
             // Data still being flushed — enable write mode to drain it.
             // CallWriteCb will ForceClose when the buffer empties.
             client_channel_->EnableWriteMode();
-        } else if (callback_ran) {
-            // Callback ran but buffer is empty and connection not closed.
-            // Possible cases:
-            // - Sync handler sent response, fast-path ForceClose'd → is_closing_ true
-            //   (caught above, won't reach here)
-            // - Async handler will send response later via SendData/SendRaw →
-            //   the fast-path there will see close_after_write_ and ForceClose.
-            //   Set a deadline in case the async handler never responds.
-            if (!has_deadline_) {
-                SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(5));
-            }
         } else {
-            // No callback ran (EOF without data) — nothing to wait for.
+            // Peer EOF and output buffer is empty: the client is gone
+            // and there is nothing queued for them. ForceClose now so
+            // the close callback runs immediately — that drives
+            // HttpServer::RemoveConnection → TripAsyncAbortHook, which
+            // fires the per-request cancel (cancels in-flight proxy
+            // transactions, releases the pool lease, flips the
+            // completion bookkeeping).
+            //
+            // Previously this branch waited on a 5s fallback deadline
+            // (when none existed) or on the existing deadline (set by
+            // the deferred-response heartbeat, up to ~60s). For async
+            // routes that means the proxy kept running against a
+            // disconnected client and kept a pool slot occupied until
+            // the deadline fired. Under disconnect bursts that
+            // compounds into tens of seconds of wasted upstream work
+            // and delayed pool recycling. Closing immediately trims
+            // that latency to the event-loop wakeup.
+            //
+            // Safety: the abort hook mechanism is specifically designed
+            // to handle this race. ProxyTransaction::Cancel is
+            // idempotent and marks complete_cb_invoked_ so any late
+            // DeliverResponse becomes a no-op; SendRaw from a stored
+            // completion callback after ForceClose is also a no-op
+            // (fast-paths short-circuit on is_closing_).
             ForceClose();
         }
     }

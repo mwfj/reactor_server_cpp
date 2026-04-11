@@ -1115,9 +1115,15 @@ void HttpServer::RecomputeAsyncDeferredCap() {
         }
         if (!found) continue;  // Should not happen — defensive
         if (found->proxy.response_timeout_ms == 0) {
-            // Opted out of a per-request deadline for this upstream.
-            // Do not let this upstream's opt-out tear down the global
-            // safety net for unrelated routes. Fall back to the floor.
+            // This upstream is opted out of per-request deadlines.
+            // We neither raise NOR disable the global cap here —
+            // ProxyHandler::Handle sets a PER-REQUEST override
+            // (HttpRequest::async_cap_sec_override = 0) so that THIS
+            // proxy's requests run unbounded while unrelated routes on
+            // the same server still get the global safety net. See
+            // HttpRequest::async_cap_sec_override and the per-request
+            // override read in HttpConnectionHandler's deferred
+            // heartbeat / Http2Session::ResetExpiredStreams.
             continue;
         }
         // 64-bit ceil division + saturating add to keep the cap

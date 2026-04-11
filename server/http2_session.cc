@@ -960,7 +960,6 @@ size_t Http2Session::ResetExpiredStreams(int parse_timeout_sec,
                                           std::vector<int32_t>* async_cap_reset_ids) {
     auto now = std::chrono::steady_clock::now();
     auto parse_limit = std::chrono::seconds(parse_timeout_sec);
-    auto async_limit = std::chrono::seconds(async_cap_sec);
     size_t count = 0;
 
     for (auto& [id, stream] : streams_) {
@@ -978,11 +977,15 @@ size_t Http2Session::ResetExpiredStreams(int parse_timeout_sec,
             // normally bounded by the handler's own timeout
             // (proxy.response_timeout_ms, custom deadlines). The
             // async_cap_sec here is an absolute safety net for stuck
-            // handlers that never submit a response. Honor only when
-            // > 0 (0 = caller opted out, e.g. proxy.response_timeout_ms=0
-            // present). The caller is expected to size async_cap_sec
-            // to respect the longest configured handler timeout — don't
-            // override operator config from inside the trie.
+            // handlers that never submit a response. The effective cap
+            // is PER-STREAM: if the request set an override
+            // (req.async_cap_sec_override >= 0) that wins for THIS
+            // stream. Otherwise fall back to the connection-level
+            // async_cap_sec parameter. An override of 0 disables the
+            // cap entirely for that stream (used by proxies with
+            // response_timeout_ms=0 to support SSE / long-poll /
+            // intentionally unbounded backends — the operator's
+            // configured "disabled" semantic).
             //
             // Anchor the check at DispatchedAt() (when the stream
             // transitioned from "being parsed" to "awaiting async
@@ -993,12 +996,16 @@ size_t Http2Session::ResetExpiredStreams(int parse_timeout_sec,
             // work. DispatchedAt() == time_point::max() when the stream
             // has not been dispatched — and in that case IsCounterDecremented
             // is false, so we never hit this branch with the sentinel.
-            if (async_cap_sec > 0 &&
-                now - stream->DispatchedAt() > async_limit) {
+            const auto& req = stream->GetRequest();
+            int effective_cap = (req.async_cap_sec_override >= 0)
+                              ? req.async_cap_sec_override
+                              : async_cap_sec;
+            if (effective_cap > 0 &&
+                now - stream->DispatchedAt() > std::chrono::seconds(effective_cap)) {
                 logging::Get()->warn(
                     "HTTP/2 async stream {} exceeded async cap ({}s) "
                     "without completion; RST'ing to release slot",
-                    id, async_cap_sec);
+                    id, effective_cap);
                 stream->MarkRejected();
                 nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
                                           id, NGHTTP2_CANCEL);
