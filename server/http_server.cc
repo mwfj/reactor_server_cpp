@@ -825,7 +825,7 @@ void HttpServer::Proxy(const std::string& route_pattern,
         mr.patterns.reserve(patterns_to_register.size());
         for (const auto& pattern : patterns_to_register) {
             if (!derived_companion.empty() && pattern == derived_companion &&
-                router_.HasSyncRouteMatching(method, pattern)) {
+                router_.HasSyncRouteConflict(method, pattern)) {
                 logging::Get()->warn(
                     "Proxy: sync route '{} {}' matches bare-prefix "
                     "companion; NOT registering async companion to "
@@ -1120,7 +1120,7 @@ void HttpServer::RegisterProxyRoutes() {
             for (const auto& pattern : patterns_to_register) {
                 if (!derived_companion.empty() &&
                     pattern == derived_companion &&
-                    router_.HasSyncRouteMatching(method, pattern)) {
+                    router_.HasSyncRouteConflict(method, pattern)) {
                     logging::Get()->warn(
                         "RegisterProxyRoutes: sync route '{} {}' matches "
                         "bare-prefix companion; NOT registering async "

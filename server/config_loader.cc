@@ -650,7 +650,17 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     "'): pool.max_requests_per_conn must be >= 0 (0 = unlimited)");
             }
 
-            // Proxy config validation
+            // Proxy config validation.
+            //
+            // route_prefix is the only field that's skipped when empty —
+            // the manual HttpServer::Proxy() API intentionally leaves it
+            // empty and passes the pattern as a code argument, so there's
+            // nothing to parse here. All the other proxy settings
+            // (methods, response_timeout_ms, retry) are read by the manual
+            // API at registration time and need to be validated up-front
+            // so bad values fail fast at config load instead of surfacing
+            // later as a logged "Proxy: registration error" that silently
+            // drops the route.
             if (!u.proxy.route_prefix.empty()) {
                 // Validate route_prefix is a well-formed route pattern.
                 // Catches double slashes, duplicate param names, catch-all
@@ -664,25 +674,27 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                         idx + " ('" + u.name +
                         "'): proxy.route_prefix is invalid: " + e.what());
                 }
+            }
 
-                // 0 = disabled (no response deadline). Otherwise minimum
-                // 1000ms: deadline checks run on the dispatcher's timer scan
-                // which has 1-second resolution. Sub-second positive values
-                // can't be honored accurately — reject them.
-                if (u.proxy.response_timeout_ms != 0 &&
-                    u.proxy.response_timeout_ms < 1000) {
-                    throw std::invalid_argument(
-                        idx + " ('" + u.name +
-                        "'): proxy.response_timeout_ms must be 0 (disabled) "
-                        "or >= 1000 (timer scan resolution is 1s)");
-                }
-                if (u.proxy.retry.max_retries < 0 || u.proxy.retry.max_retries > 10) {
-                    throw std::invalid_argument(
-                        idx + " ('" + u.name +
-                        "'): proxy.retry.max_retries must be >= 0 and <= 10");
-                }
-                // Validate method names — reject unknowns and duplicates.
-                // Duplicates would cause RouteAsync to throw at startup.
+            // 0 = disabled (no response deadline). Otherwise minimum
+            // 1000ms: deadline checks run on the dispatcher's timer scan
+            // which has 1-second resolution. Sub-second positive values
+            // can't be honored accurately — reject them.
+            if (u.proxy.response_timeout_ms != 0 &&
+                u.proxy.response_timeout_ms < 1000) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.response_timeout_ms must be 0 (disabled) "
+                    "or >= 1000 (timer scan resolution is 1s)");
+            }
+            if (u.proxy.retry.max_retries < 0 || u.proxy.retry.max_retries > 10) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.retry.max_retries must be >= 0 and <= 10");
+            }
+            // Validate method names — reject unknowns and duplicates.
+            // Duplicates would cause RouteAsync to throw at startup.
+            {
                 static const std::unordered_set<std::string> valid_methods = {
                     "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"
                 };

@@ -115,18 +115,17 @@ public:
     bool HasAsyncRouteConflict(const std::string& method,
                                 const std::string& pattern) const;
 
-    // Check whether a SYNC route exists for the given method that would
-    // be served for the given path. Used by proxy registration to avoid
-    // silently hijacking a pre-existing sync handler on a bare-prefix
-    // companion pattern (derived from an explicit catch-all like
-    // /api/*rest → companion /api). Because async routes win over sync
-    // routes at dispatch time, registering an async companion on top of
-    // a sync handler for the same path would reroute the request
-    // through the proxy. This checker uses RouteTrie::HasMatch which
-    // walks the sync trie and returns true if any registered sync
-    // pattern would match the literal path.
-    bool HasSyncRouteMatching(const std::string& method,
-                               const std::string& path) const;
+    // Check whether a registered SYNC route would conflict with the
+    // given method+pattern. This is a PATTERN-level (semantic) check,
+    // not a literal-path match: it uses the same normalization as
+    // HasAsyncRouteConflict, so /api/:id and /api/:user map to the same
+    // key, and /api/:id([0-9]+) is caught even though the literal string
+    // "/api/:id([0-9]+)" is not itself a request path. Used by proxy
+    // registration to prevent a derived bare-prefix companion from
+    // silently hijacking a pre-existing sync handler via async-over-sync
+    // dispatch precedence.
+    bool HasSyncRouteConflict(const std::string& method,
+                               const std::string& pattern) const;
 
 private:
     // Per-method route tries (one trie per HTTP method)
@@ -163,4 +162,12 @@ private:
     // equivalent pattern like /users/:id vs /users/:user.
     std::unordered_map<std::string, std::unordered_set<std::string>>
         async_pattern_keys_;
+
+    // Mirror of async_pattern_keys_ for SYNC routes. Used by
+    // HasSyncRouteConflict() to catch the case where a derived proxy
+    // companion pattern (e.g., /api/:version([0-9]+) extracted from
+    // /api/:version([0-9]+)/*rest) would shadow an existing sync route.
+    // Populated in Route() whenever a sync handler is registered.
+    std::unordered_map<std::string, std::unordered_set<std::string>>
+        sync_pattern_keys_;
 };

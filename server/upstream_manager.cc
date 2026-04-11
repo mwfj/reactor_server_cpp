@@ -74,15 +74,27 @@ UpstreamManager::UpstreamManager(
 
     // Adjust dispatcher timer intervals for upstream timeout enforcement.
     // Without this, standalone dispatchers use their default interval (often
-    // 60s), making connect_timeout_ms and idle_timeout_sec fire tens of
-    // seconds late. HttpServer::MarkServerReady does this for production;
-    // this covers standalone UpstreamManager usage.
+    // 60s), making connect_timeout_ms / idle_timeout_sec / proxy
+    // response_timeout_ms fire tens of seconds late.
+    // HttpServer::MarkServerReady does this for production; this covers
+    // standalone UpstreamManager usage (see HttpServer::MarkServerReady
+    // for the mirrored logic).
     int min_upstream_sec = std::numeric_limits<int>::max();
     for (const auto& u : upstreams) {
         int connect_sec = std::max((u.pool.connect_timeout_ms + 999) / 1000, 1);
         min_upstream_sec = std::min(min_upstream_sec, connect_sec);
         if (u.pool.idle_timeout_sec > 0) {
             min_upstream_sec = std::min(min_upstream_sec, u.pool.idle_timeout_sec);
+        }
+        // Proxy response timeout: also drives timer scan cadence when
+        // ProxyTransaction::ArmResponseTimeout sets a deadline on the
+        // transport. Without folding this in, a configured
+        // proxy.response_timeout_ms can still fire at the default ~60s
+        // cadence instead of its configured budget.
+        if (u.proxy.response_timeout_ms > 0) {
+            int response_sec = std::max(
+                (u.proxy.response_timeout_ms + 999) / 1000, 1);
+            min_upstream_sec = std::min(min_upstream_sec, response_sec);
         }
     }
     if (min_upstream_sec < std::numeric_limits<int>::max()) {

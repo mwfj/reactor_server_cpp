@@ -3,26 +3,6 @@
 #include "log/log_utils.h"
 // <algorithm> provided by common.h (via http_request.h)
 
-void HttpRouter::Get(const std::string& path, Handler handler) {
-    Route("GET", path, std::move(handler));
-}
-
-void HttpRouter::Post(const std::string& path, Handler handler) {
-    Route("POST", path, std::move(handler));
-}
-
-void HttpRouter::Put(const std::string& path, Handler handler) {
-    Route("PUT", path, std::move(handler));
-}
-
-void HttpRouter::Delete(const std::string& path, Handler handler) {
-    Route("DELETE", path, std::move(handler));
-}
-
-void HttpRouter::Route(const std::string& method, const std::string& path, Handler handler) {
-    method_tries_[method].Insert(path, std::move(handler));
-}
-
 // Reduce a route pattern to its semantic shape for conflict detection.
 // Two patterns that produce the same key will collide in the same trie
 // (matching RouteTrie's insert-time equivalence: param/catch-all names
@@ -42,7 +22,7 @@ void HttpRouter::Route(const std::string& method, const std::string& path, Handl
 //   "/users/:name/b"        -> "/users/:/b"      (different tail -> no conflict)
 //   "/api/*rest"            -> "/api/*"
 //   "/api/*tail"            -> "/api/*"          (same key -> conflict)
-static std::string NormalizeAsyncPatternKey(const std::string& pattern) {
+static std::string NormalizePatternKey(const std::string& pattern) {
     std::string result;
     result.reserve(pattern.size());
     size_t i = 0;
@@ -82,27 +62,51 @@ static std::string NormalizeAsyncPatternKey(const std::string& pattern) {
     return result;
 }
 
+void HttpRouter::Get(const std::string& path, Handler handler) {
+    Route("GET", path, std::move(handler));
+}
+
+void HttpRouter::Post(const std::string& path, Handler handler) {
+    Route("POST", path, std::move(handler));
+}
+
+void HttpRouter::Put(const std::string& path, Handler handler) {
+    Route("PUT", path, std::move(handler));
+}
+
+void HttpRouter::Delete(const std::string& path, Handler handler) {
+    Route("DELETE", path, std::move(handler));
+}
+
+void HttpRouter::Route(const std::string& method, const std::string& path, Handler handler) {
+    // Insert into the trie first so any duplicate-pattern exception
+    // surfaces before we mirror it into sync_pattern_keys_. If the trie
+    // throws, the tracking set stays consistent.
+    method_tries_[method].Insert(path, std::move(handler));
+    sync_pattern_keys_[method].insert(NormalizePatternKey(path));
+}
+
 void HttpRouter::RouteAsync(const std::string& method, const std::string& path,
                             AsyncHandler handler) {
     // Insert into the trie first so any duplicate-pattern exception
     // surfaces before we mirror it into async_pattern_keys_. If the trie
     // throws, async_pattern_keys_ stays consistent.
     async_method_tries_[method].Insert(path, std::move(handler));
-    async_pattern_keys_[method].insert(NormalizeAsyncPatternKey(path));
+    async_pattern_keys_[method].insert(NormalizePatternKey(path));
 }
 
 bool HttpRouter::HasAsyncRouteConflict(const std::string& method,
                                         const std::string& pattern) const {
     auto it = async_pattern_keys_.find(method);
     if (it == async_pattern_keys_.end()) return false;
-    return it->second.count(NormalizeAsyncPatternKey(pattern)) > 0;
+    return it->second.count(NormalizePatternKey(pattern)) > 0;
 }
 
-bool HttpRouter::HasSyncRouteMatching(const std::string& method,
-                                        const std::string& path) const {
-    auto it = method_tries_.find(method);
-    if (it == method_tries_.end()) return false;
-    return it->second.HasMatch(path);
+bool HttpRouter::HasSyncRouteConflict(const std::string& method,
+                                        const std::string& pattern) const {
+    auto it = sync_pattern_keys_.find(method);
+    if (it == sync_pattern_keys_.end()) return false;
+    return it->second.count(NormalizePatternKey(pattern)) > 0;
 }
 
 HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
