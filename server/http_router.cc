@@ -250,17 +250,35 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
         }
     }
 
-    // HEAD fallback to GET (RFC 7231 §4.3.2)
+    // HEAD fallback to GET (RFC 7231 §4.3.2).
+    // Skip the fallback if an async GET route matching the same path
+    // has opted out via DisableHeadFallback() — i.e. a proxy explicitly
+    // excluded HEAD from its methods. Without this check, a sync GET on
+    // the same path would still answer HEAD via fallback, silently
+    // bypassing the user's proxy.methods filter in the overlap case the
+    // async-side guard is meant to protect.
     if (!matched_handler && request.method == "HEAD") {
-        auto get_it = method_tries_.find("GET");
-        if (get_it != method_tries_.end()) {
-            std::unordered_map<std::string, std::string> params;
-            auto result = get_it->second.Search(request.path, params);
-            if (result.handler) {
-                request.params = std::move(params);
-                matched_handler = result.handler;
-                matched_pattern = std::move(result.matched_pattern);
-                head_fallback = true;
+        bool head_blocked_by_async = false;
+        auto async_get_it = async_method_tries_.find("GET");
+        if (async_get_it != async_method_tries_.end()) {
+            std::unordered_map<std::string, std::string> tmp;
+            auto async_result = async_get_it->second.Search(request.path, tmp);
+            if (async_result.handler &&
+                head_fallback_blocked_.count(async_result.matched_pattern)) {
+                head_blocked_by_async = true;
+            }
+        }
+        if (!head_blocked_by_async) {
+            auto get_it = method_tries_.find("GET");
+            if (get_it != method_tries_.end()) {
+                std::unordered_map<std::string, std::string> params;
+                auto result = get_it->second.Search(request.path, params);
+                if (result.handler) {
+                    request.params = std::move(params);
+                    matched_handler = result.handler;
+                    matched_pattern = std::move(result.matched_pattern);
+                    head_fallback = true;
+                }
             }
         }
     }

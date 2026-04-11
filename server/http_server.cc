@@ -131,6 +131,14 @@ static bool IsRepeatableResponseHeader(const std::string& name) {
 // empty in ProxyHandler, and strip_prefix would fall back to static_prefix_
 // stripping (only the leading static segment), misrouting every request.
 static std::string EnsureNamedCatchAll(const std::string& pattern) {
+    // Non-origin-form patterns (e.g. "*" for OPTIONS *) are treated as
+    // EXACT static routes by RouteTrie::ParsePattern when they don't
+    // start with '/'. Never rewrite them — "*" as a catch-all is only
+    // meaningful at a segment boundary of an origin-form path.
+    if (pattern.empty() || pattern.front() != '/') {
+        return pattern;
+    }
+
     bool has_catch_all = false;
     bool is_named = false;
     size_t catch_all_pos = std::string::npos;
@@ -672,9 +680,11 @@ void HttpServer::Proxy(const std::string& route_pattern,
 
     // Detect whether the pattern already contains a catch-all segment.
     // RouteTrie only treats '*' as special at segment start (immediately
-    // after '/'), so mid-segment '*' like /file*name is literal.
+    // after '/'), so mid-segment '*' like /file*name is literal. Also
+    // skip non-origin-form patterns entirely (e.g. "*" for OPTIONS *):
+    // those are exact static routes, not catch-all patterns.
     bool has_catch_all = false;
-    {
+    if (!route_pattern.empty() && route_pattern.front() == '/') {
         for (size_t i = 0; i < route_pattern.size(); ++i) {
             if (route_pattern[i] == '*' &&
                 (i == 0 || route_pattern[i - 1] == '/')) {
@@ -689,6 +699,7 @@ void HttpServer::Proxy(const std::string& route_pattern,
     //  - unnamed catch-all "/*"  → rewrites to "/*<generated>" so
     //                              ProxyHandler's strip_prefix can find it
     //  - already-named "*name"   → unchanged
+    //  - non-origin-form "*"     → unchanged (exact static route)
     std::string config_prefix = EnsureNamedCatchAll(route_pattern);
 
     // Normalize the route for dedup: strip all param and catch-all names
@@ -986,14 +997,18 @@ void HttpServer::RegisterProxyRoutes() {
         }
 
         // Check if the route_prefix already has a catch-all segment.
-        // Same segment-start rule as RouteTrie (only after '/').
+        // Same segment-start rule as RouteTrie (only after '/'). Skip
+        // non-origin-form patterns entirely — "*" for OPTIONS * is an
+        // exact static route, not a catch-all.
         std::string route_pattern = upstream.proxy.route_prefix;
         bool has_catch_all = false;
-        for (size_t i = 0; i < route_pattern.size(); ++i) {
-            if (route_pattern[i] == '*' &&
-                (i == 0 || route_pattern[i - 1] == '/')) {
-                has_catch_all = true;
-                break;
+        if (!route_pattern.empty() && route_pattern.front() == '/') {
+            for (size_t i = 0; i < route_pattern.size(); ++i) {
+                if (route_pattern[i] == '*' &&
+                    (i == 0 || route_pattern[i - 1] == '/')) {
+                    has_catch_all = true;
+                    break;
+                }
             }
         }
 
@@ -1862,7 +1877,25 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                             }
                             merged.AppendHeader(mh.first, mh.second);
                         }
+                        // Dedupe non-repeatable headers WITHIN the final
+                        // response too. Without this, a buggy upstream
+                        // or handler that emits duplicate Content-Type
+                        // / Location / etc. would have both copies
+                        // forwarded verbatim, producing a malformed
+                        // downstream response. Repeatable headers
+                        // (Set-Cookie, Cache-Control, Link, Via, ...)
+                        // are still appended in full.
+                        std::set<std::string> seen_final_non_repeatable;
                         for (const auto& fh : final_resp.GetHeaders()) {
+                            if (!IsRepeatableResponseHeader(fh.first)) {
+                                std::string lower = fh.first;
+                                std::transform(
+                                    lower.begin(), lower.end(), lower.begin(),
+                                    [](unsigned char c) { return std::tolower(c); });
+                                if (!seen_final_non_repeatable.insert(lower).second) {
+                                    continue;  // already emitted first copy
+                                }
+                            }
                             merged.AppendHeader(fh.first, fh.second);
                         }
                         auto s = weak_self.lock();
@@ -2573,7 +2606,25 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                             }
                             merged.AppendHeader(mh.first, mh.second);
                         }
+                        // Dedupe non-repeatable headers WITHIN the final
+                        // response too. Without this, a buggy upstream
+                        // or handler that emits duplicate Content-Type
+                        // / Location / etc. would have both copies
+                        // forwarded verbatim, producing a malformed
+                        // downstream response. Repeatable headers
+                        // (Set-Cookie, Cache-Control, Link, Via, ...)
+                        // are still appended in full.
+                        std::set<std::string> seen_final_non_repeatable;
                         for (const auto& fh : final_resp.GetHeaders()) {
+                            if (!IsRepeatableResponseHeader(fh.first)) {
+                                std::string lower = fh.first;
+                                std::transform(
+                                    lower.begin(), lower.end(), lower.begin(),
+                                    [](unsigned char c) { return std::tolower(c); });
+                                if (!seen_final_non_repeatable.insert(lower).second) {
+                                    continue;  // already emitted first copy
+                                }
+                            }
                             merged.AppendHeader(fh.first, fh.second);
                         }
                         auto s = weak_self.lock();

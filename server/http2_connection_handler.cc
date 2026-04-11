@@ -121,13 +121,17 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
             auto self = weak_self.lock();
             if (!self || !self->session_) return false;
 
-            size_t reset = 0;
-            if (self->request_timeout_sec_ > 0) {
-                reset = self->session_->ResetExpiredStreams(
-                    self->request_timeout_sec_);
-                if (reset > 0) {
-                    self->session_->SendPendingFrames();
-                }
+            // Always run ResetExpiredStreams. It enforces TWO caps:
+            //   1. request_timeout_sec on incomplete streams (skipped
+            //      internally when timeout_sec <= 0).
+            //   2. MAX_ASYNC_DEFERRED_SEC on async/dispatched streams,
+            //      so a stalled or forgotten complete() eventually
+            //      releases its stream slot. This cap applies even
+            //      when request_timeout_sec == 0.
+            size_t reset = self->session_->ResetExpiredStreams(
+                self->request_timeout_sec_);
+            if (reset > 0) {
+                self->session_->SendPendingFrames();
             }
             // Handle graceful shutdown on dispatcher thread
             if (self->shutdown_requested_.load(std::memory_order_acquire) &&
