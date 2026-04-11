@@ -61,20 +61,27 @@ void Http2ConnectionHandler::SetRequestTimeout(int seconds) {
     request_timeout_sec_ = seconds;
     // Reconcile deadline state with the new timeout value. At
     // initialization time deadline_armed_ is false, so this is a no-op.
-    // During live reload, stale deadlines must be updated:
+    // During live reload, stale deadlines must be updated.
+    if (!session_) return;  // Initialize() will arm the initial deadline
     if (seconds <= 0 && deadline_armed_) {
-        // Timeout disabled — clear the stale deadline so the connection
-        // reverts to idle-timeout behavior instead of staying stuck on
-        // an expired deadline with deadline_armed_ = true forever.
+        // Timeout disabled — clear the stale deadline first so
+        // UpdateDeadline recomputes from scratch. Don't just leave
+        // the deadline cleared: when active streams still exist,
+        // UpdateDeadline's has_active branch arms the
+        // ASYNC_HEARTBEAT_FALLBACK_SEC heartbeat so the deadline-
+        // driven timer keeps firing. That heartbeat is the only
+        // thing that drives ResetExpiredStreams for the
+        // max_async_deferred_sec_ safety cap; without it a stuck
+        // async stream could live forever after a live reload from
+        // positive → 0 request_timeout_sec.
         conn_->ClearDeadline();
         deadline_armed_ = false;
-    } else if (seconds > 0 && session_) {
-        // Timeout changed or newly enabled — recompute from the oldest
-        // stream's start time. Handles both deadline_armed_==true (value
-        // change) and false (timeout was previously 0, so no deadline was
-        // ever installed for existing streams).
-        UpdateDeadline();
     }
+    // Always recompute. When seconds > 0 this re-anchors parse-timeout
+    // and/or heartbeat deadlines. When seconds == 0, UpdateDeadline
+    // installs the active-stream heartbeat (or leaves the connection
+    // idle if no streams are active).
+    UpdateDeadline();
 }
 
 void Http2ConnectionHandler::Initialize(const std::string& initial_data) {

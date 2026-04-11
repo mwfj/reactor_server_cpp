@@ -959,15 +959,24 @@ size_t Http2Session::ResetExpiredStreams(int parse_timeout_sec,
 
     for (auto& [id, stream] : streams_) {
         if (stream->IsCounterDecremented()) {
-            // Async (counter-decremented) streams: normally bounded
-            // by the handler's own timeout (proxy.response_timeout_ms,
-            // custom deadlines). The async_cap_sec here is an
-            // absolute safety net for stuck handlers that never
-            // submit a response. Honor only when > 0 (0 = caller
-            // opted out, e.g. proxy.response_timeout_ms=0 present).
-            // The caller is expected to size async_cap_sec to respect
-            // the longest configured handler timeout — don't override
-            // operator config from inside the trie.
+            // Once the handler has submitted response headers the stream
+            // is no longer "awaiting async completion" — it is streaming
+            // a real response (sync responses, async responses post-
+            // completion, long downloads, SSE, etc.). nghttp2 owns body
+            // delivery from here on out; flow control + client backpressure
+            // govern the timing. Applying the async safety cap to these
+            // streams would spuriously RST legitimate long downloads.
+            if (stream->IsResponseHeadersSent()) continue;
+
+            // Async streams whose handler has NOT yet submitted headers:
+            // normally bounded by the handler's own timeout
+            // (proxy.response_timeout_ms, custom deadlines). The
+            // async_cap_sec here is an absolute safety net for stuck
+            // handlers that never submit a response. Honor only when
+            // > 0 (0 = caller opted out, e.g. proxy.response_timeout_ms=0
+            // present). The caller is expected to size async_cap_sec
+            // to respect the longest configured handler timeout — don't
+            // override operator config from inside the trie.
             //
             // Anchor the check at DispatchedAt() (when the stream
             // transitioned from "being parsed" to "awaiting async

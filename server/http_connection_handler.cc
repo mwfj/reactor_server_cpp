@@ -712,11 +712,22 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                             "aborting and sending 504",
                             cap_sec,
                             self->conn_ ? self->conn_->fd() : -1);
-                        self->CancelAsyncResponse();
+                        // Route through CompleteAsyncResponse so HEAD
+                        // body stripping, shutdown-exempt clearing, and
+                        // pipelined-buffer handling all run. Do NOT
+                        // call CancelAsyncResponse first — that wipes
+                        // deferred_was_head_, which CompleteAsyncResponse
+                        // needs to know whether to strip the body.
+                        // Forcing Connection: close on the synthetic 504
+                        // ensures NormalizeOutgoingResponse returns
+                        // should_close=true so the socket is torn down
+                        // (the handler may still be running in the
+                        // background and must not see a reusable
+                        // connection).
                         HttpResponse timeout_resp =
                             HttpResponse::GatewayTimeout();
                         timeout_resp.Header("Connection", "close");
-                        self->SendResponse(timeout_resp);
+                        self->CompleteAsyncResponse(std::move(timeout_resp));
                         return false;
                     }
                 }
