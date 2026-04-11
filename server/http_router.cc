@@ -3,34 +3,20 @@
 #include "log/log_utils.h"
 // <algorithm> provided by common.h (via http_request.h)
 
-// Reduce a route pattern to its semantic shape for conflict detection.
-// Two patterns that produce the same key will collide in the same trie
-// (matching RouteTrie's insert-time equivalence: param/catch-all names
-// don't matter, but segment STRUCTURE does).
+// Reduce a route pattern to its structural shape for conflict detection.
+// Param/catch-all names AND regex constraints are stripped, so two
+// patterns that produce the same key match RouteTrie's insert-time
+// equivalence (the trie throws on two params at the same structural
+// position regardless of names and constraint regexes).
 //
-// Two modes, selected by `preserve_constraints`:
+// Used by HasAsyncRouteConflict: the trie throws on different
+// constraints at the same param position, so collapsing constraints
+// to a single "has param here" marker is CONSERVATIVE (catches more
+// as conflict) and keeps proxy multi-method registration atomic —
+// the pre-check bails before RouteAsync would throw mid-loop, leaving
+// a partial commit.
 //
-//   preserve_constraints=false (async same-trie check, default):
-//     Regex constraints are stripped — any two different constraints
-//     at the same PARAM position throw in RouteTrie::InsertSegments,
-//     so collapsing all constraints to a single "has param here"
-//     marker is CONSERVATIVE (catches more as conflict) and keeps
-//     proxy multi-method registration atomic — the pre-check bails
-//     before RouteAsync would throw mid-loop, leaving a partial
-//     commit. Used by HasAsyncRouteConflict.
-//
-//   preserve_constraints=true (sync cross-trie check):
-//     Regex constraints are preserved in the key, so disjoint routes
-//     like /users/:id([0-9]+) and /users/:slug([a-z]+) get different
-//     keys. Used by HasSyncRouteConflict, which runs across tries
-//     (sync vs async), so the same-trie atomicity argument does not
-//     apply — and a false positive there would drop a valid proxy
-//     bare-prefix companion, leaving otherwise-reachable paths on
-//     404 (e.g. a proxy /users/:slug([a-z]+)/*path skipping its
-//     /users/:slug([a-z]+) companion because a sync
-//     /users/:id([0-9]+) route exists with a disjoint regex).
-//
-// Examples (preserve_constraints=false):
+// Examples:
 //   "/users/:id"            -> "/users/:"
 //   "/users/:user"          -> "/users/:"        (same key -> conflict)
 //   "/users/:id([0-9]+)"    -> "/users/:"        (constraint stripped)
@@ -38,14 +24,7 @@
 //   "/users/:name/b"        -> "/users/:/b"      (different tail -> no conflict)
 //   "/api/*rest"            -> "/api/*"
 //   "/api/*tail"            -> "/api/*"          (same key -> conflict)
-//
-// Examples (preserve_constraints=true):
-//   "/users/:id([0-9]+)"    -> "/users/:([0-9]+)"
-//   "/users/:slug([a-z]+)"  -> "/users/:([a-z]+)" (distinct -> no conflict)
-//   "/users/:id"            -> "/users/:"
-//   "/users/:user"          -> "/users/:"        (same key -> conflict)
-static std::string NormalizePatternKey(const std::string& pattern,
-                                       bool preserve_constraints) {
+static std::string NormalizePatternKey(const std::string& pattern) {
     std::string result;
     result.reserve(pattern.size());
     size_t i = 0;
@@ -58,22 +37,17 @@ static std::string NormalizePatternKey(const std::string& pattern,
             while (i < pattern.size() && pattern[i] != '/' && pattern[i] != '(') {
                 ++i;
             }
-            // Handle the balanced constraint block if present.
+            // Skip the entire balanced constraint block if present.
             if (i < pattern.size() && pattern[i] == '(') {
                 int depth = 0;
                 while (i < pattern.size()) {
                     char c = pattern[i];
                     if (c == '\\' && i + 1 < pattern.size()) {
-                        if (preserve_constraints) {
-                            result += c;
-                            result += pattern[i + 1];
-                        }
                         i += 2;
                         continue;
                     }
                     if (c == '(') ++depth;
                     else if (c == ')') --depth;
-                    if (preserve_constraints) result += c;
                     ++i;
                     if (depth == 0) break;
                 }
@@ -88,6 +62,70 @@ static std::string NormalizePatternKey(const std::string& pattern,
         }
     }
     return result;
+}
+
+// Build a full route fingerprint: strip key + per-param-position
+// constraint list. The constraint at each position is the balanced
+// "(regex)" block exactly as it appeared in the pattern (including
+// the parentheses), or an empty string if the param was unconstrained.
+// Catch-all positions always contribute an empty-constraint entry.
+//
+// Used by HasSyncRouteConflict to detect conflict between a new
+// proxy-companion pattern and existing sync routes. Two fingerprints
+// with matching strip_keys are DISJOINT iff there exists at least one
+// param position where BOTH routes have a constraint AND those
+// constraints differ (truly non-overlapping regexes). Otherwise they
+// OVERLAP: either they are the exact same pattern (same constraints
+// at every position) or one has an unconstrained param where the
+// other is constrained (in which case the unconstrained route covers
+// the constrained subset and must be flagged as a conflict).
+HttpRouter::RouteFingerprint HttpRouter::ExtractFingerprint(const std::string& pattern) {
+    RouteFingerprint fp;
+    std::string& result = fp.strip_key;
+    result.reserve(pattern.size());
+    size_t i = 0;
+    while (i < pattern.size()) {
+        bool at_seg_start = (i == 0) || (result.back() == '/');
+        if (at_seg_start && pattern[i] == ':') {
+            result += ':';
+            ++i;
+            // Skip param name
+            while (i < pattern.size() && pattern[i] != '/' && pattern[i] != '(') {
+                ++i;
+            }
+            // Capture constraint (if any) at THIS param position.
+            if (i < pattern.size() && pattern[i] == '(') {
+                std::string constraint;
+                int depth = 0;
+                while (i < pattern.size()) {
+                    char c = pattern[i];
+                    if (c == '\\' && i + 1 < pattern.size()) {
+                        constraint += c;
+                        constraint += pattern[i + 1];
+                        i += 2;
+                        continue;
+                    }
+                    if (c == '(') ++depth;
+                    else if (c == ')') --depth;
+                    constraint += c;
+                    ++i;
+                    if (depth == 0) break;
+                }
+                fp.constraints.push_back(std::move(constraint));
+            } else {
+                fp.constraints.push_back("");  // unconstrained
+            }
+        } else if (at_seg_start && pattern[i] == '*') {
+            // Catch-all — always the last segment. No regex constraint.
+            result += '*';
+            fp.constraints.push_back("");
+            break;
+        } else {
+            result += pattern[i];
+            ++i;
+        }
+    }
+    return fp;
 }
 
 void HttpRouter::Get(const std::string& path, Handler handler) {
@@ -108,15 +146,13 @@ void HttpRouter::Delete(const std::string& path, Handler handler) {
 
 void HttpRouter::Route(const std::string& method, const std::string& path, Handler handler) {
     // Insert into the trie first so any duplicate-pattern exception
-    // surfaces before we mirror it into sync_pattern_keys_. If the trie
-    // throws, the tracking set stays consistent.
+    // surfaces before we mirror it into sync_pattern_fingerprints_.
+    // If the trie throws, the tracking set stays consistent.
     method_tries_[method].Insert(path, std::move(handler));
-    // sync_pattern_keys_ is consulted by HasSyncRouteConflict, a
-    // cross-trie check used by proxy registration. Use a
-    // constraint-PRESERVING key so disjoint-regex routes like
-    // /users/:id([0-9]+) and /users/:slug([a-z]+) don't collide.
-    sync_pattern_keys_[method].insert(
-        NormalizePatternKey(path, /*preserve_constraints=*/true));
+    // Record a full fingerprint (strip key + per-position constraint
+    // list) so HasSyncRouteConflict can detect constrained-vs-
+    // unconstrained overlap in addition to exact structural matches.
+    sync_pattern_fingerprints_[method].push_back(ExtractFingerprint(path));
 }
 
 void HttpRouter::RouteAsync(const std::string& method, const std::string& path,
@@ -132,24 +168,48 @@ void HttpRouter::RouteAsync(const std::string& method, const std::string& path,
     // flagged conservatively — the trie throws on them, and we want
     // the pre-check to bail before RouteAsync would throw mid-loop
     // and leave a partial commit.
-    async_pattern_keys_[method].insert(
-        NormalizePatternKey(path, /*preserve_constraints=*/false));
+    async_pattern_keys_[method].insert(NormalizePatternKey(path));
 }
 
 bool HttpRouter::HasAsyncRouteConflict(const std::string& method,
                                         const std::string& pattern) const {
     auto it = async_pattern_keys_.find(method);
     if (it == async_pattern_keys_.end()) return false;
-    return it->second.count(
-        NormalizePatternKey(pattern, /*preserve_constraints=*/false)) > 0;
+    return it->second.count(NormalizePatternKey(pattern)) > 0;
 }
 
 bool HttpRouter::HasSyncRouteConflict(const std::string& method,
                                         const std::string& pattern) const {
-    auto it = sync_pattern_keys_.find(method);
-    if (it == sync_pattern_keys_.end()) return false;
-    return it->second.count(
-        NormalizePatternKey(pattern, /*preserve_constraints=*/true)) > 0;
+    auto it = sync_pattern_fingerprints_.find(method);
+    if (it == sync_pattern_fingerprints_.end()) return false;
+    // Fingerprint-based overlap check. Two routes with matching
+    // structural shapes OVERLAP (conflict) unless at least one param
+    // position has BOTH constraints set AND they differ. The net
+    // effect on the sync-vs-proxy companion scenarios:
+    //   - /users/:id([0-9]+) vs /users/:slug([a-z]+) -> disjoint,
+    //     no conflict (position 0 has distinct constraints).
+    //   - /users/:id([0-9]+) vs /users/:slug        -> CONFLICT
+    //     (position 0: one constrained, one unconstrained — the
+    //     unconstrained hijacks the constrained subset).
+    //   - /users/:id         vs /users/:slug        -> CONFLICT
+    //     (same structural shape, neither disambiguates).
+    RouteFingerprint new_fp = ExtractFingerprint(pattern);
+    for (const auto& existing : it->second) {
+        if (existing.strip_key != new_fp.strip_key) continue;
+        bool disjoint = false;
+        size_t n = std::min(existing.constraints.size(),
+                            new_fp.constraints.size());
+        for (size_t i = 0; i < n; ++i) {
+            if (!existing.constraints[i].empty() &&
+                !new_fp.constraints[i].empty() &&
+                existing.constraints[i] != new_fp.constraints[i]) {
+                disjoint = true;
+                break;
+            }
+        }
+        if (!disjoint) return true;
+    }
+    return false;
 }
 
 HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(

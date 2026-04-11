@@ -65,6 +65,24 @@ static int on_header_value(llhttp_t* parser, const char* at, size_t length) {
 static int on_headers_complete(llhttp_t* parser) {
     auto* self = static_cast<UpstreamHttpCodec*>(parser->data);
 
+    // llhttp fires on_headers_complete TWICE for chunked responses
+    // that carry trailers: once after the initial header block, and
+    // again after the trailer block. Only the first invocation should
+    // flush the last field/value pair into response_.headers and
+    // capture the status line. On the second invocation (trailers) we
+    // discard any buffered trailer pair — trailers are deliberately
+    // dropped to avoid promoting trailer-only fields (Digest, etc.)
+    // into the normal header block that BuildClientResponse forwards
+    // to clients. Without this guard, the final trailer leaks through
+    // as a regular response header.
+    if (self->response_.headers_complete) {
+        self->current_header_field_.clear();
+        self->current_header_value_.clear();
+        self->parsing_header_value_ = false;
+        self->in_header_field_ = false;
+        return 0;
+    }
+
     // Flush last header
     if (!self->current_header_field_.empty()) {
         std::string key = self->current_header_field_;
