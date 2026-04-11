@@ -41,16 +41,15 @@ struct InternalRegistrationScope {
 };
 
 // Ceiling division: convert a timeout in milliseconds to whole seconds,
-// rounding up so the timer scan fires within one interval of the real
-// deadline. The naive `(ms + 999) / 1000` on plain int overflows for
+// rounding up. Used for sizing a cap / upper bound (e.g., the async
+// deferred safety cap) where we want strict "at least as large as the
+// input ms." The naive `(ms + 999) / 1000` on plain int overflows for
 // ms values near INT_MAX — ConfigLoader::Validate does not currently
 // cap these fields, so an operator typo like response_timeout_ms=
-// 2147483647 would drive the result negative and poison the dispatcher
-// timer interval. Promoting to int64_t and saturating to INT_MAX keeps
-// the rounding safe and the result monotonic in the input.
+// 2147483647 would drive the result negative. Promoting to int64_t
+// and saturating to INT_MAX keeps the rounding safe and monotonic.
 //
-// Returns at least 1 (matches the historic `std::max(..., 1)` pattern
-// at call sites) and at most INT_MAX.
+// Returns at least 1 and at most INT_MAX.
 static int CeilMsToSec(int ms) {
     if (ms <= 0) return 1;
     int64_t sec64 = (static_cast<int64_t>(ms) + 999) / 1000;
@@ -58,6 +57,39 @@ static int CeilMsToSec(int ms) {
         return std::numeric_limits<int>::max();
     }
     if (sec64 < 1) return 1;
+    return static_cast<int>(sec64);
+}
+
+// Convert a timeout in milliseconds to a DISPATCHER TIMER CADENCE in
+// whole seconds. Distinct from CeilMsToSec because cadence sizing has
+// different requirements than cap sizing:
+//
+//   - Sub-2s timeouts (1000, 2000) ms are CLAMPED to 1s cadence
+//     instead of being rounded up to 2s. Otherwise a 1100ms deadline
+//     is scanned only every 2s and can fire up to ~0.9s late —
+//     under-delivering the documented "1s resolution" for ms-based
+//     upstream timeouts. This also protects other sub-2s deadlines on
+//     the same dispatcher (e.g. session / request-timeout deadlines
+//     that would inherit a coarse cadence from an upstream round-up).
+//
+//   - For >= 2s timeouts, ceiling still gives the correct cadence:
+//     cadence equal to the timeout budget in seconds. Scanning at a
+//     finer granularity would burn CPU for no correctness win; the
+//     overshoot is already bounded by `cadence - (ms/1000)` which is
+//     in [0, 1) by construction.
+//
+//   - Zero/negative inputs normalize to 1s (the finest representable
+//     cadence), matching historic call-site behavior.
+//
+// Saturates at INT_MAX and returns at least 1. int64_t intermediate
+// to avoid the same overflow concern as CeilMsToSec.
+static int CadenceSecFromMs(int ms) {
+    if (ms <= 0) return 1;
+    if (ms < 2000) return 1;
+    int64_t sec64 = (static_cast<int64_t>(ms) + 999) / 1000;
+    if (sec64 > std::numeric_limits<int>::max()) {
+        return std::numeric_limits<int>::max();
+    }
     return static_cast<int>(sec64);
 }
 
@@ -286,9 +318,10 @@ void HttpServer::MarkServerReady() {
         // timeouts would fire late. Reduce the interval if needed.
         int min_upstream_sec = std::numeric_limits<int>::max();
         for (const auto& u : upstream_configs_) {
-            // CeilMsToSec rounds up and saturates to avoid int overflow
-            // on misconfigured INT_MAX-range timeouts.
-            int connect_sec = CeilMsToSec(u.pool.connect_timeout_ms);
+            // CadenceSecFromMs: clamps sub-2s timeouts to 1s cadence
+            // (instead of rounding up to 2s), preserving the documented
+            // 1s resolution for ms-based upstream timeouts.
+            int connect_sec = CadenceSecFromMs(u.pool.connect_timeout_ms);
             min_upstream_sec = std::min(min_upstream_sec, connect_sec);
             // Also consider idle timeout for eviction cadence
             if (u.pool.idle_timeout_sec > 0) {
@@ -299,7 +332,7 @@ void HttpServer::MarkServerReady() {
             // the timer scan must fire often enough to detect stalled
             // upstream responses within one interval of the deadline.
             if (u.proxy.response_timeout_ms > 0) {
-                int response_sec = CeilMsToSec(u.proxy.response_timeout_ms);
+                int response_sec = CadenceSecFromMs(u.proxy.response_timeout_ms);
                 min_upstream_sec = std::min(min_upstream_sec, response_sec);
             }
         }
@@ -1038,14 +1071,17 @@ void HttpServer::RecomputeAsyncDeferredCap() {
     // operator-configured timeouts, the cap is sized to be strictly
     // larger than the longest configured proxy.response_timeout_ms.
     //
-    // When ANY referenced upstream has proxy.response_timeout_ms == 0
-    // (operator explicitly disabled the response timeout), the cap is
-    // also disabled (0 sentinel): the operator has opted for unbounded
-    // async lifetime on those routes and we should not second-guess
-    // them — enforcing a 3600s default would turn intentional long /
-    // unbounded waits into spurious 504s, while the downstream side
-    // closes even though the proxy transaction is still waiting on
-    // the upstream with its own timeout disabled.
+    // Upstreams with proxy.response_timeout_ms == 0 (operator opted out
+    // of a per-request deadline for that upstream) are SKIPPED in the
+    // max — not used to globally disable the cap. The async safety cap
+    // exists precisely to catch stuck handlers that slip past per-request
+    // timeouts, so letting a single upstream's opt-out remove it for
+    // every unrelated proxy route and custom async handler on this
+    // server would be a footgun — a wedged handler would then hang
+    // forever with no last-resort abort. Zero-timeout upstreams are
+    // still bounded by the resulting global cap (at least the default
+    // floor), but that is a very loose safety net, not a per-request
+    // deadline.
     //
     // Default floor: 3600s (1 hour). Generous enough for most custom
     // async handlers and most realistic proxy response timeouts; the
@@ -1056,7 +1092,6 @@ void HttpServer::RecomputeAsyncDeferredCap() {
     // even when the upstream's JSON proxy.route_prefix is empty.
     static constexpr int DEFAULT_MIN_CAP_SEC = 3600;
     static constexpr int BUFFER_SEC = 60;
-    bool any_disabled = false;
     int computed_sec = DEFAULT_MIN_CAP_SEC;
     for (const auto& name : proxy_referenced_upstreams_) {
         const UpstreamConfig* found = nullptr;
@@ -1068,8 +1103,10 @@ void HttpServer::RecomputeAsyncDeferredCap() {
         }
         if (!found) continue;  // Should not happen — defensive
         if (found->proxy.response_timeout_ms == 0) {
-            any_disabled = true;
-            break;
+            // Opted out of a per-request deadline for this upstream.
+            // Do not let this upstream's opt-out tear down the global
+            // safety net for unrelated routes. Fall back to the floor.
+            continue;
         }
         // 64-bit ceil division + saturating add to keep the cap
         // monotonic in the input and safe against operator typos
@@ -1084,10 +1121,10 @@ void HttpServer::RecomputeAsyncDeferredCap() {
         }
         computed_sec = std::max(computed_sec, sec);
     }
-    int new_cap = any_disabled ? 0 : computed_sec;
+    int new_cap = computed_sec;
     max_async_deferred_sec_.store(new_cap, std::memory_order_relaxed);
     logging::Get()->debug("HttpServer async deferred safety cap: {}s "
-                          "(0 = disabled, referenced upstreams={})",
+                          "(referenced upstreams={})",
                           new_cap, proxy_referenced_upstreams_.size());
 }
 
@@ -3113,15 +3150,17 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
                                                  new_config.request_timeout_sec);
         // Preserve upstream timeout cadence — upstream configs are restart-only,
         // but the timer interval must not widen past the shortest upstream timeout.
+        // CadenceSecFromMs clamps sub-2s timeouts to 1s so reload-time
+        // recomputation matches the startup-time cadence.
         for (const auto& u : upstream_configs_) {
-            int connect_sec = CeilMsToSec(u.pool.connect_timeout_ms);
+            int connect_sec = CadenceSecFromMs(u.pool.connect_timeout_ms);
             new_interval = std::min(new_interval, connect_sec);
             if (u.pool.idle_timeout_sec > 0) {
                 new_interval = std::min(new_interval, u.pool.idle_timeout_sec);
             }
             // Also preserve proxy response timeout cadence
             if (u.proxy.response_timeout_ms > 0) {
-                int response_sec = CeilMsToSec(u.proxy.response_timeout_ms);
+                int response_sec = CadenceSecFromMs(u.proxy.response_timeout_ms);
                 new_interval = std::min(new_interval, response_sec);
             }
         }

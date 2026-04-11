@@ -6,18 +6,21 @@
 #include <signal.h>
 #include <limits>
 
-// Ceiling division: convert a timeout in milliseconds to whole seconds,
-// rounding up. Promotes to int64_t to avoid signed overflow when the
-// input is near INT_MAX (ConfigLoader::Validate does not currently cap
-// these fields). Saturates to INT_MAX and returns at least 1. Mirrors
-// the helper in http_server.cc — keep them in sync.
-static int CeilMsToSec(int ms) {
+// Convert a timeout in milliseconds to a DISPATCHER TIMER CADENCE in
+// whole seconds. Sub-2s timeouts clamp to 1s (instead of rounding up
+// to 2s) so that ms-based upstream timeouts get 1s resolution as
+// documented — a 1100ms deadline rounded to 2s cadence would be
+// checked only every 2s, firing up to ~0.9s late. Promotes to int64_t
+// to avoid signed overflow on INT_MAX-range operator typos. Saturates
+// to INT_MAX and returns at least 1. Mirrors the helper in
+// http_server.cc — keep them in sync.
+static int CadenceSecFromMs(int ms) {
     if (ms <= 0) return 1;
+    if (ms < 2000) return 1;
     int64_t sec64 = (static_cast<int64_t>(ms) + 999) / 1000;
     if (sec64 > std::numeric_limits<int>::max()) {
         return std::numeric_limits<int>::max();
     }
-    if (sec64 < 1) return 1;
     return static_cast<int>(sec64);
 }
 
@@ -96,7 +99,7 @@ UpstreamManager::UpstreamManager(
     // for the mirrored logic).
     int min_upstream_sec = std::numeric_limits<int>::max();
     for (const auto& u : upstreams) {
-        int connect_sec = CeilMsToSec(u.pool.connect_timeout_ms);
+        int connect_sec = CadenceSecFromMs(u.pool.connect_timeout_ms);
         min_upstream_sec = std::min(min_upstream_sec, connect_sec);
         if (u.pool.idle_timeout_sec > 0) {
             min_upstream_sec = std::min(min_upstream_sec, u.pool.idle_timeout_sec);
@@ -107,7 +110,7 @@ UpstreamManager::UpstreamManager(
         // proxy.response_timeout_ms can still fire at the default ~60s
         // cadence instead of its configured budget.
         if (u.proxy.response_timeout_ms > 0) {
-            int response_sec = CeilMsToSec(u.proxy.response_timeout_ms);
+            int response_sec = CadenceSecFromMs(u.proxy.response_timeout_ms);
             min_upstream_sec = std::min(min_upstream_sec, response_sec);
         }
     }
