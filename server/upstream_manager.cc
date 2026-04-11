@@ -189,7 +189,8 @@ void UpstreamManager::CheckoutAsync(
     const std::string& service_name,
     size_t dispatcher_index,
     PoolPartition::ReadyCallback ready_cb,
-    PoolPartition::ErrorCallback error_cb) {
+    PoolPartition::ErrorCallback error_cb,
+    std::shared_ptr<std::atomic<bool>> cancel_token) {
 
     // Reject immediately if shutdown has started — the per-partition
     // InitiateShutdown tasks may not have executed yet on all dispatchers.
@@ -217,7 +218,8 @@ void UpstreamManager::CheckoutAsync(
         return;
     }
 
-    partition->CheckoutAsync(std::move(ready_cb), std::move(error_cb));
+    partition->CheckoutAsync(std::move(ready_cb), std::move(error_cb),
+                               std::move(cancel_token));
 }
 
 void UpstreamManager::EvictExpired(size_t dispatcher_index) {

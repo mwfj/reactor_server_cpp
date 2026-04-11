@@ -184,35 +184,18 @@ private:
     std::unordered_map<std::string, std::unordered_set<std::string>>
         async_pattern_keys_;
 
-    // SYNC route fingerprints, tracked per method. Each registered
-    // sync route is reduced to a structural shape (strip key, without
-    // param names or constraints) plus a per-param-position list of
-    // constraint strings (empty string = unconstrained). Used by
+    // SYNC route structural keys, tracked per method. Used by
     // HasSyncRouteConflict() to detect whether a new proxy companion
     // pattern would hijack or be hijacked by an existing sync route.
     //
-    // This is richer than a single normalized-string key because the
-    // conflict rule is asymmetric:
-    //   - /users/:id([0-9]+) vs /users/:slug([a-z]+)  → disjoint (no conflict)
-    //   - /users/:id([0-9]+) vs /users/:slug          → CONFLICT (unconstrained
-    //                                                  hijacks the constrained one)
-    //   - /users/:id         vs /users/:slug          → CONFLICT (same shape,
-    //                                                  both unconstrained)
-    // Two shape-matching routes are disjoint iff at least one param
-    // position has BOTH constrained AND their constraint strings
-    // differ. Everything else overlaps and counts as a conflict.
-    struct RouteFingerprint {
-        std::string strip_key;              // structural shape (no names/constraints)
-        // One entry per PARAM/CATCH_ALL position in pattern order.
-        // Empty string = no constraint (matches anything at that
-        // position). Catch-all positions always have empty constraints.
-        std::vector<std::string> constraints;
-    };
-    // Extract a full route fingerprint from a pattern. Implementation
-    // in http_router.cc — private static so HasSyncRouteConflict can
-    // access RouteFingerprint without exposing the type publicly.
-    static RouteFingerprint ExtractFingerprint(const std::string& pattern);
-
-    std::unordered_map<std::string, std::vector<RouteFingerprint>>
-        sync_pattern_fingerprints_;
+    // CONSERVATIVE rule: two routes with matching structural shape
+    // (strip_key, i.e. param/catch-all names and regex constraints
+    // stripped) are treated as CONFLICTING regardless of whether their
+    // regex constraints are syntactically identical. Textual regex
+    // inequality does NOT prove non-overlap — e.g. `\d+` and
+    // `[0-9]{1,3}` both match "123". Regex-intersection emptiness is
+    // undecidable in general, so we must assume overlap whenever the
+    // shapes match. See HasSyncRouteConflict for the full rationale.
+    std::unordered_map<std::string, std::unordered_set<std::string>>
+        sync_pattern_keys_;
 };

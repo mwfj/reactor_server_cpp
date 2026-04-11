@@ -64,70 +64,6 @@ static std::string NormalizePatternKey(const std::string& pattern) {
     return result;
 }
 
-// Build a full route fingerprint: strip key + per-param-position
-// constraint list. The constraint at each position is the balanced
-// "(regex)" block exactly as it appeared in the pattern (including
-// the parentheses), or an empty string if the param was unconstrained.
-// Catch-all positions always contribute an empty-constraint entry.
-//
-// Used by HasSyncRouteConflict to detect conflict between a new
-// proxy-companion pattern and existing sync routes. Two fingerprints
-// with matching strip_keys are DISJOINT iff there exists at least one
-// param position where BOTH routes have a constraint AND those
-// constraints differ (truly non-overlapping regexes). Otherwise they
-// OVERLAP: either they are the exact same pattern (same constraints
-// at every position) or one has an unconstrained param where the
-// other is constrained (in which case the unconstrained route covers
-// the constrained subset and must be flagged as a conflict).
-HttpRouter::RouteFingerprint HttpRouter::ExtractFingerprint(const std::string& pattern) {
-    RouteFingerprint fp;
-    std::string& result = fp.strip_key;
-    result.reserve(pattern.size());
-    size_t i = 0;
-    while (i < pattern.size()) {
-        bool at_seg_start = (i == 0) || (result.back() == '/');
-        if (at_seg_start && pattern[i] == ':') {
-            result += ':';
-            ++i;
-            // Skip param name
-            while (i < pattern.size() && pattern[i] != '/' && pattern[i] != '(') {
-                ++i;
-            }
-            // Capture constraint (if any) at THIS param position.
-            if (i < pattern.size() && pattern[i] == '(') {
-                std::string constraint;
-                int depth = 0;
-                while (i < pattern.size()) {
-                    char c = pattern[i];
-                    if (c == '\\' && i + 1 < pattern.size()) {
-                        constraint += c;
-                        constraint += pattern[i + 1];
-                        i += 2;
-                        continue;
-                    }
-                    if (c == '(') ++depth;
-                    else if (c == ')') --depth;
-                    constraint += c;
-                    ++i;
-                    if (depth == 0) break;
-                }
-                fp.constraints.push_back(std::move(constraint));
-            } else {
-                fp.constraints.push_back("");  // unconstrained
-            }
-        } else if (at_seg_start && pattern[i] == '*') {
-            // Catch-all — always the last segment. No regex constraint.
-            result += '*';
-            fp.constraints.push_back("");
-            break;
-        } else {
-            result += pattern[i];
-            ++i;
-        }
-    }
-    return fp;
-}
-
 void HttpRouter::Get(const std::string& path, Handler handler) {
     Route("GET", path, std::move(handler));
 }
@@ -146,13 +82,13 @@ void HttpRouter::Delete(const std::string& path, Handler handler) {
 
 void HttpRouter::Route(const std::string& method, const std::string& path, Handler handler) {
     // Insert into the trie first so any duplicate-pattern exception
-    // surfaces before we mirror it into sync_pattern_fingerprints_.
-    // If the trie throws, the tracking set stays consistent.
+    // surfaces before we mirror it into sync_pattern_keys_. If the trie
+    // throws, the tracking set stays consistent.
     method_tries_[method].Insert(path, std::move(handler));
-    // Record a full fingerprint (strip key + per-position constraint
-    // list) so HasSyncRouteConflict can detect constrained-vs-
-    // unconstrained overlap in addition to exact structural matches.
-    sync_pattern_fingerprints_[method].push_back(ExtractFingerprint(path));
+    // Record the structural shape (strip key — param/catch-all names
+    // and regex constraints stripped) so HasSyncRouteConflict can
+    // conservatively flag any same-shape route as a conflict.
+    sync_pattern_keys_[method].insert(NormalizePatternKey(path));
 }
 
 void HttpRouter::RouteAsync(const std::string& method, const std::string& path,
@@ -180,36 +116,32 @@ bool HttpRouter::HasAsyncRouteConflict(const std::string& method,
 
 bool HttpRouter::HasSyncRouteConflict(const std::string& method,
                                         const std::string& pattern) const {
-    auto it = sync_pattern_fingerprints_.find(method);
-    if (it == sync_pattern_fingerprints_.end()) return false;
-    // Fingerprint-based overlap check. Two routes with matching
-    // structural shapes OVERLAP (conflict) unless at least one param
-    // position has BOTH constraints set AND they differ. The net
-    // effect on the sync-vs-proxy companion scenarios:
-    //   - /users/:id([0-9]+) vs /users/:slug([a-z]+) -> disjoint,
-    //     no conflict (position 0 has distinct constraints).
-    //   - /users/:id([0-9]+) vs /users/:slug        -> CONFLICT
-    //     (position 0: one constrained, one unconstrained — the
-    //     unconstrained hijacks the constrained subset).
-    //   - /users/:id         vs /users/:slug        -> CONFLICT
-    //     (same structural shape, neither disambiguates).
-    RouteFingerprint new_fp = ExtractFingerprint(pattern);
-    for (const auto& existing : it->second) {
-        if (existing.strip_key != new_fp.strip_key) continue;
-        bool disjoint = false;
-        size_t n = std::min(existing.constraints.size(),
-                            new_fp.constraints.size());
-        for (size_t i = 0; i < n; ++i) {
-            if (!existing.constraints[i].empty() &&
-                !new_fp.constraints[i].empty() &&
-                existing.constraints[i] != new_fp.constraints[i]) {
-                disjoint = true;
-                break;
-            }
-        }
-        if (!disjoint) return true;
-    }
-    return false;
+    auto it = sync_pattern_keys_.find(method);
+    if (it == sync_pattern_keys_.end()) return false;
+    // CONSERVATIVE overlap check: two routes with matching structural
+    // shapes (strip_keys) are treated as CONFLICTING regardless of
+    // whether their param constraints are syntactically identical.
+    //
+    // Previously this helper treated different constraint strings as
+    // proof of disjointness (e.g. /users/:id([0-9]+) vs /users/:slug([a-z]+)
+    // returning false). That assumption is unsound — textual inequality
+    // of regexes does NOT prove non-overlap. For example the sync route
+    //   /users/:id(\d+)
+    // and a proxy companion
+    //   /users/:uid([0-9]{1,3})
+    // both match /users/123, so allowing the async companion to register
+    // would silently shadow the sync handler via async-over-sync
+    // precedence. General regex-intersection emptiness is undecidable,
+    // so we cannot verify disjointness in the router. Collapse to a
+    // shape-only check: any same-shape sync route is a conflict.
+    //
+    // Consequence: a proxy companion with a different-but-potentially-
+    // overlapping constraint is dropped. The catch-all part of the
+    // proxy is still registered (that insertion goes through RouteAsync
+    // into a different trie than the sync route), so the proxy still
+    // serves paths with a trailing slash — only the bare-prefix
+    // companion is suppressed.
+    return it->second.count(NormalizePatternKey(pattern)) > 0;
 }
 
 HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(

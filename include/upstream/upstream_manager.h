@@ -21,10 +21,16 @@ public:
 
     // Async checkout — delegates to the correct PoolPartition.
     // Must be called on the dispatcher thread identified by dispatcher_index.
+    // `cancel_token` is an optional shared atomic flag. When set by the
+    // caller (e.g. ProxyTransaction::Cancel on client disconnect), the
+    // pool drops the queued waiter on pop and proactively sweeps it out
+    // if the wait queue is full. See PoolPartition::CheckoutAsync for
+    // the full semantics.
     void CheckoutAsync(const std::string& service_name,
                        size_t dispatcher_index,
                        PoolPartition::ReadyCallback ready_cb,
-                       PoolPartition::ErrorCallback error_cb);
+                       PoolPartition::ErrorCallback error_cb,
+                       std::shared_ptr<std::atomic<bool>> cancel_token = nullptr);
 
     // Evict expired connections across all pools (called by timer handler)
     void EvictExpired(size_t dispatcher_index);

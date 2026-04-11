@@ -86,6 +86,11 @@ private:
     // delivery paths so the transaction is torn down even if an
     // upstream response is mid-flight. Dispatcher-thread only.
     bool cancelled_ = false;
+    // Shared cancel token passed to UpstreamManager::CheckoutAsync so
+    // the pool can drop this transaction's waiter if it's queued when
+    // Cancel() fires. Allocated at Start() time; Cancel() sets the
+    // atomic which the pool inspects on every pop / sweep.
+    std::shared_ptr<std::atomic<bool>> checkout_cancel_token_;
 
     // Request context (all copied at construction -- the original HttpRequest
     // is INVALIDATED by parser_.Reset() immediately after the async handler

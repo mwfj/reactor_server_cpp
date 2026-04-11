@@ -112,6 +112,15 @@ void ProxyTransaction::AttemptCheckout() {
 
     auto self = shared_from_this();
 
+    // Lazily allocate the shared cancel token so the pool can drop
+    // this transaction's wait-queue entry if Cancel() fires while the
+    // checkout is pending. Reused across retry attempts — Cancel()
+    // flips it once for the lifetime of the transaction.
+    if (!checkout_cancel_token_) {
+        checkout_cancel_token_ =
+            std::make_shared<std::atomic<bool>>(false);
+    }
+
     upstream_manager_->CheckoutAsync(
         service_name_,
         static_cast<size_t>(dispatcher_index_),
@@ -122,7 +131,8 @@ void ProxyTransaction::AttemptCheckout() {
         // error callback
         [self](int error_code) {
             self->OnCheckoutError(error_code);
-        }
+        },
+        checkout_cancel_token_
     );
 }
 
@@ -637,6 +647,15 @@ void ProxyTransaction::Cancel() {
                           "state={}", client_fd_, service_name_,
                           static_cast<int>(state_));
     cancelled_ = true;
+    // Signal the pool's wait queue (if we're still pending). This
+    // proactively frees the queue slot so bursts of disconnecting
+    // clients don't fill the bounded wait queue with dead waiters
+    // and block live requests with pool-exhausted / queue-timeout
+    // errors. A set token is also dropped lazily on future pops and
+    // PurgeExpiredWaitEntries sweeps, so this is idempotent.
+    if (checkout_cancel_token_) {
+        checkout_cancel_token_->store(true, std::memory_order_release);
+    }
     // Mark the completion callback as "already invoked" so any late
     // DeliverResponse path triggered by an in-flight upstream reply
     // becomes a no-op. The framework's abort hook has already handled
@@ -645,8 +664,30 @@ void ProxyTransaction::Cancel() {
     // closure's one-shot completed/cancelled contract.
     complete_cb_invoked_ = true;
     complete_cb_ = nullptr;
-    // Release the upstream lease back to the pool and clear transport
-    // callbacks so any in-flight upstream bytes land harmlessly.
+    // POISON the upstream connection before releasing the lease IF we
+    // have already started (or finished) writing the upstream request.
+    // Without this, Cleanup() would return a keep-alive socket that
+    // still has an in-flight response attached to the cancelled client
+    // — another waiter could then pick up that connection and parse
+    // the abandoned upstream reply as its OWN response, breaking
+    // request/response isolation.
+    //
+    // States beyond CHECKOUT_PENDING all imply bytes have been
+    // exchanged with the upstream or are mid-flight:
+    //   SENDING_REQUEST   — request partially written, upstream may still respond
+    //   AWAITING_RESPONSE — request fully sent, response not yet received
+    //   RECEIVING_BODY    — response partially received
+    //   COMPLETE / FAILED — terminal, but lease may still be held
+    //
+    // In INIT and CHECKOUT_PENDING no bytes have left the client side
+    // toward the upstream yet, so the connection (if any) is still
+    // clean and safe to return to the pool.
+    if (state_ != State::INIT && state_ != State::CHECKOUT_PENDING) {
+        poison_connection_ = true;
+    }
+    // Release the upstream lease back to the pool (or destroy it if
+    // poisoned) and clear transport callbacks so any in-flight upstream
+    // bytes land harmlessly.
     Cleanup();
 }
 

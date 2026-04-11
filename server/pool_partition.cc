@@ -160,7 +160,8 @@ PoolPartition::~PoolPartition() {
     // SocketHandler::~SocketHandler() will close the fd naturally.
 }
 
-void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb) {
+void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb,
+                                    std::shared_ptr<std::atomic<bool>> cancel_token) {
     // All pool operations must run on the owning dispatcher thread.
     // Off-thread access would data-race on the containers.
     if (dispatcher_ && !dispatcher_->is_dispatcher_thread()) {
@@ -180,6 +181,14 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
 
     if (shutting_down_) {
         error_cb(CHECKOUT_SHUTTING_DOWN);
+        return;
+    }
+
+    // If the caller has already cancelled (rare — typically cancel
+    // fires after CheckoutAsync), short-circuit immediately so we don't
+    // waste a slot or fire ready_cb on a dead transaction.
+    if (cancel_token &&
+        cancel_token->load(std::memory_order_acquire)) {
         return;
     }
 
@@ -211,13 +220,30 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
         return;
     }
 
-    // 3. At capacity — queue if room
+    // 3. At capacity — queue if room. Before rejecting on a full
+    // queue, sweep for cancelled waiters. A burst of disconnected
+    // clients (e.g., client-side aborts against a slow upstream)
+    // can otherwise fill the bounded queue with dead entries whose
+    // transactions have already been cancelled, leaving no room for
+    // new live requests until each dead entry expires on its own
+    // queue timeout. Purging on demand keeps the queue slot budget
+    // effective under cancel bursts.
+    if (wait_queue_.size() >= MAX_WAIT_QUEUE_SIZE) {
+        size_t purged = PurgeCancelledWaitEntries();
+        if (purged > 0) {
+            logging::Get()->debug(
+                "PoolPartition dropped {} cancelled waiters before new "
+                "checkout (host={}:{})",
+                purged, upstream_host_, upstream_port_);
+        }
+    }
     if (wait_queue_.size() < MAX_WAIT_QUEUE_SIZE) {
-        wait_queue_.push_back({
-            std::move(ready_cb),
-            std::move(error_cb),
-            std::chrono::steady_clock::now()
-        });
+        WaitEntry entry;
+        entry.ready_callback = std::move(ready_cb);
+        entry.error_callback = std::move(error_cb);
+        entry.queued_at = std::chrono::steady_clock::now();
+        entry.cancel_token = std::move(cancel_token);
+        wait_queue_.push_back(std::move(entry));
         // Ensure queued checkouts eventually get CHECKOUT_QUEUE_TIMEOUT.
         // In production (HttpServer), the timer callback calls EvictExpired
         // periodically. In standalone mode, we schedule a self-rescheduling
@@ -230,6 +256,22 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
 
     // 4. Queue full — reject
     error_cb(CHECKOUT_POOL_EXHAUSTED);
+}
+
+size_t PoolPartition::PurgeCancelledWaitEntries() {
+    size_t before = wait_queue_.size();
+    // std::deque supports erase via iterators; walk forward and erase
+    // cancelled entries in place. Callbacks are NOT fired — a cancelled
+    // checkout's owning transaction has already been torn down via the
+    // framework abort hook and does not expect any completion.
+    for (auto it = wait_queue_.begin(); it != wait_queue_.end(); ) {
+        if (IsEntryCancelled(*it)) {
+            it = wait_queue_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return before - wait_queue_.size();
 }
 
 void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
@@ -303,6 +345,13 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     if (idle_conns_.size() >= static_cast<size_t>(config_.max_idle_connections)) {
         PurgeExpiredWaitEntries();
         if (!alive->load(std::memory_order_acquire)) return;
+        // Drop cancelled waiters at the front before attempting handoff
+        // — otherwise a cancelled front-of-queue entry would "consume"
+        // the returning connection by being silently dropped while
+        // still blocking any live waiter behind it.
+        while (!wait_queue_.empty() && IsEntryCancelled(wait_queue_.front())) {
+            wait_queue_.pop_front();
+        }
         if (!wait_queue_.empty() && ValidateConnection(owned.get())) {
             // Hand directly to the next waiter (validated — not dead/expired)
             static constexpr auto FAR_FUTURE_HANDOFF = std::chrono::hours(24 * 365);
@@ -487,6 +536,11 @@ void PoolPartition::InitiateShutdown() {
     while (!wait_queue_.empty()) {
         auto entry = std::move(wait_queue_.front());
         wait_queue_.pop_front();
+        // Cancelled waiters have no callback to fire — the transaction
+        // already tore its side down via the framework abort hook.
+        if (IsEntryCancelled(entry)) {
+            continue;
+        }
         entry.error_callback(CHECKOUT_SHUTTING_DOWN);
         if (!alive->load(std::memory_order_acquire)) return;
     }
@@ -906,6 +960,18 @@ void PoolPartition::ServiceWaitQueue() {
     PurgeExpiredWaitEntries();
     if (!alive->load(std::memory_order_acquire)) return;
 
+    // Helper: drop any cancelled entries at the front so we match them
+    // against idle connections / capacity rather than "consuming" a
+    // slot with a dead entry. Cancelled entries have no callbacks to
+    // fire — the owning transaction's framework abort hook already
+    // handled that side.
+    auto drop_cancelled_front = [this]() {
+        while (!wait_queue_.empty() && IsEntryCancelled(wait_queue_.front())) {
+            wait_queue_.pop_front();
+        }
+    };
+
+    drop_cancelled_front();
     while (!wait_queue_.empty() && !idle_conns_.empty()) {
         // Validate the idle connection
         auto conn = std::move(idle_conns_.front());
@@ -929,11 +995,13 @@ void PoolPartition::ServiceWaitQueue() {
         wait_queue_.pop_front();
         entry.ready_callback(UpstreamLease(raw, this, alive_));
         if (!alive->load(std::memory_order_acquire)) return;
+        drop_cancelled_front();
     }
 
     // If idle connections ran out (all stale) but waiters remain and capacity
     // is available, create new connections for them instead of letting them
     // sit until CHECKOUT_QUEUE_TIMEOUT.
+    drop_cancelled_front();
     while (!wait_queue_.empty() && TotalCount() < partition_max_connections_) {
         auto entry = std::move(wait_queue_.front());
         wait_queue_.pop_front();
@@ -943,6 +1011,7 @@ void PoolPartition::ServiceWaitQueue() {
         CreateNewConnection(std::move(entry.ready_callback),
                             std::move(entry.error_callback));
         if (!alive->load(std::memory_order_acquire)) return;
+        drop_cancelled_front();
     }
 }
 
@@ -1015,6 +1084,12 @@ void PoolPartition::PurgeExpiredWaitEntries() {
     auto now = std::chrono::steady_clock::now();
     while (!wait_queue_.empty()) {
         auto& entry = wait_queue_.front();
+        // Cancelled entries at the front can be dropped unconditionally —
+        // their owning transaction is already gone and expects no callback.
+        if (IsEntryCancelled(entry)) {
+            wait_queue_.pop_front();
+            continue;
+        }
         auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - entry.queued_at);
         if (waited.count() >= config_.connect_timeout_ms) {
@@ -1041,6 +1116,11 @@ void PoolPartition::CreateForWaiters() {
            !manager_shutting_down_.load(std::memory_order_acquire) &&
            !wait_queue_.empty() &&
            TotalCount() < partition_max_connections_) {
+        // Drop cancelled entries before spending a new connect on them.
+        if (IsEntryCancelled(wait_queue_.front())) {
+            wait_queue_.pop_front();
+            continue;
+        }
         auto entry = std::move(wait_queue_.front());
         wait_queue_.pop_front();
         size_t count_before = TotalCount();
