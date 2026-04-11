@@ -698,8 +698,20 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                         ? req.async_cap_sec_override
                         : max_async_deferred_sec_;  // 0 = no cap
             deferred_start_ = std::chrono::steady_clock::now();
+            // Arm the FIRST deadline at min(heartbeat_sec, cap_sec)
+            // when the cap is positive and smaller than the
+            // heartbeat interval. Otherwise the heartbeat callback
+            // (which is the only place the cap is checked) wouldn't
+            // fire until heartbeat_sec, and a per-request cap of e.g.
+            // 5s on a server with request_timeout_sec=30 (or the 60s
+            // fallback when timeouts are disabled) would let the
+            // request outlive its declared cap by tens of seconds.
+            int initial_sec = heartbeat_sec;
+            if (cap_sec > 0 && cap_sec < initial_sec) {
+                initial_sec = cap_sec;
+            }
             conn_->SetDeadline(deferred_start_ +
-                               std::chrono::seconds(heartbeat_sec));
+                               std::chrono::seconds(initial_sec));
             std::weak_ptr<HttpConnectionHandler> weak_self =
                 shared_from_this();
             conn_->SetDeadlineTimeoutCb(
@@ -766,10 +778,26 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                         return false;
                     }
                 }
-                // Heartbeat: re-arm the deadline from now.
-                self->conn_->SetDeadline(
-                    std::chrono::steady_clock::now() +
-                    std::chrono::seconds(heartbeat_sec));
+                // Heartbeat: re-arm the deadline. When cap_sec is
+                // set, clamp the next wakeup so the FOLLOW-UP heartbeat
+                // does not overshoot the cap — otherwise a request
+                // with cap_sec < heartbeat_sec would only be checked
+                // on heartbeat boundaries, missing its cap window.
+                auto now_steady = std::chrono::steady_clock::now();
+                auto next_sec = std::chrono::seconds(heartbeat_sec);
+                if (cap_sec > 0) {
+                    auto elapsed_sec = std::chrono::duration_cast<
+                        std::chrono::seconds>(
+                        now_steady - self->deferred_start_).count();
+                    // `elapsed >= cap_sec` was already caught above,
+                    // so remaining is strictly positive here.
+                    auto remaining = static_cast<long long>(cap_sec)
+                                   - elapsed_sec;
+                    if (remaining > 0 && remaining < heartbeat_sec) {
+                        next_sec = std::chrono::seconds(remaining);
+                    }
+                }
+                self->conn_->SetDeadline(now_steady + next_sec);
                 return true;  // handled, keep connection alive
             });
             buf += consumed;

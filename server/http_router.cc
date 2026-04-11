@@ -403,6 +403,14 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     // the same path would still answer HEAD via fallback, silently
     // bypassing the user's proxy.methods filter in the overlap case the
     // async-side guard is meant to protect.
+    //
+    // Exception: when the matched async GET is a proxy-companion
+    // pattern that YIELDS to sync GET at runtime (see
+    // proxy_companion_patterns_ and the runtime-yield logic in
+    // GetAsyncHandler), the sync GET is the effective owner of GET
+    // for this path and sync HEAD→GET fallback should work through
+    // it. Otherwise HEAD returns 405 even though GET is actually
+    // served by the sync route.
     if (!matched_handler && request.method == "HEAD") {
         bool head_blocked_by_async = false;
         auto async_get_it = async_method_tries_.find("GET");
@@ -411,7 +419,22 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
             auto async_result = async_get_it->second.Search(request.path, tmp);
             if (async_result.handler &&
                 head_fallback_blocked_.count(async_result.matched_pattern)) {
-                head_blocked_by_async = true;
+                // Check for the proxy-companion yield case: if the
+                // matched pattern is a proxy companion AND a sync GET
+                // exists for this exact path, the sync route wins at
+                // runtime for GET (and therefore for HEAD→GET too).
+                bool companion_yields_to_sync = false;
+                if (proxy_companion_patterns_.count(
+                        async_result.matched_pattern)) {
+                    auto sync_get_it = method_tries_.find("GET");
+                    if (sync_get_it != method_tries_.end() &&
+                        sync_get_it->second.HasMatch(request.path)) {
+                        companion_yields_to_sync = true;
+                    }
+                }
+                if (!companion_yields_to_sync) {
+                    head_blocked_by_async = true;
+                }
             }
         }
         if (!head_blocked_by_async) {
@@ -507,7 +530,22 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
             if (result.handler) {
                 async_get_matches = true;
                 if (head_fallback_blocked_.count(result.matched_pattern)) {
-                    async_get_blocks_head = true;
+                    // Same proxy-companion-yield exception as the
+                    // HEAD dispatch branch above: if the blocked
+                    // async GET is a proxy companion AND a sync GET
+                    // matches this path, the sync route wins at
+                    // runtime so HEAD would actually be served.
+                    bool companion_yields_to_sync = false;
+                    if (proxy_companion_patterns_.count(result.matched_pattern)) {
+                        auto sync_get_it = method_tries_.find("GET");
+                        if (sync_get_it != method_tries_.end() &&
+                            sync_get_it->second.HasMatch(request.path)) {
+                            companion_yields_to_sync = true;
+                        }
+                    }
+                    if (!companion_yields_to_sync) {
+                        async_get_blocks_head = true;
+                    }
                 }
             }
         }
