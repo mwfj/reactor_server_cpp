@@ -995,6 +995,17 @@ void PoolPartition::ServiceWaitQueue() {
         wait_queue_.pop_front();
         entry.ready_callback(UpstreamLease(raw, this, alive_));
         if (!alive->load(std::memory_order_acquire)) return;
+        // ready_callback can synchronously start server shutdown
+        // (e.g. a first-request callback that calls HttpServer::Stop
+        // on a checkout-failure policy). After that, continuing to
+        // service queued waiters would create fresh upstream work
+        // after manager_shutting_down_ is already true, making the
+        // shutdown nondeterministic. Re-check shutdown flags after
+        // every waiter callback and bail out if they flipped.
+        if (shutting_down_ ||
+            manager_shutting_down_.load(std::memory_order_acquire)) {
+            return;
+        }
         drop_cancelled_front();
     }
 
@@ -1011,6 +1022,15 @@ void PoolPartition::ServiceWaitQueue() {
         CreateNewConnection(std::move(entry.ready_callback),
                             std::move(entry.error_callback));
         if (!alive->load(std::memory_order_acquire)) return;
+        // Re-check shutdown after the synchronous callback path —
+        // an inline connect failure's error_cb can trigger server
+        // shutdown just like ready_callback above. Without this the
+        // next loop iteration could still create a new connection
+        // after manager_shutting_down_ is true.
+        if (shutting_down_ ||
+            manager_shutting_down_.load(std::memory_order_acquire)) {
+            return;
+        }
         drop_cancelled_front();
     }
 }
@@ -1097,6 +1117,13 @@ void PoolPartition::PurgeExpiredWaitEntries() {
             wait_queue_.pop_front();
             error_cb(CHECKOUT_QUEUE_TIMEOUT);
             if (!alive->load(std::memory_order_acquire)) return;
+            // error_cb can trigger shutdown — bail so no further
+            // waiter is handed a new connect or a queue timeout
+            // after the manager has begun tearing down.
+            if (shutting_down_ ||
+                manager_shutting_down_.load(std::memory_order_acquire)) {
+                return;
+            }
         } else {
             break;  // Queue is ordered by time — stop at first non-expired
         }

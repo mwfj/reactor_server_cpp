@@ -958,17 +958,13 @@ void HttpServer::Proxy(const std::string& route_pattern,
                     method, pattern, upstream_service_name);
                 continue;
             }
-            // Sync conflict on the derived bare-prefix companion.
-            if (!derived_companion.empty() && pattern == derived_companion &&
-                router_.HasSyncRouteConflict(method, pattern)) {
-                logging::Get()->warn(
-                    "Proxy: sync route '{} {}' matches bare-prefix "
-                    "companion; NOT registering async companion to "
-                    "avoid hijacking existing handler (upstream '{}'). "
-                    "Catch-all '{}' is still registered.",
-                    method, pattern, upstream_service_name, config_prefix);
-                continue;
-            }
+            // Bare-prefix companions are always registered regardless
+            // of sync conflict. The runtime yield in
+            // HttpRouter::GetAsyncHandler consults proxy_companion_patterns_
+            // and defers to a matching sync route per-request, which
+            // correctly handles both disjoint regexes (companion serves
+            // its own subset) and overlapping regexes (sync wins on the
+            // overlap).
             mr.patterns.push_back(pattern);
         }
         if (!mr.patterns.empty()) {
@@ -1047,6 +1043,14 @@ void HttpServer::Proxy(const std::string& route_pattern,
         }
         if (head_from_defaults) {
             router_.MarkProxyDefaultHead(pattern);
+        }
+        // Mark the derived bare-prefix companion so GetAsyncHandler's
+        // runtime yield lets a matching sync route win on overlap.
+        // Only the companion (not the catch-all) is tracked here —
+        // the catch-all is the proxy's own primary route and should
+        // NOT yield.
+        if (!derived_companion.empty() && pattern == derived_companion) {
+            router_.MarkProxyCompanion(pattern);
         }
         logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                              pattern, upstream_service_name,
@@ -1345,20 +1349,11 @@ void HttpServer::RegisterProxyRoutes() {
                         method, pattern, upstream.name);
                     continue;
                 }
-                // Sync conflict on the derived bare-prefix companion:
-                // skip this one pattern so the async catch-all remains.
-                if (!derived_companion.empty() &&
-                    pattern == derived_companion &&
-                    router_.HasSyncRouteConflict(method, pattern)) {
-                    logging::Get()->warn(
-                        "RegisterProxyRoutes: sync route '{} {}' matches "
-                        "bare-prefix companion; NOT registering async "
-                        "companion to avoid hijacking existing handler "
-                        "(upstream '{}'). Catch-all '{}' is still "
-                        "registered.",
-                        method, pattern, upstream.name, config_prefix);
-                    continue;
-                }
+                // Bare-prefix companions are always registered
+                // regardless of sync conflict — runtime yield in
+                // HttpRouter::GetAsyncHandler defers to a matching
+                // sync route per-request. See HttpServer::Proxy for
+                // the full rationale.
                 mr.patterns.push_back(pattern);
             }
             if (!mr.patterns.empty()) {
@@ -1427,6 +1422,11 @@ void HttpServer::RegisterProxyRoutes() {
             }
             if (head_from_defaults) {
                 router_.MarkProxyDefaultHead(pattern);
+            }
+            // Mark the derived bare-prefix companion for runtime
+            // yield. See HttpServer::Proxy for the rationale.
+            if (!derived_companion.empty() && pattern == derived_companion) {
+                router_.MarkProxyCompanion(pattern);
             }
             logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                                  pattern, upstream.name,

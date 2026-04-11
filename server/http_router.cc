@@ -169,6 +169,56 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
         }
     }
 
+    // PROXY BARE-PREFIX COMPANION runtime yield.
+    //
+    // Proxy registration installs a derived bare-prefix companion
+    // (e.g. /api/:version for a /api/:version/*rest catch-all) so
+    // requests without a trailing path like /api/v1 still reach the
+    // proxy. That companion shares a structural shape with any
+    // pre-existing sync route that uses a param at the same position,
+    // and its regex may or may not overlap — we cannot determine that
+    // statically (regex-intersection emptiness is undecidable).
+    //
+    // Handle the ambiguity at RUNTIME: if the matched async pattern
+    // was installed as a proxy companion AND the sync trie for this
+    // method (or its HEAD→GET fallback) has a match for the current
+    // request path, YIELD to sync. The sync route's regex has already
+    // accepted this path, so it's the owner; the proxy companion was
+    // only supposed to serve paths the sync route wouldn't.
+    //
+    // - Disjoint regexes (e.g. sync /:id([0-9]+) + companion
+    //   /:slug([a-z]+)): /users/123 → sync accepts, companion yields,
+    //   sync serves. /users/abc → sync's regex rejects (no HasMatch),
+    //   companion proceeds.
+    // - Overlapping regexes (e.g. sync /:id(\d+) + companion
+    //   /:uid([0-9]{1,3})): /users/12 → both regexes accept, companion
+    //   yields to sync. The companion only serves paths sync rejects.
+    //
+    // This runs BEFORE the proxy-default HEAD branch because the
+    // companion yield is a stricter precedence rule — if a sync
+    // handler for the request's method matches, it wins regardless of
+    // async/HEAD bookkeeping.
+    if (exact_match_handler &&
+        proxy_companion_patterns_.count(exact_match_pattern)) {
+        auto sync_it = method_tries_.find(request.method);
+        bool sync_matches =
+            (sync_it != method_tries_.end() &&
+             sync_it->second.HasMatch(request.path));
+        // For HEAD requests, the sync layer also does HEAD→GET
+        // fallback — so a sync GET that matches this path would
+        // also "win" over the async companion. Consult that too.
+        if (!sync_matches && request.method == "HEAD") {
+            auto sync_get = method_tries_.find("GET");
+            if (sync_get != method_tries_.end() &&
+                sync_get->second.HasMatch(request.path)) {
+                sync_matches = true;
+            }
+        }
+        if (sync_matches) {
+            exact_match_handler = nullptr;
+        }
+    }
+
     if (exact_match_handler && request.method == "HEAD" &&
         proxy_default_head_patterns_.count(exact_match_pattern)) {
         // Proxy-default HEAD match. Decide whether to keep this
@@ -309,6 +359,10 @@ void HttpRouter::MarkProxyDefaultHead(const std::string& pattern) {
 
 void HttpRouter::MarkProxyOwnedGet(const std::string& pattern) {
     proxy_owned_get_patterns_.insert(pattern);
+}
+
+void HttpRouter::MarkProxyCompanion(const std::string& pattern) {
+    proxy_companion_patterns_.insert(pattern);
 }
 
 void HttpRouter::WebSocket(const std::string& path, WsUpgradeHandler handler) {

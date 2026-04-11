@@ -115,6 +115,27 @@ public:
     // lookup can detect that and yield to the async GET owner.
     void MarkProxyOwnedGet(const std::string& pattern);
 
+    // Mark a pattern as a proxy's derived bare-prefix companion.
+    // These patterns are registered to catch requests that the
+    // corresponding catch-all pattern (/api/*rest) would miss (e.g.
+    // /api with no trailing slash). Because async-over-sync precedence
+    // means a catch-all async companion would otherwise silently
+    // shadow an existing sync route with an overlapping regex
+    // constraint, GetAsyncHandler YIELDS to a matching sync route
+    // at runtime when the matched async pattern is in this set.
+    //
+    // The runtime yield replaces the pre-check that used to drop
+    // companions whenever any same-shape sync route existed. The
+    // pre-check was unsafe in both directions:
+    //   - Too permissive (textual regex inequality ≠ disjointness)
+    //     → hijack.
+    //   - Too conservative (collapse to strip key) → 404 for
+    //     disjoint-regex companions that should have served the
+    //     request. Runtime yield resolves per-request: sync wins
+    //     when its regex matches THIS path, proxy companion wins
+    //     otherwise.
+    void MarkProxyCompanion(const std::string& pattern);
+
     // Check whether an async route for the given method+pattern would
     // conflict with an already-registered async route on the same trie.
     // This is a SEMANTIC conflict check, not a literal string match:
@@ -163,6 +184,13 @@ private:
     // precedence over the async default — elsewhere the normal
     // async-over-sync contract is preserved.
     std::unordered_set<std::string> proxy_default_head_patterns_;
+
+    // Proxy derived bare-prefix companion patterns. Populated via
+    // MarkProxyCompanion() when a proxy auto-registers /foo alongside
+    // its /foo/*catch-all route. GetAsyncHandler consults this set and
+    // yields to a matching sync route at runtime to avoid hijacking
+    // when the companion's regex overlaps with an existing sync route.
+    std::unordered_set<std::string> proxy_companion_patterns_;
 
     // Async GET patterns that are actually owned by a proxy handler.
     // Populated whenever a proxy's GET registration succeeds (i.e. the
