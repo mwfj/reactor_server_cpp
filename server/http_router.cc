@@ -198,8 +198,20 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
     // companion yield is a stricter precedence rule — if a sync
     // handler for the request's method matches, it wins regardless of
     // async/HEAD bookkeeping.
-    if (exact_match_handler &&
-        proxy_companion_patterns_.count(exact_match_pattern)) {
+    // Companion check is keyed by (method, pattern). A pattern may be
+    // a companion for SOME methods (the ones the proxy registered on
+    // its derived bare-prefix companion) without being a companion for
+    // OTHER methods. A later unrelated async route on the same pattern
+    // but a different method MUST NOT inherit the yield behavior.
+    bool is_proxy_companion_for_method = false;
+    if (exact_match_handler) {
+        auto c_it = proxy_companion_patterns_.find(request.method);
+        if (c_it != proxy_companion_patterns_.end() &&
+            c_it->second.count(exact_match_pattern) > 0) {
+            is_proxy_companion_for_method = true;
+        }
+    }
+    if (is_proxy_companion_for_method) {
         auto sync_it = method_tries_.find(request.method);
         bool sync_matches =
             (sync_it != method_tries_.end() &&
@@ -219,82 +231,86 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
         }
     }
 
-    if (exact_match_handler && request.method == "HEAD" &&
-        proxy_default_head_patterns_.count(exact_match_pattern)) {
-        // Proxy-default HEAD match. Decide whether to keep this
-        // handler or yield so HEAD follows whichever route actually
-        // owns GET for this path.
-        //
-        //  (a) Explicit sync Head() match → always yield.
-        //
-        //  (b) Proxy does NOT own GET for this pattern (either
-        //      because the proxy's GET was filtered out by the
-        //      async-conflict pre-check, or because another handler
-        //      on a different pattern matches first at request time)
-        //      → drop the proxy-default HEAD and fall through to the
-        //      async HEAD→GET fallback below. That ensures HEAD is
-        //      served by the SAME async handler GET resolves to,
-        //      instead of silently routing HEAD to the proxy while
-        //      GET goes to a different owner.
-        //
-        //  (c) Proxy owns GET for this pattern AND the winning async
-        //      GET at request time IS that same pattern → keep the
-        //      proxy HEAD (GET and HEAD both go to the same route).
-        //
-        //  (d) No async GET match at request time: sync Head()/
-        //      HEAD→GET fallback takes priority if a sync handler
-        //      matches; otherwise keep the proxy-default HEAD.
-        auto sync_head = method_tries_.find("HEAD");
-        if (sync_head != method_tries_.end() &&
-            sync_head->second.HasMatch(request.path)) {
-            return nullptr;  // explicit sync HEAD always wins
-        }
-
-        // Probe the async GET trie to find the actual winning pattern
-        // for this path (not just "some pattern matches").
-        bool async_get_matches = false;
-        std::string async_get_pattern;
-        auto async_get_it = async_method_tries_.find("GET");
-        if (async_get_it != async_method_tries_.end()) {
-            std::unordered_map<std::string, std::string> tmp;
-            auto async_get_result =
-                async_get_it->second.Search(request.path, tmp);
-            if (async_get_result.handler) {
-                async_get_matches = true;
-                async_get_pattern = async_get_result.matched_pattern;
+    if (exact_match_handler && request.method == "HEAD") {
+        auto head_it =
+            proxy_default_head_patterns_.find(exact_match_pattern);
+        if (head_it != proxy_default_head_patterns_.end()) {
+            // Proxy-default HEAD match. Decide whether to keep this
+            // handler or yield so HEAD follows whichever route actually
+            // owns GET for this path.
+            //
+            //  (a) Explicit sync Head() match → always yield.
+            //
+            //  (b) The SAME proxy registration that added this HEAD
+            //      did NOT also register GET (paired_with_get == false).
+            //      The proxy's GET was filtered out (typically because
+            //      an earlier route already owns GET on this pattern).
+            //      Drop the proxy-default HEAD and fall through to the
+            //      async HEAD→GET fallback below so HEAD is served by
+            //      the SAME handler GET would resolve to.
+            //
+            //  (c) Same proxy owns both, AND the winning async GET at
+            //      request time IS the same pattern → keep the proxy
+            //      HEAD. The second condition still matters because a
+            //      broader async GET catch-all registered elsewhere
+            //      can win over this pattern at request time, in
+            //      which case HEAD should also track that winner.
+            //
+            //  (d) No async GET match at request time: sync Head()/
+            //      HEAD→GET fallback takes priority if a sync handler
+            //      matches; otherwise keep the proxy-default HEAD.
+            //
+            // Tracking paired_with_get per REGISTRATION (not by
+            // a global "proxy_owned_get_patterns_" set) is required
+            // because two proxies can share a pattern with only
+            // partial method overlap — see the comment on
+            // proxy_default_head_patterns_ in http_router.h.
+            auto sync_head = method_tries_.find("HEAD");
+            if (sync_head != method_tries_.end() &&
+                sync_head->second.HasMatch(request.path)) {
+                return nullptr;  // explicit sync HEAD always wins
             }
-        }
 
-        if (async_get_matches) {
-            // HEAD should follow GET's OWNER. Two conditions must hold
-            // to keep the proxy HEAD:
-            //   1. The proxy owns GET for this exact pattern (so GET
-            //      and HEAD are both implemented by the proxy).
-            //   2. The winning async GET at request time IS the same
-            //      pattern (so a broader async GET catch-all that
-            //      overlaps with this proxy's HEAD pattern doesn't
-            //      steal GET while HEAD stays on the proxy).
-            // If either condition fails, drop the proxy HEAD and let
-            // the async HEAD→GET fallback route HEAD through the same
-            // handler GET resolves to.
-            bool proxy_owns_get =
-                proxy_owned_get_patterns_.count(exact_match_pattern) > 0;
-            if (!proxy_owns_get ||
-                async_get_pattern != exact_match_pattern) {
+            bool paired_with_get = head_it->second;
+            if (!paired_with_get) {
+                // The proxy that installed this HEAD did not also
+                // register GET on the same pattern; drop and let the
+                // async HEAD→GET fallback reach the real GET owner.
                 exact_match_handler = nullptr;
+            } else {
+                // Probe the async GET trie to find the actual winning
+                // pattern for this path (not just "some pattern
+                // matches"). If it is a DIFFERENT pattern, a broader
+                // catch-all owns GET at runtime and we should yield.
+                bool async_get_matches = false;
+                std::string async_get_pattern;
+                auto async_get_it = async_method_tries_.find("GET");
+                if (async_get_it != async_method_tries_.end()) {
+                    std::unordered_map<std::string, std::string> tmp;
+                    auto async_get_result =
+                        async_get_it->second.Search(request.path, tmp);
+                    if (async_get_result.handler) {
+                        async_get_matches = true;
+                        async_get_pattern = async_get_result.matched_pattern;
+                    }
+                }
+
+                if (async_get_matches) {
+                    if (async_get_pattern != exact_match_pattern) {
+                        exact_match_handler = nullptr;
+                    }
+                    // else: same pattern, same owner — keep HEAD.
+                } else {
+                    // No async GET match. Sync HEAD→GET fallback owns
+                    // the path if a sync GET matches; yield in that
+                    // case. Otherwise keep the proxy-default HEAD.
+                    auto sync_get = method_tries_.find("GET");
+                    if (sync_get != method_tries_.end() &&
+                        sync_get->second.HasMatch(request.path)) {
+                        return nullptr;
+                    }
+                }
             }
-            // else: proxy owns BOTH on this pattern and it's also the
-            // runtime winner — keep exact_match_handler.
-        } else {
-            // No async GET match. Sync HEAD→GET fallback owns the
-            // path if a sync GET matches; yield in that case.
-            auto sync_get = method_tries_.find("GET");
-            if (sync_get != method_tries_.end() &&
-                sync_get->second.HasMatch(request.path)) {
-                return nullptr;  // sync HEAD→GET fallback owns this path
-            }
-            // No sync GET either — keep exact_match_handler (proxy
-            // HEAD is the only thing that would serve this path).
         }
     }
 
@@ -353,16 +369,17 @@ void HttpRouter::DisableHeadFallback(const std::string& pattern) {
     head_fallback_blocked_.insert(pattern);
 }
 
-void HttpRouter::MarkProxyDefaultHead(const std::string& pattern) {
-    proxy_default_head_patterns_.insert(pattern);
+void HttpRouter::MarkProxyDefaultHead(const std::string& pattern,
+                                       bool paired_with_get) {
+    // Last write wins if a pattern is re-registered. In practice the
+    // async trie rejects duplicate HEAD registrations on the same
+    // pattern, so this map is effectively single-entry per pattern.
+    proxy_default_head_patterns_[pattern] = paired_with_get;
 }
 
-void HttpRouter::MarkProxyOwnedGet(const std::string& pattern) {
-    proxy_owned_get_patterns_.insert(pattern);
-}
-
-void HttpRouter::MarkProxyCompanion(const std::string& pattern) {
-    proxy_companion_patterns_.insert(pattern);
+void HttpRouter::MarkProxyCompanion(const std::string& method,
+                                     const std::string& pattern) {
+    proxy_companion_patterns_[method].insert(pattern);
 }
 
 void HttpRouter::WebSocket(const std::string& path, WsUpgradeHandler handler) {
@@ -420,12 +437,15 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
             if (async_result.handler &&
                 head_fallback_blocked_.count(async_result.matched_pattern)) {
                 // Check for the proxy-companion yield case: if the
-                // matched pattern is a proxy companion AND a sync GET
+                // matched pattern is registered as a proxy companion
+                // FOR GET (keyed by method + pattern) AND a sync GET
                 // exists for this exact path, the sync route wins at
                 // runtime for GET (and therefore for HEAD→GET too).
                 bool companion_yields_to_sync = false;
-                if (proxy_companion_patterns_.count(
-                        async_result.matched_pattern)) {
+                auto comp_get_it = proxy_companion_patterns_.find("GET");
+                if (comp_get_it != proxy_companion_patterns_.end() &&
+                    comp_get_it->second.count(
+                        async_result.matched_pattern) > 0) {
                     auto sync_get_it = method_tries_.find("GET");
                     if (sync_get_it != method_tries_.end() &&
                         sync_get_it->second.HasMatch(request.path)) {
@@ -532,11 +552,18 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
                 if (head_fallback_blocked_.count(result.matched_pattern)) {
                     // Same proxy-companion-yield exception as the
                     // HEAD dispatch branch above: if the blocked
-                    // async GET is a proxy companion AND a sync GET
-                    // matches this path, the sync route wins at
-                    // runtime so HEAD would actually be served.
+                    // async GET is a proxy companion FOR GET AND a
+                    // sync GET matches this path, the sync route
+                    // wins at runtime so HEAD would actually be
+                    // served. Companion check is keyed by (method,
+                    // pattern) — we look up "GET" explicitly because
+                    // we are reasoning about the async GET match
+                    // that feeds the HEAD→GET fallback.
                     bool companion_yields_to_sync = false;
-                    if (proxy_companion_patterns_.count(result.matched_pattern)) {
+                    auto comp_get_it =
+                        proxy_companion_patterns_.find("GET");
+                    if (comp_get_it != proxy_companion_patterns_.end() &&
+                        comp_get_it->second.count(result.matched_pattern) > 0) {
                         auto sync_get_it = method_tries_.find("GET");
                         if (sync_get_it != method_tries_.end() &&
                             sync_get_it->second.HasMatch(request.path)) {

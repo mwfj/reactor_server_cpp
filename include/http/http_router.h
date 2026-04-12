@@ -99,30 +99,44 @@ public:
     // proxy routes that got HEAD via default_methods (not via the
     // user's explicit proxy.methods list), so that an explicit sync
     // Head() handler isn't silently shadowed by a catch-all proxy
-    // default. Patterns registered here are consulted in
-    // GetAsyncHandler() — see the HEAD-handling branch.
-    void MarkProxyDefaultHead(const std::string& pattern);
+    // default.
+    //
+    // `paired_with_get` is set to true when the SAME proxy registration
+    // that inserted this HEAD also successfully registered GET on the
+    // same pattern. It is used by GetAsyncHandler's HEAD precedence
+    // logic to decide whether keeping the proxy HEAD is safe: safe
+    // only if the same proxy owns both GET and HEAD on this pattern,
+    // because only then is HEAD guaranteed to be served by the same
+    // handler GET would route through. When paired_with_get is false
+    // (e.g. the proxy's GET was skipped by the async-conflict filter
+    // because an EARLIER proxy already owned GET on this pattern),
+    // the HEAD precedence drops the proxy HEAD and falls through to
+    // the async HEAD→GET fallback, which dispatches HEAD through the
+    // actual GET owner.
+    //
+    // Tracking paired_with_get per REGISTRATION (not by "does any
+    // proxy own GET for this pattern") is required because multiple
+    // proxies can share a pattern with only partial method overlap,
+    // and the global "some proxy owns GET" view conflates registrations.
+    void MarkProxyDefaultHead(const std::string& pattern, bool paired_with_get);
 
-    // Mark a pattern as having its async GET method owned by a proxy
-    // handler (i.e. the proxy successfully registered GET for this
-    // pattern during its registration pass). Used by GetAsyncHandler's
-    // HEAD precedence logic so HEAD follows the **owner** of GET, not
-    // just "some route with the same pattern string." When a proxy
-    // registers HEAD by default but its GET gets filtered out by the
-    // conflict check (because an earlier async GET for the same path
-    // already exists), the proxy's HEAD is kept in
-    // proxy_default_head_patterns_ but NOT in this set — so the HEAD
-    // lookup can detect that and yield to the async GET owner.
-    void MarkProxyOwnedGet(const std::string& pattern);
-
-    // Mark a pattern as a proxy's derived bare-prefix companion.
-    // These patterns are registered to catch requests that the
-    // corresponding catch-all pattern (/api/*rest) would miss (e.g.
-    // /api with no trailing slash). Because async-over-sync precedence
-    // means a catch-all async companion would otherwise silently
-    // shadow an existing sync route with an overlapping regex
-    // constraint, GetAsyncHandler YIELDS to a matching sync route
-    // at runtime when the matched async pattern is in this set.
+    // Mark a pattern as a proxy's derived bare-prefix companion for
+    // a SPECIFIC METHOD. These patterns are registered to catch
+    // requests that the corresponding catch-all pattern (/api/*rest)
+    // would miss (e.g. /api with no trailing slash). Because
+    // async-over-sync precedence means a catch-all async companion
+    // would otherwise silently shadow an existing sync route with an
+    // overlapping regex constraint, GetAsyncHandler YIELDS to a
+    // matching sync route at runtime when the matched async pattern
+    // is a companion for that method.
+    //
+    // Keying by (method, pattern) — not just pattern — is required
+    // because a later async registration (e.g. RouteAsync("POST",
+    // "/api", ...)) on the SAME pattern MUST NOT inherit the
+    // yield-to-sync behavior: the new POST route is not a companion,
+    // and yielding to a sync POST /api would incorrectly drop a
+    // first-class async registration. Only the methods the proxy
+    // actually registered on the companion pattern should yield.
     //
     // The runtime yield replaces the pre-check that used to drop
     // companions whenever any same-shape sync route existed. The
@@ -134,7 +148,8 @@ public:
     //     request. Runtime yield resolves per-request: sync wins
     //     when its regex matches THIS path, proxy companion wins
     //     otherwise.
-    void MarkProxyCompanion(const std::string& pattern);
+    void MarkProxyCompanion(const std::string& method,
+                             const std::string& pattern);
 
     // Check whether an async route for the given method+pattern would
     // conflict with an already-registered async route on the same trie.
@@ -178,28 +193,33 @@ private:
     // proxy.methods explicitly exclude HEAD.
     std::unordered_set<std::string> head_fallback_blocked_;
 
-    // Async HEAD patterns installed by proxy defaults (user did not
-    // explicitly include HEAD in proxy.methods). For these specific
-    // patterns, an explicit sync Head() handler on the same path takes
-    // precedence over the async default — elsewhere the normal
-    // async-over-sync contract is preserved.
-    std::unordered_set<std::string> proxy_default_head_patterns_;
+    // Async HEAD patterns installed by proxy defaults. The value is
+    // `true` when the SAME proxy registration that inserted this HEAD
+    // also successfully registered GET on the pattern — i.e. keeping
+    // the proxy HEAD at dispatch time is safe because GET and HEAD
+    // are owned by the same registration. When `false`, the proxy's
+    // GET was filtered out (typically because an earlier proxy or
+    // user route already owns GET on this pattern), so HEAD must
+    // YIELD at dispatch time and fall through to the HEAD→GET
+    // fallback that routes through the actual GET owner.
+    //
+    // Tracking this per REGISTRATION is required because two proxies
+    // can share a pattern with only partial method overlap; a global
+    // "does any proxy own GET for this pattern" check conflates them
+    // and causes HEAD to stick on a proxy that does NOT own GET. See
+    // MarkProxyDefaultHead for the full rationale.
+    std::unordered_map<std::string, bool> proxy_default_head_patterns_;
 
-    // Proxy derived bare-prefix companion patterns. Populated via
-    // MarkProxyCompanion() when a proxy auto-registers /foo alongside
-    // its /foo/*catch-all route. GetAsyncHandler consults this set and
-    // yields to a matching sync route at runtime to avoid hijacking
-    // when the companion's regex overlaps with an existing sync route.
-    std::unordered_set<std::string> proxy_companion_patterns_;
-
-    // Async GET patterns that are actually owned by a proxy handler.
-    // Populated whenever a proxy's GET registration succeeds (i.e. the
-    // method-level conflict pre-check did not filter it out). Used by
-    // GetAsyncHandler's proxy-default HEAD precedence logic to decide
-    // whether the proxy also owns GET for a matched HEAD pattern: if
-    // not, the HEAD match is dropped so HEAD follows the async GET
-    // OWNER rather than just "whatever matches the same pattern string."
-    std::unordered_set<std::string> proxy_owned_get_patterns_;
+    // Proxy derived bare-prefix companion markers, keyed by method.
+    // `proxy_companion_patterns_[method]` is the set of patterns this
+    // method treats as a companion. GetAsyncHandler checks the
+    // (request.method, matched_pattern) pair — not just the pattern —
+    // so an unrelated first-class async route later registered on the
+    // same pattern with a different method (e.g. POST /api while
+    // /api is only a GET companion) does NOT inherit the yield-to-sync
+    // behavior. See MarkProxyCompanion for the full rationale.
+    std::unordered_map<std::string, std::unordered_set<std::string>>
+        proxy_companion_patterns_;
 
     // Normalized-pattern keys for async routes, tracked per method.
     // Each registered pattern is reduced to a "semantic shape" key

@@ -1041,7 +1041,10 @@ void HttpServer::Proxy(const std::string& route_pattern,
     // Perform the actual registration per-method per-pattern. Any
     // exception here is unexpected (e.g., std::bad_alloc) and is
     // propagated; the common "duplicate/conflicting pattern" case was
-    // caught by the per-method pre-check above.
+    // caught by the per-method pre-check above. The companion marker
+    // is set PER (method, pattern) here so unrelated async routes
+    // registered later on the same pattern with a different method
+    // don't inherit the yield-to-sync behavior.
     for (const auto& mr : to_register) {
         for (const auto& pattern : mr.patterns) {
             // Capture handler by shared_ptr so the lambda shares
@@ -1052,13 +1055,13 @@ void HttpServer::Proxy(const std::string& route_pattern,
                           HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                     handler->Handle(request, std::move(complete));
                 });
-            // Track GET ownership per-pattern so GetAsyncHandler's
-            // HEAD precedence logic can decide whether HEAD should
-            // stay on this proxy or follow a different async GET
-            // owner. See HttpRouter::MarkProxyOwnedGet and the
-            // HEAD branch in GetAsyncHandler.
-            if (mr.method == "GET") {
-                router_.MarkProxyOwnedGet(pattern);
+            // Mark the derived bare-prefix companion only for the
+            // methods this proxy actually registers on it. A method
+            // not in the proxy's method list should NOT yield — a
+            // later first-class async route on the same pattern with
+            // a different method is unrelated to this companion.
+            if (!derived_companion.empty() && pattern == derived_companion) {
+                router_.MarkProxyCompanion(mr.method, pattern);
             }
         }
     }
@@ -1067,15 +1070,13 @@ void HttpServer::Proxy(const std::string& route_pattern,
             router_.DisableHeadFallback(pattern);
         }
         if (head_from_defaults) {
-            router_.MarkProxyDefaultHead(pattern);
-        }
-        // Mark the derived bare-prefix companion so GetAsyncHandler's
-        // runtime yield lets a matching sync route win on overlap.
-        // Only the companion (not the catch-all) is tracked here —
-        // the catch-all is the proxy's own primary route and should
-        // NOT yield.
-        if (!derived_companion.empty() && pattern == derived_companion) {
-            router_.MarkProxyCompanion(pattern);
+            // `proxy_has_get` is the post-filter flag — it is true iff
+            // the SAME proxy registration that installed this default
+            // HEAD also registered GET. The HEAD precedence logic uses
+            // this to keep the proxy HEAD only when the SAME registration
+            // owns both sides, so an earlier proxy's GET on the same
+            // pattern doesn't get credit for this proxy's HEAD.
+            router_.MarkProxyDefaultHead(pattern, proxy_has_get);
         }
         logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                              pattern, upstream_service_name,
@@ -1430,7 +1431,11 @@ void HttpServer::RegisterProxyRoutes() {
             }
         }
 
-        // Perform the actual registration per-method per-pattern.
+        // Perform the actual registration per-method per-pattern. The
+        // companion marker is set PER (method, pattern) here so an
+        // unrelated async route registered later on the same pattern
+        // with a different method doesn't inherit the yield-to-sync
+        // behavior. See HttpServer::Proxy for the same rationale.
         for (const auto& mr : to_register) {
             for (const auto& pattern : mr.patterns) {
                 // Capture handler by shared_ptr so the lambda shares
@@ -1440,12 +1445,8 @@ void HttpServer::RegisterProxyRoutes() {
                               HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                         handler->Handle(request, std::move(complete));
                     });
-                // Track GET ownership per-pattern so the HEAD
-                // precedence logic knows whether the proxy owns GET
-                // for this pattern. See HttpServer::Proxy for the
-                // rationale.
-                if (mr.method == "GET") {
-                    router_.MarkProxyOwnedGet(pattern);
+                if (!derived_companion.empty() && pattern == derived_companion) {
+                    router_.MarkProxyCompanion(mr.method, pattern);
                 }
             }
         }
@@ -1454,12 +1455,12 @@ void HttpServer::RegisterProxyRoutes() {
                 router_.DisableHeadFallback(pattern);
             }
             if (head_from_defaults) {
-                router_.MarkProxyDefaultHead(pattern);
-            }
-            // Mark the derived bare-prefix companion for runtime
-            // yield. See HttpServer::Proxy for the rationale.
-            if (!derived_companion.empty() && pattern == derived_companion) {
-                router_.MarkProxyCompanion(pattern);
+                // paired_with_get == proxy_has_get — true iff the SAME
+                // proxy registration also installed GET on this pattern.
+                // When false the HEAD precedence yields to the async
+                // HEAD→GET fallback so HEAD follows the real GET owner
+                // instead of sticking on a proxy that only has HEAD.
+                router_.MarkProxyDefaultHead(pattern, proxy_has_get);
             }
             logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                                  pattern, upstream.name,
