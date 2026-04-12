@@ -81,22 +81,25 @@ bool RateLimitManager::Check(const HttpRequest& request,
         }
     }
 
-    // Set RateLimit-Policy and RateLimit headers if configured and we have a
-    // best zone to report on.
+    // Set RateLimit-Policy and RateLimit headers per IETF draft
+    // (draft-ietf-httpapi-ratelimit-headers-10).
+    //   RateLimit-Policy: {limit};w={window}
+    //   RateLimit: limit={limit}, remaining={remaining}, reset={reset}
     bool want_headers = include_headers();
     if (want_headers && !best_name.empty()) {
-        // RateLimit-Policy: "{zone_name}";q={limit}
+        // RateLimit-Policy: {limit};w=1
+        // w=1 (1-second window) matches the token bucket's per-second rate.
         response.Header("RateLimit-Policy",
-                        "\"" + best_name + "\";q=" + std::to_string(best_limit));
+                        std::to_string(best_limit) + ";w=1");
 
-        // RateLimit: "{zone_name}";r={remaining};t={reset_ceil}
+        // RateLimit: limit={L}, remaining={R}, reset={T}
         int reset_ceil = (best_retry_after > 0.0)
             ? static_cast<int>(std::ceil(best_retry_after))
             : 0;
         response.Header("RateLimit",
-                        "\"" + best_name + "\";r=" +
-                        std::to_string(best_remaining) + ";t=" +
-                        std::to_string(reset_ceil));
+                        "limit=" + std::to_string(best_limit) + ", " +
+                        "remaining=" + std::to_string(best_remaining) + ", " +
+                        "reset=" + std::to_string(reset_ceil));
     }
 
     if (denied) {

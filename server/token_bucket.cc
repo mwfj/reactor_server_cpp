@@ -14,6 +14,14 @@ void TokenBucket::Refill() const {
         now - last_refill_time_).count();
     if (elapsed_ms <= 0) return;
 
+    // Guard against int64_t overflow in rate_mt_ * elapsed_ms:
+    // If enough time has passed to fill the bucket, cap directly.
+    if (rate_mt_ > 0 && elapsed_ms > capacity_mt_ * 1000 / rate_mt_ + 1) {
+        tokens_mt_ = capacity_mt_;
+        last_refill_time_ = now;
+        return;
+    }
+
     // Compute tokens to add: rate_mt_ (millitokens/sec) * elapsed_ms / 1000
     int64_t add = rate_mt_ * elapsed_ms / 1000;
     tokens_mt_ = std::min(capacity_mt_, tokens_mt_ + add);
@@ -43,6 +51,10 @@ double TokenBucket::SecondsUntilAvailable() const {
 }
 
 void TokenBucket::UpdateConfig(double rate, int64_t capacity) {
+    // Materialize tokens accrued under the old rate before switching.
+    // Without this, the next Refill() would charge pre-reload idle
+    // time at the new rate, causing a sudden token jump.
+    Refill();
     rate_mt_ = static_cast<int64_t>(rate * MILLITOKENS_PER_TOKEN);
     capacity_mt_ = capacity * MILLITOKENS_PER_TOKEN;
     if (tokens_mt_ > capacity_mt_) {

@@ -20,6 +20,9 @@ public:
     // Return the capacity in whole tokens.
     int64_t Capacity() const { return capacity_mt_ / MILLITOKENS_PER_TOKEN; }
 
+    // Return the current rate in tokens per second.
+    double Rate() const { return static_cast<double>(rate_mt_) / MILLITOKENS_PER_TOKEN; }
+
     // Seconds until at least one token is available (0 if tokens >= 1).
     // Used for Retry-After header computation.
     double SecondsUntilAvailable() const;

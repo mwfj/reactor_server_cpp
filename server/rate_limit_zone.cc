@@ -28,6 +28,7 @@ RateLimitZone::KeyExtractor MakeKeyExtractor(const std::string& key_type) {
     }
     if (key_type == "client_ip+path") {
         return [](const HttpRequest& req) -> std::string {
+            if (req.client_ip.empty()) return "";
             return req.client_ip + "|" + req.path;
         };
     }
@@ -35,6 +36,7 @@ RateLimitZone::KeyExtractor MakeKeyExtractor(const std::string& key_type) {
         key_type.substr(0, COMPOSITE_HEADER_PREFIX_LEN) == "client_ip+header:") {
         std::string header_name = key_type.substr(COMPOSITE_HEADER_PREFIX_LEN);
         return [header_name](const HttpRequest& req) -> std::string {
+            if (req.client_ip.empty()) return "";
             std::string hval = req.GetHeader(header_name);
             if (hval.empty()) return "";
             return req.client_ip + "|" + hval;
@@ -154,14 +156,22 @@ RateLimitZone::Result RateLimitZone::Check(const HttpRequest& request) {
     auto policy = LoadPolicy();
 
     // 2. Check applies_to filter: if non-empty, request path must match
-    //    at least one prefix. No match → allow (zone doesn't apply).
+    //    at least one prefix on a segment boundary. "/api" matches
+    //    "/api", "/api/", "/api/users" but NOT "/apis" or "/api2".
     if (!policy->applies_to.empty()) {
         bool matched = false;
         for (const auto& prefix : policy->applies_to) {
             if (request.path.size() >= prefix.size() &&
                 request.path.compare(0, prefix.size(), prefix) == 0) {
-                matched = true;
-                break;
+                // Ensure the match ends at a segment boundary:
+                // prefix already ends with '/', OR path matches exactly,
+                // OR the next character is '/'.
+                if (prefix.back() == '/' ||
+                    request.path.size() == prefix.size() ||
+                    request.path[prefix.size()] == '/') {
+                    matched = true;
+                    break;
+                }
             }
         }
         if (!matched) {
@@ -188,8 +198,11 @@ RateLimitZone::Result RateLimitZone::Check(const HttpRequest& request) {
     entry->last_access = std::chrono::steady_clock::now();
     shard.TouchLru(entry);
 
-    // 7. Lazy config update: if policy changed since entry was created
-    if (entry->bucket.Capacity() != policy->capacity) {
+    // 7. Lazy config update: sync bucket with current policy if rate or
+    //    capacity changed. UpdateConfig calls Refill() first to materialize
+    //    tokens accrued under the old rate before switching.
+    if (entry->bucket.Capacity() != policy->capacity ||
+        entry->bucket.Rate() != policy->rate) {
         entry->bucket.UpdateConfig(policy->rate, policy->capacity);
     }
 
@@ -224,9 +237,6 @@ void RateLimitZone::EvictExpired(size_t dispatcher_index, size_t dispatcher_coun
     static constexpr int IDLE_REFILL_CYCLES = 4;
     auto cutoff_duration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(refill_sec * IDLE_REFILL_CYCLES));
-    (void)now;  // Used inside EvictFromShard via cutoff comparison
-
-    // Store cutoff as time_point for EvictFromShard
     auto cutoff = now - cutoff_duration;
 
     // Stride across shards assigned to this dispatcher
@@ -244,36 +254,6 @@ void RateLimitZone::EvictExpired(size_t dispatcher_index, size_t dispatcher_coun
             shard.buckets.erase(victim_key);
             shard.count--;
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// EvictFromShard (standalone helper — used when caller already holds lock)
-// ---------------------------------------------------------------------------
-
-void RateLimitZone::EvictFromShard(Shard& shard, size_t max_per_shard) {
-    // This method is available for future use by callers that already hold
-    // the shard lock and have computed their own max_per_shard.
-    // Currently EvictExpired inlines the eviction logic to avoid computing
-    // the cutoff twice. Kept for API completeness.
-    auto policy = LoadPolicy();
-    auto now = std::chrono::steady_clock::now();
-    double refill_sec = (policy->rate > 0.0)
-        ? (static_cast<double>(policy->capacity) / policy->rate)
-        : 60.0;
-    static constexpr int IDLE_REFILL_CYCLES = 4;
-    auto cutoff_duration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-        std::chrono::duration<double>(refill_sec * IDLE_REFILL_CYCLES));
-    auto cutoff = now - cutoff_duration;
-
-    while (shard.lru_tail != nullptr &&
-           (shard.count > max_per_shard ||
-            shard.lru_tail->last_access < cutoff)) {
-        Entry* victim = shard.lru_tail;
-        std::string victim_key = std::move(victim->key);
-        shard.RemoveLru(victim);
-        shard.buckets.erase(victim_key);
-        shard.count--;
     }
 }
 

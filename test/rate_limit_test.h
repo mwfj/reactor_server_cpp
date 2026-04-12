@@ -851,14 +851,22 @@ void TestReloadRateChange() {
             }
         }
 
-        // Reload with higher capacity
+        // Reload with higher rate and capacity
         config.zones[0].capacity = 100;
         config.zones[0].rate = 100.0;
         manager.Reload(config);
 
-        // The existing zone is reused, but capacity is updated.
-        // Existing tokens are preserved (still 0), but the refill rate is now
-        // much higher. Sleep briefly to let tokens refill.
+        // Trigger the lazy config update: this Check() detects the rate/capacity
+        // mismatch and calls UpdateConfig(), which Refills at the OLD rate first
+        // (materializing any pre-reload idle time), then applies the new rate.
+        // The request itself will be denied (0 tokens after old-rate refill).
+        {
+            HttpResponse response;
+            manager.Check(req, response);  // triggers UpdateConfig on the bucket
+        }
+
+        // Now sleep so the NEW rate (100 req/sec) produces tokens.
+        // 50ms at 100 req/sec = ~5 tokens.
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
         {

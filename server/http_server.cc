@@ -3184,8 +3184,11 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // Upstream configs are restart-only — clear them so staged edits
         // in the config file don't block live-safe field reloads.
         validation_copy.upstreams.clear();
-        // Rate limit config is live-reloadable — clear from validation copy
-        validation_copy.rate_limit = RateLimitConfig{};
+        // Rate limit config IS live-reloadable and MUST be validated.
+        // Unlike upstreams (restart-only), rate_limit changes are applied
+        // immediately via rate_limit_manager_->Reload(), so bad values
+        // (rate<=0, invalid key_type, duplicate zone names) must be caught.
+        validation_copy.rate_limit = new_config.rate_limit;
         try {
             ConfigLoader::Validate(validation_copy);
         } catch (const std::invalid_argument& e) {

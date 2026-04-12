@@ -880,9 +880,13 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                 throw std::invalid_argument(
                     "Duplicate rate_limit zone name: '" + z.name + "'");
             }
-            if (z.rate <= 0) {
+            // Minimum rate: 0.001 req/sec. Below this, rate * 1000 truncates
+            // to 0 millitokens/sec and the bucket never refills after initial burst.
+            static constexpr double MIN_RATE = 0.001;
+            if (z.rate < MIN_RATE) {
                 throw std::invalid_argument(
-                    idx + " ('" + z.name + "'): rate must be > 0");
+                    idx + " ('" + z.name + "'): rate must be >= " +
+                    std::to_string(MIN_RATE) + " (got " + std::to_string(z.rate) + ")");
             }
             if (z.capacity < 1) {
                 throw std::invalid_argument(
@@ -893,15 +897,26 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     idx + " ('" + z.name + "'): max_entries must be >= 1");
             }
 
-            // Validate key_type: exact match or prefix match
+            // Validate key_type: exact match or prefix+name match.
+            // Bare prefixes like "header:" or "client_ip+header:" (no name
+            // after colon) are rejected — MakeKeyExtractor can't build a
+            // useful extractor and silently becomes pass-through.
             bool valid_key = valid_key_types.count(z.key_type) > 0;
             if (!valid_key) {
                 for (const auto& prefix : valid_key_prefixes) {
-                    if (z.key_type == prefix ||
-                        (prefix.back() == ':' && z.key_type.size() > prefix.size() &&
-                         z.key_type.substr(0, prefix.size()) == prefix)) {
-                        valid_key = true;
-                        break;
+                    if (prefix.back() == ':') {
+                        // Prefix ending with ':' requires at least one char after it
+                        if (z.key_type.size() > prefix.size() &&
+                            z.key_type.substr(0, prefix.size()) == prefix) {
+                            valid_key = true;
+                            break;
+                        }
+                    } else {
+                        // Exact match (e.g., "client_ip+path")
+                        if (z.key_type == prefix) {
+                            valid_key = true;
+                            break;
+                        }
                     }
                 }
             }

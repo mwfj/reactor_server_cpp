@@ -111,8 +111,10 @@ private:
     Entry* FindOrCreate(Shard& shard, const std::string& key,
                         const ZonePolicy& policy);
 
-    // Evict entries from a single shard that are idle or over capacity.
-    void EvictFromShard(Shard& shard, size_t max_per_shard);
+    // Shards are sized at construction and never resized. std::vector<Shard>
+    // works because Shard contains std::mutex (non-movable), but any future
+    // push_back / resize would fail to compile. This is intentional — shard
+    // count is a compile-time constant (DEFAULT_SHARD_COUNT).
 };
 
 // Factory: build a KeyExtractor from a key_type string.
