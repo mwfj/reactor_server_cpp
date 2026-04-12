@@ -1035,7 +1035,7 @@ void TestRouterPatternParamsCleared() {
 }
 
 // ---------------------------------------------------------------------------
-// Additional edge case tests (from PR review)
+// Additional edge case tests
 // ---------------------------------------------------------------------------
 
 // Root catch-all: /*rest should match "/" with rest=""
@@ -1643,8 +1643,6 @@ void RunAllTests() {
     TestTrieRootCatchAll();
     TestTrieCatchAllNoTrailingSlash();
     TestRouterWsPatternRoute();
-
-    // Regression tests (from PR review rounds)
     TestTrieSlashBoundarySplit();
     TestTrieNoCollapsedPathMatch();
     TestTrieParamTrailingSlashDistinct();
@@ -1652,7 +1650,7 @@ void RunAllTests() {
     TestRouterParamsClearedOnMiss();
     TestTrieMidSegmentColonStar();
 
-    // Proxy-marker per-registration scoping (P1 + P2 from latest review)
+    // Proxy-marker per-registration scoping
     TestRouterProxyHeadFollowsRegistrationOwner();
     TestRouterProxyHeadKeptWhenSameRegistrationPair();
     TestRouterProxyCompanionScopedByMethod();
