@@ -2168,7 +2168,11 @@ void TestIntegrationBackoffDoesNotBlockOtherRequests() {
         ServerConfig gw_config;
         gw_config.bind_host = "127.0.0.1";
         gw_config.bind_port = 0;
-        gw_config.worker_threads = 4;
+        // Pin to 1 worker so both /slow and /fast land on the same
+        // dispatcher. With multiple workers, fd % N routing can put
+        // them on different dispatchers, letting /fast succeed even
+        // if the retry path blocks its own dispatcher thread.
+        gw_config.worker_threads = 1;
         gw_config.http2.enabled = false;
 
         // /slow has retry_on_5xx=true so backoff will be applied between attempts.

@@ -411,6 +411,13 @@ void Dispatcher::HandleEventId(){
         tasks.swap(task_que_);
     }
 
+    // Advance the deferred-drain timestamp so the next shortened-timeout
+    // iteration in RunEventLoop doesn't re-drain immediately. Without this,
+    // an EnQueue → HandleEventId drain leaves last_deferred_drain_ stale,
+    // and the next delayed-task-shortened idle timeout sees >= 1s elapsed
+    // and drains EnQueueDeferred work at retry-backoff frequency.
+    last_deferred_drain_ = std::chrono::steady_clock::now();
+
     // Execute tasks without holding lock
     while(!tasks.empty()){
         auto fn = std::move(tasks.front());
@@ -428,7 +435,11 @@ void Dispatcher::ProcessPendingTasks() {
     std::vector<std::function<void()>> expired_delayed;
     {
         std::lock_guard<std::mutex> lck(mtx_);
-        if (!task_que_.empty()) tasks.swap(task_que_);
+        if (!task_que_.empty()) {
+            tasks.swap(task_que_);
+            // Advance the deferred-drain timestamp (same as HandleEventId)
+            last_deferred_drain_ = std::chrono::steady_clock::now();
+        }
         // Also collect expired delayed tasks. This is critical for the
         // stop-from-handler path: the dispatcher thread is blocked in a
         // handler callback and pumps ProcessPendingTasks() instead of
