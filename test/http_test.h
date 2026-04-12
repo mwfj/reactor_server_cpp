@@ -576,8 +576,7 @@ namespace HttpTests {
 
     // ─── Async-route integration tests ────────────────────────────────────
     //
-    // These lock in the four review fixes: middleware gating of async routes,
-    // preserving HTTP/1 response ordering across the deferred window,
+    // Middleware gating of async routes, preserving HTTP/1 response ordering across the deferred window,
     // HEAD/close semantics in deferred responses, and HTTP/2 async dispatch.
 
     // Helper: send raw bytes on a dedicated socket, read the full response

@@ -225,8 +225,6 @@ namespace WebSocketTests {
         }
     }
 
-    // === Additional Tests (from plan review) ===
-
     void TestParserBinaryFrame() {
         std::cout << "\n[TEST] Parser Binary Frame..." << std::endl;
         try {

@@ -1035,7 +1035,7 @@ void TestRouterPatternParamsCleared() {
 }
 
 // ---------------------------------------------------------------------------
-// Additional edge case tests (from PR review)
+// Additional edge case tests
 // ---------------------------------------------------------------------------
 
 // Root catch-all: /*rest should match "/" with rest=""
@@ -1296,6 +1296,423 @@ void TestTrieMidSegmentColonStar() {
 }
 
 // ---------------------------------------------------------------------------
+// Proxy-marker regression tests (per-registration scoping)
+//
+// These tests exercise HttpRouter's proxy precedence markers directly
+// to guard against cross-route contamination. The markers track:
+//
+//   - MarkProxyDefaultHead(pattern, paired_with_get) — installed when a
+//     proxy's HEAD comes from default_methods AND whether the SAME
+//     registration also installed GET. Used so HEAD follows the same
+//     registration's GET owner, not some other proxy that happens to
+//     own GET on the same pattern string.
+//
+//   - MarkProxyCompanion(method, pattern) — installed for a proxy's
+//     derived bare-prefix companion, keyed by (method, pattern) so a
+//     later unrelated async registration on the same pattern with a
+//     different method does NOT inherit the yield-to-sync behavior.
+// ---------------------------------------------------------------------------
+
+// P1 regression: proxy A owns async GET on a pattern, then proxy B
+// installs a default-HEAD on the same pattern but its GET was filtered
+// out by the async-conflict check. HEAD requests must NOT stick on
+// proxy B — they must drop B's HEAD and fall through to the async
+// HEAD→GET fallback that routes through A's GET.
+void TestRouterProxyHeadFollowsRegistrationOwner() {
+    std::cout << "\n[TEST] Router: proxy default HEAD follows same-registration GET owner..."
+              << std::endl;
+    try {
+        HttpRouter router;
+
+        // Proxy A: owns GET on /api/*rest. Simulate by registering the
+        // async GET route directly. Mark nothing for HEAD — A has no HEAD.
+        auto proxy_a_hit = std::make_shared<bool>(false);
+        router.RouteAsync("GET", "/api/*rest",
+            [proxy_a_hit](const HttpRequest&,
+                          HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
+                *proxy_a_hit = true;
+            });
+
+        // Proxy B: registers HEAD on the same pattern as a DEFAULT method,
+        // but its GET was filtered out (proxy A already owns it). In the
+        // real proxy registration loop, the per-method conflict check
+        // would skip B's GET and keep B's HEAD, then mark
+        // proxy_default_head_patterns_[/api/*rest] = false (paired=false)
+        // because proxy_has_get (for B) is false post-filter.
+        auto proxy_b_head_hit = std::make_shared<bool>(false);
+        router.RouteAsync("HEAD", "/api/*rest",
+            [proxy_b_head_hit](const HttpRequest&,
+                               HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
+                *proxy_b_head_hit = true;
+            });
+        // paired_with_get = false — B did NOT register GET on this pattern.
+        router.MarkProxyDefaultHead("/api/*rest", /*paired_with_get=*/false);
+
+        HttpRequest req;
+        req.method = "HEAD";
+        req.path = "/api/foo";
+        bool head_fallback = false;
+        auto handler = router.GetAsyncHandler(req, &head_fallback);
+
+        // Expected: handler is A's GET handler (via HEAD→GET fallback),
+        // NOT B's HEAD handler.
+        bool got_handler = (handler != nullptr);
+        bool fallback_flag = head_fallback;
+        if (got_handler) {
+            handler(req, [](HttpResponse) {});
+        }
+
+        bool pass = got_handler && fallback_flag &&
+                    *proxy_a_hit && !*proxy_b_head_hit;
+        std::string err;
+        if (!got_handler) err = "HEAD returned no handler";
+        else if (!fallback_flag) err = "HEAD→GET fallback flag was false";
+        else if (!*proxy_a_hit) err = "proxy A's GET was not invoked";
+        else if (*proxy_b_head_hit) err = "proxy B's default HEAD hijacked the request";
+        TestFramework::RecordTest(
+            "Router: proxy default HEAD follows same-registration GET owner",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Router: proxy default HEAD follows same-registration GET owner",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// P1 companion case: same registration DID own both GET and HEAD on
+// the same pattern — HEAD must stay on the proxy.
+void TestRouterProxyHeadKeptWhenSameRegistrationPair() {
+    std::cout << "\n[TEST] Router: proxy default HEAD stays when same registration owns GET..."
+              << std::endl;
+    try {
+        HttpRouter router;
+
+        // Single proxy registers both GET and HEAD on /items/*rest.
+        auto get_hit = std::make_shared<bool>(false);
+        auto head_hit = std::make_shared<bool>(false);
+        router.RouteAsync("GET", "/items/*rest",
+            [get_hit](const HttpRequest&,
+                      HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
+                *get_hit = true;
+            });
+        router.RouteAsync("HEAD", "/items/*rest",
+            [head_hit](const HttpRequest&,
+                       HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
+                *head_hit = true;
+            });
+        // paired_with_get = true — same registration owns both.
+        router.MarkProxyDefaultHead("/items/*rest", /*paired_with_get=*/true);
+
+        HttpRequest req;
+        req.method = "HEAD";
+        req.path = "/items/foo";
+        bool head_fallback = false;
+        auto handler = router.GetAsyncHandler(req, &head_fallback);
+
+        if (handler) handler(req, [](HttpResponse) {});
+
+        // HEAD stays on the proxy's HEAD handler (not via HEAD→GET fallback).
+        bool pass = (handler != nullptr) && !head_fallback &&
+                    *head_hit && !*get_hit;
+        std::string err;
+        if (!handler) err = "HEAD returned no handler";
+        else if (head_fallback) err = "unexpected HEAD→GET fallback";
+        else if (!*head_hit) err = "proxy's HEAD handler was not invoked";
+        else if (*get_hit) err = "GET handler was unexpectedly invoked";
+        TestFramework::RecordTest(
+            "Router: proxy default HEAD stays when same registration owns GET",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Router: proxy default HEAD stays when same registration owns GET",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// P2 regression: proxy companion marked for GET on /api. Later, an
+// unrelated async POST /api is registered. A POST request to /api
+// must NOT yield to a matching sync POST /api — it was never a
+// companion for the POST method.
+void TestRouterProxyCompanionScopedByMethod() {
+    std::cout << "\n[TEST] Router: proxy companion yield is scoped to marked methods..."
+              << std::endl;
+    try {
+        HttpRouter router;
+
+        // Sync POST /api — user's first-class handler.
+        auto sync_post_hit = std::make_shared<bool>(false);
+        router.Route("POST", "/api",
+            [sync_post_hit](const HttpRequest&, HttpResponse& resp) {
+                *sync_post_hit = true;
+                resp.Status(200).Text("sync-post");
+            });
+
+        // Proxy-like GET companion registration: /api is the derived
+        // bare-prefix companion for a /api/*rest proxy with methods=[GET].
+        auto async_get_hit = std::make_shared<bool>(false);
+        router.RouteAsync("GET", "/api",
+            [async_get_hit](const HttpRequest&,
+                            HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
+                *async_get_hit = true;
+            });
+        // Mark ONLY (GET, /api) as a companion — this is what the per-method
+        // proxy registration loop produces.
+        router.MarkProxyCompanion("GET", "/api");
+
+        // Later: an UNRELATED first-class async POST /api. NOT a companion.
+        auto async_post_hit = std::make_shared<bool>(false);
+        router.RouteAsync("POST", "/api",
+            [async_post_hit](const HttpRequest&,
+                             HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
+                *async_post_hit = true;
+            });
+
+        // POST /api → should reach the async POST handler and NOT yield
+        // to the sync POST handler (the async registration is first-class,
+        // not a companion).
+        HttpRequest req;
+        req.method = "POST";
+        req.path = "/api";
+        auto handler = router.GetAsyncHandler(req, nullptr);
+        if (handler) handler(req, [](HttpResponse) {});
+
+        bool pass = (handler != nullptr) &&
+                    *async_post_hit && !*sync_post_hit;
+        std::string err;
+        if (!handler) err = "POST returned no async handler (unexpected yield)";
+        else if (!*async_post_hit) err = "async POST handler not invoked";
+        else if (*sync_post_hit) err = "sync POST handler was incorrectly invoked via yield";
+        TestFramework::RecordTest(
+            "Router: proxy companion yield is scoped to marked methods",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Router: proxy companion yield is scoped to marked methods",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// P2 companion case: GET /api is a companion and sync GET /api exists
+// → companion must still yield for GET requests (this is the existing
+// behavior the earlier fix added; keep it working after the method-
+// scoping refactor).
+void TestRouterProxyCompanionYieldsForMarkedMethod() {
+    std::cout << "\n[TEST] Router: proxy companion still yields for the marked method..."
+              << std::endl;
+    try {
+        HttpRouter router;
+
+        auto sync_get_hit = std::make_shared<bool>(false);
+        router.Route("GET", "/api",
+            [sync_get_hit](const HttpRequest&, HttpResponse& resp) {
+                *sync_get_hit = true;
+                resp.Status(200).Text("sync-get");
+            });
+
+        auto async_get_hit = std::make_shared<bool>(false);
+        router.RouteAsync("GET", "/api",
+            [async_get_hit](const HttpRequest&,
+                            HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
+                *async_get_hit = true;
+            });
+        router.MarkProxyCompanion("GET", "/api");
+
+        HttpRequest req;
+        req.method = "GET";
+        req.path = "/api";
+        auto handler = router.GetAsyncHandler(req, nullptr);
+
+        // Expected: GetAsyncHandler yields (returns null) and sync GET
+        // serves via Dispatch. Verify the yield; the sync invocation is
+        // verified via Dispatch below.
+        bool yielded = (handler == nullptr);
+
+        HttpResponse resp;
+        bool dispatched = router.Dispatch(req, resp);
+        bool pass = yielded && dispatched && *sync_get_hit && !*async_get_hit;
+        std::string err;
+        if (!yielded) err = "async companion did not yield to sync GET";
+        else if (!dispatched) err = "sync Dispatch did not handle the request";
+        else if (!*sync_get_hit) err = "sync GET handler was not invoked";
+        else if (*async_get_hit) err = "async GET companion was unexpectedly invoked";
+        TestFramework::RecordTest(
+            "Router: proxy companion still yields for the marked method",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Router: proxy companion still yields for the marked method",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// P2 (latest review): per-pattern paired_with_get. When a proxy
+// registers both a companion pattern and a catch-all pattern, the
+// per-(method,pattern) async-conflict filter may drop GET on ONE
+// pattern while keeping it on the OTHER. MarkProxyDefaultHead must
+// be called with a PER-PATTERN paired flag — marking both patterns
+// as paired=true just because the proxy owns GET on SOME pattern
+// overall would incorrectly keep HEAD on the proxy for the pattern
+// where GET was actually filtered out.
+//
+// Scenario (mirrors the production bug):
+//   - Existing async GET /api (user's own handler — not a proxy)
+//   - Proxy on /api/*rest with default methods. Its companion /api
+//     and catch-all /api/*rest both survive except for GET /api,
+//     which collides with the user's async GET.
+//   - MarkProxyDefaultHead should be called with paired=FALSE for
+//     /api (proxy's GET skipped) and paired=TRUE for /api/*rest.
+//   - HEAD /api must fall through to HEAD→GET fallback and reach
+//     the user's async GET /api.
+//   - HEAD /api/foo must stay on the proxy's HEAD /api/*rest
+//     (same-registration pair, paired=true).
+void TestRouterProxyDefaultHeadPairingPerPattern() {
+    std::cout << "\n[TEST] Router: proxy default HEAD paired_with_get is per-pattern..."
+              << std::endl;
+    try {
+        HttpRouter router;
+
+        // User's first-class async GET /api (the real GET owner).
+        auto user_get_hit = std::make_shared<bool>(false);
+        router.RouteAsync("GET", "/api",
+            [user_get_hit](const HttpRequest&,
+                           HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
+                *user_get_hit = true;
+            });
+
+        // Proxy's surviving async HEAD /api (the collision filtered
+        // out proxy's GET /api, so the proxy's companion only has
+        // HEAD). In the real http_server.cc loop, this is what we
+        // would see after the per-method conflict filter runs.
+        auto proxy_head_api_hit = std::make_shared<bool>(false);
+        router.RouteAsync("HEAD", "/api",
+            [proxy_head_api_hit](const HttpRequest&,
+                                 HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
+                *proxy_head_api_hit = true;
+            });
+        // paired=false: proxy did NOT register GET /api (filtered out).
+        router.MarkProxyDefaultHead("/api", /*paired_with_get=*/false);
+
+        // Proxy's catch-all pattern — GET /api/*rest and HEAD
+        // /api/*rest both survived, so pairing is TRUE here.
+        auto proxy_get_catchall_hit = std::make_shared<bool>(false);
+        auto proxy_head_catchall_hit = std::make_shared<bool>(false);
+        router.RouteAsync("GET", "/api/*rest",
+            [proxy_get_catchall_hit](const HttpRequest&,
+                                      HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
+                *proxy_get_catchall_hit = true;
+            });
+        router.RouteAsync("HEAD", "/api/*rest",
+            [proxy_head_catchall_hit](const HttpRequest&,
+                                       HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
+                *proxy_head_catchall_hit = true;
+            });
+        router.MarkProxyDefaultHead("/api/*rest", /*paired_with_get=*/true);
+
+        // HEAD /api must route through the user's async GET /api
+        // via the HEAD→GET fallback (proxy HEAD /api dropped because
+        // paired=false for that pattern).
+        {
+            HttpRequest req;
+            req.method = "HEAD";
+            req.path = "/api";
+            bool head_fallback = false;
+            auto handler = router.GetAsyncHandler(req, &head_fallback);
+            if (handler) handler(req, [](HttpResponse) {});
+
+            bool api_ok = (handler != nullptr) && head_fallback &&
+                          *user_get_hit && !*proxy_head_api_hit;
+            std::string err1;
+            if (!handler) err1 = "HEAD /api returned no handler";
+            else if (!head_fallback) err1 = "HEAD /api did not use HEAD→GET fallback";
+            else if (!*user_get_hit) err1 = "user's async GET /api was not invoked";
+            else if (*proxy_head_api_hit) err1 = "proxy HEAD /api incorrectly hijacked";
+            if (!api_ok) {
+                TestFramework::RecordTest(
+                    "Router: proxy default HEAD paired_with_get is per-pattern",
+                    false, err1, TestFramework::TestCategory::ROUTE);
+                return;
+            }
+        }
+
+        // HEAD /api/foo must stay on the proxy's HEAD /api/*rest
+        // (paired=true, same-registration pairing honored). Proxy
+        // GET /api/*rest must NOT be invoked — the catch-all's HEAD
+        // handler is.
+        {
+            HttpRequest req;
+            req.method = "HEAD";
+            req.path = "/api/foo";
+            bool head_fallback = false;
+            auto handler = router.GetAsyncHandler(req, &head_fallback);
+            if (handler) handler(req, [](HttpResponse) {});
+
+            bool catchall_ok = (handler != nullptr) && !head_fallback &&
+                               *proxy_head_catchall_hit &&
+                               !*proxy_get_catchall_hit;
+            std::string err2;
+            if (!handler) err2 = "HEAD /api/foo returned no handler";
+            else if (head_fallback) err2 = "HEAD /api/foo unexpectedly used HEAD→GET fallback";
+            else if (!*proxy_head_catchall_hit) err2 = "proxy HEAD /api/*rest not invoked";
+            else if (*proxy_get_catchall_hit) err2 = "proxy GET /api/*rest unexpectedly invoked";
+            TestFramework::RecordTest(
+                "Router: proxy default HEAD paired_with_get is per-pattern",
+                catchall_ok, err2, TestFramework::TestCategory::ROUTE);
+        }
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Router: proxy default HEAD paired_with_get is per-pattern",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// P2 disjoint-regex companion case: sync /users/:id([0-9]+) +
+// async companion /users/:slug([a-z]+). Alphabetic bare-prefix
+// requests should still reach the async companion (no sync match).
+void TestRouterProxyCompanionDisjointRegex() {
+    std::cout << "\n[TEST] Router: proxy companion serves disjoint-regex paths..."
+              << std::endl;
+    try {
+        HttpRouter router;
+
+        // Sync numeric-only route.
+        router.Route("GET", "/users/:id([0-9]+)",
+            [](const HttpRequest&, HttpResponse& resp) {
+                resp.Status(200).Text("sync-num");
+            });
+
+        // Async alphabetic-only companion.
+        auto async_hit = std::make_shared<bool>(false);
+        router.RouteAsync("GET", "/users/:slug([a-z]+)",
+            [async_hit](const HttpRequest&,
+                        HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
+                *async_hit = true;
+            });
+        router.MarkProxyCompanion("GET", "/users/:slug([a-z]+)");
+
+        // Request /users/abc — sync regex rejects, async companion
+        // should NOT yield (sync GET HasMatch returns false for /users/abc
+        // because [0-9]+ doesn't match "abc").
+        HttpRequest req;
+        req.method = "GET";
+        req.path = "/users/abc";
+        auto handler = router.GetAsyncHandler(req, nullptr);
+        if (handler) handler(req, [](HttpResponse) {});
+
+        bool pass = (handler != nullptr) && *async_hit;
+        std::string err;
+        if (!handler) err = "async companion incorrectly yielded for disjoint-regex path";
+        else if (!*async_hit) err = "async companion handler was not invoked";
+        TestFramework::RecordTest(
+            "Router: proxy companion serves disjoint-regex paths",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Router: proxy companion serves disjoint-regex paths",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RunAllTests
 // ---------------------------------------------------------------------------
 void RunAllTests() {
@@ -1346,14 +1763,20 @@ void RunAllTests() {
     TestTrieRootCatchAll();
     TestTrieCatchAllNoTrailingSlash();
     TestRouterWsPatternRoute();
-
-    // Regression tests (from PR review rounds)
     TestTrieSlashBoundarySplit();
     TestTrieNoCollapsedPathMatch();
     TestTrieParamTrailingSlashDistinct();
     TestTrieRegexCharacterClass();
     TestRouterParamsClearedOnMiss();
     TestTrieMidSegmentColonStar();
+
+    // Proxy-marker per-registration scoping
+    TestRouterProxyHeadFollowsRegistrationOwner();
+    TestRouterProxyHeadKeptWhenSameRegistrationPair();
+    TestRouterProxyCompanionScopedByMethod();
+    TestRouterProxyCompanionYieldsForMarkedMethod();
+    TestRouterProxyCompanionDisjointRegex();
+    TestRouterProxyDefaultHeadPairingPerPattern();
 }
 
 }  // namespace RouteTests

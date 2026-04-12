@@ -121,10 +121,24 @@ public:
     // streams. Returns time_point::max() if no incomplete streams exist.
     std::chrono::steady_clock::time_point OldestIncompleteStreamStart() const;
 
-    // RST_STREAM all incomplete streams that have exceeded the given timeout.
-    // Returns the number of streams reset. Caller should call SendPendingFrames()
-    // and UpdateDeadline() after this.
-    size_t ResetExpiredStreams(int timeout_sec);
+    // RST_STREAM streams that have exceeded either of two caps:
+    //   - parse_timeout_sec: incomplete (non-counter-decremented)
+    //     streams whose request parsing is still in progress. 0 = skip.
+    //   - async_cap_sec: async (counter-decremented) streams where the
+    //     handler never submitted a response — last-resort safety net
+    //     for stuck handlers. 0 = skip. When > 0 this MUST be set by
+    //     the caller to a value at least as large as the longest
+    //     configured handler timeout (e.g., proxy.response_timeout_ms)
+    //     so it doesn't override operator config.
+    // Returns the number of streams reset. Caller should call
+    // SendPendingFrames() and UpdateDeadline() after this.
+    //
+    // If async_cap_reset_ids is non-null, the IDs of streams RST'd by
+    // the async_cap_sec branch (and only that branch) are appended so
+    // the caller can fire per-stream abort hooks that release the
+    // stored handler-side bookkeeping (e.g., active_requests decrement).
+    size_t ResetExpiredStreams(int parse_timeout_sec, int async_cap_sec = 0,
+                               std::vector<int32_t>* async_cap_reset_ids = nullptr);
 
     // Body size limit (set from config, checked during data ingestion)
     void SetMaxBodySize(size_t max) { max_body_size_ = max; }

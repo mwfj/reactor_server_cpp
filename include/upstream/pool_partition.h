@@ -46,7 +46,17 @@ public:
     // function returns (e.g., when a valid idle connection is available or
     // the pool is immediately exhausted). Callers must not hold any lock
     // that the callback itself might attempt to acquire.
-    void CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb);
+    //
+    // Optional `cancel_token`: a shared atomic flag the caller may set
+    // to abort a queued checkout. The pool checks it on every pop and
+    // also proactively sweeps the queue for cancelled entries when the
+    // queue would otherwise reject a new CheckoutAsync for fullness.
+    // Cancelled entries are dropped without firing any callback. This
+    // prevents a burst of disconnected clients from filling the bounded
+    // wait queue with dead waiters that would otherwise block live
+    // requests with queue-full / queue-timeout errors.
+    void CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb,
+                       std::shared_ptr<std::atomic<bool>> cancel_token = nullptr);
 
     // Return a connection to the pool. Called by UpstreamLease destructor.
     void ReturnConnection(UpstreamConnection* conn);
@@ -119,9 +129,24 @@ private:
         ReadyCallback ready_callback;
         ErrorCallback error_callback;
         std::chrono::steady_clock::time_point queued_at;
+        // Optional cancel flag set by the caller (e.g. via
+        // ProxyTransaction::Cancel) to short-circuit this entry. When
+        // true, the pool drops the entry on pop and skips firing its
+        // callbacks. Nullable — regular checkouts leave this empty.
+        std::shared_ptr<std::atomic<bool>> cancel_token;
     };
     std::deque<WaitEntry> wait_queue_;
     static constexpr size_t MAX_WAIT_QUEUE_SIZE = 256;
+
+    // Helper: returns true if this entry's cancel token is set.
+    static bool IsEntryCancelled(const WaitEntry& e) {
+        return e.cancel_token && e.cancel_token->load(std::memory_order_acquire);
+    }
+    // Walk the wait queue and erase cancelled entries in-place.
+    // Called by CheckoutAsync before rejecting on a full queue so a
+    // burst of disconnected clients doesn't permanently consume slots.
+    // Returns the number of entries removed.
+    size_t PurgeCancelledWaitEntries();
 
     size_t partition_max_connections_;
 
@@ -153,6 +178,10 @@ private:
     bool ValidateConnection(UpstreamConnection* conn);
     void ServiceWaitQueue();
     void PurgeExpiredWaitEntries();
+    // Create new connections for queued waiters after a pool slot opens.
+    // Loops while capacity is available and waiters remain. Checks alive_
+    // after each callback (user callbacks may tear down the partition).
+    void CreateForWaiters();
     void ScheduleWaitQueuePurge();
     void DestroyConnection(std::unique_ptr<UpstreamConnection> conn);
 

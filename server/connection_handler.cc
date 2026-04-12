@@ -276,24 +276,46 @@ void ConnectionHandler::OnMessage(){
 
     // If peer sent EOF and connection isn't already closing (the sync fast-path
     // in DoSendRaw/DoSend may have already ForceClose'd), handle the close.
+    //
+    // HTTP/1 clients are allowed to half-close the write side
+    // (shutdown(SHUT_WR) after sending the request) while waiting for
+    // the response. When that happens we see peer_closed=true with an
+    // empty output buffer (the async handler has not written anything
+    // yet), and force-closing the socket here would cancel the
+    // in-flight request before the handler can reply. We must instead
+    // let the handler run to completion; the existing deferred
+    // heartbeat and its absolute safety cap (cap_sec) bound the wait,
+    // and any actual write failure (client read-shutdown or
+    // full-disconnect) already funnels through the send-side fast-path
+    // which sets close_after_write_ / calls ForceClose on EPIPE.
     if (peer_closed && !is_closing_.load(std::memory_order_acquire)) {
         if (output_bf_.Size() > 0) {
             // Data still being flushed — enable write mode to drain it.
             // CallWriteCb will ForceClose when the buffer empties.
             client_channel_->EnableWriteMode();
         } else if (callback_ran) {
-            // Callback ran but buffer is empty and connection not closed.
-            // Possible cases:
-            // - Sync handler sent response, fast-path ForceClose'd → is_closing_ true
-            //   (caught above, won't reach here)
-            // - Async handler will send response later via SendData/SendRaw →
-            //   the fast-path there will see close_after_write_ and ForceClose.
-            //   Set a deadline in case the async handler never responds.
+            // Callback ran but buffer is empty and connection not
+            // closed. Possible cases:
+            //   - Sync handler sent response, fast-path ForceClose'd
+            //     → is_closing_ == true (caught by outer guard).
+            //   - Async handler will send response later via
+            //     SendData/SendRaw; the send fast-path will see
+            //     close_after_write_ and ForceClose when it runs.
+            //   - Client is half-closed waiting for the response;
+            //     the deferred heartbeat already armed a deadline
+            //     that will either fire cap_sec or re-arm until the
+            //     handler completes.
+            // Arm a modest fallback deadline when nothing else has —
+            // guarantees the timer callback eventually runs so the
+            // connection can be torn down if the handler hangs,
+            // without closing a valid in-flight request up front.
             if (!has_deadline_) {
-                SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+                SetDeadline(std::chrono::steady_clock::now() +
+                            std::chrono::seconds(5));
             }
         } else {
-            // No callback ran (EOF without data) — nothing to wait for.
+            // No callback ran (EOF without any input this cycle and
+            // no handler in-flight) — nothing to wait for.
             ForceClose();
         }
     }
@@ -885,11 +907,27 @@ std::string ConnectionHandler::GetAlpnProtocol() const {
 
 void ConnectionHandler::SetDeadlineTimeoutCb(DeadlineTimeoutCb cb) {
     deadline_timeout_cb_ = std::move(cb);
+    ++deadline_cb_generation_;
 }
 
 bool ConnectionHandler::CallDeadlineTimeoutCb() {
     if (deadline_timeout_cb_) {
-        return deadline_timeout_cb_();
+        // Move to stack local before invoking: the callback may call
+        // SetDeadlineTimeoutCb(nullptr) (e.g., proxy's ClearResponseTimeout),
+        // which would destroy the std::function while it's executing (UB).
+        //
+        // After invocation, restore the callback UNLESS the callback
+        // explicitly called SetDeadlineTimeoutCb() during invocation
+        // (detected by generation change). This supports both:
+        //   - One-shot callbacks (proxy): clear themselves → generation changed → no restore
+        //   - Recurring callbacks (H2): don't touch Set → generation unchanged → restored
+        auto gen_before = deadline_cb_generation_;
+        auto cb = std::move(deadline_timeout_cb_);
+        bool result = cb();
+        if (deadline_cb_generation_ == gen_before && !deadline_timeout_cb_) {
+            deadline_timeout_cb_ = std::move(cb);
+        }
+        return result;
     }
     return false;
 }

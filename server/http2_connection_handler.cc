@@ -53,24 +53,35 @@ void Http2ConnectionHandler::SetMaxHeaderSize(size_t max) {
     }
 }
 
+void Http2ConnectionHandler::SetMaxAsyncDeferredSec(int sec) {
+    max_async_deferred_sec_ = sec;
+}
+
 void Http2ConnectionHandler::SetRequestTimeout(int seconds) {
     request_timeout_sec_ = seconds;
     // Reconcile deadline state with the new timeout value. At
     // initialization time deadline_armed_ is false, so this is a no-op.
-    // During live reload, stale deadlines must be updated:
+    // During live reload, stale deadlines must be updated.
+    if (!session_) return;  // Initialize() will arm the initial deadline
     if (seconds <= 0 && deadline_armed_) {
-        // Timeout disabled — clear the stale deadline so the connection
-        // reverts to idle-timeout behavior instead of staying stuck on
-        // an expired deadline with deadline_armed_ = true forever.
+        // Timeout disabled — clear the stale deadline first so
+        // UpdateDeadline recomputes from scratch. Don't just leave
+        // the deadline cleared: when active streams still exist,
+        // UpdateDeadline's has_active branch arms the
+        // ASYNC_HEARTBEAT_FALLBACK_SEC heartbeat so the deadline-
+        // driven timer keeps firing. That heartbeat is the only
+        // thing that drives ResetExpiredStreams for the
+        // max_async_deferred_sec_ safety cap; without it a stuck
+        // async stream could live forever after a live reload from
+        // positive → 0 request_timeout_sec.
         conn_->ClearDeadline();
         deadline_armed_ = false;
-    } else if (seconds > 0 && session_) {
-        // Timeout changed or newly enabled — recompute from the oldest
-        // stream's start time. Handles both deadline_armed_==true (value
-        // change) and false (timeout was previously 0, so no deadline was
-        // ever installed for existing streams).
-        UpdateDeadline();
     }
+    // Always recompute. When seconds > 0 this re-anchors parse-timeout
+    // and/or heartbeat deadlines. When seconds == 0, UpdateDeadline
+    // installs the active-stream heartbeat (or leaves the connection
+    // idle if no streams are active).
+    UpdateDeadline();
 }
 
 void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
@@ -121,10 +132,36 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
             auto self = weak_self.lock();
             if (!self || !self->session_) return false;
 
+            // ResetExpiredStreams enforces two independent caps:
+            //   - parse_timeout: request_timeout_sec (0 = skip).
+            //   - async_cap: max_async_deferred_sec (0 = skip). This
+            //     is a last-resort safety net for async streams whose
+            //     handler never submits a response.
+            // Run whenever either is set so the async cap still applies
+            // when request_timeout_sec is disabled. The async-cap-reset
+            // stream IDs are captured so we can fire per-stream abort
+            // hooks — without that, a stuck handler's stored complete()
+            // closure would keep active_requests_ elevated even after
+            // the stream has been RST'd off the wire.
             size_t reset = 0;
-            if (self->request_timeout_sec_ > 0) {
+            std::vector<int32_t> async_cap_reset_ids;
+            if (self->request_timeout_sec_ > 0 ||
+                self->max_async_deferred_sec_ > 0) {
                 reset = self->session_->ResetExpiredStreams(
-                    self->request_timeout_sec_);
+                    self->request_timeout_sec_,
+                    self->max_async_deferred_sec_,
+                    &async_cap_reset_ids);
+                // Fire abort hooks BEFORE flushing frames. SendPendingFrames
+                // can synchronously drive nghttp2's on_stream_close callback,
+                // which fires our stream-close callback, which also fires
+                // the abort hook. The hook is one-shot (internal exchange
+                // on `completed`), so double-firing is safe, but we must
+                // not MISS firing it — if SendPendingFrames erased the
+                // hook before we ran the loop, active_requests_ would be
+                // permanently leaked for the stuck handler.
+                for (int32_t id : async_cap_reset_ids) {
+                    self->FireAndEraseStreamAbortHook(id);
+                }
                 if (reset > 0) {
                     self->session_->SendPendingFrames();
                 }
@@ -493,22 +530,57 @@ void Http2ConnectionHandler::OnWriteProgress(size_t remaining_bytes) {
 
 
 void Http2ConnectionHandler::UpdateDeadline() {
-    if (request_timeout_sec_ <= 0 || !session_) return;
+    if (!session_) return;
 
     auto oldest = session_->OldestIncompleteStreamStart();
-    if (oldest != std::chrono::steady_clock::time_point::max()) {
-        // Set deadline based on the oldest incomplete stream's start time.
-        // New streams cannot extend the deadline for older stalled streams.
+    bool has_incomplete =
+        (oldest != std::chrono::steady_clock::time_point::max());
+    bool has_active = (session_->ActiveStreamCount() > 0);
+
+    // Fallback heartbeat interval used when request_timeout_sec is disabled
+    // (0) but active streams still need idle_timeout suppression.
+    static constexpr int ASYNC_HEARTBEAT_FALLBACK_SEC = 60;
+
+    if (has_incomplete && request_timeout_sec_ > 0) {
+        // Per-stream request-parsing timeout — anchor at the oldest
+        // incomplete stream's creation time. New streams cannot extend
+        // the deadline for older stalled streams.
         auto deadline = oldest + std::chrono::seconds(request_timeout_sec_);
-        // Only call SetDeadline when the value actually changes to avoid
-        // unnecessary atomic operations on every frame batch.
         if (!deadline_armed_ || deadline != last_deadline_) {
             conn_->SetDeadline(deadline);
             deadline_armed_ = true;
             last_deadline_ = deadline;
         }
+    } else if (has_active) {
+        // Either:
+        //  (a) has_incomplete && request_timeout_sec_ == 0 — no hard parse
+        //      timeout, but we still need to suppress idle_timeout so
+        //      slow-but-legitimate parses aren't dropped.
+        //  (b) !has_incomplete — all streams are past parsing and waiting
+        //      on async handler work (e.g., proxy upstream response).
+        // In both cases, arm a rolling heartbeat deadline from NOW. The
+        // actual response-wait bound is enforced by the handler itself
+        // (proxy.response_timeout_ms for proxies). When this heartbeat
+        // fires and streams are still active, the timeout callback
+        // re-arms it — effectively a keep-alive.
+        //
+        // NOTE: This branch is ALSO reached when request_timeout_sec_ == 0
+        // and has_incomplete is true. Without this, a stale heartbeat
+        // from a prior "all-active" state could expire and keep firing
+        // the callback every scan tick, because the incomplete branch
+        // above wouldn't touch the deadline — creating a tight retry
+        // loop where the deadline stays in the past.
+        int heartbeat_sec = request_timeout_sec_ > 0
+                          ? request_timeout_sec_
+                          : ASYNC_HEARTBEAT_FALLBACK_SEC;
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(heartbeat_sec);
+        conn_->SetDeadline(deadline);
+        deadline_armed_ = true;
+        last_deadline_ = deadline;
     } else if (deadline_armed_ && session_->LastStreamId() > 0) {
-        // No incomplete streams (including rejected) — idle keep-alive
+        // No active streams at all — idle keep-alive, let idle_timeout
+        // take over.
         conn_->ClearDeadline();
         deadline_armed_ = false;
     }

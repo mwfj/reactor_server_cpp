@@ -56,6 +56,16 @@ public:
     // Deadline is armed on first OnRawData call (after TLS handshake completes for TLS connections).
     void SetRequestTimeout(int seconds);
 
+    // Set the absolute safety cap (in seconds) for a deferred async
+    // response window. When set > 0, the heartbeat callback aborts the
+    // deferred state after this elapsed time — releasing the connection
+    // even if an async handler forgets to call complete() or a proxy
+    // talking to a hung upstream never completes. 0 disables the cap
+    // entirely (no absolute bound; honors operator "disabled" configs).
+    // HttpServer computes this from upstream configs at MarkServerReady
+    // (see HttpServer::max_async_deferred_sec_).
+    void SetMaxAsyncDeferredSec(int sec);
+
     // Called when raw data arrives (set as NetServer's on_message callback)
     void OnRawData(std::shared_ptr<ConnectionHandler> conn, std::string& data);
 
@@ -79,6 +89,29 @@ public:
     // completion callback. Resets deferred state + shutdown exemption so
     // the outer exception handler can send a 500 and close normally.
     void CancelAsyncResponse();
+
+    // Install a one-shot "abort the async cycle" hook. Used by the
+    // deferred-heartbeat safety-cap path to short-circuit the stored
+    // AsyncCompletionCallback closure (flipping its completed/cancelled
+    // atomics) and release its active_requests bookkeeping exactly
+    // once, even if the real handler never calls complete(). The hook
+    // is installed by the server-level request dispatcher after the
+    // complete closure is built; the handler owns it for the lifetime
+    // of the deferred window. Cleared by Complete/CancelAsyncResponse.
+    void SetAsyncAbortHook(std::function<void()> hook) {
+        async_abort_hook_ = std::move(hook);
+    }
+
+    // Fire the async-abort hook if one is installed, then clear it.
+    // Idempotent via the hook's internal one-shot exchange. Called
+    // from HttpServer::RemoveConnection when the downstream client
+    // drops the socket while a request is still deferred — without
+    // this, the heartbeat timer dies with the connection and a stuck
+    // handler would leak active_requests_ permanently.
+    void TripAsyncAbortHook() {
+        auto hook = std::move(async_abort_hook_);
+        if (hook) hook();
+    }
 
     // Append bytes that arrived while an async response was pending.
     // Called by OnRawData. Separated from OnRawData so that the framework's
@@ -111,6 +144,7 @@ private:
     size_t max_header_size_ = 0;  // 0 = unlimited
     size_t max_ws_message_size_ = 0; // 0 = unlimited
     int request_timeout_sec_ = 0; // 0 = disabled
+    int max_async_deferred_sec_ = 0;  // 0 = disabled (no safety cap)
 
     // Slowloris protection: tracks when the current incomplete request started
     bool request_in_progress_ = false;
@@ -169,4 +203,13 @@ private:
     bool deferred_was_head_ = false;
     bool deferred_keep_alive_ = true;
     std::string deferred_pending_buf_;
+
+    // Start time of the current deferred-response window. Currently
+    // only used for diagnostic / logging purposes; the heartbeat
+    // deadline is unbounded so handlers' own timeouts govern the
+    // overall request lifetime.
+    std::chrono::steady_clock::time_point deferred_start_{};
+
+    // Safety-cap abort hook. See SetAsyncAbortHook.
+    std::function<void()> async_abort_hook_;
 };

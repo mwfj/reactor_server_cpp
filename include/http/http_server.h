@@ -15,9 +15,11 @@
 #include <condition_variable>
 #include <set>
 #include <string>
+#include <unordered_set>
 
-// Forward declaration for upstream pool
+// Forward declarations for upstream pool and proxy
 class UpstreamManager;
+class ProxyHandler;
 
 class HttpServer {
 public:
@@ -104,6 +106,13 @@ public:
     void RouteAsync(const std::string& method, const std::string& path,
                     HttpRouter::AsyncHandler handler);
 
+    // Proxy route registration: forward all requests matching route_pattern
+    // to the named upstream service. The upstream must be configured in the
+    // server config's upstreams array. The proxy config comes from the
+    // upstream's proxy section in the config.
+    void Proxy(const std::string& route_pattern,
+               const std::string& upstream_service_name);
+
     // Server lifecycle.
     // NOTE: Start/Stop is one-shot — after Stop(), the internal dispatchers
     // and thread pool are permanently stopped and cannot be restarted.
@@ -162,6 +171,13 @@ private:
     void HandleErrorConnection(std::shared_ptr<ConnectionHandler> conn);
     void HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::string& message);
 
+    // Reject any route / middleware mutation once the server has been
+    // marked ready. RouteTrie (and the middleware chain) are not safe
+    // for concurrent insert + lookup, so calls from SetReadyCallback
+    // or any worker thread after Start() must be refused. Returns
+    // true if the operation should be rejected (server is live).
+    bool RejectIfServerLive(const char* op, const std::string& path) const;
+
     // Snapshot of all active connection handlers, taken under conn_mtx_.
     // Used by Reload() to push updated config to existing connections.
     struct ConnectionSnapshot {
@@ -210,6 +226,17 @@ private:
     std::atomic<size_t> max_ws_message_size_{16777216}; // 16 MB
     std::atomic<int> request_timeout_sec_{30};         // Slowloris protection
 
+    // Safety cap for deferred async requests that never call complete().
+    // Computed from config at MarkServerReady: max of (DEFAULT_MIN,
+    // max upstream.proxy.response_timeout_ms/1000 + buffer). Set to 0
+    // (disabled) when ANY upstream has response_timeout_ms == 0
+    // (explicitly disabled) — in that mode operators accept the hang
+    // risk for stuck handlers in exchange for unbounded async lifetime.
+    // Propagated to HttpConnectionHandler / Http2ConnectionHandler so
+    // the per-connection heartbeat / stream-reset paths can enforce it
+    // without overriding operator-configured timeouts.
+    std::atomic<int> max_async_deferred_sec_{3600};    // 1 hour default
+
     // HTTP/2 support
     bool http2_enabled_ = true;
     Http2Session::Settings h2_settings_;
@@ -248,6 +275,17 @@ private:
     // Needed because auto mode (worker_threads=0) resolves inside ThreadPool.
     int resolved_worker_threads_ = 0;
 
+    // Set at the entry of Start() — before any dispatcher spins up
+    // and before MarkServerReady mutates router_/proxy state. Closes
+    // the gap between "user called Start()" and "server_ready_ = true":
+    // during that window MarkServerReady runs unsynchronized inserts
+    // into RouteTrie from the dispatcher thread, so any concurrent
+    // Post()/Proxy()/RegisterProxyRoutes-style call from another
+    // thread would race those inserts. RejectIfServerLive and Proxy()
+    // check this flag in addition to server_ready_, and MarkServerReady
+    // bypasses the check via an internal thread-local scope guard.
+    std::atomic<bool> startup_begun_{false};
+
     // Set by the ready callback after Start() finishes building dispatchers.
     // Reload() checks this to avoid walking socket_dispatchers_ during startup.
     std::atomic<bool> server_ready_{false};
@@ -281,4 +319,41 @@ private:
     // Upstream connection pool
     std::vector<UpstreamConfig> upstream_configs_;
     std::unique_ptr<UpstreamManager> upstream_manager_;
+
+    // Proxy handlers keyed by (upstream_service_name + normalized prefix).
+    // shared_ptr (not unique_ptr) so that route lambdas capture shared
+    // ownership — if a later Proxy()/RegisterProxyRoutes() call replaces
+    // the entry under the same key (e.g., partial method overlap adding
+    // new methods), existing route lambdas still hold the old handler
+    // alive until they are themselves replaced or destroyed, avoiding
+    // a use-after-free when the handler_ptr inside those lambdas would
+    // otherwise dangle.
+    std::unordered_map<std::string, std::shared_ptr<ProxyHandler>> proxy_handlers_;
+
+    // Tracks which methods are registered per canonical proxy path.
+    // Key: dedup_prefix (e.g., "/api/*"), Value: set of registered methods.
+    // Used to detect method-level conflicts before RouteAsync throws.
+    std::unordered_map<std::string, std::unordered_set<std::string>> proxy_route_methods_;
+
+    // Pending manual Proxy() registrations — stored when Proxy() is called
+    // before Start(), processed in MarkServerReady() after upstream_manager_
+    // is created. Each entry is {route_pattern, upstream_service_name}.
+    std::vector<std::pair<std::string, std::string>> pending_proxy_routes_;
+
+    // Names of upstream services actually referenced by at least one
+    // successfully-registered proxy route (either from
+    // RegisterProxyRoutes' JSON auto-registration OR from programmatic
+    // HttpServer::Proxy() calls). Used by MarkServerReady to size the
+    // async-deferred safety cap: upstreams not referenced here cannot
+    // affect request lifetimes and must not be folded into the cap, and
+    // upstreams referenced here must be, regardless of whether their
+    // JSON config has proxy.route_prefix set.
+    std::unordered_set<std::string> proxy_referenced_upstreams_;
+
+    // Recomputes max_async_deferred_sec_ from proxy_referenced_upstreams_.
+    // Called from MarkServerReady after all proxy routes are registered.
+    void RecomputeAsyncDeferredCap();
+
+    // Auto-register proxy routes from upstream configs at Start() time
+    void RegisterProxyRoutes();
 };

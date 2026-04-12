@@ -1,4 +1,5 @@
 #include "http/http_connection_handler.h"
+#include "http/http_status.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
 #include <sstream>
@@ -73,6 +74,15 @@ void HttpConnectionHandler::UpdateSizeLimits(size_t body, size_t header,
         // HTTP-mode connection: use the composite HTTP input cap.
         conn_->SetMaxInputSize(http_input_cap);
     }
+}
+
+void HttpConnectionHandler::SetMaxAsyncDeferredSec(int sec) {
+    max_async_deferred_sec_ = sec;
+    // Not applied retroactively to an already-armed deferred heartbeat:
+    // the per-request cap uses whatever value was in effect when the
+    // deferred state began. Reload-driven config changes only affect
+    // subsequent deferred requests — matching the pattern used for
+    // other request-scoped settings.
 }
 
 void HttpConnectionHandler::SetRequestTimeout(int seconds) {
@@ -175,6 +185,13 @@ void HttpConnectionHandler::CancelAsyncResponse() {
     deferred_was_head_ = false;
     deferred_keep_alive_ = true;
     deferred_pending_buf_.clear();
+    deferred_start_ = std::chrono::steady_clock::time_point{};
+    // Release the abort hook's captured shared_ptrs so the request's
+    // atomic flags and active_counter handle can be freed. The throw
+    // path that calls CancelAsyncResponse already has its own
+    // bookkeeping (the RequestGuard still fires on stack unwinding),
+    // so we do NOT invoke the hook here.
+    async_abort_hook_ = nullptr;
     if (conn_) conn_->SetShutdownExempt(false);
 }
 
@@ -263,6 +280,11 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     deferred_response_pending_ = false;
     deferred_was_head_ = false;
     deferred_keep_alive_ = true;
+    deferred_start_ = std::chrono::steady_clock::time_point{};
+    // Release the abort hook's captures — by the time CompleteAsyncResponse
+    // runs on the normal path, the complete closure already owns the
+    // bookkeeping and the safety cap no longer needs to fire.
+    async_abort_hook_ = nullptr;
 
     if (conn_->IsClosing()) {
         if (conn_) conn_->SetShutdownExempt(false);
@@ -282,6 +304,15 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     // race: the response bytes are already buffered and the connection
     // is not closing.
     if (conn_) conn_->SetShutdownExempt(false);
+
+    // Clear the async timeout deadline: the response has been delivered,
+    // so the connection should revert to idle_timeout_sec behavior until
+    // the next request arrives. Without this, the stale 504 callback
+    // would fire at the deferred deadline and close a healthy keep-alive
+    // connection (HandleCompleteRequest installed this deadline + callback
+    // when the response was marked deferred).
+    conn_->ClearDeadline();
+    conn_->SetDeadlineTimeoutCb(nullptr);
 
     // Resume parsing any pipelined bytes that arrived during the deferred
     // window. Move out of the member first so a nested BeginAsyncResponse
@@ -359,6 +390,12 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
 
     // Propagate dispatcher index for upstream pool partition affinity
     req.dispatcher_index = conn_->dispatcher_index();
+
+    // Propagate peer connection metadata for proxy header rewriting
+    // (X-Forwarded-For, X-Forwarded-Proto) and log correlation (client_fd).
+    req.client_ip = conn_->ip_addr();
+    req.client_tls = conn_->HasTls();
+    req.client_fd = conn_->fd();
 
     // Count every completed request parse — dispatched, rejected, or upgraded.
     if (callbacks_.request_count_callback) {
@@ -438,9 +475,9 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                 // or auth headers before rejecting should still produce 403,
                 // not leak a 200 OK on a denied WebSocket upgrade. Matches
                 // the async HTTP path (FillDefaultRejectionResponse).
-                if (mw_response.GetStatusCode() == 200 &&
+                if (mw_response.GetStatusCode() == HttpStatus::OK &&
                     mw_response.GetBody().empty()) {
-                    mw_response.Status(403).Text("Forbidden");
+                    mw_response.Status(HttpStatus::FORBIDDEN).Text("Forbidden");
                 }
                 logging::Get()->debug("WebSocket upgrade rejected by middleware fd={} path={}",
                                       conn_->fd(), req.path);
@@ -523,7 +560,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             logging::Get()->debug("WS upgrade rejected: server shutting down fd={}",
                                   conn_->fd());
             HttpResponse shutdown_resp;
-            shutdown_resp.Status(503).Text("Service Unavailable");
+            shutdown_resp.Status(HttpStatus::SERVICE_UNAVAILABLE).Text("Service Unavailable");
             shutdown_resp.Header("Connection", "close");
             SendResponse(shutdown_resp);
             CloseConnection();
@@ -625,8 +662,145 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         // applies.
         if (response.IsDeferred()) {
             request_in_progress_ = false;
-            conn_->ClearDeadline();
-            conn_->SetDeadlineTimeoutCb(nullptr);
+            // Arm a ROLLING heartbeat deadline that re-arms itself on
+            // fire to suppress idle_timeout while the async handler
+            // runs. The handler (proxy or custom) bounds its own
+            // response wait via its own timeout (proxy.response_timeout_ms,
+            // custom handler deadlines) — this heartbeat just keeps
+            // idle_timeout from closing the connection.
+            //
+            // An OPTIONAL absolute cap (max_async_deferred_sec_) acts
+            // as a last-resort safety net for stuck handlers that
+            // never call complete(). Computed by HttpServer from
+            // upstream configs so it honors the largest configured
+            // proxy.response_timeout_ms (with buffer). When 0, the
+            // cap is disabled entirely — that mode is selected
+            // automatically when any upstream has
+            // proxy.response_timeout_ms=0 (operator explicitly opted
+            // out of bounded async lifetime).
+            //
+            // When request_timeout_sec == 0 ("disabled" per config),
+            // still install the heartbeat using a fallback interval —
+            // otherwise idle_timeout would close quiet async work
+            // mid-flight, which is a supported configuration per the
+            // validator.
+            static constexpr int ASYNC_HEARTBEAT_FALLBACK_SEC = 60;
+            int heartbeat_sec = request_timeout_sec_ > 0
+                              ? request_timeout_sec_
+                              : ASYNC_HEARTBEAT_FALLBACK_SEC;
+            // Per-request override takes precedence over the global cap.
+            // A handler (e.g. ProxyHandler with response_timeout_ms=0)
+            // may set req.async_cap_sec_override to 0 to disable the
+            // cap for unbounded requests (SSE, long-poll) without
+            // affecting unrelated routes on the same connection. See
+            // HttpRequest::async_cap_sec_override for the full
+            // rationale and sentinel semantics.
+            int cap_sec = (req.async_cap_sec_override >= 0)
+                        ? req.async_cap_sec_override
+                        : max_async_deferred_sec_;  // 0 = no cap
+            deferred_start_ = std::chrono::steady_clock::now();
+            // Arm the FIRST deadline at min(heartbeat_sec, cap_sec)
+            // when the cap is positive and smaller than the
+            // heartbeat interval. Otherwise the heartbeat callback
+            // (which is the only place the cap is checked) wouldn't
+            // fire until heartbeat_sec, and a per-request cap of e.g.
+            // 5s on a server with request_timeout_sec=30 (or the 60s
+            // fallback when timeouts are disabled) would let the
+            // request outlive its declared cap by tens of seconds.
+            int initial_sec = heartbeat_sec;
+            if (cap_sec > 0 && cap_sec < initial_sec) {
+                initial_sec = cap_sec;
+            }
+            conn_->SetDeadline(deferred_start_ +
+                               std::chrono::seconds(initial_sec));
+            std::weak_ptr<HttpConnectionHandler> weak_self =
+                shared_from_this();
+            conn_->SetDeadlineTimeoutCb(
+                [weak_self, heartbeat_sec, cap_sec]() -> bool {
+                auto self = weak_self.lock();
+                if (!self) return false;
+                if (!self->deferred_response_pending_) {
+                    // Response already delivered; let the normal close
+                    // path run (callback shouldn't normally fire here
+                    // because CompleteAsyncResponse clears the deadline,
+                    // but handle defensively).
+                    return false;
+                }
+                // Absolute safety cap: if configured AND exceeded,
+                // abort the deferred state and send 504. This catches
+                // stuck handlers without overriding operator-configured
+                // timeouts — the cap is computed to be at least as
+                // large as the longest configured proxy response
+                // timeout (see HttpServer::max_async_deferred_sec_).
+                if (cap_sec > 0) {
+                    auto elapsed = std::chrono::duration_cast<
+                        std::chrono::seconds>(
+                        std::chrono::steady_clock::now() -
+                        self->deferred_start_).count();
+                    if (elapsed >= cap_sec) {
+                        logging::Get()->warn(
+                            "HTTP/1 async deferred response exceeded "
+                            "safety cap ({}s) without completion fd={}; "
+                            "aborting and sending 504",
+                            cap_sec,
+                            self->conn_ ? self->conn_->fd() : -1);
+                        // Fire the abort hook FIRST. It short-circuits
+                        // the stored complete() closure (flipping its
+                        // one-shot completed/cancelled atomics) and
+                        // decrements active_requests exactly once,
+                        // regardless of whether the real handler
+                        // eventually calls complete(). Without this
+                        // the /stats.requests.active counter stays
+                        // permanently elevated after a stuck handler.
+                        //
+                        // Move to a local first so CompleteAsyncResponse
+                        // (which clears async_abort_hook_) cannot
+                        // destroy the std::function while we're
+                        // invoking it.
+                        auto abort_hook =
+                            std::move(self->async_abort_hook_);
+                        if (abort_hook) abort_hook();
+                        // Route through CompleteAsyncResponse so HEAD
+                        // body stripping, shutdown-exempt clearing, and
+                        // pipelined-buffer handling all run. Do NOT
+                        // call CancelAsyncResponse first — that wipes
+                        // deferred_was_head_, which CompleteAsyncResponse
+                        // needs to know whether to strip the body.
+                        // Forcing Connection: close on the synthetic 504
+                        // ensures NormalizeOutgoingResponse returns
+                        // should_close=true so the socket is torn down
+                        // (the handler may still be running in the
+                        // background and must not see a reusable
+                        // connection).
+                        HttpResponse timeout_resp =
+                            HttpResponse::GatewayTimeout();
+                        timeout_resp.Header("Connection", "close");
+                        self->CompleteAsyncResponse(std::move(timeout_resp));
+                        return false;
+                    }
+                }
+                // Heartbeat: re-arm the deadline. When cap_sec is
+                // set, clamp the next wakeup so the FOLLOW-UP heartbeat
+                // does not overshoot the cap — otherwise a request
+                // with cap_sec < heartbeat_sec would only be checked
+                // on heartbeat boundaries, missing its cap window.
+                auto now_steady = std::chrono::steady_clock::now();
+                auto next_sec = std::chrono::seconds(heartbeat_sec);
+                if (cap_sec > 0) {
+                    auto elapsed_sec = std::chrono::duration_cast<
+                        std::chrono::seconds>(
+                        now_steady - self->deferred_start_).count();
+                    // `elapsed >= cap_sec` was already caught above,
+                    // so remaining is strictly positive here.
+                    auto remaining = static_cast<long long>(cap_sec)
+                                   - elapsed_sec;
+                    if (remaining > 0 && remaining < heartbeat_sec) {
+                        next_sec = std::chrono::seconds(remaining);
+                    }
+                }
+                self->conn_->SetDeadline(now_steady + next_sec);
+                return true;  // handled, keep connection alive
+            });
             buf += consumed;
             remaining -= consumed;
             if (remaining > 0) {

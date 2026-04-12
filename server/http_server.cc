@@ -1,8 +1,10 @@
 #include "http/http_server.h"
+#include "http/http_status.h"
 #include "config/config_loader.h"
 #include "ws/websocket_frame.h"
 #include "http2/http2_constants.h"
 #include "upstream/upstream_manager.h"
+#include "upstream/proxy_handler.h"
 #include "log/logger.h"
 #include <algorithm>
 #include <set>
@@ -23,6 +25,228 @@ struct RequestGuard {
     RequestGuard(const RequestGuard&) = delete;
     RequestGuard& operator=(const RequestGuard&) = delete;
 };
+
+// Thread-local scope flag that lets MarkServerReady's internal
+// registration pass (pending_proxy_routes_ + RegisterProxyRoutes) call
+// back through the public entry points without tripping the startup
+// gate. Only MarkServerReady sets this — and only on its own dispatcher
+// thread — so user-threaded Post()/Proxy() calls on other threads still
+// see the gate closed.
+static thread_local bool tls_internal_registration_pass = false;
+
+struct InternalRegistrationScope {
+    InternalRegistrationScope() { tls_internal_registration_pass = true; }
+    ~InternalRegistrationScope() { tls_internal_registration_pass = false; }
+    InternalRegistrationScope(const InternalRegistrationScope&) = delete;
+    InternalRegistrationScope& operator=(const InternalRegistrationScope&) = delete;
+};
+
+// Collects (method, patterns) pairs during proxy route pre-checking.
+// Used by both Proxy() and RegisterProxyRoutes() to filter per-(method,
+// pattern) collisions atomically before any RouteAsync call mutates the
+// router.
+struct MethodRegistration {
+    std::string method;
+    std::vector<std::string> patterns;
+};
+
+// Ceiling division: convert a timeout in milliseconds to whole seconds,
+// rounding up. Used for sizing a cap / upper bound (e.g., the async
+// deferred safety cap) where we want strict "at least as large as the
+// input ms." The naive `(ms + 999) / 1000` on plain int overflows for
+// ms values near INT_MAX — ConfigLoader::Validate does not currently
+// cap these fields, so an operator typo like response_timeout_ms=
+// 2147483647 would drive the result negative. Promoting to int64_t
+// and saturating to INT_MAX keeps the rounding safe and monotonic.
+//
+// Returns at least 1 and at most INT_MAX.
+static int CeilMsToSec(int ms) {
+    if (ms <= 0) return 1;
+    int64_t sec64 = (static_cast<int64_t>(ms) + 999) / 1000;
+    if (sec64 > std::numeric_limits<int>::max()) {
+        return std::numeric_limits<int>::max();
+    }
+    if (sec64 < 1) return 1;
+    return static_cast<int>(sec64);
+}
+
+// Convert a timeout in milliseconds to a DISPATCHER TIMER CADENCE in
+// whole seconds. Distinct from CeilMsToSec because cadence sizing has
+// different requirements than cap sizing:
+//
+//   - Sub-2s timeouts (1000, 2000) ms are CLAMPED to 1s cadence
+//     instead of being rounded up to 2s. Otherwise a 1100ms deadline
+//     is scanned only every 2s and can fire up to ~0.9s late —
+//     under-delivering the documented "1s resolution" for ms-based
+//     upstream timeouts. This also protects other sub-2s deadlines on
+//     the same dispatcher (e.g. session / request-timeout deadlines
+//     that would inherit a coarse cadence from an upstream round-up).
+//
+//   - For >= 2s timeouts, ceiling still gives the correct cadence:
+//     cadence equal to the timeout budget in seconds. Scanning at a
+//     finer granularity would burn CPU for no correctness win; the
+//     overshoot is already bounded by `cadence - (ms/1000)` which is
+//     in [0, 1) by construction.
+//
+//   - Zero/negative inputs normalize to 1s (the finest representable
+//     cadence), matching historic call-site behavior.
+//
+// Saturates at INT_MAX and returns at least 1. int64_t intermediate
+// to avoid the same overflow concern as CeilMsToSec.
+static int CadenceSecFromMs(int ms) {
+    if (ms <= 0) return 1;
+    if (ms < 2000) return 1;
+    int64_t sec64 = (static_cast<int64_t>(ms) + 999) / 1000;
+    if (sec64 > std::numeric_limits<int>::max()) {
+        return std::numeric_limits<int>::max();
+    }
+    return static_cast<int>(sec64);
+}
+
+// Normalize a route pattern for dedup comparison by stripping all param
+// and catch-all names. E.g., "/api/:id/users/*rest" → "/api/:/users/*".
+// This way, semantically identical routes with different param names
+// (like /api/:id/*rest vs /api/:user/*tail) produce the same dedup key.
+// Regex constraints like :id([0-9]+) are PRESERVED — the route trie treats
+// /users/:id([0-9]+) and /users/:name([a-z]+) as distinct routes, so the
+// dedup key must distinguish them too.
+static std::string NormalizeRouteForDedup(const std::string& pattern) {
+    std::string result;
+    result.reserve(pattern.size());
+    size_t i = 0;
+    while (i < pattern.size()) {
+        bool at_seg_start = (i == 0) || (result.back() == '/');
+        if (at_seg_start && pattern[i] == ':') {
+            result += ':';
+            ++i;
+            // Skip param name (until '/', '(' for regex constraint, or end)
+            while (i < pattern.size() && pattern[i] != '/' && pattern[i] != '(') {
+                ++i;
+            }
+            // Preserve regex constraint if present: "([0-9]+)".
+            // Balance nested parentheses, mirroring route_trie::ExtractConstraint.
+            if (i < pattern.size() && pattern[i] == '(') {
+                int depth = 0;
+                while (i < pattern.size()) {
+                    char c = pattern[i];
+                    // Handle backslash escapes like \( \) so they don't affect depth
+                    if (c == '\\' && i + 1 < pattern.size()) {
+                        result += c;
+                        result += pattern[i + 1];
+                        i += 2;
+                        continue;
+                    }
+                    if (c == '(') ++depth;
+                    else if (c == ')') --depth;
+                    result += c;
+                    ++i;
+                    if (depth == 0) break;
+                }
+            }
+        } else if (at_seg_start && pattern[i] == '*') {
+            result += '*';
+            // Skip catch-all name (rest of string — catch-all must be last)
+            break;
+        } else {
+            result += pattern[i];
+            ++i;
+        }
+    }
+    return result;
+}
+
+// Generate a catch-all param name that doesn't collide with existing
+// param names in the route pattern. Starts with "proxy_path", falls
+// back to "_proxy_tail", then appends numeric suffixes.
+static std::string GenerateCatchAllName(const std::string& pattern) {
+    auto has_param = [&](const std::string& name) {
+        return pattern.find(":" + name) != std::string::npos;
+    };
+    if (!has_param("proxy_path")) return "proxy_path";
+    if (!has_param("_proxy_tail")) return "_proxy_tail";
+    for (int i = 0; i < 100; ++i) {
+        std::string candidate = "_pp" + std::to_string(i);
+        if (!has_param(candidate)) return candidate;
+    }
+    return "_proxy_fallback";  // extremely unlikely
+}
+
+// Headers that can legitimately appear multiple times in a response. When
+// merging middleware + handler/upstream headers in the async completion
+// path, these names are preserved from BOTH sources (so middleware-added
+// caching/policy headers aren't silently dropped when the upstream also
+// emits the same name). All other headers are treated as single-value and
+// the handler/upstream wins (middleware copy is dropped to avoid invalid
+// duplicates like two Content-Type or two Location headers).
+//
+// Includes Set-Cookie / authenticate headers that literally cannot be
+// combined into one line (RFC 6265, RFC 7235) plus common list-based
+// response headers that often carry gateway/middleware-added values
+// alongside upstream values (Cache-Control, Link, Via, Vary, Warning,
+// Allow, Content-Language).
+static bool IsRepeatableResponseHeader(const std::string& name) {
+    std::string lower(name);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return lower == "set-cookie" ||
+           lower == "www-authenticate" ||
+           lower == "proxy-authenticate" ||
+           lower == "cache-control" ||
+           lower == "link" ||
+           lower == "via" ||
+           lower == "warning" ||
+           lower == "vary" ||
+           lower == "allow" ||
+           lower == "content-language";
+}
+
+// Ensure the pattern has a NAMED catch-all so ProxyHandler can extract the
+// strip_prefix tail from request.params. Handles three cases:
+//   1. No catch-all          → append "/*<generated>"
+//   2. Unnamed catch-all "*" → rewrite to "*<generated>" in place
+//   3. Already named "*name" → return unchanged
+// Without (2), patterns like /api/:version/* would leave catch_all_param_
+// empty in ProxyHandler, and strip_prefix would fall back to static_prefix_
+// stripping (only the leading static segment), misrouting every request.
+static std::string EnsureNamedCatchAll(const std::string& pattern) {
+    // Non-origin-form patterns (e.g. "*" for OPTIONS *) are treated as
+    // EXACT static routes by RouteTrie::ParsePattern when they don't
+    // start with '/'. Never rewrite them — "*" as a catch-all is only
+    // meaningful at a segment boundary of an origin-form path.
+    if (pattern.empty() || pattern.front() != '/') {
+        return pattern;
+    }
+
+    bool has_catch_all = false;
+    bool is_named = false;
+    size_t catch_all_pos = std::string::npos;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        if (pattern[i] == '*' && (i == 0 || pattern[i - 1] == '/')) {
+            has_catch_all = true;
+            catch_all_pos = i;
+            // Named if there's a character after '*' (catch-all must be last,
+            // so anything after '*' is the name).
+            is_named = (i + 1 < pattern.size());
+            break;
+        }
+    }
+
+    if (has_catch_all && is_named) {
+        return pattern;
+    }
+
+    std::string generated = GenerateCatchAllName(pattern);
+
+    if (!has_catch_all) {
+        std::string result = pattern;
+        if (result.empty() || result.back() != '/') result += '/';
+        result += "*" + generated;
+        return result;
+    }
+
+    // Unnamed catch-all: insert the generated name right after '*'.
+    return pattern.substr(0, catch_all_pos + 1) + generated;
+}
 
 int HttpServer::ComputeTimerInterval(int idle_timeout_sec, int request_timeout_sec) {
     int idle_iv = idle_timeout_sec > 0
@@ -69,6 +293,14 @@ bool HttpServer::HasPendingH1Output() {
 }
 
 void HttpServer::MarkServerReady() {
+    // Bypass RejectIfServerLive for the internal registration pass below.
+    // MarkServerReady runs on the dispatcher thread and is the ONLY
+    // legitimate mutator of router_/pending_proxy_routes_ between Start()
+    // and server_ready_ = true. The thread-local scope is narrow so a
+    // user-threaded Post()/Proxy() call on another thread still sees the
+    // gate closed (as intended).
+    InternalRegistrationScope scope;
+
     // Assign dispatcher indices for upstream pool partition affinity
     const auto& dispatchers = net_server_.GetSocketDispatchers();
     for (size_t i = 0; i < dispatchers.size(); ++i) {
@@ -96,16 +328,22 @@ void HttpServer::MarkServerReady() {
         // timeouts would fire late. Reduce the interval if needed.
         int min_upstream_sec = std::numeric_limits<int>::max();
         for (const auto& u : upstream_configs_) {
-            // ceil division: ensures the timer fires within 1 interval of the
-            // deadline, minimizing overshoot. Floor would let deadlines fire
-            // up to (interval - 1)s late in the worst case.
-            int connect_sec = std::max(
-                (u.pool.connect_timeout_ms + 999) / 1000, 1);
+            // CadenceSecFromMs: clamps sub-2s timeouts to 1s cadence
+            // (instead of rounding up to 2s), preserving the documented
+            // 1s resolution for ms-based upstream timeouts.
+            int connect_sec = CadenceSecFromMs(u.pool.connect_timeout_ms);
             min_upstream_sec = std::min(min_upstream_sec, connect_sec);
             // Also consider idle timeout for eviction cadence
             if (u.pool.idle_timeout_sec > 0) {
                 min_upstream_sec = std::min(min_upstream_sec,
                                             u.pool.idle_timeout_sec);
+            }
+            // Also consider proxy response timeout — if configured,
+            // the timer scan must fire often enough to detect stalled
+            // upstream responses within one interval of the deadline.
+            if (u.proxy.response_timeout_ms > 0) {
+                int response_sec = CadenceSecFromMs(u.proxy.response_timeout_ms);
+                min_upstream_sec = std::min(min_upstream_sec, response_sec);
             }
         }
         if (min_upstream_sec < std::numeric_limits<int>::max()) {
@@ -117,6 +355,33 @@ void HttpServer::MarkServerReady() {
             }
         }
     }
+
+    // Process deferred Proxy() calls + auto-register proxy routes from
+    // upstream configs. Any validation failure in either path throws
+    // std::invalid_argument — we catch it, stop the already-running
+    // dispatchers, and rethrow so the caller of HttpServer::Start()
+    // sees the failure instead of the server starting in a partially
+    // configured state where the expected proxy routes are missing.
+    // Mirrors the upstream_manager_ init-failure pattern above.
+    try {
+        for (const auto& [pattern, name] : pending_proxy_routes_) {
+            Proxy(pattern, name);
+        }
+        pending_proxy_routes_.clear();
+        RegisterProxyRoutes();
+    } catch (...) {
+        logging::Get()->error(
+            "Proxy route registration failed, stopping server");
+        net_server_.Stop();
+        throw;
+    }
+
+    // Compute the async-deferred safety cap from all upstream configs
+    // referenced by successfully-registered proxy routes (both the
+    // auto-registration path via RegisterProxyRoutes and the
+    // programmatic HttpServer::Proxy() API). See RecomputeAsyncDeferredCap
+    // for the sizing logic and opt-out sentinel.
+    RecomputeAsyncDeferredCap();
 
     start_time_ = std::chrono::steady_clock::now();
     server_ready_.store(true, std::memory_order_release);
@@ -165,6 +430,18 @@ void HttpServer::RemoveConnection(std::shared_ptr<ConnectionHandler> conn) {
     if (was_h2) {
         active_http2_connections_.fetch_sub(1, std::memory_order_relaxed);
         CompensateH2Streams(h2_handler);
+        // Fire any pending per-stream abort hooks before releasing the
+        // handler. When the h2 handler destructs, ~Http2Session calls
+        // nghttp2_session_del which dispatches on_stream_close for each
+        // stream — but OnStreamCloseCallback locks the weak Owner(),
+        // which is null during destruction, so the server-level
+        // SetStreamCloseCallback NEVER runs on the teardown path. Without
+        // this explicit fire, a client-side disconnect with deferred
+        // async streams would leak active_requests_ for any wedged
+        // handler (matches the HTTP/1 TripAsyncAbortHook fix below).
+        if (h2_handler) {
+            h2_handler->FireAllStreamAbortHooks();
+        }
         OnH2DrainComplete(conn.get());
         return;
     }
@@ -174,6 +451,16 @@ void HttpServer::RemoveConnection(std::shared_ptr<ConnectionHandler> conn) {
         if (!http_conn->IsUpgraded()) {
             active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
+        // If the downstream client dropped while an async request was
+        // still deferred, the heartbeat timer dies with the connection
+        // and the stored complete() closure is the only thing that
+        // would have decremented active_requests_. A wedged handler
+        // (stuck proxy upstream, bugged custom async route) would
+        // therefore leak the counter permanently. Fire the abort hook
+        // before releasing the handler — it is one-shot (internal
+        // exchange on `completed`) so firing when the handler is
+        // already racing complete() is safe.
+        http_conn->TripAsyncAbortHook();
     }
     SafeNotifyWsClose(http_conn);
     OnWsDrainComplete(conn.get());
@@ -384,23 +671,863 @@ HttpServer::~HttpServer() {
     Stop();
 }
 
-// Route registration delegates
-void HttpServer::Get(const std::string& path, HttpRouter::Handler handler)    { router_.Get(path, std::move(handler)); }
-void HttpServer::Post(const std::string& path, HttpRouter::Handler handler)   { router_.Post(path, std::move(handler)); }
-void HttpServer::Put(const std::string& path, HttpRouter::Handler handler)    { router_.Put(path, std::move(handler)); }
-void HttpServer::Delete(const std::string& path, HttpRouter::Handler handler) { router_.Delete(path, std::move(handler)); }
-void HttpServer::Route(const std::string& method, const std::string& path, HttpRouter::Handler handler) { router_.Route(method, path, std::move(handler)); }
-void HttpServer::WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler) { router_.WebSocket(path, std::move(handler)); }
-void HttpServer::Use(HttpRouter::Middleware middleware) { router_.Use(std::move(middleware)); }
+// Route / middleware mutation is gated by RejectIfServerLive() so a
+// call from SetReadyCallback or a worker thread after Start() can't
+// race the dispatch path on the non-thread-safe RouteTrie / middleware
+// chain. The gate trips as soon as Start() is called (startup_begun_)
+// — NOT just once server_ready_ flips true — because MarkServerReady
+// mutates router_ on the dispatcher thread during the window between
+// those two events. Proxy() has the same guard — see the block near
+// its top. MarkServerReady bypasses the check via
+// tls_internal_registration_pass so its internal reprocessing of
+// pending_proxy_routes_ and RegisterProxyRoutes still works.
+bool HttpServer::RejectIfServerLive(const char* op,
+                                     const std::string& path) const {
+    if (tls_internal_registration_pass) return false;
+    if (startup_begun_.load(std::memory_order_acquire) ||
+        server_ready_.load(std::memory_order_acquire)) {
+        logging::Get()->error(
+            "{}: cannot register route/middleware after Start() has been "
+            "called (path='{}'). RouteTrie is not safe for concurrent "
+            "insert+lookup — register before Start().",
+            op, path);
+        return true;
+    }
+    return false;
+}
 
-void HttpServer::GetAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { router_.RouteAsync("GET",    path, std::move(handler)); }
-void HttpServer::PostAsync(const std::string& path, HttpRouter::AsyncHandler handler)   { router_.RouteAsync("POST",   path, std::move(handler)); }
-void HttpServer::PutAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { router_.RouteAsync("PUT",    path, std::move(handler)); }
-void HttpServer::DeleteAsync(const std::string& path, HttpRouter::AsyncHandler handler) { router_.RouteAsync("DELETE", path, std::move(handler)); }
-void HttpServer::RouteAsync(const std::string& method, const std::string& path, HttpRouter::AsyncHandler handler) { router_.RouteAsync(method, path, std::move(handler)); }
+// Route registration delegates
+void HttpServer::Get(const std::string& path, HttpRouter::Handler handler)    { if (RejectIfServerLive("Get", path)) return; router_.Get(path, std::move(handler)); }
+void HttpServer::Post(const std::string& path, HttpRouter::Handler handler)   { if (RejectIfServerLive("Post", path)) return; router_.Post(path, std::move(handler)); }
+void HttpServer::Put(const std::string& path, HttpRouter::Handler handler)    { if (RejectIfServerLive("Put", path)) return; router_.Put(path, std::move(handler)); }
+void HttpServer::Delete(const std::string& path, HttpRouter::Handler handler) { if (RejectIfServerLive("Delete", path)) return; router_.Delete(path, std::move(handler)); }
+void HttpServer::Route(const std::string& method, const std::string& path, HttpRouter::Handler handler) { if (RejectIfServerLive("Route", path)) return; router_.Route(method, path, std::move(handler)); }
+void HttpServer::WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler) { if (RejectIfServerLive("WebSocket", path)) return; router_.WebSocket(path, std::move(handler)); }
+void HttpServer::Use(HttpRouter::Middleware middleware) { if (RejectIfServerLive("Use", "<middleware>")) return; router_.Use(std::move(middleware)); }
+
+void HttpServer::GetAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { if (RejectIfServerLive("GetAsync", path)) return; router_.RouteAsync("GET",    path, std::move(handler)); }
+void HttpServer::PostAsync(const std::string& path, HttpRouter::AsyncHandler handler)   { if (RejectIfServerLive("PostAsync", path)) return; router_.RouteAsync("POST",   path, std::move(handler)); }
+void HttpServer::PutAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { if (RejectIfServerLive("PutAsync", path)) return; router_.RouteAsync("PUT",    path, std::move(handler)); }
+void HttpServer::DeleteAsync(const std::string& path, HttpRouter::AsyncHandler handler) { if (RejectIfServerLive("DeleteAsync", path)) return; router_.RouteAsync("DELETE", path, std::move(handler)); }
+void HttpServer::RouteAsync(const std::string& method, const std::string& path, HttpRouter::AsyncHandler handler) { if (RejectIfServerLive("RouteAsync", path)) return; router_.RouteAsync(method, path, std::move(handler)); }
+
+void HttpServer::Proxy(const std::string& route_pattern,
+                       const std::string& upstream_service_name) {
+    // Gate external callers. MarkServerReady bypasses this via
+    // tls_internal_registration_pass when replaying the pending list.
+    // The check covers BOTH the deferred (!upstream_manager_) branch
+    // — pending_proxy_routes_ is a plain vector and would race an
+    // in-progress MarkServerReady — and the live-registration branch.
+    if (!tls_internal_registration_pass &&
+        (startup_begun_.load(std::memory_order_acquire) ||
+         server_ready_.load(std::memory_order_acquire))) {
+        logging::Get()->error(
+            "Proxy: cannot register routes after Start() has been called "
+            "(route_pattern='{}', upstream='{}'). Call Proxy() before "
+            "Start().",
+            route_pattern, upstream_service_name);
+        return;
+    }
+    // Reject empty route patterns — calling .back() on an empty string is UB,
+    // and an empty pattern is never a valid route.
+    //
+    // Validation throws std::invalid_argument (rather than logging and
+    // returning) so embedders calling this API directly can see the
+    // failure instead of finding a missing route at traffic time. The
+    // HttpServer(ServerConfig) constructor already runs
+    // ConfigLoader::Validate() on upstream_configs_, so the per-upstream
+    // checks below are defense-in-depth for that path. They still need
+    // to throw on the runtime Proxy() API path, where the route_pattern
+    // argument is freshly supplied by the caller and has not gone
+    // through any prior validation.
+    if (route_pattern.empty()) {
+        throw std::invalid_argument(
+            "Proxy: route_pattern must not be empty (upstream '" +
+            upstream_service_name + "')");
+    }
+    // Validate the route pattern early — same rules as config_loader
+    // applies to JSON-loaded routes. Without this, invalid patterns
+    // (duplicate params, catch-all not last, etc.) only fail inside
+    // RouteAsync after handler/method bookkeeping has been partially
+    // applied.
+    try {
+        auto segments = ROUTE_TRIE::ParsePattern(route_pattern);
+        ROUTE_TRIE::ValidatePattern(route_pattern, segments);
+    } catch (const std::invalid_argument& e) {
+        throw std::invalid_argument(
+            "Proxy: invalid route_pattern '" + route_pattern + "': " + e.what());
+    }
+
+    // Validate that the upstream service exists in config (can check eagerly)
+    const UpstreamConfig* found = nullptr;
+    for (const auto& u : upstream_configs_) {
+        if (u.name == upstream_service_name) {
+            found = &u;
+            break;
+        }
+    }
+    if (!found) {
+        throw std::invalid_argument(
+            "Proxy: upstream service '" + upstream_service_name +
+            "' not configured");
+    }
+
+    // Validate proxy config eagerly — fail fast for code-registered routes
+    // that bypass config_loader validation. Normally ConfigLoader::Validate
+    // already rejects these at HttpServer construction time, but we repeat
+    // the check here so the Proxy() API cannot silently register a route
+    // against a mis-validated upstream (defense-in-depth) — and so an
+    // embedder gets an immediate exception if they somehow populate
+    // upstream_configs_ outside the normal constructor path.
+    if (found->proxy.response_timeout_ms != 0 &&
+        found->proxy.response_timeout_ms < 1000) {
+        throw std::invalid_argument(
+            "Proxy: upstream '" + upstream_service_name +
+            "' has invalid response_timeout_ms=" +
+            std::to_string(found->proxy.response_timeout_ms) +
+            " (must be 0 or >= 1000)");
+    }
+    if (found->proxy.retry.max_retries < 0 ||
+        found->proxy.retry.max_retries > 10) {
+        throw std::invalid_argument(
+            "Proxy: upstream '" + upstream_service_name +
+            "' has invalid max_retries=" +
+            std::to_string(found->proxy.retry.max_retries) +
+            " (must be 0-10)");
+    }
+    // Validate methods — reject unknowns and duplicates (same as config_loader).
+    // Without this, duplicates crash RouteAsync and unknowns bypass validation.
+    {
+        static const std::unordered_set<std::string> valid_methods = {
+            "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"
+        };
+        std::unordered_set<std::string> seen;
+        for (const auto& m : found->proxy.methods) {
+            if (valid_methods.find(m) == valid_methods.end()) {
+                throw std::invalid_argument(
+                    "Proxy: upstream '" + upstream_service_name +
+                    "' has invalid method '" + m + "'");
+            }
+            if (!seen.insert(m).second) {
+                throw std::invalid_argument(
+                    "Proxy: upstream '" + upstream_service_name +
+                    "' has duplicate method '" + m + "'");
+            }
+        }
+    }
+
+    if (!upstream_manager_) {
+        // Pre-Start: defer registration. pending_proxy_routes_ mutation
+        // is safe here because the startup gate above ensures we are
+        // either before Start() (single-threaded user code) or inside
+        // MarkServerReady's internal pass (dispatcher thread, exclusive
+        // owner of pending_proxy_routes_).
+        pending_proxy_routes_.emplace_back(route_pattern, upstream_service_name);
+        logging::Get()->debug("Proxy: deferred registration {} -> {} "
+                              "(upstream manager not yet initialized)",
+                              route_pattern, upstream_service_name);
+        return;
+    }
+
+    // Detect whether the pattern already contains a catch-all segment.
+    // RouteTrie only treats '*' as special at segment start (immediately
+    // after '/'), so mid-segment '*' like /file*name is literal. Also
+    // skip non-origin-form patterns entirely (e.g. "*" for OPTIONS *):
+    // those are exact static routes, not catch-all patterns.
+    bool has_catch_all = false;
+    if (!route_pattern.empty() && route_pattern.front() == '/') {
+        for (size_t i = 0; i < route_pattern.size(); ++i) {
+            if (route_pattern[i] == '*' &&
+                (i == 0 || route_pattern[i - 1] == '/')) {
+                has_catch_all = true;
+                break;
+            }
+        }
+    }
+
+    // Build the effective config_prefix with a NAMED catch-all. Handles:
+    //  - no catch-all            → appends "/*<generated>"
+    //  - unnamed catch-all "/*"  → rewrites to "/*<generated>" so
+    //                              ProxyHandler's strip_prefix can find it
+    //  - already-named "*name"   → unchanged
+    //  - non-origin-form "*"     → unchanged (exact static route)
+    std::string config_prefix = EnsureNamedCatchAll(route_pattern);
+
+    // Normalize the route for dedup: strip all param and catch-all names
+    // so semantically identical routes with different names produce the
+    // same key. E.g., /api/:id/*rest and /api/:user/*tail both → /api/:/*.
+    std::string dedup_prefix = NormalizeRouteForDedup(config_prefix);
+    std::string handler_key = upstream_service_name + "\t" + dedup_prefix;
+
+    ProxyConfig handler_config = found->proxy;
+    handler_config.route_prefix = config_prefix;
+    auto handler = std::make_shared<ProxyHandler>(
+        upstream_service_name,
+        handler_config,
+        found->tls.enabled,
+        found->host,
+        found->port,
+        found->tls.sni_hostname,
+        upstream_manager_.get());
+
+    // Determine methods to register. HEAD is included so the proxy sends
+    // HEAD upstream (not GET via fallback, which downloads the full body).
+    // Explicit sync Head() handlers are not shadowed because GetAsyncHandler
+    // checks sync HEAD routes before async HEAD matches.
+    static const std::vector<std::string> DEFAULT_PROXY_METHODS =
+        {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
+    const bool methods_from_defaults = found->proxy.methods.empty();
+    const auto& methods = methods_from_defaults
+        ? DEFAULT_PROXY_METHODS : found->proxy.methods;
+
+    // Method-level conflict check BEFORE storing the handler.
+    // Partial overlaps are tolerated: skip conflicting methods (with a
+    // warn log) and register the rest. Callers expect non-conflicting
+    // methods to remain reachable instead of losing the entire route.
+    auto& registered = proxy_route_methods_[dedup_prefix];
+    std::vector<std::string> accepted_methods;
+    accepted_methods.reserve(methods.size());
+    for (const auto& m : methods) {
+        if (registered.count(m)) {
+            logging::Get()->warn("Proxy: method {} on path '{}' already "
+                                 "registered by proxy, skipping "
+                                 "(upstream '{}')",
+                                 m, dedup_prefix, upstream_service_name);
+            continue;
+        }
+        accepted_methods.push_back(m);
+    }
+    if (accepted_methods.empty()) {
+        logging::Get()->error("Proxy: no methods available for path '{}' "
+                              "(all conflicted, upstream '{}')",
+                              dedup_prefix, upstream_service_name);
+        return;
+    }
+
+    // Build the list of patterns to register. Both auto-generated and
+    // explicit catch-all routes need a companion exact-prefix registration
+    // so bare paths (e.g., /api/v1 without trailing slash) don't 404. The
+    // catch-all variant is always config_prefix (the NAMED form) so
+    // ProxyHandler's catch_all_param_ matches the trie's registered name.
+    //
+    // Track the "derived companion" separately: only in the has_catch_all
+    // case, the exact-prefix companion is derived from the user's
+    // catch-all pattern (the user wrote /api/*rest and we implicitly
+    // also register /api). This pattern gets an extra sync-conflict
+    // check below, so a pre-existing sync handler on the bare prefix
+    // isn't silently hijacked by the async companion.
+    std::vector<std::string> patterns_to_register;
+    std::string derived_companion;  // non-empty only for has_catch_all with a derived companion
+    if (!has_catch_all) {
+        patterns_to_register.push_back(route_pattern);    // exact prefix (user-specified)
+        // Skip the catch-all variant when EnsureNamedCatchAll produced
+        // the same string as route_pattern (e.g., non-origin-form "*"
+        // for OPTIONS *, which is an exact static route — not a
+        // rewritable catch-all). Pushing both would attempt a duplicate
+        // RouteAsync insert after partial mutation, since the pre-check
+        // only consults routes already in the router.
+        if (config_prefix != route_pattern) {
+            patterns_to_register.push_back(config_prefix);  // auto catch-all
+        }
+    } else {
+        // Explicit catch-all (possibly rewritten from unnamed to named).
+        // Extract the prefix before the catch-all segment.
+        auto star_pos = config_prefix.rfind('*');
+        if (star_pos != std::string::npos) {
+            std::string exact_prefix = config_prefix.substr(0, star_pos);
+            while (exact_prefix.size() > 1 && exact_prefix.back() == '/') {
+                exact_prefix.pop_back();
+            }
+            if (!exact_prefix.empty()) {
+                derived_companion = exact_prefix;
+                patterns_to_register.push_back(exact_prefix);
+            }
+        }
+        patterns_to_register.push_back(config_prefix);    // named catch-all
+    }
+
+    // PRE-CHECK PER METHOD: build a per-method list of patterns where
+    // registration is allowed, considering BOTH async and sync conflicts.
+    //
+    // Async conflict on any pattern → drop the method ENTIRELY (from all
+    // patterns). Two async routes on semantically equivalent patterns
+    // cannot coexist in the same trie.
+    //
+    // Sync conflict on the DERIVED companion pattern → drop just that
+    // (method, pattern) pair, not the whole method. The companion is
+    // implicit (user wrote /api/*rest; /api is derived). If the user
+    // already has a sync handler serving the bare prefix, the companion
+    // would silently hijack it via async-over-sync precedence — so we
+    // skip the companion registration for that method and let the sync
+    // handler keep serving bare-prefix requests. Non-companion patterns
+    // aren't touched by the sync check (they're the user's explicit
+    // Proxy target and they accepted the implications).
+    //
+    // Atomic in the sense that the set of (method, pattern) pairs that
+    // will actually register is fully conflict-free BEFORE any
+    // RouteAsync call mutates the router.
+    std::vector<MethodRegistration> to_register;
+    to_register.reserve(accepted_methods.size());
+    // PRE-CHECK PER (METHOD, PATTERN): filter individual collisions
+    // rather than dropping the whole method on the first conflict.
+    // Without this, a proxy on /api/*rest whose bare-prefix companion
+    // /api collides with an existing async GET /api would drop GET
+    // entirely — even though the catch-all /api/*rest would still
+    // coexist in the trie and serve /api/foo.
+    for (const auto& method : accepted_methods) {
+        MethodRegistration mr;
+        mr.method = method;
+        mr.patterns.reserve(patterns_to_register.size());
+        for (const auto& pattern : patterns_to_register) {
+            // Async conflict: the pre-check subsumes the trie's
+            // own throw condition for this specific pattern, so
+            // skipping just this pattern is safe.
+            if (router_.HasAsyncRouteConflict(method, pattern)) {
+                logging::Get()->warn(
+                    "Proxy: async route '{} {}' already registered on the "
+                    "router, skipping pattern for upstream '{}'",
+                    method, pattern, upstream_service_name);
+                continue;
+            }
+            // Bare-prefix companions are always registered regardless
+            // of sync conflict. The runtime yield in
+            // HttpRouter::GetAsyncHandler consults proxy_companion_patterns_
+            // and defers to a matching sync route per-request, which
+            // correctly handles both disjoint regexes (companion serves
+            // its own subset) and overlapping regexes (sync wins on the
+            // overlap).
+            mr.patterns.push_back(pattern);
+        }
+        if (!mr.patterns.empty()) {
+            to_register.push_back(std::move(mr));
+        }
+    }
+    if (to_register.empty()) {
+        logging::Get()->error(
+            "Proxy: no (method, pattern) pairs available after live-"
+            "router conflict check for upstream '{}' pattern '{}'",
+            upstream_service_name, route_pattern);
+        return;
+    }
+
+    // Rebuild accepted_methods from to_register (stable order) so the
+    // HEAD-flag computation and bookkeeping below see the final set.
+    accepted_methods.clear();
+    accepted_methods.reserve(to_register.size());
+    for (const auto& mr : to_register) {
+        accepted_methods.push_back(mr.method);
+    }
+
+    // Now that the final method set is known, compute HEAD-related flags.
+    // block_head_fallback: user explicitly included GET but omitted HEAD,
+    // so HEAD→GET fallback on this pattern would leak the method filter.
+    // head_from_defaults: HEAD was added by default_methods (not the
+    // user's explicit list) — mark the pattern so an explicit sync
+    // Head() handler on the same path wins, per the HEAD precedence fix.
+    bool proxy_has_get = std::find(accepted_methods.begin(),
+                                    accepted_methods.end(), "GET")
+                         != accepted_methods.end();
+    bool proxy_has_head = std::find(accepted_methods.begin(),
+                                     accepted_methods.end(), "HEAD")
+                          != accepted_methods.end();
+    bool block_head_fallback = proxy_has_get && !proxy_has_head;
+    bool head_from_defaults = methods_from_defaults && proxy_has_head;
+
+    // Collect the union of patterns actually registered, so pattern-level
+    // per-pattern flags (DisableHeadFallback / MarkProxyDefaultHead) can
+    // be applied consistently regardless of which individual (method,
+    // pattern) pairs survived the sync-conflict filter above.
+    std::unordered_set<std::string> registered_patterns;
+    for (const auto& mr : to_register) {
+        for (const auto& p : mr.patterns) {
+            registered_patterns.insert(p);
+        }
+    }
+
+    // Build a per-pattern "has GET" set so HEAD pairing is computed
+    // per-pattern, not per-registration. The per-(method,pattern)
+    // async conflict filter can drop GET on the companion pattern
+    // (because an earlier async GET on the same pattern exists) while
+    // keeping GET on the catch-all, so the global `proxy_has_get` flag
+    // is TRUE overall but NOT for the skipped pattern. Marking every
+    // surviving HEAD pattern as paired=proxy_has_get would
+    // incorrectly keep the proxy HEAD on the companion even though
+    // the real GET owner is the user's earlier async route.
+    std::unordered_set<std::string> patterns_with_get;
+    for (const auto& mr : to_register) {
+        if (mr.method == "GET") {
+            for (const auto& pattern : mr.patterns) {
+                patterns_with_get.insert(pattern);
+            }
+        }
+    }
+
+    // Perform the actual registration per-method per-pattern. Any
+    // exception here is unexpected (e.g., std::bad_alloc) and is
+    // propagated; the common "duplicate/conflicting pattern" case was
+    // caught by the per-method pre-check above. The companion marker
+    // is set PER (method, pattern) here so unrelated async routes
+    // registered later on the same pattern with a different method
+    // don't inherit the yield-to-sync behavior.
+    for (const auto& mr : to_register) {
+        for (const auto& pattern : mr.patterns) {
+            // Capture handler by shared_ptr so the lambda shares
+            // ownership — later overwrites of proxy_handlers_[handler_key]
+            // don't destroy this handler while this route is still live.
+            router_.RouteAsync(mr.method, pattern,
+                [handler](const HttpRequest& request,
+                          HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
+                    handler->Handle(request, std::move(complete));
+                });
+            // Mark the derived bare-prefix companion only for the
+            // methods this proxy actually registers on it. A method
+            // not in the proxy's method list should NOT yield — a
+            // later first-class async route on the same pattern with
+            // a different method is unrelated to this companion.
+            if (!derived_companion.empty() && pattern == derived_companion) {
+                router_.MarkProxyCompanion(mr.method, pattern);
+            }
+        }
+    }
+    for (const auto& pattern : registered_patterns) {
+        if (block_head_fallback) {
+            router_.DisableHeadFallback(pattern);
+        }
+        if (head_from_defaults) {
+            // paired_with_get is PER-PATTERN: true iff the SAME proxy
+            // registration also installed GET on THIS pattern. The
+            // per-method conflict filter may have kept GET on some
+            // patterns (catch-all) while dropping it on others
+            // (companion conflicting with a pre-existing user route),
+            // so using a global flag would incorrectly mark the
+            // companion's HEAD as paired. The HEAD precedence logic
+            // then routes HEAD through the real GET owner instead of
+            // sticking on this proxy.
+            bool pattern_paired_with_get =
+                patterns_with_get.count(pattern) > 0;
+            router_.MarkProxyDefaultHead(pattern, pattern_paired_with_get);
+        }
+        logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
+                             pattern, upstream_service_name,
+                             found->host, found->port);
+    }
+
+    // All routes registered successfully — commit bookkeeping. The
+    // handler shared_ptr is captured by the lambdas above (keeping it
+    // alive even if proxy_handlers_ is later overwritten), so this is
+    // just for future Proxy() lookups and conflict detection.
+    proxy_handlers_[handler_key] = handler;
+    for (const auto& m : accepted_methods) {
+        registered.insert(m);
+    }
+    // Track the upstream name so the async-deferred safety cap
+    // computed in MarkServerReady folds it in (otherwise manual
+    // proxies with response_timeout_ms=0 would still inherit the
+    // 3600s default — see RecomputeAsyncDeferredCap).
+    proxy_referenced_upstreams_.insert(upstream_service_name);
+}
+
+void HttpServer::RecomputeAsyncDeferredCap() {
+    // Compute the async-deferred safety cap from all upstream configs
+    // referenced by successfully-registered proxy routes.
+    //
+    // The cap is a last-resort abort timer for deferred async
+    // responses that never call complete() (e.g., a proxy talking to
+    // a genuinely wedged upstream with response_timeout_ms configured,
+    // or a custom RouteAsync handler with a bug). To avoid overriding
+    // operator-configured timeouts, the cap is sized to be strictly
+    // larger than the longest configured proxy.response_timeout_ms.
+    //
+    // Upstreams with proxy.response_timeout_ms == 0 (operator opted out
+    // of a per-request deadline for that upstream) are SKIPPED in the
+    // max — not used to globally disable the cap. The async safety cap
+    // exists precisely to catch stuck handlers that slip past per-request
+    // timeouts, so letting a single upstream's opt-out remove it for
+    // every unrelated proxy route and custom async handler on this
+    // server would be a footgun — a wedged handler would then hang
+    // forever with no last-resort abort. Zero-timeout upstreams are
+    // still bounded by the resulting global cap (at least the default
+    // floor), but that is a very loose safety net, not a per-request
+    // deadline.
+    //
+    // Default floor: 3600s (1 hour). Generous enough for most custom
+    // async handlers and most realistic proxy response timeouts; the
+    // computation below raises it when a proxy config demands more.
+    //
+    // Iterates proxy_referenced_upstreams_ rather than upstream_configs_
+    // directly, so programmatic HttpServer::Proxy() calls are included
+    // even when the upstream's JSON proxy.route_prefix is empty.
+    static constexpr int DEFAULT_MIN_CAP_SEC = 3600;
+    static constexpr int BUFFER_SEC = 60;
+    int computed_sec = DEFAULT_MIN_CAP_SEC;
+    for (const auto& name : proxy_referenced_upstreams_) {
+        const UpstreamConfig* found = nullptr;
+        for (const auto& u : upstream_configs_) {
+            if (u.name == name) {
+                found = &u;
+                break;
+            }
+        }
+        if (!found) continue;  // Should not happen — defensive
+        if (found->proxy.response_timeout_ms == 0) {
+            // This upstream is opted out of per-request deadlines.
+            // We neither raise NOR disable the global cap here —
+            // ProxyHandler::Handle sets a PER-REQUEST override
+            // (HttpRequest::async_cap_sec_override = 0) so that THIS
+            // proxy's requests run unbounded while unrelated routes on
+            // the same server still get the global safety net. See
+            // HttpRequest::async_cap_sec_override and the per-request
+            // override read in HttpConnectionHandler's deferred
+            // heartbeat / Http2Session::ResetExpiredStreams.
+            continue;
+        }
+        // 64-bit ceil division + saturating add to keep the cap
+        // monotonic in the input and safe against operator typos
+        // near INT_MAX (ConfigLoader::Validate does not currently
+        // cap this field).
+        int base_sec = CeilMsToSec(found->proxy.response_timeout_ms);
+        int sec;
+        if (base_sec > std::numeric_limits<int>::max() - BUFFER_SEC) {
+            sec = std::numeric_limits<int>::max();
+        } else {
+            sec = base_sec + BUFFER_SEC;
+        }
+        computed_sec = std::max(computed_sec, sec);
+    }
+    int new_cap = computed_sec;
+    max_async_deferred_sec_.store(new_cap, std::memory_order_relaxed);
+    logging::Get()->debug("HttpServer async deferred safety cap: {}s "
+                          "(referenced upstreams={})",
+                          new_cap, proxy_referenced_upstreams_.size());
+}
+
+void HttpServer::RegisterProxyRoutes() {
+    if (!upstream_manager_) {
+        return;
+    }
+
+    for (const auto& upstream : upstream_configs_) {
+        if (upstream.proxy.route_prefix.empty()) {
+            continue;  // No proxy config for this upstream
+        }
+
+        // Validate proxy config — same checks as ConfigLoader::Validate.
+        // For JSON-loaded configs this is a no-op second pass (Validate
+        // already rejected anything invalid at HttpServer construction).
+        // For programmatic configs the HttpServer(ServerConfig) constructor
+        // also runs ConfigLoader::Validate via ValidateConfig(), so this
+        // block is defense-in-depth. If a mismatch ever develops between
+        // the validator and the registration code, THROW rather than
+        // silently log-and-skip — starting the server without the
+        // expected proxy routes is a much harder failure to diagnose
+        // than an exception at Start() time. MarkServerReady wraps this
+        // call in a try/catch that stops the server and rethrows so the
+        // caller of HttpServer::Start() sees the failure.
+        try {
+            auto segments = ROUTE_TRIE::ParsePattern(upstream.proxy.route_prefix);
+            ROUTE_TRIE::ValidatePattern(upstream.proxy.route_prefix, segments);
+        } catch (const std::invalid_argument& e) {
+            throw std::invalid_argument(
+                "RegisterProxyRoutes: upstream '" + upstream.name +
+                "' has invalid route_prefix '" + upstream.proxy.route_prefix +
+                "': " + e.what());
+        }
+        if (upstream.proxy.response_timeout_ms != 0 &&
+            upstream.proxy.response_timeout_ms < 1000) {
+            throw std::invalid_argument(
+                "RegisterProxyRoutes: upstream '" + upstream.name +
+                "' has invalid response_timeout_ms=" +
+                std::to_string(upstream.proxy.response_timeout_ms) +
+                " (must be 0 or >= 1000)");
+        }
+        if (upstream.proxy.retry.max_retries < 0 ||
+            upstream.proxy.retry.max_retries > 10) {
+            throw std::invalid_argument(
+                "RegisterProxyRoutes: upstream '" + upstream.name +
+                "' has invalid max_retries=" +
+                std::to_string(upstream.proxy.retry.max_retries) +
+                " (must be 0-10)");
+        }
+        {
+            static const std::unordered_set<std::string> valid_methods = {
+                "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD",
+                "OPTIONS", "TRACE"
+            };
+            std::unordered_set<std::string> seen;
+            for (const auto& m : upstream.proxy.methods) {
+                if (valid_methods.find(m) == valid_methods.end()) {
+                    throw std::invalid_argument(
+                        "RegisterProxyRoutes: upstream '" + upstream.name +
+                        "' has invalid method '" + m + "'");
+                }
+                if (!seen.insert(m).second) {
+                    throw std::invalid_argument(
+                        "RegisterProxyRoutes: upstream '" + upstream.name +
+                        "' has duplicate method '" + m + "'");
+                }
+            }
+        }
+
+        // Check if the route_prefix already has a catch-all segment.
+        // Same segment-start rule as RouteTrie (only after '/'). Skip
+        // non-origin-form patterns entirely — "*" for OPTIONS * is an
+        // exact static route, not a catch-all.
+        std::string route_pattern = upstream.proxy.route_prefix;
+        bool has_catch_all = false;
+        if (!route_pattern.empty() && route_pattern.front() == '/') {
+            for (size_t i = 0; i < route_pattern.size(); ++i) {
+                if (route_pattern[i] == '*' &&
+                    (i == 0 || route_pattern[i - 1] == '/')) {
+                    has_catch_all = true;
+                    break;
+                }
+            }
+        }
+
+        // Build effective route_prefix with a NAMED catch-all. Handles
+        // no-catch-all, unnamed catch-all, and already-named cases.
+        // See EnsureNamedCatchAll for details on why unnamed catch-alls
+        // must be rewritten for strip_prefix to work correctly.
+        std::string config_prefix = EnsureNamedCatchAll(route_pattern);
+
+        // Same normalized dedup as Proxy()
+        std::string dedup_prefix = NormalizeRouteForDedup(config_prefix);
+        std::string handler_key = upstream.name + "\t" + dedup_prefix;
+
+        // Create ProxyHandler with the full catch-all-aware route_prefix.
+        // shared_ptr so route lambdas can capture shared ownership and
+        // survive a later overwrite of proxy_handlers_[handler_key].
+        ProxyConfig handler_config = upstream.proxy;
+        handler_config.route_prefix = config_prefix;
+        auto handler = std::make_shared<ProxyHandler>(
+            upstream.name,
+            handler_config,
+            upstream.tls.enabled,
+            upstream.host,
+            upstream.port,
+            upstream.tls.sni_hostname,
+            upstream_manager_.get());
+
+        // Same HEAD policy as Proxy() — HEAD included for correct upstream semantics
+        static const std::vector<std::string> DEFAULT_PROXY_METHODS =
+            {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"};
+        const bool methods_from_defaults = upstream.proxy.methods.empty();
+        const auto& methods = methods_from_defaults
+            ? DEFAULT_PROXY_METHODS : upstream.proxy.methods;
+
+        // Method-level conflict check BEFORE storing (same as Proxy()).
+        // Partial overlaps are tolerated: skip conflicting methods and
+        // register the rest.
+        auto& registered = proxy_route_methods_[dedup_prefix];
+        std::vector<std::string> accepted_methods;
+        accepted_methods.reserve(methods.size());
+        for (const auto& m : methods) {
+            if (registered.count(m)) {
+                logging::Get()->warn("RegisterProxyRoutes: method {} on '{}' "
+                                     "already registered by proxy, skipping "
+                                     "(upstream '{}')",
+                                     m, dedup_prefix, upstream.name);
+                continue;
+            }
+            accepted_methods.push_back(m);
+        }
+        if (accepted_methods.empty()) {
+            logging::Get()->error("RegisterProxyRoutes: no methods available "
+                                  "for path '{}' (all conflicted, upstream '{}')",
+                                  dedup_prefix, upstream.name);
+            continue;
+        }
+
+        // Build the list of patterns to register. Same layout as Proxy().
+        // Track `derived_companion` separately (see HttpServer::Proxy for
+        // the rationale — the derived bare-prefix companion gets an
+        // extra sync-conflict check so it doesn't silently hijack a
+        // pre-existing sync handler).
+        std::vector<std::string> patterns_to_register;
+        std::string derived_companion;
+        if (!has_catch_all) {
+            // Register the exact prefix to handle requests without a
+            // trailing path (e.g., /api/users). Not a "derived"
+            // companion — the user wrote this pattern directly.
+            patterns_to_register.push_back(upstream.proxy.route_prefix);
+        } else {
+            // Explicit catch-all (possibly rewritten from unnamed to named):
+            // register exact-prefix companion so bare paths (e.g., /api/v1)
+            // don't 404. Extract from config_prefix to account for the
+            // unnamed→named rewrite done by EnsureNamedCatchAll.
+            auto sp = config_prefix.rfind('*');
+            if (sp != std::string::npos) {
+                std::string exact_prefix = config_prefix.substr(0, sp);
+                while (exact_prefix.size() > 1 && exact_prefix.back() == '/') {
+                    exact_prefix.pop_back();
+                }
+                if (!exact_prefix.empty()) {
+                    derived_companion = exact_prefix;
+                    patterns_to_register.push_back(exact_prefix);
+                }
+            }
+        }
+        // Register the catch-all variant (auto-generated or user-provided,
+        // always with named catch-all after EnsureNamedCatchAll).
+        // Skip when it duplicates the exact-prefix we already pushed
+        // (non-origin-form like "*" where EnsureNamedCatchAll returns
+        // the input unchanged) — otherwise RouteAsync would throw a
+        // duplicate-route exception on the second insert.
+        if (patterns_to_register.empty() ||
+            patterns_to_register.back() != config_prefix) {
+            patterns_to_register.push_back(config_prefix);
+        }
+
+        // PRE-CHECK PER (METHOD, PATTERN): build a per-method list of
+        // patterns, filtering out individual collisions rather than
+        // dropping the entire method on the first conflict. Previously
+        // an async conflict on ANY pattern (e.g. an existing async GET
+        // /api overlapping with the bare-prefix companion of a proxy
+        // on /api/*rest) dropped GET for the whole proxy — even though
+        // the catch-all /api/*rest would still coexist in the trie.
+        // The sync-companion branch below already does this per-pattern;
+        // async is now symmetric. See HttpServer::Proxy for the
+        // same fix applied to the programmatic path.
+        std::vector<MethodRegistration> to_register;
+        to_register.reserve(accepted_methods.size());
+        for (const auto& method : accepted_methods) {
+            MethodRegistration mr;
+            mr.method = method;
+            mr.patterns.reserve(patterns_to_register.size());
+            for (const auto& pattern : patterns_to_register) {
+                // Async conflict: the pre-check subsumes the trie's
+                // own throw condition for this specific pattern, so
+                // skipping just this pattern is safe (the remaining
+                // patterns in this method cannot trigger a mid-loop
+                // RouteAsync throw).
+                if (router_.HasAsyncRouteConflict(method, pattern)) {
+                    logging::Get()->warn(
+                        "RegisterProxyRoutes: async route '{} {}' already "
+                        "registered on the router, skipping pattern for "
+                        "upstream '{}'",
+                        method, pattern, upstream.name);
+                    continue;
+                }
+                // Bare-prefix companions are always registered
+                // regardless of sync conflict — runtime yield in
+                // HttpRouter::GetAsyncHandler defers to a matching
+                // sync route per-request. See HttpServer::Proxy for
+                // the full rationale.
+                mr.patterns.push_back(pattern);
+            }
+            if (!mr.patterns.empty()) {
+                to_register.push_back(std::move(mr));
+            }
+        }
+        if (to_register.empty()) {
+            logging::Get()->error(
+                "RegisterProxyRoutes: no (method, pattern) pairs "
+                "available after live-router conflict check for "
+                "upstream '{}'",
+                upstream.name);
+            continue;
+        }
+
+        // Rebuild accepted_methods (stable order) from to_register.
+        accepted_methods.clear();
+        accepted_methods.reserve(to_register.size());
+        for (const auto& mr : to_register) {
+            accepted_methods.push_back(mr.method);
+        }
+
+        // Now that the final method set is known, compute HEAD flags.
+        // See HttpServer::Proxy for the detailed rationale.
+        bool proxy_has_get = std::find(accepted_methods.begin(),
+                                        accepted_methods.end(), "GET")
+                             != accepted_methods.end();
+        bool proxy_has_head = std::find(accepted_methods.begin(),
+                                         accepted_methods.end(), "HEAD")
+                              != accepted_methods.end();
+        bool block_head_fallback = proxy_has_get && !proxy_has_head;
+        bool head_from_defaults = methods_from_defaults && proxy_has_head;
+
+        // Collect the union of patterns actually registered so per-pattern
+        // flags apply consistently regardless of which (method, pattern)
+        // pairs survived the sync-conflict filter.
+        std::unordered_set<std::string> registered_patterns;
+        for (const auto& mr : to_register) {
+            for (const auto& p : mr.patterns) {
+                registered_patterns.insert(p);
+            }
+        }
+
+        // Build per-pattern "has GET" set. See HttpServer::Proxy for
+        // the full rationale — the per-method conflict filter can
+        // drop GET on some patterns while keeping it on others, so a
+        // global proxy_has_get flag misattributes pairing.
+        std::unordered_set<std::string> patterns_with_get;
+        for (const auto& mr : to_register) {
+            if (mr.method == "GET") {
+                for (const auto& pattern : mr.patterns) {
+                    patterns_with_get.insert(pattern);
+                }
+            }
+        }
+
+        // Perform the actual registration per-method per-pattern. The
+        // companion marker is set PER (method, pattern) here so an
+        // unrelated async route registered later on the same pattern
+        // with a different method doesn't inherit the yield-to-sync
+        // behavior. See HttpServer::Proxy for the same rationale.
+        for (const auto& mr : to_register) {
+            for (const auto& pattern : mr.patterns) {
+                // Capture handler by shared_ptr so the lambda shares
+                // ownership and survives any later overwrite.
+                router_.RouteAsync(mr.method, pattern,
+                    [handler](const HttpRequest& request,
+                              HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
+                        handler->Handle(request, std::move(complete));
+                    });
+                if (!derived_companion.empty() && pattern == derived_companion) {
+                    router_.MarkProxyCompanion(mr.method, pattern);
+                }
+            }
+        }
+        for (const auto& pattern : registered_patterns) {
+            if (block_head_fallback) {
+                router_.DisableHeadFallback(pattern);
+            }
+            if (head_from_defaults) {
+                // paired_with_get is PER-PATTERN — true iff the SAME
+                // proxy registration also installed GET on THIS exact
+                // pattern. See HttpServer::Proxy for the rationale;
+                // same bug exists here if we used a registration-wide
+                // proxy_has_get flag.
+                bool pattern_paired_with_get =
+                    patterns_with_get.count(pattern) > 0;
+                router_.MarkProxyDefaultHead(pattern, pattern_paired_with_get);
+            }
+            logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
+                                 pattern, upstream.name,
+                                 upstream.host, upstream.port);
+        }
+
+        // All routes registered successfully — commit bookkeeping.
+        proxy_handlers_[handler_key] = handler;
+        for (const auto& m : accepted_methods) {
+            registered.insert(m);
+        }
+        // Track the upstream so the async-deferred safety cap
+        // considers its response_timeout_ms — same rationale as
+        // the programmatic Proxy() path.
+        proxy_referenced_upstreams_.insert(upstream.name);
+    }
+}
 
 void HttpServer::Start() {
     logging::Get()->info("HttpServer starting");
+    // Close the registration window AS SOON AS Start() is called, not
+    // when server_ready_ flips true later. RouteTrie is not thread-safe
+    // for concurrent insert + lookup, and MarkServerReady runs on the
+    // dispatcher thread while user code may still be on the caller
+    // thread. Without this flag, a late Post() on the caller thread
+    // could race with MarkServerReady's RegisterProxyRoutes inserts.
+    startup_begun_.store(true, std::memory_order_release);
     net_server_.Start();
 }
 
@@ -882,6 +2009,13 @@ void HttpServer::Stop() {
         h2_connections_.clear();
         pending_detection_.clear();
     }
+    // Clear proxy handlers after upstream shutdown. ProxyHandlers hold raw
+    // UpstreamManager* pointers, but upstream_manager_ is still alive here
+    // (destroyed in ~HttpServer). Clearing here prevents any stale route
+    // callback from reaching a proxy handler after Stop().
+    proxy_handlers_.clear();
+    proxy_route_methods_.clear();
+
     // Clear one-shot drain state (Stop may be called from destructor too)
     {
         std::lock_guard<std::mutex> dlck(drain_mtx_);
@@ -942,6 +2076,8 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetMaxHeaderSize(max_header_size_.load(std::memory_order_relaxed));
     http_conn->SetMaxWsMessageSize(max_ws_message_size_.load(std::memory_order_relaxed));
     http_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
+    http_conn->SetMaxAsyncDeferredSec(
+        max_async_deferred_sec_.load(std::memory_order_relaxed));
 
     // Count every completed HTTP parse — dispatched, rejected (400/413/etc), or
     // upgraded. Fires from HandleCompleteRequest before dispatch or rejection.
@@ -1013,6 +2149,14 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 //              decrements, and the guard also decrements.
                 auto completed = std::make_shared<std::atomic<bool>>(false);
                 auto cancelled = std::make_shared<std::atomic<bool>>(false);
+                // Allocate a cancel slot for handler-installed cleanup
+                // (e.g., ProxyHandler registers tx->Cancel() here).
+                // Fired by the async abort hook below. Populated BEFORE
+                // invoking async_handler so the handler can install its
+                // cancel callback inline.
+                auto cancel_slot =
+                    std::make_shared<std::function<void()>>();
+                request.async_cancel_slot = cancel_slot;
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, active_counter,
                      mw_headers, completed, cancelled](HttpResponse final_resp) {
@@ -1024,11 +2168,51 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         merged.Status(final_resp.GetStatusCode(),
                                       final_resp.GetStatusReason());
                         merged.Body(final_resp.GetBody());
-                        for (const auto& mh : mw_headers) {
-                            merged.Header(mh.first, mh.second);
+                        // Preserve proxy HEAD Content-Length flag across merge
+                        if (final_resp.IsContentLengthPreserved()) {
+                            merged.PreserveContentLength();
                         }
+                        std::set<std::string> final_non_repeatable;
                         for (const auto& fh : final_resp.GetHeaders()) {
-                            merged.Header(fh.first, fh.second);
+                            if (!IsRepeatableResponseHeader(fh.first)) {
+                                std::string lower = fh.first;
+                                std::transform(
+                                    lower.begin(), lower.end(), lower.begin(),
+                                    [](unsigned char c) { return std::tolower(c); });
+                                final_non_repeatable.insert(std::move(lower));
+                            }
+                        }
+                        for (const auto& mh : mw_headers) {
+                            std::string lower = mh.first;
+                            std::transform(
+                                lower.begin(), lower.end(), lower.begin(),
+                                [](unsigned char c) { return std::tolower(c); });
+                            if (!IsRepeatableResponseHeader(mh.first) &&
+                                final_non_repeatable.count(lower)) {
+                                continue;
+                            }
+                            merged.AppendHeader(mh.first, mh.second);
+                        }
+                        // Dedupe non-repeatable headers WITHIN the final
+                        // response too. Without this, a buggy upstream
+                        // or handler that emits duplicate Content-Type
+                        // / Location / etc. would have both copies
+                        // forwarded verbatim, producing a malformed
+                        // downstream response. Repeatable headers
+                        // (Set-Cookie, Cache-Control, Link, Via, ...)
+                        // are still appended in full.
+                        std::set<std::string> seen_final_non_repeatable;
+                        for (const auto& fh : final_resp.GetHeaders()) {
+                            if (!IsRepeatableResponseHeader(fh.first)) {
+                                std::string lower = fh.first;
+                                std::transform(
+                                    lower.begin(), lower.end(), lower.begin(),
+                                    [](unsigned char c) { return std::tolower(c); });
+                                if (!seen_final_non_repeatable.insert(lower).second) {
+                                    continue;  // already emitted first copy
+                                }
+                            }
+                            merged.AppendHeader(fh.first, fh.second);
                         }
                         auto s = weak_self.lock();
                         if (!s) {
@@ -1079,13 +2263,47 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 }
                 // Handler returned without throwing — it owns the
                 // completion callback and is responsible for invoking it.
-                // Disarm the guard so the callback handles the decrement.
+                // Install a safety-cap abort hook so the deferred
+                // heartbeat (which may fire 504 on a stuck handler) can
+                // short-circuit the stored complete closure and release
+                // the active_requests bookkeeping exactly once. Uses the
+                // same one-shot `completed` atomic as the complete
+                // closure so abort + complete races decrement at most
+                // once. Also fires the handler-installed cancel_slot
+                // (e.g. ProxyHandler's tx->Cancel()) so upstream work
+                // can release pool capacity instead of running to
+                // completion against a disconnected client.
+                self->SetAsyncAbortHook(
+                    [completed, cancelled, active_counter, cancel_slot]() {
+                        if (!completed->exchange(true,
+                                                 std::memory_order_acq_rel)) {
+                            cancelled->store(true, std::memory_order_release);
+                            active_counter->fetch_sub(
+                                1, std::memory_order_relaxed);
+                            // Fire handler cancel (if any) — one-shot.
+                            // Move out first so a throwing cancel hook
+                            // cannot be re-entered and the captures are
+                            // released even on failure.
+                            if (cancel_slot && *cancel_slot) {
+                                auto local = std::move(*cancel_slot);
+                                *cancel_slot = nullptr;
+                                try { local(); }
+                                catch (const std::exception& e) {
+                                    logging::Get()->error(
+                                        "Async cancel hook threw: {}",
+                                        e.what());
+                                }
+                            }
+                        }
+                    });
+                // Disarm the guard so the callback (or the abort hook)
+                // handles the decrement.
                 guard.release();
                 return;
             }
 
             if (!router_.Dispatch(request, response)) {
-                response.Status(404).Text("Not Found");
+                response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
             // During shutdown, signal the client to close the connection.
             // Without this, a keep-alive response looks persistent but
@@ -1655,6 +2873,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     // h2_settings_.max_header_list_size (Http2Config, default 64KB), which is
     // already baked into the session settings and advertised via SETTINGS frame.
     h2_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
+    h2_conn->SetMaxAsyncDeferredSec(
+        max_async_deferred_sec_.load(std::memory_order_relaxed));
 
     // Set request callback: dispatch through HttpRouter (same as HTTP/1.x).
     // total_requests_ is counted in stream_open_callback (below), which fires
@@ -1703,20 +2923,68 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 // marks `completed` so the callback becomes a no-op.
                 auto completed = std::make_shared<std::atomic<bool>>(false);
                 auto cancelled = std::make_shared<std::atomic<bool>>(false);
+                // Handler-installed cancel slot — mirrors HTTP/1.
+                // Populated before async_handler runs; fired by the
+                // per-stream abort hook on client-side abort (stream
+                // RST, close callback, or the async safety cap).
+                auto cancel_slot =
+                    std::make_shared<std::function<void()>>();
+                request.async_cancel_slot = cancel_slot;
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, stream_id, active_counter,
                      mw_headers, completed, cancelled](HttpResponse final_resp) {
                         if (completed->exchange(true)) return;
                         // Same merge as H1: middleware first, handler second.
+                        // Use AppendHeader to preserve repeated upstream
+                        // headers (Cache-Control, Link, Via, etc.).
                         HttpResponse merged;
                         merged.Status(final_resp.GetStatusCode(),
                                       final_resp.GetStatusReason());
                         merged.Body(final_resp.GetBody());
-                        for (const auto& mh : mw_headers) {
-                            merged.Header(mh.first, mh.second);
+                        if (final_resp.IsContentLengthPreserved()) {
+                            merged.PreserveContentLength();
                         }
+                        std::set<std::string> final_non_repeatable;
                         for (const auto& fh : final_resp.GetHeaders()) {
-                            merged.Header(fh.first, fh.second);
+                            if (!IsRepeatableResponseHeader(fh.first)) {
+                                std::string lower = fh.first;
+                                std::transform(
+                                    lower.begin(), lower.end(), lower.begin(),
+                                    [](unsigned char c) { return std::tolower(c); });
+                                final_non_repeatable.insert(std::move(lower));
+                            }
+                        }
+                        for (const auto& mh : mw_headers) {
+                            std::string lower = mh.first;
+                            std::transform(
+                                lower.begin(), lower.end(), lower.begin(),
+                                [](unsigned char c) { return std::tolower(c); });
+                            if (!IsRepeatableResponseHeader(mh.first) &&
+                                final_non_repeatable.count(lower)) {
+                                continue;
+                            }
+                            merged.AppendHeader(mh.first, mh.second);
+                        }
+                        // Dedupe non-repeatable headers WITHIN the final
+                        // response too. Without this, a buggy upstream
+                        // or handler that emits duplicate Content-Type
+                        // / Location / etc. would have both copies
+                        // forwarded verbatim, producing a malformed
+                        // downstream response. Repeatable headers
+                        // (Set-Cookie, Cache-Control, Link, Via, ...)
+                        // are still appended in full.
+                        std::set<std::string> seen_final_non_repeatable;
+                        for (const auto& fh : final_resp.GetHeaders()) {
+                            if (!IsRepeatableResponseHeader(fh.first)) {
+                                std::string lower = fh.first;
+                                std::transform(
+                                    lower.begin(), lower.end(), lower.begin(),
+                                    [](unsigned char c) { return std::tolower(c); });
+                                if (!seen_final_non_repeatable.insert(lower).second) {
+                                    continue;  // already emitted first copy
+                                }
+                            }
+                            merged.AppendHeader(fh.first, fh.second);
                         }
                         auto s = weak_self.lock();
                         if (!s) {
@@ -1751,12 +3019,43 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     cancelled->store(true, std::memory_order_release);
                     throw;
                 }
+                // Handler returned without throwing — install a
+                // per-stream abort hook for the safety-cap path.
+                // When ResetExpiredStreams RSTs a stuck stream, the
+                // hook flips the stored complete closure's one-shot
+                // completed/cancelled atomics and decrements
+                // active_requests exactly once, avoiding the
+                // bookkeeping leak that would otherwise occur when
+                // the real handler never calls complete(). It also
+                // fires the handler-installed cancel_slot (e.g.
+                // ProxyHandler's tx->Cancel()) so upstream work is
+                // released back to the pool on client-side abort.
+                self->SetStreamAbortHook(
+                    stream_id,
+                    [completed, cancelled, active_counter, cancel_slot]() {
+                        if (!completed->exchange(true,
+                                                 std::memory_order_acq_rel)) {
+                            cancelled->store(true, std::memory_order_release);
+                            active_counter->fetch_sub(
+                                1, std::memory_order_relaxed);
+                            if (cancel_slot && *cancel_slot) {
+                                auto local = std::move(*cancel_slot);
+                                *cancel_slot = nullptr;
+                                try { local(); }
+                                catch (const std::exception& e) {
+                                    logging::Get()->error(
+                                        "Async cancel hook threw: {}",
+                                        e.what());
+                                }
+                            }
+                        }
+                    });
                 guard.release();
                 return;
             }
 
             if (!router_.Dispatch(request, response)) {
-                response.Status(404).Text("Not Found");
+                response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
         }
     );
@@ -1773,9 +3072,20 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     );
     h2_conn->SetStreamCloseCallback(
         [this](std::shared_ptr<Http2ConnectionHandler> self,
-               int32_t /*stream_id*/, uint32_t /*error_code*/) {
+               int32_t stream_id, uint32_t /*error_code*/) {
             active_h2_streams_.fetch_sub(1, std::memory_order_relaxed);
             self->DecrementLocalStreamCount();
+            // FIRE the abort hook — do NOT merely erase it. A client-side
+            // RST_STREAM, peer disconnect, or connection-level GOAWAY
+            // can close a pending async stream BEFORE the handler ever
+            // calls complete(). If we only erased, a stuck handler
+            // would never decrement active_requests_ and /stats would
+            // stay permanently elevated. Firing is idempotent: the
+            // hook's one-shot `completed` exchange(true) returns true
+            // on the normal-complete path (closure already fired the
+            // decrement), so the hook is a no-op on clean close and
+            // releases bookkeeping on early close.
+            self->FireAndEraseStreamAbortHook(stream_id);
         }
     );
 }
@@ -1976,12 +3286,18 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
                                                  new_config.request_timeout_sec);
         // Preserve upstream timeout cadence — upstream configs are restart-only,
         // but the timer interval must not widen past the shortest upstream timeout.
+        // CadenceSecFromMs clamps sub-2s timeouts to 1s so reload-time
+        // recomputation matches the startup-time cadence.
         for (const auto& u : upstream_configs_) {
-            int connect_sec = std::max(
-                (u.pool.connect_timeout_ms + 999) / 1000, 1);
+            int connect_sec = CadenceSecFromMs(u.pool.connect_timeout_ms);
             new_interval = std::min(new_interval, connect_sec);
             if (u.pool.idle_timeout_sec > 0) {
                 new_interval = std::min(new_interval, u.pool.idle_timeout_sec);
+            }
+            // Also preserve proxy response timeout cadence
+            if (u.proxy.response_timeout_ms > 0) {
+                int response_sec = CadenceSecFromMs(u.proxy.response_timeout_ms);
+                new_interval = std::min(new_interval, response_sec);
             }
         }
         net_server_.SetTimerInterval(new_interval);

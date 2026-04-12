@@ -6,6 +6,24 @@
 #include <signal.h>
 #include <limits>
 
+// Convert a timeout in milliseconds to a DISPATCHER TIMER CADENCE in
+// whole seconds. Sub-2s timeouts clamp to 1s (instead of rounding up
+// to 2s) so that ms-based upstream timeouts get 1s resolution as
+// documented — a 1100ms deadline rounded to 2s cadence would be
+// checked only every 2s, firing up to ~0.9s late. Promotes to int64_t
+// to avoid signed overflow on INT_MAX-range operator typos. Saturates
+// to INT_MAX and returns at least 1. Mirrors the helper in
+// http_server.cc — keep them in sync.
+static int CadenceSecFromMs(int ms) {
+    if (ms <= 0) return 1;
+    if (ms < 2000) return 1;
+    int64_t sec64 = (static_cast<int64_t>(ms) + 999) / 1000;
+    if (sec64 > std::numeric_limits<int>::max()) {
+        return std::numeric_limits<int>::max();
+    }
+    return static_cast<int>(sec64);
+}
+
 // Suppress SIGPIPE for TLS upstream connections. SSL_write uses the
 // underlying socket's write() which bypasses MSG_NOSIGNAL. Without
 // this, a peer reset during SSL_write kills the process.
@@ -74,15 +92,26 @@ UpstreamManager::UpstreamManager(
 
     // Adjust dispatcher timer intervals for upstream timeout enforcement.
     // Without this, standalone dispatchers use their default interval (often
-    // 60s), making connect_timeout_ms and idle_timeout_sec fire tens of
-    // seconds late. HttpServer::MarkServerReady does this for production;
-    // this covers standalone UpstreamManager usage.
+    // 60s), making connect_timeout_ms / idle_timeout_sec / proxy
+    // response_timeout_ms fire tens of seconds late.
+    // HttpServer::MarkServerReady does this for production; this covers
+    // standalone UpstreamManager usage (see HttpServer::MarkServerReady
+    // for the mirrored logic).
     int min_upstream_sec = std::numeric_limits<int>::max();
     for (const auto& u : upstreams) {
-        int connect_sec = std::max((u.pool.connect_timeout_ms + 999) / 1000, 1);
+        int connect_sec = CadenceSecFromMs(u.pool.connect_timeout_ms);
         min_upstream_sec = std::min(min_upstream_sec, connect_sec);
         if (u.pool.idle_timeout_sec > 0) {
             min_upstream_sec = std::min(min_upstream_sec, u.pool.idle_timeout_sec);
+        }
+        // Proxy response timeout: also drives timer scan cadence when
+        // ProxyTransaction::ArmResponseTimeout sets a deadline on the
+        // transport. Without folding this in, a configured
+        // proxy.response_timeout_ms can still fire at the default ~60s
+        // cadence instead of its configured budget.
+        if (u.proxy.response_timeout_ms > 0) {
+            int response_sec = CadenceSecFromMs(u.proxy.response_timeout_ms);
+            min_upstream_sec = std::min(min_upstream_sec, response_sec);
         }
     }
     if (min_upstream_sec < std::numeric_limits<int>::max()) {
@@ -160,7 +189,8 @@ void UpstreamManager::CheckoutAsync(
     const std::string& service_name,
     size_t dispatcher_index,
     PoolPartition::ReadyCallback ready_cb,
-    PoolPartition::ErrorCallback error_cb) {
+    PoolPartition::ErrorCallback error_cb,
+    std::shared_ptr<std::atomic<bool>> cancel_token) {
 
     // Reject immediately if shutdown has started — the per-partition
     // InitiateShutdown tasks may not have executed yet on all dispatchers.
@@ -188,7 +218,8 @@ void UpstreamManager::CheckoutAsync(
         return;
     }
 
-    partition->CheckoutAsync(std::move(ready_cb), std::move(error_cb));
+    partition->CheckoutAsync(std::move(ready_cb), std::move(error_cb),
+                               std::move(cancel_token));
 }
 
 void UpstreamManager::EvictExpired(size_t dispatcher_index) {

@@ -1,6 +1,7 @@
 #include "http2/http2_session.h"
 #include "http2/http2_connection_handler.h"
 #include "http/http_response.h"
+#include "http/http_status.h"
 #include "log/logger.h"
 
 #include <nghttp2/nghttp2.h>
@@ -668,7 +669,7 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     // Other 1xx (103 Early Hints etc.) need a separate non-final API.
     // Reject all 1xx here — they would be sent as final with END_STREAM,
     // closing the stream before the real response.
-    if (status_code < 200) {
+    if (status_code < HttpStatus::OK) {
         logging::Get()->error("HTTP/2 stream {} SubmitResponse called with {} "
                               "(1xx not supported as app response)", stream_id, status_code);
         nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
@@ -681,8 +682,9 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     // RFC 9110 Section 15.3.5/15.3.6/15.4.5: 204, 205, 304 MUST NOT contain a body.
     const HttpRequest& req = stream->GetRequest();
     bool suppress_body = (req.method == "HEAD" ||
-                          status_code == 204 || status_code == 205 ||
-                          status_code == 304);
+                          status_code == HttpStatus::NO_CONTENT ||
+                          status_code == HttpStatus::RESET_CONTENT ||
+                          status_code == HttpStatus::NOT_MODIFIED);
 
     // Build nghttp2 header name-value pairs.
     // We do NOT use NGHTTP2_NV_FLAG_NO_COPY_NAME or NO_COPY_VALUE:
@@ -715,17 +717,15 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
             key == "transfer-encoding" || key == "upgrade") {
             continue;
         }
-        // Skip content-length — we compute the correct value below to
-        // prevent mismatches between declared and actual body size.
-        // Exception: for HEAD with empty body, preserve the caller-supplied
-        // content-length (the handler knows the representation size).
-        if (key == "content-length") {
-            if (req.method == "HEAD" && response.GetBody().empty()) {
-                // Keep it — the handler explicitly set the representation length
-            } else {
-                continue;
-            }
-        }
+        // Always strip caller-set content-length — we compute the
+        // authoritative value below via HttpResponse::ComputeWireContentLength
+        // (which mirrors the HTTP/1 Serialize() rules: 304 metadata
+        // preservation, 205 zeroing, HEAD auto-compute vs. preserve flag).
+        // The previous "HEAD && empty body keeps caller value" special-case
+        // let stale CL headers leak into HEAD responses without any
+        // PreserveContentLength opt-in, and silently dropped 304 CL
+        // metadata that HTTP/1 preserves.
+        if (key == "content-length") continue;
         lowered_names.push_back(std::move(key));
         nva.push_back({
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(lowered_names.back().c_str())),
@@ -739,14 +739,21 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     const std::string& raw_body = response.GetBody();
     bool has_body = !raw_body.empty() && !suppress_body;
 
-    // Compute correct content-length. Always server-managed to prevent
-    // mismatches between declared length and actual body size.
-    // HEAD: content-length reflects the GET body size (RFC 9110 §9.3.2)
-    // 204/205/304: no content-length (body suppressed)
-    // Normal: content-length = actual body size
+    // Compute the Content-Length header via the shared helper so HTTP/2
+    // stays in lockstep with HTTP/1 Serialize():
+    //   - 1xx/101/204: no CL
+    //   - 205:         CL = "0"
+    //   - 304:         preserve first caller-set CL, else no CL
+    //   - otherwise:   PreserveContentLength → first caller-set CL,
+    //                  else auto-compute from body_.size()
+    // For HEAD the helper returns body_.size() (auto) or the preserved
+    // value — matching HTTP/1 which also computes CL from body_ before
+    // stripping the body on the wire. `content_length_str` must live
+    // until nghttp2_submit_response2 returns because nva holds raw
+    // pointers into its storage.
     std::string content_length_str;
-    if (!raw_body.empty() && (!suppress_body || req.method == "HEAD")) {
-        content_length_str = std::to_string(raw_body.size());
+    if (auto effective_cl = response.ComputeWireContentLength(status_code)) {
+        content_length_str = std::move(*effective_cl);
         nva.push_back({
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("content-length")),
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(content_length_str.c_str())),
@@ -804,7 +811,14 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
         callbacks_.request_count_callback();
     }
 
-    // Request is complete — no longer incomplete for timeout purposes.
+    // Request parsing is complete — decrement the "incomplete" counter so
+    // request_timeout_sec no longer applies to this stream. For async
+    // (deferred) responses, the connection is kept alive via
+    // Http2ConnectionHandler::UpdateDeadline's safety-deadline path (active
+    // streams with zero incomplete), NOT by leaving the stream counted as
+    // incomplete. That was tried but made request_timeout_sec cap the full
+    // async handler lifetime, RST'ing proxy streams whose upstream was
+    // still responding within the longer proxy.response_timeout_ms budget.
     OnStreamNoLongerIncomplete();
     stream->MarkCounterDecremented();
 
@@ -813,6 +827,11 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
     // Propagate dispatcher index for upstream pool partition affinity
     if (conn_) {
         req.dispatcher_index = conn_->dispatcher_index();
+        // Propagate peer connection metadata for proxy header rewriting
+        // (X-Forwarded-For, X-Forwarded-Proto) and log correlation (client_fd).
+        req.client_ip = conn_->ip_addr();
+        req.client_tls = conn_->HasTls();
+        req.client_fd = conn_->fd();
     }
 
     // RFC 9110 Section 8.6: If content-length is declared, the actual body
@@ -849,8 +868,9 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
     // Async handler path: the framework has dispatched an async route and
     // will submit the real response on this stream later via
     // Http2ConnectionHandler::SubmitStreamResponse. Skipping here leaves the
-    // stream open; the H2 graceful-shutdown drain already waits on open
-    // streams, so in-flight async work is naturally protected.
+    // stream open; H2's graceful-shutdown drain already waits on open
+    // streams, and Http2ConnectionHandler::UpdateDeadline arms a rolling
+    // safety deadline while active streams exist to suppress idle_timeout.
     if (response.IsDeferred()) {
         return;
     }
@@ -937,18 +957,74 @@ std::chrono::steady_clock::time_point Http2Session::OldestIncompleteStreamStart(
     return std::chrono::steady_clock::time_point::max();
 }
 
-size_t Http2Session::ResetExpiredStreams(int timeout_sec) {
+size_t Http2Session::ResetExpiredStreams(int parse_timeout_sec,
+                                          int async_cap_sec,
+                                          std::vector<int32_t>* async_cap_reset_ids) {
     auto now = std::chrono::steady_clock::now();
-    auto limit = std::chrono::seconds(timeout_sec);
+    auto parse_limit = std::chrono::seconds(parse_timeout_sec);
     size_t count = 0;
 
     for (auto& [id, stream] : streams_) {
-        if (stream->IsCounterDecremented()) continue;
+        if (stream->IsCounterDecremented()) {
+            // Once the handler has submitted response headers the stream
+            // is no longer "awaiting async completion" — it is streaming
+            // a real response (sync responses, async responses post-
+            // completion, long downloads, SSE, etc.). nghttp2 owns body
+            // delivery from here on out; flow control + client backpressure
+            // govern the timing. Applying the async safety cap to these
+            // streams would spuriously RST legitimate long downloads.
+            if (stream->IsResponseHeadersSent()) continue;
+
+            // Async streams whose handler has NOT yet submitted headers:
+            // normally bounded by the handler's own timeout
+            // (proxy.response_timeout_ms, custom deadlines). The
+            // async_cap_sec here is an absolute safety net for stuck
+            // handlers that never submit a response. The effective cap
+            // is PER-STREAM: if the request set an override
+            // (req.async_cap_sec_override >= 0) that wins for THIS
+            // stream. Otherwise fall back to the connection-level
+            // async_cap_sec parameter. An override of 0 disables the
+            // cap entirely for that stream (used by proxies with
+            // response_timeout_ms=0 to support SSE / long-poll /
+            // intentionally unbounded backends — the operator's
+            // configured "disabled" semantic).
+            //
+            // Anchor the check at DispatchedAt() (when the stream
+            // transitioned from "being parsed" to "awaiting async
+            // response"), NOT CreatedAt(). Uploads on slow links can
+            // consume minutes before DispatchStreamRequest fires; using
+            // CreatedAt() would cause the cap to trip immediately after
+            // dispatch even though the handler has barely started its
+            // work. DispatchedAt() == time_point::max() when the stream
+            // has not been dispatched — and in that case IsCounterDecremented
+            // is false, so we never hit this branch with the sentinel.
+            const auto& req = stream->GetRequest();
+            int effective_cap = (req.async_cap_sec_override >= 0)
+                              ? req.async_cap_sec_override
+                              : async_cap_sec;
+            if (effective_cap > 0 &&
+                now - stream->DispatchedAt() > std::chrono::seconds(effective_cap)) {
+                logging::Get()->warn(
+                    "HTTP/2 async stream {} exceeded async cap ({}s) "
+                    "without completion; RST'ing to release slot",
+                    id, effective_cap);
+                stream->MarkRejected();
+                nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
+                                          id, NGHTTP2_CANCEL);
+                if (async_cap_reset_ids) {
+                    async_cap_reset_ids->push_back(id);
+                }
+                ++count;
+            }
+            continue;
+        }
+        // Incomplete stream parse timeout — only when configured.
+        if (parse_timeout_sec <= 0) continue;
         // Check incomplete AND rejected-but-not-closed streams.
         // Rejected streams (e.g. 417 Expect) may be half-open on the client
         // side — RST them to free nghttp2 max_concurrent_streams slots.
-        if (now - stream->CreatedAt() > limit) {
-            logging::Get()->warn("HTTP/2 stream {} timed out ({}s)", id, timeout_sec);
+        if (now - stream->CreatedAt() > parse_limit) {
+            logging::Get()->warn("HTTP/2 stream {} timed out ({}s)", id, parse_timeout_sec);
             stream->MarkRejected();
             nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
                                       id, NGHTTP2_CANCEL);

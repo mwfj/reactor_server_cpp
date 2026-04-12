@@ -61,16 +61,87 @@ struct UpstreamPoolConfig {
     bool operator!=(const UpstreamPoolConfig& o) const { return !(*this == o); }
 };
 
+struct ProxyHeaderRewriteConfig {
+    bool set_x_forwarded_for = true;      // Append client IP to X-Forwarded-For
+    bool set_x_forwarded_proto = true;     // Set X-Forwarded-Proto
+    bool set_via_header = true;            // Add Via header
+    bool rewrite_host = true;             // Rewrite Host to upstream address
+
+    bool operator==(const ProxyHeaderRewriteConfig& o) const {
+        return set_x_forwarded_for == o.set_x_forwarded_for &&
+               set_x_forwarded_proto == o.set_x_forwarded_proto &&
+               set_via_header == o.set_via_header &&
+               rewrite_host == o.rewrite_host;
+    }
+    bool operator!=(const ProxyHeaderRewriteConfig& o) const { return !(*this == o); }
+};
+
+struct ProxyRetryConfig {
+    int max_retries = 0;                    // 0 = no retries
+    bool retry_on_connect_failure = true;   // Retry when pool checkout connect fails
+    bool retry_on_5xx = false;              // Retry on 5xx response from upstream
+    bool retry_on_timeout = false;          // Retry on response timeout
+    bool retry_on_disconnect = true;        // Retry when upstream closes mid-response
+    bool retry_non_idempotent = false;      // Retry POST/PATCH/DELETE (dangerous)
+
+    bool operator==(const ProxyRetryConfig& o) const {
+        return max_retries == o.max_retries &&
+               retry_on_connect_failure == o.retry_on_connect_failure &&
+               retry_on_5xx == o.retry_on_5xx &&
+               retry_on_timeout == o.retry_on_timeout &&
+               retry_on_disconnect == o.retry_on_disconnect &&
+               retry_non_idempotent == o.retry_non_idempotent;
+    }
+    bool operator!=(const ProxyRetryConfig& o) const { return !(*this == o); }
+};
+
+struct ProxyConfig {
+    // Response timeout: max time to wait for upstream response headers
+    // after request is fully sent. 0 = disabled (no deadline). Otherwise
+    // must be >= 1000 (timer scan has 1s resolution).
+    int response_timeout_ms = 30000;  // 30 seconds
+
+    // Route pattern prefix to match (e.g., "/api/users")
+    // Supports the existing pattern syntax: "/api/:version/users/*path"
+    std::string route_prefix;
+
+    // Strip the route prefix before forwarding to upstream.
+    // Example: route_prefix="/api/v1", strip_prefix=true
+    //   client: GET /api/v1/users/123 -> upstream: GET /users/123
+    // When false: upstream sees the full original path.
+    bool strip_prefix = false;
+
+    // Methods to proxy. Empty = all methods.
+    std::vector<std::string> methods;
+
+    // Header rewriting configuration
+    ProxyHeaderRewriteConfig header_rewrite;
+
+    // Retry policy configuration
+    ProxyRetryConfig retry;
+
+    bool operator==(const ProxyConfig& o) const {
+        return response_timeout_ms == o.response_timeout_ms &&
+               route_prefix == o.route_prefix &&
+               strip_prefix == o.strip_prefix &&
+               methods == o.methods &&
+               header_rewrite == o.header_rewrite &&
+               retry == o.retry;
+    }
+    bool operator!=(const ProxyConfig& o) const { return !(*this == o); }
+};
+
 struct UpstreamConfig {
     std::string name;
     std::string host;
     int port = 80;
     UpstreamTlsConfig tls;
     UpstreamPoolConfig pool;
+    ProxyConfig proxy;
 
     bool operator==(const UpstreamConfig& o) const {
         return name == o.name && host == o.host && port == o.port &&
-               tls == o.tls && pool == o.pool;
+               tls == o.tls && pool == o.pool && proxy == o.proxy;
     }
     bool operator!=(const UpstreamConfig& o) const { return !(*this == o); }
 };
