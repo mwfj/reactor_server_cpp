@@ -40,8 +40,9 @@ ProxyTransaction::ProxyTransaction(
       upstream_path_override_(upstream_path_override),
       static_prefix_(static_prefix),
       upstream_manager_(upstream_manager),
-      dispatcher_(upstream_manager ? upstream_manager->GetDispatcherForIndex(
-                      static_cast<size_t>(client_request.dispatcher_index))
+      dispatcher_(upstream_manager && client_request.dispatcher_index >= 0
+                  ? upstream_manager->GetDispatcherForIndex(
+                        static_cast<size_t>(client_request.dispatcher_index))
                   : nullptr),
       config_(config),
       header_rewriter_(header_rewriter),
@@ -609,12 +610,19 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                     self->AttemptCheckout();
                 },
                 delay);
-        } else if (delay.count() > 0 && (!dispatcher_ || dispatcher_->was_stopped())) {
-            // Dispatcher unavailable during retry — fail fast
+        } else if (delay.count() > 0 && !dispatcher_) {
+            OnError(RESULT_CHECKOUT_FAILED,
+                    "Dispatcher unavailable for retry backoff");
+        } else if (delay.count() > 0 && dispatcher_->was_stopped()) {
             OnError(RESULT_CHECKOUT_FAILED,
                     "Dispatcher stopped during retry backoff");
         } else {
             // Zero delay (connection-level first retry): immediate
+            logging::Get()->debug(
+                "ProxyTransaction immediate retry client_fd={} "
+                "service={} attempt={} condition={}",
+                client_fd_, service_name_, attempt_,
+                static_cast<int>(condition));
             AttemptCheckout();
         }
         return;

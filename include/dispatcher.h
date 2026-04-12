@@ -42,13 +42,22 @@ private:
     // TIMER_BASED_RETRY_BACKOFF_DESIGN.md).
     struct DelayedTask {
         std::chrono::steady_clock::time_point deadline;
-        std::function<void()> callback;
+        // mutable: allows move-out from priority_queue::top() (which
+        // returns const&) without const_cast. Safe because callback is
+        // not part of the heap's comparison logic (only deadline is).
+        mutable std::function<void()> callback;
         bool operator>(const DelayedTask& other) const {
             return deadline > other.deadline;
         }
     };
     std::priority_queue<DelayedTask, std::vector<DelayedTask>,
                         std::greater<DelayedTask>> delayed_tasks_;
+
+    // Wall-clock gate for the opportunistic task_que_ drain in the
+    // channels.size()==0 path. Ensures EnQueueDeferred users get ~1s
+    // cadence even when delayed tasks shorten the WaitForEvent timeout.
+    // Accessed only from the event loop thread — no atomic needed.
+    std::chrono::steady_clock::time_point last_deferred_drain_{};
 
     std::atomic<std::thread::id> thread_id_{};
 

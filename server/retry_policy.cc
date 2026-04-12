@@ -82,12 +82,13 @@ std::chrono::milliseconds RetryPolicy::BackoffDelay(int attempt) const {
         upper_bound = MAX_BACKOFF_MS;
     }
 
-    // Defensive guard: if constants were ever changed to make upper_bound
-    // zero, dist(0, -1) would be undefined behavior.
-    if (upper_bound <= 0) {
-        return std::chrono::milliseconds(0);
+    // Defensive guard: dist(a, b) requires a <= b.
+    if (upper_bound <= 1) {
+        return std::chrono::milliseconds(upper_bound > 0 ? 1 : 0);
     }
 
-    std::uniform_int_distribution<int> dist(0, upper_bound - 1);
+    // Lower bound 1 guarantees at least 1ms for attempt >= 1, so the
+    // "always back off" contract for response-level retries is truthful.
+    std::uniform_int_distribution<int> dist(1, upper_bound - 1);
     return std::chrono::milliseconds(dist(rng));
 }

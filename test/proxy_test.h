@@ -1824,62 +1824,43 @@ void TestRetryFullJitterRange() {
         bool pass = true;
         std::string err;
 
-        // attempt=1: upper_bound = BASE(25) * 2^1 = 50, range [0, 50)
+        // attempt=1: upper_bound = BASE(25) * 2^1 = 50, range [1, 50)
         {
             static constexpr int EXPECTED_MAX = 50;  // BASE_BACKOFF_MS * 2^1
-            bool seen_nonzero = false;
             for (int i = 0; i < 1000; ++i) {
                 auto d = policy.BackoffDelay(1).count();
-                if (d < 0 || d >= EXPECTED_MAX) {
+                if (d < 1 || d >= EXPECTED_MAX) {
                     pass = false;
                     err += "attempt=1 out of range: " + std::to_string(d) + "; ";
                     break;
                 }
-                if (d > 0) seen_nonzero = true;
-            }
-            // Verify jitter is actually happening (not always returning 0 or constant)
-            if (!seen_nonzero) {
-                pass = false;
-                err += "attempt=1 always returns 0 (no jitter); ";
             }
         }
 
-        // attempt=3: upper_bound = BASE(25) * 2^3 = 200, range [0, 200)
+        // attempt=3: upper_bound = BASE(25) * 2^3 = 200, range [1, 200)
         {
             static constexpr int EXPECTED_MAX = 200;  // BASE_BACKOFF_MS * 2^3
-            bool seen_nonzero = false;
             for (int i = 0; i < 1000; ++i) {
                 auto d = policy.BackoffDelay(3).count();
-                if (d < 0 || d >= EXPECTED_MAX) {
+                if (d < 1 || d >= EXPECTED_MAX) {
                     pass = false;
                     err += "attempt=3 out of range: " + std::to_string(d) + "; ";
                     break;
                 }
-                if (d > 0) seen_nonzero = true;
-            }
-            if (!seen_nonzero) {
-                pass = false;
-                err += "attempt=3 always returns 0 (no jitter); ";
             }
         }
 
         // attempt=5: upper_bound = BASE(25) * 2^5 = 800 -> capped at MAX_BACKOFF_MS(250)
-        // range [0, 250)
+        // range [1, 250)
         {
             static constexpr int EXPECTED_MAX = 250;  // MAX_BACKOFF_MS cap
-            bool seen_nonzero = false;
             for (int i = 0; i < 1000; ++i) {
                 auto d = policy.BackoffDelay(5).count();
-                if (d < 0 || d >= EXPECTED_MAX) {
+                if (d < 1 || d >= EXPECTED_MAX) {
                     pass = false;
                     err += "attempt=5 out of range: " + std::to_string(d) + "; ";
                     break;
                 }
-                if (d > 0) seen_nonzero = true;
-            }
-            if (!seen_nonzero) {
-                pass = false;
-                err += "attempt=5 always returns 0 (no jitter); ";
             }
         }
 
@@ -1932,11 +1913,11 @@ void TestRetryFullJitterCapAtMax() {
         for (int attempt : {5, 7, 10, 15, 20, 50}) {
             for (int i = 0; i < 1000; ++i) {
                 auto d = policy.BackoffDelay(attempt).count();
-                if (d < 0 || d >= MAX_BACKOFF_MS) {
+                if (d < 1 || d >= MAX_BACKOFF_MS) {
                     pass = false;
                     err += "attempt=" + std::to_string(attempt) +
                            " returned " + std::to_string(d) +
-                           "ms (not in [0, 250)); ";
+                           "ms (not in [1, 250)); ";
                     break;
                 }
             }

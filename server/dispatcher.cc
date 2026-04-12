@@ -175,19 +175,32 @@ void Dispatcher::RunEventLoop(){
         // Note: on macOS, EVFILT_TIMER may fire with no channel events,
         // so we still need to check ConsumeTimerFired() below.
         if(channels.size() == 0){
-            // Drain queued tasks on the natural ~1s timeout only.
-            // When WaitForEvent was shortened by a delayed task deadline,
-            // skip the drain to preserve EnQueueDeferred's ~1s cadence
-            // (pool purge chain relies on this — see Decision 7 in
-            // TIMER_BASED_RETRY_BACKOFF_DESIGN.md).
-            if (!delayed_shortened) {
+            // Drain queued tasks on the ~1s cadence. When WaitForEvent was
+            // shortened by a delayed task deadline, only drain if at least
+            // 1 second has passed since the last drain. This preserves
+            // EnQueueDeferred's expected ~1s cadence (pool purge chain
+            // relies on this) while preventing starvation under sustained
+            // retry traffic where delayed_shortened is true for many
+            // consecutive iterations.
+            auto now_drain = std::chrono::steady_clock::now();
+            bool should_drain = !delayed_shortened ||
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now_drain - last_deferred_drain_).count() >= 1000;
+            if (should_drain) {
+                last_deferred_drain_ = now_drain;
                 std::deque<std::function<void()>> tasks;
                 {
                     std::lock_guard<std::mutex> lck(mtx_);
                     if (!task_que_.empty()) tasks.swap(task_que_);
                 }
                 for (auto& fn : tasks) {
-                    try { fn(); } catch (...) {}
+                    try {
+                        fn();
+                    } catch (const std::exception& e) {
+                        logging::Get()->error("Deferred task error: {}", e.what());
+                    } catch (...) {
+                        logging::Get()->error("Deferred task unknown error");
+                    }
                 }
             }
             // NOTE: timeout_trigger_callback is NOT fired here. It fires
@@ -240,10 +253,7 @@ void Dispatcher::RunEventLoop(){
                 auto now = std::chrono::steady_clock::now();
                 while (!delayed_tasks_.empty() &&
                        delayed_tasks_.top().deadline <= now) {
-                    // const_cast safe: element is immediately pop()'d after move
-                    expired.push_back(
-                        std::move(const_cast<DelayedTask&>(
-                            delayed_tasks_.top()).callback));
+                    expired.push_back(std::move(delayed_tasks_.top().callback));
                     delayed_tasks_.pop();
                 }
             }
@@ -436,6 +446,12 @@ void Dispatcher::EnQueueDeferred(std::function<void()> fn) {
 void Dispatcher::EnQueueDelayed(std::function<void()> fn,
                                  std::chrono::milliseconds delay) {
     if (was_stopped_.load(std::memory_order_acquire)) return;
+    // Zero or negative delay: use the immediate EnQueue path (avoids
+    // priority queue overhead and ensures the task runs ASAP).
+    if (delay.count() <= 0) {
+        EnQueue(std::move(fn));
+        return;
+    }
     auto deadline = std::chrono::steady_clock::now() + delay;
     {
         std::lock_guard<std::mutex> lck(mtx_);
