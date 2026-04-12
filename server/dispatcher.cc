@@ -301,10 +301,13 @@ void Dispatcher::RunEventLoop(){
         }
     }
 
-    // Discard pending delayed tasks — they would fire into a shutting-down
-    // system where dispatchers/pools may already be torn down. The
-    // ProxyTransaction destructor's safety net logs a warning if the
-    // completion callback was never invoked.
+    // Discard pending delayed tasks. By this point, NetServer::Stop() has
+    // already fired abort hooks on all pending async requests (which call
+    // ProxyTransaction::Cancel() → cancelled_ = true, complete_cb_invoked_
+    // = true), so delayed retry callbacks would be no-ops anyway. Firing
+    // them here would attempt AttemptCheckout on a shutting-down pool,
+    // producing error responses that can't reach the client (event loop
+    // is no longer polling for EPOLLOUT).
     {
         std::lock_guard<std::mutex> lck(mtx_);
         while (!delayed_tasks_.empty()) {
@@ -422,10 +425,25 @@ void Dispatcher::HandleEventId(){
 
 void Dispatcher::ProcessPendingTasks() {
     std::deque<std::function<void()>> tasks;
+    std::vector<std::function<void()>> expired_delayed;
     {
         std::lock_guard<std::mutex> lck(mtx_);
-        if (task_que_.empty()) return;
-        tasks.swap(task_que_);
+        if (!task_que_.empty()) tasks.swap(task_que_);
+        // Also collect expired delayed tasks. This is critical for the
+        // stop-from-handler path: the dispatcher thread is blocked in a
+        // handler callback and pumps ProcessPendingTasks() instead of
+        // running the normal event loop. Without this, a delayed retry
+        // that's past its deadline would sit unprocessed until
+        // StopEventLoop() discards it.
+        if (!delayed_tasks_.empty()) {
+            auto now = std::chrono::steady_clock::now();
+            while (!delayed_tasks_.empty() &&
+                   delayed_tasks_.top().deadline <= now) {
+                expired_delayed.push_back(
+                    std::move(delayed_tasks_.top().callback));
+                delayed_tasks_.pop();
+            }
+        }
     }
     for (auto& fn : tasks) {
         try {
@@ -434,6 +452,15 @@ void Dispatcher::ProcessPendingTasks() {
             logging::Get()->error("Pending task error: {}", e.what());
         } catch (...) {
             logging::Get()->error("Pending task unknown error");
+        }
+    }
+    for (auto& fn : expired_delayed) {
+        try {
+            fn();
+        } catch (const std::exception& e) {
+            logging::Get()->error("Delayed task error: {}", e.what());
+        } catch (...) {
+            logging::Get()->error("Delayed task unknown error");
         }
     }
 }
@@ -460,7 +487,11 @@ bool Dispatcher::EnQueueDelayed(std::function<void()> fn,
     if (was_stopped_.load(std::memory_order_acquire)) return false;
     // Zero or negative delay: use the immediate EnQueue path (avoids
     // priority queue overhead and ensures the task runs ASAP).
+    // Re-check was_stopped_ to match EnQueue's internal guard —
+    // EnQueue silently drops on was_stopped_, so returning true
+    // would violate the "false if dropped" contract.
     if (delay.count() <= 0) {
+        if (was_stopped_.load(std::memory_order_acquire)) return false;
         EnQueue(std::move(fn));
         return true;
     }
