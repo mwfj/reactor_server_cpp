@@ -346,14 +346,25 @@ void HttpServer::MarkServerReady() {
         }
     }
 
-    // Process deferred Proxy() calls (registered before Start)
-    for (const auto& [pattern, name] : pending_proxy_routes_) {
-        Proxy(pattern, name);
+    // Process deferred Proxy() calls + auto-register proxy routes from
+    // upstream configs. Any validation failure in either path throws
+    // std::invalid_argument — we catch it, stop the already-running
+    // dispatchers, and rethrow so the caller of HttpServer::Start()
+    // sees the failure instead of the server starting in a partially
+    // configured state where the expected proxy routes are missing.
+    // Mirrors the upstream_manager_ init-failure pattern above.
+    try {
+        for (const auto& [pattern, name] : pending_proxy_routes_) {
+            Proxy(pattern, name);
+        }
+        pending_proxy_routes_.clear();
+        RegisterProxyRoutes();
+    } catch (...) {
+        logging::Get()->error(
+            "Proxy route registration failed, stopping server");
+        net_server_.Stop();
+        throw;
     }
-    pending_proxy_routes_.clear();
-
-    // Auto-register proxy routes from upstream configs
-    RegisterProxyRoutes();
 
     // Compute the async-deferred safety cap from all upstream configs
     // referenced by successfully-registered proxy routes (both the
@@ -709,22 +720,32 @@ void HttpServer::Proxy(const std::string& route_pattern,
     }
     // Reject empty route patterns — calling .back() on an empty string is UB,
     // and an empty pattern is never a valid route.
+    //
+    // Validation throws std::invalid_argument (rather than logging and
+    // returning) so embedders calling this API directly can see the
+    // failure instead of finding a missing route at traffic time. The
+    // HttpServer(ServerConfig) constructor already runs
+    // ConfigLoader::Validate() on upstream_configs_, so the per-upstream
+    // checks below are defense-in-depth for that path. They still need
+    // to throw on the runtime Proxy() API path, where the route_pattern
+    // argument is freshly supplied by the caller and has not gone
+    // through any prior validation.
     if (route_pattern.empty()) {
-        logging::Get()->error("Proxy: route_pattern must not be empty "
-                              "(upstream '{}')", upstream_service_name);
-        return;
+        throw std::invalid_argument(
+            "Proxy: route_pattern must not be empty (upstream '" +
+            upstream_service_name + "')");
     }
-    // Validate the route pattern early — same as config_loader does for
-    // JSON-loaded routes. Without this, invalid patterns (duplicate params,
-    // catch-all not last, etc.) only fail inside RouteAsync after handler/
-    // method bookkeeping has been partially applied.
+    // Validate the route pattern early — same rules as config_loader
+    // applies to JSON-loaded routes. Without this, invalid patterns
+    // (duplicate params, catch-all not last, etc.) only fail inside
+    // RouteAsync after handler/method bookkeeping has been partially
+    // applied.
     try {
         auto segments = ROUTE_TRIE::ParsePattern(route_pattern);
         ROUTE_TRIE::ValidatePattern(route_pattern, segments);
     } catch (const std::invalid_argument& e) {
-        logging::Get()->error("Proxy: invalid route_pattern '{}': {}",
-                              route_pattern, e.what());
-        return;
+        throw std::invalid_argument(
+            "Proxy: invalid route_pattern '" + route_pattern + "': " + e.what());
     }
 
     // Validate that the upstream service exists in config (can check eagerly)
@@ -736,29 +757,33 @@ void HttpServer::Proxy(const std::string& route_pattern,
         }
     }
     if (!found) {
-        logging::Get()->error("Proxy: upstream service '{}' not configured",
-                              upstream_service_name);
-        return;
+        throw std::invalid_argument(
+            "Proxy: upstream service '" + upstream_service_name +
+            "' not configured");
     }
 
     // Validate proxy config eagerly — fail fast for code-registered routes
-    // that bypass config_loader validation (which only runs for JSON-loaded
-    // configs with non-empty route_prefix).
+    // that bypass config_loader validation. Normally ConfigLoader::Validate
+    // already rejects these at HttpServer construction time, but we repeat
+    // the check here so the Proxy() API cannot silently register a route
+    // against a mis-validated upstream (defense-in-depth) — and so an
+    // embedder gets an immediate exception if they somehow populate
+    // upstream_configs_ outside the normal constructor path.
     if (found->proxy.response_timeout_ms != 0 &&
         found->proxy.response_timeout_ms < 1000) {
-        logging::Get()->error("Proxy: upstream '{}' has invalid "
-                              "response_timeout_ms={} (must be 0 or >= 1000)",
-                              upstream_service_name,
-                              found->proxy.response_timeout_ms);
-        return;
+        throw std::invalid_argument(
+            "Proxy: upstream '" + upstream_service_name +
+            "' has invalid response_timeout_ms=" +
+            std::to_string(found->proxy.response_timeout_ms) +
+            " (must be 0 or >= 1000)");
     }
     if (found->proxy.retry.max_retries < 0 ||
         found->proxy.retry.max_retries > 10) {
-        logging::Get()->error("Proxy: upstream '{}' has invalid "
-                              "max_retries={} (must be 0-10)",
-                              upstream_service_name,
-                              found->proxy.retry.max_retries);
-        return;
+        throw std::invalid_argument(
+            "Proxy: upstream '" + upstream_service_name +
+            "' has invalid max_retries=" +
+            std::to_string(found->proxy.retry.max_retries) +
+            " (must be 0-10)");
     }
     // Validate methods — reject unknowns and duplicates (same as config_loader).
     // Without this, duplicates crash RouteAsync and unknowns bypass validation.
@@ -769,14 +794,14 @@ void HttpServer::Proxy(const std::string& route_pattern,
         std::unordered_set<std::string> seen;
         for (const auto& m : found->proxy.methods) {
             if (valid_methods.find(m) == valid_methods.end()) {
-                logging::Get()->error("Proxy: upstream '{}' has invalid "
-                                      "method '{}'", upstream_service_name, m);
-                return;
+                throw std::invalid_argument(
+                    "Proxy: upstream '" + upstream_service_name +
+                    "' has invalid method '" + m + "'");
             }
             if (!seen.insert(m).second) {
-                logging::Get()->error("Proxy: upstream '{}' has duplicate "
-                                      "method '{}'", upstream_service_name, m);
-                return;
+                throw std::invalid_argument(
+                    "Proxy: upstream '" + upstream_service_name +
+                    "' has duplicate method '" + m + "'");
             }
         }
     }
@@ -1156,34 +1181,42 @@ void HttpServer::RegisterProxyRoutes() {
             continue;  // No proxy config for this upstream
         }
 
-        // Validate proxy config — same checks as Proxy(). ServerConfig built
-        // programmatically bypasses config_loader validation, so invalid
-        // values here would cause RouteAsync to throw after dispatchers start.
+        // Validate proxy config — same checks as ConfigLoader::Validate.
+        // For JSON-loaded configs this is a no-op second pass (Validate
+        // already rejected anything invalid at HttpServer construction).
+        // For programmatic configs the HttpServer(ServerConfig) constructor
+        // also runs ConfigLoader::Validate via ValidateConfig(), so this
+        // block is defense-in-depth. If a mismatch ever develops between
+        // the validator and the registration code, THROW rather than
+        // silently log-and-skip — starting the server without the
+        // expected proxy routes is a much harder failure to diagnose
+        // than an exception at Start() time. MarkServerReady wraps this
+        // call in a try/catch that stops the server and rethrows so the
+        // caller of HttpServer::Start() sees the failure.
         try {
             auto segments = ROUTE_TRIE::ParsePattern(upstream.proxy.route_prefix);
             ROUTE_TRIE::ValidatePattern(upstream.proxy.route_prefix, segments);
         } catch (const std::invalid_argument& e) {
-            logging::Get()->error("RegisterProxyRoutes: invalid route_prefix "
-                                  "'{}': {}", upstream.proxy.route_prefix,
-                                  e.what());
-            continue;
+            throw std::invalid_argument(
+                "RegisterProxyRoutes: upstream '" + upstream.name +
+                "' has invalid route_prefix '" + upstream.proxy.route_prefix +
+                "': " + e.what());
         }
         if (upstream.proxy.response_timeout_ms != 0 &&
             upstream.proxy.response_timeout_ms < 1000) {
-            logging::Get()->error("RegisterProxyRoutes: upstream '{}' has "
-                                  "invalid response_timeout_ms={} (must be "
-                                  "0 or >= 1000)",
-                                  upstream.name,
-                                  upstream.proxy.response_timeout_ms);
-            continue;
+            throw std::invalid_argument(
+                "RegisterProxyRoutes: upstream '" + upstream.name +
+                "' has invalid response_timeout_ms=" +
+                std::to_string(upstream.proxy.response_timeout_ms) +
+                " (must be 0 or >= 1000)");
         }
         if (upstream.proxy.retry.max_retries < 0 ||
             upstream.proxy.retry.max_retries > 10) {
-            logging::Get()->error("RegisterProxyRoutes: upstream '{}' has "
-                                  "invalid max_retries={} (must be 0-10)",
-                                  upstream.name,
-                                  upstream.proxy.retry.max_retries);
-            continue;
+            throw std::invalid_argument(
+                "RegisterProxyRoutes: upstream '" + upstream.name +
+                "' has invalid max_retries=" +
+                std::to_string(upstream.proxy.retry.max_retries) +
+                " (must be 0-10)");
         }
         {
             static const std::unordered_set<std::string> valid_methods = {
@@ -1191,24 +1224,18 @@ void HttpServer::RegisterProxyRoutes() {
                 "OPTIONS", "TRACE"
             };
             std::unordered_set<std::string> seen;
-            bool invalid = false;
             for (const auto& m : upstream.proxy.methods) {
                 if (valid_methods.find(m) == valid_methods.end()) {
-                    logging::Get()->error("RegisterProxyRoutes: upstream '{}' "
-                                          "has invalid method '{}'",
-                                          upstream.name, m);
-                    invalid = true;
-                    break;
+                    throw std::invalid_argument(
+                        "RegisterProxyRoutes: upstream '" + upstream.name +
+                        "' has invalid method '" + m + "'");
                 }
                 if (!seen.insert(m).second) {
-                    logging::Get()->error("RegisterProxyRoutes: upstream '{}' "
-                                          "has duplicate method '{}'",
-                                          upstream.name, m);
-                    invalid = true;
-                    break;
+                    throw std::invalid_argument(
+                        "RegisterProxyRoutes: upstream '" + upstream.name +
+                        "' has duplicate method '" + m + "'");
                 }
             }
-            if (invalid) continue;
         }
 
         // Check if the route_prefix already has a catch-all segment.

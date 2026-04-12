@@ -1249,6 +1249,65 @@ void TestProxyConfigNegativeTimeout() {
     }
 }
 
+// HttpServer::Proxy() must throw std::invalid_argument on bad inputs
+// instead of logging and silently dropping the route — otherwise an
+// embedder who mistypes a route pattern starts the server with the
+// expected route missing and only finds out when real traffic hits.
+// Covers: empty route_pattern, malformed route_pattern (duplicate
+// params), unknown upstream name, and unknown method in
+// upstream.proxy.methods.
+void TestProxyApiInvalidInputsThrow() {
+    std::cout << "\n[TEST] HttpServer::Proxy throws on invalid inputs..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_port = 0;
+        UpstreamConfig u;
+        u.name = "svc";
+        u.host = "127.0.0.1";
+        u.port = 9000;
+        // No proxy.route_prefix — this is a "programmatic Proxy() only"
+        // upstream that ConfigLoader::Validate accepts as-is.
+        cfg.upstreams.push_back(u);
+
+        HttpServer server(cfg);
+
+        bool empty_pattern_threw = false;
+        try {
+            server.Proxy("", "svc");
+        } catch (const std::invalid_argument&) {
+            empty_pattern_threw = true;
+        }
+
+        bool bad_pattern_threw = false;
+        try {
+            // Duplicate parameter names — ROUTE_TRIE::ValidatePattern
+            // rejects this.
+            server.Proxy("/api/:id/:id", "svc");
+        } catch (const std::invalid_argument&) {
+            bad_pattern_threw = true;
+        }
+
+        bool unknown_upstream_threw = false;
+        try {
+            server.Proxy("/api/*rest", "does-not-exist");
+        } catch (const std::invalid_argument&) {
+            unknown_upstream_threw = true;
+        }
+
+        bool pass = empty_pattern_threw && bad_pattern_threw &&
+                    unknown_upstream_threw;
+        std::string err;
+        if (!empty_pattern_threw) err += "empty pattern did not throw; ";
+        if (!bad_pattern_threw)   err += "malformed pattern did not throw; ";
+        if (!unknown_upstream_threw) err += "unknown upstream did not throw; ";
+        TestFramework::RecordTest("HttpServer::Proxy throws on invalid inputs",
+                                   pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("HttpServer::Proxy throws on invalid inputs",
+                                   false, e.what());
+    }
+}
+
 // Serialization round-trip: ToJson -> LoadFromString must produce equal config.
 void TestProxyConfigRoundTrip() {
     std::cout << "\n[TEST] ProxyConfig: JSON round-trip preserves all fields..." << std::endl;
@@ -1807,6 +1866,7 @@ void RunAllTests() {
     TestProxyConfigMaxRetriesExcessive();
     TestProxyConfigNegativeTimeout();
     TestProxyConfigRoundTrip();
+    TestProxyApiInvalidInputsThrow();
 
     // Sections 6-11: Integration tests
     TestIntegrationGetProxied();
