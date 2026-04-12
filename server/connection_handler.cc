@@ -263,6 +263,7 @@ void ConnectionHandler::OnMessage(){
     bool alpn_h2_ready = tls_just_ready && input_bf_.Size() == 0 && tls_ &&
                          (GetAlpnProtocol() == "h2" ||
                           connect_state_ == ConnectState::CONNECTED);
+    bool callback_ran = false;
     if((input_bf_.Size() > 0 || alpn_h2_ready) && callbacks_.on_message_callback){
         std::string message(input_bf_.Data(), input_bf_.Size());
         callbacks_.on_message_callback(shared_from_this(), message);
@@ -270,40 +271,51 @@ void ConnectionHandler::OnMessage(){
         ts_ = TimeStamp::Now();
         // Clear the input buffer after processing
         input_bf_.Clear();
+        callback_ran = true;
     }
 
     // If peer sent EOF and connection isn't already closing (the sync fast-path
     // in DoSendRaw/DoSend may have already ForceClose'd), handle the close.
+    //
+    // HTTP/1 clients are allowed to half-close the write side
+    // (shutdown(SHUT_WR) after sending the request) while waiting for
+    // the response. When that happens we see peer_closed=true with an
+    // empty output buffer (the async handler has not written anything
+    // yet), and force-closing the socket here would cancel the
+    // in-flight request before the handler can reply. We must instead
+    // let the handler run to completion; the existing deferred
+    // heartbeat and its absolute safety cap (cap_sec) bound the wait,
+    // and any actual write failure (client read-shutdown or
+    // full-disconnect) already funnels through the send-side fast-path
+    // which sets close_after_write_ / calls ForceClose on EPIPE.
     if (peer_closed && !is_closing_.load(std::memory_order_acquire)) {
         if (output_bf_.Size() > 0) {
             // Data still being flushed — enable write mode to drain it.
             // CallWriteCb will ForceClose when the buffer empties.
             client_channel_->EnableWriteMode();
+        } else if (callback_ran) {
+            // Callback ran but buffer is empty and connection not
+            // closed. Possible cases:
+            //   - Sync handler sent response, fast-path ForceClose'd
+            //     → is_closing_ == true (caught by outer guard).
+            //   - Async handler will send response later via
+            //     SendData/SendRaw; the send fast-path will see
+            //     close_after_write_ and ForceClose when it runs.
+            //   - Client is half-closed waiting for the response;
+            //     the deferred heartbeat already armed a deadline
+            //     that will either fire cap_sec or re-arm until the
+            //     handler completes.
+            // Arm a modest fallback deadline when nothing else has —
+            // guarantees the timer callback eventually runs so the
+            // connection can be torn down if the handler hangs,
+            // without closing a valid in-flight request up front.
+            if (!has_deadline_) {
+                SetDeadline(std::chrono::steady_clock::now() +
+                            std::chrono::seconds(5));
+            }
         } else {
-            // Peer EOF and output buffer is empty: the client is gone
-            // and there is nothing queued for them. ForceClose now so
-            // the close callback runs immediately — that drives
-            // HttpServer::RemoveConnection → TripAsyncAbortHook, which
-            // fires the per-request cancel (cancels in-flight proxy
-            // transactions, releases the pool lease, flips the
-            // completion bookkeeping).
-            //
-            // Previously this branch waited on a 5s fallback deadline
-            // (when none existed) or on the existing deadline (set by
-            // the deferred-response heartbeat, up to ~60s). For async
-            // routes that means the proxy kept running against a
-            // disconnected client and kept a pool slot occupied until
-            // the deadline fired. Under disconnect bursts that
-            // compounds into tens of seconds of wasted upstream work
-            // and delayed pool recycling. Closing immediately trims
-            // that latency to the event-loop wakeup.
-            //
-            // Safety: the abort hook mechanism is specifically designed
-            // to handle this race. ProxyTransaction::Cancel is
-            // idempotent and marks complete_cb_invoked_ so any late
-            // DeliverResponse becomes a no-op; SendRaw from a stored
-            // completion callback after ForceClose is also a no-op
-            // (fast-paths short-circuit on is_closing_).
+            // No callback ran (EOF without any input this cycle and
+            // no handler in-flight) — nothing to wait for.
             ForceClose();
         }
     }

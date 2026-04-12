@@ -1038,6 +1038,24 @@ void HttpServer::Proxy(const std::string& route_pattern,
         }
     }
 
+    // Build a per-pattern "has GET" set so HEAD pairing is computed
+    // per-pattern, not per-registration. The per-(method,pattern)
+    // async conflict filter can drop GET on the companion pattern
+    // (because an earlier async GET on the same pattern exists) while
+    // keeping GET on the catch-all, so the global `proxy_has_get` flag
+    // is TRUE overall but NOT for the skipped pattern. Marking every
+    // surviving HEAD pattern as paired=proxy_has_get would
+    // incorrectly keep the proxy HEAD on the companion even though
+    // the real GET owner is the user's earlier async route.
+    std::unordered_set<std::string> patterns_with_get;
+    for (const auto& mr : to_register) {
+        if (mr.method == "GET") {
+            for (const auto& pattern : mr.patterns) {
+                patterns_with_get.insert(pattern);
+            }
+        }
+    }
+
     // Perform the actual registration per-method per-pattern. Any
     // exception here is unexpected (e.g., std::bad_alloc) and is
     // propagated; the common "duplicate/conflicting pattern" case was
@@ -1070,13 +1088,18 @@ void HttpServer::Proxy(const std::string& route_pattern,
             router_.DisableHeadFallback(pattern);
         }
         if (head_from_defaults) {
-            // `proxy_has_get` is the post-filter flag — it is true iff
-            // the SAME proxy registration that installed this default
-            // HEAD also registered GET. The HEAD precedence logic uses
-            // this to keep the proxy HEAD only when the SAME registration
-            // owns both sides, so an earlier proxy's GET on the same
-            // pattern doesn't get credit for this proxy's HEAD.
-            router_.MarkProxyDefaultHead(pattern, proxy_has_get);
+            // paired_with_get is PER-PATTERN: true iff the SAME proxy
+            // registration also installed GET on THIS pattern. The
+            // per-method conflict filter may have kept GET on some
+            // patterns (catch-all) while dropping it on others
+            // (companion conflicting with a pre-existing user route),
+            // so using a global flag would incorrectly mark the
+            // companion's HEAD as paired. The HEAD precedence logic
+            // then routes HEAD through the real GET owner instead of
+            // sticking on this proxy.
+            bool pattern_paired_with_get =
+                patterns_with_get.count(pattern) > 0;
+            router_.MarkProxyDefaultHead(pattern, pattern_paired_with_get);
         }
         logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                              pattern, upstream_service_name,
@@ -1431,6 +1454,19 @@ void HttpServer::RegisterProxyRoutes() {
             }
         }
 
+        // Build per-pattern "has GET" set. See HttpServer::Proxy for
+        // the full rationale — the per-method conflict filter can
+        // drop GET on some patterns while keeping it on others, so a
+        // global proxy_has_get flag misattributes pairing.
+        std::unordered_set<std::string> patterns_with_get;
+        for (const auto& mr : to_register) {
+            if (mr.method == "GET") {
+                for (const auto& pattern : mr.patterns) {
+                    patterns_with_get.insert(pattern);
+                }
+            }
+        }
+
         // Perform the actual registration per-method per-pattern. The
         // companion marker is set PER (method, pattern) here so an
         // unrelated async route registered later on the same pattern
@@ -1455,12 +1491,14 @@ void HttpServer::RegisterProxyRoutes() {
                 router_.DisableHeadFallback(pattern);
             }
             if (head_from_defaults) {
-                // paired_with_get == proxy_has_get — true iff the SAME
-                // proxy registration also installed GET on this pattern.
-                // When false the HEAD precedence yields to the async
-                // HEAD→GET fallback so HEAD follows the real GET owner
-                // instead of sticking on a proxy that only has HEAD.
-                router_.MarkProxyDefaultHead(pattern, proxy_has_get);
+                // paired_with_get is PER-PATTERN — true iff the SAME
+                // proxy registration also installed GET on THIS exact
+                // pattern. See HttpServer::Proxy for the rationale;
+                // same bug exists here if we used a registration-wide
+                // proxy_has_get flag.
+                bool pattern_paired_with_get =
+                    patterns_with_get.count(pattern) > 0;
+                router_.MarkProxyDefaultHead(pattern, pattern_paired_with_get);
             }
             logging::Get()->info("Proxy route registered: {} -> {} ({}:{})",
                                  pattern, upstream.name,
