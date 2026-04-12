@@ -13,6 +13,7 @@
 // Forward declarations
 class UpstreamManager;
 class ConnectionHandler;
+class Dispatcher;
 
 class ProxyTransaction : public std::enable_shared_from_this<ProxyTransaction> {
 public:
@@ -118,6 +119,7 @@ private:
 
     // Dependencies
     UpstreamManager* upstream_manager_;   // non-owning, outlives the transaction
+    Dispatcher* dispatcher_;              // non-owning, outlives the transaction (for EnQueueDelayed)
     ProxyConfig config_;                  // stored by value — decoupled from ProxyHandler lifetime
     HeaderRewriter header_rewriter_;      // stored by value — small (4 bools config)
     RetryPolicy retry_policy_;            // stored by value — small (1 int + 5 bools config)

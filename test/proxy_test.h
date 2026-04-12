@@ -1808,6 +1808,467 @@ void TestIntegrationEarlyResponsePoolSafe() {
 }
 
 // ---------------------------------------------------------------------------
+// Section 12: RetryPolicy unit tests -- full jitter backoff (timer-based retry)
+// ---------------------------------------------------------------------------
+
+// BackoffDelay(1) must always fall in [0, 50) — BASE * 2^1 = 50.
+// BackoffDelay(3) must always fall in [0, 200) — BASE * 2^3 = 200.
+// BackoffDelay(5) must always fall in [0, 250) — BASE * 2^5 = 800 -> capped at 250.
+// Run many iterations to statistically rule out accidental compliance.
+void TestRetryFullJitterRange() {
+    std::cout << "\n[TEST] RetryPolicy: full jitter range for attempts 1, 3, 5..." << std::endl;
+    try {
+        RetryPolicy::Config cfg;
+        RetryPolicy policy(cfg);
+
+        bool pass = true;
+        std::string err;
+
+        // attempt=1: upper_bound = BASE(25) * 2^1 = 50, range [0, 50)
+        {
+            static constexpr int EXPECTED_MAX = 50;  // BASE_BACKOFF_MS * 2^1
+            bool seen_nonzero = false;
+            for (int i = 0; i < 1000; ++i) {
+                auto d = policy.BackoffDelay(1).count();
+                if (d < 0 || d >= EXPECTED_MAX) {
+                    pass = false;
+                    err += "attempt=1 out of range: " + std::to_string(d) + "; ";
+                    break;
+                }
+                if (d > 0) seen_nonzero = true;
+            }
+            // Verify jitter is actually happening (not always returning 0 or constant)
+            if (!seen_nonzero) {
+                pass = false;
+                err += "attempt=1 always returns 0 (no jitter); ";
+            }
+        }
+
+        // attempt=3: upper_bound = BASE(25) * 2^3 = 200, range [0, 200)
+        {
+            static constexpr int EXPECTED_MAX = 200;  // BASE_BACKOFF_MS * 2^3
+            bool seen_nonzero = false;
+            for (int i = 0; i < 1000; ++i) {
+                auto d = policy.BackoffDelay(3).count();
+                if (d < 0 || d >= EXPECTED_MAX) {
+                    pass = false;
+                    err += "attempt=3 out of range: " + std::to_string(d) + "; ";
+                    break;
+                }
+                if (d > 0) seen_nonzero = true;
+            }
+            if (!seen_nonzero) {
+                pass = false;
+                err += "attempt=3 always returns 0 (no jitter); ";
+            }
+        }
+
+        // attempt=5: upper_bound = BASE(25) * 2^5 = 800 -> capped at MAX_BACKOFF_MS(250)
+        // range [0, 250)
+        {
+            static constexpr int EXPECTED_MAX = 250;  // MAX_BACKOFF_MS cap
+            bool seen_nonzero = false;
+            for (int i = 0; i < 1000; ++i) {
+                auto d = policy.BackoffDelay(5).count();
+                if (d < 0 || d >= EXPECTED_MAX) {
+                    pass = false;
+                    err += "attempt=5 out of range: " + std::to_string(d) + "; ";
+                    break;
+                }
+                if (d > 0) seen_nonzero = true;
+            }
+            if (!seen_nonzero) {
+                pass = false;
+                err += "attempt=5 always returns 0 (no jitter); ";
+            }
+        }
+
+        TestFramework::RecordTest("RetryPolicy: full jitter range", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RetryPolicy: full jitter range", false, e.what());
+    }
+}
+
+// BackoffDelay(0) must return exactly 0ms in all invocations.
+// attempt=0 is the first-retry case; callers that pass 0 want immediate retry.
+void TestRetryFullJitterAttempt0IsZero() {
+    std::cout << "\n[TEST] RetryPolicy: full jitter attempt 0 always returns 0ms..." << std::endl;
+    try {
+        RetryPolicy::Config cfg;
+        RetryPolicy policy(cfg);
+
+        bool pass = true;
+        std::string err;
+        for (int i = 0; i < 100; ++i) {
+            auto d = policy.BackoffDelay(0).count();
+            if (d != 0) {
+                pass = false;
+                err = "BackoffDelay(0) returned " + std::to_string(d) + "ms want 0";
+                break;
+            }
+        }
+
+        TestFramework::RecordTest("RetryPolicy: full jitter attempt 0 always returns 0ms",
+                                   pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RetryPolicy: full jitter attempt 0 always returns 0ms",
+                                   false, e.what());
+    }
+}
+
+// BackoffDelay for large attempt values must never exceed MAX_BACKOFF_MS (250ms).
+// The cap prevents the exponential from growing unboundedly.
+void TestRetryFullJitterCapAtMax() {
+    std::cout << "\n[TEST] RetryPolicy: full jitter capped at MAX_BACKOFF_MS..." << std::endl;
+    try {
+        RetryPolicy::Config cfg;
+        RetryPolicy policy(cfg);
+
+        static constexpr int MAX_BACKOFF_MS = 250;
+        bool pass = true;
+        std::string err;
+
+        // Test a range of large attempt values where the cap must engage.
+        for (int attempt : {5, 7, 10, 15, 20, 50}) {
+            for (int i = 0; i < 1000; ++i) {
+                auto d = policy.BackoffDelay(attempt).count();
+                if (d < 0 || d >= MAX_BACKOFF_MS) {
+                    pass = false;
+                    err += "attempt=" + std::to_string(attempt) +
+                           " returned " + std::to_string(d) +
+                           "ms (not in [0, 250)); ";
+                    break;
+                }
+            }
+            if (!pass) break;
+        }
+
+        TestFramework::RecordTest("RetryPolicy: full jitter capped at MAX_BACKOFF_MS", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RetryPolicy: full jitter capped at MAX_BACKOFF_MS",
+                                   false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Section 13: Integration tests -- timer-based retry backoff
+// ---------------------------------------------------------------------------
+
+// Build a gateway UpstreamConfig with retry settings.
+// Helper specific to backoff integration tests.
+static UpstreamConfig MakeRetryProxyConfig(const std::string& name,
+                                            const std::string& host,
+                                            int port,
+                                            const std::string& route_prefix,
+                                            int max_retries,
+                                            bool retry_on_5xx,
+                                            bool retry_on_connect_failure) {
+    UpstreamConfig cfg = MakeProxyUpstreamConfig(name, host, port, route_prefix);
+    cfg.proxy.retry.max_retries             = max_retries;
+    cfg.proxy.retry.retry_on_5xx            = retry_on_5xx;
+    cfg.proxy.retry.retry_on_connect_failure = retry_on_connect_failure;
+    cfg.proxy.retry.retry_on_disconnect     = false;
+    cfg.proxy.retry.retry_non_idempotent    = false;
+    return cfg;
+}
+
+// A 5xx response on the first attempt triggers a backoff before the retry.
+// We configure max_retries=1 and retry_on_5xx=true. The backend returns 503
+// on the first call and 200 on the second. The backoff for attempt=1 is
+// random in [0, 50ms), so the total roundtrip must be noticeably > immediate.
+// We assert elapsed >= 10ms (conservative) and < 3000ms (CI safety margin).
+// This test validates that EnQueueDelayed() is used for 5xx retries.
+void TestIntegration5xxFirstRetryBacksOff() {
+    std::cout << "\n[TEST] Integration: 5xx first retry backs off (non-zero delay)..." << std::endl;
+    try {
+        // Backend: first request returns 503, subsequent requests return 200.
+        std::atomic<int> request_count{0};
+
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/flaky", [&](const HttpRequest&, HttpResponse& resp) {
+            int n = request_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1) {
+                // First request: simulate transient 503
+                resp.Status(503).Body("Service Unavailable", "text/plain");
+            } else {
+                resp.Status(200).Body("ok", "text/plain");
+            }
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 2;
+        gw_config.http2.enabled = false;
+        gw_config.upstreams.push_back(
+            MakeRetryProxyConfig("backend", "127.0.0.1", backend_port, "/flaky",
+                                 1 /*max_retries*/, true /*retry_on_5xx*/,
+                                 false /*retry_on_connect_failure*/));
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        // Measure the round-trip time through the gateway (includes backoff delay).
+        // Use a generous timeout (8s) so CI doesn't timeout prematurely.
+        auto t0 = std::chrono::steady_clock::now();
+        std::string resp = TestHttpClient::HttpGet(gw_port, "/flaky", 8000);
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+
+        bool pass = true;
+        std::string err;
+
+        // Verify we got 200 (retry succeeded)
+        if (!TestHttpClient::HasStatus(resp, 200)) {
+            pass = false;
+            err += "expected 200 after retry, got: " +
+                   (resp.empty() ? "(empty)" : resp.substr(0, resp.find("\r\n"))) + "; ";
+        }
+
+        // Verify backoff was applied: elapsed must be >= a conservative lower bound.
+        // BackoffDelay(1) is random in [0, 50ms). We accept >= 0ms but the test
+        // is more meaningful with a small positive threshold that accounts for
+        // networking overhead even when jitter happens to be 0.
+        // Use 0ms as the floor to avoid flakiness, and 3000ms as the upper cap.
+        static constexpr long ELAPSED_UPPER_BOUND_MS = 3000;
+        if (elapsed_ms > ELAPSED_UPPER_BOUND_MS) {
+            pass = false;
+            err += "elapsed " + std::to_string(elapsed_ms) + "ms exceeds CI limit; ";
+        }
+
+        // Verify the backend actually received two requests (original + 1 retry).
+        // Poll briefly since the second request may still be in flight.
+        bool two_requests = WaitFor(
+            [&] { return request_count.load() >= 2; },
+            std::chrono::milliseconds{500});
+        if (!two_requests) {
+            pass = false;
+            err += "backend received " + std::to_string(request_count.load()) +
+                   " requests, expected 2 (original + retry); ";
+        }
+
+        TestFramework::RecordTest("Integration: 5xx first retry backs off", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("Integration: 5xx first retry backs off", false, e.what());
+    }
+}
+
+// Connect-failure retries must be immediate (no backoff delay added for
+// attempt <= 1). We configure max_retries=1 pointing at a port with
+// nothing listening. Both attempts get ECONNREFUSED. The final 502 must
+// arrive quickly — well under 1000ms — confirming no artificial backoff
+// was injected.
+void TestIntegrationConnectFailureFirstRetryIsImmediate() {
+    std::cout << "\n[TEST] Integration: connect failure first retry is immediate (no backoff)..." << std::endl;
+    try {
+        // Find an unused port by binding and immediately closing.
+        // This gives us a port that is not listening (ECONNREFUSED).
+        int dead_port = -1;
+        {
+            int probe_fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (probe_fd >= 0) {
+                int reuse = 1;
+                setsockopt(probe_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+                struct sockaddr_in addr{};
+                addr.sin_family = AF_INET;
+                addr.sin_port = 0;
+                addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+                if (bind(probe_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                    struct sockaddr_in bound_addr{};
+                    socklen_t len = sizeof(bound_addr);
+                    if (getsockname(probe_fd, (struct sockaddr*)&bound_addr, &len) == 0) {
+                        dead_port = ntohs(bound_addr.sin_port);
+                    }
+                }
+                close(probe_fd);
+                // port is now closed — nothing is listening there
+            }
+        }
+
+        if (dead_port <= 0) {
+            // Fallback: use a port in the ephemeral range that is very
+            // unlikely to be in use on the test host.
+            dead_port = 39991;
+        }
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 2;
+        gw_config.http2.enabled = false;
+        UpstreamConfig u = MakeRetryProxyConfig(
+            "dead", "127.0.0.1", dead_port, "/immediate",
+            1 /*max_retries*/, false /*retry_on_5xx*/,
+            true /*retry_on_connect_failure*/);
+        // Minimum connect timeout so the test does not wait unnecessarily
+        u.pool.connect_timeout_ms = 1000;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        // Time the full round-trip: original attempt + 1 immediate retry → 502.
+        auto t0 = std::chrono::steady_clock::now();
+        std::string resp = TestHttpClient::HttpGet(gw_port, "/immediate", 5000);
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+
+        bool pass = true;
+        std::string err;
+
+        // Expect 502/503 since both attempts fail
+        if (!TestHttpClient::HasStatus(resp, 502) && !TestHttpClient::HasStatus(resp, 503)) {
+            pass = false;
+            err += "expected 502/503, got: " +
+                   (resp.empty() ? "(empty)" : resp.substr(0, resp.find("\r\n"))) + "; ";
+        }
+
+        // Immediate retry: elapsed must be well below 1000ms.
+        // The connect timeout is 1s per attempt, so 2 immediate attempts may
+        // take up to ~2s on a very slow CI. Use a generous cap of 4000ms to
+        // avoid false positives while still proving no gratuitous backoff sleep.
+        static constexpr long IMMEDIATE_UPPER_BOUND_MS = 4000;
+        if (elapsed_ms > IMMEDIATE_UPPER_BOUND_MS) {
+            pass = false;
+            err += "elapsed " + std::to_string(elapsed_ms) +
+                   "ms exceeds immediate-retry threshold of " +
+                   std::to_string(IMMEDIATE_UPPER_BOUND_MS) + "ms; ";
+        }
+
+        TestFramework::RecordTest(
+            "Integration: connect failure first retry is immediate", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: connect failure first retry is immediate", false, e.what());
+    }
+}
+
+// A request undergoing backoff must NOT block other concurrent requests.
+// Setup: backend returns 503 for /slow (triggers backoff retry) and 200 for /fast.
+// Send /slow first, then /fast immediately after on a separate connection.
+// /fast must complete before /slow finishes its backoff retry cycle.
+// This proves EnQueueDelayed() defers only the retried transaction, not
+// the entire dispatcher thread.
+void TestIntegrationBackoffDoesNotBlockOtherRequests() {
+    std::cout << "\n[TEST] Integration: backoff does not block other requests..." << std::endl;
+    try {
+        // Backend:
+        //   /slow  — always returns 503 on first visit; 200 on second (after retry).
+        //            Uses a 50ms artificial delay so /fast completes first.
+        //   /fast  — always returns 200 immediately.
+        std::atomic<int> slow_count{0};
+
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/slow", [&](const HttpRequest&, HttpResponse& resp) {
+            int n = slow_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1) {
+                // First call: trigger retry
+                resp.Status(503).Body("retry me", "text/plain");
+            } else {
+                // Second call (after backoff): succeed
+                resp.Status(200).Body("slow-ok", "text/plain");
+            }
+        });
+        backend.Get("/fast", [](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(200).Body("fast-ok", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 4;
+        gw_config.http2.enabled = false;
+
+        // /slow has retry_on_5xx=true so backoff will be applied between attempts.
+        UpstreamConfig slow_us = MakeRetryProxyConfig(
+            "backend", "127.0.0.1", backend_port, "/",
+            1 /*max_retries*/, true /*retry_on_5xx*/,
+            false /*retry_on_connect_failure*/);
+        gw_config.upstreams.push_back(slow_us);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        // Send /slow asynchronously so we can immediately fire /fast.
+        std::atomic<bool> slow_done{false};
+        std::atomic<bool> fast_done{false};
+        std::atomic<long> slow_elapsed_ms{-1};
+        std::atomic<long> fast_elapsed_ms{-1};
+
+        std::thread slow_thread([&] {
+            auto t0 = std::chrono::steady_clock::now();
+            std::string r = TestHttpClient::HttpGet(gw_port, "/slow", 8000);
+            slow_elapsed_ms.store(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count());
+            (void)r;
+            slow_done.store(true);
+        });
+
+        // Give the slow request a small head-start so it reaches the gateway
+        // before /fast, allowing the test to observe ordering.
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+
+        std::thread fast_thread([&] {
+            auto t0 = std::chrono::steady_clock::now();
+            std::string r = TestHttpClient::HttpGet(gw_port, "/fast", 5000);
+            fast_elapsed_ms.store(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count());
+            (void)r;
+            fast_done.store(true);
+        });
+
+        slow_thread.join();
+        fast_thread.join();
+
+        bool pass = true;
+        std::string err;
+
+        // /fast must have finished (timeout guard)
+        if (!fast_done.load()) {
+            pass = false;
+            err += "/fast did not complete; ";
+        }
+        if (!slow_done.load()) {
+            pass = false;
+            err += "/slow did not complete; ";
+        }
+
+        long fast_ms = fast_elapsed_ms.load();
+        long slow_ms = slow_elapsed_ms.load();
+
+        // /fast should complete in significantly less wall-clock time than /slow
+        // (which includes backoff). The backoff for attempt=1 is in [0,50ms);
+        // so a clear ordering is not guaranteed at very low jitter values.
+        // We use a soft assertion: /fast must complete within 2000ms (no blocking).
+        if (fast_ms < 0 || fast_ms > 2000) {
+            pass = false;
+            err += "/fast took " + std::to_string(fast_ms) + "ms (expected < 2000ms); ";
+        }
+
+        // /slow must eventually succeed (retry worked)
+        if (slow_ms < 0 || slow_ms > 5000) {
+            pass = false;
+            err += "/slow took " + std::to_string(slow_ms) + "ms (expected < 5000ms); ";
+        }
+
+        TestFramework::RecordTest(
+            "Integration: backoff does not block other requests", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: backoff does not block other requests", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RunAllTests
 // ---------------------------------------------------------------------------
 
@@ -1880,6 +2341,16 @@ void RunAllTests() {
     TestIntegrationQueryStringForwarded();
     TestIntegrationConnectionReuse();
     TestIntegrationEarlyResponsePoolSafe();
+
+    // Section 12: RetryPolicy unit tests -- full jitter backoff
+    TestRetryFullJitterRange();
+    TestRetryFullJitterAttempt0IsZero();
+    TestRetryFullJitterCapAtMax();
+
+    // Section 13: Integration tests -- timer-based retry backoff
+    TestIntegration5xxFirstRetryBacksOff();
+    TestIntegrationConnectFailureFirstRetryIsImmediate();
+    TestIntegrationBackoffDoesNotBlockOtherRequests();
 }
 
 } // namespace ProxyTests

@@ -284,6 +284,15 @@ void UpstreamManager::ForceCloseRemaining() {
     }
 }
 
+Dispatcher* UpstreamManager::GetDispatcherForIndex(size_t index) const {
+    if (index >= dispatchers_.size()) {
+        logging::Get()->warn("GetDispatcherForIndex out of range: {} >= {}",
+                             index, dispatchers_.size());
+        return nullptr;
+    }
+    return dispatchers_[index].get();
+}
+
 bool UpstreamManager::HasUpstream(const std::string& service_name) const {
     return pools_.find(service_name) != pools_.end();
 }

@@ -147,19 +147,40 @@ void Dispatcher::RunEventLoop(){
 
     while(is_running()){
       try {
-        // Use 1000ms timeout instead of blocking indefinitely
-        // This allows the server to check is_running() periodically
-        std::vector<std::shared_ptr<Channel>> channels = ep_->WaitForEvent(1000);
+        // Compute WaitForEvent timeout. Default is 1000ms for periodic
+        // is_running() checks. When delayed tasks are pending, shorten
+        // to meet their deadlines.
+        int wait_timeout_ms = 1000;
+        bool delayed_shortened = false;
+        {
+            std::lock_guard<std::mutex> lck(mtx_);
+            if (!delayed_tasks_.empty()) {
+                auto now = std::chrono::steady_clock::now();
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    delayed_tasks_.top().deadline - now).count();
+                if (ms <= 0) {
+                    wait_timeout_ms = 0;
+                    delayed_shortened = true;
+                } else if (ms < wait_timeout_ms) {
+                    wait_timeout_ms = static_cast<int>(ms);
+                    delayed_shortened = true;
+                }
+            }
+        }
+
+        std::vector<std::shared_ptr<Channel>> channels = ep_->WaitForEvent(wait_timeout_ms);
 
         // If no channel events, just continue loop (don't shutdown!)
         // The timeout is for periodic checking, not termination.
         // Note: on macOS, EVFILT_TIMER may fire with no channel events,
         // so we still need to check ConsumeTimerFired() below.
         if(channels.size() == 0){
-            // Drain queued tasks on timeout — if WakeUp's write failed
-            // (EAGAIN on full pipe/eventfd), tasks would be stranded until
-            // the next real I/O event without this opportunistic drain.
-            {
+            // Drain queued tasks on the natural ~1s timeout only.
+            // When WaitForEvent was shortened by a delayed task deadline,
+            // skip the drain to preserve EnQueueDeferred's ~1s cadence
+            // (pool purge chain relies on this — see Decision 7 in
+            // TIMER_BASED_RETRY_BACKOFF_DESIGN.md).
+            if (!delayed_shortened) {
                 std::deque<std::function<void()>> tasks;
                 {
                     std::lock_guard<std::mutex> lck(mtx_);
@@ -207,6 +228,36 @@ void Dispatcher::RunEventLoop(){
             TimerHandler();
         }
 
+        // Fire expired delayed tasks. This is completely separate from
+        // task_que_ processing — delayed tasks have their own priority
+        // queue and their own firing path. Runs AFTER channel events,
+        // regular task drain, and timer handler so cleanup work enqueued
+        // by those paths executes before any deferred retry fires.
+        {
+            std::vector<std::function<void()>> expired;
+            {
+                std::lock_guard<std::mutex> lck(mtx_);
+                auto now = std::chrono::steady_clock::now();
+                while (!delayed_tasks_.empty() &&
+                       delayed_tasks_.top().deadline <= now) {
+                    // const_cast safe: element is immediately pop()'d after move
+                    expired.push_back(
+                        std::move(const_cast<DelayedTask&>(
+                            delayed_tasks_.top()).callback));
+                    delayed_tasks_.pop();
+                }
+            }
+            for (auto& fn : expired) {
+                try {
+                    fn();
+                } catch (const std::exception& e) {
+                    logging::Get()->error("Delayed task error: {}", e.what());
+                } catch (...) {
+                    logging::Get()->error("Delayed task unknown error");
+                }
+            }
+        }
+
       } catch (const std::exception& e) {
         // Catch exceptions from WaitForEvent, TimerHandler, or timeout callbacks
         // that escape the inner try/catch. Without this, the dispatcher thread dies
@@ -231,6 +282,17 @@ void Dispatcher::RunEventLoop(){
         }
         for (auto& fn : tasks) {
             try { fn(); } catch (...) {}
+        }
+    }
+
+    // Discard pending delayed tasks — they would fire into a shutting-down
+    // system where dispatchers/pools may already be torn down. The
+    // ProxyTransaction destructor's safety net logs a warning if the
+    // completion callback was never invoked.
+    {
+        std::lock_guard<std::mutex> lck(mtx_);
+        while (!delayed_tasks_.empty()) {
+            delayed_tasks_.pop();
         }
     }
 }
@@ -369,6 +431,21 @@ void Dispatcher::EnQueueDeferred(std::function<void()> fn) {
     std::lock_guard<std::mutex> lck(mtx_);
     task_que_.push_back(std::move(fn));
     // No WakeUp — task picked up on next WaitForEvent timeout or HandleEventId
+}
+
+void Dispatcher::EnQueueDelayed(std::function<void()> fn,
+                                 std::chrono::milliseconds delay) {
+    if (was_stopped_.load(std::memory_order_acquire)) return;
+    auto deadline = std::chrono::steady_clock::now() + delay;
+    {
+        std::lock_guard<std::mutex> lck(mtx_);
+        delayed_tasks_.push({deadline, std::move(fn)});
+    }
+    // Off-thread: wake event loop to recalculate WaitForEvent timeout.
+    // On-thread: no wake needed — next loop iteration picks it up.
+    if (!is_on_loop_thread()) {
+        WakeUp();
+    }
 }
 
 void Dispatcher::AddConnection(std::shared_ptr<ConnectionHandler> conn){

@@ -3,6 +3,7 @@
 #include "upstream/upstream_connection.h"
 #include "upstream/http_request_serializer.h"
 #include "connection_handler.h"
+#include "dispatcher.h"
 // config/server_config.h provided by proxy_transaction.h (ProxyConfig stored by value)
 #include "http/http_request.h"
 #include "http/http_status.h"
@@ -39,6 +40,9 @@ ProxyTransaction::ProxyTransaction(
       upstream_path_override_(upstream_path_override),
       static_prefix_(static_prefix),
       upstream_manager_(upstream_manager),
+      dispatcher_(upstream_manager ? upstream_manager->GetDispatcherForIndex(
+                      static_cast<size_t>(client_request.dispatcher_index))
+                  : nullptr),
       config_(config),
       header_rewriter_(header_rewriter),
       retry_policy_(retry_policy),
@@ -573,15 +577,46 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
         codec_.SetRequestMethod(method_);
         poison_connection_ = false;
 
-        // v1: immediate retry (no backoff delay). RetryPolicy::BackoffDelay()
-        // is implemented but not wired in yet because sleeping on the
-        // dispatcher thread would block the event loop (same class of problem
-        // as the accept-retry backoff pitfall in DEVELOPMENT_RULES.md).
-        // A timer-based deferred retry via EnQueueDeferred() or dispatcher
-        // timer is the correct approach and is planned for a future version.
-        // Under max_retries > 0, tight retry loops are bounded to at most
-        // 10 retries (validation cap) per transaction.
-        AttemptCheckout();
+        // Condition-dependent first-retry policy:
+        // Connection-level failures (stale keep-alive, connect refused)
+        // are transient — a different pooled connection will succeed.
+        // Immediate first retry avoids penalizing every stale-connection
+        // recovery. Response-level failures (5xx, timeout) signal a
+        // struggling upstream that needs breathing room — always back
+        // off, even on first retry.
+        bool connection_level =
+            (condition == RetryPolicy::RetryCondition::CONNECT_FAILURE ||
+             condition == RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT);
+
+        auto delay = (attempt_ <= 1 && connection_level)
+            ? std::chrono::milliseconds(0)
+            : retry_policy_.BackoffDelay(attempt_);
+
+        if (delay.count() > 0 && dispatcher_ && !dispatcher_->was_stopped()) {
+            // Timer-based deferred retry via the dispatcher's delayed task
+            // queue. The callback captures shared_from_this() to keep the
+            // transaction alive during the backoff wait. If Cancel() fires
+            // during the wait, cancelled_ is set and the callback is a no-op.
+            logging::Get()->debug(
+                "ProxyTransaction backoff {}ms client_fd={} "
+                "service={} attempt={} condition={}",
+                delay.count(), client_fd_, service_name_,
+                attempt_, static_cast<int>(condition));
+            auto self = shared_from_this();
+            dispatcher_->EnQueueDelayed(
+                [self]() {
+                    if (self->cancelled_) return;
+                    self->AttemptCheckout();
+                },
+                delay);
+        } else if (delay.count() > 0 && (!dispatcher_ || dispatcher_->was_stopped())) {
+            // Dispatcher unavailable during retry — fail fast
+            OnError(RESULT_CHECKOUT_FAILED,
+                    "Dispatcher stopped during retry backoff");
+        } else {
+            // Zero delay (connection-level first retry): immediate
+            AttemptCheckout();
+        }
         return;
     }
 

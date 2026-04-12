@@ -66,30 +66,28 @@ std::chrono::milliseconds RetryPolicy::BackoffDelay(int attempt) const {
 
     // Thread-local random engine for jitter
     static thread_local std::mt19937 rng(std::random_device{}());
-    std::uniform_int_distribution<int> jitter_dist(0, BASE_BACKOFF_MS - 1);
 
-    // Exponential backoff: BASE_BACKOFF_MS * 2^(attempt-1) + jitter
-    int exponent = attempt - 1;
-    int base_delay = BASE_BACKOFF_MS;
-
-    // Guard against overflow. max_retries is capped at 10 (RetryPolicy::Config
-    // validation), so the maximum exponent is 9. 25 * 2^9 = 12800, well within
-    // int range. Use MAX_SAFE_SHIFT = 10 to provide headroom for any future
-    // limit increase while still preventing overflow on pathological inputs.
+    // Full jitter: random(0, min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2^attempt))
+    // Industry-standard algorithm (AWS Architecture Blog, Envoy proxy).
+    // Spreads retries uniformly across [0, upper_bound) to prevent
+    // synchronized retry waves from multiple clients.
+    int upper_bound;
     static constexpr int MAX_SAFE_SHIFT = 10;
-    if (exponent < MAX_SAFE_SHIFT) {
-        base_delay = BASE_BACKOFF_MS * (1 << exponent);
+    if (attempt < MAX_SAFE_SHIFT) {
+        upper_bound = BASE_BACKOFF_MS * (1 << attempt);
+        if (upper_bound > MAX_BACKOFF_MS) {
+            upper_bound = MAX_BACKOFF_MS;
+        }
     } else {
-        base_delay = MAX_BACKOFF_MS;
+        upper_bound = MAX_BACKOFF_MS;
     }
 
-    int jitter = jitter_dist(rng);
-    int total = base_delay + jitter;
-
-    // Cap at maximum
-    if (total > MAX_BACKOFF_MS) {
-        total = MAX_BACKOFF_MS;
+    // Defensive guard: if constants were ever changed to make upper_bound
+    // zero, dist(0, -1) would be undefined behavior.
+    if (upper_bound <= 0) {
+        return std::chrono::milliseconds(0);
     }
 
-    return std::chrono::milliseconds(total);
+    std::uniform_int_distribution<int> dist(0, upper_bound - 1);
+    return std::chrono::milliseconds(dist(rng));
 }

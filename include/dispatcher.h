@@ -1,7 +1,8 @@
 #pragma once
 #include "common.h"
 #include "event_handler.h"
-#include <deque>
+// <deque>, <queue>, <functional>, <chrono>, <mutex>, <map>, <atomic>
+// provided by common.h
 #include "callbacks.h"
 
 // Forward declarations to break circular dependency
@@ -33,6 +34,21 @@ private:
     int wakeup_pipe_[2];  // macOS uses pipe for wakeup (pipe[0]=read, pipe[1]=write)
 #endif
     std::deque<std::function<void()>> task_que_;
+
+    // Delayed task queue — min-heap ordered by deadline (earliest first).
+    // Used by EnQueueDelayed() for timer-based retry backoff and other
+    // sub-second deferred work. Separate from task_que_ to avoid
+    // accelerating EnQueueDeferred users (see Decision 7 in
+    // TIMER_BASED_RETRY_BACKOFF_DESIGN.md).
+    struct DelayedTask {
+        std::chrono::steady_clock::time_point deadline;
+        std::function<void()> callback;
+        bool operator>(const DelayedTask& other) const {
+            return deadline > other.deadline;
+        }
+    };
+    std::priority_queue<DelayedTask, std::vector<DelayedTask>,
+                        std::greater<DelayedTask>> delayed_tasks_;
 
     std::atomic<std::thread::id> thread_id_{};
 
@@ -92,6 +108,20 @@ public:
     // next natural WaitForEvent timeout (~1s) or next HandleEventId from
     // another EnQueue. Used for deferred retries that need backoff.
     void EnQueueDeferred(std::function<void()>);
+    // Schedule a task to run after `delay` milliseconds. The task runs on
+    // this dispatcher's event loop thread. Safe to call from any thread
+    // (uses mtx_ + WakeUp for off-thread). Tasks pending at shutdown are
+    // silently discarded during the final drain.
+    //
+    // LIFETIME CONTRACT (same rules as EnQueue/EnQueueDeferred):
+    //   - Capture shared_ptr or weak_ptr in callbacks, NEVER raw `this`.
+    //   - If the captured object uses an inflight-guard pattern (like
+    //     PoolPartition::MakeInflightGuard), the guard MUST be captured
+    //     so the destructor's wait-for-zero barrier works correctly.
+    //   - The callback must be self-contained — no dangling references
+    //     to stack variables or objects with shorter lifetimes.
+    void EnQueueDelayed(std::function<void()> fn,
+                        std::chrono::milliseconds delay);
     void AddConnection(std::shared_ptr<ConnectionHandler>);
     void RemoveTimerConnection(int fd);
     void RemoveTimerConnectionIfMatch(int fd, std::shared_ptr<ConnectionHandler> conn);
