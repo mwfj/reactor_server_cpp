@@ -129,7 +129,10 @@ public:
     //     so the destructor's wait-for-zero barrier works correctly.
     //   - The callback must be self-contained — no dangling references
     //     to stack variables or objects with shorter lifetimes.
-    void EnQueueDelayed(std::function<void()> fn,
+    // Returns true if the task was enqueued, false if dropped (dispatcher
+    // stopped). Callers MUST handle the false case — e.g., deliver an
+    // error response — since the callback will never fire.
+    bool EnQueueDelayed(std::function<void()> fn,
                         std::chrono::milliseconds delay);
     void AddConnection(std::shared_ptr<ConnectionHandler>);
     void RemoveTimerConnection(int fd);

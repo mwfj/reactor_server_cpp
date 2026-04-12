@@ -593,7 +593,7 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             ? std::chrono::milliseconds(0)
             : retry_policy_.BackoffDelay(attempt_);
 
-        if (delay.count() > 0 && dispatcher_ && !dispatcher_->was_stopped()) {
+        if (delay.count() > 0 && dispatcher_) {
             // Timer-based deferred retry via the dispatcher's delayed task
             // queue. The callback captures shared_from_this() to keep the
             // transaction alive during the backoff wait. If Cancel() fires
@@ -604,18 +604,22 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                 delay.count(), client_fd_, service_name_,
                 attempt_, static_cast<int>(condition));
             auto self = shared_from_this();
-            dispatcher_->EnQueueDelayed(
+            bool enqueued = dispatcher_->EnQueueDelayed(
                 [self]() {
                     if (self->cancelled_) return;
                     self->AttemptCheckout();
                 },
                 delay);
-        } else if (delay.count() > 0 && !dispatcher_) {
+            if (!enqueued) {
+                // Dispatcher stopped — task was silently dropped.
+                // Deliver an error so the transaction doesn't die
+                // without invoking complete_cb_.
+                OnError(RESULT_CHECKOUT_FAILED,
+                        "Dispatcher stopped during retry backoff");
+            }
+        } else if (delay.count() > 0) {
             OnError(RESULT_CHECKOUT_FAILED,
                     "Dispatcher unavailable for retry backoff");
-        } else if (delay.count() > 0 && dispatcher_->was_stopped()) {
-            OnError(RESULT_CHECKOUT_FAILED,
-                    "Dispatcher stopped during retry backoff");
         } else {
             // Zero delay (connection-level first retry): immediate
             logging::Get()->debug(

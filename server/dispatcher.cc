@@ -291,7 +291,13 @@ void Dispatcher::RunEventLoop(){
             tasks.swap(task_que_);
         }
         for (auto& fn : tasks) {
-            try { fn(); } catch (...) {}
+            try {
+                fn();
+            } catch (const std::exception& e) {
+                logging::Get()->error("Shutdown drain task error: {}", e.what());
+            } catch (...) {
+                logging::Get()->error("Shutdown drain task unknown error");
+            }
         }
     }
 
@@ -422,7 +428,13 @@ void Dispatcher::ProcessPendingTasks() {
         tasks.swap(task_que_);
     }
     for (auto& fn : tasks) {
-        try { fn(); } catch (...) {}
+        try {
+            fn();
+        } catch (const std::exception& e) {
+            logging::Get()->error("Pending task error: {}", e.what());
+        } catch (...) {
+            logging::Get()->error("Pending task unknown error");
+        }
     }
 }
 
@@ -443,18 +455,23 @@ void Dispatcher::EnQueueDeferred(std::function<void()> fn) {
     // No WakeUp — task picked up on next WaitForEvent timeout or HandleEventId
 }
 
-void Dispatcher::EnQueueDelayed(std::function<void()> fn,
+bool Dispatcher::EnQueueDelayed(std::function<void()> fn,
                                  std::chrono::milliseconds delay) {
-    if (was_stopped_.load(std::memory_order_acquire)) return;
+    if (was_stopped_.load(std::memory_order_acquire)) return false;
     // Zero or negative delay: use the immediate EnQueue path (avoids
     // priority queue overhead and ensures the task runs ASAP).
     if (delay.count() <= 0) {
         EnQueue(std::move(fn));
-        return;
+        return true;
     }
     auto deadline = std::chrono::steady_clock::now() + delay;
     {
         std::lock_guard<std::mutex> lck(mtx_);
+        // Re-check inside the lock to close the TOCTOU gap with
+        // StopEventLoop(). The shutdown drain also holds mtx_, so
+        // if we pass this check the task is guaranteed to either
+        // fire or be discarded by the drain (not silently lost).
+        if (was_stopped_.load(std::memory_order_acquire)) return false;
         delayed_tasks_.push({deadline, std::move(fn)});
     }
     // Off-thread: wake event loop to recalculate WaitForEvent timeout.
@@ -462,6 +479,7 @@ void Dispatcher::EnQueueDelayed(std::function<void()> fn,
     if (!is_on_loop_thread()) {
         WakeUp();
     }
+    return true;
 }
 
 void Dispatcher::AddConnection(std::shared_ptr<ConnectionHandler> conn){

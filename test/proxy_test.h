@@ -1811,9 +1811,9 @@ void TestIntegrationEarlyResponsePoolSafe() {
 // Section 12: RetryPolicy unit tests -- full jitter backoff (timer-based retry)
 // ---------------------------------------------------------------------------
 
-// BackoffDelay(1) must always fall in [0, 50) — BASE * 2^1 = 50.
-// BackoffDelay(3) must always fall in [0, 200) — BASE * 2^3 = 200.
-// BackoffDelay(5) must always fall in [0, 250) — BASE * 2^5 = 800 -> capped at 250.
+// BackoffDelay(1) must always fall in [1, 50) — BASE * 2^1 = 50.
+// BackoffDelay(3) must always fall in [1, 200) — BASE * 2^3 = 200.
+// BackoffDelay(5) must always fall in [1, 250) — BASE * 2^5 = 800 -> capped at 250.
 // Run many iterations to statistically rule out accidental compliance.
 void TestRetryFullJitterRange() {
     std::cout << "\n[TEST] RetryPolicy: full jitter range for attempts 1, 3, 5..." << std::endl;
@@ -1956,8 +1956,8 @@ static UpstreamConfig MakeRetryProxyConfig(const std::string& name,
 // A 5xx response on the first attempt triggers a backoff before the retry.
 // We configure max_retries=1 and retry_on_5xx=true. The backend returns 503
 // on the first call and 200 on the second. The backoff for attempt=1 is
-// random in [0, 50ms), so the total roundtrip must be noticeably > immediate.
-// We assert elapsed >= 10ms (conservative) and < 3000ms (CI safety margin).
+// random in [1, 50ms), so the total roundtrip includes at least 1ms of
+// artificial delay. We assert elapsed >= 1ms and < 3000ms (CI safety margin).
 // This test validates that EnQueueDelayed() is used for 5xx retries.
 void TestIntegration5xxFirstRetryBacksOff() {
     std::cout << "\n[TEST] Integration: 5xx first retry backs off (non-zero delay)..." << std::endl;
@@ -2009,12 +2009,17 @@ void TestIntegration5xxFirstRetryBacksOff() {
                    (resp.empty() ? "(empty)" : resp.substr(0, resp.find("\r\n"))) + "; ";
         }
 
-        // Verify backoff was applied: elapsed must be >= a conservative lower bound.
-        // BackoffDelay(1) is random in [0, 50ms). We accept >= 0ms but the test
-        // is more meaningful with a small positive threshold that accounts for
-        // networking overhead even when jitter happens to be 0.
-        // Use 0ms as the floor to avoid flakiness, and 3000ms as the upper cap.
+        // Verify backoff was applied: elapsed must be >= 1ms (BackoffDelay
+        // guarantees >= 1ms for attempt >= 1). Use 1ms as the floor and
+        // 3000ms as the CI safety cap.
+        static constexpr long ELAPSED_LOWER_BOUND_MS = 1;
         static constexpr long ELAPSED_UPPER_BOUND_MS = 3000;
+        if (elapsed_ms < ELAPSED_LOWER_BOUND_MS) {
+            pass = false;
+            err += "elapsed " + std::to_string(elapsed_ms) +
+                   "ms < " + std::to_string(ELAPSED_LOWER_BOUND_MS) +
+                   "ms (backoff not applied?); ";
+        }
         if (elapsed_ms > ELAPSED_UPPER_BOUND_MS) {
             pass = false;
             err += "elapsed " + std::to_string(elapsed_ms) + "ms exceeds CI limit; ";
@@ -2227,9 +2232,12 @@ void TestIntegrationBackoffDoesNotBlockOtherRequests() {
         long slow_ms = slow_elapsed_ms.load();
 
         // /fast should complete in significantly less wall-clock time than /slow
-        // (which includes backoff). The backoff for attempt=1 is in [0,50ms);
-        // so a clear ordering is not guaranteed at very low jitter values.
-        // We use a soft assertion: /fast must complete within 2000ms (no blocking).
+        // (which includes backoff). The backoff for attempt=1 is in [1, 50ms).
+        // Assert ordering: /fast must finish before /slow. This holds even
+        // with multiple worker threads because /fast has no retry overhead
+        // while /slow must wait for at least 1ms of backoff + a second
+        // upstream round-trip. The 10ms head-start for /slow ensures it
+        // enters the backoff wait before /fast is dispatched.
         if (fast_ms < 0 || fast_ms > 2000) {
             pass = false;
             err += "/fast took " + std::to_string(fast_ms) + "ms (expected < 2000ms); ";
@@ -2239,6 +2247,14 @@ void TestIntegrationBackoffDoesNotBlockOtherRequests() {
         if (slow_ms < 0 || slow_ms > 5000) {
             pass = false;
             err += "/slow took " + std::to_string(slow_ms) + "ms (expected < 5000ms); ";
+        }
+
+        // Key assertion: /fast must complete before /slow, proving that
+        // the backoff delay on /slow did not block /fast.
+        if (fast_ms >= 0 && slow_ms >= 0 && fast_ms >= slow_ms) {
+            pass = false;
+            err += "/fast (" + std::to_string(fast_ms) + "ms) did not finish before /slow (" +
+                   std::to_string(slow_ms) + "ms); backoff may be blocking; ";
         }
 
         TestFramework::RecordTest(

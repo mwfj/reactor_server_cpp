@@ -67,10 +67,11 @@ std::chrono::milliseconds RetryPolicy::BackoffDelay(int attempt) const {
     // Thread-local random engine for jitter
     static thread_local std::mt19937 rng(std::random_device{}());
 
-    // Full jitter: random(0, min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2^attempt))
-    // Industry-standard algorithm (AWS Architecture Blog, Envoy proxy).
-    // Spreads retries uniformly across [0, upper_bound) to prevent
-    // synchronized retry waves from multiple clients.
+    // Full jitter with 1ms floor: random(1, min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2^attempt))
+    // Based on the industry-standard algorithm (AWS Architecture Blog, Envoy proxy)
+    // with a guaranteed minimum of 1ms to make the "always back off" contract
+    // for response-level retries truthful. Spreads retries uniformly across
+    // [1, upper_bound) to prevent synchronized retry waves.
     int upper_bound;
     static constexpr int MAX_SAFE_SHIFT = 10;
     if (attempt < MAX_SAFE_SHIFT) {
