@@ -1,0 +1,307 @@
+#include "rate_limit/rate_limit_zone.h"
+#include "log/logger.h"
+
+// ---------------------------------------------------------------------------
+// MakeKeyExtractor — factory for key extraction lambdas
+// ---------------------------------------------------------------------------
+
+static constexpr size_t HEADER_PREFIX_LEN = 7;           // strlen("header:")
+static constexpr size_t COMPOSITE_HEADER_PREFIX_LEN = 17; // strlen("client_ip+header:")
+
+RateLimitZone::KeyExtractor MakeKeyExtractor(const std::string& key_type) {
+    if (key_type == "client_ip") {
+        return [](const HttpRequest& req) -> std::string {
+            return req.client_ip;
+        };
+    }
+    if (key_type == "path") {
+        return [](const HttpRequest& req) -> std::string {
+            return req.path;
+        };
+    }
+    if (key_type.size() > HEADER_PREFIX_LEN &&
+        key_type.substr(0, HEADER_PREFIX_LEN) == "header:") {
+        std::string header_name = key_type.substr(HEADER_PREFIX_LEN);
+        return [header_name](const HttpRequest& req) -> std::string {
+            return req.GetHeader(header_name);
+        };
+    }
+    if (key_type == "client_ip+path") {
+        return [](const HttpRequest& req) -> std::string {
+            return req.client_ip + "|" + req.path;
+        };
+    }
+    if (key_type.size() > COMPOSITE_HEADER_PREFIX_LEN &&
+        key_type.substr(0, COMPOSITE_HEADER_PREFIX_LEN) == "client_ip+header:") {
+        std::string header_name = key_type.substr(COMPOSITE_HEADER_PREFIX_LEN);
+        return [header_name](const HttpRequest& req) -> std::string {
+            std::string hval = req.GetHeader(header_name);
+            if (hval.empty()) return "";
+            return req.client_ip + "|" + hval;
+        };
+    }
+
+    // Unknown key type — log warning and return extractor that always yields empty.
+    logging::Get()->warn("Unknown rate limit key_type '{}', zone will pass all requests",
+                         key_type);
+    return [](const HttpRequest&) -> std::string {
+        return "";
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Shard LRU helpers (all called under shard lock)
+// ---------------------------------------------------------------------------
+
+void RateLimitZone::Shard::TouchLru(Entry* e) {
+    if (e == lru_head) return;  // Already most-recent
+    RemoveLru(e);
+    PushFrontLru(e);
+}
+
+void RateLimitZone::Shard::RemoveLru(Entry* e) {
+    if (e->lru_prev) {
+        e->lru_prev->lru_next = e->lru_next;
+    } else {
+        lru_head = e->lru_next;
+    }
+    if (e->lru_next) {
+        e->lru_next->lru_prev = e->lru_prev;
+    } else {
+        lru_tail = e->lru_prev;
+    }
+    e->lru_prev = nullptr;
+    e->lru_next = nullptr;
+}
+
+void RateLimitZone::Shard::PushFrontLru(Entry* e) {
+    e->lru_prev = nullptr;
+    e->lru_next = lru_head;
+    if (lru_head) {
+        lru_head->lru_prev = e;
+    }
+    lru_head = e;
+    if (!lru_tail) {
+        lru_tail = e;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Constructor / Destructor
+// ---------------------------------------------------------------------------
+
+RateLimitZone::RateLimitZone(const std::string& name,
+                             const RateLimitZoneConfig& config,
+                             KeyExtractor extractor)
+    : name_(name),
+      key_type_(config.key_type),
+      key_extractor_(std::move(extractor)),
+      shards_(DEFAULT_SHARD_COUNT)
+{
+    auto policy = std::make_shared<ZonePolicy>();
+    policy->rate = config.rate;
+    policy->capacity = config.capacity;
+    policy->max_entries = config.max_entries;
+    policy->applies_to = config.applies_to;
+    StorePolicy(std::move(policy));
+
+    logging::Get()->debug("RateLimitZone '{}' created: rate={} capacity={} key_type={} "
+                          "max_entries={} shards={}",
+                          name_, config.rate, config.capacity, config.key_type,
+                          config.max_entries, DEFAULT_SHARD_COUNT);
+}
+
+RateLimitZone::~RateLimitZone() {
+    logging::Get()->debug("RateLimitZone '{}' destroyed", name_);
+}
+
+// ---------------------------------------------------------------------------
+// ShardIndex
+// ---------------------------------------------------------------------------
+
+size_t RateLimitZone::ShardIndex(const std::string& key) const {
+    return std::hash<std::string>{}(key) % shards_.size();
+}
+
+// ---------------------------------------------------------------------------
+// FindOrCreate (called under shard lock)
+// ---------------------------------------------------------------------------
+
+RateLimitZone::Entry* RateLimitZone::FindOrCreate(Shard& shard,
+                                                   const std::string& key,
+                                                   const ZonePolicy& policy) {
+    auto it = shard.buckets.find(key);
+    if (it != shard.buckets.end()) {
+        return it->second.get();
+    }
+
+    // Create new entry
+    auto entry = std::make_unique<Entry>(policy.rate, policy.capacity);
+    entry->key = key;
+    Entry* raw = entry.get();
+    shard.buckets.emplace(key, std::move(entry));
+    shard.PushFrontLru(raw);
+    shard.count++;
+    return raw;
+}
+
+// ---------------------------------------------------------------------------
+// Check
+// ---------------------------------------------------------------------------
+
+RateLimitZone::Result RateLimitZone::Check(const HttpRequest& request) {
+    // 1. Load immutable policy snapshot
+    auto policy = LoadPolicy();
+
+    // 2. Check applies_to filter: if non-empty, request path must match
+    //    at least one prefix. No match → allow (zone doesn't apply).
+    if (!policy->applies_to.empty()) {
+        bool matched = false;
+        for (const auto& prefix : policy->applies_to) {
+            if (request.path.size() >= prefix.size() &&
+                request.path.compare(0, prefix.size(), prefix) == 0) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            return {true, policy->capacity, policy->capacity, 0.0};
+        }
+    }
+
+    // 3. Extract key from request
+    std::string key = key_extractor_(request);
+    if (key.empty()) {
+        // No key extracted (e.g., missing header) — allow request
+        return {true, policy->capacity, policy->capacity, 0.0};
+    }
+
+    // 4. Hash to shard and lock
+    size_t idx = ShardIndex(key);
+    Shard& shard = shards_[idx];
+    std::lock_guard<std::mutex> lk(shard.mutex);
+
+    // 5. Find or create entry
+    Entry* entry = FindOrCreate(shard, key, *policy);
+
+    // 6. Update access time and LRU position
+    entry->last_access = std::chrono::steady_clock::now();
+    shard.TouchLru(entry);
+
+    // 7. Lazy config update: if policy changed since entry was created
+    if (entry->bucket.Capacity() != policy->capacity) {
+        entry->bucket.UpdateConfig(policy->rate, policy->capacity);
+    }
+
+    // 8. Attempt to consume a token
+    bool allowed = entry->bucket.TryConsume();
+    int64_t remaining = entry->bucket.AvailableTokens();
+    double retry_after = allowed ? 0.0 : entry->bucket.SecondsUntilAvailable();
+
+    return {allowed, policy->capacity, remaining, retry_after};
+}
+
+// ---------------------------------------------------------------------------
+// EvictExpired
+// ---------------------------------------------------------------------------
+
+void RateLimitZone::EvictExpired(size_t dispatcher_index, size_t dispatcher_count) {
+    if (dispatcher_count == 0) return;
+
+    auto policy = LoadPolicy();
+
+    // Compute per-shard capacity limit (minimum 1 to avoid zero-cap)
+    size_t shard_count = shards_.size();
+    size_t max_per_shard = static_cast<size_t>(policy->max_entries) / shard_count;
+    if (max_per_shard == 0) max_per_shard = 1;
+
+    // Compute idle cutoff: 4 full refill cycles (capacity / rate * 4 seconds).
+    // An entry idle for this long has fully refilled and is wasting memory.
+    auto now = std::chrono::steady_clock::now();
+    double refill_sec = (policy->rate > 0.0)
+        ? (static_cast<double>(policy->capacity) / policy->rate)
+        : 60.0;  // Fallback: 60 seconds if rate is zero
+    static constexpr int IDLE_REFILL_CYCLES = 4;
+    auto cutoff_duration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(refill_sec * IDLE_REFILL_CYCLES));
+    (void)now;  // Used inside EvictFromShard via cutoff comparison
+
+    // Store cutoff as time_point for EvictFromShard
+    auto cutoff = now - cutoff_duration;
+
+    // Stride across shards assigned to this dispatcher
+    for (size_t i = dispatcher_index; i < shard_count; i += dispatcher_count) {
+        Shard& shard = shards_[i];
+        std::lock_guard<std::mutex> lk(shard.mutex);
+
+        // Evict from tail (LRU = least recently used)
+        while (shard.lru_tail != nullptr &&
+               (shard.count > max_per_shard ||
+                shard.lru_tail->last_access < cutoff)) {
+            Entry* victim = shard.lru_tail;
+            std::string victim_key = std::move(victim->key);
+            shard.RemoveLru(victim);
+            shard.buckets.erase(victim_key);
+            shard.count--;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EvictFromShard (standalone helper — used when caller already holds lock)
+// ---------------------------------------------------------------------------
+
+void RateLimitZone::EvictFromShard(Shard& shard, size_t max_per_shard) {
+    // This method is available for future use by callers that already hold
+    // the shard lock and have computed their own max_per_shard.
+    // Currently EvictExpired inlines the eviction logic to avoid computing
+    // the cutoff twice. Kept for API completeness.
+    auto policy = LoadPolicy();
+    auto now = std::chrono::steady_clock::now();
+    double refill_sec = (policy->rate > 0.0)
+        ? (static_cast<double>(policy->capacity) / policy->rate)
+        : 60.0;
+    static constexpr int IDLE_REFILL_CYCLES = 4;
+    auto cutoff_duration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(refill_sec * IDLE_REFILL_CYCLES));
+    auto cutoff = now - cutoff_duration;
+
+    while (shard.lru_tail != nullptr &&
+           (shard.count > max_per_shard ||
+            shard.lru_tail->last_access < cutoff)) {
+        Entry* victim = shard.lru_tail;
+        std::string victim_key = std::move(victim->key);
+        shard.RemoveLru(victim);
+        shard.buckets.erase(victim_key);
+        shard.count--;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UpdateConfig
+// ---------------------------------------------------------------------------
+
+void RateLimitZone::UpdateConfig(const RateLimitZoneConfig& config) {
+    auto policy = std::make_shared<ZonePolicy>();
+    policy->rate = config.rate;
+    policy->capacity = config.capacity;
+    policy->max_entries = config.max_entries;
+    policy->applies_to = config.applies_to;
+    StorePolicy(std::move(policy));
+
+    logging::Get()->debug("RateLimitZone '{}' config updated: rate={} capacity={} max_entries={}",
+                          name_, config.rate, config.capacity, config.max_entries);
+}
+
+// ---------------------------------------------------------------------------
+// EntryCount
+// ---------------------------------------------------------------------------
+
+size_t RateLimitZone::EntryCount() const {
+    size_t total = 0;
+    for (const auto& shard : shards_) {
+        std::lock_guard<std::mutex> lk(shard.mutex);
+        total += shard.count;
+    }
+    return total;
+}

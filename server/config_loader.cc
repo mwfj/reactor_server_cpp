@@ -265,6 +265,65 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
         }
     }
 
+    // Rate limit section
+    if (j.contains("rate_limit")) {
+        if (!j["rate_limit"].is_object())
+            throw std::runtime_error("rate_limit must be an object");
+        auto& rl = j["rate_limit"];
+        if (rl.contains("enabled")) {
+            if (!rl["enabled"].is_boolean())
+                throw std::runtime_error("rate_limit.enabled must be a boolean");
+            config.rate_limit.enabled = rl["enabled"].get<bool>();
+        }
+        if (rl.contains("dry_run")) {
+            if (!rl["dry_run"].is_boolean())
+                throw std::runtime_error("rate_limit.dry_run must be a boolean");
+            config.rate_limit.dry_run = rl["dry_run"].get<bool>();
+        }
+        if (rl.contains("status_code")) {
+            if (!rl["status_code"].is_number_integer())
+                throw std::runtime_error("rate_limit.status_code must be an integer");
+            config.rate_limit.status_code = rl["status_code"].get<int>();
+        }
+        if (rl.contains("include_headers")) {
+            if (!rl["include_headers"].is_boolean())
+                throw std::runtime_error("rate_limit.include_headers must be a boolean");
+            config.rate_limit.include_headers = rl["include_headers"].get<bool>();
+        }
+        if (rl.contains("zones")) {
+            if (!rl["zones"].is_array())
+                throw std::runtime_error("rate_limit.zones must be an array");
+            for (const auto& item : rl["zones"]) {
+                if (!item.is_object())
+                    throw std::runtime_error("each rate_limit zone entry must be an object");
+                RateLimitZoneConfig zone;
+                zone.name = item.value("name", "");
+                if (item.contains("rate")) {
+                    if (!item["rate"].is_number())
+                        throw std::runtime_error("rate_limit zone rate must be a number");
+                    zone.rate = item["rate"].get<double>();
+                }
+                if (item.contains("capacity")) {
+                    if (!item["capacity"].is_number_integer())
+                        throw std::runtime_error("rate_limit zone capacity must be an integer");
+                    zone.capacity = item["capacity"].get<int64_t>();
+                }
+                zone.key_type = item.value("key_type", "client_ip");
+                zone.max_entries = item.value("max_entries", 100000);
+                if (item.contains("applies_to")) {
+                    if (!item["applies_to"].is_array())
+                        throw std::runtime_error("rate_limit zone applies_to must be an array");
+                    for (const auto& prefix : item["applies_to"]) {
+                        if (!prefix.is_string())
+                            throw std::runtime_error("rate_limit zone applies_to entry must be a string");
+                        zone.applies_to.push_back(prefix.get<std::string>());
+                    }
+                }
+                config.rate_limit.zones.push_back(std::move(zone));
+            }
+        }
+    }
+
     return config;
 }
 
@@ -386,6 +445,38 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     // No per-upstream environment variable overrides. Upstream configuration
     // is complex (array of named objects) and best managed through the JSON
     // config file. Individual upstream settings are not overridable via env.
+
+    // Rate limit env overrides
+    val = std::getenv("REACTOR_RATE_LIMIT_ENABLED");
+    if (val) {
+        std::string s(val);
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
+        if (s == "1" || s == "true" || s == "yes") {
+            config.rate_limit.enabled = true;
+        } else if (s == "0" || s == "false" || s == "no") {
+            config.rate_limit.enabled = false;
+        } else {
+            throw std::invalid_argument(
+                "Invalid REACTOR_RATE_LIMIT_ENABLED: '" + std::string(val) +
+                "' (must be true/false/yes/no/1/0)");
+        }
+    }
+    val = std::getenv("REACTOR_RATE_LIMIT_DRY_RUN");
+    if (val) {
+        std::string s(val);
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
+        if (s == "1" || s == "true" || s == "yes") {
+            config.rate_limit.dry_run = true;
+        } else if (s == "0" || s == "false" || s == "no") {
+            config.rate_limit.dry_run = false;
+        } else {
+            throw std::invalid_argument(
+                "Invalid REACTOR_RATE_LIMIT_DRY_RUN: '" + std::string(val) +
+                "' (must be true/false/yes/no/1/0)");
+        }
+    }
+    val = std::getenv("REACTOR_RATE_LIMIT_STATUS_CODE");
+    if (val) config.rate_limit.status_code = EnvToInt(val, "REACTOR_RATE_LIMIT_STATUS_CODE");
 }
 
 void ConfigLoader::Validate(const ServerConfig& config) {
@@ -755,6 +846,81 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             }  // if (u.tls.enabled)
         }
     }
+
+    // Rate limit validation
+    {
+        const auto& rl = config.rate_limit;
+        if (rl.enabled && rl.zones.empty()) {
+            throw std::invalid_argument(
+                "rate_limit enabled but no zones configured");
+        }
+        if (rl.status_code < 400 || rl.status_code > 599) {
+            throw std::invalid_argument(
+                "rate_limit.status_code must be 400-599, got " +
+                std::to_string(rl.status_code));
+        }
+
+        static const std::unordered_set<std::string> valid_key_types = {
+            "client_ip", "path"
+        };
+        // key_type prefixes that require a suffix (e.g., "header:X-API-Key")
+        static const std::vector<std::string> valid_key_prefixes = {
+            "header:", "client_ip+path", "client_ip+header:"
+        };
+
+        std::unordered_set<std::string> seen_zone_names;
+        for (size_t i = 0; i < rl.zones.size(); ++i) {
+            const auto& z = rl.zones[i];
+            const std::string idx = "rate_limit.zones[" + std::to_string(i) + "]";
+
+            if (z.name.empty()) {
+                throw std::invalid_argument(idx + ".name must not be empty");
+            }
+            if (!seen_zone_names.insert(z.name).second) {
+                throw std::invalid_argument(
+                    "Duplicate rate_limit zone name: '" + z.name + "'");
+            }
+            if (z.rate <= 0) {
+                throw std::invalid_argument(
+                    idx + " ('" + z.name + "'): rate must be > 0");
+            }
+            if (z.capacity < 1) {
+                throw std::invalid_argument(
+                    idx + " ('" + z.name + "'): capacity must be >= 1");
+            }
+            if (z.max_entries < 1) {
+                throw std::invalid_argument(
+                    idx + " ('" + z.name + "'): max_entries must be >= 1");
+            }
+
+            // Validate key_type: exact match or prefix match
+            bool valid_key = valid_key_types.count(z.key_type) > 0;
+            if (!valid_key) {
+                for (const auto& prefix : valid_key_prefixes) {
+                    if (z.key_type == prefix ||
+                        (prefix.back() == ':' && z.key_type.size() > prefix.size() &&
+                         z.key_type.substr(0, prefix.size()) == prefix)) {
+                        valid_key = true;
+                        break;
+                    }
+                }
+            }
+            if (!valid_key) {
+                throw std::invalid_argument(
+                    idx + " ('" + z.name + "'): invalid key_type '" + z.key_type +
+                    "' (must be client_ip, path, header:<name>, "
+                    "client_ip+path, or client_ip+header:<name>)");
+            }
+
+            // Warn if capacity < rate (burst smaller than sustained rate)
+            if (static_cast<double>(z.capacity) < z.rate) {
+                logging::Get()->warn(
+                    "rate_limit zone '{}': capacity ({}) < rate ({:.1f}) "
+                    "— burst will be smaller than sustained rate",
+                    z.name, z.capacity, z.rate);
+            }
+        }
+    }
 }
 
 ServerConfig ConfigLoader::Default() {
@@ -835,6 +1001,27 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             uj["proxy"] = pj;
         }
         j["upstreams"].push_back(uj);
+    }
+
+    // Rate limit serialization
+    {
+        nlohmann::json rlj;
+        rlj["enabled"] = config.rate_limit.enabled;
+        rlj["dry_run"] = config.rate_limit.dry_run;
+        rlj["status_code"] = config.rate_limit.status_code;
+        rlj["include_headers"] = config.rate_limit.include_headers;
+        rlj["zones"] = nlohmann::json::array();
+        for (const auto& z : config.rate_limit.zones) {
+            nlohmann::json zj;
+            zj["name"] = z.name;
+            zj["rate"] = z.rate;
+            zj["capacity"] = z.capacity;
+            zj["key_type"] = z.key_type;
+            zj["max_entries"] = z.max_entries;
+            zj["applies_to"] = z.applies_to;
+            rlj["zones"].push_back(zj);
+        }
+        j["rate_limit"] = rlj;
     }
 
     return j.dump(4);

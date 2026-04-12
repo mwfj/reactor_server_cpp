@@ -12,6 +12,7 @@
 #include "kqueue_test.h"
 #include "upstream_pool_test.h"
 #include "proxy_test.h"
+#include "rate_limit_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -73,6 +74,9 @@ void RunAllTest(){
     // Run proxy engine tests
     ProxyTests::RunAllTests();
 
+    // Run rate limit tests
+    RateLimitTests::RunAllTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -93,8 +97,9 @@ void PrintUsage(const char* program_name) {
     std::cout << "  kqueue,   -K    Run kqueue platform tests only (macOS; skipped on Linux)" << std::endl;
     std::cout << "  upstream, -U    Run upstream connection pool tests only" << std::endl;
     std::cout << "  proxy,    -P    Run proxy engine tests only" << std::endl;
+    std::cout << "  rate_limit, -L  Run rate limit tests only" << std::endl;
     std::cout << "  help,     -h    Show this help message" << std::endl;
-    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route + kqueue + upstream + proxy)" << std::endl;
+    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route + kqueue + upstream + proxy + rate_limit)" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -147,6 +152,9 @@ int main(int argc, char* argv[]) {
         // Run proxy engine tests
         }else if(mode == "proxy" || mode == "-P"){
             ProxyTests::RunAllTests();
+        // Run rate limit tests
+        }else if(mode == "rate_limit" || mode == "-L"){
+            RateLimitTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

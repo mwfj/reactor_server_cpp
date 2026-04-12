@@ -29,6 +29,7 @@ struct HttpStatus {
     static constexpr int REQUEST_TIMEOUT              = 408;
     static constexpr int PAYLOAD_TOO_LARGE            = 413;
     static constexpr int EXPECTATION_FAILED           = 417;
+    static constexpr int TOO_MANY_REQUESTS             = 429;
     static constexpr int REQUEST_HEADER_FIELDS_TOO_LARGE = 431;
 
     // 5xx Server Error
