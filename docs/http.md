@@ -338,8 +338,10 @@ Proxied requests using absolute-form URIs (`GET http://example.com/foo HTTP/1.1`
 ### Builder Pattern
 
 ```cpp
-// Chained builder
-HttpResponse().Status(200).Header("X-Custom", "value").Json(R"({"ok":true})")
+#include "http/http_status.h"
+
+// Chained builder — use HttpStatus::* constants (see include/http/http_status.h)
+HttpResponse().Status(HttpStatus::OK).Header("X-Custom", "value").Json(R"({"ok":true})")
 
 // Content type helpers
 res.Json(json_string);   // Sets Content-Type: application/json
@@ -362,7 +364,9 @@ res.Body(data, "image/png");  // Custom content type
 | `PayloadTooLarge()` | 413 | Body exceeds limit |
 | `HeaderTooLarge()` | 431 | Headers exceed limit |
 | `InternalError(msg)` | 500 | Server error |
+| `BadGateway()` | 502 | Upstream unreachable |
 | `ServiceUnavailable()` | 503 | Overloaded |
+| `GatewayTimeout()` | 504 | Upstream timeout |
 | `HttpVersionNotSupported()` | 505 | Non-1.x HTTP version |
 
 ### Header Behavior
