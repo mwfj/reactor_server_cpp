@@ -1,4 +1,5 @@
 #include "upstream/upstream_http_codec.h"
+#include "http/http_status.h"
 #include "llhttp/llhttp.h"
 
 #include <algorithm>
@@ -181,7 +182,7 @@ size_t UpstreamHttpCodec::Parse(const char* data, size_t len) {
             size_t consumed = llhttp_get_error_pos(&impl_->parser) - (data + total_consumed);
             total_consumed += consumed;
             int status = llhttp_get_status_code(&impl_->parser);
-            if (status >= 100 && status < 200) {
+            if (status >= HttpStatus::CONTINUE && status < HttpStatus::OK) {
                 // Interim 1xx response: discard, resume, continue parsing
                 // remaining bytes. The proxy does NOT forward 1xx to the
                 // client — it waits for the final response.

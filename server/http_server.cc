@@ -1,4 +1,5 @@
 #include "http/http_server.h"
+#include "http/http_status.h"
 #include "config/config_loader.h"
 #include "ws/websocket_frame.h"
 #include "http2/http2_constants.h"
@@ -38,6 +39,15 @@ struct InternalRegistrationScope {
     ~InternalRegistrationScope() { tls_internal_registration_pass = false; }
     InternalRegistrationScope(const InternalRegistrationScope&) = delete;
     InternalRegistrationScope& operator=(const InternalRegistrationScope&) = delete;
+};
+
+// Collects (method, patterns) pairs during proxy route pre-checking.
+// Used by both Proxy() and RegisterProxyRoutes() to filter per-(method,
+// pattern) collisions atomically before any RouteAsync call mutates the
+// router.
+struct MethodRegistration {
+    std::string method;
+    std::vector<std::string> patterns;
 };
 
 // Ceiling division: convert a timeout in milliseconds to whole seconds,
@@ -956,10 +966,6 @@ void HttpServer::Proxy(const std::string& route_pattern,
     // Atomic in the sense that the set of (method, pattern) pairs that
     // will actually register is fully conflict-free BEFORE any
     // RouteAsync call mutates the router.
-    struct MethodRegistration {
-        std::string method;
-        std::vector<std::string> patterns;
-    };
     std::vector<MethodRegistration> to_register;
     to_register.reserve(accepted_methods.size());
     // PRE-CHECK PER (METHOD, PATTERN): filter individual collisions
@@ -1382,10 +1388,6 @@ void HttpServer::RegisterProxyRoutes() {
         // The sync-companion branch below already does this per-pattern;
         // async is now symmetric. See HttpServer::Proxy for the
         // same fix applied to the programmatic path.
-        struct MethodRegistration {
-            std::string method;
-            std::vector<std::string> patterns;
-        };
         std::vector<MethodRegistration> to_register;
         to_register.reserve(accepted_methods.size());
         for (const auto& method : accepted_methods) {
@@ -2301,7 +2303,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
             }
 
             if (!router_.Dispatch(request, response)) {
-                response.Status(404).Text("Not Found");
+                response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
             // During shutdown, signal the client to close the connection.
             // Without this, a keep-alive response looks persistent but
@@ -3053,7 +3055,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
             }
 
             if (!router_.Dispatch(request, response)) {
-                response.Status(404).Text("Not Found");
+                response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
         }
     );

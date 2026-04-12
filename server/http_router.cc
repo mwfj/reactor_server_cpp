@@ -1,4 +1,5 @@
 #include "http/http_router.h"
+#include "http/http_status.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
 // <algorithm> provided by common.h (via http_request.h)
@@ -605,7 +606,7 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
                               request.method, logging::SanitizePath(request.path));
         // Set status on the existing response to preserve any headers that
         // middleware already added (CORS, request-id, auth tokens, etc.).
-        response.Status(405).Text("Method Not Allowed");
+        response.Status(HttpStatus::METHOD_NOT_ALLOWED).Text("Method Not Allowed");
         response.Header("Allow", allowed);
         return true;
     }
@@ -633,8 +634,8 @@ void HttpRouter::FillDefaultRejectionResponse(HttpResponse& response) {
     // response, and the client would silently succeed. We keep the empty-
     // body check so a middleware that explicitly populated a 200-status
     // body (unusual but well-defined) is still preserved.
-    if (response.GetStatusCode() == 200 && response.GetBody().empty()) {
-        response.Status(403).Text("Forbidden");
+    if (response.GetStatusCode() == HttpStatus::OK && response.GetBody().empty()) {
+        response.Status(HttpStatus::FORBIDDEN).Text("Forbidden");
     }
 }
 

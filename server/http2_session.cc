@@ -1,6 +1,7 @@
 #include "http2/http2_session.h"
 #include "http2/http2_connection_handler.h"
 #include "http/http_response.h"
+#include "http/http_status.h"
 #include "log/logger.h"
 
 #include <nghttp2/nghttp2.h>
@@ -668,7 +669,7 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     // Other 1xx (103 Early Hints etc.) need a separate non-final API.
     // Reject all 1xx here — they would be sent as final with END_STREAM,
     // closing the stream before the real response.
-    if (status_code < 200) {
+    if (status_code < HttpStatus::OK) {
         logging::Get()->error("HTTP/2 stream {} SubmitResponse called with {} "
                               "(1xx not supported as app response)", stream_id, status_code);
         nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
@@ -681,8 +682,9 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     // RFC 9110 Section 15.3.5/15.3.6/15.4.5: 204, 205, 304 MUST NOT contain a body.
     const HttpRequest& req = stream->GetRequest();
     bool suppress_body = (req.method == "HEAD" ||
-                          status_code == 204 || status_code == 205 ||
-                          status_code == 304);
+                          status_code == HttpStatus::NO_CONTENT ||
+                          status_code == HttpStatus::RESET_CONTENT ||
+                          status_code == HttpStatus::NOT_MODIFIED);
 
     // Build nghttp2 header name-value pairs.
     // We do NOT use NGHTTP2_NV_FLAG_NO_COPY_NAME or NO_COPY_VALUE:

@@ -1,8 +1,9 @@
 #include "http/http_response.h"
+#include "http/http_status.h"
 #include <sstream>
 #include <algorithm>
 
-HttpResponse::HttpResponse() : status_code_(200), status_reason_("OK") {}
+HttpResponse::HttpResponse() : status_code_(HttpStatus::OK), status_reason_("OK") {}
 
 HttpResponse& HttpResponse::Status(int code) {
     status_code_ = code;
@@ -106,11 +107,13 @@ HttpResponse::ComputeWireContentLength(int status_code) const {
     // in lockstep with Serialize()'s Content-Length handling.
 
     // 1xx, 101, 204: Content-Length MUST be stripped (RFC 7230 §3.3.2).
-    if (status_code < 200 || status_code == 101 || status_code == 204) {
+    if (status_code < HttpStatus::OK ||
+        status_code == HttpStatus::SWITCHING_PROTOCOLS ||
+        status_code == HttpStatus::NO_CONTENT) {
         return std::nullopt;
     }
     // 205 Reset Content: force CL=0 regardless of caller.
-    if (status_code == 205) return std::string("0");
+    if (status_code == HttpStatus::RESET_CONTENT) return std::string("0");
 
     // Find the first caller-set Content-Length (case-insensitive).
     // Used for 304 passthrough and PreserveContentLength paths.
@@ -128,7 +131,7 @@ HttpResponse::ComputeWireContentLength(int status_code) const {
     // selected representation. Preserve caller's first value; if none
     // set, don't inject one (injecting CL: 0 would lie about the
     // representation size).
-    if (status_code == 304) return first_caller_cl();
+    if (status_code == HttpStatus::NOT_MODIFIED) return first_caller_cl();
 
     // Non-bodyless statuses (200, HEAD replies, proxy passthrough, ...).
     // If the handler or proxy has asked for preservation, keep the
@@ -151,8 +154,10 @@ std::string HttpResponse::Serialize() const {
 
     // Determine if this status code must not have a body (RFC 7230 §3.3.3).
     // For all of these, the body is suppressed regardless of headers.
-    bool bodyless_status = (status_code_ < 200 || status_code_ == 101 ||
-                            status_code_ == 204 || status_code_ == 304);
+    bool bodyless_status = (status_code_ < HttpStatus::OK ||
+                            status_code_ == HttpStatus::SWITCHING_PROTOCOLS ||
+                            status_code_ == HttpStatus::NO_CONTENT ||
+                            status_code_ == HttpStatus::NOT_MODIFIED);
 
     // Statuses for which Content-Length must be stripped: 1xx/101/204
     // per RFC 7230 §3.3.2. 304 is NOT in this set — RFC 7232 §4.1 allows
@@ -161,7 +166,9 @@ std::string HttpResponse::Serialize() const {
     // by the blank line (so CL doesn't affect framing). Stripping CL from
     // 304 would lose information when proxying an upstream 304 reply.
     bool strip_content_length_header =
-        (status_code_ < 200 || status_code_ == 101 || status_code_ == 204);
+        (status_code_ < HttpStatus::OK ||
+         status_code_ == HttpStatus::SWITCHING_PROTOCOLS ||
+         status_code_ == HttpStatus::NO_CONTENT);
 
     // Strip Transfer-Encoding headers — this server does not implement chunked
     // encoding, so emitting Transfer-Encoding: chunked with an un-chunked body
@@ -183,7 +190,7 @@ std::string HttpResponse::Serialize() const {
     //   responses when proxying an upstream 304 that sent duplicate CLs.
     //   No auto-compute from body_.size() — 304 never emits a body.
     // - Other non-bodyless: preserve (proxy HEAD) or auto-compute.
-    if (status_code_ == 205) {
+    if (status_code_ == HttpStatus::RESET_CONTENT) {
         // Strip any caller-set Content-Length first, then force 0
         hdrs.erase(std::remove_if(hdrs.begin(), hdrs.end(),
             [](const std::pair<std::string, std::string>& kv) {
@@ -192,7 +199,7 @@ std::string HttpResponse::Serialize() const {
                 return key == "content-length";
             }), hdrs.end());
         hdrs.emplace_back("Content-Length", "0");
-    } else if (status_code_ == 304) {
+    } else if (status_code_ == HttpStatus::NOT_MODIFIED) {
         // 304: canonicalize duplicate Content-Length headers (keep the
         // first value, drop the rest). If the caller didn't set any CL,
         // don't inject one — the body is always suppressed, and injecting
@@ -274,9 +281,11 @@ std::string HttpResponse::Serialize() const {
     oss << "\r\n";
 
     // Body — suppress for status codes that must not have a body (101, 204, 205, 304)
-    bool suppress_body = (status_code_ == 101 || status_code_ == 204 ||
-                          status_code_ == 205 || status_code_ == 304 ||
-                          status_code_ < 200);
+    bool suppress_body = (status_code_ == HttpStatus::SWITCHING_PROTOCOLS ||
+                          status_code_ == HttpStatus::NO_CONTENT ||
+                          status_code_ == HttpStatus::RESET_CONTENT ||
+                          status_code_ == HttpStatus::NOT_MODIFIED ||
+                          status_code_ < HttpStatus::OK);
     if (!body_.empty() && !suppress_body) {
         oss << body_;
     }
@@ -288,55 +297,55 @@ std::string HttpResponse::Serialize() const {
 HttpResponse HttpResponse::Ok() { return HttpResponse(); }
 
 HttpResponse HttpResponse::BadRequest(const std::string& message) {
-    return HttpResponse().Status(400).Text(message);
+    return HttpResponse().Status(HttpStatus::BAD_REQUEST).Text(message);
 }
 
 HttpResponse HttpResponse::NotFound() {
-    return HttpResponse().Status(404).Text("Not Found");
+    return HttpResponse().Status(HttpStatus::NOT_FOUND).Text("Not Found");
 }
 
 HttpResponse HttpResponse::Unauthorized(const std::string& message) {
-    return HttpResponse().Status(401).Text(message);
+    return HttpResponse().Status(HttpStatus::UNAUTHORIZED).Text(message);
 }
 
 HttpResponse HttpResponse::Forbidden() {
-    return HttpResponse().Status(403).Text("Forbidden");
+    return HttpResponse().Status(HttpStatus::FORBIDDEN).Text("Forbidden");
 }
 
 HttpResponse HttpResponse::MethodNotAllowed() {
-    return HttpResponse().Status(405).Text("Method Not Allowed");
+    return HttpResponse().Status(HttpStatus::METHOD_NOT_ALLOWED).Text("Method Not Allowed");
 }
 
 HttpResponse HttpResponse::InternalError(const std::string& message) {
-    return HttpResponse().Status(500).Text(message);
+    return HttpResponse().Status(HttpStatus::INTERNAL_SERVER_ERROR).Text(message);
 }
 
 HttpResponse HttpResponse::BadGateway() {
-    return HttpResponse().Status(502).Text("Bad Gateway");
+    return HttpResponse().Status(HttpStatus::BAD_GATEWAY).Text("Bad Gateway");
 }
 
 HttpResponse HttpResponse::ServiceUnavailable() {
-    return HttpResponse().Status(503).Text("Service Unavailable");
+    return HttpResponse().Status(HttpStatus::SERVICE_UNAVAILABLE).Text("Service Unavailable");
 }
 
 HttpResponse HttpResponse::GatewayTimeout() {
-    return HttpResponse().Status(504).Text("Gateway Timeout");
+    return HttpResponse().Status(HttpStatus::GATEWAY_TIMEOUT).Text("Gateway Timeout");
 }
 
 HttpResponse HttpResponse::PayloadTooLarge() {
-    return HttpResponse().Status(413).Text("Payload Too Large");
+    return HttpResponse().Status(HttpStatus::PAYLOAD_TOO_LARGE).Text("Payload Too Large");
 }
 
 HttpResponse HttpResponse::HeaderTooLarge() {
-    return HttpResponse().Status(431).Text("Request Header Fields Too Large");
+    return HttpResponse().Status(HttpStatus::REQUEST_HEADER_FIELDS_TOO_LARGE).Text("Request Header Fields Too Large");
 }
 
 HttpResponse HttpResponse::RequestTimeout() {
-    return HttpResponse().Status(408).Text("Request Timeout");
+    return HttpResponse().Status(HttpStatus::REQUEST_TIMEOUT).Text("Request Timeout");
 }
 
 HttpResponse HttpResponse::HttpVersionNotSupported() {
-    return HttpResponse().Status(505).Text("HTTP Version Not Supported");
+    return HttpResponse().Status(HttpStatus::HTTP_VERSION_NOT_SUPPORTED).Text("HTTP Version Not Supported");
 }
 
 std::string HttpResponse::DefaultReason(int code) {

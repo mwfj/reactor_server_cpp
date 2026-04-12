@@ -5,6 +5,7 @@
 #include "connection_handler.h"
 // config/server_config.h provided by proxy_transaction.h (ProxyConfig stored by value)
 #include "http/http_request.h"
+#include "http/http_status.h"
 #include "log/logger.h"
 
 ProxyTransaction::ProxyTransaction(
@@ -505,7 +506,8 @@ void ProxyTransaction::OnResponseComplete() {
     // Check for 5xx and retry if policy allows — before setting COMPLETE.
     // COMPLETE is terminal; resetting it back to INIT after setting it would
     // be a logic error (and confusing for any future state assertions).
-    if (response.status_code >= 500 && response.status_code < 600) {
+    if (response.status_code >= HttpStatus::INTERNAL_SERVER_ERROR &&
+        response.status_code < 600) {
         logging::Get()->warn("ProxyTransaction upstream 5xx client_fd={} "
                              "service={} status={} attempt={}",
                              client_fd_, service_name_,

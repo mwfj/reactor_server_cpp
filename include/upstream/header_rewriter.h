@@ -40,6 +40,9 @@ public:
     std::vector<std::pair<std::string, std::string>> RewriteResponse(
         const std::vector<std::pair<std::string, std::string>>& upstream_headers) const;
 
+    // Via header value appended by the proxy (RFC 7230 §5.7.1).
+    static constexpr const char* VIA_ENTRY = "1.1 reactor-gateway";
+
 private:
     Config config_;
 

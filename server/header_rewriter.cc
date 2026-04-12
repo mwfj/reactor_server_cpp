@@ -109,10 +109,10 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
 
     // Via: append gateway identifier
     if (config_.set_via_header) {
-        static const std::string VIA_ENTRY = "1.1 reactor-gateway";
         auto it = output.find("via");
         if (it != output.end()) {
-            it->second += ", " + VIA_ENTRY;
+            it->second += ", ";
+            it->second += VIA_ENTRY;
         } else {
             output["via"] = VIA_ENTRY;
         }
@@ -175,12 +175,12 @@ std::vector<std::pair<std::string, std::string>> HeaderRewriter::RewriteResponse
 
     // Via: append gateway identifier
     if (config_.set_via_header) {
-        static const std::string VIA_ENTRY = "1.1 reactor-gateway";
         // Look for existing Via header to append
         bool found_via = false;
         for (auto& [name, value] : output) {
             if (name == "via") {
-                value += ", " + VIA_ENTRY;
+                value += ", ";
+                value += VIA_ENTRY;
                 found_via = true;
                 break;
             }

@@ -10,6 +10,7 @@
 // common.h (via http_server.h -> net_server.h)
 #include "http/http_request.h"
 #include "http/http_response.h"
+#include "http/http_status.h"
 #include "log/logger.h"
 
 // <cstdio> provided by common.h (via http_server.h)
@@ -135,7 +136,7 @@ MakeHealthHandler(HttpServer* server) {
             R"({"status":"ok","pid":%d,"uptime_seconds":%lld})",
             static_cast<int>(getpid()),
             static_cast<long long>(stats.uptime_seconds));
-        res.Status(200).Json(buf);
+        res.Status(HttpStatus::OK).Json(buf);
     };
 }
 
@@ -180,10 +181,10 @@ MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
             config.http2.enabled ? "true" : "false");
         if (written < 0 || static_cast<size_t>(written) >= sizeof(buf)) {
             logging::Get()->error("Stats JSON buffer overflow (written={})", written);
-            res.Status(500).Json(R"({"error":"stats buffer overflow"})");
+            res.Status(HttpStatus::INTERNAL_SERVER_ERROR).Json(R"({"error":"stats buffer overflow"})");
             return;
         }
-        res.Status(200).Json(buf);
+        res.Status(HttpStatus::OK).Json(buf);
     };
 }
 

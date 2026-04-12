@@ -1,4 +1,5 @@
 #include "http/http_connection_handler.h"
+#include "http/http_status.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
 #include <sstream>
@@ -474,9 +475,9 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                 // or auth headers before rejecting should still produce 403,
                 // not leak a 200 OK on a denied WebSocket upgrade. Matches
                 // the async HTTP path (FillDefaultRejectionResponse).
-                if (mw_response.GetStatusCode() == 200 &&
+                if (mw_response.GetStatusCode() == HttpStatus::OK &&
                     mw_response.GetBody().empty()) {
-                    mw_response.Status(403).Text("Forbidden");
+                    mw_response.Status(HttpStatus::FORBIDDEN).Text("Forbidden");
                 }
                 logging::Get()->debug("WebSocket upgrade rejected by middleware fd={} path={}",
                                       conn_->fd(), req.path);
@@ -559,7 +560,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             logging::Get()->debug("WS upgrade rejected: server shutting down fd={}",
                                   conn_->fd());
             HttpResponse shutdown_resp;
-            shutdown_resp.Status(503).Text("Service Unavailable");
+            shutdown_resp.Status(HttpStatus::SERVICE_UNAVAILABLE).Text("Service Unavailable");
             shutdown_resp.Header("Connection", "close");
             SendResponse(shutdown_resp);
             CloseConnection();
