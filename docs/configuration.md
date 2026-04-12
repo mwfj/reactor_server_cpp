@@ -201,6 +201,80 @@ Upstream connection pools are configured via the `upstreams` array in the JSON c
 
 **Note:** Upstream configuration changes require a server restart — pools are built once during `Start()` and cannot be rebuilt at runtime.
 
+### Proxy Route Configuration
+
+Each upstream entry may include an optional `proxy` section to auto-register a proxy route that forwards matching requests to the backend. When `proxy.route_prefix` is non-empty, `HttpServer::Start()` registers the route automatically — no handler code is needed.
+
+```json
+{
+    "upstreams": [
+        {
+            "name": "api-backend",
+            "host": "10.0.1.5",
+            "port": 8080,
+            "pool": { "max_connections": 64 },
+            "proxy": {
+                "route_prefix": "/api/v1",
+                "strip_prefix": true,
+                "response_timeout_ms": 5000,
+                "methods": ["GET", "POST", "PUT", "DELETE"],
+                "header_rewrite": {
+                    "set_x_forwarded_for": true,
+                    "set_x_forwarded_proto": true,
+                    "set_via_header": true,
+                    "rewrite_host": true
+                },
+                "retry": {
+                    "max_retries": 2,
+                    "retry_on_connect_failure": true,
+                    "retry_on_5xx": false,
+                    "retry_on_timeout": false,
+                    "retry_on_disconnect": true,
+                    "retry_non_idempotent": false
+                }
+            }
+        }
+    ]
+}
+```
+
+**Proxy fields** (`proxy.*`):
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `route_prefix` | "" | Route pattern to match (empty = disabled). Supports full pattern syntax: `/api/v1`, `/api/:version/*path`, `/users/:id([0-9]+)`. Patterns ending in `/*rest` match anything under the prefix. |
+| `strip_prefix` | false | When `true`, strip the static portion of `route_prefix` before forwarding. Example: `route_prefix="/api/v1"`, `strip_prefix=true` → client `GET /api/v1/users/123` reaches upstream as `GET /users/123`. |
+| `response_timeout_ms` | 30000 | Max time to wait for upstream response headers after the request is fully sent. **Must be `0` or `>= 1000`** (timer scan has 1 s resolution). `0` disables the per-request deadline and lifts the async safety cap for this request only — use with caution, long-running handlers still respect the server-wide `max_async_deferred_sec_`. |
+| `methods` | `[]` | Methods to proxy. Empty array means all methods. Methods listed here are auto-registered on the route; conflicts with any user-registered async route on the same `(method, pattern)` are detected at `Start()` and raise `std::invalid_argument`. |
+
+**Proxy header rewrite fields** (`proxy.header_rewrite.*`):
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `set_x_forwarded_for` | true | Append the client IP to `X-Forwarded-For` (preserves any upstream chain) |
+| `set_x_forwarded_proto` | true | Set `X-Forwarded-Proto` to `http` or `https` based on the client connection |
+| `set_via_header` | true | Add the server's `Via` header per RFC 7230 §5.7.1 |
+| `rewrite_host` | true | Rewrite the outgoing `Host` header to the upstream's authority (off = forward client's Host verbatim) |
+
+Hop-by-hop headers listed in RFC 7230 §6.1 (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailers`, `Transfer-Encoding`, `Upgrade`) are always stripped from both the outgoing request and the returned response.
+
+**Proxy retry fields** (`proxy.retry.*`):
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_retries` | 0 | Max retry attempts (0 = no retries). Backoff is jittered exponential (25 ms base, 250 ms cap). |
+| `retry_on_connect_failure` | true | Retry when the pool checkout fails to establish a TCP/TLS connection |
+| `retry_on_5xx` | false | Retry when the upstream returns a 5xx response (headers only — once the body starts streaming to the client, retries stop) |
+| `retry_on_timeout` | false | Retry when the response deadline fires before headers arrive |
+| `retry_on_disconnect` | true | Retry when the upstream closes the connection before any response bytes are sent to the client |
+| `retry_non_idempotent` | false | Allow retries on POST/PATCH/DELETE (dangerous — can duplicate side effects; default safe methods only) |
+
+**Notes:**
+
+- Retries never fire after any response bytes have been sent to the downstream client.
+- `proxy.route_prefix` conflicts — two upstreams auto-registering the same pattern, or an upstream conflicting with a user-registered async route on the same `(method, pattern)` — are rejected at `Start()` with `std::invalid_argument`.
+- The proxy engine is built on the async route framework: per-request deadlines, client abort propagation, and pool checkout cancellation are all handled by `ProxyTransaction::Cancel()`. See [docs/http.md](http.md) for the programmatic API.
+
 ### Validation
 
 `ConfigLoader::Validate()` checks:

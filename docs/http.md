@@ -189,6 +189,90 @@ The handler receives a const request reference and a completion callback. Call `
 - **Thread safety** — the completion callback MUST be invoked on the dispatcher thread that owns the connection. Upstream pool `CheckoutAsync` naturally routes callbacks to the correct dispatcher.
 - **HTTP/2 support** — async routes work identically for H2 streams; the framework binds `SubmitStreamResponse` internally
 
+## Proxy Routes
+
+Proxy routes forward client requests to an upstream backend service. They are built on top of the async-route framework and require a matching `upstreams[]` entry in the server config so the connection pool, TLS client context, and retry/header policies exist. See [docs/configuration.md](configuration.md#proxy-route-configuration) for the full set of config fields.
+
+### Auto-registration from config
+
+The simplest way to use a proxy route is to set `proxy.route_prefix` in the upstream config. `HttpServer::Start()` walks every upstream with a non-empty `route_prefix` and registers the route automatically — no application code required.
+
+```json
+{
+    "upstreams": [
+        {
+            "name": "api-backend",
+            "host": "10.0.1.5",
+            "port": 8080,
+            "pool": { "max_connections": 64 },
+            "proxy": {
+                "route_prefix": "/api/v1/*rest",
+                "strip_prefix": true,
+                "methods": ["GET", "POST", "PUT", "DELETE"]
+            }
+        }
+    ]
+}
+```
+
+Any `GET/POST/PUT/DELETE` under `/api/v1/` is forwarded to `api-backend`, with the `/api/v1` prefix stripped before forwarding (so upstream sees `/users/123` instead of `/api/v1/users/123`).
+
+### Programmatic registration
+
+Applications that construct their own config in code can use `HttpServer::Proxy()`:
+
+```cpp
+#include "http/http_server.h"
+
+HttpServer server(config);
+
+// Register a proxy route on an already-configured upstream.
+// Reuses the proxy fields (methods, strip_prefix, header_rewrite, retry,
+// response_timeout_ms) from config.upstreams[i].proxy — only route_prefix
+// is overridden by the first argument.
+server.Proxy("/api/v1/*rest", "api-backend");
+
+server.Start();
+```
+
+`Proxy()` calls must happen before `Start()`. Calling it afterwards — or naming an upstream that is not in the config — raises `std::invalid_argument`.
+
+### HEAD precedence and companion methods
+
+Proxy registrations interact with the HEAD-fallback rule from [Route Matching](#route-matching) as follows:
+
+- **Paired HEAD + GET on the same registration** (both in `methods`): HEAD goes to the proxy, GET goes to the proxy. No fallback.
+- **HEAD only** (no GET in `methods`): HEAD is registered as a proxy *default*. If a user async handler later registers GET on the same pattern, the router uses the user's GET for HEAD fallback and silently drops the proxy HEAD. This prevents accidental conflicts between library-provided proxies and application-defined GETs.
+- **Companion methods**: If a proxy registers `OPTIONS` for a pattern that also has a user-registered async GET, the router marks the proxy pattern as a *companion*. At dispatch time, if the companion proxy route wins (e.g. for a non-matching method), it yields to the user handler via a runtime decision rather than a registration-time rejection — because the conflict is method-level and only detectable per-request.
+- Per-`(method, pattern)` conflict markers are stored separately so two proxies registering disjoint methods on the same pattern do not contaminate each other's HEAD pairing.
+
+### Request lifecycle and client abort
+
+Each proxy request is handled by a per-request `ProxyTransaction`:
+
+1. `CHECKOUT_PENDING` — wait for an idle pooled connection (or open a new one, subject to `pool.max_connections`)
+2. `SENDING_REQUEST` — serialize and write the HTTP/1.1 request, with header rewriting applied
+3. `AWAITING_RESPONSE` — wait for response headers (bounded by `proxy.response_timeout_ms`)
+4. `RECEIVING_BODY` — stream the body back to the client
+5. `COMPLETE` / `FAILED` — return the connection to the pool or discard it
+
+If the client disconnects mid-request, the framework's async-abort hook calls `ProxyTransaction::Cancel()`, which:
+
+- Sets a `cancelled_` flag guarding every callback entry point
+- Signals the pool wait-queue via a shared cancel token so `PoolPartition` can purge the dead entry
+- Poisons the upstream connection (`MarkClosing()`) if any bytes have already been written — retrying a partially-sent request on a reused connection is unsafe
+- Returns the connection to the pool (or destroys it) without further I/O
+
+### Response timeouts and the async safety cap
+
+`proxy.response_timeout_ms` is the hard deadline for receiving response headers after the request is fully sent. Its valid values are:
+
+- **`>= 1000`** — normal case. The deadline is armed when the request is flushed and cleared when headers arrive. If it fires, the transaction retries (if policy allows) or responds with 504.
+- **`0`** — disables the per-request deadline *and* disables the server-wide async safety cap (`max_async_deferred_sec_`) for this request only. The `ProxyHandler` sets `request.async_cap_sec_override = 0` before dispatching. Use this only for intentionally long-polling backends; normal requests should keep a bounded timeout.
+- **Other positive values below 1000** — rejected at config load (the 1 s floor matches the timer scan resolution).
+
+Retries are bounded by `proxy.retry.max_retries` and never fire after any response bytes have reached the client. See [docs/configuration.md](configuration.md#proxy-route-configuration) for the full retry matrix.
+
 ## Middleware
 
 ```cpp
