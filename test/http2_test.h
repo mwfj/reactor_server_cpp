@@ -22,6 +22,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <future>
+#include <optional>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -255,53 +256,12 @@ public:
                         std::chrono::milliseconds(IO_TIMEOUT_MS);
 
         while (true) {
-            auto it = streams_.find(stream_id);
-            // Wait until parent is done AND every promised child of that
-            // parent has finished. Without this, tests that exercise push
-            // would race the pushed streams' completion against return.
-            if (it != streams_.end() && it->second.done) {
-                bool any_promised_pending = false;
-                for (const auto& [id, st] : streams_) {
-                    if (st.parent_id == stream_id && !st.done) {
-                        any_promised_pending = true;
-                        break;
-                    }
-                }
-                if (!any_promised_pending) {
-                    Response resp;
-                    resp.status           = it->second.status;
-                    resp.body             = it->second.body;
-                    resp.rst              = it->second.rst;
-                    resp.interim_statuses = std::move(it->second.interim_statuses);
-                    resp.interim_headers  = std::move(it->second.interim_headers);
-                    // Collect pushed children before erasing.
-                    for (auto sit = streams_.begin(); sit != streams_.end();) {
-                        if (sit->second.parent_id == stream_id) {
-                            PushedStream ps;
-                            ps.promised_stream_id = sit->first;
-                            ps.method    = std::move(sit->second.promise_method);
-                            ps.scheme    = std::move(sit->second.promise_scheme);
-                            ps.authority = std::move(sit->second.promise_authority);
-                            ps.path      = std::move(sit->second.promise_path);
-                            ps.status    = sit->second.status;
-                            ps.body      = std::move(sit->second.body);
-                            ps.rst       = sit->second.rst;
-                            ps.done      = sit->second.done;
-                            resp.pushed.push_back(std::move(ps));
-                            sit = streams_.erase(sit);
-                        } else {
-                            ++sit;
-                        }
-                    }
-                    streams_.erase(stream_id);
-                    return resp;
-                }
+            if (auto done = CollectCompletedResponse(stream_id)) {
+                return std::move(*done);
             }
-
             if (std::chrono::steady_clock::now() >= deadline) {
                 Response r; r.error = true; return r;
             }
-
             if (!ReadAndProcess(100)) {
                 Response r; r.error = true; return r;
             }
@@ -358,53 +318,12 @@ public:
                         std::chrono::milliseconds(IO_TIMEOUT_MS);
 
         while (true) {
-            auto it = streams_.find(stream_id);
-            // Wait until parent is done AND every promised child of that
-            // parent has finished. Without this, tests that exercise push
-            // would race the pushed streams' completion against return.
-            if (it != streams_.end() && it->second.done) {
-                bool any_promised_pending = false;
-                for (const auto& [id, st] : streams_) {
-                    if (st.parent_id == stream_id && !st.done) {
-                        any_promised_pending = true;
-                        break;
-                    }
-                }
-                if (!any_promised_pending) {
-                    Response resp;
-                    resp.status           = it->second.status;
-                    resp.body             = it->second.body;
-                    resp.rst              = it->second.rst;
-                    resp.interim_statuses = std::move(it->second.interim_statuses);
-                    resp.interim_headers  = std::move(it->second.interim_headers);
-                    // Collect pushed children before erasing.
-                    for (auto sit = streams_.begin(); sit != streams_.end();) {
-                        if (sit->second.parent_id == stream_id) {
-                            PushedStream ps;
-                            ps.promised_stream_id = sit->first;
-                            ps.method    = std::move(sit->second.promise_method);
-                            ps.scheme    = std::move(sit->second.promise_scheme);
-                            ps.authority = std::move(sit->second.promise_authority);
-                            ps.path      = std::move(sit->second.promise_path);
-                            ps.status    = sit->second.status;
-                            ps.body      = std::move(sit->second.body);
-                            ps.rst       = sit->second.rst;
-                            ps.done      = sit->second.done;
-                            resp.pushed.push_back(std::move(ps));
-                            sit = streams_.erase(sit);
-                        } else {
-                            ++sit;
-                        }
-                    }
-                    streams_.erase(stream_id);
-                    return resp;
-                }
+            if (auto done = CollectCompletedResponse(stream_id)) {
+                return std::move(*done);
             }
-
             if (std::chrono::steady_clock::now() >= deadline) {
                 Response r; r.error = true; return r;
             }
-
             if (!ReadAndProcess(100)) {
                 Response r; r.error = true; return r;
             }
@@ -449,6 +368,44 @@ private:
     // initial SETTINGS — used by tests verifying the server's
     // peer-refused branch in PushEnabled().
     bool refuse_pushes_in_client_settings_ = false;
+
+    // Build the Response for `stream_id` once the parent is done AND every
+    // promised child has finished. Returns nullopt while any child is still
+    // in flight so the caller keeps polling. Extracted so SendRequest and
+    // SendRequestRaw share identical completion semantics.
+    std::optional<Response> CollectCompletedResponse(int32_t stream_id) {
+        auto it = streams_.find(stream_id);
+        if (it == streams_.end() || !it->second.done) return std::nullopt;
+        for (const auto& [id, st] : streams_) {
+            if (st.parent_id == stream_id && !st.done) return std::nullopt;
+        }
+        Response resp;
+        resp.status           = it->second.status;
+        resp.body             = it->second.body;
+        resp.rst              = it->second.rst;
+        resp.interim_statuses = std::move(it->second.interim_statuses);
+        resp.interim_headers  = std::move(it->second.interim_headers);
+        for (auto sit = streams_.begin(); sit != streams_.end();) {
+            if (sit->second.parent_id == stream_id) {
+                PushedStream ps;
+                ps.promised_stream_id = sit->first;
+                ps.method    = std::move(sit->second.promise_method);
+                ps.scheme    = std::move(sit->second.promise_scheme);
+                ps.authority = std::move(sit->second.promise_authority);
+                ps.path      = std::move(sit->second.promise_path);
+                ps.status    = sit->second.status;
+                ps.body      = std::move(sit->second.body);
+                ps.rst       = sit->second.rst;
+                ps.done      = sit->second.done;
+                resp.pushed.push_back(std::move(ps));
+                sit = streams_.erase(sit);
+            } else {
+                ++sit;
+            }
+        }
+        streams_.erase(stream_id);
+        return resp;
+    }
 
     // ---- Raw I/O ----
 

@@ -18,6 +18,26 @@
 thread_local HTTP_CALLBACKS_NAMESPACE::ResourcePusher*
     HttpServer::current_sync_pusher_ = nullptr;
 
+// Factory for the H2 ResourcePusher closure. Both the async (bound on
+// the AsyncHandler signature) and sync (installed into
+// HttpServer::current_sync_pusher_) paths need the same weak_ptr +
+// stream_id capture; factoring here avoids drift between them and keeps
+// the binding logic in one place.
+static HTTP_CALLBACKS_NAMESPACE::ResourcePusher
+MakeH2ResourcePusher(std::weak_ptr<Http2ConnectionHandler> h2_weak,
+                     int32_t stream_id) {
+    return [h2_weak, stream_id](const std::string& method,
+                                 const std::string& scheme,
+                                 const std::string& authority,
+                                 const std::string& path,
+                                 const HttpResponse& resp) -> int32_t {
+        auto h2 = h2_weak.lock();
+        if (!h2) return -1;
+        return h2->PushResource(stream_id, method, scheme,
+                                authority, path, resp);
+    };
+}
+
 namespace http {
 
 int32_t PushResource(const std::string& method,
@@ -3126,18 +3146,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     if (!h2) return;
                     h2->SendInterimResponse(stream_id, status_code, hdrs);
                 };
-                auto push_resource =
-                    [h2_weak, stream_id](
-                        const std::string& method,
-                        const std::string& scheme,
-                        const std::string& authority,
-                        const std::string& path,
-                        const HttpResponse& resp) -> int32_t {
-                    auto h2 = h2_weak.lock();
-                    if (!h2) return -1;
-                    return h2->PushResource(stream_id, method, scheme,
-                                            authority, path, resp);
-                };
+                auto push_resource = MakeH2ResourcePusher(h2_weak, stream_id);
                 try {
                     if (async_head_fallback) {
                         HttpRequest get_req = request;
@@ -3194,20 +3203,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
             // — the closure delegates to PushResource which enforces
             // both checks. The scope guard guarantees the thread-local
             // never dangles past the dispatch (even on exception).
-            std::weak_ptr<Http2ConnectionHandler> h2_weak_sync = self;
-            int32_t sync_stream_id = stream_id;
             HTTP_CALLBACKS_NAMESPACE::ResourcePusher sync_pusher =
-                [h2_weak_sync, sync_stream_id](
-                    const std::string& method,
-                    const std::string& scheme,
-                    const std::string& authority,
-                    const std::string& path,
-                    const HttpResponse& resp) -> int32_t {
-                auto h2 = h2_weak_sync.lock();
-                if (!h2) return -1;
-                return h2->PushResource(sync_stream_id, method, scheme,
-                                        authority, path, resp);
-            };
+                MakeH2ResourcePusher(self, stream_id);
             HttpServer::current_sync_pusher_ = &sync_pusher;
             struct PusherSlotGuard {
                 ~PusherSlotGuard() { HttpServer::current_sync_pusher_ = nullptr; }
