@@ -775,6 +775,187 @@ void TestHalfOpenFullCounterSeparate() {
     }
 }
 
+// BUG (review round 2, P2): Reload preserved stale state across enabled
+// toggles. Disabling while OPEN and re-enabling later resumed the OPEN state,
+// rejecting requests despite an explicit operator off→on cycle. Disabling
+// after accumulated consecutive failures would re-trip on the very next
+// failure. Fix: reset state to CLOSED whenever enabled toggles.
+void TestReloadResetsStateOnEnabledToggleWhileOpen() {
+    std::cout << "\n[TEST] CB: reload resets state on enabled toggle (while OPEN)..."
+              << std::endl;
+    try {
+        auto cb = DefaultEnabledConfig();
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Drive to OPEN.
+        for (int i = 0; i < 5; ++i) {
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        }
+        if (slice.CurrentState() != State::OPEN) {
+            TestFramework::RecordTest(
+                "CB: reload resets state on enabled toggle (OPEN)", false,
+                "precondition: slice not OPEN",
+                TestFramework::TestCategory::OTHER);
+            return;
+        }
+
+        // Disable via reload — state must reset to CLOSED.
+        auto disabled = cb;
+        disabled.enabled = false;
+        slice.Reload(disabled);
+        bool disabled_closed = slice.CurrentState() == State::CLOSED;
+
+        // Re-enable via reload — state must remain CLOSED (no stale OPEN).
+        slice.Reload(cb);
+        bool reenabled_closed = slice.CurrentState() == State::CLOSED;
+
+        // And the slice must NOT insta-trip on a single failure (pre-fix,
+        // consecutive_failures_ could have persisted ≥ threshold).
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        bool one_fail_no_trip = slice.CurrentState() == State::CLOSED;
+
+        bool pass = disabled_closed && reenabled_closed && one_fail_no_trip;
+        TestFramework::RecordTest(
+            "CB: reload resets state on enabled toggle (OPEN)", pass,
+            pass ? "" : "disabled_closed=" + std::to_string(disabled_closed) +
+                        " reenabled_closed=" + std::to_string(reenabled_closed) +
+                        " one_fail_no_trip=" + std::to_string(one_fail_no_trip),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: reload resets state on enabled toggle (OPEN)", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// BUG (review round 2, P2, variant): if disable happens while
+// consecutive_failures_ has accumulated but not yet tripped, re-enable would
+// inherit that count and trip early on the next failure.
+void TestReloadResetsConsecutiveFailuresOnEnabledToggle() {
+    std::cout << "\n[TEST] CB: reload clears consecutive_failures on enable toggle..."
+              << std::endl;
+    try {
+        auto cb = DefaultEnabledConfig();
+        cb.consecutive_failure_threshold = 5;
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // 4 failures — just under threshold. State still CLOSED.
+        for (int i = 0; i < 4; ++i) {
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        }
+        if (slice.CurrentState() != State::CLOSED) {
+            TestFramework::RecordTest(
+                "CB: reload clears consecutive_failures", false,
+                "precondition: slice not CLOSED",
+                TestFramework::TestCategory::OTHER);
+            return;
+        }
+
+        // Disable then re-enable.
+        auto disabled = cb; disabled.enabled = false;
+        slice.Reload(disabled);
+        slice.Reload(cb);
+
+        // A single failure post-reenable must NOT trip — consecutive_failures_
+        // should have been reset to 0, not preserved at 4.
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        bool pass = slice.CurrentState() == State::CLOSED;
+        TestFramework::RecordTest(
+            "CB: reload clears consecutive_failures on enable toggle",
+            pass,
+            pass ? "" : "expected CLOSED after 1 post-reenable failure, got " +
+                        std::string(circuit_breaker::StateName(slice.CurrentState())),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: reload clears consecutive_failures on enable toggle",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Threshold-change-only reload (enabled unchanged) MUST preserve live state
+// per design §10. Regression guard for fix #1.
+void TestReloadThresholdChangePreservesState() {
+    std::cout << "\n[TEST] CB: reload preserves state when only thresholds change..."
+              << std::endl;
+    try {
+        auto cb = DefaultEnabledConfig();
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        for (int i = 0; i < 5; ++i) {
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        }
+        // OPEN. Reload with a tighter threshold but enabled unchanged.
+        auto tighter = cb;
+        tighter.consecutive_failure_threshold = 2;
+        slice.Reload(tighter);
+        // State must remain OPEN — live state preservation.
+        bool pass = slice.CurrentState() == State::OPEN;
+        TestFramework::RecordTest(
+            "CB: reload preserves state on threshold-only change",
+            pass, pass ? "" : "expected OPEN, got " +
+                              std::string(circuit_breaker::StateName(slice.CurrentState())),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: reload preserves state on threshold-only change", false,
+            e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// BUG (review round 2, P3): saw_failure short-circuit incorrectly bumped the
+// HALF_OPEN_FULL counter, polluting dashboards that need to distinguish
+// "probing, no capacity left" from "recovery attempt is failing".
+void TestSawFailureDoesNotBumpHalfOpenFullCounter() {
+    std::cout << "\n[TEST] CB: saw_failure reject does not bump HALF_OPEN_FULL..."
+              << std::endl;
+    try {
+        auto cb = DefaultEnabledConfig();
+        cb.permitted_half_open_calls = 5;  // plenty of capacity
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        for (int i = 0; i < 5; ++i) {
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        }
+        clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
+
+        // Admit 2 probes, fail the first — saw_failure=true, inflight=1.
+        slice.TryAcquire();  // probe 1 admitted
+        slice.TryAcquire();  // probe 2 admitted
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, true);
+
+        int64_t hof_before = slice.RejectedHalfOpenFull();
+        // Reject via saw_failure short-circuit (capacity is NOT exhausted —
+        // only 1 probe actually in flight, and permitted is 5).
+        Decision d = slice.TryAcquire();
+        int64_t hof_after = slice.RejectedHalfOpenFull();
+
+        // Still REJECTED_OPEN (same client-visible outcome), but
+        // RejectedHalfOpenFull must NOT be incremented — this is a
+        // "recovery failing" reject, not a capacity reject.
+        bool pass = d == Decision::REJECTED_OPEN &&
+                    hof_before == 0 &&
+                    hof_after == 0;
+        TestFramework::RecordTest(
+            "CB: saw_failure reject does not bump HALF_OPEN_FULL",
+            pass, pass ? "" : "hof_before=" + std::to_string(hof_before) +
+                              " hof_after=" + std::to_string(hof_after),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: saw_failure reject does not bump HALF_OPEN_FULL",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestTransitionCallbackInvoked() {
     std::cout << "\n[TEST] CB: transition callback invoked..." << std::endl;
     try {
@@ -842,6 +1023,10 @@ void RunAllTests() {
     TestLateSuccessAfterTripIgnored();
     TestHalfOpenStopsAdmittingAfterFirstProbeFailure();
     TestHalfOpenFullCounterSeparate();
+    TestReloadResetsStateOnEnabledToggleWhileOpen();
+    TestReloadResetsConsecutiveFailuresOnEnabledToggle();
+    TestReloadThresholdChangePreservesState();
+    TestSawFailureDoesNotBumpHalfOpenFullCounter();
     TestTransitionCallbackInvoked();
 }
 

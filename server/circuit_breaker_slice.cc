@@ -99,6 +99,12 @@ void CircuitBreakerSlice::TransitionOpenToHalfOpen() {
     half_open_inflight_ = 0;
     half_open_successes_ = 0;
     half_open_saw_failure_ = false;
+    // Reset the info-log "first reject" breadcrumb so the first rejection
+    // observed in the HALF_OPEN phase surfaces at info, not debug. HALF_OPEN
+    // rejection (recovery attempt failing or probe budget full) is
+    // operationally distinct from OPEN rejection (still backing off) and
+    // deserves its own breadcrumb in default-warn operator logs.
+    first_reject_logged_for_open_ = false;
 
     logging::Get()->info(
         "circuit breaker half-open {} probes_allowed={}",
@@ -187,14 +193,20 @@ Decision CircuitBreakerSlice::TryAcquire() {
     }
 
     if (s == State::HALF_OPEN) {
-        // Short-circuit as soon as any probe has failed: the breaker is
-        // guaranteed to re-trip once the remaining in-flight probes drain, so
-        // admitting more probes just wastes capacity on a known-bad upstream.
-        // Previously this path kept admitting probes until `permitted_half_open_calls`
-        // in-flight was reached, which under continued failure could keep
-        // traffic flowing indefinitely instead of converging back to OPEN.
-        if (half_open_saw_failure_ ||
-            half_open_inflight_ >= config_.permitted_half_open_calls) {
+        // Case A: a sibling probe already failed. Short-circuit remaining
+        // admissions — the breaker is guaranteed to re-trip once in-flight
+        // probes drain. This is operationally DIFFERENT from "budget
+        // exhausted" (case B): probe slots may still be free, we just know
+        // using them can't change the outcome. Track it with its own log
+        // label and do NOT bump `rejected_half_open_full_` — that counter
+        // is specifically "probing, no capacity left" for dashboards.
+        if (half_open_saw_failure_) {
+            return RejectWithLog("half_open_recovery_failing",
+                                 /*half_open_full=*/false);
+        }
+        // Case B: probe budget fully in flight. "No capacity" — bump the
+        // dedicated counter so dashboards can tell these two apart.
+        if (half_open_inflight_ >= config_.permitted_half_open_calls) {
             return RejectWithLog("half_open_full", /*half_open_full=*/true);
         }
         half_open_inflight_++;
@@ -244,9 +256,20 @@ void CircuitBreakerSlice::ReportSuccess(bool probe) {
     if (!config_.enabled) return;
 
     if (probe) {
+        // Record the completed-probe outcome for observability regardless of
+        // current state — this is a signal about upstream behavior, not a
+        // signal about our state machine.
         probe_successes_.fetch_add(1, std::memory_order_relaxed);
-        // Count the completed probe regardless of saw_failure state (we still
-        // decrement inflight to release the slot).
+
+        // Stale probe defense: we admitted this probe in HALF_OPEN, but the
+        // slice may have transitioned out (e.g., `Reload()` flipped enabled
+        // or resized the window, `TransitionHalfOpenToClosed` already fired
+        // on sibling probes, or — post-Phase 8 — an operator toggle
+        // transitioned us to CLOSED). Only touch HALF_OPEN bookkeeping /
+        // fire transitions when state is STILL HALF_OPEN. Otherwise the
+        // probe is informational only.
+        if (state_.load(std::memory_order_acquire) != State::HALF_OPEN) return;
+
         if (half_open_inflight_ > 0) half_open_inflight_--;
         if (half_open_saw_failure_) {
             // A sibling probe already failed; whichever probe finishes last
@@ -280,6 +303,10 @@ void CircuitBreakerSlice::ReportFailure(FailureKind kind, bool probe) {
 
     if (probe) {
         probe_failures_.fetch_add(1, std::memory_order_relaxed);
+
+        // Stale probe defense — see matching comment in ReportSuccess above.
+        if (state_.load(std::memory_order_acquire) != State::HALF_OPEN) return;
+
         if (half_open_inflight_ > 0) half_open_inflight_--;
         half_open_saw_failure_ = true;
         // On the last probe (or if all remaining complete) transition OPEN.
@@ -309,18 +336,52 @@ void CircuitBreakerSlice::ReportFailure(FailureKind kind, bool probe) {
 }
 
 void CircuitBreakerSlice::Reload(const CircuitBreakerConfig& new_config) {
-    bool window_changed = (config_.window_seconds != new_config.window_seconds);
+    const bool enabled_changed = (config_.enabled != new_config.enabled);
+    const bool window_changed =
+        (config_.window_seconds != new_config.window_seconds);
+
     config_ = new_config;
     if (window_changed) window_.Resize(new_config.window_seconds);
-    // Live state preserved — operator expects new thresholds to apply to the
-    // next evaluation, not to reset an in-progress trip.
+
+    if (enabled_changed) {
+        // Toggling `enabled` is an operator intent to start fresh, not a
+        // runtime state transition. Without this reset:
+        //   - Disabling while OPEN and re-enabling later would resume the
+        //     OPEN state and reject requests even though the operator
+        //     explicitly turned the breaker off and back on.
+        //   - Disabling while HALF_OPEN with in-flight probes would leave
+        //     inconsistent bookkeeping (inflight > 0, state=HALF_OPEN) that
+        //     a subsequent enable would interpret as live probes.
+        //   - Disabling mid-CLOSED-cycle and re-enabling would trip on the
+        //     very next failure because consecutive_failures_ persisted.
+        // Matches design doc §10.1 (enabled→disabled / disabled→enabled
+        // transitions both get a clean CLOSED start).
+        //
+        // Silent reset — no transition callback. The change is operator-
+        // initiated configuration, not a runtime state signal; firing the
+        // callback would cause PoolPartition::DrainWaitQueueOnTrip-style
+        // consumers (Phase 6) to spuriously drain waiters on a config edit.
+        state_.store(State::CLOSED, std::memory_order_release);
+        open_until_steady_ns_.store(0, std::memory_order_release);
+        consecutive_trips_.store(0, std::memory_order_relaxed);
+        consecutive_failures_ = 0;
+        window_.Reset();
+        half_open_inflight_ = 0;
+        half_open_successes_ = 0;
+        half_open_saw_failure_ = false;
+        first_reject_logged_for_open_ = false;
+    }
+    // When `enabled` is unchanged: live state preserved — operator expects
+    // new thresholds to apply to the next evaluation, not to reset an
+    // in-progress trip.
 
     logging::Get()->info(
         "circuit breaker config applied {} enabled={} window_s={} "
-        "fail_rate={} consec_threshold={}",
+        "fail_rate={} consec_threshold={}{}",
         host_label_, new_config.enabled, new_config.window_seconds,
         new_config.failure_rate_threshold,
-        new_config.consecutive_failure_threshold);
+        new_config.consecutive_failure_threshold,
+        enabled_changed ? " (enabled toggled — state reset to CLOSED)" : "");
 }
 
 void CircuitBreakerSlice::SetTransitionCallback(StateTransitionCallback cb) {
