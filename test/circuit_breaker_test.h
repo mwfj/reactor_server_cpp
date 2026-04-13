@@ -56,12 +56,12 @@ void TestDisabledFastPath() {
         CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
             [clock]() { return clock->now; });
 
-        bool pass = slice.TryAcquire() == Decision::ADMITTED &&
+        bool pass = slice.TryAcquire().decision == Decision::ADMITTED &&
                     slice.CurrentState() == State::CLOSED;
 
         // Reporting 100 failures must not trip.
         for (int i = 0; i < 100; ++i) {
-            slice.ReportFailure(FailureKind::CONNECT_FAILURE, false);
+            slice.ReportFailure(FailureKind::CONNECT_FAILURE, false, slice.CurrentGenerationForTesting());
         }
         pass = pass && slice.CurrentState() == State::CLOSED &&
                slice.Trips() == 0;
@@ -83,10 +83,10 @@ void TestClosedStaysClosedBelowConsecutiveThreshold() {
             [clock]() { return clock->now; });
 
         for (int i = 0; i < 4; ++i) {
-            slice.ReportFailure(FailureKind::CONNECT_FAILURE, false);
+            slice.ReportFailure(FailureKind::CONNECT_FAILURE, false, slice.CurrentGenerationForTesting());
         }
         bool pass = slice.CurrentState() == State::CLOSED &&
-                    slice.TryAcquire() == Decision::ADMITTED &&
+                    slice.TryAcquire().decision == Decision::ADMITTED &&
                     slice.Trips() == 0;
         TestFramework::RecordTest("CB: 4 failures below threshold", pass, "",
             TestFramework::TestCategory::OTHER);
@@ -105,11 +105,11 @@ void TestConsecutiveFailureTrip() {
             [clock]() { return clock->now; });
 
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         bool pass = slice.CurrentState() == State::OPEN &&
                     slice.Trips() == 1 &&
-                    slice.TryAcquire() == Decision::REJECTED_OPEN;
+                    slice.TryAcquire().decision == Decision::REJECTED_OPEN;
         TestFramework::RecordTest("CB: 5 consecutive failures trip", pass, "",
             TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
@@ -130,17 +130,17 @@ void TestFailureRateTrip() {
         // Alternate 10 failures and 10 successes within the same second —
         // ratio = 50%, total = 20 (>= minimum_volume).
         for (int i = 0; i < 10; ++i) {
-            slice.ReportSuccess(false);
+            slice.ReportSuccess(false, slice.CurrentGenerationForTesting());
         }
         // A success between-failures clears consecutive_failures_, confirming
         // only rate path can trip here.
         for (int i = 0; i < 9; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         // Still CLOSED — 9/19 < 50%.
         bool pass_pre = slice.CurrentState() == State::CLOSED;
         // 10th failure brings ratio to 10/20 = 50% exactly — tripper.
-        slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         bool pass = pass_pre && slice.CurrentState() == State::OPEN &&
                     slice.Trips() == 1;
         TestFramework::RecordTest("CB: failure-rate trip (50% of 20)", pass, "",
@@ -163,7 +163,7 @@ void TestMinimumVolumeGate() {
 
         // 19 total calls, all failures — should NOT trip (below volume).
         for (int i = 0; i < 19; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         bool pass = slice.CurrentState() == State::CLOSED && slice.Trips() == 0;
         TestFramework::RecordTest("CB: minimum_volume gate", pass, "",
@@ -183,11 +183,11 @@ void TestOpenBeforeDurationStaysOpen() {
             [clock]() { return clock->now; });
 
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         // Advance less than base_open_duration_ms (5000ms).
         clock->Advance(std::chrono::milliseconds(2000));
-        Decision d = slice.TryAcquire();
+        Decision d = slice.TryAcquire().decision;
         bool pass = d == Decision::REJECTED_OPEN &&
                     slice.CurrentState() == State::OPEN;
         TestFramework::RecordTest("CB: OPEN rejects before elapsed", pass, "",
@@ -207,10 +207,10 @@ void TestOpenToHalfOpenAfterDuration() {
             [clock]() { return clock->now; });
 
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
-        Decision d = slice.TryAcquire();
+        Decision d = slice.TryAcquire().decision;
         bool pass = d == Decision::ADMITTED_PROBE &&
                     slice.CurrentState() == State::HALF_OPEN;
         TestFramework::RecordTest("CB: OPEN -> HALF_OPEN after duration", pass, "",
@@ -230,13 +230,13 @@ void TestHalfOpenAllProbesSucceed() {
             [clock]() { return clock->now; });
 
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
 
         // Take 5 probes; report success on each.
         for (int i = 0; i < cb.permitted_half_open_calls; ++i) {
-            Decision d = slice.TryAcquire();
+            Decision d = slice.TryAcquire().decision;
             if (d != Decision::ADMITTED_PROBE) {
                 TestFramework::RecordTest(
                     "CB: HALF_OPEN 5 probe successes close", false,
@@ -244,7 +244,7 @@ void TestHalfOpenAllProbesSucceed() {
                     TestFramework::TestCategory::OTHER);
                 return;
             }
-            slice.ReportSuccess(true);
+            slice.ReportSuccess(true, slice.CurrentGenerationForTesting());
         }
         bool pass = slice.CurrentState() == State::CLOSED &&
                     slice.ProbeSuccesses() == 5;
@@ -265,13 +265,13 @@ void TestHalfOpenProbeFailureReopens() {
             [clock]() { return clock->now; });
 
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
 
         // Take 1 probe, fail it.
-        Decision d = slice.TryAcquire();
-        slice.ReportFailure(FailureKind::RESPONSE_5XX, true);
+        Decision d = slice.TryAcquire().decision;
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, true, slice.CurrentGenerationForTesting());
         bool pass = d == Decision::ADMITTED_PROBE &&
                     slice.CurrentState() == State::OPEN &&
                     slice.Trips() == 2 &&  // initial trip + re-trip
@@ -293,13 +293,13 @@ void TestHalfOpenExhaustedSlotsRejected() {
             [clock]() { return clock->now; });
 
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
         // Take 5 probes but DON'T report outcomes yet.
         for (int i = 0; i < 5; ++i) slice.TryAcquire();
         // 6th TryAcquire must reject (all slots taken).
-        Decision d = slice.TryAcquire();
+        Decision d = slice.TryAcquire().decision;
         bool pass = d == Decision::REJECTED_OPEN;
         TestFramework::RecordTest("CB: HALF_OPEN over capacity rejects",
             pass, "", TestFramework::TestCategory::OTHER);
@@ -322,7 +322,7 @@ void TestExponentialBackoff() {
         auto trip_then_probe_fail = [&]() {
             // Reach OPEN.
             for (int i = 0; i < 5; ++i) {
-                slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+                slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
             }
         };
         auto measure_open_ms = [&]() {
@@ -339,19 +339,19 @@ void TestExponentialBackoff() {
         // Move to HALF_OPEN and fail the probe → trip 2.
         clock->Advance(std::chrono::milliseconds(d1 + 1));
         slice.TryAcquire();  // HALF_OPEN, ADMITTED_PROBE
-        slice.ReportFailure(FailureKind::RESPONSE_5XX, true);
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, true, slice.CurrentGenerationForTesting());
         int64_t d2 = measure_open_ms();
         clock->Advance(std::chrono::milliseconds(d2 + 1));
         slice.TryAcquire();
-        slice.ReportFailure(FailureKind::RESPONSE_5XX, true);
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, true, slice.CurrentGenerationForTesting());
         int64_t d3 = measure_open_ms();
         clock->Advance(std::chrono::milliseconds(d3 + 1));
         slice.TryAcquire();
-        slice.ReportFailure(FailureKind::RESPONSE_5XX, true);
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, true, slice.CurrentGenerationForTesting());
         int64_t d4 = measure_open_ms();
         clock->Advance(std::chrono::milliseconds(d4 + 1));
         slice.TryAcquire();
-        slice.ReportFailure(FailureKind::RESPONSE_5XX, true);
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, true, slice.CurrentGenerationForTesting());
         int64_t d5 = measure_open_ms();
 
         // Expect 1000, 2000, 4000, 8000, 8000 (capped).
@@ -379,17 +379,17 @@ void TestResetOnClose() {
 
         // Trip 1.
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         clock->Advance(std::chrono::milliseconds(1001));
         // Move to HALF_OPEN.
         for (int i = 0; i < 5; ++i) {
             slice.TryAcquire();
-            slice.ReportSuccess(true);
+            slice.ReportSuccess(true, slice.CurrentGenerationForTesting());
         }
         // Now CLOSED. Trip again — expect base_duration again (not doubled).
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         auto open_until = slice.OpenUntil();
         auto remaining = open_until - clock->now;
@@ -496,10 +496,10 @@ void TestDryRunAdmits() {
             [clock]() { return clock->now; });
 
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         // OPEN + dry_run → REJECTED_OPEN_DRYRUN (caller proceeds).
-        Decision d = slice.TryAcquire();
+        Decision d = slice.TryAcquire().decision;
         bool pass = d == Decision::REJECTED_OPEN_DRYRUN &&
                     slice.CurrentState() == State::OPEN &&
                     slice.Rejected() == 1;
@@ -520,7 +520,7 @@ void TestReloadPreservesState() {
             [clock]() { return clock->now; });
 
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         // OPEN at this point.
         auto cb2 = cb;
@@ -545,7 +545,7 @@ void TestConsecutiveThresholdOne() {
         auto clock = std::make_shared<MockClock>();
         CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
             [clock]() { return clock->now; });
-        slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         bool pass = slice.CurrentState() == State::OPEN && slice.Trips() == 1;
         TestFramework::RecordTest("CB: threshold=1 single failure trips",
             pass, "", TestFramework::TestCategory::OTHER);
@@ -564,10 +564,10 @@ void TestSuccessClearsConsecutive() {
             [clock]() { return clock->now; });
 
         for (int i = 0; i < 4; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
-        slice.ReportSuccess(false);  // resets consecutive
-        slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        slice.ReportSuccess(false, slice.CurrentGenerationForTesting());  // resets consecutive
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         // consecutive is back to 1, no trip.
         bool pass = slice.CurrentState() == State::CLOSED;
         TestFramework::RecordTest("CB: success clears consecutive", pass, "",
@@ -601,7 +601,7 @@ void TestLateFailureAfterTripDoesNotInflateBackoff() {
         // production the outcomes for those admitted requests can arrive after
         // the slice has already tripped.
         for (int i = 0; i < 10; ++i) {
-            Decision d = slice.TryAcquire();
+            Decision d = slice.TryAcquire().decision;
             if (d != Decision::ADMITTED) {
                 TestFramework::RecordTest("CB: late failure after trip",
                     false, "admission i=" + std::to_string(i) + " not ADMITTED",
@@ -611,7 +611,7 @@ void TestLateFailureAfterTripDoesNotInflateBackoff() {
         }
         // Report 5 failures — trip at the 5th.
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         if (slice.CurrentState() != State::OPEN) {
             TestFramework::RecordTest("CB: late failure after trip", false,
@@ -628,7 +628,7 @@ void TestLateFailureAfterTripDoesNotInflateBackoff() {
         // climb consecutive_failures_, and trigger another TripClosedToOpen
         // even though state is already OPEN.
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         int64_t trips_after_late = slice.Trips();
         auto open_until_after_late = slice.OpenUntil();
@@ -661,11 +661,11 @@ void TestLateSuccessAfterTripIgnored() {
             [clock]() { return clock->now; });
 
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         // Slice is OPEN now. A late success arrives — must not change state.
         State pre = slice.CurrentState();
-        slice.ReportSuccess(false);
+        slice.ReportSuccess(false, slice.CurrentGenerationForTesting());
         bool pass = pre == State::OPEN && slice.CurrentState() == State::OPEN;
         TestFramework::RecordTest("CB: late success after trip ignored", pass,
             "", TestFramework::TestCategory::OTHER);
@@ -691,14 +691,14 @@ void TestHalfOpenStopsAdmittingAfterFirstProbeFailure() {
 
         // Trip the breaker.
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
 
         // Admit 2 probes. Report failure on the first (but NOT the second yet
         // — leave 1 in-flight so we can observe the short-circuit).
-        Decision d1 = slice.TryAcquire();   // ADMITTED_PROBE, inflight=1
-        Decision d2 = slice.TryAcquire();   // ADMITTED_PROBE, inflight=2
+        Decision d1 = slice.TryAcquire().decision;   // ADMITTED_PROBE, inflight=1
+        Decision d2 = slice.TryAcquire().decision;   // ADMITTED_PROBE, inflight=2
         if (d1 != Decision::ADMITTED_PROBE || d2 != Decision::ADMITTED_PROBE) {
             TestFramework::RecordTest(
                 "CB: HALF_OPEN stops admitting after probe fail",
@@ -708,7 +708,7 @@ void TestHalfOpenStopsAdmittingAfterFirstProbeFailure() {
         }
         // Fail the first probe — inflight drops to 1, saw_failure=true.
         // Last-probe trip does not yet fire (inflight is still 1).
-        slice.ReportFailure(FailureKind::RESPONSE_5XX, true);
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, true, slice.CurrentGenerationForTesting());
 
         // State must still be HALF_OPEN (final probe not yet completed).
         State mid = slice.CurrentState();
@@ -716,7 +716,7 @@ void TestHalfOpenStopsAdmittingAfterFirstProbeFailure() {
         // Subsequent TryAcquire — BEFORE fix this would succeed because
         // inflight (1) < permitted (5). AFTER fix it short-circuits because
         // saw_failure is set.
-        Decision d3 = slice.TryAcquire();
+        Decision d3 = slice.TryAcquire().decision;
 
         bool pass = mid == State::HALF_OPEN &&
                     d3 == Decision::REJECTED_OPEN;
@@ -745,7 +745,7 @@ void TestHalfOpenFullCounterSeparate() {
 
         // Trip → OPEN reject increments generic counter only.
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         slice.TryAcquire();  // REJECTED_OPEN (backoff active)
         int64_t rejected_open_only = slice.Rejected();
@@ -791,7 +791,7 @@ void TestReloadResetsStateOnEnabledToggleWhileOpen() {
 
         // Drive to OPEN.
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         if (slice.CurrentState() != State::OPEN) {
             TestFramework::RecordTest(
@@ -813,7 +813,7 @@ void TestReloadResetsStateOnEnabledToggleWhileOpen() {
 
         // And the slice must NOT insta-trip on a single failure (pre-fix,
         // consecutive_failures_ could have persisted ≥ threshold).
-        slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         bool one_fail_no_trip = slice.CurrentState() == State::CLOSED;
 
         bool pass = disabled_closed && reenabled_closed && one_fail_no_trip;
@@ -845,7 +845,7 @@ void TestReloadResetsConsecutiveFailuresOnEnabledToggle() {
 
         // 4 failures — just under threshold. State still CLOSED.
         for (int i = 0; i < 4; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         if (slice.CurrentState() != State::CLOSED) {
             TestFramework::RecordTest(
@@ -862,7 +862,7 @@ void TestReloadResetsConsecutiveFailuresOnEnabledToggle() {
 
         // A single failure post-reenable must NOT trip — consecutive_failures_
         // should have been reset to 0, not preserved at 4.
-        slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         bool pass = slice.CurrentState() == State::CLOSED;
         TestFramework::RecordTest(
             "CB: reload clears consecutive_failures on enable toggle",
@@ -889,7 +889,7 @@ void TestReloadThresholdChangePreservesState() {
             [clock]() { return clock->now; });
 
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         // OPEN. Reload with a tighter threshold but enabled unchanged.
         auto tighter = cb;
@@ -923,19 +923,19 @@ void TestSawFailureDoesNotBumpHalfOpenFullCounter() {
             [clock]() { return clock->now; });
 
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
 
         // Admit 2 probes, fail the first — saw_failure=true, inflight=1.
         slice.TryAcquire();  // probe 1 admitted
         slice.TryAcquire();  // probe 2 admitted
-        slice.ReportFailure(FailureKind::RESPONSE_5XX, true);
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, true, slice.CurrentGenerationForTesting());
 
         int64_t hof_before = slice.RejectedHalfOpenFull();
         // Reject via saw_failure short-circuit (capacity is NOT exhausted —
         // only 1 probe actually in flight, and permitted is 5).
-        Decision d = slice.TryAcquire();
+        Decision d = slice.TryAcquire().decision;
         int64_t hof_after = slice.RejectedHalfOpenFull();
 
         // Still REJECTED_OPEN (same client-visible outcome), but
@@ -952,6 +952,289 @@ void TestSawFailureDoesNotBumpHalfOpenFullCounter() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "CB: saw_failure reject does not bump HALF_OPEN_FULL",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// BUG (review round 3, P2): TransitionOpenToHalfOpen deliberately left
+// `open_until_steady_ns_` populated, violating the documented OpenUntil()
+// contract ("zero when not OPEN"). A Phase 4 consumer computing Retry-After
+// from a HALF_OPEN slice would compute (stale_deadline - now), which is
+// negative once HALF_OPEN begins.
+void TestOpenUntilZeroWhenHalfOpen() {
+    std::cout << "\n[TEST] CB: OpenUntil() zero in HALF_OPEN..." << std::endl;
+    try {
+        auto cb = DefaultEnabledConfig();
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Trip → OPEN. OpenUntil() must be non-zero (contract: zero iff NOT OPEN).
+        for (int i = 0; i < 5; ++i) {
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false,
+                                slice.CurrentGenerationForTesting());
+        }
+        auto open_ns = slice.OpenUntil();
+        bool open_nonzero = open_ns != std::chrono::steady_clock::time_point{};
+
+        // Elapse backoff → HALF_OPEN via TryAcquire.
+        clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
+        auto a = slice.TryAcquire();
+        bool halfopen = slice.CurrentState() == State::HALF_OPEN &&
+                        a.decision == Decision::ADMITTED_PROBE;
+
+        // Contract: OpenUntil() zero now that state != OPEN.
+        auto halfopen_ns = slice.OpenUntil();
+        bool halfopen_zero = halfopen_ns == std::chrono::steady_clock::time_point{};
+
+        bool pass = open_nonzero && halfopen && halfopen_zero;
+        TestFramework::RecordTest(
+            "CB: OpenUntil() zero in HALF_OPEN",
+            pass, pass ? "" :
+                  "open_nonzero=" + std::to_string(open_nonzero) +
+                  " halfopen=" + std::to_string(halfopen) +
+                  " halfopen_zero=" + std::to_string(halfopen_zero),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: OpenUntil() zero in HALF_OPEN",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// BUG (review round 3, P1): Reload reset the state on enabled toggle but
+// gave Report* no way to distinguish pre-toggle admissions from post-toggle
+// ones. Stale completions then polluted the fresh CLOSED cycle. Fixed with
+// a generation token captured at admission and checked at report.
+void TestStaleGenerationReportsDroppedAfterReloadToggle() {
+    std::cout << "\n[TEST] CB: stale-generation reports dropped after reload toggle..."
+              << std::endl;
+    try {
+        auto cb = DefaultEnabledConfig();
+        cb.consecutive_failure_threshold = 3;  // make insta-trip detection easy
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Admit 3 requests in the original CLOSED cycle (generation = A).
+        auto a1 = slice.TryAcquire();
+        auto a2 = slice.TryAcquire();
+        auto a3 = slice.TryAcquire();
+        uint64_t gen_A = a1.generation;
+        bool same_gen_pre = a2.generation == gen_A && a3.generation == gen_A;
+
+        // Operator toggles: disable then re-enable → fresh CLOSED cycle.
+        auto disabled = cb; disabled.enabled = false;
+        slice.Reload(disabled);
+        slice.Reload(cb);
+        // After toggle, state is CLOSED and generation has advanced.
+        uint64_t gen_B = slice.CurrentGenerationForTesting();
+        bool generation_advanced = gen_B != gen_A;
+
+        // Late failures from the pre-toggle cycle arrive. Without the fix,
+        // these would increment consecutive_failures_ and trip the fresh
+        // cycle IMMEDIATELY (threshold=3, 3 late failures).
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, gen_A);
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, gen_A);
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, gen_A);
+
+        // Fresh cycle must be untouched.
+        bool state_still_closed = slice.CurrentState() == State::CLOSED;
+        bool stale_counter_bumped = slice.ReportsStaleGeneration() == 3;
+
+        // A fresh post-toggle admission + 3 REAL failures should still trip —
+        // so the guard didn't over-drop.
+        auto fresh = slice.TryAcquire();
+        for (int i = 0; i < 3; ++i) {
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, fresh.generation);
+        }
+        bool fresh_trips = slice.CurrentState() == State::OPEN;
+
+        bool pass = same_gen_pre && generation_advanced &&
+                    state_still_closed && stale_counter_bumped && fresh_trips;
+        TestFramework::RecordTest(
+            "CB: stale-generation reports dropped after reload toggle",
+            pass, pass ? "" :
+                  "same_gen_pre=" + std::to_string(same_gen_pre) +
+                  " gen_advanced=" + std::to_string(generation_advanced) +
+                  " state_closed=" + std::to_string(state_still_closed) +
+                  " stale_cnt=" + std::to_string(slice.ReportsStaleGeneration()) +
+                  " fresh_trips=" + std::to_string(fresh_trips),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: stale-generation reports dropped after reload toggle",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Generation also advances across state transitions (not just Reload), so
+// a report admitted in CLOSED cycle A that completes after OPEN → HALF_OPEN
+// → CLOSED cycle B is dropped instead of polluting cycle B's counters.
+void TestStaleGenerationReportsDroppedAcrossStateTransitions() {
+    std::cout << "\n[TEST] CB: stale reports dropped across CLOSED->OPEN->CLOSED..."
+              << std::endl;
+    try {
+        auto cb = DefaultEnabledConfig();
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // CLOSED cycle A — admit a request, capture its generation.
+        auto admit_A = slice.TryAcquire();
+        uint64_t gen_A = admit_A.generation;
+
+        // Drive to OPEN, then HALF_OPEN, then CLOSED (cycle B) via probe success.
+        for (int i = 0; i < 5; ++i) {
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false,
+                                slice.CurrentGenerationForTesting());
+        }
+        clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
+        for (int i = 0; i < cb.permitted_half_open_calls; ++i) {
+            auto p = slice.TryAcquire();  // probe
+            slice.ReportSuccess(true, p.generation);
+        }
+        bool cycleB_closed = slice.CurrentState() == State::CLOSED;
+        uint64_t gen_B = slice.CurrentGenerationForTesting();
+        bool gen_advanced = gen_B > gen_A;
+
+        // Now the original cycle-A request finally reports a success. In a
+        // world without the generation guard, this would reset cycle B's
+        // (freshly-zero) consecutive_failures_ and add to cycle B's window,
+        // polluting fresh telemetry.
+        int64_t stale_before = slice.ReportsStaleGeneration();
+        slice.ReportSuccess(false, gen_A);
+        int64_t stale_after = slice.ReportsStaleGeneration();
+        bool dropped = stale_after == stale_before + 1;
+
+        bool pass = cycleB_closed && gen_advanced && dropped;
+        TestFramework::RecordTest(
+            "CB: stale reports dropped across CLOSED->OPEN->CLOSED",
+            pass, pass ? "" :
+                  "cycleB_closed=" + std::to_string(cycleB_closed) +
+                  " gen_advanced=" + std::to_string(gen_advanced) +
+                  " dropped=" + std::to_string(dropped),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: stale reports dropped across CLOSED->OPEN->CLOSED",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// BUG (review round 4, P2): Reload that resizes the rolling window without
+// toggling enabled cleared the window buckets but left generation_ unchanged.
+// Late reports from pre-reload admissions would carry the still-current
+// generation, pass the guard, and re-populate the freshly empty window —
+// mixing pre-reload and post-reload traffic. A pre-reload + post-reload
+// failure pair could satisfy minimum_volume / failure_rate immediately on
+// what should be a fresh observation cycle.
+void TestWindowResizeAdvancesGeneration() {
+    std::cout << "\n[TEST] CB: window resize advances generation..." << std::endl;
+    try {
+        // Use rate-trip path only (high consec threshold disables that path),
+        // a low minimum_volume so 2 failures suffice, and a high
+        // failure_rate_threshold so the trip relies on the rate calc.
+        CircuitBreakerConfig cb;
+        cb.enabled = true;
+        cb.consecutive_failure_threshold = 1000;  // disable consecutive path
+        cb.failure_rate_threshold = 50;
+        cb.minimum_volume = 2;
+        cb.window_seconds = 10;
+        cb.permitted_half_open_calls = 5;
+        cb.base_open_duration_ms = 5000;
+        cb.max_open_duration_ms = 60000;
+
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Pre-reload: admit a request and capture its generation.
+        auto admit_pre = slice.TryAcquire();
+        uint64_t gen_pre = admit_pre.generation;
+
+        // Reload: change window_seconds but keep enabled=true. Window is
+        // resized (cleared) and generation MUST advance so the pre-reload
+        // admission's late report doesn't seed the new window.
+        auto resized = cb;
+        resized.window_seconds = 30;
+        slice.Reload(resized);
+
+        uint64_t gen_post = slice.CurrentGenerationForTesting();
+        bool gen_advanced = gen_post != gen_pre;
+
+        // The pre-reload admission completes (failure). Without the fix,
+        // this would add one failure to the freshly-empty window. Then
+        // a post-reload admission's failure brings total=2 >= minimum_volume,
+        // failures=2/2=100% >= 50% → IMMEDIATE TRIP on a fresh window.
+        // With the fix, the pre-reload report is dropped (counted as stale).
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, gen_pre);
+
+        int64_t stale_after_pre = slice.ReportsStaleGeneration();
+
+        // Now a real post-reload admission and failure — single failure in
+        // a fresh window of size 30s. total=1, below minimum_volume=2 → no trip.
+        auto admit_post = slice.TryAcquire();
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, admit_post.generation);
+
+        bool state_still_closed = slice.CurrentState() == State::CLOSED;
+        bool stale_dropped = stale_after_pre == 1;
+
+        bool pass = gen_advanced && state_still_closed && stale_dropped;
+        TestFramework::RecordTest(
+            "CB: window resize advances generation",
+            pass, pass ? "" :
+                  "gen_advanced=" + std::to_string(gen_advanced) +
+                  " state_closed=" + std::to_string(state_still_closed) +
+                  " stale_count=" + std::to_string(slice.ReportsStaleGeneration()),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: window resize advances generation",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Regression guard: a reload that changes only thresholds (no window resize,
+// no enabled toggle) MUST preserve generation. Operator intent is "apply new
+// thresholds to existing observations" — the round-4 fix's window-resize
+// generation bump must NOT trigger here.
+void TestThresholdOnlyReloadDoesNotAdvanceGeneration() {
+    std::cout << "\n[TEST] CB: threshold-only reload preserves generation..."
+              << std::endl;
+    try {
+        auto cb = DefaultEnabledConfig();
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        auto admit = slice.TryAcquire();
+        uint64_t gen_pre = admit.generation;
+
+        // Tighten thresholds; same enabled, same window_seconds.
+        auto tightened = cb;
+        tightened.consecutive_failure_threshold = 2;
+        tightened.failure_rate_threshold = 30;
+        slice.Reload(tightened);
+
+        uint64_t gen_post = slice.CurrentGenerationForTesting();
+        bool gen_preserved = gen_post == gen_pre;
+
+        // The pre-reload admission's report should NOT be dropped — operator
+        // wants the new thresholds applied to existing in-flight observations.
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, gen_pre);
+        bool stale_zero = slice.ReportsStaleGeneration() == 0;
+
+        bool pass = gen_preserved && stale_zero;
+        TestFramework::RecordTest(
+            "CB: threshold-only reload preserves generation",
+            pass, pass ? "" :
+                  "gen_preserved=" + std::to_string(gen_preserved) +
+                  " stale_zero=" + std::to_string(stale_zero),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: threshold-only reload preserves generation",
             false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
@@ -976,12 +1259,12 @@ void TestTransitionCallbackInvoked() {
 
         // Full cycle.
         for (int i = 0; i < 5; ++i) {
-            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, slice.CurrentGenerationForTesting());
         }
         clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
         for (int i = 0; i < cb.permitted_half_open_calls; ++i) {
             slice.TryAcquire();
-            slice.ReportSuccess(true);
+            slice.ReportSuccess(true, slice.CurrentGenerationForTesting());
         }
         bool pass = closed_to_open == 1 && open_to_halfopen == 1 &&
                     halfopen_to_closed == 1;
@@ -1027,6 +1310,11 @@ void RunAllTests() {
     TestReloadResetsConsecutiveFailuresOnEnabledToggle();
     TestReloadThresholdChangePreservesState();
     TestSawFailureDoesNotBumpHalfOpenFullCounter();
+    TestOpenUntilZeroWhenHalfOpen();
+    TestStaleGenerationReportsDroppedAfterReloadToggle();
+    TestStaleGenerationReportsDroppedAcrossStateTransitions();
+    TestWindowResizeAdvancesGeneration();
+    TestThresholdOnlyReloadDoesNotAdvanceGeneration();
     TestTransitionCallbackInvoked();
 }
 

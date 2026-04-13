@@ -30,16 +30,34 @@ public:
     CircuitBreakerSlice(const CircuitBreakerSlice&) = delete;
     CircuitBreakerSlice& operator=(const CircuitBreakerSlice&) = delete;
 
+    // Return value of TryAcquire. `generation` is a monotonically-increasing
+    // token identifying which state-machine cycle the admission belongs to.
+    // Callers MUST pass it back to Report*() unchanged so the slice can drop
+    // late completions that belong to a prior cycle (crossed a state
+    // transition or a Reload()-reset boundary). Without this, stale
+    // completions can pollute the bookkeeping of a fresh CLOSED/HALF_OPEN
+    // cycle (e.g., a pre-toggle failure incrementing the post-toggle
+    // consecutive_failures_, or a pre-CLOSED'-cycle success wiping a
+    // legitimate post-CLOSED' counter).
+    struct Admission {
+        Decision decision;
+        uint64_t generation;
+    };
+
     // Hot-path decision. Consults state + (if applicable) advances OPEN→HALF_OPEN
     // and reserves a probe slot. Increments `rejected_` on REJECTED_OPEN*
     // (both enforce and dry-run). Emits reject log on dispatcher thread.
-    Decision TryAcquire();
+    // Returned generation must be threaded to the paired Report*().
+    Admission TryAcquire();
 
     // Outcome reporting. `probe` is true iff the paired TryAcquire returned
-    // ADMITTED_PROBE. Report* may trigger state transitions and fire the
-    // transition callback.
-    void ReportSuccess(bool probe);
-    void ReportFailure(FailureKind kind, bool probe);
+    // ADMITTED_PROBE. `admission_generation` is the generation returned by
+    // the paired TryAcquire — reports from a stale generation are silently
+    // dropped (observability counters still update so the outcome is not
+    // lost from dashboards). Report* may trigger state transitions and fire
+    // the transition callback.
+    void ReportSuccess(bool probe, uint64_t admission_generation);
+    void ReportFailure(FailureKind kind, bool probe, uint64_t admission_generation);
 
     // Apply a new config (called on this slice's dispatcher thread).
     // Preserves live state (CLOSED/OPEN/HALF_OPEN). Resets window if
@@ -63,6 +81,20 @@ public:
     int64_t  RejectedHalfOpenFull() const {
         return rejected_half_open_full_.load(std::memory_order_relaxed);
     }
+    // Number of Report* calls silently dropped because their admission
+    // generation no longer matches the slice's current generation. These
+    // are reports of requests admitted before a state transition or a
+    // Reload()-reset. Useful for detecting mis-threaded admission tokens.
+    int64_t  ReportsStaleGeneration() const {
+        return reports_stale_generation_.load(std::memory_order_relaxed);
+    }
+
+    // **Test-only** accessor for the current generation. Production callers
+    // MUST use the generation returned by TryAcquire (racy otherwise — this
+    // getter is not atomic). Tests use it as ergonomic shorthand for
+    // "admission just happened in the current cycle", bypassing the need to
+    // thread a token per synthetic Report* call.
+    uint64_t CurrentGenerationForTesting() const { return generation_; }
 
     const std::string& host_label() const { return host_label_; }
     size_t dispatcher_index() const { return dispatcher_index_; }
@@ -107,6 +139,19 @@ private:
     // per-request reject logs at debug while still surfacing the first
     // post-trip reject in default-warn operator logs. Dispatcher-thread only.
     bool first_reject_logged_for_open_ = false;
+
+    // Monotonic generation counter. Incremented on every state transition
+    // AND on every Reload() enabled-toggle reset. TryAcquire captures the
+    // current generation at admission time; Report* compares against it
+    // and drops reports from a stale generation (e.g., a request admitted
+    // before an operator reset whose outcome arrives after). Dispatcher-
+    // thread only — plain int (no atomic needed).
+    uint64_t generation_ = 1;
+
+    // Rejections silently dropped because their admission generation no
+    // longer matches `generation_`. Observability only; lets dashboards see
+    // how often the generation guard fires.
+    std::atomic<int64_t> reports_stale_generation_{0};
 
     StateTransitionCallback transition_cb_;
 

@@ -80,6 +80,9 @@ void CircuitBreakerSlice::TripClosedToOpen(const char* trigger) {
     half_open_successes_ = 0;
     half_open_saw_failure_ = false;
     first_reject_logged_for_open_ = false;
+    // Bump generation: any in-flight admission from the closing CLOSED
+    // cycle is now stale. Late Report*() for those requests is dropped.
+    ++generation_;
 
     trips_.fetch_add(1, std::memory_order_relaxed);
 
@@ -94,8 +97,13 @@ void CircuitBreakerSlice::TripClosedToOpen(const char* trigger) {
 
 void CircuitBreakerSlice::TransitionOpenToHalfOpen() {
     state_.store(State::HALF_OPEN, std::memory_order_release);
-    // Keep open_until_steady_ns_ so observers see the "last open" boundary;
-    // it's cleared on transition to CLOSED.
+    // Clear open_until_steady_ns_ per the OpenUntil() contract ("zero when
+    // not OPEN"). Leaving a stale deadline here would cause Phase 4's
+    // ProxyTransaction::MakeCircuitOpenResponse to compute a Retry-After
+    // from a past time_point (negative delta → floor at 1s, misleading for
+    // a reject in the HALF_OPEN probe-budget-full path). Retry-After for
+    // HALF_OPEN rejects is computed fresh by callers when needed.
+    open_until_steady_ns_.store(0, std::memory_order_release);
     half_open_inflight_ = 0;
     half_open_successes_ = 0;
     half_open_saw_failure_ = false;
@@ -105,6 +113,9 @@ void CircuitBreakerSlice::TransitionOpenToHalfOpen() {
     // operationally distinct from OPEN rejection (still backing off) and
     // deserves its own breadcrumb in default-warn operator logs.
     first_reject_logged_for_open_ = false;
+    // Fresh HALF_OPEN cycle — any stale probe admissions from a prior
+    // HALF_OPEN cycle (after re-trip then re-enter) are now invalidated.
+    ++generation_;
 
     logging::Get()->info(
         "circuit breaker half-open {} probes_allowed={}",
@@ -131,6 +142,10 @@ void CircuitBreakerSlice::TransitionHalfOpenToClosed() {
     half_open_successes_ = 0;
     half_open_saw_failure_ = false;
     first_reject_logged_for_open_ = false;
+    // Fresh CLOSED cycle — any non-probe admissions from the PREVIOUS
+    // CLOSED cycle (before trip) are now stale, and any probe admissions
+    // from the just-completed HALF_OPEN cycle are too.
+    ++generation_;
 
     logging::Get()->info(
         "circuit breaker closed {} probes_succeeded={}",
@@ -157,6 +172,9 @@ void CircuitBreakerSlice::TripHalfOpenToOpen(const char* trigger) {
     half_open_successes_ = 0;
     half_open_saw_failure_ = false;
     first_reject_logged_for_open_ = false;
+    // Bump generation — any in-flight probe admissions from the closing
+    // HALF_OPEN cycle are now stale.
+    ++generation_;
 
     trips_.fetch_add(1, std::memory_order_relaxed);
 
@@ -169,9 +187,12 @@ void CircuitBreakerSlice::TripHalfOpenToOpen(const char* trigger) {
     if (transition_cb_) transition_cb_(State::HALF_OPEN, State::OPEN, trigger);
 }
 
-Decision CircuitBreakerSlice::TryAcquire() {
+CircuitBreakerSlice::Admission CircuitBreakerSlice::TryAcquire() {
     // Disabled fast path — zero overhead when config.enabled=false.
-    if (!config_.enabled) return Decision::ADMITTED;
+    // Use generation 0 (sentinel) since the slice won't consult it on report.
+    if (!config_.enabled) {
+        return Admission{Decision::ADMITTED, /*generation=*/0};
+    }
 
     State s = state_.load(std::memory_order_acquire);
 
@@ -188,7 +209,8 @@ Decision CircuitBreakerSlice::TryAcquire() {
             TransitionOpenToHalfOpen();
             s = State::HALF_OPEN;
         } else {
-            return RejectWithLog("open", /*half_open_full=*/false);
+            return Admission{RejectWithLog("open", /*half_open_full=*/false),
+                             generation_};
         }
     }
 
@@ -201,20 +223,23 @@ Decision CircuitBreakerSlice::TryAcquire() {
         // label and do NOT bump `rejected_half_open_full_` — that counter
         // is specifically "probing, no capacity left" for dashboards.
         if (half_open_saw_failure_) {
-            return RejectWithLog("half_open_recovery_failing",
-                                 /*half_open_full=*/false);
+            return Admission{RejectWithLog("half_open_recovery_failing",
+                                           /*half_open_full=*/false),
+                             generation_};
         }
         // Case B: probe budget fully in flight. "No capacity" — bump the
         // dedicated counter so dashboards can tell these two apart.
         if (half_open_inflight_ >= config_.permitted_half_open_calls) {
-            return RejectWithLog("half_open_full", /*half_open_full=*/true);
+            return Admission{RejectWithLog("half_open_full",
+                                           /*half_open_full=*/true),
+                             generation_};
         }
         half_open_inflight_++;
-        return Decision::ADMITTED_PROBE;
+        return Admission{Decision::ADMITTED_PROBE, generation_};
     }
 
     // CLOSED: fast path.
-    return Decision::ADMITTED;
+    return Admission{Decision::ADMITTED, generation_};
 }
 
 Decision CircuitBreakerSlice::RejectWithLog(const char* state_label,
@@ -252,7 +277,8 @@ Decision CircuitBreakerSlice::RejectWithLog(const char* state_label,
     return Decision::REJECTED_OPEN;
 }
 
-void CircuitBreakerSlice::ReportSuccess(bool probe) {
+void CircuitBreakerSlice::ReportSuccess(bool probe,
+                                        uint64_t admission_generation) {
     if (!config_.enabled) return;
 
     if (probe) {
@@ -261,13 +287,22 @@ void CircuitBreakerSlice::ReportSuccess(bool probe) {
         // signal about our state machine.
         probe_successes_.fetch_add(1, std::memory_order_relaxed);
 
+        // Generation guard: drop reports for admissions that pre-date the
+        // current cycle (a state transition or Reload reset invalidated them).
+        // Belt-and-suspenders with the state guard below — the generation
+        // catches stale-report-in-same-state cases (e.g., HALF_OPEN cycle
+        // A probe completing after re-trip and re-entry into HALF_OPEN B).
+        if (admission_generation != generation_) {
+            reports_stale_generation_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
         // Stale probe defense: we admitted this probe in HALF_OPEN, but the
-        // slice may have transitioned out (e.g., `Reload()` flipped enabled
-        // or resized the window, `TransitionHalfOpenToClosed` already fired
-        // on sibling probes, or — post-Phase 8 — an operator toggle
-        // transitioned us to CLOSED). Only touch HALF_OPEN bookkeeping /
-        // fire transitions when state is STILL HALF_OPEN. Otherwise the
-        // probe is informational only.
+        // slice may have transitioned out (e.g., `Reload()` flipped enabled,
+        // `TransitionHalfOpenToClosed` already fired on sibling probes, or —
+        // post-Phase 8 — an operator toggle transitioned us to CLOSED).
+        // Only touch HALF_OPEN bookkeeping / fire transitions when state is
+        // STILL HALF_OPEN.
         if (state_.load(std::memory_order_acquire) != State::HALF_OPEN) return;
 
         if (half_open_inflight_ > 0) half_open_inflight_--;
@@ -286,23 +321,36 @@ void CircuitBreakerSlice::ReportSuccess(bool probe) {
         return;
     }
 
-    // Non-probe success: only meaningful when state is CLOSED. If the slice
-    // has since transitioned (e.g., other requests in this burst tripped it),
-    // this late outcome must NOT retroactively reset `consecutive_failures_`
-    // or pollute the window — a fresh CLOSED cycle after recovery would start
-    // with bogus success history.
+    // Non-probe success path.
+    if (admission_generation != generation_) {
+        reports_stale_generation_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // Only meaningful when state is CLOSED. If the slice has since
+    // transitioned (e.g., other requests in this burst tripped it), this
+    // late outcome must NOT retroactively reset `consecutive_failures_` or
+    // pollute the window — a fresh CLOSED cycle after recovery would start
+    // with bogus success history. (Transitions bump `generation_`, so the
+    // guard above catches this too; the state check is a direct guard for
+    // observability clarity.)
     if (state_.load(std::memory_order_acquire) != State::CLOSED) return;
     consecutive_failures_ = 0;
     window_.AddSuccess(Now());
 }
 
-void CircuitBreakerSlice::ReportFailure(FailureKind kind, bool probe) {
+void CircuitBreakerSlice::ReportFailure(FailureKind kind, bool probe,
+                                        uint64_t admission_generation) {
     (void)kind;  // Kind is used by higher layers for logging; slice itself
                  // treats all failures the same way for trip math.
     if (!config_.enabled) return;
 
     if (probe) {
         probe_failures_.fetch_add(1, std::memory_order_relaxed);
+
+        if (admission_generation != generation_) {
+            reports_stale_generation_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
 
         // Stale probe defense — see matching comment in ReportSuccess above.
         if (state_.load(std::memory_order_acquire) != State::HALF_OPEN) return;
@@ -316,12 +364,18 @@ void CircuitBreakerSlice::ReportFailure(FailureKind kind, bool probe) {
         return;
     }
 
-    // Non-probe failure: only count when CLOSED. Late failures from requests
-    // admitted in CLOSED but completing after a trip must NOT re-enter
-    // `TripClosedToOpen` — doing so double-increments `consecutive_trips_`
-    // (inflating open_duration) and fires a spurious CLOSED→OPEN transition
-    // edge that downstream consumers (wait-queue drain, snapshot telemetry)
-    // would see as a ghost trip.
+    // Non-probe failure path.
+    if (admission_generation != generation_) {
+        reports_stale_generation_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // Only count when CLOSED. Late failures from requests admitted in CLOSED
+    // but completing after a trip must NOT re-enter `TripClosedToOpen` —
+    // doing so double-increments `consecutive_trips_` (inflating
+    // open_duration) and fires a spurious CLOSED→OPEN transition edge that
+    // downstream consumers (wait-queue drain, snapshot telemetry) would see
+    // as a ghost trip. (Again, the generation guard above catches this too;
+    // keep the state check for observability clarity.)
     if (state_.load(std::memory_order_acquire) != State::CLOSED) return;
 
     consecutive_failures_++;
@@ -341,7 +395,22 @@ void CircuitBreakerSlice::Reload(const CircuitBreakerConfig& new_config) {
         (config_.window_seconds != new_config.window_seconds);
 
     config_ = new_config;
-    if (window_changed) window_.Resize(new_config.window_seconds);
+    if (window_changed) {
+        // Resize wipes the failure-rate ring buckets. Without bumping
+        // generation_ here, late completions from pre-reload admissions
+        // would still carry the matching generation, pass the guard, and
+        // repopulate the freshly empty window — mixing pre-reload and
+        // post-reload traffic. A pre-reload failure plus one new failure
+        // could then immediately satisfy minimum_volume / failure_rate
+        // and trip on the next evaluation, despite this being a fresh
+        // observation cycle by operator intent.
+        //
+        // Skip when enabled_changed is also true: the full-reset branch
+        // below bumps the generation as part of its larger reset, and
+        // double-bumping is harmless but noisy.
+        window_.Resize(new_config.window_seconds);
+        if (!enabled_changed) ++generation_;
+    }
 
     if (enabled_changed) {
         // Toggling `enabled` is an operator intent to start fresh, not a
@@ -370,6 +439,10 @@ void CircuitBreakerSlice::Reload(const CircuitBreakerConfig& new_config) {
         half_open_successes_ = 0;
         half_open_saw_failure_ = false;
         first_reject_logged_for_open_ = false;
+        // Fresh generation: reports of requests admitted before this
+        // reset will carry the old generation and be silently dropped,
+        // preserving clean-restart semantics.
+        ++generation_;
     }
     // When `enabled` is unchanged: live state preserved — operator expects
     // new thresholds to apply to the next evaluation, not to reset an
