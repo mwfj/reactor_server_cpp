@@ -585,11 +585,11 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
         // recovery. Response-level failures (5xx, timeout) signal a
         // struggling upstream that needs breathing room — always back
         // off, even on first retry.
-        bool connection_level =
+        bool is_transient_connection_failure =
             (condition == RetryPolicy::RetryCondition::CONNECT_FAILURE ||
              condition == RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT);
 
-        auto delay = (attempt_ <= 1 && connection_level)
+        auto delay = (attempt_ <= 1 && is_transient_connection_failure)
             ? std::chrono::milliseconds(0)
             : retry_policy_.BackoffDelay(attempt_);
 

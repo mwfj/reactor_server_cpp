@@ -38,8 +38,7 @@ private:
     // Delayed task queue — min-heap ordered by deadline (earliest first).
     // Used by EnQueueDelayed() for timer-based retry backoff and other
     // sub-second deferred work. Separate from task_que_ to avoid
-    // accelerating EnQueueDeferred users (see Decision 7 in
-    // TIMER_BASED_RETRY_BACKOFF_DESIGN.md).
+    // accelerating EnQueueDeferred users
     struct DelayedTask {
         std::chrono::steady_clock::time_point deadline;
         // mutable: allows move-out from priority_queue::top() (which
