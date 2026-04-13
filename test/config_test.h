@@ -549,25 +549,55 @@ namespace ConfigTests {
             "permitted_half_open_calls must be in [1, 1000]");
     }
 
-    // Test 14: Equality operator covers circuit_breaker field
+    // Test 14: UpstreamConfig::operator== EXCLUDES circuit_breaker field.
+    // Rationale: breaker tuning is live-reloadable (design §10). Including
+    // it here would make HttpServer::Reload (http_server.cc:3383) treat a
+    // breaker-only edit as an upstream topology change, fire the "restart
+    // required" warning, and block the hot-reload path. Topology fields
+    // (name/host/port/tls/pool/proxy) ARE included — they require a restart.
     void TestCircuitBreakerEquality() {
-        std::cout << "\n[TEST] Circuit Breaker Equality..." << std::endl;
+        std::cout << "\n[TEST] Circuit Breaker Equality (topology only)..." << std::endl;
         try {
             UpstreamConfig a;
             a.name = "svc"; a.host = "h"; a.port = 80;
             UpstreamConfig b = a;
+
+            // Default equal.
             bool equal_default = (a == b);
 
+            // Circuit-breaker-only edit must NOT change UpstreamConfig equality.
             b.circuit_breaker.enabled = true;
-            bool not_equal_after_diff = (a != b);
+            b.circuit_breaker.window_seconds = 30;
+            bool topology_still_equal = (a == b);
 
-            bool pass = equal_default && not_equal_after_diff;
-            TestFramework::RecordTest("Circuit Breaker Equality", pass,
-                pass ? "" : "operator== failed for circuit_breaker",
+            // BUT CircuitBreakerConfig::operator== catches the field diff
+            // (Phase 8 reload uses this to detect what changed per-host).
+            bool cb_fields_differ = (a.circuit_breaker != b.circuit_breaker);
+
+            // Topology changes DO make configs unequal.
+            UpstreamConfig c = a;
+            c.host = "different";
+            bool topology_changed = (a != c);
+
+            UpstreamConfig d = a;
+            d.port = 9999;
+            bool port_change_detected = (a != d);
+
+            bool pass = equal_default && topology_still_equal &&
+                        cb_fields_differ && topology_changed &&
+                        port_change_detected;
+            TestFramework::RecordTest("Circuit Breaker Equality (topology only)",
+                pass,
+                pass ? "" :
+                "equal_default=" + std::to_string(equal_default) +
+                " topology_still_equal=" + std::to_string(topology_still_equal) +
+                " cb_fields_differ=" + std::to_string(cb_fields_differ) +
+                " topology_changed=" + std::to_string(topology_changed) +
+                " port_change_detected=" + std::to_string(port_change_detected),
                 TestFramework::TestCategory::OTHER);
         } catch (const std::exception& e) {
-            TestFramework::RecordTest("Circuit Breaker Equality", false, e.what(),
-                TestFramework::TestCategory::OTHER);
+            TestFramework::RecordTest("Circuit Breaker Equality (topology only)",
+                false, e.what(), TestFramework::TestCategory::OTHER);
         }
     }
 

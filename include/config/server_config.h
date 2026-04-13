@@ -183,10 +183,17 @@ struct UpstreamConfig {
     ProxyConfig proxy;
     CircuitBreakerConfig circuit_breaker;
 
+    // Intentionally EXCLUDES circuit_breaker — breaker tuning is live-
+    // reloadable (§10 of CIRCUIT_BREAKER_DESIGN.md) and must not trigger
+    // the "upstream configuration changes require a restart" warning in
+    // HttpServer::Reload (http_server.cc:3383). Phase 8's breaker-reload
+    // path compares CircuitBreakerConfig fields directly (per-host
+    // iteration), not via this operator==. All other fields here are
+    // restart-required: changing name/host/port/tls rebuilds pool
+    // topology; changing pool/proxy would re-register routes.
     bool operator==(const UpstreamConfig& o) const {
         return name == o.name && host == o.host && port == o.port &&
-               tls == o.tls && pool == o.pool && proxy == o.proxy &&
-               circuit_breaker == o.circuit_breaker;
+               tls == o.tls && pool == o.pool && proxy == o.proxy;
     }
     bool operator!=(const UpstreamConfig& o) const { return !(*this == o); }
 };

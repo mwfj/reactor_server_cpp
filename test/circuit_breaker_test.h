@@ -1239,6 +1239,144 @@ void TestThresholdOnlyReloadDoesNotAdvanceGeneration() {
     }
 }
 
+// BUG (review round 5, P1): Reload with window_seconds change while the
+// slice is HALF_OPEN used to bump the single `generation_`, invalidating
+// every in-flight probe. Those probes' late Report* calls then dropped
+// WITHOUT decrementing half_open_inflight_, wedging the slice in HALF_OPEN
+// with all probe slots stuck "in flight" forever — subsequent TryAcquires
+// rejected with half_open_full indefinitely until another full reset.
+//
+// Fix: split generation into closed_gen_ (non-probe, CLOSED-state data)
+// and halfopen_gen_ (probe, HALF_OPEN-state data). window_seconds reload
+// bumps only closed_gen_ because it only resets CLOSED-state data.
+void TestWindowResizeDuringHalfOpenDoesNotStrandProbes() {
+    std::cout << "\n[TEST] CB: window resize during HALF_OPEN preserves probes..."
+              << std::endl;
+    try {
+        auto cb = DefaultEnabledConfig();
+        cb.permitted_half_open_calls = 3;
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Drive to HALF_OPEN.
+        for (int i = 0; i < 5; ++i) {
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false,
+                                slice.CurrentGenerationForTesting());
+        }
+        clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
+
+        // Admit all 3 probes (capture their admission tokens).
+        auto p1 = slice.TryAcquire();
+        auto p2 = slice.TryAcquire();
+        auto p3 = slice.TryAcquire();
+        bool all_admitted_probe = p1.decision == Decision::ADMITTED_PROBE &&
+                                  p2.decision == Decision::ADMITTED_PROBE &&
+                                  p3.decision == Decision::ADMITTED_PROBE;
+
+        // Reload window_seconds (enabled unchanged). PRE-fix: bumps single
+        // generation, invalidates p1/p2/p3 probes → stranded. POST-fix:
+        // bumps only closed_gen_, probe tokens still match halfopen_gen_.
+        auto resized = cb;
+        resized.window_seconds = 30;
+        slice.Reload(resized);
+
+        // closed_gen advanced, halfopen_gen preserved.
+        bool closed_gen_advanced = slice.CurrentClosedGenForTesting() !=
+                                   p1.generation;  // p1 was admitted in HALF_OPEN
+                                                   // but let's check against gen
+                                                   // we'd have captured in CLOSED
+        // Actually, directly: probes tokens must still match halfopen_gen_.
+        bool probe_gen_preserved =
+            p1.generation == slice.CurrentHalfOpenGenForTesting() &&
+            p2.generation == slice.CurrentHalfOpenGenForTesting() &&
+            p3.generation == slice.CurrentHalfOpenGenForTesting();
+
+        // Probes report success — each must be accepted and advance the
+        // HALF_OPEN → CLOSED transition.
+        slice.ReportSuccess(true, p1.generation);
+        slice.ReportSuccess(true, p2.generation);
+        slice.ReportSuccess(true, p3.generation);
+
+        // After 3 probe successes at permitted_half_open_calls=3, slice
+        // MUST have transitioned to CLOSED. Pre-fix: probes dropped, no
+        // progression, still HALF_OPEN with inflight stuck at 3.
+        bool closed_now = slice.CurrentState() == State::CLOSED;
+        // None of the probes were dropped as stale.
+        bool no_stale_drops = slice.ReportsStaleGeneration() == 0;
+        // All 3 probe successes counted.
+        bool all_probes_counted = slice.ProbeSuccesses() == 3;
+
+        bool pass = all_admitted_probe && probe_gen_preserved &&
+                    closed_now && no_stale_drops && all_probes_counted;
+        (void)closed_gen_advanced;  // (informational only)
+
+        TestFramework::RecordTest(
+            "CB: window resize during HALF_OPEN preserves probes",
+            pass, pass ? "" :
+                  "admitted=" + std::to_string(all_admitted_probe) +
+                  " probe_gen_preserved=" + std::to_string(probe_gen_preserved) +
+                  " closed_now=" + std::to_string(closed_now) +
+                  " stale=" + std::to_string(slice.ReportsStaleGeneration()) +
+                  " probe_success=" + std::to_string(slice.ProbeSuccesses()),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: window resize during HALF_OPEN preserves probes",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Companion guard: window_seconds reload MUST still invalidate pre-reload
+// CLOSED (non-probe) admissions. Ensures the split-gen didn't weaken the
+// round-4 fix.
+void TestWindowResizeStillInvalidatesClosedAdmissions() {
+    std::cout << "\n[TEST] CB: window resize invalidates CLOSED admissions..."
+              << std::endl;
+    try {
+        CircuitBreakerConfig cb;
+        cb.enabled = true;
+        cb.consecutive_failure_threshold = 1000;  // disable consec path
+        cb.failure_rate_threshold = 50;
+        cb.minimum_volume = 2;
+        cb.window_seconds = 10;
+        cb.permitted_half_open_calls = 5;
+        cb.base_open_duration_ms = 5000;
+        cb.max_open_duration_ms = 60000;
+
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        auto admit_pre = slice.TryAcquire();
+        uint64_t gen_pre = admit_pre.generation;
+
+        auto resized = cb; resized.window_seconds = 30;
+        slice.Reload(resized);
+
+        // Pre-reload CLOSED admission reports — must drop as stale.
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, gen_pre);
+        bool dropped_stale = slice.ReportsStaleGeneration() == 1;
+
+        // And state must remain CLOSED (pre-reload failure did NOT seed window).
+        auto admit_post = slice.TryAcquire();
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, admit_post.generation);
+        bool still_closed = slice.CurrentState() == State::CLOSED;
+
+        bool pass = dropped_stale && still_closed;
+        TestFramework::RecordTest(
+            "CB: window resize invalidates CLOSED admissions",
+            pass, pass ? "" :
+                  "dropped=" + std::to_string(dropped_stale) +
+                  " closed=" + std::to_string(still_closed),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: window resize invalidates CLOSED admissions",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestTransitionCallbackInvoked() {
     std::cout << "\n[TEST] CB: transition callback invoked..." << std::endl;
     try {
@@ -1315,6 +1453,8 @@ void RunAllTests() {
     TestStaleGenerationReportsDroppedAcrossStateTransitions();
     TestWindowResizeAdvancesGeneration();
     TestThresholdOnlyReloadDoesNotAdvanceGeneration();
+    TestWindowResizeDuringHalfOpenDoesNotStrandProbes();
+    TestWindowResizeStillInvalidatesClosedAdmissions();
     TestTransitionCallbackInvoked();
 }
 

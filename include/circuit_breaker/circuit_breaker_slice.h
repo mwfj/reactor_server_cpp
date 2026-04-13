@@ -82,19 +82,32 @@ public:
         return rejected_half_open_full_.load(std::memory_order_relaxed);
     }
     // Number of Report* calls silently dropped because their admission
-    // generation no longer matches the slice's current generation. These
-    // are reports of requests admitted before a state transition or a
+    // generation no longer matches the relevant per-domain counter
+    // (closed_gen_ for non-probe, halfopen_gen_ for probe). These are
+    // reports of requests admitted before a state transition or a
     // Reload()-reset. Useful for detecting mis-threaded admission tokens.
     int64_t  ReportsStaleGeneration() const {
         return reports_stale_generation_.load(std::memory_order_relaxed);
     }
 
-    // **Test-only** accessor for the current generation. Production callers
-    // MUST use the generation returned by TryAcquire (racy otherwise — this
-    // getter is not atomic). Tests use it as ergonomic shorthand for
-    // "admission just happened in the current cycle", bypassing the need to
-    // thread a token per synthetic Report* call.
-    uint64_t CurrentGenerationForTesting() const { return generation_; }
+    // **Test-only** accessor for the generation that the current state's
+    // next admission would receive. Returns `halfopen_gen_` when state is
+    // HALF_OPEN (probe admissions use that counter), otherwise `closed_gen_`
+    // (non-probe admissions use that counter). This matches what TryAcquire
+    // would stamp on a new admission right now.
+    //
+    // Production callers MUST use the generation returned by TryAcquire
+    // (racy otherwise — these getters are not atomic). Tests use it as
+    // ergonomic shorthand for "admission just happened in the current
+    // cycle", bypassing the need to thread a token per synthetic Report*.
+    uint64_t CurrentGenerationForTesting() const {
+        return (state_.load(std::memory_order_acquire) == State::HALF_OPEN)
+                   ? halfopen_gen_ : closed_gen_;
+    }
+    // Explicit per-domain getters for tests that cross state transitions
+    // while holding a captured generation from a specific domain.
+    uint64_t CurrentClosedGenForTesting()   const { return closed_gen_; }
+    uint64_t CurrentHalfOpenGenForTesting() const { return halfopen_gen_; }
 
     const std::string& host_label() const { return host_label_; }
     size_t dispatcher_index() const { return dispatcher_index_; }
@@ -140,13 +153,27 @@ private:
     // post-trip reject in default-warn operator logs. Dispatcher-thread only.
     bool first_reject_logged_for_open_ = false;
 
-    // Monotonic generation counter. Incremented on every state transition
-    // AND on every Reload() enabled-toggle reset. TryAcquire captures the
-    // current generation at admission time; Report* compares against it
-    // and drops reports from a stale generation (e.g., a request admitted
-    // before an operator reset whose outcome arrives after). Dispatcher-
-    // thread only — plain int (no atomic needed).
-    uint64_t generation_ = 1;
+    // Monotonic generation counters — one per admission domain. TryAcquire
+    // stamps the admission with the domain's current value; Report* compares
+    // against it and drops reports whose admission no longer matches a live
+    // cycle. Split into two counters so operations that reset ONE domain
+    // (e.g., window_seconds reload wipes the CLOSED rate window) don't
+    // invalidate admissions in the OTHER domain (HALF_OPEN probes) — which
+    // would strand probe capacity and wedge the slice in HALF_OPEN.
+    //
+    // Dispatcher-thread only — plain ints (no atomics needed).
+    //
+    //   closed_gen_   bumps on: TripClosedToOpen (CLOSED cycle ends),
+    //                           Reload enabled-toggle reset,
+    //                           Reload window_seconds change (rate-window wipe).
+    //   halfopen_gen_ bumps on: TripHalfOpenToOpen (HALF_OPEN cycle ends),
+    //                           TransitionHalfOpenToClosed (HALF_OPEN cycle ends on success),
+    //                           Reload enabled-toggle reset.
+    //
+    // Initial value 1 (so 0 can be a "not-applicable" sentinel for
+    // admissions returned from disabled slices or the REJECTED_* paths).
+    uint64_t closed_gen_   = 1;
+    uint64_t halfopen_gen_ = 1;
 
     // Rejections silently dropped because their admission generation no
     // longer matches `generation_`. Observability only; lets dashboards see
