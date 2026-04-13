@@ -13,6 +13,7 @@
 #include "upstream_pool_test.h"
 #include "proxy_test.h"
 #include "rate_limit_test.h"
+#include "circuit_breaker_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -76,6 +77,9 @@ void RunAllTest(){
 
     // Run rate limit tests
     RateLimitTests::RunAllTests();
+
+    // Run circuit breaker tests
+    CircuitBreakerTests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;
 }
@@ -155,6 +159,9 @@ int main(int argc, char* argv[]) {
         // Run rate limit tests
         }else if(mode == "rate_limit" || mode == "-L"){
             RateLimitTests::RunAllTests();
+        // Run circuit breaker tests
+        }else if(mode == "circuit_breaker" || mode == "-B"){
+            CircuitBreakerTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

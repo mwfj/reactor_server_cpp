@@ -131,6 +131,49 @@ struct ProxyConfig {
     bool operator!=(const ProxyConfig& o) const { return !(*this == o); }
 };
 
+struct CircuitBreakerConfig {
+    bool enabled = false;                      // Opt-in; off by default
+    bool dry_run = false;                      // Compute + log, but do not reject
+
+    // Trip conditions (ORed). Either alone is sufficient.
+    int consecutive_failure_threshold = 5;     // Trip after N consecutive failures
+    int failure_rate_threshold = 50;           // Trip when fail_rate >= N percent
+    int minimum_volume = 20;                   // Required window volume before
+                                               // failure_rate is consulted
+    int window_seconds = 10;                   // Sliding-window duration
+
+    // HALF_OPEN admission
+    int permitted_half_open_calls = 5;
+
+    // Recovery timing. open_duration = min(base * 2^consecutive_trips, max).
+    int base_open_duration_ms = 5000;
+    int max_open_duration_ms = 60000;
+
+    // Safety valve (future-proof for load-balanced services; no-op v1).
+    int max_ejection_percent_per_host_set = 50;
+
+    // Retry budget (orthogonal to the breaker). Caps concurrent retries to
+    // max(retry_budget_min_concurrency, in_flight * retry_budget_percent/100).
+    int retry_budget_percent = 20;
+    int retry_budget_min_concurrency = 3;
+
+    bool operator==(const CircuitBreakerConfig& o) const {
+        return enabled == o.enabled &&
+               dry_run == o.dry_run &&
+               consecutive_failure_threshold == o.consecutive_failure_threshold &&
+               failure_rate_threshold == o.failure_rate_threshold &&
+               minimum_volume == o.minimum_volume &&
+               window_seconds == o.window_seconds &&
+               permitted_half_open_calls == o.permitted_half_open_calls &&
+               base_open_duration_ms == o.base_open_duration_ms &&
+               max_open_duration_ms == o.max_open_duration_ms &&
+               max_ejection_percent_per_host_set == o.max_ejection_percent_per_host_set &&
+               retry_budget_percent == o.retry_budget_percent &&
+               retry_budget_min_concurrency == o.retry_budget_min_concurrency;
+    }
+    bool operator!=(const CircuitBreakerConfig& o) const { return !(*this == o); }
+};
+
 struct UpstreamConfig {
     std::string name;
     std::string host;
@@ -138,10 +181,12 @@ struct UpstreamConfig {
     UpstreamTlsConfig tls;
     UpstreamPoolConfig pool;
     ProxyConfig proxy;
+    CircuitBreakerConfig circuit_breaker;
 
     bool operator==(const UpstreamConfig& o) const {
         return name == o.name && host == o.host && port == o.port &&
-               tls == o.tls && pool == o.pool && proxy == o.proxy;
+               tls == o.tls && pool == o.pool && proxy == o.proxy &&
+               circuit_breaker == o.circuit_breaker;
     }
     bool operator!=(const UpstreamConfig& o) const { return !(*this == o); }
 };
