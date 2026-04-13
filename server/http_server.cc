@@ -681,6 +681,7 @@ HttpServer::HttpServer(const ServerConfig& config)
     h2_settings_.initial_window_size    = config.http2.initial_window_size;
     h2_settings_.max_frame_size         = config.http2.max_frame_size;
     h2_settings_.max_header_list_size   = config.http2.max_header_list_size;
+    h2_settings_.enable_push            = config.http2.enable_push;
 
     // Store upstream configurations for pool creation in Start()
     upstream_configs_ = config.upstreams;
@@ -3418,6 +3419,11 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         h2_settings_.initial_window_size    = new_config.http2.initial_window_size;
         h2_settings_.max_frame_size         = new_config.http2.max_frame_size;
         h2_settings_.max_header_list_size   = new_config.http2.max_header_list_size;
+        // enable_push only takes effect for new connections (the SETTINGS
+        // preface is sent once at session creation). Existing connections
+        // keep the value they were created with — RFC 9113 §6.5.2 forbids
+        // a server from sending ENABLE_PUSH after the preface.
+        h2_settings_.enable_push            = new_config.http2.enable_push;
     }
 
     // Rate limit reload — always safe because manager is always created

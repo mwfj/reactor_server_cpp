@@ -14,6 +14,7 @@ public:
         uint32_t initial_window_size    = HTTP2_CONSTANTS::DEFAULT_INITIAL_WINDOW_SIZE;
         uint32_t max_frame_size         = HTTP2_CONSTANTS::DEFAULT_MAX_FRAME_SIZE;
         uint32_t max_header_list_size   = HTTP2_CONSTANTS::DEFAULT_MAX_HEADER_LIST_SIZE;
+        bool     enable_push            = false;  // see Http2Config::enable_push
     };
 
     explicit Http2Session(std::shared_ptr<ConnectionHandler> conn,

@@ -545,19 +545,32 @@ Http2Session::Http2Session(std::shared_ptr<ConnectionHandler> conn,
 Http2Session::~Http2Session() = default;
 
 void Http2Session::SendServerPreface() {
-    // Submit SETTINGS frame with our server settings
-    nghttp2_settings_entry iv[] = {
-        {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, settings_.max_concurrent_streams},
-        {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,    settings_.initial_window_size},
-        {NGHTTP2_SETTINGS_MAX_FRAME_SIZE,         settings_.max_frame_size},
-        {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE,   settings_.max_header_list_size},
-        // Disable server push
-        {NGHTTP2_SETTINGS_ENABLE_PUSH, 0}
-    };
+    // Submit SETTINGS frame with our server settings.
+    //
+    // SETTINGS_ENABLE_PUSH (RFC 9113 §6.5.2 + §7) is direction-asymmetric on
+    // the server: a server MUST NOT send a value of 1, and the absence of
+    // an entry leaves the peer's view at the protocol default of 1. So:
+    //   - enable_push = false (default): advertise {ENABLE_PUSH, 0} so the
+    //     client knows we will never push and can reject a stray
+    //     PUSH_PROMISE. nghttp2's local_settings ENABLE_PUSH stays 0,
+    //     refusing PUSH_PROMISE submission.
+    //   - enable_push = true: OMIT the entry entirely. nghttp2's local
+    //     setting falls back to its internal default of 1, allowing
+    //     PUSH_PROMISE emission, while we never write the forbidden value
+    //     1 onto the wire.
+    std::vector<nghttp2_settings_entry> iv;
+    iv.reserve(5);
+    iv.push_back({NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, settings_.max_concurrent_streams});
+    iv.push_back({NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,    settings_.initial_window_size});
+    iv.push_back({NGHTTP2_SETTINGS_MAX_FRAME_SIZE,         settings_.max_frame_size});
+    iv.push_back({NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE,   settings_.max_header_list_size});
+    if (!settings_.enable_push) {
+        iv.push_back({NGHTTP2_SETTINGS_ENABLE_PUSH, 0});
+    }
 
     int rv = nghttp2_submit_settings(
         impl_->session, NGHTTP2_FLAG_NONE,
-        iv, sizeof(iv) / sizeof(iv[0]));
+        iv.data(), iv.size());
     if (rv != 0) {
         logging::Get()->error("Failed to submit SETTINGS: {}",
                               nghttp2_strerror(rv));

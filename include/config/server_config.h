@@ -25,6 +25,13 @@ struct Http2Config {
     uint32_t initial_window_size = 65535;         // RFC 9113 default (64 KB - 1)
     uint32_t max_frame_size = 16384;             // RFC 9113 default (16 KB)
     uint32_t max_header_list_size = 65536;       // 64 KB
+    // Server push (RFC 9113 §8.4). Default OFF — modern browsers
+    // (Chrome, Firefox) have removed client-side support, so this is
+    // primarily for tooling, internal RPC clients, or curated deployments.
+    // SETTINGS_ENABLE_PUSH semantics: when false the server advertises 0
+    // in its preface; when true the entry is OMITTED so nghttp2's local
+    // default of 1 applies internally for our PUSH_PROMISE emission.
+    bool enable_push = false;
 };
 
 struct UpstreamTlsConfig {

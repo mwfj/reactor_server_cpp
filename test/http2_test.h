@@ -526,6 +526,10 @@ void TestH2ConfigDefaults() {
             pass = false;
             err += "max_header_list_size != 65536; ";
         }
+        if (cfg.http2.enable_push) {
+            pass = false;
+            err += "enable_push should be false by default; ";
+        }
 
         TestFramework::RecordTest("H2 Config: Default Values", pass, err,
                                   TestFramework::TestCategory::OTHER);
@@ -545,7 +549,8 @@ void TestH2ConfigFromJson() {
                 "max_concurrent_streams": 200,
                 "initial_window_size": 131070,
                 "max_frame_size": 32768,
-                "max_header_list_size": 32768
+                "max_header_list_size": 32768,
+                "enable_push": true
             }
         })";
 
@@ -568,6 +573,9 @@ void TestH2ConfigFromJson() {
         }
         if (cfg.http2.max_header_list_size != 32768) {
             pass = false; err += "max_header_list_size mismatch; ";
+        }
+        if (!cfg.http2.enable_push) {
+            pass = false; err += "enable_push not parsed as true; ";
         }
 
         TestFramework::RecordTest("H2 Config: Parse From JSON", pass, err,
@@ -688,12 +696,14 @@ void TestH2ConfigEnvOverride() {
         unsetenv("REACTOR_HTTP2_INITIAL_WINDOW_SIZE");
         unsetenv("REACTOR_HTTP2_MAX_FRAME_SIZE");
         unsetenv("REACTOR_HTTP2_MAX_HEADER_LIST_SIZE");
+        unsetenv("REACTOR_HTTP2_ENABLE_PUSH");
 
         setenv("REACTOR_HTTP2_ENABLED",                  "false", 1);
         setenv("REACTOR_HTTP2_MAX_CONCURRENT_STREAMS",   "50",    1);
         setenv("REACTOR_HTTP2_INITIAL_WINDOW_SIZE",      "32768", 1);
         setenv("REACTOR_HTTP2_MAX_FRAME_SIZE",           "32768", 1);
         setenv("REACTOR_HTTP2_MAX_HEADER_LIST_SIZE",     "16384", 1);
+        setenv("REACTOR_HTTP2_ENABLE_PUSH",              "true",  1);
 
         ServerConfig cfg = ConfigLoader::Default();
         ConfigLoader::ApplyEnvOverrides(cfg);
@@ -716,6 +726,9 @@ void TestH2ConfigEnvOverride() {
         if (cfg.http2.max_header_list_size != 16384) {
             pass = false; err += "max_header_list_size not overridden; ";
         }
+        if (!cfg.http2.enable_push) {
+            pass = false; err += "enable_push not overridden to true; ";
+        }
 
         // Cleanup
         unsetenv("REACTOR_HTTP2_ENABLED");
@@ -723,6 +736,7 @@ void TestH2ConfigEnvOverride() {
         unsetenv("REACTOR_HTTP2_INITIAL_WINDOW_SIZE");
         unsetenv("REACTOR_HTTP2_MAX_FRAME_SIZE");
         unsetenv("REACTOR_HTTP2_MAX_HEADER_LIST_SIZE");
+        unsetenv("REACTOR_HTTP2_ENABLE_PUSH");
 
         TestFramework::RecordTest("H2 Config: Env Overrides", pass, err,
                                   TestFramework::TestCategory::OTHER);
@@ -732,6 +746,7 @@ void TestH2ConfigEnvOverride() {
         unsetenv("REACTOR_HTTP2_INITIAL_WINDOW_SIZE");
         unsetenv("REACTOR_HTTP2_MAX_FRAME_SIZE");
         unsetenv("REACTOR_HTTP2_MAX_HEADER_LIST_SIZE");
+        unsetenv("REACTOR_HTTP2_ENABLE_PUSH");
         TestFramework::RecordTest("H2 Config: Env Overrides", false, e.what(),
                                   TestFramework::TestCategory::OTHER);
     }
@@ -777,6 +792,7 @@ void TestH2ConfigSerialization() {
         cfg.http2.initial_window_size    = 131070;
         cfg.http2.max_frame_size         = 32768;
         cfg.http2.max_header_list_size   = 16384;
+        cfg.http2.enable_push            = true;
 
         std::string json = ConfigLoader::ToJson(cfg);
 
@@ -805,6 +821,9 @@ void TestH2ConfigSerialization() {
         if (json.find("\"max_header_list_size\"") == std::string::npos) {
             pass = false; err += "missing max_header_list_size; ";
         }
+        if (json.find("\"enable_push\"") == std::string::npos) {
+            pass = false; err += "missing enable_push; ";
+        }
 
         // Verify round-trip: parse back what we serialized
         ServerConfig cfg2 = ConfigLoader::LoadFromString(json);
@@ -813,6 +832,9 @@ void TestH2ConfigSerialization() {
         }
         if (cfg2.http2.initial_window_size != 131070) {
             pass = false; err += "round-trip initial_window_size mismatch; ";
+        }
+        if (!cfg2.http2.enable_push) {
+            pass = false; err += "round-trip enable_push mismatch; ";
         }
 
         TestFramework::RecordTest("H2 Config: Serialization", pass, err,
@@ -2829,6 +2851,180 @@ void TestH2_EarlyHints_OffDispatcherThread() {
 }
 
 // ============================================================
+// Category 9: SETTINGS_ENABLE_PUSH wire-format regression tests
+// ============================================================
+
+// Helper: connect a raw TCP socket, send the H2 client preface + an
+// empty client SETTINGS, and read the server's preface SETTINGS frame.
+// Returns the server SETTINGS payload bytes on success, empty on failure.
+// Does NOT use nghttp2 — we are intentionally validating wire bytes here
+// because the SETTINGS_ENABLE_PUSH semantics are direction-asymmetric and
+// must be observable at the byte level.
+static std::vector<uint8_t> ReadServerSettingsPayload(int port) {
+    std::vector<uint8_t> empty;
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return empty;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(static_cast<uint16_t>(port));
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(fd); return empty;
+    }
+    timeval tv{};
+    tv.tv_sec = IO_TIMEOUT_MS / 1000;
+    tv.tv_usec = (IO_TIMEOUT_MS % 1000) * 1000;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    // Client preface (RFC 9113 §3.4) followed by an empty client SETTINGS
+    // frame so the server completes its preface exchange.
+    static constexpr char kPreface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    static constexpr size_t kPrefaceLen = 24;
+    static constexpr uint8_t kEmptySettings[9] = {
+        0, 0, 0,        // length = 0
+        0x04,           // type = SETTINGS
+        0x00,           // flags = 0 (no ACK)
+        0, 0, 0, 0      // stream_id = 0
+    };
+    if (::send(fd, kPreface, kPrefaceLen, 0) != static_cast<ssize_t>(kPrefaceLen)) {
+        ::close(fd); return empty;
+    }
+    if (::send(fd, kEmptySettings, sizeof(kEmptySettings), 0) !=
+        static_cast<ssize_t>(sizeof(kEmptySettings))) {
+        ::close(fd); return empty;
+    }
+
+    // Read the server's frame header (9 bytes). Loop because recv may return
+    // partial data even on a hot loopback.
+    auto recv_exact = [&](uint8_t* buf, size_t need) -> bool {
+        size_t got = 0;
+        while (got < need) {
+            ssize_t n = ::recv(fd, buf + got, need - got, 0);
+            if (n <= 0) return false;
+            got += static_cast<size_t>(n);
+        }
+        return true;
+    };
+    uint8_t header[9];
+    if (!recv_exact(header, 9)) { ::close(fd); return empty; }
+
+    uint32_t length = (static_cast<uint32_t>(header[0]) << 16) |
+                      (static_cast<uint32_t>(header[1]) << 8)  |
+                      static_cast<uint32_t>(header[2]);
+    uint8_t  type   = header[3];
+    uint8_t  flags  = header[4];
+    if (type != 0x04 || (flags & 0x01) != 0) {
+        // Not a non-ACK SETTINGS frame — bail.
+        ::close(fd); return empty;
+    }
+    std::vector<uint8_t> payload(length, 0);
+    if (length > 0 && !recv_exact(payload.data(), length)) {
+        ::close(fd); return empty;
+    }
+    ::close(fd);
+    return payload;
+}
+
+// Walk a SETTINGS payload and return the value of the first matching entry,
+// or std::nullopt if not present. RFC 9113 §6.5: each entry is 6 bytes —
+// 16-bit identifier (big-endian) + 32-bit value (big-endian).
+static bool FindSettingsEntry(const std::vector<uint8_t>& payload,
+                               uint16_t id, uint32_t& out_value) {
+    for (size_t i = 0; i + 6 <= payload.size(); i += 6) {
+        uint16_t entry_id =
+            (static_cast<uint16_t>(payload[i]) << 8) | payload[i + 1];
+        if (entry_id == id) {
+            out_value = (static_cast<uint32_t>(payload[i + 2]) << 24) |
+                        (static_cast<uint32_t>(payload[i + 3]) << 16) |
+                        (static_cast<uint32_t>(payload[i + 4]) << 8)  |
+                        static_cast<uint32_t>(payload[i + 5]);
+            return true;
+        }
+    }
+    return false;
+}
+
+// SETTINGS_ENABLE_PUSH wire format with push DISABLED (default):
+// the server preface MUST contain {ENABLE_PUSH (0x02), 0}.
+void TestH2_SettingsEnablePushWire_Disabled() {
+    std::cout << "\n[TEST] H2 SETTINGS: ENABLE_PUSH=0 advertised when disabled..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = false;  // explicit, default is also false
+        HttpServer server(cfg);
+        server.Get("/", [](const HttpRequest&, HttpResponse& r) { r.Text("ok"); });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        auto payload = ReadServerSettingsPayload(port);
+        bool pass = true;
+        std::string err;
+        if (payload.empty()) {
+            pass = false; err += "no SETTINGS payload received; ";
+        } else {
+            uint32_t value = 0;
+            if (!FindSettingsEntry(payload, 0x0002, value)) {
+                pass = false;
+                err += "ENABLE_PUSH (0x02) entry MISSING when push disabled; ";
+            } else if (value != 0) {
+                pass = false;
+                err += "ENABLE_PUSH value must be 0 when push disabled, got " +
+                       std::to_string(value) + "; ";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "H2 SETTINGS: ENABLE_PUSH=0 advertised when disabled",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 SETTINGS: ENABLE_PUSH=0 advertised when disabled",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// SETTINGS_ENABLE_PUSH wire format with push ENABLED:
+// the entry MUST be ABSENT (a server MUST NOT write a value of 1 per
+// RFC 9113 §7). nghttp2's local default of 1 then applies internally.
+void TestH2_SettingsEnablePushWire_Enabled() {
+    std::cout << "\n[TEST] H2 SETTINGS: ENABLE_PUSH entry omitted when enabled..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        server.Get("/", [](const HttpRequest&, HttpResponse& r) { r.Text("ok"); });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        auto payload = ReadServerSettingsPayload(port);
+        bool pass = true;
+        std::string err;
+        if (payload.empty()) {
+            pass = false; err += "no SETTINGS payload received; ";
+        } else {
+            uint32_t value = 0;
+            if (FindSettingsEntry(payload, 0x0002, value)) {
+                pass = false;
+                err += "ENABLE_PUSH must be ABSENT when push enabled, got value " +
+                       std::to_string(value) + "; ";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "H2 SETTINGS: ENABLE_PUSH entry omitted when enabled",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 SETTINGS: ENABLE_PUSH entry omitted when enabled",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ============================================================
 // Entry point
 // ============================================================
 
@@ -2905,6 +3101,10 @@ void RunAllTests() {
     TestH2_EarlyHints_StreamClosedByPeerSafe();
     TestH2_EarlyHints_100ContinueThen103();
     TestH2_EarlyHints_OffDispatcherThread();
+
+    // --- Category 9: SETTINGS_ENABLE_PUSH wire format ---
+    TestH2_SettingsEnablePushWire_Disabled();
+    TestH2_SettingsEnablePushWire_Enabled();
 }
 
 }  // namespace Http2Tests
