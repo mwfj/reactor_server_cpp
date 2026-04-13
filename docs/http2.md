@@ -269,14 +269,28 @@ Resume happens at two points:
 
 If the connection is closing (`IsClosing()`), `SendPendingFrames` breaks the loop early to avoid wasting CPU serializing frames for a disconnected peer.
 
+## Early Hints (103)
+
+HTTP/2 async routes can emit `103 Early Hints` responses before the final response via the `InterimResponseSender` passed to the handler — the same API as HTTP/1.1 (see [docs/http.md](http.md#early-hints-103) for the basic usage and contract). On HTTP/2 the interim is sent as a non-final HEADERS frame **without** `END_STREAM`, so the same stream carries both the 103 and the eventual 200.
+
+Defined in [RFC 8297](https://datatracker.ietf.org/doc/html/rfc8297); HTTP/2 wire format in [RFC 9113 §8.1](https://datatracker.ietf.org/doc/html/rfc9113#section-8.1).
+
+### Implementation notes specific to HTTP/2
+
+- **`SubmitInterimHeaders`** on `Http2Session` submits a HEADERS frame with `NGHTTP2_FLAG_NONE` and no data provider, leaving the stream in `HALF_CLOSED_REMOTE` so the subsequent `SubmitResponse` can emit the final block on the same stream.
+- **`final_response_submitted_`** — per-stream boolean flag set in `SubmitResponse` on success. `SubmitInterimHeaders` refuses to submit when the flag is set, preventing a late 1xx from racing or corrupting a stream nghttp2 already considers half-closed.
+- **Dispatcher-thread-only contract** — `Http2ConnectionHandler::SendInterimResponse` rejects calls from foreign threads with a warn log, rather than silently mutating nghttp2 state across a thread boundary. Async code that lives off-dispatcher (e.g. an upstream completion thread) must hop via `RunOnDispatcher()` before calling `send_interim`.
+- **Peer-closed-stream safety** — if the client RST's the stream or drops the transport before the interim fires, `SubmitInterimHeaders` observes a missing/closed stream and drops the submit without crashing. No special teardown is needed in the handler.
+- **`send_interim(100, ...)`** — rejected. The framework already emits `100 Continue` automatically when the client includes `Expect: 100-continue`; application code cannot emit additional 100s.
+- **`send_interim(101, ...)`** — rejected. `101 Switching Protocols` is invalid in HTTP/2 (RFC 9113 §8.6).
+- **Forbidden headers** — `Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Transfer-Encoding`, `Upgrade`, `Content-Length`, any `Proxy-*`, and the HTTP/2 pseudo-headers are stripped before serialization.
+
 ## Limitations
 
-- Server push disabled (SETTINGS_ENABLE_PUSH = 0)
+- Server push disabled (SETTINGS_ENABLE_PUSH = 0) — re-enabled opt-in via `http2.enable_push` is planned in a follow-up phase
 - No WebSocket-over-HTTP/2 (Extended CONNECT, RFC 8441)
 - No HTTP/2 priority tree optimization (nghttp2 handles basic priority)
 - No manual flow control (nghttp2 automatic mode)
-- No non-final 1xx API for app handlers (103 Early Hints requires internal submit_headers; SubmitResponse rejects all `status < 200`)
-- Default-port authority normalization deferred (e.g. `example.com` vs `example.com:80` treated as different)
 
 ## Third-Party Dependency
 
