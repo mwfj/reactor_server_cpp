@@ -98,7 +98,7 @@ RateLimitZone::RateLimitZone(const std::string& name,
     : name_(name),
       key_type_(config.key_type),
       key_extractor_(std::move(extractor)),
-      shards_(DEFAULT_SHARD_COUNT)
+      shards_(SHARD_COUNT)
 {
     auto policy = std::make_shared<ZonePolicy>();
     policy->rate = config.rate;
@@ -110,7 +110,7 @@ RateLimitZone::RateLimitZone(const std::string& name,
     logging::Get()->debug("RateLimitZone '{}' created: rate={} capacity={} key_type={} "
                           "max_entries={} shards={}",
                           name_, config.rate, config.capacity, config.key_type,
-                          config.max_entries, DEFAULT_SHARD_COUNT);
+                          config.max_entries, SHARD_COUNT);
 }
 
 RateLimitZone::~RateLimitZone() {
@@ -144,6 +144,11 @@ RateLimitZone::Entry* RateLimitZone::FindOrCreate(Shard& shard,
     //
     // max_per_shard: floor(max_entries / SHARD_COUNT), minimum 1 so we
     // never produce a zero-capacity shard. Matches the EvictExpired math.
+    //
+    // Tradeoff: drastic reductions via Reload() (e.g., 100k → 16) will
+    // cause the first insert into an over-capacity shard to evict many
+    // entries under the shard lock. Extreme reductions are rare and the
+    // memory guarantee is considered worth the one-time latency spike.
     size_t max_per_shard = static_cast<size_t>(policy.max_entries) / shards_.size();
     if (max_per_shard == 0) max_per_shard = 1;
     // Evict LRU tail until there's room for the new entry.
@@ -246,7 +251,7 @@ RateLimitZone::Result RateLimitZone::Check(const HttpRequest& request) {
     // 8. Attempt to consume a token
     bool allowed = entry->bucket.TryConsume();
     int64_t remaining = entry->bucket.AvailableTokens();
-    double retry_after = allowed ? 0.0 : entry->bucket.SecondsUntilAvailable();
+    double retry_after = entry->bucket.SecondsUntilAvailable();
 
     return {allowed, /*applicable=*/true, policy->capacity, remaining,
             retry_after, policy->rate};
@@ -273,9 +278,20 @@ void RateLimitZone::EvictExpired(size_t dispatcher_index, size_t dispatcher_coun
         ? (static_cast<double>(policy->capacity) / policy->rate)
         : 60.0;  // Fallback: 60 seconds if rate is zero
     static constexpr int IDLE_REFILL_CYCLES = 4;
-    auto cutoff_duration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-        std::chrono::duration<double>(refill_sec * IDLE_REFILL_CYCLES));
-    auto cutoff = now - cutoff_duration;
+    auto cutoff = std::chrono::steady_clock::time_point::min();
+    long double idle_window_sec =
+        static_cast<long double>(refill_sec) *
+        static_cast<long double>(IDLE_REFILL_CYCLES);
+    long double max_duration_sec = std::chrono::duration<long double>(
+        std::chrono::steady_clock::duration::max()).count();
+    if (idle_window_sec < max_duration_sec) {
+        auto cutoff_duration =
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<long double>(idle_window_sec));
+        if (cutoff_duration <= now.time_since_epoch()) {
+            cutoff = now - cutoff_duration;
+        }
+    }
 
     // Stride across shards assigned to this dispatcher
     for (size_t i = dispatcher_index; i < shard_count; i += dispatcher_count) {

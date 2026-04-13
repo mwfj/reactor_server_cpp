@@ -60,18 +60,18 @@ HttpResponse& HttpResponse::Header(const std::string& key, const std::string& va
 }
 
 bool HttpResponse::RemoveHeader(const std::string& key) {
-    std::string lower_key = key;
-    std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+    // Stateless case-insensitive comparator — avoids the O(N) string
+    // allocations that a lowercase-copy-per-comparison approach would incur.
+    auto eq_ci = [](unsigned char a, unsigned char b) {
+        return std::tolower(a) == std::tolower(b);
+    };
     auto before = headers_.size();
     headers_.erase(
         std::remove_if(headers_.begin(), headers_.end(),
-            [&lower_key](const std::pair<std::string, std::string>& hdr) {
-                std::string hdr_lower = hdr.first;
-                std::transform(hdr_lower.begin(), hdr_lower.end(),
-                               hdr_lower.begin(),
-                               [](unsigned char c) { return std::tolower(c); });
-                return hdr_lower == lower_key;
+            [&key, &eq_ci](const std::pair<std::string, std::string>& hdr) {
+                return hdr.first.size() == key.size() &&
+                       std::equal(hdr.first.begin(), hdr.first.end(),
+                                  key.begin(), eq_ci);
             }),
         headers_.end());
     return headers_.size() < before;

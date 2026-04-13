@@ -110,9 +110,6 @@ public:
     static constexpr size_t SHARD_COUNT = 16;
 
 private:
-    // Backward-compatibility alias for the constant used in this file.
-    static constexpr size_t DEFAULT_SHARD_COUNT = SHARD_COUNT;
-
     std::string name_;
     std::string key_type_;
     KeyExtractor key_extractor_;

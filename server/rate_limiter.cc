@@ -1,6 +1,7 @@
 #include "rate_limit/rate_limiter.h"
 #include "log/logger.h"
 #include <cmath>
+#include <limits>
 
 // ---------------------------------------------------------------------------
 // Constructor / Destructor
@@ -117,10 +118,18 @@ bool RateLimitManager::Check(const HttpRequest& request,
     if (want_headers && !best_name.empty()) {
         // window_sec = ceil(capacity / rate). Minimum 1 to satisfy the
         // IETF draft's requirement that w is a positive integer.
-        int window_sec = 1;
+        int64_t window_sec = 1;
         if (best_rate > 0.0 && best_limit > 0) {
-            double w = static_cast<double>(best_limit) / best_rate;
-            window_sec = std::max(1, static_cast<int>(std::ceil(w)));
+            long double w = static_cast<long double>(best_limit) /
+                            static_cast<long double>(best_rate);
+            constexpr long double MAX_WINDOW_SEC =
+                static_cast<long double>(std::numeric_limits<int64_t>::max());
+            if (w >= MAX_WINDOW_SEC) {
+                window_sec = std::numeric_limits<int64_t>::max();
+            } else {
+                window_sec = std::max<int64_t>(
+                    1, static_cast<int64_t>(std::ceil(w)));
+            }
         }
 
         // RateLimit-Policy: {quota};w={window}
@@ -178,8 +187,13 @@ void RateLimitManager::EvictExpired(size_t dispatcher_index,
 // ---------------------------------------------------------------------------
 
 void RateLimitManager::Reload(const RateLimitConfig& config) {
-    // 1. Store scalar atomics
-    enabled_.store(config.enabled, std::memory_order_release);
+    // 1. Store scalar atomics. Apply the enabled flag with transition-aware
+    // ordering: disabling goes first so requests stop checking immediately,
+    // enabling goes last so no request can observe enabled=true with the old
+    // zone snapshot.
+    if (!config.enabled) {
+        enabled_.store(false, std::memory_order_release);
+    }
     dry_run_.store(config.dry_run, std::memory_order_release);
     status_code_.store(config.status_code, std::memory_order_release);
     include_headers_.store(config.include_headers, std::memory_order_release);
@@ -216,6 +230,10 @@ void RateLimitManager::Reload(const RateLimitConfig& config) {
 
     // 4. Swap the zone list atomically
     StoreZones(std::move(new_zones));
+
+    if (config.enabled) {
+        enabled_.store(true, std::memory_order_release);
+    }
 
     logging::Get()->info("RateLimitManager reloaded: enabled={} dry_run={} "
                          "status_code={} zones={}",

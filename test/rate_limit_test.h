@@ -444,12 +444,20 @@ void TestZoneEmptyKeySkipsRateLimit() {
         // Request without x-api-key header -> empty key -> allowed
         HttpRequest req = MakeRequest("GET", "/test");
 
-        // Should always be allowed regardless of rate limit
+        // Should always be allowed regardless of rate limit, AND the result
+        // must be marked applicable=false so the manager skips this zone
+        // when building response headers (symmetric with applies_to miss).
         for (int i = 0; i < 10; i++) {
             auto result = zone.Check(req);
             if (!result.allowed) {
                 pass = false;
                 err += "request " + std::to_string(i) + " was denied with empty key; ";
+                break;
+            }
+            if (result.applicable) {
+                pass = false;
+                err += "request " + std::to_string(i) +
+                       " result.applicable=true (should be false — empty key); ";
                 break;
             }
         }
@@ -961,6 +969,80 @@ void TestManagerResponseHeaders() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest("RateLimitManager: response headers present", false, e.what(),
                                   TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestManagerLargePolicyWindowHeader() {
+    std::cout << "\n[TEST] RateLimitManager: large policy window header doesn't overflow..." << std::endl;
+    try {
+        bool pass = true;
+        std::string err;
+
+        RateLimitConfig config;
+        config.enabled = true;
+        config.include_headers = true;
+        config.zones.push_back(
+            {"huge_window", 0.001, 1000000000000LL, "client_ip", 1000, {}});
+
+        RateLimitManager manager(config);
+
+        HttpRequest req = MakeRequest("GET", "/test");
+        HttpResponse response;
+        if (!manager.Check(req, response)) {
+            pass = false;
+            err += "request should be allowed; ";
+        }
+
+        std::string policy = ResponseGetHeader(response, "RateLimit-Policy");
+        if (policy != "1000000000000;w=1000000000000000") {
+            pass = false;
+            err += "RateLimit-Policy='" + policy +
+                   "' expected '1000000000000;w=1000000000000000'; ";
+        }
+
+        TestFramework::RecordTest("RateLimitManager: large policy window header doesn't overflow",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RateLimitManager: large policy window header doesn't overflow",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestManagerResetHeaderWhenBucketEmpties() {
+    std::cout << "\n[TEST] RateLimitManager: reset header reflects empty allowed bucket..." << std::endl;
+    try {
+        bool pass = true;
+        std::string err;
+
+        RateLimitConfig config;
+        config.enabled = true;
+        config.include_headers = true;
+        config.zones.push_back({"test_zone", 1.0, 1, "client_ip", 1000, {}});
+
+        RateLimitManager manager(config);
+
+        HttpRequest req = MakeRequest("GET", "/test");
+        HttpResponse response;
+        if (!manager.Check(req, response)) {
+            pass = false;
+            err += "first request should be allowed; ";
+        }
+
+        std::string header = ResponseGetHeader(response, "RateLimit");
+        if (header.find("remaining=0") == std::string::npos) {
+            pass = false;
+            err += "RateLimit header should report remaining=0; ";
+        }
+        if (header.find("reset=0") != std::string::npos) {
+            pass = false;
+            err += "RateLimit header should not report reset=0 after last token is consumed; ";
+        }
+
+        TestFramework::RecordTest("RateLimitManager: reset header reflects empty allowed bucket",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RateLimitManager: reset header reflects empty allowed bucket",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
 
@@ -2090,6 +2172,8 @@ void RunAllTests() {
     TestManagerStopsDebitingAfterDenial();
     TestManagerSkipsNonApplicableZonesForHeaders();
     TestManagerResponseHeaders();
+    TestManagerLargePolicyWindowHeader();
+    TestManagerResetHeaderWhenBucketEmpties();
     TestManagerRetryAfterOnDenial();
     TestManagerDisabledReturnsTrueImmediately();
 
