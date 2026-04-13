@@ -80,6 +80,25 @@ public:
         int status_code,
         const std::vector<std::pair<std::string, std::string>>& headers);
 
+    // HTTP/2 server push primitive — atomically issues PUSH_PROMISE on
+    // `parent_stream_id` and the associated response on the freshly
+    // promised stream, then flushes nghttp2 output. Returns the promised
+    // stream_id (>0) on success, -1 otherwise (off-thread, shutdown
+    // requested, push disabled, validation failure, nghttp2 failure —
+    // see Http2Session::SubmitPushPromise for the full validation list).
+    //
+    // Dispatcher-thread-only contract — off-thread callers must hop via
+    // RunOnDispatcher() first. Application code should use the bound
+    // ResourcePusher closure (async routes) or http::PushResource (sync
+    // routes) rather than calling this directly.
+    int32_t PushResource(
+        int32_t parent_stream_id,
+        const std::string& method,
+        const std::string& scheme,
+        const std::string& authority,
+        const std::string& path,
+        const HttpResponse& response);
+
     // Check if session is still active
     bool IsAlive() const { return session_ && session_->IsAlive(); }
 

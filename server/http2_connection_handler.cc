@@ -479,6 +479,47 @@ bool Http2ConnectionHandler::SendInterimResponse(
     return true;
 }
 
+int32_t Http2ConnectionHandler::PushResource(
+    int32_t parent_stream_id,
+    const std::string& method, const std::string& scheme,
+    const std::string& authority, const std::string& path,
+    const HttpResponse& response) {
+    // Same dispatcher-thread guard as SendInterimResponse — nghttp2's
+    // session state is not thread-safe, and PUSH_PROMISE submission
+    // mutates stream tracking. Off-thread callers (async handlers
+    // resuming on a worker thread) must hop via RunOnDispatcher().
+    if (!conn_ || !conn_->IsOnDispatcherThread()) {
+        logging::Get()->warn(
+            "PushResource off-dispatcher-thread parent={} (hop via RunOnDispatcher first)",
+            parent_stream_id);
+        return -1;
+    }
+    if (!session_) {
+        logging::Get()->debug(
+            "PushResource on destroyed session parent={}; drop",
+            parent_stream_id);
+        return -1;
+    }
+    if (shutdown_requested_.load(std::memory_order_acquire)) {
+        logging::Get()->debug(
+            "PushResource: shutdown requested parent={}", parent_stream_id);
+        return -1;
+    }
+    int32_t promised = session_->SubmitPushPromise(
+        parent_stream_id, method, scheme, authority, path, response);
+    if (promised > 0) {
+        // Pushed streams count toward the per-connection stream counter
+        // so abrupt-close compensation in HttpServer::RemoveConnection
+        // doesn't under-count their close. The stream-close callback
+        // decrements symmetrically when the promised stream finalizes.
+        IncrementLocalStreamCount();
+    }
+    // Same flush reasoning as SubmitStreamResponse — async/post-handler
+    // submissions don't ride the tail flush in OnRawData.
+    session_->SendPendingFrames();
+    return promised;
+}
+
 void Http2ConnectionHandler::NotifyDrainComplete() {
     if (drain_notified_) return;
     drain_notified_ = true;

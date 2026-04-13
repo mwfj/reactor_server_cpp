@@ -1,5 +1,6 @@
 #include "http/http_server.h"
 #include "http/http_status.h"
+#include "http/push_helper.h"
 #include "config/config_loader.h"
 #include "ws/websocket_frame.h"
 #include "http2/http2_constants.h"
@@ -9,6 +10,34 @@
 #include "log/log_utils.h"
 #include <algorithm>
 #include <set>
+
+// Definition of the per-thread sync push slot. See declaration in
+// include/http/http_server.h. Initial value is nullptr — the helper
+// http::PushResource() returns -1 with a debug log when the slot is
+// null (called outside any sync dispatch).
+thread_local HTTP_CALLBACKS_NAMESPACE::ResourcePusher*
+    HttpServer::current_sync_pusher_ = nullptr;
+
+namespace http {
+
+int32_t PushResource(const std::string& method,
+                     const std::string& scheme,
+                     const std::string& authority,
+                     const std::string& path,
+                     const HttpResponse& response) {
+    auto* p = HttpServer::current_sync_pusher_;
+    if (!p || !*p) {
+        // No active sync dispatch on this thread, or the pusher slot
+        // was installed but the closure itself is empty. Either way,
+        // treat as "push not available right now" rather than crashing.
+        logging::Get()->debug(
+            "http::PushResource called outside a sync dispatch; ignored");
+        return -1;
+    }
+    return (*p)(method, scheme, authority, path, response);
+}
+
+}  // namespace http
 
 // RAII guard: decrements an atomic counter on scope exit. Used in request
 // dispatch callbacks to ensure active_requests_ is decremented even on throw.
@@ -3082,13 +3111,12 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         });
                     };
 
-                // Real H2 send_interim: captures a weak_ptr to the H2
-                // connection handler and the stream_id, then calls
-                // SendInterimResponse. The handler enforces the
-                // dispatcher-thread-only contract — an app that fires
-                // send_interim from a foreign thread (or after final) is
-                // logged and dropped without touching nghttp2 state.
-                // Push stays on the phase-2 no-op until Phase 5 wires it.
+                // Real H2 send_interim + push_resource. Both capture a
+                // weak_ptr to the H2 handler and the per-stream id and
+                // delegate to the handler's primitives, which enforce
+                // the dispatcher-thread-only contract — off-thread
+                // callers (async work resuming on a worker) must hop
+                // via RunOnDispatcher() before invoking the closure.
                 std::weak_ptr<Http2ConnectionHandler> h2_weak = self;
                 auto send_interim =
                     [h2_weak, stream_id](
@@ -3099,10 +3127,16 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     h2->SendInterimResponse(stream_id, status_code, hdrs);
                 };
                 auto push_resource =
-                    [](const std::string&, const std::string&, const std::string&,
-                       const std::string&, const HttpResponse&) -> int32_t {
-                    logging::Get()->debug("push_resource no-op (H2 / phase-2 scaffold)");
-                    return -1;
+                    [h2_weak, stream_id](
+                        const std::string& method,
+                        const std::string& scheme,
+                        const std::string& authority,
+                        const std::string& path,
+                        const HttpResponse& resp) -> int32_t {
+                    auto h2 = h2_weak.lock();
+                    if (!h2) return -1;
+                    return h2->PushResource(stream_id, method, scheme,
+                                            authority, path, resp);
                 };
                 try {
                     if (async_head_fallback) {
@@ -3151,6 +3185,33 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 guard.release();
                 return;
             }
+
+            // Sync H2 dispatch path: install a thread-local ResourcePusher
+            // so synchronous handlers can issue HTTP/2 server push via
+            // http::PushResource() without changing the sync handler
+            // signature. Push remains opt-in via http2.enable_push and
+            // is gated per-connection by the peer's SETTINGS_ENABLE_PUSH
+            // — the closure delegates to PushResource which enforces
+            // both checks. The scope guard guarantees the thread-local
+            // never dangles past the dispatch (even on exception).
+            std::weak_ptr<Http2ConnectionHandler> h2_weak_sync = self;
+            int32_t sync_stream_id = stream_id;
+            HTTP_CALLBACKS_NAMESPACE::ResourcePusher sync_pusher =
+                [h2_weak_sync, sync_stream_id](
+                    const std::string& method,
+                    const std::string& scheme,
+                    const std::string& authority,
+                    const std::string& path,
+                    const HttpResponse& resp) -> int32_t {
+                auto h2 = h2_weak_sync.lock();
+                if (!h2) return -1;
+                return h2->PushResource(sync_stream_id, method, scheme,
+                                        authority, path, resp);
+            };
+            HttpServer::current_sync_pusher_ = &sync_pusher;
+            struct PusherSlotGuard {
+                ~PusherSlotGuard() { HttpServer::current_sync_pusher_ = nullptr; }
+            } pusher_slot_guard;
 
             if (!router_.Dispatch(request, response)) {
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
