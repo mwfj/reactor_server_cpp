@@ -41,10 +41,18 @@ void TokenBucket::Refill() const {
     }
 
     tokens_mt_ = std::min(capacity_mt_, tokens_mt_ + add);
-    // Advance last_refill_time_ by exactly the time that produced `add`
-    // millitokens. The truncation remainder (elapsed_ms - consumed_ms)
-    // stays as credit for the next Refill() call.
-    int64_t consumed_ms = (add * 1000) / rate_mt_;
+    // Advance last_refill_time_ by the time that produced `add` millitokens,
+    // rounded UP (ceiling division). Ceiling ensures that when `add > 0` the
+    // time advances by at least 1 ms — without this, fractional rates (e.g.,
+    // 1.5 req/s → rate_mt_=1500) can produce add=1 with floor-consumed_ms=0,
+    // which would re-count the same millisecond on the next call and let the
+    // effective rate exceed the configured rate. Ceiling slightly under-
+    // credits (safer: stricter enforcement, bounded by 1 ms of refill).
+    int64_t numerator = add * 1000;
+    int64_t consumed_ms = numerator / rate_mt_;
+    if (numerator % rate_mt_ != 0) {
+        ++consumed_ms;
+    }
     last_refill_time_ += std::chrono::milliseconds(consumed_ms);
 }
 

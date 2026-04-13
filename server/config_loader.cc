@@ -2,6 +2,7 @@
 #include "http2/http2_constants.h"
 #include "http/route_trie.h"         // ParsePattern, ValidatePattern for proxy route_prefix
 #include "log/logger.h"
+#include "rate_limit/rate_limit_zone.h"  // RateLimitZone::SHARD_COUNT
 #include "nlohmann/json.hpp"
 
 #include <fstream>
@@ -875,7 +876,7 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             "header:", "client_ip+path", "client_ip+header:"
         };
 
-        // Rate limit zone bounds.
+        // Rate limit zone bounds (scoped to this validation block).
         //   MIN_RATE: sub-millitoken rates truncate to 0 and buckets never refill.
         //   MAX_RATE: guards the `rate * 1000` conversion in TokenBucket from
         //             int64_t overflow. 1e9 req/s is astronomical — real
@@ -883,15 +884,12 @@ void ConfigLoader::Validate(const ServerConfig& config) {
         //   MAX_CAPACITY: guards `capacity * 1000` in TokenBucket's constructor
         //                 from int64_t overflow. 1e12 is 1 trillion — more than
         //                 any realistic burst budget.
-        static constexpr double MIN_RATE = 0.001;
-        static constexpr double MAX_RATE = 1e9;
-        static constexpr int64_t MAX_CAPACITY = 1'000'000'000'000LL;  // 1e12
-        // Shard count used by RateLimitZone (must stay in sync with
-        // DEFAULT_SHARD_COUNT in rate_limit_zone.h). Used to document the
-        // actual max_entries behavior: the runtime cap is
-        // floor(max_entries / SHARD_COUNT) * SHARD_COUNT, with a minimum
-        // of SHARD_COUNT (one entry per shard).
-        static constexpr int RATE_LIMIT_SHARD_COUNT = 16;
+        //   RATE_LIMIT_SHARD_COUNT: pulled from RateLimitZone to stay in sync.
+        constexpr double MIN_RATE = 0.001;
+        constexpr double MAX_RATE = 1e9;
+        constexpr int64_t MAX_CAPACITY = 1'000'000'000'000LL;  // 1e12
+        constexpr int RATE_LIMIT_SHARD_COUNT =
+            static_cast<int>(RateLimitZone::SHARD_COUNT);
 
         std::unordered_set<std::string> seen_zone_names;
         for (size_t i = 0; i < rl.zones.size(); ++i) {

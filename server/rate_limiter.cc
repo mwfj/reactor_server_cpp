@@ -43,27 +43,44 @@ bool RateLimitManager::Check(const HttpRequest& request,
         return true;
     }
 
-    // Track the most restrictive zone across all checks.
+    // Track the most restrictive *applicable* zone across all checks.
+    // Non-applicable zones (applies_to miss, empty key, etc.) are ignored
+    // for header purposes — they did not govern this request.
+    //
+    // Note on multi-zone denial semantics: when a zone denies, we stop
+    // evaluating later zones (match Nginx's "first deny wins"). This means
+    // the emitted Retry-After reflects the first denying zone in config
+    // order, not the longest wait across all zones. Operators should put
+    // tighter (narrower, shorter-retry) zones first. If two zones would
+    // both deny the same request, only the first is reported — the second
+    // is not consulted to avoid unnecessary token debit.
     std::string best_name;
     int64_t best_limit = 0;
     int64_t best_remaining = INT64_MAX;
     double best_retry_after = 0.0;
+    double best_rate = 0.0;
     bool denied = false;
 
     for (const auto& zone : *zones) {
         RateLimitZone::Result result = zone->Check(request);
+
+        // Skip zones that didn't apply to this request — they must not
+        // drive response headers (would incorrectly advertise limits on
+        // requests those zones never actually governed).
+        if (!result.applicable) {
+            continue;
+        }
 
         if (!result.allowed) {
             // Denied: record this zone for headers and stop evaluating
             // remaining zones. Continuing would debit tokens in zones
             // whose outcome cannot change the final decision — the
             // request is already rejected.
-            // Matches Nginx's behavior (first-deny wins, later zones
-            // are not consulted).
             best_name = zone->name();
             best_limit = result.limit;
             best_remaining = result.remaining;
             best_retry_after = result.retry_after_sec;
+            best_rate = result.rate;
             denied = true;
             break;
         }
@@ -82,19 +99,34 @@ bool RateLimitManager::Check(const HttpRequest& request,
             best_limit = result.limit;
             best_remaining = result.remaining;
             best_retry_after = result.retry_after_sec;
+            best_rate = result.rate;
         }
     }
 
     // Set RateLimit-Policy and RateLimit headers per IETF draft
     // (draft-ietf-httpapi-ratelimit-headers-10).
-    //   RateLimit-Policy: {limit};w={window}
+    //   RateLimit-Policy: {quota};w={window_seconds}
     //   RateLimit: limit={limit}, remaining={remaining}, reset={reset}
+    //
+    // For a token bucket with sustained rate R and burst capacity C, the
+    // effective quota is C requests over a window of (C/R) seconds (the
+    // time to refill from empty to full). Reporting w=1 with quota=C
+    // misleads clients into thinking they can send C requests per second,
+    // when the actual sustained rate is R.
     bool want_headers = include_headers();
     if (want_headers && !best_name.empty()) {
-        // RateLimit-Policy: {limit};w=1
-        // w=1 (1-second window) matches the token bucket's per-second rate.
+        // window_sec = ceil(capacity / rate). Minimum 1 to satisfy the
+        // IETF draft's requirement that w is a positive integer.
+        int window_sec = 1;
+        if (best_rate > 0.0 && best_limit > 0) {
+            double w = static_cast<double>(best_limit) / best_rate;
+            window_sec = std::max(1, static_cast<int>(std::ceil(w)));
+        }
+
+        // RateLimit-Policy: {quota};w={window}
         response.Header("RateLimit-Policy",
-                        std::to_string(best_limit) + ";w=1");
+                        std::to_string(best_limit) + ";w=" +
+                        std::to_string(window_sec));
 
         // RateLimit: limit={L}, remaining={R}, reset={T}
         int reset_ceil = (best_retry_after > 0.0)

@@ -59,6 +59,24 @@ HttpResponse& HttpResponse::Header(const std::string& key, const std::string& va
     return *this;
 }
 
+bool HttpResponse::RemoveHeader(const std::string& key) {
+    std::string lower_key = key;
+    std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    auto before = headers_.size();
+    headers_.erase(
+        std::remove_if(headers_.begin(), headers_.end(),
+            [&lower_key](const std::pair<std::string, std::string>& hdr) {
+                std::string hdr_lower = hdr.first;
+                std::transform(hdr_lower.begin(), hdr_lower.end(),
+                               hdr_lower.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                return hdr_lower == lower_key;
+            }),
+        headers_.end());
+    return headers_.size() < before;
+}
+
 HttpResponse& HttpResponse::AppendHeader(const std::string& key, const std::string& value) {
     // Same sanitization as Header() — prevent response splitting
     std::string safe_key = key;

@@ -492,13 +492,21 @@ void TestZoneAppliesToFilter() {
             err += "second /api/ request should be denied (capacity=1); ";
         }
 
-        // Request to /health -- should NOT be rate limited (no prefix match)
+        // Request to /health -- should NOT be rate limited (no prefix match).
+        // The result must be marked applicable=false so the manager skips
+        // this zone when building response headers.
         HttpRequest health_req = MakeRequest("GET", "/health");
         for (int i = 0; i < 5; i++) {
             auto r = zone.Check(health_req);
             if (!r.allowed) {
                 pass = false;
                 err += "/health request " + std::to_string(i) + " was denied (should bypass); ";
+                break;
+            }
+            if (r.applicable) {
+                pass = false;
+                err += "/health request " + std::to_string(i) +
+                       " result.applicable=true (should be false — prefix miss); ";
                 break;
             }
         }
@@ -632,6 +640,52 @@ void TestZoneLruEviction() {
                                   TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("RateLimitZone: LRU eviction when max_entries exceeded", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestZoneSynchronousMaxEntriesEnforcement() {
+    std::cout << "\n[TEST] RateLimitZone: max_entries enforced synchronously on insert..." << std::endl;
+    try {
+        bool pass = true;
+        std::string err;
+
+        // Insert many unique keys WITHOUT calling EvictExpired in between.
+        // Under the old behavior, the shard could grow unbounded until the
+        // next timer sweep (vulnerability to memory spikes under high-
+        // cardinality bursts). With the fix, FindOrCreate evicts LRU before
+        // insert if the shard is at capacity.
+        RateLimitZoneConfig config;
+        config.name = "sync_evict_zone";
+        config.rate = 1000.0;
+        config.capacity = 100;
+        config.key_type = "client_ip";
+        config.max_entries = 16;  // 1 per shard (16 shards default)
+
+        auto extractor = MakeKeyExtractor(config.key_type);
+        RateLimitZone zone(config.name, config, std::move(extractor));
+
+        // Insert 500 unique keys without calling EvictExpired.
+        for (int i = 0; i < 500; i++) {
+            HttpRequest req = MakeRequest("GET", "/test",
+                "10.1." + std::to_string(i / 256) + "." + std::to_string(i % 256));
+            zone.Check(req);
+        }
+
+        // Without a timer sweep, count must still respect max_entries
+        // (thanks to synchronous eviction on insert).
+        size_t count = zone.EntryCount();
+        if (count > static_cast<size_t>(config.max_entries)) {
+            pass = false;
+            err += "count=" + std::to_string(count) +
+                   " exceeds max_entries=" + std::to_string(config.max_entries) +
+                   " without timer sweep (sync eviction failed); ";
+        }
+
+        TestFramework::RecordTest("RateLimitZone: synchronous max_entries enforcement", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RateLimitZone: synchronous max_entries enforcement", false, e.what(),
                                   TestFramework::TestCategory::OTHER);
     }
 }
@@ -791,23 +845,31 @@ void TestManagerStopsDebitingAfterDenial() {
         bool pass = true;
         std::string err;
 
-        // Zone order matters: deny_first (capacity=1) before trailing
-        // "witness" zone. After deny_first rejects, Check() must NOT consume
-        // from trailing_zone. We verify by checking trailing_zone's state
-        // via a request that would only succeed if its tokens were intact.
+        // Strategy: use key_type="path" for BOTH zones so buckets are
+        // SHARED across all clients. Then we can directly observe whether
+        // the trailing zone's bucket was debited by requests that the
+        // leading zone rejected.
+        //
+        //   deny_first:    key=path, capacity=1 — rejects 2nd+ request on same path
+        //   trailing_zone: key=path, capacity=4 — witness; if debited after
+        //                  deny_first rejects, it will exhaust faster
+        //
+        // With OLD behavior (debit all zones): every rejection by deny_first
+        // still consumes 1 from trailing_zone, so after 4 total requests
+        // trailing_zone is exhausted (4 debits = capacity).
+        //
+        // With NEW behavior (break on deny): only request #1 debits
+        // trailing_zone. Rejections by deny_first do not touch it. After
+        // 100 rejections, trailing_zone still has 3 tokens.
         RateLimitConfig config;
         config.enabled = true;
-        // Zone 1: will be exhausted first
-        config.zones.push_back({"deny_first", 1.0, 1, "client_ip", 1000, {}});
-        // Zone 2 (later in iteration order): capacity=2. If debited after
-        // deny_first rejects, only 1 token remains; otherwise 2 tokens remain.
-        config.zones.push_back({"trailing_zone", 100.0, 2, "client_ip", 1000, {}});
+        config.zones.push_back({"deny_first", 1.0, 1, "path", 1000, {}});
+        config.zones.push_back({"trailing_zone", 0.001, 4, "path", 1000, {}});
 
         RateLimitManager manager(config);
-
         HttpRequest req = MakeRequest("GET", "/test", "10.0.0.1");
 
-        // First request: both zones allow. deny_first: 1 -> 0. trailing_zone: 2 -> 1.
+        // First request: both zones allow. deny_first: 1→0, trailing: 4→3.
         {
             HttpResponse response;
             if (!manager.Check(req, response)) {
@@ -816,38 +878,47 @@ void TestManagerStopsDebitingAfterDenial() {
             }
         }
 
-        // Second request: deny_first denies. With the fix, trailing_zone is
-        // NOT consulted. trailing_zone should still have 1 token remaining.
-        {
+        // Send 5 more requests that deny_first will reject. With the fix,
+        // trailing_zone stays at 3 tokens (no debit on rejection path).
+        for (int i = 0; i < 5; i++) {
             HttpResponse response;
             if (manager.Check(req, response)) {
                 pass = false;
-                err += "second request should be denied by deny_first; ";
+                err += "request " + std::to_string(i + 2) +
+                       " should be denied by deny_first; ";
             }
         }
 
-        // Third request from a DIFFERENT client_ip to bypass deny_first
-        // (per-client_ip key). If the fix is in place, trailing_zone has
-        // 2 tokens left for this new client (unconsumed by prior rejection).
-        // If the old behavior leaked, trailing_zone would have 1 token and
-        // we'd see only one allow-before-deny. We issue 2 requests.
-        HttpRequest req2 = MakeRequest("GET", "/test", "10.0.0.2");
-        {
-            HttpResponse r1, r2;
-            bool a1 = manager.Check(req2, r1);
-            bool a2 = manager.Check(req2, r2);
-            // trailing_zone has capacity=2, so both should pass
-            // (deny_first is per-client_ip so new client has 1 token).
-            if (!a1) {
-                pass = false;
-                err += "new-client first request should pass; ";
+        // Now REMOVE deny_first from the config via Reload, leaving only
+        // trailing_zone. Under the fix (new behavior), trailing_zone still
+        // has ~3 tokens from the initial allow. Under the old behavior
+        // (debit all zones), trailing_zone was drained to 0 by the 5
+        // subsequent rejections.
+        //
+        // Reload preserves existing zone state by name+key_type match, so
+        // trailing_zone keeps its accumulated bucket state across reload.
+        RateLimitConfig reduced;
+        reduced.enabled = true;
+        reduced.zones.push_back({"trailing_zone", 0.001, 4, "path", 1000, {}});
+        manager.Reload(reduced);
+
+        int successes = 0;
+        for (int i = 0; i < 10; i++) {
+            HttpResponse response;
+            if (manager.Check(req, response)) {
+                successes++;
             }
-            if (a2) {
-                // Expected: deny_first exhausts for this client_ip on request 2
-                // trailing_zone still has 2 tokens, but deny_first rejects.
-                // That's fine — we just want to prove trailing_zone wasn't
-                // pre-debited by the prior rejection from client 1.
-            }
+        }
+
+        // With new behavior: trailing_zone had 3 tokens left after the
+        // initial Check() (req 1 debited 1 of 4 tokens). Rate=0.001/s,
+        // negligible refill over a few ms. Expected: ~3 successes.
+        // With old behavior: trailing_zone was drained to 0 by the 5
+        // rejections in the previous loop. Expected: 0 successes.
+        if (successes < 2) {
+            pass = false;
+            err += "trailing_zone exhausted: " + std::to_string(successes) +
+                   " successes (old debit-all behavior detected; expected >= 2); ";
         }
 
         TestFramework::RecordTest("RateLimitManager: stops debiting after denial", pass, err,
@@ -889,6 +960,61 @@ void TestManagerResponseHeaders() {
                                   TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("RateLimitManager: response headers present", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestManagerSkipsNonApplicableZonesForHeaders() {
+    std::cout << "\n[TEST] RateLimitManager: non-applicable zones don't drive headers..." << std::endl;
+    try {
+        bool pass = true;
+        std::string err;
+
+        // Two zones: one applies to /api/, one applies to /admin/.
+        // Request to /something-else matches neither — both are
+        // non-applicable. With the fix, NO RateLimit-* headers are
+        // emitted. Without the fix, the first zone would be promoted
+        // to best_name and bogus headers would appear.
+        RateLimitConfig config;
+        config.enabled = true;
+        config.include_headers = true;
+        config.zones.push_back({"api_zone",   100.0, 50, "client_ip", 1000, {"/api/"}});
+        config.zones.push_back({"admin_zone", 10.0,  5,  "client_ip", 1000, {"/admin/"}});
+
+        RateLimitManager manager(config);
+
+        HttpRequest req = MakeRequest("GET", "/health", "10.0.0.1");
+        HttpResponse response;
+        bool allowed = manager.Check(req, response);
+
+        if (!allowed) {
+            pass = false;
+            err += "request should pass (no applicable zone); ";
+        }
+
+        // No RateLimit-* headers expected — neither zone governed this request.
+        if (ResponseHasHeader(response, "RateLimit-Policy")) {
+            pass = false;
+            err += "RateLimit-Policy should NOT be present when no zone applies; ";
+        }
+        if (ResponseHasHeader(response, "RateLimit")) {
+            pass = false;
+            err += "RateLimit should NOT be present when no zone applies; ";
+        }
+
+        // Sanity check: request to /api/users DOES get headers.
+        HttpRequest api_req = MakeRequest("GET", "/api/users", "10.0.0.1");
+        HttpResponse api_response;
+        manager.Check(api_req, api_response);
+        if (!ResponseHasHeader(api_response, "RateLimit-Policy")) {
+            pass = false;
+            err += "RateLimit-Policy should be present when api_zone applies; ";
+        }
+
+        TestFramework::RecordTest("RateLimitManager: non-applicable zones don't drive headers", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RateLimitManager: non-applicable zones don't drive headers", false, e.what(),
                                   TestFramework::TestCategory::OTHER);
     }
 }
@@ -1435,8 +1561,11 @@ void TestIntegrationDryRunMode() {
         TestServerRunner<HttpServer> runner(server);
         int port = runner.GetPort();
 
-        // Send multiple requests -- all should get 200 in dry-run mode
+        // Send multiple requests -- all should get 200 in dry-run mode,
+        // AND none should have Retry-After (that would trigger client backoff
+        // on responses that were actually allowed).
         bool all_200 = true;
+        bool saw_retry_after = false;
         for (int i = 0; i < 5; i++) {
             std::string response = TestHttpClient::HttpGet(port, "/test");
             if (!TestHttpClient::HasStatus(response, 200)) {
@@ -1444,10 +1573,18 @@ void TestIntegrationDryRunMode() {
                 err += "request " + std::to_string(i) + " not 200 in dry-run mode; ";
                 break;
             }
+            // Check: Retry-After must NOT be present on allowed responses.
+            std::string retry = FindRawHeader(response, "Retry-After");
+            if (!retry.empty()) {
+                saw_retry_after = true;
+                err += "request " + std::to_string(i) +
+                       " has Retry-After='" + retry + "' on dry-run 200 response; ";
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
 
-        if (!all_200) {
+        if (!all_200 || saw_retry_after) {
             pass = false;
         }
 
@@ -1943,6 +2080,7 @@ void RunAllTests() {
     TestZoneAppliesToFilter();
     TestZoneAppliesToSegmentBoundary();
     TestZoneLruEviction();
+    TestZoneSynchronousMaxEntriesEnforcement();
 
     // C. RateLimitManager tests (7)
     TestManagerSingleZoneAllow();
@@ -1950,6 +2088,7 @@ void RunAllTests() {
     TestManagerMultiZoneAllPass();
     TestManagerMultiZoneOneDenies();
     TestManagerStopsDebitingAfterDenial();
+    TestManagerSkipsNonApplicableZonesForHeaders();
     TestManagerResponseHeaders();
     TestManagerRetryAfterOnDenial();
     TestManagerDisabledReturnsTrueImmediately();

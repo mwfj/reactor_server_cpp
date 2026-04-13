@@ -137,6 +137,24 @@ RateLimitZone::Entry* RateLimitZone::FindOrCreate(Shard& shard,
         return it->second.get();
     }
 
+    // Enforce max_entries synchronously on insert. Relying on the periodic
+    // timer sweep alone lets high-cardinality bursts (many unique keys per
+    // interval) grow the shard far beyond the configured cap, which makes
+    // max_entries useless as a RAM guard under adversarial traffic.
+    //
+    // max_per_shard: floor(max_entries / SHARD_COUNT), minimum 1 so we
+    // never produce a zero-capacity shard. Matches the EvictExpired math.
+    size_t max_per_shard = static_cast<size_t>(policy.max_entries) / shards_.size();
+    if (max_per_shard == 0) max_per_shard = 1;
+    // Evict LRU tail until there's room for the new entry.
+    while (shard.count >= max_per_shard && shard.lru_tail != nullptr) {
+        Entry* victim = shard.lru_tail;
+        std::string victim_key = std::move(victim->key);
+        shard.RemoveLru(victim);
+        shard.buckets.erase(victim_key);
+        shard.count--;
+    }
+
     // Create new entry
     auto entry = std::make_unique<Entry>(policy.rate, policy.capacity);
     entry->key = key;
@@ -154,6 +172,19 @@ RateLimitZone::Entry* RateLimitZone::FindOrCreate(Shard& shard,
 RateLimitZone::Result RateLimitZone::Check(const HttpRequest& request) {
     // 1. Load immutable policy snapshot
     auto policy = LoadPolicy();
+
+    // "Not applicable" result — zone didn't apply to this request.
+    // applicable=false tells the manager to skip this zone when building
+    // response headers (so RateLimit-* headers reflect the actual zones
+    // that governed the request, not skipped zones).
+    Result not_applicable{
+        /*allowed=*/true,
+        /*applicable=*/false,
+        /*limit=*/policy->capacity,
+        /*remaining=*/policy->capacity,
+        /*retry_after_sec=*/0.0,
+        /*rate=*/policy->rate
+    };
 
     // 2. Check applies_to filter: if non-empty, request path must match
     //    at least one prefix on a segment boundary. "/api" matches
@@ -175,15 +206,15 @@ RateLimitZone::Result RateLimitZone::Check(const HttpRequest& request) {
             }
         }
         if (!matched) {
-            return {true, policy->capacity, policy->capacity, 0.0};
+            return not_applicable;
         }
     }
 
     // 3. Extract key from request
     std::string key = key_extractor_(request);
     if (key.empty()) {
-        // No key extracted (e.g., missing header) — allow request
-        return {true, policy->capacity, policy->capacity, 0.0};
+        // No key extracted (e.g., missing header) — zone doesn't apply.
+        return not_applicable;
     }
 
     // 4. Hash to shard and lock
@@ -217,7 +248,8 @@ RateLimitZone::Result RateLimitZone::Check(const HttpRequest& request) {
     int64_t remaining = entry->bucket.AvailableTokens();
     double retry_after = allowed ? 0.0 : entry->bucket.SecondsUntilAvailable();
 
-    return {allowed, policy->capacity, remaining, retry_after};
+    return {allowed, /*applicable=*/true, policy->capacity, remaining,
+            retry_after, policy->rate};
 }
 
 // ---------------------------------------------------------------------------

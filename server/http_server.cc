@@ -320,6 +320,14 @@ void HttpServer::MarkServerReady() {
 
             if (!rl->Check(request, response)) {
                 if (rl->dry_run()) {
+                    // Shadow mode: Check() already wrote Retry-After
+                    // and RateLimit headers. Strip Retry-After because
+                    // the request is being allowed through — leaving it
+                    // would advertise a retry delay on a 200 response,
+                    // which may trigger incorrect client backoff.
+                    // The RateLimit headers are kept (they carry
+                    // informational data on quota state).
+                    response.RemoveHeader("Retry-After");
                     logging::Get()->info(
                         "Rate limit dry-run: would deny {} {} from {}",
                         request.method,

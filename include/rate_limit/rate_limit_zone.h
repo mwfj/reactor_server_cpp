@@ -21,9 +21,14 @@ public:
     // Result of a Check() call — consumed by the middleware layer.
     struct Result {
         bool allowed;
+        bool applicable;     // False when zone was skipped (applies_to miss,
+                             // empty key, etc.) — no bucket was touched and
+                             // the caller should not use this result to
+                             // populate RateLimit-* headers.
         int64_t limit;       // Bucket capacity (for RateLimit-Limit header)
         int64_t remaining;   // Tokens remaining (for RateLimit-Remaining header)
         double retry_after_sec; // Seconds until a token is available (for Retry-After header)
+        double rate;         // Sustained rate in req/sec (for RateLimit-Policy window)
     };
 
     // Construct a zone from config with the given key extractor.
@@ -97,7 +102,16 @@ private:
         void PushFrontLru(Entry* e);
     };
 
-    static constexpr size_t DEFAULT_SHARD_COUNT = 16;
+public:
+    // Shard count — exposed publicly so config_loader can validate
+    // max_entries against it (enforcing max_entries >= SHARD_COUNT keeps
+    // the documented cap meaningful). Changing this value requires updating
+    // the memory-cap documentation too.
+    static constexpr size_t SHARD_COUNT = 16;
+
+private:
+    // Backward-compatibility alias for the constant used in this file.
+    static constexpr size_t DEFAULT_SHARD_COUNT = SHARD_COUNT;
 
     std::string name_;
     std::string key_type_;
