@@ -34,7 +34,9 @@ public:
                      RetryCondition condition, bool headers_sent) const;
 
     // Compute backoff delay for the given attempt number.
-    // Returns 0 for first retry (no delay), then jittered exponential.
+    // Uses full jitter with 1ms floor: random(1, min(MAX, BASE * 2^attempt)).
+    // Returns 0 for attempt <= 0 (defensive guard; callers typically
+    // implement their own first-retry policy and pass attempt >= 1).
     std::chrono::milliseconds BackoffDelay(int attempt) const;
 
     int MaxRetries() const { return config_.max_retries; }

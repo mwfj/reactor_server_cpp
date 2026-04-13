@@ -15,6 +15,7 @@
 #include <mutex>
 #include <vector>
 #include <deque>
+#include <queue>
 #include <memory>
 #include <functional>
 #include <map>

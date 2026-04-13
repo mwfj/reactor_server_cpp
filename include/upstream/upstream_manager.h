@@ -51,6 +51,11 @@ public:
     // Force-close all remaining connections (enqueues to each dispatcher).
     void ForceCloseRemaining();
 
+    // Get the dispatcher for the given index. Returns nullptr if index is
+    // out of range. Used by ProxyTransaction to schedule delayed retries
+    // on the correct dispatcher thread.
+    Dispatcher* GetDispatcherForIndex(size_t index) const;
+
     // Check if an upstream service is configured
     bool HasUpstream(const std::string& service_name) const;
 
