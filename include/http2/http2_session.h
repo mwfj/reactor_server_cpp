@@ -65,6 +65,47 @@ public:
         int status_code,
         const std::vector<std::pair<std::string, std::string>>& headers);
 
+    // ---- HTTP/2 server push (RFC 9113 §8.4) ----
+
+    // True iff (a) local config enables push AND (b) the peer has not
+    // advertised SETTINGS_ENABLE_PUSH=0. Reads nghttp2's snapshot of the
+    // peer's most-recently-ACKed remote settings. Dispatcher-thread-only.
+    bool PushEnabled() const;
+
+    // Create a server-initiated stream entry for a freshly-promised push.
+    // Skips the incomplete-stream lifecycle entirely — pushed streams are
+    // never request-parsed and so must not contribute to the parse-timeout
+    // safety cap (`parse_timeout_sec` branch of ResetExpiredStreams) nor
+    // to OldestIncompleteStreamStart(). Returns the new (or existing on
+    // duplicate id) stream pointer; callers should EraseStream(id) on
+    // any subsequent submit failure.
+    Http2Stream* CreateServerInitiatedStream(int32_t stream_id);
+
+    // Remove a stream entry — used as the rollback path when a push
+    // submit fails after the synthetic stream has been registered.
+    void EraseStream(int32_t stream_id);
+
+    // Atomically submit PUSH_PROMISE on `parent_stream_id` and the
+    // associated response on the newly promised stream. Returns the
+    // promised stream_id (>0) on success or -1 on any validation /
+    // nghttp2 failure. On failure, any synthetic stream registered as
+    // a side effect is rolled back via EraseStream.
+    //
+    // Validation enforced here (RFC 9113 §8.4 + §8.2):
+    //   - method must be GET or HEAD (no body on the push request)
+    //   - scheme must be http or https
+    //   - authority must be non-empty
+    //   - path must start with '/'
+    //   - PushEnabled() must be true (local config + peer hasn't refused)
+    //   - GOAWAY must not have been sent
+    //   - parent stream must exist and be open
+    int32_t SubmitPushPromise(int32_t parent_stream_id,
+                              const std::string& method,
+                              const std::string& scheme,
+                              const std::string& authority,
+                              const std::string& path,
+                              const HttpResponse& response);
+
     // --- Connection management ---
 
     // Send GOAWAY frame with the given error code.

@@ -906,6 +906,158 @@ int Http2Session::SubmitInterimHeaders(
     return 0;
 }
 
+// ---- HTTP/2 server push (RFC 9113 §8.4) ----
+
+bool Http2Session::PushEnabled() const {
+    if (!settings_.enable_push) return false;
+    // nghttp2 tracks the peer's most-recently-ACKed remote settings; the
+    // getter returns the protocol default (1 for ENABLE_PUSH) until the
+    // peer ACKs an explicit value, so a brand-new connection treats push
+    // as allowed unless the peer explicitly refuses.
+    uint32_t remote = nghttp2_session_get_remote_settings(
+        impl_->session, NGHTTP2_SETTINGS_ENABLE_PUSH);
+    return remote != 0;
+}
+
+Http2Stream* Http2Session::CreateServerInitiatedStream(int32_t stream_id) {
+    auto [it, inserted] = streams_.emplace(
+        stream_id, std::make_unique<Http2Stream>(stream_id));
+    if (!inserted) {
+        logging::Get()->warn(
+            "CreateServerInitiatedStream: stream {} already exists; reusing",
+            stream_id);
+        return it->second.get();
+    }
+    // IMPORTANT: do NOT call OnStreamBecameIncomplete() here. Pushed streams
+    // bypass the request-parsing lifecycle entirely — they are synthetic
+    // server-side responses with no client request to parse. Including them
+    // in the incomplete counter would (a) inflate OldestIncompleteStreamStart,
+    // and (b) make the parse_timeout_sec branch of ResetExpiredStreams RST
+    // a perfectly healthy push mid-response.
+    //
+    // MarkCounterDecremented sets dispatched_at_ to now() so the
+    // async-deferred safety-cap timer is anchored from the moment the
+    // push begins streaming, matching the contract of regular async
+    // responses entering their handler-response budget.
+    it->second->MarkCounterDecremented();
+    return it->second.get();
+}
+
+void Http2Session::EraseStream(int32_t stream_id) {
+    streams_.erase(stream_id);
+}
+
+int32_t Http2Session::SubmitPushPromise(
+    int32_t parent_stream_id,
+    const std::string& method, const std::string& scheme,
+    const std::string& authority, const std::string& path,
+    const HttpResponse& response) {
+    // ---- Boundary validation ----
+    // RFC 9113 §8.4: a server MUST only push GET or HEAD; clients MUST
+    // reject anything else with PROTOCOL_ERROR. Reject locally so we
+    // never produce a non-conforming PUSH_PROMISE on the wire.
+    if (method != "GET" && method != "HEAD") {
+        logging::Get()->warn(
+            "push: invalid method '{}' (must be GET or HEAD) parent={}",
+            method, parent_stream_id);
+        return -1;
+    }
+    if (scheme != "http" && scheme != "https") {
+        logging::Get()->warn(
+            "push: invalid scheme '{}' parent={}", scheme, parent_stream_id);
+        return -1;
+    }
+    if (authority.empty()) {
+        logging::Get()->warn(
+            "push: empty authority parent={}", parent_stream_id);
+        return -1;
+    }
+    if (path.empty() || path[0] != '/') {
+        logging::Get()->warn(
+            "push: invalid path '{}' (must start with /) parent={}",
+            path, parent_stream_id);
+        return -1;
+    }
+    if (!PushEnabled()) {
+        logging::Get()->debug(
+            "push: disabled (local config or peer refused) parent={}",
+            parent_stream_id);
+        return -1;
+    }
+    if (IsGoawaySent()) {
+        logging::Get()->debug(
+            "push: GOAWAY already sent — refusing new promise parent={}",
+            parent_stream_id);
+        return -1;
+    }
+    auto* parent = FindStream(parent_stream_id);
+    if (!parent || parent->IsClosed()) {
+        logging::Get()->debug(
+            "push: parent stream {} not open", parent_stream_id);
+        return -1;
+    }
+
+    // ---- Build the promise pseudo-headers ----
+    // Local storage holds the pseudo-header strings until nghttp2 has
+    // copied them. nghttp2 copies because we don't pass NO_COPY flags.
+    std::vector<nghttp2_nv> promise_nva;
+    promise_nva.reserve(4);
+    auto add_ph = [&](const char* name, size_t name_len,
+                      const std::string& value) {
+        promise_nva.push_back({
+            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(name)),
+            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(value.c_str())),
+            name_len, value.size(),
+            NGHTTP2_NV_FLAG_NONE
+        });
+    };
+    add_ph(":method",    7, method);
+    add_ph(":scheme",    7, scheme);
+    add_ph(":authority", 10, authority);
+    add_ph(":path",      5, path);
+
+    int32_t promised = nghttp2_submit_push_promise(
+        impl_->session, NGHTTP2_FLAG_NONE, parent_stream_id,
+        promise_nva.data(), promise_nva.size(), nullptr);
+    if (promised < 0) {
+        logging::Get()->warn(
+            "nghttp2_submit_push_promise failed parent={} rv={} ({})",
+            parent_stream_id, promised, nghttp2_strerror(promised));
+        return -1;
+    }
+
+    // ---- Register the synthetic stream AFTER nghttp2 accepted ----
+    // Populate the request so SubmitResponse's HEAD body suppression
+    // (req.method == "HEAD") and req.headers["host"] (used by header
+    // rewriting / log correlation) reflect the pushed request.
+    Http2Stream* pushed = CreateServerInitiatedStream(promised);
+    HttpRequest& req = pushed->GetRequest();
+    req.method  = method;
+    req.path    = path;
+    req.headers["host"] = authority;
+    pushed->MarkHeadersComplete();
+    pushed->MarkEndStream();
+
+    // ---- Submit the response on the promised stream ----
+    int rv = SubmitResponse(promised, response);
+    if (rv != 0) {
+        logging::Get()->warn(
+            "push: SubmitResponse failed on promised stream {} rv={}",
+            promised, rv);
+        // Best-effort RST so the client can release any bookkeeping
+        // it allocated for the promised id. The synthetic stream entry
+        // is also rolled back so OnStreamCloseCallback won't double-fire.
+        nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
+                                  promised, NGHTTP2_INTERNAL_ERROR);
+        EraseStream(promised);
+        return -1;
+    }
+    logging::Get()->debug(
+        "push: PUSH_PROMISE+response queued parent={} promised={} {} {}",
+        parent_stream_id, promised, method, path);
+    return promised;
+}
+
 void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id) {
     // Count every dispatched request — including those rejected below by
     // content-length checks. Matches HTTP/1's request_count_callback which
