@@ -426,7 +426,20 @@ void CircuitBreakerSlice::Reload(const CircuitBreakerConfig& new_config) {
         // Skip when enabled_changed is also true: the full-reset branch
         // below bumps both generations as part of its larger reset.
         window_.Resize(new_config.window_seconds);
-        if (!enabled_changed) ++closed_gen_;
+        if (!enabled_changed) {
+            // Reset consecutive_failures_ alongside the window wipe.
+            // Both are CLOSED-domain state from the same observation cycle.
+            // Bumping closed_gen_ drops all pre-reload CLOSED reports
+            // (correct — they must not seed the fresh window). But if
+            // consecutive_failures_ is NOT also reset, those dropped reports
+            // can no longer clear or advance the counter either, so the
+            // leftover count becomes an orphaned value that mis-fires future
+            // trip evaluations (spurious trip: pre-reload success was going
+            // to clear the counter but got dropped, so the next real failure
+            // crosses the threshold using a stale count).
+            consecutive_failures_ = 0;
+            ++closed_gen_;
+        }
     }
 
     if (enabled_changed) {

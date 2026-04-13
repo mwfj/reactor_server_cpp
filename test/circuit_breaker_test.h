@@ -1377,6 +1377,81 @@ void TestWindowResizeStillInvalidatesClosedAdmissions() {
     }
 }
 
+// BUG (review round 6, P2): Reload with window_seconds change preserved
+// consecutive_failures_ while bumping closed_gen_. Pre-reload CLOSED
+// reports are correctly blocked (stale gen), but they can no longer
+// clear or advance consecutive_failures_ either. The counter becomes an
+// orphaned relic from a prior observation cycle:
+//
+//   Scenario: 4 consecutive failures (threshold=5), reload window_seconds.
+//   Pre-reload success arrives → stale gen → DROPPED.
+//   Without fix: consecutive_failures_ stays at 4.
+//   Next real failure: consecutive_failures_ = 5 → SPURIOUS TRIP.
+//
+// Fix: reset consecutive_failures_ = 0 in the same branch that clears
+// the window on resize. Both are CLOSED-domain state from the same
+// observation cycle; invalidating one without resetting the other leaves
+// an inconsistent counter.
+void TestWindowResizeResetConsecutiveFailures() {
+    std::cout << "\n[TEST] CB: window resize resets consecutive_failures_..."
+              << std::endl;
+    try {
+        CircuitBreakerConfig cb;
+        cb.enabled = true;
+        cb.consecutive_failure_threshold = 5;
+        cb.failure_rate_threshold = 100;  // rate-trip disabled (100% threshold)
+        cb.minimum_volume = 1000;         // rate-trip disabled (high volume gate)
+        cb.window_seconds = 10;
+        cb.permitted_half_open_calls = 5;
+        cb.base_open_duration_ms = 5000;
+        cb.max_open_duration_ms = 60000;
+
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Accumulate 4 consecutive failures (one below the threshold of 5).
+        for (int i = 0; i < 4; ++i) {
+            auto a = slice.TryAcquire();
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, a.generation);
+        }
+        bool pre_reload_closed = slice.CurrentState() == State::CLOSED;
+
+        // Capture a pre-reload admission.
+        auto pre_admit = slice.TryAcquire();
+        uint64_t pre_gen = pre_admit.generation;
+
+        // Window-only reload: wipes the rate window, bumps closed_gen_,
+        // and (with the fix) resets consecutive_failures_ to 0.
+        auto resized = cb;
+        resized.window_seconds = 30;
+        slice.Reload(resized);
+
+        // Pre-reload success arrives late — must be dropped (stale gen).
+        slice.ReportSuccess(false, pre_gen);
+        bool stale_dropped = slice.ReportsStaleGeneration() == 1;
+
+        // Verify consecutive_failures_ was reset: one real post-reload failure
+        // must NOT trip the breaker (counter is 1/5, not 5/5).
+        auto post_admit = slice.TryAcquire();
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, post_admit.generation);
+        bool no_spurious_trip = slice.CurrentState() == State::CLOSED;
+
+        bool pass = pre_reload_closed && stale_dropped && no_spurious_trip;
+        TestFramework::RecordTest(
+            "CB: window resize resets consecutive_failures_",
+            pass, pass ? "" :
+                  "pre_reload_closed=" + std::to_string(pre_reload_closed) +
+                  " stale_dropped=" + std::to_string(stale_dropped) +
+                  " no_spurious_trip=" + std::to_string(no_spurious_trip),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: window resize resets consecutive_failures_",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestTransitionCallbackInvoked() {
     std::cout << "\n[TEST] CB: transition callback invoked..." << std::endl;
     try {
@@ -1455,6 +1530,7 @@ void RunAllTests() {
     TestThresholdOnlyReloadDoesNotAdvanceGeneration();
     TestWindowResizeDuringHalfOpenDoesNotStrandProbes();
     TestWindowResizeStillInvalidatesClosedAdmissions();
+    TestWindowResizeResetConsecutiveFailures();
     TestTransitionCallbackInvoked();
 }
 
