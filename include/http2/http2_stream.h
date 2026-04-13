@@ -64,6 +64,15 @@ public:
     bool IsResponseComplete() const { return response_complete_; }
     void MarkResponseComplete() { response_complete_ = true; }
 
+    // Final (>=200) response has been handed to nghttp2. Tracked separately
+    // from response_headers_sent_ because that flag is also set by the
+    // upcoming SubmitInterimHeaders path for non-final 1xx responses.
+    // SubmitInterimHeaders refuses to submit when this is true so a stray
+    // late interim cannot reopen a stream nghttp2 considers half-closed.
+    // Dispatcher-thread-only — no synchronization needed.
+    bool FinalResponseSubmitted() const { return final_response_submitted_; }
+    void MarkFinalResponseSubmitted() { final_response_submitted_ = true; }
+
     // Body size tracking for limit enforcement
     size_t AccumulatedBodySize() const { return accumulated_body_size_; }
 
@@ -127,6 +136,7 @@ private:
     bool end_stream_received_ = false;
     bool response_headers_sent_ = false;
     bool response_complete_ = false;
+    bool final_response_submitted_ = false;
     size_t accumulated_body_size_ = 0;
     size_t accumulated_header_size_ = 0;
     bool rejected_ = false;

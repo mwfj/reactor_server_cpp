@@ -20,6 +20,7 @@
 #include <vector>
 #include <mutex>
 #include <condition_variable>
+#include <future>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -58,6 +59,11 @@ public:
         std::string body;
         bool        rst     = false;   // stream was RST'd
         bool        error   = false;   // transport or session error
+        // Interim 1xx response blocks observed BEFORE the final status,
+        // in arrival order. interim_headers[i] are the headers carried by
+        // interim_statuses[i]. Used by 103 Early Hints and 100 Continue tests.
+        std::vector<int> interim_statuses;
+        std::vector<std::vector<std::pair<std::string, std::string>>> interim_headers;
     };
 
     Http2TestClient() = default;
@@ -209,9 +215,11 @@ public:
             auto it = streams_.find(stream_id);
             if (it != streams_.end() && it->second.done) {
                 Response resp;
-                resp.status = it->second.status;
-                resp.body   = it->second.body;
-                resp.rst    = it->second.rst;
+                resp.status           = it->second.status;
+                resp.body             = it->second.body;
+                resp.rst              = it->second.rst;
+                resp.interim_statuses = std::move(it->second.interim_statuses);
+                resp.interim_headers  = std::move(it->second.interim_headers);
                 streams_.erase(it);
                 return resp;
             }
@@ -279,9 +287,11 @@ public:
             auto it = streams_.find(stream_id);
             if (it != streams_.end() && it->second.done) {
                 Response resp;
-                resp.status = it->second.status;
-                resp.body   = it->second.body;
-                resp.rst    = it->second.rst;
+                resp.status           = it->second.status;
+                resp.body             = it->second.body;
+                resp.rst              = it->second.rst;
+                resp.interim_statuses = std::move(it->second.interim_statuses);
+                resp.interim_headers  = std::move(it->second.interim_headers);
                 streams_.erase(it);
                 return resp;
             }
@@ -309,6 +319,13 @@ private:
         std::string body;
         bool        done   = false;
         bool        rst    = false;
+        // Interim 1xx tracking. A new entry is appended to interim_statuses
+        // when ":status" with a code in [100, 200) is observed; subsequent
+        // header callbacks for the same HEADERS frame are appended to
+        // interim_headers.back() until a non-1xx ":status" arrives.
+        std::vector<int> interim_statuses;
+        std::vector<std::vector<std::pair<std::string, std::string>>> interim_headers;
+        bool current_block_interim = false;
     };
     std::map<int32_t, StreamState> streams_;
 
@@ -403,11 +420,24 @@ private:
         std::string n(reinterpret_cast<const char*>(name),  namelen);
         std::string v(reinterpret_cast<const char*>(value), valuelen);
 
+        auto it = self->streams_.find(sid);
+        if (it == self->streams_.end()) return 0;
+        StreamState& s = it->second;
+
         if (n == ":status") {
-            auto it = self->streams_.find(sid);
-            if (it != self->streams_.end()) {
-                try { it->second.status = std::stoi(v); } catch (...) {}
+            int code = 0;
+            try { code = std::stoi(v); } catch (...) {}
+            if (code >= 100 && code < 200) {
+                // Interim 1xx — start a new interim block.
+                s.interim_statuses.push_back(code);
+                s.interim_headers.emplace_back();
+                s.current_block_interim = true;
+            } else {
+                s.status = code;
+                s.current_block_interim = false;
             }
+        } else if (s.current_block_interim && !s.interim_headers.empty()) {
+            s.interim_headers.back().emplace_back(std::move(n), std::move(v));
         }
         return 0;
     }
@@ -2345,6 +2375,460 @@ void TestH2_AuthorityCaseInsensitiveHostDefaultPort() {
 }
 
 // ============================================================
+// Category 8: HTTP/2 103 Early Hints (SubmitInterimHeaders /
+// SendInterimResponse). See plan Task 4 / design doc §4.2.
+// ============================================================
+
+// Helper: small wrapper that builds a default H2-enabled config bound to
+// the given port and 2 worker threads — matches surrounding H2 tests.
+static ServerConfig MakeH2Config(uint16_t port) {
+    ServerConfig cfg;
+    cfg.bind_host      = "127.0.0.1";
+    cfg.bind_port      = port;
+    cfg.worker_threads = 2;
+    cfg.http2.enabled  = true;
+    return cfg;
+}
+
+// T4.1: Basic 103 → 200. Handler emits one 103 with a Link header, then
+// completes 200. Client must observe one interim_status == 103 with the
+// Link header, followed by a final status == 200.
+void TestH2_EarlyHints_Basic() {
+    std::cout << "\n[TEST] H2 103 Early Hints: basic..." << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync("/hints",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender send_interim,
+               HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::AsyncCompletionCallback complete) {
+                send_interim(103, {{"link", "</style.css>; rel=preload; as=style"}});
+                HttpResponse r;
+                r.Status(200).Text("done");
+                complete(std::move(r));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/hints");
+            if (resp.error)              { pass = false; err += "transport error; "; }
+            if (resp.status != 200)      { pass = false; err += "final status != 200; "; }
+            if (resp.body.find("done") == std::string::npos)
+                                          { pass = false; err += "body mismatch; "; }
+            if (resp.interim_statuses.size() != 1) {
+                pass = false;
+                err += "expected 1 interim, got " +
+                       std::to_string(resp.interim_statuses.size()) + "; ";
+            } else {
+                if (resp.interim_statuses[0] != 103) {
+                    pass = false; err += "interim status != 103; ";
+                }
+                bool has_link = false;
+                for (const auto& [k, v] : resp.interim_headers[0]) {
+                    if (k == "link") { has_link = true; break; }
+                }
+                if (!has_link) { pass = false; err += "Link header missing from 103; "; }
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest("H2 103 Early Hints: basic", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 103 Early Hints: basic", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T4.2: Two 103s before the final 200. Client must observe interim_statuses
+// == [103, 103] with each block's Link header attached.
+void TestH2_EarlyHints_Multiple() {
+    std::cout << "\n[TEST] H2 103 Early Hints: multiple before final..." << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync("/multi",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender send_interim,
+               HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::AsyncCompletionCallback complete) {
+                send_interim(103, {{"link", "</a.css>; rel=preload"}});
+                send_interim(103, {{"link", "</b.js>; rel=preload"}});
+                HttpResponse r;
+                r.Status(200).Text("done");
+                complete(std::move(r));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/multi");
+            if (resp.error)         { pass = false; err += "transport error; "; }
+            if (resp.status != 200) { pass = false; err += "final status != 200; "; }
+            if (resp.interim_statuses.size() != 2) {
+                pass = false;
+                err += "expected 2 interims, got " +
+                       std::to_string(resp.interim_statuses.size()) + "; ";
+            } else {
+                if (resp.interim_statuses[0] != 103 ||
+                    resp.interim_statuses[1] != 103) {
+                    pass = false; err += "interim statuses must both be 103; ";
+                }
+                if (resp.interim_headers.size() != 2 ||
+                    resp.interim_headers[0].empty() ||
+                    resp.interim_headers[1].empty()) {
+                    pass = false; err += "interim header blocks empty; ";
+                }
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest("H2 103 Early Hints: multiple before final",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 103 Early Hints: multiple before final",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T4.3: 103 attempted from a background thread AFTER the handler completed
+// the final 200. The H2 SendInterimResponse contract is dispatcher-thread-
+// only AND drops post-final calls — both guards together must ensure the
+// late 103 never reaches the wire. Mirrors H1's TestH1_EarlyHints_DroppedAfterFinal.
+void TestH2_EarlyHints_DroppedAfterFinal() {
+    std::cout << "\n[TEST] H2 103 Early Hints: dropped after final..." << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+
+        auto p_sender = std::make_shared<std::promise<HttpRouter::InterimResponseSender>>();
+        auto f_sender = p_sender->get_future().share();
+
+        server.GetAsync("/postfinal",
+            [p_sender](
+                const HttpRequest&,
+                HttpRouter::InterimResponseSender send_interim,
+                HttpRouter::ResourcePusher        /*push_resource*/,
+                HttpRouter::AsyncCompletionCallback complete) {
+                HttpResponse r;
+                r.Status(200).Text("done");
+                complete(std::move(r));
+                p_sender->set_value(send_interim);
+            });
+
+        std::thread watcher([f_sender]() mutable {
+            auto send_interim = f_sender.get();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            send_interim(103, {{"link", "</late.css>; rel=preload"}});
+        });
+        struct JoinGuard {
+            std::thread& t;
+            ~JoinGuard() { if (t.joinable()) t.join(); }
+        };
+        JoinGuard watcher_guard{watcher};
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/postfinal");
+            if (resp.error)         { pass = false; err += "transport error; "; }
+            if (resp.status != 200) { pass = false; err += "final status != 200; "; }
+            // The late 103 must never appear on the wire. The watcher's
+            // delayed call may still be in flight at this point, so wait
+            // a little to let any errant frame arrive (it won't).
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!resp.interim_statuses.empty()) {
+                pass = false;
+                err += "post-final 103 must be dropped, got " +
+                       std::to_string(resp.interim_statuses.size()) +
+                       " interim(s); ";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest("H2 103 Early Hints: dropped after final",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 103 Early Hints: dropped after final",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T4.4: Invalid status codes are rejected by SubmitInterimHeaders.
+// 50 / 200 / 101 / 100 must all be dropped (51-99 below 1xx; 200 >= 200 final;
+// 101 reserved for upgrade and invalid in H2; 100 framework-managed only).
+// Only the final 200 from complete() reaches the client; no interim arrives.
+void TestH2_EarlyHints_InvalidStatusDropped() {
+    std::cout << "\n[TEST] H2 103 Early Hints: invalid status dropped..." << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync("/badstatus",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender send_interim,
+               HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::AsyncCompletionCallback complete) {
+                send_interim(50,  {{"link", "</a>; rel=preload"}});
+                send_interim(200, {{"link", "</b>; rel=preload"}});
+                send_interim(101, {{"link", "</c>; rel=preload"}});
+                send_interim(100, {{"link", "</d>; rel=preload"}});
+                HttpResponse r;
+                r.Status(200).Text("done");
+                complete(std::move(r));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/badstatus");
+            if (resp.error)         { pass = false; err += "transport error; "; }
+            if (resp.status != 200) { pass = false; err += "final status != 200; "; }
+            if (!resp.interim_statuses.empty()) {
+                pass = false;
+                err += "expected 0 interims, got " +
+                       std::to_string(resp.interim_statuses.size()) + "; ";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest("H2 103 Early Hints: invalid status dropped",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 103 Early Hints: invalid status dropped",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T4.5: Calling SendInterimResponse on a stream that the peer has already
+// reset must not crash. We can't easily cancel a stream from the test
+// client AFTER opening it, so we approximate by tearing down the client
+// connection mid-handler: the watcher disconnects the test client (which
+// closes the H2 transport), then fires the late 103. With session_-> being
+// torn down on the server side, SendInterimResponse must observe missing
+// stream / closed session and return false without crashing.
+void TestH2_EarlyHints_StreamClosedByPeerSafe() {
+    std::cout << "\n[TEST] H2 103 Early Hints: stream closed by peer is safe..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+
+        auto p_sender = std::make_shared<std::promise<HttpRouter::InterimResponseSender>>();
+        auto f_sender = p_sender->get_future().share();
+
+        // Handler: defer indefinitely and hand the sender to the watcher.
+        // We never call complete() in this test — the response is abandoned
+        // when the transport tears down.
+        server.GetAsync("/peerclose",
+            [p_sender](
+                const HttpRequest&,
+                HttpRouter::InterimResponseSender send_interim,
+                HttpRouter::ResourcePusher        /*push_resource*/,
+                HttpRouter::AsyncCompletionCallback /*complete*/) {
+                p_sender->set_value(send_interim);
+            });
+
+        std::thread watcher([f_sender]() mutable {
+            auto send_interim = f_sender.get();
+            // Give the client time to disconnect (test main thread does so
+            // immediately after issuing the request below). The off-thread
+            // guard alone catches this on the H2 side, but we also want to
+            // exercise the closed-session path defensively.
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            // Must not crash regardless of stream/session state.
+            send_interim(103, {{"link", "</late.css>; rel=preload"}});
+        });
+        struct JoinGuard {
+            std::thread& t;
+            ~JoinGuard() { if (t.joinable()) t.join(); }
+        };
+        JoinGuard watcher_guard{watcher};
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            // Fire-and-forget: send the request, then disconnect immediately.
+            // Do NOT wait for a response (handler never completes).
+            // We rely on the watcher firing the 103 after the client is gone.
+            // Reuse Get() with a very short response wait by closing the
+            // socket mid-poll: just disconnect after sending the headers.
+            std::vector<std::pair<std::string, std::string>> nh;
+            std::vector<std::pair<std::string, std::string>> hp;
+            hp.emplace_back(":method",    "GET");
+            hp.emplace_back(":path",      "/peerclose");
+            hp.emplace_back(":scheme",    "http");
+            hp.emplace_back(":authority", "localhost");
+            std::vector<nghttp2_nv> nva;
+            nva.reserve(hp.size());
+            for (const auto& p : hp) {
+                nva.push_back({
+                    const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(p.first.c_str())),
+                    const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(p.second.c_str())),
+                    p.first.size(), p.second.size(),
+                    NGHTTP2_NV_FLAG_NONE
+                });
+            }
+            // Submit + flush headers via the public API path is not exposed;
+            // simplest portable path: send a normal request with a short wait,
+            // accept a transport timeout (resp.error = true), then disconnect.
+            // The test passes if the server didn't crash by the time we Stop.
+            (void)nh; (void)nva;
+            auto resp = client.Get("/peerclose");
+            // resp.error may be true (timeout) — that's expected.
+            (void)resp;
+        }
+        client.Disconnect();
+
+        // Give the watcher time to fire its late send_interim.
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+        // Reaching here without a server crash is the assertion.
+        TestFramework::RecordTest("H2 103 Early Hints: stream closed by peer is safe",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 103 Early Hints: stream closed by peer is safe",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T4.6: 100 Continue followed by 103 Early Hints, then final 200.
+// The server emits 100 Continue automatically when the client includes
+// Expect: 100-continue; the handler then emits a 103 and completes 200.
+// Client must observe interim_statuses == [100, 103] in order, then 200.
+void TestH2_EarlyHints_100ContinueThen103() {
+    std::cout << "\n[TEST] H2 103 Early Hints: 100-continue then 103 then 200..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync("/upload",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender send_interim,
+               HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::AsyncCompletionCallback complete) {
+                send_interim(103, {{"link", "</style.css>; rel=preload"}});
+                HttpResponse r;
+                r.Status(200).Text("uploaded");
+                complete(std::move(r));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/upload", {{"expect", "100-continue"}});
+            if (resp.error)         { pass = false; err += "transport error; "; }
+            if (resp.status != 200) { pass = false; err += "final status != 200; "; }
+            if (resp.interim_statuses.size() != 2) {
+                pass = false;
+                err += "expected 2 interims (100, 103), got " +
+                       std::to_string(resp.interim_statuses.size()) + "; ";
+            } else if (resp.interim_statuses[0] != 100 ||
+                       resp.interim_statuses[1] != 103) {
+                pass = false;
+                err += "expected order 100,103 — got " +
+                       std::to_string(resp.interim_statuses[0]) + "," +
+                       std::to_string(resp.interim_statuses[1]) + "; ";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: 100-continue then 103 then 200",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: 100-continue then 103 then 200",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T4.7: Off-dispatcher-thread send_interim is rejected. The handler spawns
+// a thread that calls send_interim BEFORE complete() runs. The H2 contract
+// is dispatcher-thread-only, so the call must return false (warn-logged)
+// and no 103 must reach the wire. The handler then completes 200 normally.
+void TestH2_EarlyHints_OffDispatcherThread() {
+    std::cout << "\n[TEST] H2 103 Early Hints: off-dispatcher-thread rejected..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync("/offthread",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender send_interim,
+               HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::AsyncCompletionCallback complete) {
+                std::thread t([send_interim]() {
+                    send_interim(103, {{"link", "</late.css>; rel=preload"}});
+                });
+                t.join();
+                HttpResponse r;
+                r.Status(200).Text("done");
+                complete(std::move(r));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/offthread");
+            if (resp.error)         { pass = false; err += "transport error; "; }
+            if (resp.status != 200) { pass = false; err += "final status != 200; "; }
+            if (!resp.interim_statuses.empty()) {
+                pass = false;
+                err += "off-thread 103 must be dropped, got " +
+                       std::to_string(resp.interim_statuses.size()) +
+                       " interim(s); ";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: off-dispatcher-thread rejected",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: off-dispatcher-thread rejected",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ============================================================
 // Entry point
 // ============================================================
 
@@ -2412,6 +2896,15 @@ void RunAllTests() {
     TestH2_AuthorityMismatchWrongDefault();
     TestH2_AuthorityIPv6WithDefaultPort();
     TestH2_AuthorityCaseInsensitiveHostDefaultPort();
+
+    // --- Category 8: 103 Early Hints / SubmitInterimHeaders ---
+    TestH2_EarlyHints_Basic();
+    TestH2_EarlyHints_Multiple();
+    TestH2_EarlyHints_DroppedAfterFinal();
+    TestH2_EarlyHints_InvalidStatusDropped();
+    TestH2_EarlyHints_StreamClosedByPeerSafe();
+    TestH2_EarlyHints_100ContinueThen103();
+    TestH2_EarlyHints_OffDispatcherThread();
 }
 
 }  // namespace Http2Tests

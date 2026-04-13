@@ -800,6 +800,96 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     }
 
     stream->MarkResponseHeadersSent();
+    // Final response (>=200) is now in nghttp2's send queue. Lock out any
+    // late SubmitInterimHeaders so a stray 1xx cannot interleave with — or
+    // race ahead of — the final block on the wire.
+    stream->MarkFinalResponseSubmitted();
+    return 0;
+}
+
+int Http2Session::SubmitInterimHeaders(
+    int32_t stream_id, int status_code,
+    const std::vector<std::pair<std::string, std::string>>& headers) {
+    // Valid range: [102, 199]. 100 is framework-managed (auto-emitted for
+    // Expect: 100-continue); 101 is an HTTP/1 Upgrade status and MUST NOT
+    // appear in HTTP/2 (RFC 9113 Section 8.6).
+    if (status_code < 102 || status_code >= 200) {
+        logging::Get()->warn(
+            "H2 SubmitInterimHeaders invalid status {} stream={}",
+            status_code, stream_id);
+        return -1;
+    }
+    auto* stream = FindStream(stream_id);
+    if (!stream || stream->IsClosed()) {
+        logging::Get()->debug(
+            "H2 SubmitInterimHeaders: stream {} missing/closed; drop",
+            stream_id);
+        return -1;
+    }
+    if (stream->FinalResponseSubmitted()) {
+        logging::Get()->warn(
+            "H2 SubmitInterimHeaders after final stream={} status={}; drop",
+            stream_id, status_code);
+        return -1;
+    }
+
+    // Build the nva. nghttp2 copies bytes because we do not use
+    // NGHTTP2_NV_FLAG_NO_COPY_NAME/VALUE, so local storage is safe.
+    std::string status_str = std::to_string(status_code);
+    std::vector<nghttp2_nv> nva;
+    nva.reserve(1 + headers.size());
+    nva.push_back({
+        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
+        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(status_str.c_str())),
+        7, status_str.size(),
+        NGHTTP2_NV_FLAG_NONE
+    });
+
+    // Forbidden-header strip: same list SubmitResponse enforces, plus
+    // pseudo-headers which are response-only on the server side (":status")
+    // or request-only but defensively scrubbed here.
+    std::vector<std::string> lowered_names;
+    lowered_names.reserve(headers.size());
+    for (const auto& [key, value] : headers) {
+        std::string lower = key;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lower == "connection" || lower == "keep-alive" ||
+            lower == "proxy-connection" || lower == "te" ||
+            lower == "transfer-encoding" || lower == "upgrade" ||
+            lower == "content-length" ||
+            (lower.size() >= 6 && lower.compare(0, 6, "proxy-") == 0) ||
+            lower == ":status" || lower == ":path" || lower == ":method" ||
+            lower == ":scheme" || lower == ":authority") {
+            logging::Get()->debug(
+                "H2 interim: forbidden header '{}' stripped stream={}",
+                key, stream_id);
+            continue;
+        }
+        lowered_names.push_back(std::move(lower));
+        nva.push_back({
+            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(lowered_names.back().c_str())),
+            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(value.c_str())),
+            lowered_names.back().size(), value.size(),
+            NGHTTP2_NV_FLAG_NONE
+        });
+    }
+
+    // NGHTTP2_FLAG_NONE — no END_STREAM so the stream stays open for the
+    // subsequent final response. nghttp2 itself treats 1xx headers as
+    // non-final and allows further HEADERS on the same stream.
+    int rv = nghttp2_submit_headers(impl_->session, NGHTTP2_FLAG_NONE,
+                                    stream_id, nullptr,
+                                    nva.data(), nva.size(), nullptr);
+    if (rv != 0) {
+        logging::Get()->warn(
+            "nghttp2_submit_headers(interim) stream={} status={} rv={} ({})",
+            stream_id, status_code, rv, nghttp2_strerror(rv));
+        return -1;
+    }
+    logging::Get()->debug(
+        "H2 SubmitInterimHeaders queued stream={} status={}",
+        stream_id, status_code);
     return 0;
 }
 

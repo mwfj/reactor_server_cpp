@@ -3081,19 +3081,26 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         });
                     };
 
-                // Phase-2 scaffold — both closures are no-ops.
-                // Phase 3 replaces send_interim with a real H1 binding.
-                // Phase 4 replaces push_resource on the H2 site; H1 stays no-op.
+                // Real H2 send_interim: captures a weak_ptr to the H2
+                // connection handler and the stream_id, then calls
+                // SendInterimResponse. The handler enforces the
+                // dispatcher-thread-only contract — an app that fires
+                // send_interim from a foreign thread (or after final) is
+                // logged and dropped without touching nghttp2 state.
+                // Push stays on the phase-2 no-op until Phase 5 wires it.
+                std::weak_ptr<Http2ConnectionHandler> h2_weak = self;
                 auto send_interim =
-                    [](int status_code,
-                       const std::vector<std::pair<std::string, std::string>>&) {
-                    logging::Get()->debug(
-                        "send_interim no-op (phase-2 scaffold) status={}", status_code);
+                    [h2_weak, stream_id](
+                        int status_code,
+                        const std::vector<std::pair<std::string, std::string>>& hdrs) {
+                    auto h2 = h2_weak.lock();
+                    if (!h2) return;
+                    h2->SendInterimResponse(stream_id, status_code, hdrs);
                 };
                 auto push_resource =
                     [](const std::string&, const std::string&, const std::string&,
                        const std::string&, const HttpResponse&) -> int32_t {
-                    logging::Get()->debug("push_resource no-op (H1 / phase-2 scaffold)");
+                    logging::Get()->debug("push_resource no-op (H2 / phase-2 scaffold)");
                     return -1;
                 };
                 try {

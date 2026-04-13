@@ -69,6 +69,17 @@ public:
     // Http2Session handles the missing-stream case internally.
     void SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
 
+    // Submit a non-final 1xx informational response (e.g. 103 Early Hints)
+    // on a specific stream and flush nghttp2 output. The contract is
+    // dispatcher-thread-only — off-thread calls are refused with a warn
+    // log so a mis-routed call never corrupts nghttp2 state. Returns
+    // true on successful submission, false on validation / state failure
+    // (missing stream, final already submitted, off-thread, invalid status).
+    bool SendInterimResponse(
+        int32_t stream_id,
+        int status_code,
+        const std::vector<std::pair<std::string, std::string>>& headers);
+
     // Check if session is still active
     bool IsAlive() const { return session_ && session_->IsAlive(); }
 

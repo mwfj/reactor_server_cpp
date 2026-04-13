@@ -52,6 +52,18 @@ public:
     // Submit HTTP response for a stream. Returns 0 on success.
     int SubmitResponse(int32_t stream_id, const HttpResponse& response);
 
+    // Submit a non-final 1xx informational response on a stream WITHOUT
+    // END_STREAM (RFC 9113 + RFC 8297). Status must be in [102, 200) and
+    // not 101 (HTTP/2 forbids 101). Forbidden / pseudo / hop-by-hop
+    // headers are stripped to match the SubmitResponse policy.
+    // Returns 0 on success, -1 on validation or nghttp2 failure.
+    // Caller is responsible for flushing output via SendPendingFrames().
+    // Dispatcher-thread-only.
+    int SubmitInterimHeaders(
+        int32_t stream_id,
+        int status_code,
+        const std::vector<std::pair<std::string, std::string>>& headers);
+
     // --- Connection management ---
 
     // Send GOAWAY frame with the given error code.

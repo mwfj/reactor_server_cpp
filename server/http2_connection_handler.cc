@@ -451,6 +451,34 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
     }
 }
 
+bool Http2ConnectionHandler::SendInterimResponse(
+    int32_t stream_id, int status_code,
+    const std::vector<std::pair<std::string, std::string>>& headers) {
+    // Dispatcher-thread-only contract. An off-thread caller would race
+    // nghttp2's non-thread-safe session state against sync request
+    // processing, so refuse rather than silently corrupting the session.
+    if (!conn_ || !conn_->IsOnDispatcherThread()) {
+        logging::Get()->warn(
+            "H2 SendInterimResponse off-dispatcher-thread stream={} status={}; drop",
+            stream_id, status_code);
+        return false;
+    }
+    if (!session_) {
+        logging::Get()->debug(
+            "H2 SendInterimResponse on destroyed session stream={}; drop",
+            stream_id);
+        return false;
+    }
+    if (session_->SubmitInterimHeaders(stream_id, status_code, headers) != 0) {
+        return false;
+    }
+    // Mirror SubmitStreamResponse's flush reasoning: async paths don't have
+    // the tail flush in OnRawData, so we must push frames onto the
+    // transport ourselves or the 103 sits queued until unrelated I/O.
+    session_->SendPendingFrames();
+    return true;
+}
+
 void Http2ConnectionHandler::NotifyDrainComplete() {
     if (drain_notified_) return;
     drain_notified_ = true;
