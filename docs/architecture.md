@@ -26,6 +26,8 @@ The server uses the [Reactor pattern](https://en.wikipedia.org/wiki/Reactor_patt
 ## Layered Design
 
 ```
+Layer 7: RateLimitManager, RateLimitZone,   (rate limiting middleware)
+         TokenBucket
 Layer 6: UpstreamManager, UpstreamHostPool, (upstream connection pooling)
          PoolPartition, UpstreamConnection,
          UpstreamLease, TlsClientContext
@@ -41,7 +43,7 @@ Layer 1: ConnectionHandler, Channel,        (reactor core)
          Dispatcher, EventHandler
 ```
 
-Layers 1–2 are the transport. Layers 3–5 are the protocol. Layer 6 is the gateway (upstream connectivity). HTTP/1.x and HTTP/2 are parallel handlers at Layer 3, selected by `ProtocolDetector` at connection time. Both converge on the same `HttpRouter` at Layer 4. ConnectionHandler supports both inbound (server) and outbound (client) connections.
+Layers 1–2 are the transport. Layers 3–5 are the protocol. Layer 6 is the gateway (upstream connectivity). Layer 7 is the inbound traffic-management middleware (rate limiting). HTTP/1.x and HTTP/2 are parallel handlers at Layer 3, selected by `ProtocolDetector` at connection time. Both converge on the same `HttpRouter` at Layer 4. ConnectionHandler supports both inbound (server) and outbound (client) connections.
 
 ## Core Components
 
@@ -99,9 +101,36 @@ HttpServer
 - **`alive_` guard** — `shared_ptr<atomic<bool>>` detects partition destruction from callbacks, preventing use-after-free when the pool shuts down while async work is in flight
 - **Wait queue** — when all connections are busy and capacity is available, waiters queue until a connection frees up or a timeout fires (`CHECKOUT_QUEUE_TIMEOUT`)
 
+## Rate Limiting (Layer 7)
+
+Inbound request rate limiting is implemented as a middleware inserted at the front of the router's middleware chain. Token bucket with lazy refill; per-key state in sharded hash maps for bounded contention.
+
+```
+HttpServer
+  └── RateLimitManager (always created, even when disabled)
+        ├── atomic<bool> enabled_, dry_run_, include_headers_
+        ├── atomic<int>  status_code_
+        └── shared_ptr<ZoneList>                  (atomically swapped on reload)
+              └── vector<shared_ptr<RateLimitZone>>
+                    ├── shared_ptr<const ZonePolicy>  (atomically swapped on UpdateConfig)
+                    └── vector<Shard>[16]
+                          └── unordered_map<string, unique_ptr<Entry>>
+                                └── TokenBucket (integer millitokens, lazy refill)
+```
+
+**Key design points:**
+- **Always registered** — middleware is prepended in `MarkServerReady()` regardless of config, so `Reload()` can enable or add zones without re-registration (blocked by `RejectIfServerLive()` after Start)
+- **Sharded mutex** — 16 shards per zone, each with its own `std::mutex` + `unordered_map` + intrusive LRU list. Worst-case contention is 1/16 across dispatcher threads
+- **Immutable snapshots** — `ZoneList` (manager) and `ZonePolicy` (zone) are `shared_ptr<const T>` swapped atomically. In-flight `Check()` calls hold their own refcounted copy — old state stays alive until the last reader releases it. No mutex on the hot path beyond the shard lock
+- **First-deny wins** — multi-zone denial breaks the iteration on the first denying zone (matches Nginx). Trailing zones are not consulted, preventing unnecessary token debit
+- **Synchronous LRU eviction on insert** — `FindOrCreate` evicts LRU tail before creating a new entry if the shard is at capacity, guaranteeing `max_entries` is honored even under high-cardinality bursts
+- **Disable-first / enable-last reload ordering** — ensures no request can observe `enabled=true` with the previous (stale) zone list during a `(false,[])→(true,[Z])` transition
+
+See `docs/configuration.md` for the full config reference and `.claude/documents/features/RATE_LIMITING.md` for implementation internals.
+
 ## Memory Management
 
-- `unique_ptr`: sole ownership (Dispatcher→EventHandler, Acceptor→SocketHandler, ConnectionHandler→SocketHandler, HttpServer→UpstreamManager, PoolPartition→UpstreamConnection)
+- `unique_ptr`: sole ownership (Dispatcher→EventHandler, Acceptor→SocketHandler, ConnectionHandler→SocketHandler, HttpServer→UpstreamManager, HttpServer→RateLimitManager, PoolPartition→UpstreamConnection)
 - `shared_ptr`: shared ownership (Channels in epoll map, ConnectionHandlers in connections map, TlsContext shared between HttpServer and NetServer, TlsClientContext shared across PoolPartitions)
 - `weak_ptr`: non-owning observers (Channel→Dispatcher, callback captures)
 - Two-phase init: callbacks registered after object is wrapped in shared_ptr, using weak_ptr captures to break circular references

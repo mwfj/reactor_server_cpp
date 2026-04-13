@@ -301,6 +301,7 @@ server.Use([](const HttpRequest& req, HttpResponse& res) {
 - Route matching runs first (populating `request.params`), then middleware executes in registration order, then the matched handler runs. This means middleware can read route parameters (e.g., `req.params["id"]` for authorization decisions)
 - Return `true` to continue the chain, `false` to short-circuit (response is sent immediately)
 - **Headers survive fallbacks**: middleware-set headers are preserved even on 404/405 responses because `Dispatch()` sets status on the existing response object rather than replacing it
+- **Rate limit middleware runs first**: when `rate_limit.enabled=true`, the rate limiter is registered at the front of the chain via `PrependMiddleware()` during server startup. It runs before any user `Use()` middleware so denied requests skip auth/logging overhead. See [docs/configuration.md](configuration.md#rate-limiting) for configuration
 
 ## HttpRequest
 

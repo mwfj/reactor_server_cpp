@@ -134,6 +134,11 @@ Environment variables take precedence over JSON file values:
 | `REACTOR_HTTP2_INITIAL_WINDOW_SIZE` | `http2.initial_window_size` | int |
 | `REACTOR_HTTP2_MAX_FRAME_SIZE` | `http2.max_frame_size` | int |
 | `REACTOR_HTTP2_MAX_HEADER_LIST_SIZE` | `http2.max_header_list_size` | int |
+| `REACTOR_RATE_LIMIT_ENABLED` | `rate_limit.enabled` | bool (`1`/`true`/`yes`) |
+| `REACTOR_RATE_LIMIT_DRY_RUN` | `rate_limit.dry_run` | bool (`1`/`true`/`yes`) |
+| `REACTOR_RATE_LIMIT_STATUS_CODE` | `rate_limit.status_code` | int (400-599) |
+
+Per-zone rate limit config (the `zones[]` array) is JSON-only — env vars cover the global toggles only.
 
 ### Upstream Configuration
 

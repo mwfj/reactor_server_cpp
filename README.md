@@ -8,11 +8,13 @@ A high-performance C++ network server built on the Reactor pattern with epoll/kq
 - **HTTP/2** — RFC 9113 compliant: stream multiplexing, HPACK, flow control, ALPN negotiation, flood protection
 - **WebSocket** — RFC 6455 compliant: handshake, binary/text frames, fragmentation, close handshake, ping/pong
 - **TLS/SSL** — optional OpenSSL 3.x integration with configurable minimum version and cipher suites
+- **Upstream Proxy** — per-service connection pools with TLS, request forwarding, retry policy, header rewriting (XFF, Via, Host)
+- **Rate Limiting** — per-client / per-route token-bucket middleware with sharded state, LRU eviction, IETF `RateLimit-*` headers, dry-run mode, hot-reloadable
 - **Reactor Core** — edge-triggered epoll (Linux) / kqueue (macOS), non-blocking I/O, multi-threaded dispatcher pool
 - **Thread Pool** — configurable worker threads for event loop dispatchers
 - **Connection Management** — idle timeout detection, request deadlines (Slowloris protection), graceful shutdown with WS close frames and H2 GOAWAY drain
 - **CLI** — production binary with config validation, signal management, PID file tracking, health/stats endpoints, daemon mode
-- **Configuration** — JSON config files + environment variable overrides + CLI flag overrides
+- **Configuration** — JSON config files + environment variable overrides + CLI flag overrides, SIGHUP hot reload
 - **Structured Logging** — spdlog-based logging with date-based file rotation
 
 ## Quick Start
@@ -250,6 +252,8 @@ reactor_server_cpp/
 │   ├── http2/            #   HTTP/2 layer (session, stream, connection handler)
 │   ├── ws/               #   WebSocket layer (connection, parser, frame, handshake)
 │   ├── tls/              #   TLS layer (context, connection)
+│   ├── upstream/         #   Upstream proxy (pool, proxy handler, retry policy)
+│   ├── rate_limit/       #   Rate limiting (manager, zone, token bucket)
 │   ├── cli/              #   CLI layer (parser, signal handler, PID file, version)
 │   ├── config/           #   Configuration (server_config, config_loader)
 │   ├── log/              #   Logging (logger, log_utils)
@@ -257,7 +261,7 @@ reactor_server_cpp/
 ├── server/               # Implementation (.cc)
 │   ├── main.cc           #   Production entry point
 │   └── *.cc              #   All component implementations
-├── test/                 # Test suites (basic, stress, race, timeout, http, ws, tls, http2, cli, route, upstream, proxy, kqueue)
+├── test/                 # Test suites (basic, stress, race, timeout, http, ws, tls, http2, cli, route, upstream, proxy, rate_limit, kqueue)
 ├── thread_pool/          # Standalone thread pool (separate build)
 ├── third_party/          # llhttp, nghttp2, nlohmann/json, spdlog
 ├── config/               # Example config files
@@ -270,17 +274,17 @@ reactor_server_cpp/
 ```bash
 make                    # Build both test runner (./test_runner) and server (./server_runner)
 make server             # Build only the production server
-make test               # Build and run all tests (319 tests across 15 suites)
+make test               # Build and run all tests (372 tests across 16 suites)
 make clean              # Remove artifacts
 make help               # Show all targets
 
 # Run specific test suites
-./test_runner basic     # Basic functionality (6 tests)
-./test_runner stress    # Stress tests — 100 concurrent clients (1 test)
-./test_runner race      # Race condition tests (14 tests)
+./test_runner basic     # Basic functionality (9 tests)
+./test_runner stress    # Stress tests — 100 concurrent clients (3 tests)
+./test_runner race      # Race condition tests (9 tests)
 ./test_runner timeout   # Connection timeout tests (6 tests)
 ./test_runner config    # Configuration tests (8 tests)
-./test_runner http      # HTTP protocol tests (14 tests)
+./test_runner http      # HTTP protocol tests (21 tests)
 ./test_runner ws        # WebSocket protocol tests (10 tests)
 ./test_runner tls       # TLS/SSL tests (2 tests)
 ./test_runner http2     # HTTP/2 protocol tests (37 tests)
@@ -288,6 +292,7 @@ make help               # Show all targets
 ./test_runner route     # Route trie/pattern matching (50 tests)
 ./test_runner upstream  # Upstream connection pool tests (30 tests)
 ./test_runner proxy     # Proxy engine tests (56 tests)
+./test_runner rate_limit # Rate limit tests (46 tests)
 ./test_runner kqueue    # macOS kqueue platform tests (7 tests, skipped on Linux)
 
 # Thread pool subproject (independent)
@@ -308,7 +313,7 @@ cd thread_pool && make && ./run
 | [docs/http2.md](docs/http2.md) | HTTP/2 layer — streams, HPACK, flow control, ALPN |
 | [docs/websocket.md](docs/websocket.md) | WebSocket — upgrade flow, frames, message API, RFC 6455 compliance |
 | [docs/tls.md](docs/tls.md) | TLS/SSL — configuration, state machine, OpenSSL integration |
-| [docs/configuration.md](docs/configuration.md) | JSON config, environment variables, structured logging |
+| [docs/configuration.md](docs/configuration.md) | JSON config, environment variables, rate limiting, structured logging |
 
 ## Platform Support
 

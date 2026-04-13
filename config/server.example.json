@@ -19,5 +19,21 @@
         "file": "",
         "max_file_size": 10485760,
         "max_files": 3
+    },
+    "rate_limit": {
+        "enabled": false,
+        "dry_run": false,
+        "status_code": 429,
+        "include_headers": true,
+        "zones": [
+            {
+                "name": "per_ip",
+                "rate": 100,
+                "capacity": 200,
+                "key_type": "client_ip",
+                "max_entries": 100000,
+                "applies_to": []
+            }
+        ]
     }
 }

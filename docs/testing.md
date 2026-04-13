@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all tests (319 tests across 15 suites)
+make test               # Build and run all tests (372 tests across 16 suites)
 ./test_runner                   # Run all tests directly (after building)
 
 # Individual test suites
@@ -20,6 +20,7 @@ make test               # Build and run all tests (319 tests across 15 suites)
 ./test_runner route             # Route trie/pattern matching tests (or: ./test_runner -R)
 ./test_runner upstream          # Upstream connection pool tests (or: ./test_runner -U)
 ./test_runner proxy             # Proxy engine tests (or: ./test_runner -P)
+./test_runner rate_limit        # Rate limit tests (or: ./test_runner -L)
 ./test_runner kqueue            # macOS kqueue platform tests (or: ./test_runner -K)
 ./test_runner help              # Show all options
 
@@ -33,25 +34,29 @@ make test_ws            # Build and run WebSocket tests
 make test_tls           # Build and run TLS tests
 make test_http2         # Build and run HTTP/2 tests
 make test_cli           # Build and run CLI tests
+make test_upstream      # Build and run upstream pool tests
+make test_proxy         # Build and run proxy engine tests
+make test_rate_limit    # Build and run rate limit tests
 ```
 
 ## Test Suites
 
 | Suite | Tests | Port | File | Command |
 |-------|-------|------|------|---------|
-| Basic | 6 | ephemeral | `test/basic_test.h` | `./test_runner basic` |
-| Stress | 1 | ephemeral | `test/stress_test.h` | `./test_runner stress` |
-| Race Condition | 14 | ephemeral | `test/race_condition_test.h` | `./test_runner race` |
+| Basic | 9 | ephemeral | `test/basic_test.h` | `./test_runner basic` |
+| Stress | 3 | ephemeral | `test/stress_test.h` | `./test_runner stress` |
+| Race Condition | 9 | ephemeral | `test/race_condition_test.h` | `./test_runner race` |
 | Timeout | 6 | ephemeral | `test/timeout_test.h` | `./test_runner timeout` |
 | Config | 8 | N/A | `test/config_test.h` | `./test_runner config` |
-| HTTP | 14 | ephemeral | `test/http_test.h` | `./test_runner http` |
+| HTTP | 21 | ephemeral | `test/http_test.h` | `./test_runner http` |
 | WebSocket | 10 | ephemeral | `test/websocket_test.h` | `./test_runner ws` |
 | TLS | 2 | ephemeral | `test/tls_test.h` | `./test_runner tls` |
 | HTTP/2 | 37 | ephemeral | `test/http2_test.h` | `./test_runner http2` |
 | CLI | 79 | N/A | `test/cli_test.h` | `./test_runner cli` |
-| Route | 44 | ephemeral | `test/route_test.h` | `./test_runner route` |
+| Route | 50 | ephemeral | `test/route_test.h` | `./test_runner route` |
 | Upstream Pool | 30 | ephemeral | `test/upstream_pool_test.h` | `./test_runner upstream` |
 | Proxy | 56 | ephemeral | `test/proxy_test.h` | `./test_runner proxy` |
+| Rate Limit | 46 | ephemeral | `test/rate_limit_test.h` | `./test_runner rate_limit` |
 | Kqueue | 7 | ephemeral | `test/kqueue_test.h` | `./test_runner kqueue` (macOS only, skipped on Linux) |
 
 ### Basic Tests
@@ -136,6 +141,24 @@ Uses `Http2TestClient` -- a test helper wrapping nghttp2 in client mode with `me
 **Integration Tests (11 tests):** HasUpstream lookup, checkout from unknown service, shutdown drain, EvictExpired no-crash, CheckoutAsync valid connection, connection reuse (same fd after return), connect failure fires error callback, wait-queue overflow (POOL_EXHAUSTED), upstream drops connection while lease held, multi-dispatcher concurrency.
 
 Uses a real `HttpServer` instance as the upstream backend with ephemeral ports. Tests validate the full lifecycle: checkout → use → return → reuse, including error paths and graceful shutdown.
+
+### Rate Limit Tests
+
+**TokenBucket unit (7 tests):** Fresh bucket full, lazy refill, capacity limit, UpdateConfig rate/capacity change, low-rate fractional credit preservation, SecondsUntilAvailable accuracy.
+
+**RateLimitZone tests (8 tests):** Key extractor types (client_ip, header, composite, empty-key skip), `applies_to` prefix filter with segment-boundary matching, LRU eviction after timer sweep, synchronous `max_entries` enforcement on insert (no timer dependency).
+
+**RateLimitManager tests (11 tests):** Single-zone allow/deny, multi-zone all-pass, multi-zone one-denies (first-deny-wins), stops-debiting-after-denial, skips non-applicable zones when building headers, RateLimit/Retry-After header generation, large-policy-window overflow safety, reset-header on empty bucket, disabled short-circuit.
+
+**Hot-reload tests (6 tests):** Enable/disable toggle, rate change on existing buckets, add/remove zone, status_code and dry_run changes visible to next request.
+
+**Integration tests — full HTTP (5 tests):** 200 with `RateLimit-*` headers, 429 with `Retry-After`, custom status code (503), dry-run allows and strips `Retry-After`, middleware applies to all routes.
+
+**Configuration tests (6 tests):** JSON round-trip, validation errors (rate≤0, unknown key_type, duplicate names, enabled+empty zones, empty `applies_to` entry rejection).
+
+**Edge cases (3 tests):** Empty client_ip skip, capacity=1, very high rate (1e6) without integer overflow.
+
+Total: 46 tests. Uses ephemeral ports via `TestServerRunner<HttpServer>` for integration paths.
 
 ### Kqueue Tests (macOS only)
 - EVFILT_TIMER idle timeout verification
