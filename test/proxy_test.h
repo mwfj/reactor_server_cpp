@@ -2144,7 +2144,13 @@ void TestIntegrationBackoffDoesNotBlockOtherRequests() {
     try {
         // Backend:
         //   /slow  — always returns 503 on first visit; 200 on second (after retry).
-        //            Uses a 50ms artificial delay so /fast completes first.
+        //            The retry path sleeps 200ms BEFORE responding to ensure
+        //            /slow completes well after /fast, regardless of the
+        //            specific jitter value picked for backoff (1-49ms).
+        //            Without this deterministic delay, a low jitter value
+        //            combined with fast-machine backend processing could
+        //            let /slow finish before /fast, flaking the ordering
+        //            assertion below.
         //   /fast  — always returns 200 immediately.
         std::atomic<int> slow_count{0};
 
@@ -2155,7 +2161,10 @@ void TestIntegrationBackoffDoesNotBlockOtherRequests() {
                 // First call: trigger retry
                 resp.Status(503).Body("retry me", "text/plain");
             } else {
-                // Second call (after backoff): succeed
+                // Second call (after backoff): sleep then succeed.
+                // The 200ms sleep dominates the backoff jitter, making
+                // the total /slow wall-clock time predictably > /fast.
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 resp.Status(200).Body("slow-ok", "text/plain");
             }
         });
@@ -2235,13 +2244,12 @@ void TestIntegrationBackoffDoesNotBlockOtherRequests() {
         long fast_ms = fast_elapsed_ms.load();
         long slow_ms = slow_elapsed_ms.load();
 
-        // /fast should complete in significantly less wall-clock time than /slow
-        // (which includes backoff). The backoff for attempt=1 is in [1, 50ms).
-        // Assert ordering: /fast must finish before /slow. This holds even
-        // with multiple worker threads because /fast has no retry overhead
-        // while /slow must wait for at least 1ms of backoff + a second
-        // upstream round-trip. The 10ms head-start for /slow ensures it
-        // enters the backoff wait before /fast is dispatched.
+        // /fast should complete in significantly less wall-clock time than /slow.
+        // /slow takes at least 200ms (deterministic backend sleep on retry)
+        // + backoff jitter + two round-trips. /fast takes one round-trip with
+        // no sleep. The 10ms head-start for /slow ensures it enters the backoff
+        // wait before /fast is dispatched. The 200ms backend sleep eliminates
+        // the flake risk where a low jitter value could let /slow finish first.
         if (fast_ms < 0 || fast_ms > 2000) {
             pass = false;
             err += "/fast took " + std::to_string(fast_ms) + "ms (expected < 2000ms); ";

@@ -496,14 +496,18 @@ void Dispatcher::EnQueueDeferred(std::function<void()> fn) {
 bool Dispatcher::EnQueueDelayed(std::function<void()> fn,
                                  std::chrono::milliseconds delay) {
     if (was_stopped_.load(std::memory_order_acquire)) return false;
-    // Zero or negative delay: use the immediate EnQueue path (avoids
-    // priority queue overhead and ensures the task runs ASAP).
-    // Re-check was_stopped_ to match EnQueue's internal guard —
-    // EnQueue silently drops on was_stopped_, so returning true
-    // would violate the "false if dropped" contract.
+    // Zero or negative delay: push directly to task_que_ under the lock
+    // so the was_stopped_ check and push are atomic. This honors the
+    // "false if dropped" contract — without the lock, was_stopped_ could
+    // flip between an outer check and EnQueue's internal check, silently
+    // dropping the task while returning true.
     if (delay.count() <= 0) {
-        if (was_stopped_.load(std::memory_order_acquire)) return false;
-        EnQueue(std::move(fn));
+        {
+            std::lock_guard<std::mutex> lck(mtx_);
+            if (was_stopped_.load(std::memory_order_acquire)) return false;
+            task_que_.push_back(std::move(fn));
+        }
+        WakeUp();
         return true;
     }
     auto deadline = std::chrono::steady_clock::now() + delay;
