@@ -1377,6 +1377,92 @@ void TestWindowResizeStillInvalidatesClosedAdmissions() {
     }
 }
 
+// BUG (review round 7, P2): Reload() lowering permitted_half_open_calls
+// while a HALF_OPEN cycle is active could close the breaker early and
+// discard failures from already-admitted probes.
+//
+// Scenario (5-probe cycle reloaded down to 1):
+//   TransitionOpenToHalfOpen: snapshot=5, admit 5 probes.
+//   Reload: permitted_half_open_calls → 1.
+//   First success arrives → half_open_successes_=1 ≥ NEW limit (1)
+//   → TransitionHalfOpenToClosed() fires → halfopen_gen_ bumped.
+//   Remaining 4 admitted probes are now stale → their failures DROPPED.
+//   Breaker falsely closes even though 4 probes have not reported yet.
+//
+// Fix: snapshot config_.permitted_half_open_calls into
+// half_open_permitted_snapshot_ at TransitionOpenToHalfOpen time.
+// TryAcquire (slot gate) and ReportSuccess (close check) both use the
+// snapshot so the cycle budget is frozen for its lifetime.
+void TestHalfOpenBudgetFrozenAcrossReload() {
+    std::cout << "\n[TEST] CB: HALF_OPEN budget frozen across mid-cycle reload..."
+              << std::endl;
+    try {
+        CircuitBreakerConfig cb;
+        cb.enabled = true;
+        cb.consecutive_failure_threshold = 5;
+        cb.failure_rate_threshold = 100;   // disable rate-trip
+        cb.minimum_volume = 1000;          // disable rate-trip
+        cb.window_seconds = 10;
+        cb.permitted_half_open_calls = 2;  // exactly 2 probes for clean drain
+        cb.base_open_duration_ms = 100;
+        cb.max_open_duration_ms = 60000;
+
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Trip the breaker.
+        for (int i = 0; i < 5; ++i) {
+            auto a = slice.TryAcquire();
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, a.generation);
+        }
+        bool is_open = slice.CurrentState() == State::OPEN;
+
+        // Advance past open_until → OPEN→HALF_OPEN on next TryAcquire.
+        clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
+
+        // Admit both probes (budget=2; snapshot set to 2 at TransitionOpenToHalfOpen).
+        auto a0 = slice.TryAcquire();
+        auto a1 = slice.TryAcquire();
+        bool both_probes = (a0.decision == Decision::ADMITTED_PROBE) &&
+                           (a1.decision == Decision::ADMITTED_PROBE);
+        bool is_halfopen = slice.CurrentState() == State::HALF_OPEN;
+
+        // Lower the limit to 1 mid-cycle.
+        auto lowered = cb;
+        lowered.permitted_half_open_calls = 1;
+        slice.Reload(lowered);
+
+        // First probe succeeds.
+        // Without fix: successes(1) >= NEW config(1) → TransitionHalfOpenToClosed
+        //              → halfopen_gen_ bumped → second probe's failure DROPPED
+        //              → breaker falsely CLOSED.
+        // With fix:    successes(1) >= snapshot(2) is false → stays HALF_OPEN.
+        slice.ReportSuccess(true, a0.generation);
+        bool not_closed_after_one = slice.CurrentState() == State::HALF_OPEN;
+
+        // Second probe fails. inflight drops to 0 → TripHalfOpenToOpen fires.
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, true, a1.generation);
+        bool retripped = slice.CurrentState() == State::OPEN;
+
+        bool pass = is_open && both_probes && is_halfopen &&
+                    not_closed_after_one && retripped;
+        TestFramework::RecordTest(
+            "CB: HALF_OPEN budget frozen across mid-cycle reload",
+            pass, pass ? "" :
+                  "is_open=" + std::to_string(is_open) +
+                  " both_probes=" + std::to_string(both_probes) +
+                  " is_halfopen=" + std::to_string(is_halfopen) +
+                  " not_closed_after_one=" + std::to_string(not_closed_after_one) +
+                  " retripped=" + std::to_string(retripped),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: HALF_OPEN budget frozen across mid-cycle reload",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // BUG (review round 6, P2): Reload with window_seconds change preserved
 // consecutive_failures_ while bumping closed_gen_. Pre-reload CLOSED
 // reports are correctly blocked (stale gen), but they can no longer
@@ -1531,6 +1617,7 @@ void RunAllTests() {
     TestWindowResizeDuringHalfOpenDoesNotStrandProbes();
     TestWindowResizeStillInvalidatesClosedAdmissions();
     TestWindowResizeResetConsecutiveFailures();
+    TestHalfOpenBudgetFrozenAcrossReload();
     TestTransitionCallbackInvoked();
 }
 

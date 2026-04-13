@@ -108,6 +108,15 @@ void CircuitBreakerSlice::TransitionOpenToHalfOpen() {
     half_open_inflight_ = 0;
     half_open_successes_ = 0;
     half_open_saw_failure_ = false;
+    // Snapshot the probe budget for this cycle. A live Reload() during this
+    // HALF_OPEN episode may lower or raise config_.permitted_half_open_calls,
+    // but TryAcquire's slot gate (Case B) and ReportSuccess's close check must
+    // both operate against the budget that was in effect when probes were
+    // admitted. Without the snapshot: lowering the limit causes premature close
+    // (first success satisfies the reduced count → TransitionHalfOpenToClosed
+    // bumps halfopen_gen_ → remaining admitted probes become stale → their
+    // failures are silently dropped and the breaker falsely closes).
+    half_open_permitted_snapshot_ = config_.permitted_half_open_calls;
     // Reset the info-log "first reject" breadcrumb so the first rejection
     // observed in the HALF_OPEN phase surfaces at info, not debug. HALF_OPEN
     // rejection (recovery attempt failing or probe budget full) is
@@ -122,7 +131,7 @@ void CircuitBreakerSlice::TransitionOpenToHalfOpen() {
 
     logging::Get()->info(
         "circuit breaker half-open {} probes_allowed={}",
-        host_label_, config_.permitted_half_open_calls);
+        host_label_, half_open_permitted_snapshot_);
 
     if (transition_cb_) {
         transition_cb_(State::OPEN, State::HALF_OPEN, "open_elapsed");
@@ -238,7 +247,10 @@ CircuitBreakerSlice::Admission CircuitBreakerSlice::TryAcquire() {
         }
         // Case B: probe budget fully in flight. "No capacity" — bump the
         // dedicated counter so dashboards can tell these two apart.
-        if (half_open_inflight_ >= config_.permitted_half_open_calls) {
+        // Use the cycle snapshot, not config_, so a live Reload() that
+        // lowers permitted_half_open_calls mid-cycle doesn't change how many
+        // probes were promised to this cycle.
+        if (half_open_inflight_ >= half_open_permitted_snapshot_) {
             return Admission{RejectWithLog("half_open_full",
                                            /*half_open_full=*/true),
                              /*generation=*/0};
@@ -326,7 +338,10 @@ void CircuitBreakerSlice::ReportSuccess(bool probe,
             return;
         }
         half_open_successes_++;
-        if (half_open_successes_ >= config_.permitted_half_open_calls) {
+        // Use the cycle snapshot so a mid-cycle Reload() that lowers the
+        // limit doesn't close the breaker early (before all admitted probes
+        // have reported back), silently dropping the remaining probes' failures.
+        if (half_open_successes_ >= half_open_permitted_snapshot_) {
             TransitionHalfOpenToClosed();
         }
         return;

@@ -138,6 +138,13 @@ private:
     int half_open_inflight_ = 0;
     int half_open_successes_ = 0;
     bool half_open_saw_failure_ = false;
+    // Probe budget for the CURRENT HALF_OPEN cycle. Snapshotted from
+    // config_.permitted_half_open_calls at the moment TransitionOpenToHalfOpen
+    // fires. A live Reload() may lower (or raise) the config field mid-cycle;
+    // the snapshot ensures TryAcquire's slot gate and ReportSuccess's close
+    // check both operate against the budget that was in effect when the probes
+    // were admitted — preventing early close or indefinitely-open behaviour.
+    int half_open_permitted_snapshot_ = 0;
 
     // Observability counters.
     std::atomic<int64_t> trips_{0};
