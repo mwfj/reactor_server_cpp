@@ -201,8 +201,14 @@ RateLimitZone::Result RateLimitZone::Check(const HttpRequest& request) {
     // 7. Lazy config update: sync bucket with current policy if rate or
     //    capacity changed. UpdateConfig calls Refill() first to materialize
     //    tokens accrued under the old rate before switching.
+    //
+    //    Compare rate as millitokens (integer) to avoid spurious mismatches
+    //    from floating-point round-trip (e.g., rate=0.3 stored as 299 mt
+    //    reads back as 0.299, which != 0.3 and would trigger UpdateConfig
+    //    on every request on the hot path).
+    int64_t policy_rate_mt = static_cast<int64_t>(policy->rate * 1000);
     if (entry->bucket.Capacity() != policy->capacity ||
-        entry->bucket.Rate() != policy->rate) {
+        entry->bucket.RateMillitokens() != policy_rate_mt) {
         entry->bucket.UpdateConfig(policy->rate, policy->capacity);
     }
 

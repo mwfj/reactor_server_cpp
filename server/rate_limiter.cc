@@ -54,30 +54,34 @@ bool RateLimitManager::Check(const HttpRequest& request,
         RateLimitZone::Result result = zone->Check(request);
 
         if (!result.allowed) {
-            // Denied: track the zone with the longest retry_after
-            if (!denied || result.retry_after_sec > best_retry_after) {
-                best_name = zone->name();
-                best_limit = result.limit;
-                best_remaining = result.remaining;
-                best_retry_after = result.retry_after_sec;
-            }
+            // Denied: record this zone for headers and stop evaluating
+            // remaining zones. Continuing would debit tokens in zones
+            // whose outcome cannot change the final decision — the
+            // request is already rejected.
+            // Matches Nginx's behavior (first-deny wins, later zones
+            // are not consulted).
+            best_name = zone->name();
+            best_limit = result.limit;
+            best_remaining = result.remaining;
+            best_retry_after = result.retry_after_sec;
             denied = true;
-        } else if (!denied) {
-            // Allowed: track the most restrictive zone by remaining/limit ratio.
-            // Lower ratio = more restrictive.
-            double ratio = (result.limit > 0)
-                ? static_cast<double>(result.remaining) / static_cast<double>(result.limit)
-                : 1.0;
-            double best_ratio = (best_limit > 0)
-                ? static_cast<double>(best_remaining) / static_cast<double>(best_limit)
-                : 1.0;
+            break;
+        }
 
-            if (best_name.empty() || ratio < best_ratio) {
-                best_name = zone->name();
-                best_limit = result.limit;
-                best_remaining = result.remaining;
-                best_retry_after = result.retry_after_sec;
-            }
+        // Allowed: track the most restrictive zone by remaining/limit ratio.
+        // Lower ratio = more restrictive.
+        double ratio = (result.limit > 0)
+            ? static_cast<double>(result.remaining) / static_cast<double>(result.limit)
+            : 1.0;
+        double best_ratio = (best_limit > 0)
+            ? static_cast<double>(best_remaining) / static_cast<double>(best_limit)
+            : 1.0;
+
+        if (best_name.empty() || ratio < best_ratio) {
+            best_name = zone->name();
+            best_limit = result.limit;
+            best_remaining = result.remaining;
+            best_retry_after = result.retry_after_sec;
         }
     }
 

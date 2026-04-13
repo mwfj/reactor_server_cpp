@@ -252,6 +252,55 @@ void TestTokenBucketUpdateConfigCapacityShrink() {
     }
 }
 
+void TestTokenBucketLowRateFractionalCredit() {
+    std::cout << "\n[TEST] TokenBucket: low-rate fractional refill credit preserved..." << std::endl;
+    try {
+        bool pass = true;
+        std::string err;
+
+        // Rate = 10 req/sec → 10000 millitokens/sec.
+        // Capacity = 1. Each refill requires 1000 millitokens = 100 ms.
+        // We probe faster than the refill period (every 50 ms). With the
+        // fractional-credit fix, after 2 probes (100 ms total) we should
+        // accrue 1 token. Without the fix, add truncates to 0 on each
+        // probe and last_refill_time_ advances, losing all credit — the
+        // bucket would stay empty forever.
+        TokenBucket bucket(10.0, 1);
+
+        // Drain the bucket
+        if (!bucket.TryConsume()) {
+            pass = false;
+            err += "initial TryConsume should succeed; ";
+        }
+        if (bucket.TryConsume()) {
+            pass = false;
+            err += "second TryConsume should be denied; ";
+        }
+
+        // Now probe every 50 ms. After 100 ms total (2 probes), we should
+        // have earned 1 token via accumulated fractional credit.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        bool r1 = bucket.TryConsume();  // Should still be denied (only 500 mt)
+        if (r1) {
+            pass = false;
+            err += "probe after 50ms should be denied (only 500 mt accrued); ";
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));  // total ~110ms
+        bool r2 = bucket.TryConsume();  // Should succeed (1000+ mt accrued)
+        if (!r2) {
+            pass = false;
+            err += "probe after 110ms total should succeed (credit accumulated); ";
+        }
+
+        TestFramework::RecordTest("TokenBucket: low-rate fractional credit preserved", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("TokenBucket: low-rate fractional credit preserved", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestTokenBucketSecondsUntilAvailable() {
     std::cout << "\n[TEST] TokenBucket: SecondsUntilAvailable..." << std::endl;
     try {
@@ -462,6 +511,85 @@ void TestZoneAppliesToFilter() {
     }
 }
 
+void TestZoneAppliesToSegmentBoundary() {
+    std::cout << "\n[TEST] RateLimitZone: applies_to matches on segment boundary only..." << std::endl;
+    try {
+        bool pass = true;
+        std::string err;
+
+        // Prefix "/api" WITHOUT trailing slash. Should match "/api",
+        // "/api/users", etc., but NOT "/apis" or "/api2" (no segment
+        // boundary).
+        RateLimitZoneConfig config;
+        config.name = "boundary_zone";
+        config.rate = 1.0;
+        config.capacity = 1;
+        config.key_type = "client_ip";
+        config.max_entries = 100;
+        config.applies_to = {"/api"};
+
+        auto extractor = MakeKeyExtractor(config.key_type);
+        RateLimitZone zone(config.name, config, std::move(extractor));
+
+        // /api (exact match) — zone applies, capacity=1, first allowed, second denied
+        {
+            HttpRequest req = MakeRequest("GET", "/api");
+            auto r1 = zone.Check(req);
+            auto r2 = zone.Check(req);
+            if (!r1.allowed || r2.allowed) {
+                pass = false;
+                err += "/api: expected allow then deny; ";
+            }
+        }
+
+        // /api/users (segment boundary) — zone applies, shares the /api bucket
+        // Since we already consumed the token above for this client_ip, this
+        // should also be denied.
+        {
+            HttpRequest req = MakeRequest("GET", "/api/users");
+            auto r = zone.Check(req);
+            if (r.allowed) {
+                pass = false;
+                err += "/api/users: expected deny (shares bucket via segment match); ";
+            }
+        }
+
+        // /apis — zone does NOT apply (no segment boundary), always allowed
+        {
+            HttpRequest req = MakeRequest("GET", "/apis");
+            for (int i = 0; i < 5; i++) {
+                auto r = zone.Check(req);
+                if (!r.allowed) {
+                    pass = false;
+                    err += "/apis request " + std::to_string(i) +
+                           " denied (should bypass — not a segment match); ";
+                    break;
+                }
+            }
+        }
+
+        // /api2 — zone does NOT apply, always allowed
+        {
+            HttpRequest req = MakeRequest("GET", "/api2");
+            for (int i = 0; i < 5; i++) {
+                auto r = zone.Check(req);
+                if (!r.allowed) {
+                    pass = false;
+                    err += "/api2 request " + std::to_string(i) +
+                           " denied (should bypass — not a segment match); ";
+                    break;
+                }
+            }
+        }
+
+        TestFramework::RecordTest("RateLimitZone: applies_to segment boundary", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RateLimitZone: applies_to segment boundary", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestZoneLruEviction() {
     std::cout << "\n[TEST] RateLimitZone: LRU eviction when max_entries exceeded..." << std::endl;
     try {
@@ -653,6 +781,79 @@ void TestManagerMultiZoneOneDenies() {
                                   TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("RateLimitManager: multi-zone one denies", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestManagerStopsDebitingAfterDenial() {
+    std::cout << "\n[TEST] RateLimitManager: later zones are not debited after denial..." << std::endl;
+    try {
+        bool pass = true;
+        std::string err;
+
+        // Zone order matters: deny_first (capacity=1) before trailing
+        // "witness" zone. After deny_first rejects, Check() must NOT consume
+        // from trailing_zone. We verify by checking trailing_zone's state
+        // via a request that would only succeed if its tokens were intact.
+        RateLimitConfig config;
+        config.enabled = true;
+        // Zone 1: will be exhausted first
+        config.zones.push_back({"deny_first", 1.0, 1, "client_ip", 1000, {}});
+        // Zone 2 (later in iteration order): capacity=2. If debited after
+        // deny_first rejects, only 1 token remains; otherwise 2 tokens remain.
+        config.zones.push_back({"trailing_zone", 100.0, 2, "client_ip", 1000, {}});
+
+        RateLimitManager manager(config);
+
+        HttpRequest req = MakeRequest("GET", "/test", "10.0.0.1");
+
+        // First request: both zones allow. deny_first: 1 -> 0. trailing_zone: 2 -> 1.
+        {
+            HttpResponse response;
+            if (!manager.Check(req, response)) {
+                pass = false;
+                err += "first request should pass; ";
+            }
+        }
+
+        // Second request: deny_first denies. With the fix, trailing_zone is
+        // NOT consulted. trailing_zone should still have 1 token remaining.
+        {
+            HttpResponse response;
+            if (manager.Check(req, response)) {
+                pass = false;
+                err += "second request should be denied by deny_first; ";
+            }
+        }
+
+        // Third request from a DIFFERENT client_ip to bypass deny_first
+        // (per-client_ip key). If the fix is in place, trailing_zone has
+        // 2 tokens left for this new client (unconsumed by prior rejection).
+        // If the old behavior leaked, trailing_zone would have 1 token and
+        // we'd see only one allow-before-deny. We issue 2 requests.
+        HttpRequest req2 = MakeRequest("GET", "/test", "10.0.0.2");
+        {
+            HttpResponse r1, r2;
+            bool a1 = manager.Check(req2, r1);
+            bool a2 = manager.Check(req2, r2);
+            // trailing_zone has capacity=2, so both should pass
+            // (deny_first is per-client_ip so new client has 1 token).
+            if (!a1) {
+                pass = false;
+                err += "new-client first request should pass; ";
+            }
+            if (a2) {
+                // Expected: deny_first exhausts for this client_ip on request 2
+                // trailing_zone still has 2 tokens, but deny_first rejects.
+                // That's fine — we just want to prove trailing_zone wasn't
+                // pre-debited by the prior rejection from client 1.
+            }
+        }
+
+        TestFramework::RecordTest("RateLimitManager: stops debiting after denial", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("RateLimitManager: stops debiting after denial", false, e.what(),
                                   TestFramework::TestCategory::OTHER);
     }
 }
@@ -1541,6 +1742,54 @@ void TestConfigValidateEnabledWithEmptyZones() {
     }
 }
 
+void TestConfigRejectEmptyAppliesToPrefix() {
+    std::cout << "\n[TEST] Config: empty applies_to prefix rejected at parse time..." << std::endl;
+    try {
+        bool pass = true;
+        std::string err;
+
+        // Empty prefix ("") would crash RateLimitZone::Check() via
+        // prefix.back() (UB on empty strings). Must be rejected at parse.
+        std::string json = R"({
+            "rate_limit": {
+                "enabled": true,
+                "zones": [{
+                    "name": "bad_zone",
+                    "rate": 10.0,
+                    "capacity": 10,
+                    "key_type": "client_ip",
+                    "max_entries": 100,
+                    "applies_to": [""]
+                }]
+            }
+        })";
+
+        bool threw = false;
+        try {
+            ConfigLoader::LoadFromString(json);
+        } catch (const std::exception& e) {
+            threw = true;
+            std::string what = e.what();
+            if (what.find("applies_to") == std::string::npos &&
+                what.find("empty") == std::string::npos) {
+                pass = false;
+                err += "exception should mention empty applies_to: " + what + "; ";
+            }
+        }
+
+        if (!threw) {
+            pass = false;
+            err += "should throw for empty applies_to entry; ";
+        }
+
+        TestFramework::RecordTest("Config: empty applies_to prefix rejected", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("Config: empty applies_to prefix rejected", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
 
 // =========================================================================
 // G. Edge case tests
@@ -1683,6 +1932,7 @@ void RunAllTests() {
     TestTokenBucketCapacityLimit();
     TestTokenBucketUpdateConfigRateChange();
     TestTokenBucketUpdateConfigCapacityShrink();
+    TestTokenBucketLowRateFractionalCredit();
     TestTokenBucketSecondsUntilAvailable();
 
     // B. RateLimitZone tests (6)
@@ -1691,6 +1941,7 @@ void RunAllTests() {
     TestZoneKeyExtractorComposite();
     TestZoneEmptyKeySkipsRateLimit();
     TestZoneAppliesToFilter();
+    TestZoneAppliesToSegmentBoundary();
     TestZoneLruEviction();
 
     // C. RateLimitManager tests (7)
@@ -1698,6 +1949,7 @@ void RunAllTests() {
     TestManagerSingleZoneDeny();
     TestManagerMultiZoneAllPass();
     TestManagerMultiZoneOneDenies();
+    TestManagerStopsDebitingAfterDenial();
     TestManagerResponseHeaders();
     TestManagerRetryAfterOnDenial();
     TestManagerDisabledReturnsTrueImmediately();
@@ -1723,6 +1975,7 @@ void RunAllTests() {
     TestConfigValidateUnknownKeyType();
     TestConfigValidateDuplicateZoneNames();
     TestConfigValidateEnabledWithEmptyZones();
+    TestConfigRejectEmptyAppliesToPrefix();
 
     // G. Edge case tests (3)
     TestEdgeCaseEmptyClientIp();

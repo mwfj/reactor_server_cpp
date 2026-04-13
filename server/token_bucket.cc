@@ -13,19 +13,39 @@ void TokenBucket::Refill() const {
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - last_refill_time_).count();
     if (elapsed_ms <= 0) return;
+    if (rate_mt_ <= 0) return;
 
-    // Guard against int64_t overflow in rate_mt_ * elapsed_ms:
-    // If enough time has passed to fill the bucket, cap directly.
-    if (rate_mt_ > 0 && elapsed_ms > capacity_mt_ * 1000 / rate_mt_ + 1) {
-        tokens_mt_ = capacity_mt_;
-        last_refill_time_ = now;
-        return;
+    // Fill-in-one-shot fast path for very long idle intervals.
+    // We compare in seconds to avoid the multiplication overflow that
+    // `elapsed_ms > capacity_mt_ * 1000 / rate_mt_` would have on large
+    // capacities (capacity_mt_ * 1000 overflows above ~9.2e12).
+    // Integer division fill_sec = capacity_mt_ / rate_mt_ always fits.
+    {
+        int64_t fill_sec = capacity_mt_ / rate_mt_;
+        if (elapsed_ms / 1000 > fill_sec) {
+            tokens_mt_ = capacity_mt_;
+            last_refill_time_ = now;
+            return;
+        }
     }
 
     // Compute tokens to add: rate_mt_ (millitokens/sec) * elapsed_ms / 1000
     int64_t add = rate_mt_ * elapsed_ms / 1000;
+
+    if (add == 0) {
+        // Not enough elapsed time to accrue even one millitoken at this rate.
+        // Do NOT advance last_refill_time_ — otherwise repeated probes at
+        // intervals shorter than 1000/rate_mt_ ms would discard the
+        // fractional refill credit and a low-rate bucket would never recover.
+        return;
+    }
+
     tokens_mt_ = std::min(capacity_mt_, tokens_mt_ + add);
-    last_refill_time_ = now;
+    // Advance last_refill_time_ by exactly the time that produced `add`
+    // millitokens. The truncation remainder (elapsed_ms - consumed_ms)
+    // stays as credit for the next Refill() call.
+    int64_t consumed_ms = (add * 1000) / rate_mt_;
+    last_refill_time_ += std::chrono::milliseconds(consumed_ms);
 }
 
 bool TokenBucket::TryConsume() {

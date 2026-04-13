@@ -23,6 +23,12 @@ public:
     // Return the current rate in tokens per second.
     double Rate() const { return static_cast<double>(rate_mt_) / MILLITOKENS_PER_TOKEN; }
 
+    // Return the current rate as stored internally (millitokens per second).
+    // Used by RateLimitZone's lazy-update check for exact integer
+    // comparison — avoids false "change detected" triggers from
+    // floating-point round-trip (e.g., rate=0.3 → 299 mt/sec → 0.299 ≠ 0.3).
+    int64_t RateMillitokens() const { return rate_mt_; }
+
     // Seconds until at least one token is available (0 if tokens >= 1).
     // Used for Retry-After header computation.
     double SecondsUntilAvailable() const;

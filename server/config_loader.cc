@@ -316,7 +316,14 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     for (const auto& prefix : item["applies_to"]) {
                         if (!prefix.is_string())
                             throw std::runtime_error("rate_limit zone applies_to entry must be a string");
-                        zone.applies_to.push_back(prefix.get<std::string>());
+                        std::string p = prefix.get<std::string>();
+                        // Reject empty prefixes: RateLimitZone::Check() calls
+                        // prefix.back() which is UB on empty strings, and an
+                        // empty prefix semantically means "no filter" which
+                        // should be expressed as an empty applies_to array.
+                        if (p.empty())
+                            throw std::runtime_error("rate_limit zone applies_to entry must not be empty");
+                        zone.applies_to.push_back(std::move(p));
                     }
                 }
                 config.rate_limit.zones.push_back(std::move(zone));
@@ -868,6 +875,24 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             "header:", "client_ip+path", "client_ip+header:"
         };
 
+        // Rate limit zone bounds.
+        //   MIN_RATE: sub-millitoken rates truncate to 0 and buckets never refill.
+        //   MAX_RATE: guards the `rate * 1000` conversion in TokenBucket from
+        //             int64_t overflow. 1e9 req/s is astronomical — real
+        //             deployments never approach this.
+        //   MAX_CAPACITY: guards `capacity * 1000` in TokenBucket's constructor
+        //                 from int64_t overflow. 1e12 is 1 trillion — more than
+        //                 any realistic burst budget.
+        static constexpr double MIN_RATE = 0.001;
+        static constexpr double MAX_RATE = 1e9;
+        static constexpr int64_t MAX_CAPACITY = 1'000'000'000'000LL;  // 1e12
+        // Shard count used by RateLimitZone (must stay in sync with
+        // DEFAULT_SHARD_COUNT in rate_limit_zone.h). Used to document the
+        // actual max_entries behavior: the runtime cap is
+        // floor(max_entries / SHARD_COUNT) * SHARD_COUNT, with a minimum
+        // of SHARD_COUNT (one entry per shard).
+        static constexpr int RATE_LIMIT_SHARD_COUNT = 16;
+
         std::unordered_set<std::string> seen_zone_names;
         for (size_t i = 0; i < rl.zones.size(); ++i) {
             const auto& z = rl.zones[i];
@@ -880,21 +905,35 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                 throw std::invalid_argument(
                     "Duplicate rate_limit zone name: '" + z.name + "'");
             }
-            // Minimum rate: 0.001 req/sec. Below this, rate * 1000 truncates
-            // to 0 millitokens/sec and the bucket never refills after initial burst.
-            static constexpr double MIN_RATE = 0.001;
             if (z.rate < MIN_RATE) {
                 throw std::invalid_argument(
                     idx + " ('" + z.name + "'): rate must be >= " +
                     std::to_string(MIN_RATE) + " (got " + std::to_string(z.rate) + ")");
             }
+            if (z.rate > MAX_RATE) {
+                throw std::invalid_argument(
+                    idx + " ('" + z.name + "'): rate must be <= " +
+                    std::to_string(MAX_RATE) + " (got " + std::to_string(z.rate) + ")");
+            }
             if (z.capacity < 1) {
                 throw std::invalid_argument(
                     idx + " ('" + z.name + "'): capacity must be >= 1");
             }
-            if (z.max_entries < 1) {
+            if (z.capacity > MAX_CAPACITY) {
                 throw std::invalid_argument(
-                    idx + " ('" + z.name + "'): max_entries must be >= 1");
+                    idx + " ('" + z.name + "'): capacity must be <= " +
+                    std::to_string(MAX_CAPACITY) +
+                    " (got " + std::to_string(z.capacity) + ")");
+            }
+            if (z.max_entries < RATE_LIMIT_SHARD_COUNT) {
+                // Below shard count, the runtime cap becomes SHARD_COUNT (one
+                // per shard) rather than max_entries. Reject to keep the
+                // configured value meaningful.
+                throw std::invalid_argument(
+                    idx + " ('" + z.name + "'): max_entries must be >= " +
+                    std::to_string(RATE_LIMIT_SHARD_COUNT) +
+                    " (shard count; runtime cap is rounded down to a multiple "
+                    "of shard count, minimum one entry per shard)");
             }
 
             // Validate key_type: exact match or prefix+name match.
