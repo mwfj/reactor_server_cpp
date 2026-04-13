@@ -46,7 +46,7 @@ Layers 1–2 are the transport. Layers 3–5 are the protocol. Layer 6 is the ga
 ## Core Components
 
 ### Dispatcher
-Central event loop coordinator. Wraps the platform-specific `EventHandler` (epoll on Linux, kqueue on macOS). Supports cross-thread task queueing via `EnQueue()`/`WakeUp()` using eventfd (Linux) or pipe (macOS). Connection timeout scanning via timerfd.
+Central event loop coordinator. Wraps the platform-specific `EventHandler` (epoll on Linux, kqueue on macOS). Supports cross-thread task queueing via `EnQueue()`/`WakeUp()` using eventfd (Linux) or pipe (macOS). Connection timeout scanning via timerfd. Also exposes `EnQueueDelayed(fn, delay)` — a min-heap of deadline-ordered callbacks used by the upstream retry path for sub-second timer-based backoff without blocking the event loop thread.
 
 ### Channel
 Represents a file descriptor + its event callbacks (read, write, close, error). Uses edge-triggered mode for client connections. Holds a `weak_ptr<Dispatcher>` to avoid circular references.

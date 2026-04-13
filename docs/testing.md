@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all tests (252 tests across 14 suites)
+make test               # Build and run all tests (319 tests across 15 suites)
 ./test_runner                   # Run all tests directly (after building)
 
 # Individual test suites
@@ -19,6 +19,7 @@ make test               # Build and run all tests (252 tests across 14 suites)
 ./test_runner cli               # CLI entry point tests (or: ./test_runner -C)
 ./test_runner route             # Route trie/pattern matching tests (or: ./test_runner -R)
 ./test_runner upstream          # Upstream connection pool tests (or: ./test_runner -U)
+./test_runner proxy             # Proxy engine tests (or: ./test_runner -P)
 ./test_runner kqueue            # macOS kqueue platform tests (or: ./test_runner -K)
 ./test_runner help              # Show all options
 
@@ -50,6 +51,7 @@ make test_cli           # Build and run CLI tests
 | CLI | 79 | N/A | `test/cli_test.h` | `./test_runner cli` |
 | Route | 44 | ephemeral | `test/route_test.h` | `./test_runner route` |
 | Upstream Pool | 30 | ephemeral | `test/upstream_pool_test.h` | `./test_runner upstream` |
+| Proxy | 56 | ephemeral | `test/proxy_test.h` | `./test_runner proxy` |
 | Kqueue | 7 | ephemeral | `test/kqueue_test.h` | `./test_runner kqueue` (macOS only, skipped on Linux) |
 
 ### Basic Tests

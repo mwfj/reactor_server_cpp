@@ -262,7 +262,7 @@ Hop-by-hop headers listed in RFC 7230 §6.1 (`Connection`, `Keep-Alive`, `Proxy-
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_retries` | 0 | Max retry attempts (0 = no retries). Backoff is jittered exponential (25 ms base, 250 ms cap). |
+| `max_retries` | 0 | Max retry attempts (0 = no retries). Backoff uses full jitter (25 ms base, 250 ms cap) with a 1 ms minimum: `random(1, min(250, 25 * 2^attempt))`. The first retry is immediate for connection-level failures (`retry_on_connect_failure`, `retry_on_disconnect`) so stale keep-alive recovery is fast; response-level failures (`retry_on_5xx`, `retry_on_timeout`) always back off to give the upstream breathing room. Retries are scheduled via the dispatcher's delayed task queue — never a sleep on the event loop thread. |
 | `retry_on_connect_failure` | true | Retry when the pool checkout fails to establish a TCP/TLS connection |
 | `retry_on_5xx` | false | Retry when the upstream returns a 5xx response (headers only — once the body starts streaming to the client, retries stop) |
 | `retry_on_timeout` | false | Retry when the response deadline fires before headers arrive |

@@ -257,7 +257,7 @@ reactor_server_cpp/
 ├── server/               # Implementation (.cc)
 │   ├── main.cc           #   Production entry point
 │   └── *.cc              #   All component implementations
-├── test/                 # Test suites (basic, stress, race, timeout, http, ws, tls, http2, cli, route, kqueue)
+├── test/                 # Test suites (basic, stress, race, timeout, http, ws, tls, http2, cli, route, upstream, proxy, kqueue)
 ├── thread_pool/          # Standalone thread pool (separate build)
 ├── third_party/          # llhttp, nghttp2, nlohmann/json, spdlog
 ├── config/               # Example config files
@@ -270,7 +270,7 @@ reactor_server_cpp/
 ```bash
 make                    # Build both test runner (./test_runner) and server (./server_runner)
 make server             # Build only the production server
-make test               # Build and run all tests (211 tests across 13 suites)
+make test               # Build and run all tests (319 tests across 15 suites)
 make clean              # Remove artifacts
 make help               # Show all targets
 
@@ -285,7 +285,9 @@ make help               # Show all targets
 ./test_runner tls       # TLS/SSL tests (2 tests)
 ./test_runner http2     # HTTP/2 protocol tests (37 tests)
 ./test_runner cli       # CLI entry point tests (79 tests)
-./test_runner route     # Route trie/pattern matching (44 tests)
+./test_runner route     # Route trie/pattern matching (50 tests)
+./test_runner upstream  # Upstream connection pool tests (30 tests)
+./test_runner proxy     # Proxy engine tests (56 tests)
 ./test_runner kqueue    # macOS kqueue platform tests (7 tests, skipped on Linux)
 
 # Thread pool subproject (independent)

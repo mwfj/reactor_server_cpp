@@ -271,7 +271,7 @@ If the client disconnects mid-request, the framework's async-abort hook calls `P
 - **`0`** — disables the per-request deadline *and* disables the server-wide async safety cap (`max_async_deferred_sec_`) for this request only. The `ProxyHandler` sets `request.async_cap_sec_override = 0` before dispatching. Use this only for intentionally long-polling backends; normal requests should keep a bounded timeout.
 - **Other positive values below 1000** — rejected at config load (the 1 s floor matches the timer scan resolution).
 
-Retries are bounded by `proxy.retry.max_retries` and never fire after any response bytes have reached the client. See [docs/configuration.md](configuration.md#proxy-route-configuration) for the full retry matrix.
+Retries are bounded by `proxy.retry.max_retries` and never fire after any response bytes have reached the client. Backoff between attempts is scheduled via the dispatcher's delayed task queue using full jitter (1–250 ms window) — the event loop thread is never blocked. Connection-level retry conditions (connect failure, upstream disconnect) skip backoff on the first retry for stale-keep-alive recovery; response-level conditions (5xx, timeout) always back off. See [docs/configuration.md](configuration.md#proxy-route-configuration) for the full retry matrix.
 
 ## Middleware
 
