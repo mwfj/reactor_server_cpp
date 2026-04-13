@@ -183,17 +183,20 @@ struct UpstreamConfig {
     ProxyConfig proxy;
     CircuitBreakerConfig circuit_breaker;
 
-    // Intentionally EXCLUDES circuit_breaker — breaker tuning is live-
-    // reloadable (§10 of CIRCUIT_BREAKER_DESIGN.md) and must not trigger
-    // the "upstream configuration changes require a restart" warning in
-    // HttpServer::Reload (http_server.cc:3383). Phase 8's breaker-reload
-    // path compares CircuitBreakerConfig fields directly (per-host
-    // iteration), not via this operator==. All other fields here are
-    // restart-required: changing name/host/port/tls rebuilds pool
-    // topology; changing pool/proxy would re-register routes.
+    // Includes circuit_breaker until Phase 8 ships CircuitBreakerManager::Reload.
+    // A CB-only SIGHUP currently has no propagation path into live slice state,
+    // so operator== must return false to trigger the "restart required" warning
+    // rather than silently committing the new config object while the live slices
+    // continue running with the old settings.
+    //
+    // TODO(phase-8): once CircuitBreakerManager::Reload is wired into
+    // HttpServer::Reload, remove circuit_breaker from this operator and diff it
+    // separately (per-host CircuitBreakerConfig comparison) so breaker-only
+    // edits are hot-reloadable without a restart.
     bool operator==(const UpstreamConfig& o) const {
         return name == o.name && host == o.host && port == o.port &&
-               tls == o.tls && pool == o.pool && proxy == o.proxy;
+               tls == o.tls && pool == o.pool && proxy == o.proxy &&
+               circuit_breaker == o.circuit_breaker;
     }
     bool operator!=(const UpstreamConfig& o) const { return !(*this == o); }
 };

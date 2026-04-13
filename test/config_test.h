@@ -549,14 +549,14 @@ namespace ConfigTests {
             "permitted_half_open_calls must be in [1, 1000]");
     }
 
-    // Test 14: UpstreamConfig::operator== EXCLUDES circuit_breaker field.
-    // Rationale: breaker tuning is live-reloadable (design §10). Including
-    // it here would make HttpServer::Reload (http_server.cc:3383) treat a
-    // breaker-only edit as an upstream topology change, fire the "restart
-    // required" warning, and block the hot-reload path. Topology fields
-    // (name/host/port/tls/pool/proxy) ARE included — they require a restart.
+    // Test 14: UpstreamConfig::operator== INCLUDES circuit_breaker until Phase 8.
+    // Until CircuitBreakerManager::Reload is wired in HttpServer::Reload, a
+    // CB-only SIGHUP has no propagation path. Keeping circuit_breaker in the
+    // equality check ensures the server fires the "restart required" warning
+    // rather than silently reporting "reload OK" with stale live settings.
+    // TODO(phase-8): flip this test when CB hot-reload is implemented.
     void TestCircuitBreakerEquality() {
-        std::cout << "\n[TEST] Circuit Breaker Equality (topology only)..." << std::endl;
+        std::cout << "\n[TEST] Circuit Breaker Equality (CB included until Phase 8)..." << std::endl;
         try {
             UpstreamConfig a;
             a.name = "svc"; a.host = "h"; a.port = 80;
@@ -565,16 +565,16 @@ namespace ConfigTests {
             // Default equal.
             bool equal_default = (a == b);
 
-            // Circuit-breaker-only edit must NOT change UpstreamConfig equality.
+            // Circuit-breaker-only edit DOES change UpstreamConfig equality
+            // (until Phase 8 ships the live-reload path).
             b.circuit_breaker.enabled = true;
             b.circuit_breaker.window_seconds = 30;
-            bool topology_still_equal = (a == b);
+            bool cb_edit_detected = (a != b);
 
-            // BUT CircuitBreakerConfig::operator== catches the field diff
-            // (Phase 8 reload uses this to detect what changed per-host).
+            // CircuitBreakerConfig::operator== agrees on the field diff.
             bool cb_fields_differ = (a.circuit_breaker != b.circuit_breaker);
 
-            // Topology changes DO make configs unequal.
+            // Topology changes also make configs unequal.
             UpstreamConfig c = a;
             c.host = "different";
             bool topology_changed = (a != c);
@@ -583,20 +583,20 @@ namespace ConfigTests {
             d.port = 9999;
             bool port_change_detected = (a != d);
 
-            bool pass = equal_default && topology_still_equal &&
+            bool pass = equal_default && cb_edit_detected &&
                         cb_fields_differ && topology_changed &&
                         port_change_detected;
-            TestFramework::RecordTest("Circuit Breaker Equality (topology only)",
+            TestFramework::RecordTest("Circuit Breaker Equality (CB included until Phase 8)",
                 pass,
                 pass ? "" :
                 "equal_default=" + std::to_string(equal_default) +
-                " topology_still_equal=" + std::to_string(topology_still_equal) +
+                " cb_edit_detected=" + std::to_string(cb_edit_detected) +
                 " cb_fields_differ=" + std::to_string(cb_fields_differ) +
                 " topology_changed=" + std::to_string(topology_changed) +
                 " port_change_detected=" + std::to_string(port_change_detected),
                 TestFramework::TestCategory::OTHER);
         } catch (const std::exception& e) {
-            TestFramework::RecordTest("Circuit Breaker Equality (topology only)",
+            TestFramework::RecordTest("Circuit Breaker Equality (CB included until Phase 8)",
                 false, e.what(), TestFramework::TestCategory::OTHER);
         }
     }
