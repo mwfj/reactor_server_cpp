@@ -226,6 +226,76 @@ public:
         }
     }
 
+    // Send a request with explicit :scheme and :authority (for authority/host tests).
+    // extra_headers may include a "host" header to test :authority vs host matching.
+    Response SendRequestRaw(
+        const std::string& method,
+        const std::string& path,
+        const std::string& scheme,
+        const std::string& authority,
+        const std::vector<std::pair<std::string,std::string>>& extra_headers = {}) {
+
+        if (!session_ || fd_ < 0) {
+            Response r; r.error = true; return r;
+        }
+
+        std::vector<std::pair<std::string, std::string>> header_pairs;
+        header_pairs.reserve(4 + extra_headers.size());
+        header_pairs.emplace_back(":method", method);
+        header_pairs.emplace_back(":path", path);
+        header_pairs.emplace_back(":scheme", scheme);
+        header_pairs.emplace_back(":authority", authority);
+        for (const auto& h : extra_headers) {
+            header_pairs.push_back(h);
+        }
+
+        std::vector<nghttp2_nv> nva;
+        nva.reserve(header_pairs.size());
+        for (const auto& hp : header_pairs) {
+            nva.push_back({
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.first.c_str())),
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.second.c_str())),
+                hp.first.size(), hp.second.size(),
+                NGHTTP2_NV_FLAG_NONE
+            });
+        }
+
+        int32_t stream_id = nghttp2_submit_request2(
+            session_, nullptr, nva.data(), nva.size(), nullptr, this);
+
+        if (stream_id < 0) {
+            Response r; r.error = true; return r;
+        }
+
+        streams_[stream_id] = StreamState{};
+        if (!FlushOutput()) {
+            Response r; r.error = true; return r;
+        }
+
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(IO_TIMEOUT_MS);
+
+        while (true) {
+            auto it = streams_.find(stream_id);
+            if (it != streams_.end() && it->second.done) {
+                Response resp;
+                resp.status = it->second.status;
+                resp.body   = it->second.body;
+                resp.rst    = it->second.rst;
+                streams_.erase(it);
+                return resp;
+            }
+
+            if (std::chrono::steady_clock::now() >= deadline) {
+                Response r; r.error = true; return r;
+            }
+
+            if (!ReadAndProcess(100)) {
+                Response r; r.error = true; return r;
+            }
+        }
+    }
+
 private:
     int fd_ = -1;
     nghttp2_session* session_ = nullptr;
@@ -1946,6 +2016,335 @@ void TestH2_MinDetectionBytes() {
 }
 
 // ============================================================
+// ============================================================
+// TEST CATEGORY 7: :authority vs host default-port normalization
+// ============================================================
+// ============================================================
+
+// Helper: spin up a minimal HTTP/2 server with GET / → 200, return port.
+// Caller owns the server lifetime via TestServerRunner.
+static void SetupH2AuthorityServer(HttpServer& server) {
+    server.Get("/", [](const HttpRequest&, HttpResponse& res) {
+        res.Status(200).Text("ok");
+    });
+}
+
+// :authority=example.com  host=example.com:80  scheme=http  → 200
+// Absent port on :authority normalized to default 80.
+void TestH2_AuthorityMatchesHostWithDefaultHttpPort() {
+    std::cout << "\n[TEST] H2 Authority: absent port == default http port (80)..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            auto resp = client.SendRequestRaw("GET", "/", "http", "example.com",
+                                             {{"host", "example.com:80"}});
+            if (resp.error || resp.rst) {
+                pass = false; err = "transport error or RST (authority mismatch rejected)";
+            } else if (resp.status != 200) {
+                pass = false;
+                err = "expected 200, got " + std::to_string(resp.status);
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: absent port == default http port (80)", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: absent port == default http port (80)", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// :authority=example.com:80  host=example.com  scheme=http  → 200
+// Absent port on host normalized to default 80 (reverse of test 1).
+void TestH2_AuthorityMatchesHostReverseOrder() {
+    std::cout << "\n[TEST] H2 Authority: explicit :80 on authority, absent on host..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            auto resp = client.SendRequestRaw("GET", "/", "http", "example.com:80",
+                                             {{"host", "example.com"}});
+            if (resp.error || resp.rst) {
+                pass = false; err = "transport error or RST (authority mismatch rejected)";
+            } else if (resp.status != 200) {
+                pass = false;
+                err = "expected 200, got " + std::to_string(resp.status);
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: explicit :80 on authority, absent on host", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: explicit :80 on authority, absent on host", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// :authority=example.com:443  host=example.com  scheme=https  → 200
+// Absent port on host normalized to default 443.
+void TestH2_AuthorityMatchesHostWithDefaultHttpsPort() {
+    std::cout << "\n[TEST] H2 Authority: absent port == default https port (443)..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            auto resp = client.SendRequestRaw("GET", "/", "https", "example.com:443",
+                                             {{"host", "example.com"}});
+            if (resp.error || resp.rst) {
+                pass = false; err = "transport error or RST (authority mismatch rejected)";
+            } else if (resp.status != 200) {
+                pass = false;
+                err = "expected 200, got " + std::to_string(resp.status);
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: absent port == default https port (443)", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: absent port == default https port (443)", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// :authority=example.com:8080  host=example.com  scheme=http  → rejected
+// Non-default explicit port on authority does not match absent (→80) host port.
+void TestH2_AuthorityMismatchExplicitNonDefaultPort() {
+    std::cout << "\n[TEST] H2 Authority: non-default port mismatch rejected..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            // :authority carries port 8080, host carries no port (→ default 80).
+            // 8080 != 80 → server must reject with RST or error status.
+            auto resp = client.SendRequestRaw("GET", "/", "http", "example.com:8080",
+                                             {{"host", "example.com"}});
+            if (!resp.rst && !resp.error && resp.status == 200) {
+                pass = false;
+                err = "expected rejection but got 200 (conflicting ports not detected)";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: non-default port mismatch rejected", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: non-default port mismatch rejected", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// :authority=example.com  host=example.com:443  scheme=http  → rejected
+// Default for http is 80, not 443. Absent :authority port → 80, host:443 → mismatch.
+void TestH2_AuthorityMismatchWrongDefault() {
+    std::cout << "\n[TEST] H2 Authority: wrong default port mismatch rejected..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            // scheme=http → default 80. :authority absent port → 80. host:443 → 443.
+            // 80 != 443 → server must reject.
+            auto resp = client.SendRequestRaw("GET", "/", "http", "example.com",
+                                             {{"host", "example.com:443"}});
+            if (!resp.rst && !resp.error && resp.status == 200) {
+                pass = false;
+                err = "expected rejection but got 200 (http default 80 vs host:443 not caught)";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: wrong default port mismatch rejected", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: wrong default port mismatch rejected", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// :authority=[::1]  host=[::1]:80  scheme=http  → 200
+// IPv6 bare address normalized with default port 80.
+void TestH2_AuthorityIPv6WithDefaultPort() {
+    std::cout << "\n[TEST] H2 Authority: IPv6 absent port == default http port..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            auto resp = client.SendRequestRaw("GET", "/", "http", "[::1]",
+                                             {{"host", "[::1]:80"}});
+            if (resp.error || resp.rst) {
+                pass = false; err = "transport error or RST (IPv6 authority mismatch)";
+            } else if (resp.status != 200) {
+                pass = false;
+                err = "expected 200, got " + std::to_string(resp.status);
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: IPv6 absent port == default http port", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: IPv6 absent port == default http port", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// :authority=Example.COM  host=example.com:80  scheme=http  → 200
+// Case-insensitive hostname match combined with default-port normalization.
+void TestH2_AuthorityCaseInsensitiveHostDefaultPort() {
+    std::cout << "\n[TEST] H2 Authority: case-insensitive hostname + default port..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            auto resp = client.SendRequestRaw("GET", "/", "http", "Example.COM",
+                                             {{"host", "example.com:80"}});
+            if (resp.error || resp.rst) {
+                pass = false; err = "transport error or RST (case/port mismatch)";
+            } else if (resp.status != 200) {
+                pass = false;
+                err = "expected 200, got " + std::to_string(resp.status);
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: case-insensitive hostname + default port", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: case-insensitive hostname + default port", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ============================================================
 // Entry point
 // ============================================================
 
@@ -2004,6 +2403,15 @@ void RunAllTests() {
     // --- Category 6: Race Conditions ---
     TestH2C_ConcurrentClients();
     TestH2C_MixedProtocolClients();
+
+    // --- Category 7: :authority vs host default-port normalization ---
+    TestH2_AuthorityMatchesHostWithDefaultHttpPort();
+    TestH2_AuthorityMatchesHostReverseOrder();
+    TestH2_AuthorityMatchesHostWithDefaultHttpsPort();
+    TestH2_AuthorityMismatchExplicitNonDefaultPort();
+    TestH2_AuthorityMismatchWrongDefault();
+    TestH2_AuthorityIPv6WithDefaultPort();
+    TestH2_AuthorityCaseInsensitiveHostDefaultPort();
 }
 
 }  // namespace Http2Tests

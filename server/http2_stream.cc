@@ -2,11 +2,23 @@
 #include "log/logger.h"
 #include <algorithm>
 
+// Returns the default port for a given HTTP(S) scheme. Empty string if
+// scheme is unknown (caller falls back to strict exact-match).
+static std::string DefaultPortForScheme(const std::string& scheme) {
+    if (scheme == "http") return "80";
+    if (scheme == "https") return "443";
+    return "";
+}
+
 // Case-insensitive hostname comparison for :authority vs host.
 // Splits host[:port], lowercases the host portion, compares.
-// Port (if present) is compared exactly.
-static bool AuthorityMatch(const std::string& a, const std::string& b) {
-    // Find port separator (last colon not inside IPv6 brackets)
+// Port (if present) is compared exactly after scheme-aware default-port
+// normalization: an absent port is treated as equivalent to the scheme's
+// default port (80 for http, 443 for https). Unknown scheme → strict
+// exact-port comparison (preserves prior behavior for malformed inputs).
+static bool AuthorityMatch(const std::string& scheme,
+                           const std::string& a,
+                           const std::string& b) {
     auto split_host_port = [](const std::string& s) -> std::pair<std::string, std::string> {
         if (!s.empty() && s[0] == '[') {
             // IPv6: [::1]:port
@@ -26,10 +38,14 @@ static bool AuthorityMatch(const std::string& a, const std::string& b) {
     auto [host_a, port_a] = split_host_port(a);
     auto [host_b, port_b] = split_host_port(b);
 
-    // Port must match exactly (or both absent)
+    const std::string default_port = DefaultPortForScheme(scheme);
+    if (!default_port.empty()) {
+        if (port_a.empty()) port_a = default_port;
+        if (port_b.empty()) port_b = default_port;
+    }
+
     if (port_a != port_b) return false;
 
-    // Host comparison is case-insensitive (RFC 3986 Section 3.2.2)
     if (host_a.size() != host_b.size()) return false;
     for (size_t i = 0; i < host_a.size(); ++i) {
         if (::tolower(static_cast<unsigned char>(host_a[i])) !=
@@ -132,7 +148,7 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
     // - If :authority was set and conflicts, reject
     // - Duplicate host headers (without :authority) rejected below as singleton
     if (lower_name == "host" && has_authority_) {
-        if (!AuthorityMatch(authority_, value)) {
+        if (!AuthorityMatch(scheme_, authority_, value)) {
             logging::Get()->debug("H2 stream {} conflicting :authority and host", stream_id_);
             return -1;  // Malformed: conflicting :authority and host
         }

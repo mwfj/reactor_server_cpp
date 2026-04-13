@@ -17,6 +17,34 @@ constexpr size_t DEFERRED_STASH_OVERHEAD = 8192;
 // accepting large uploads (the parser enforces the real per-request
 // limits when it processes the buffered bytes after the async response).
 constexpr size_t DEFERRED_STASH_FALLBACK_CAP = 64 * 1024 * 1024;  // 64 MiB
+
+// Returns true if `lower_name` (must already be lowercased) is a
+// hop-by-hop or framing header that is forbidden in 1xx interim responses
+// per RFC 9110 §15.2 and RFC 7230 §6.1.
+bool IsForbiddenInterimHeader(const std::string& lower_name) {
+    if (lower_name == "connection" || lower_name == "keep-alive" ||
+        lower_name == "proxy-connection" ||
+        lower_name == "transfer-encoding" || lower_name == "content-length" ||
+        lower_name == "te" || lower_name == "upgrade") {
+        return true;
+    }
+    // Proxy-*  (Proxy-Authenticate, Proxy-Authorization, etc.)
+    if (lower_name.size() >= 6 && lower_name.compare(0, 6, "proxy-") == 0) {
+        return true;
+    }
+    return false;
+}
+
+// Returns the standard reason phrase for 1xx status codes.
+const char* InterimReasonPhrase(int code) {
+    switch (code) {
+        case 100: return "Continue";
+        case 102: return "Processing";
+        case 103: return "Early Hints";
+        default:  return "Interim";
+    }
+}
+
 }  // namespace
 
 HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn)
@@ -171,6 +199,11 @@ void HttpConnectionHandler::BeginAsyncResponse(const HttpRequest& req) {
     deferred_response_pending_ = true;
     deferred_was_head_ = (req.method == "HEAD");
     deferred_keep_alive_ = req.keep_alive;
+    // Reset so interim responses can be emitted before the final response
+    // on this new async cycle. Without this, back-to-back requests on a
+    // keep-alive connection would inherit the previous request's
+    // final_response_sent_ = true and block all interims.
+    final_response_sent_.store(false, std::memory_order_release);
     // current_http_minor_ was updated by the parser when headers completed
     // and persists across the deferred window, so no separate capture is
     // needed. Mark the transport exempt from NetServer::Stop()'s close
@@ -264,6 +297,7 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     const bool should_close = NormalizeOutgoingResponse(
         response, effective_keep_alive, current_http_minor_);
 
+    final_response_sent_.store(true, std::memory_order_release);
     response.Version(1, current_http_minor_);
     std::string wire = response.Serialize();
     if (was_head) StripResponseBodyForHead(wire);
@@ -329,10 +363,85 @@ void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
     // Stamp the response with the current request's HTTP version so the
     // status line matches (e.g. HTTP/1.0 for 1.0 clients, HTTP/1.1 for 1.1).
     // For pre-parse errors, current_http_minor_ is 1 (default = HTTP/1.1).
+    //
+    // Mark the final response sent only for actual terminal (2xx+) responses.
+    // The framework sends 1xx responses (e.g. 100 Continue) through this path
+    // before the request is complete; those MUST NOT set the flag so that
+    // SendInterimResponse (103 Early Hints) can still fire after the 100.
+    if (response.GetStatusCode() >= 200) {
+        final_response_sent_.store(true, std::memory_order_release);
+    }
     HttpResponse versioned = response;
     versioned.Version(1, current_http_minor_);
     std::string wire = versioned.Serialize();
     conn_->SendRaw(wire.data(), wire.size());
+}
+
+bool HttpConnectionHandler::SendInterimResponse(
+    int status_code,
+    const std::vector<std::pair<std::string, std::string>>& headers) {
+    if (!conn_) return false;
+
+    // Valid range: [102, 199]. 100 is framework-managed (internal Continue);
+    // 101 is reserved for WebSocket upgrade.
+    if (status_code < 102 || status_code >= 200) {
+        logging::Get()->warn(
+            "SendInterimResponse invalid status {} fd={}",
+            status_code, conn_->fd());
+        return false;
+    }
+    // Drop if the final response has already been written.
+    if (final_response_sent_.load(std::memory_order_acquire)) {
+        logging::Get()->warn(
+            "SendInterimResponse after final fd={} status={}; dropped",
+            conn_->fd(), status_code);
+        return false;
+    }
+    // HTTP/1.0: interim responses require HTTP/1.1+ (RFC 8297).
+    // current_http_minor_ is updated by the parser when headers complete
+    // and persists across the deferred-response window.
+    if (current_http_minor_ < 1) {
+        logging::Get()->debug(
+            "SendInterimResponse rejected on HTTP/1.0 fd={}", conn_->fd());
+        return false;
+    }
+
+    // Build the wire bytes: status line + filtered headers + blank line.
+    std::string out;
+    out.reserve(256);
+    out += "HTTP/1.1 ";
+    out += std::to_string(status_code);
+    out += ' ';
+    out += InterimReasonPhrase(status_code);
+    out += "\r\n";
+    for (const auto& [key, value] : headers) {
+        std::string lower = key;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (IsForbiddenInterimHeader(lower)) {
+            logging::Get()->debug(
+                "Interim: forbidden header '{}' stripped fd={}", key, conn_->fd());
+            continue;
+        }
+        out += key;
+        out += ": ";
+        out += value;
+        out += "\r\n";
+    }
+    out += "\r\n";
+
+    // Size cap using max_header_size_ (0 means unlimited — skip the check).
+    if (max_header_size_ > 0 && out.size() > max_header_size_) {
+        logging::Get()->warn(
+            "SendInterimResponse oversize ({} > {}) fd={}",
+            out.size(), max_header_size_, conn_->fd());
+        return false;
+    }
+
+    conn_->SendRaw(out.data(), out.size());
+    logging::Get()->debug(
+        "SendInterimResponse sent status={} fd={}", status_code, conn_->fd());
+    return true;
 }
 
 void HttpConnectionHandler::CloseConnection() {

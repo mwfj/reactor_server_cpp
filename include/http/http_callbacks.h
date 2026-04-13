@@ -60,6 +60,29 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     // completion via EnQueue.
     using AsyncCompletionCallback = std::function<void(HttpResponse)>;
 
+    // Send a non-final 1xx response (RFC 8297 Early Hints, etc.).
+    // May be called zero or more times BEFORE the final AsyncCompletionCallback.
+    // Dispatcher-thread-only. Calls from wrong thread or after the final response
+    // are logged (warn) and dropped. See design spec §4.2 for full contract.
+    using InterimResponseSender = std::function<void(
+        int status_code,
+        const std::vector<std::pair<std::string, std::string>>& headers
+    )>;
+
+    // Push an HTTP/2 resource alongside the current response.
+    // Returns the promised stream_id (>0) on success, or -1 when push is not
+    // permitted (config disabled, peer disabled, non-H2 transport, invalid
+    // method, session shutting down, wrong thread). Dispatcher-thread-only
+    // — callers off-thread MUST hop via RunOnDispatcher() first and stash
+    // the returned id in their own state if they care. See design spec §2.2.
+    using ResourcePusher = std::function<int32_t(
+        const std::string& method,
+        const std::string& scheme,
+        const std::string& authority,
+        const std::string& path,
+        const HttpResponse& response
+    )>;
+
     // Async handler for HTTP requests. Used when the request handler needs to
     // dispatch async work (e.g. upstream proxy via UpstreamManager::CheckoutAsync)
     // and deliver the response later. The handler receives the request plus
@@ -72,8 +95,12 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     //     pending so graceful shutdown waits for the reply
     //   - Applies Connection: close / keep-alive / HEAD body-stripping to
     //     the completion response using the original request's metadata
+    // Invoked by HttpServer (NOT HttpRouter — the router has no transport
+    // context). See design §2.2 and §4.2.
     using AsyncHandler = std::function<void(
         const HttpRequest& request,
+        InterimResponseSender send_interim,
+        ResourcePusher        push_resource,
         AsyncCompletionCallback complete
     )>;
 

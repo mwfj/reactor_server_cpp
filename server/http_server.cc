@@ -1126,6 +1126,8 @@ void HttpServer::Proxy(const std::string& route_pattern,
             // don't destroy this handler while this route is still live.
             router_.RouteAsync(mr.method, pattern,
                 [handler](const HttpRequest& request,
+                          HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
+                          HTTP_CALLBACKS_NAMESPACE::ResourcePusher        /*push_resource*/,
                           HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                     handler->Handle(request, std::move(complete));
                 });
@@ -1530,6 +1532,8 @@ void HttpServer::RegisterProxyRoutes() {
                 // ownership and survives any later overwrite.
                 router_.RouteAsync(mr.method, pattern,
                     [handler](const HttpRequest& request,
+                              HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
+                              HTTP_CALLBACKS_NAMESPACE::ResourcePusher        /*push_resource*/,
                               HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                         handler->Handle(request, std::move(complete));
                     });
@@ -2292,13 +2296,34 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 // 500 and close normally (CloseAfterWrite won't be blocked
                 // by shutdown_exempt_, and OnRawData won't buffer into
                 // the deferred stash).
+                // Real H1 send_interim: captures a weak_ptr to the handler
+                // and calls SendInterimResponse. We're on the dispatcher
+                // thread by virtue of being inside the sync request-callback
+                // body. Off-thread callers (async work post-upstream) must
+                // hop via RunOnDispatcher themselves.
+                // Phase 4 replaces push_resource on the H2 site; H1 stays no-op.
+                std::weak_ptr<HttpConnectionHandler> weak_h1_self = self;
+                auto send_interim =
+                    [weak_h1_self](
+                        int status_code,
+                        const std::vector<std::pair<std::string, std::string>>& hdrs) {
+                    auto h = weak_h1_self.lock();
+                    if (!h) return;
+                    h->SendInterimResponse(status_code, hdrs);
+                };
+                auto push_resource =
+                    [](const std::string&, const std::string&, const std::string&,
+                       const std::string&, const HttpResponse&) -> int32_t {
+                    logging::Get()->debug("push_resource no-op (H1)");
+                    return -1;
+                };
                 try {
                     if (async_head_fallback) {
                         HttpRequest get_req = request;
                         get_req.method = "GET";
-                        async_handler(get_req, std::move(complete));
+                        async_handler(get_req, send_interim, push_resource, std::move(complete));
                     } else {
-                        async_handler(request, std::move(complete));
+                        async_handler(request, send_interim, push_resource, std::move(complete));
                     }
                 } catch (...) {
                     // Mark both flags: completed stops a stored callback
@@ -3056,13 +3081,28 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         });
                     };
 
+                // Phase-2 scaffold — both closures are no-ops.
+                // Phase 3 replaces send_interim with a real H1 binding.
+                // Phase 4 replaces push_resource on the H2 site; H1 stays no-op.
+                auto send_interim =
+                    [](int status_code,
+                       const std::vector<std::pair<std::string, std::string>>&) {
+                    logging::Get()->debug(
+                        "send_interim no-op (phase-2 scaffold) status={}", status_code);
+                };
+                auto push_resource =
+                    [](const std::string&, const std::string&, const std::string&,
+                       const std::string&, const HttpResponse&) -> int32_t {
+                    logging::Get()->debug("push_resource no-op (H1 / phase-2 scaffold)");
+                    return -1;
+                };
                 try {
                     if (async_head_fallback) {
                         HttpRequest get_req = request;
                         get_req.method = "GET";
-                        async_handler(get_req, std::move(complete));
+                        async_handler(get_req, send_interim, push_resource, std::move(complete));
                     } else {
-                        async_handler(request, std::move(complete));
+                        async_handler(request, send_interim, push_resource, std::move(complete));
                     }
                 } catch (...) {
                     completed->store(true, std::memory_order_relaxed);

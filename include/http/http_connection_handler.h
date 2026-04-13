@@ -30,6 +30,20 @@ public:
     // Send an HTTP response
     void SendResponse(const HttpResponse& response);
 
+    // Send a non-final 1xx response (103 Early Hints, 102 Processing, etc.).
+    // Dispatcher-thread-only. Returns true if the interim was written to the
+    // output buffer; false if rejected (wrong thread, HTTP/1.0 request, final
+    // response already serialized, invalid status code, or oversized header
+    // block). Multiple interims on the same request are legal per RFC 8297.
+    //
+    // Forbidden headers (Connection, Keep-Alive, Transfer-Encoding,
+    // Content-Length, TE, Upgrade, Proxy-*) are silently stripped.
+    // Status code must be in [102,199]. 101 is reserved for WebSocket upgrade
+    // (dedicated path). 100 is framework-managed (internal 100-continue).
+    bool SendInterimResponse(
+        int status_code,
+        const std::vector<std::pair<std::string, std::string>>& headers);
+
     // Check if upgraded to WebSocket
     bool IsUpgraded() const { return upgraded_; }
 
@@ -203,6 +217,21 @@ private:
     bool deferred_was_head_ = false;
     bool deferred_keep_alive_ = true;
     std::string deferred_pending_buf_;
+
+    // Tracks whether the final (>=200) response has been written for the
+    // CURRENT request. Set by SendResponse (status >= 200) and
+    // CompleteAsyncResponse, cleared by BeginAsyncResponse. Sync handlers
+    // don't reset this on each new keep-alive request — but they also don't
+    // have access to InterimResponseSender, so a stale `true` from a
+    // previous sync request is harmless. Async cycles always reset on entry.
+    //
+    // Atomic with acquire/release ordering: the sync request handler runs
+    // on the dispatcher thread, but documented off-thread interim callers
+    // (after hopping via RunOnDispatcher to call complete()) may still
+    // observe this from any thread. Defensive against future off-thread
+    // callers via the published happens-before edge.
+    // <atomic> is provided by common.h (via connection_handler.h).
+    std::atomic<bool> final_response_sent_{false};
 
     // Start time of the current deferred-response window. Currently
     // only used for diagnostic / logging purposes; the heartbeat
