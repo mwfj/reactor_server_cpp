@@ -49,7 +49,11 @@ enum class FailureKind : uint8_t {
 // owning dispatcher thread. Callers can compare old/new to key off a
 // specific edge (e.g. CLOSED→OPEN fires wait-queue drain).
 // `trigger` is a short static string such as "consecutive" / "rate" /
-// "probe_success" / "probe_failure" for logging.
+// "probe_success" / "probe_fail" / "open_elapsed" for logging.
+//
+// TODO(phase-7): once a snapshot / admin JSON endpoint lands, convert
+// `trigger` to an `enum class TransitionTrigger` so the valid set is
+// compile-time checked rather than string-compared. See design doc §15.8.
 using StateTransitionCallback =
     std::function<void(State old_state, State new_state, const char* trigger)>;
 

@@ -578,6 +578,203 @@ void TestSuccessClearsConsecutive() {
     }
 }
 
+// ============================================================================
+// Regression tests — critical bugs caught in code review
+// ============================================================================
+
+// BUG: late non-probe failure after trip re-entered TripClosedToOpen, inflating
+// consecutive_trips_ (→ longer backoff) and firing a spurious CLOSED→OPEN
+// transition edge. Fix: guard ReportFailure(probe=false) on state_ == CLOSED.
+void TestLateFailureAfterTripDoesNotInflateBackoff() {
+    std::cout << "\n[TEST] CB: late failure after trip does not inflate backoff..."
+              << std::endl;
+    try {
+        auto cb = DefaultEnabledConfig();
+        cb.base_open_duration_ms = 1000;
+        cb.max_open_duration_ms = 60000;
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Admit 10 requests in CLOSED. Slice state is single-threaded so
+        // admission + bookkeeping is serialized by the event loop — but in
+        // production the outcomes for those admitted requests can arrive after
+        // the slice has already tripped.
+        for (int i = 0; i < 10; ++i) {
+            Decision d = slice.TryAcquire();
+            if (d != Decision::ADMITTED) {
+                TestFramework::RecordTest("CB: late failure after trip",
+                    false, "admission i=" + std::to_string(i) + " not ADMITTED",
+                    TestFramework::TestCategory::OTHER);
+                return;
+            }
+        }
+        // Report 5 failures — trip at the 5th.
+        for (int i = 0; i < 5; ++i) {
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        }
+        if (slice.CurrentState() != State::OPEN) {
+            TestFramework::RecordTest("CB: late failure after trip", false,
+                "expected OPEN after 5 failures",
+                TestFramework::TestCategory::OTHER);
+            return;
+        }
+        int64_t trips_after_first_trip = slice.Trips();
+        // Capture open_until immediately post-trip.
+        auto open_until_initial = slice.OpenUntil();
+
+        // Now the remaining 5 in-flight requests land with late failures.
+        // Before the fix, each of these would go through the CLOSED path,
+        // climb consecutive_failures_, and trigger another TripClosedToOpen
+        // even though state is already OPEN.
+        for (int i = 0; i < 5; ++i) {
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        }
+        int64_t trips_after_late = slice.Trips();
+        auto open_until_after_late = slice.OpenUntil();
+
+        bool pass = slice.CurrentState() == State::OPEN &&
+                    trips_after_late == trips_after_first_trip &&  // no ghost trip
+                    open_until_after_late == open_until_initial;    // backoff unchanged
+        TestFramework::RecordTest(
+            "CB: late failure after trip does not inflate backoff",
+            pass, pass ? "" :
+                  "trips: " + std::to_string(trips_after_first_trip) +
+                  " → " + std::to_string(trips_after_late),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: late failure after trip does not inflate backoff",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// BUG: late non-probe success after trip would reset consecutive_failures_
+// and pollute the sliding window (pretending a fresh CLOSED cycle observed
+// successes). Fix: guard ReportSuccess(probe=false) on state_ == CLOSED.
+void TestLateSuccessAfterTripIgnored() {
+    std::cout << "\n[TEST] CB: late success after trip ignored..." << std::endl;
+    try {
+        auto cb = DefaultEnabledConfig();
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        for (int i = 0; i < 5; ++i) {
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        }
+        // Slice is OPEN now. A late success arrives — must not change state.
+        State pre = slice.CurrentState();
+        slice.ReportSuccess(false);
+        bool pass = pre == State::OPEN && slice.CurrentState() == State::OPEN;
+        TestFramework::RecordTest("CB: late success after trip ignored", pass,
+            "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("CB: late success after trip ignored",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// BUG: HALF_OPEN admission kept accepting probes after the first probe
+// failure (only enforcing `inflight < permitted`), so under load a failed
+// recovery cycle could keep leaking traffic indefinitely instead of re-OPENing
+// after the in-flight probes drained. Fix: short-circuit on saw_failure.
+void TestHalfOpenStopsAdmittingAfterFirstProbeFailure() {
+    std::cout << "\n[TEST] CB: HALF_OPEN stops admitting after probe fail..."
+              << std::endl;
+    try {
+        auto cb = DefaultEnabledConfig();
+        cb.permitted_half_open_calls = 5;
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Trip the breaker.
+        for (int i = 0; i < 5; ++i) {
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        }
+        clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
+
+        // Admit 2 probes. Report failure on the first (but NOT the second yet
+        // — leave 1 in-flight so we can observe the short-circuit).
+        Decision d1 = slice.TryAcquire();   // ADMITTED_PROBE, inflight=1
+        Decision d2 = slice.TryAcquire();   // ADMITTED_PROBE, inflight=2
+        if (d1 != Decision::ADMITTED_PROBE || d2 != Decision::ADMITTED_PROBE) {
+            TestFramework::RecordTest(
+                "CB: HALF_OPEN stops admitting after probe fail",
+                false, "probes not admitted as expected",
+                TestFramework::TestCategory::OTHER);
+            return;
+        }
+        // Fail the first probe — inflight drops to 1, saw_failure=true.
+        // Last-probe trip does not yet fire (inflight is still 1).
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, true);
+
+        // State must still be HALF_OPEN (final probe not yet completed).
+        State mid = slice.CurrentState();
+
+        // Subsequent TryAcquire — BEFORE fix this would succeed because
+        // inflight (1) < permitted (5). AFTER fix it short-circuits because
+        // saw_failure is set.
+        Decision d3 = slice.TryAcquire();
+
+        bool pass = mid == State::HALF_OPEN &&
+                    d3 == Decision::REJECTED_OPEN;
+        TestFramework::RecordTest(
+            "CB: HALF_OPEN stops admitting after probe fail",
+            pass, pass ? "" : "expected REJECTED_OPEN on 3rd TryAcquire",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: HALF_OPEN stops admitting after probe fail",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Verifies the dedicated HALF_OPEN-full counter is bumped separately from the
+// generic `rejected_` counter, so Phase 7 snapshots can distinguish
+// "open, backoff not elapsed" from "probing, no slots left".
+void TestHalfOpenFullCounterSeparate() {
+    std::cout << "\n[TEST] CB: HALF_OPEN_FULL counter separate..." << std::endl;
+    try {
+        auto cb = DefaultEnabledConfig();
+        cb.permitted_half_open_calls = 2;
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Trip → OPEN reject increments generic counter only.
+        for (int i = 0; i < 5; ++i) {
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false);
+        }
+        slice.TryAcquire();  // REJECTED_OPEN (backoff active)
+        int64_t rejected_open_only = slice.Rejected();
+        int64_t half_open_full_open_only = slice.RejectedHalfOpenFull();
+
+        // Elapse backoff → HALF_OPEN. Fill the probe budget, then a 3rd
+        // TryAcquire rejects with half_open_full, incrementing both counters.
+        clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
+        slice.TryAcquire();                  // probe 1 admitted
+        slice.TryAcquire();                  // probe 2 admitted (budget full)
+        slice.TryAcquire();                  // REJECTED (full)
+        int64_t rejected_total = slice.Rejected();
+        int64_t half_open_full_total = slice.RejectedHalfOpenFull();
+
+        bool pass = rejected_open_only == 1 &&
+                    half_open_full_open_only == 0 &&
+                    rejected_total == 2 &&            // 1 OPEN + 1 HALF_OPEN_FULL
+                    half_open_full_total == 1;        // only the HALF_OPEN one
+        TestFramework::RecordTest("CB: HALF_OPEN_FULL counter separate",
+            pass, pass ? "" :
+                  "rej=" + std::to_string(rejected_total) +
+                  " hof=" + std::to_string(half_open_full_total),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("CB: HALF_OPEN_FULL counter separate",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestTransitionCallbackInvoked() {
     std::cout << "\n[TEST] CB: transition callback invoked..." << std::endl;
     try {
@@ -641,6 +838,10 @@ void RunAllTests() {
     TestReloadPreservesState();
     TestConsecutiveThresholdOne();
     TestSuccessClearsConsecutive();
+    TestLateFailureAfterTripDoesNotInflateBackoff();
+    TestLateSuccessAfterTripIgnored();
+    TestHalfOpenStopsAdmittingAfterFirstProbeFailure();
+    TestHalfOpenFullCounterSeparate();
     TestTransitionCallbackInvoked();
 }
 

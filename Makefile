@@ -242,6 +242,11 @@ test_rate_limit: $(TARGET)
 	@echo "Running rate limit tests only..."
 	./$(TARGET) rate_limit
 
+# Run only circuit breaker tests
+test_circuit_breaker: $(TARGET)
+	@echo "Running circuit breaker tests only..."
+	./$(TARGET) circuit_breaker
+
 # Display help information
 help:
 	@echo "Reactor Server C++ - Makefile Help"
@@ -322,4 +327,4 @@ help:
 # Build only the production server binary
 server: $(SERVER_TARGET)
 
-.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit help
+.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker help

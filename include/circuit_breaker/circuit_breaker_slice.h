@@ -57,6 +57,12 @@ public:
     int64_t  Rejected()         const { return rejected_.load(std::memory_order_relaxed); }
     int64_t  ProbeSuccesses()   const { return probe_successes_.load(std::memory_order_relaxed); }
     int64_t  ProbeFailures()    const { return probe_failures_.load(std::memory_order_relaxed); }
+    // Rejections specifically caused by HALF_OPEN being out of probe slots
+    // (subset of `Rejected()`). Lets dashboards distinguish "backoff has not
+    // elapsed" from "probing, no capacity left".
+    int64_t  RejectedHalfOpenFull() const {
+        return rejected_half_open_full_.load(std::memory_order_relaxed);
+    }
 
     const std::string& host_label() const { return host_label_; }
     size_t dispatcher_index() const { return dispatcher_index_; }
@@ -91,8 +97,16 @@ private:
     // Observability counters.
     std::atomic<int64_t> trips_{0};
     std::atomic<int64_t> rejected_{0};
+    std::atomic<int64_t> rejected_half_open_full_{0};
     std::atomic<int64_t> probe_successes_{0};
     std::atomic<int64_t> probe_failures_{0};
+
+    // One-shot flag: true after the slice has emitted a higher-level
+    // (info) log for the first rejection in the current OPEN/HALF_OPEN
+    // cycle. Reset on transition to CLOSED and on each fresh trip. Keeps
+    // per-request reject logs at debug while still surfacing the first
+    // post-trip reject in default-warn operator logs. Dispatcher-thread only.
+    bool first_reject_logged_for_open_ = false;
 
     StateTransitionCallback transition_cb_;
 
@@ -101,6 +115,11 @@ private:
     void TransitionOpenToHalfOpen();
     void TransitionHalfOpenToClosed();
     void TripHalfOpenToOpen(const char* trigger);
+
+    // Emit the correct reject log line, bump counters, and return the matching
+    // Decision (enforce or dry-run). Used by both the OPEN (backoff active)
+    // and HALF_OPEN-full paths — keeps the three loggers/counters consistent.
+    Decision RejectWithLog(const char* state_label, bool half_open_full);
 
     // Compute open duration for the current consecutive_trips_ value:
     // min(base * 2^consecutive_trips, max). Always >= base_open_duration_ms.

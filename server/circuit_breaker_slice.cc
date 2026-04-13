@@ -25,14 +25,21 @@ std::chrono::steady_clock::time_point CircuitBreakerSlice::OpenUntil() const {
     return std::chrono::steady_clock::time_point(std::chrono::nanoseconds(ns));
 }
 
+// Cap the left-shift exponent used to compute open duration. `1 << 30` already
+// covers ~12.4 days of base open duration even before the `max_open_duration_ms`
+// clamp — higher shift amounts would invoke undefined behavior on `int`.
+static constexpr int MAX_OPEN_DURATION_SHIFT = 30;
+
+// Scale factor for integer percent math: `fails * PERCENT_SCALE >= threshold * total`.
+static constexpr int PERCENT_SCALE = 100;
+
 std::chrono::nanoseconds CircuitBreakerSlice::ComputeOpenDuration() const {
     // Duration = base << consecutive_trips_ (shift expresses 2^n exponential).
     // `consecutive_trips_` is the number of trips observed BEFORE this one, so
     // the first trip uses 2^0 = 1x base, the second trip uses 2x, etc.
     // Callers must increment consecutive_trips_ AFTER calling this method.
     int trips = consecutive_trips_.load(std::memory_order_relaxed);
-    // Saturate shift at 30 to avoid UB on huge trip counts.
-    if (trips > 30) trips = 30;
+    if (trips > MAX_OPEN_DURATION_SHIFT) trips = MAX_OPEN_DURATION_SHIFT;
     int64_t base_ms = config_.base_open_duration_ms;
     int64_t max_ms  = config_.max_open_duration_ms;
     int64_t scaled_ms = base_ms << trips;
@@ -50,8 +57,9 @@ bool CircuitBreakerSlice::ShouldTripClosed() {
     int64_t total = window_.TotalCount(now);
     if (total < config_.minimum_volume) return false;
     int64_t fails = window_.FailureCount(now);
-    // Compare without floating point: fails * 100 >= threshold * total.
-    return (fails * 100) >= (static_cast<int64_t>(config_.failure_rate_threshold) * total);
+    // Integer percent math: fails * PERCENT_SCALE >= threshold_pct * total.
+    return (fails * PERCENT_SCALE) >=
+           (static_cast<int64_t>(config_.failure_rate_threshold) * total);
 }
 
 void CircuitBreakerSlice::TripClosedToOpen(const char* trigger) {
@@ -71,6 +79,7 @@ void CircuitBreakerSlice::TripClosedToOpen(const char* trigger) {
     half_open_inflight_ = 0;
     half_open_successes_ = 0;
     half_open_saw_failure_ = false;
+    first_reject_logged_for_open_ = false;
 
     trips_.fetch_add(1, std::memory_order_relaxed);
 
@@ -101,6 +110,12 @@ void CircuitBreakerSlice::TransitionOpenToHalfOpen() {
 }
 
 void CircuitBreakerSlice::TransitionHalfOpenToClosed() {
+    // Capture actual probes-succeeded BEFORE resetting — the log then reflects
+    // reality instead of the configured target (the two are equal at the moment
+    // of transition today, but relying on that is brittle if the transition
+    // logic ever changes).
+    int probes_succeeded = half_open_successes_;
+
     state_.store(State::CLOSED, std::memory_order_release);
     open_until_steady_ns_.store(0, std::memory_order_release);
     consecutive_trips_.store(0, std::memory_order_relaxed);
@@ -109,10 +124,11 @@ void CircuitBreakerSlice::TransitionHalfOpenToClosed() {
     half_open_inflight_ = 0;
     half_open_successes_ = 0;
     half_open_saw_failure_ = false;
+    first_reject_logged_for_open_ = false;
 
     logging::Get()->info(
         "circuit breaker closed {} probes_succeeded={}",
-        host_label_, config_.permitted_half_open_calls);
+        host_label_, probes_succeeded);
 
     if (transition_cb_) {
         transition_cb_(State::HALF_OPEN, State::CLOSED, "probe_success");
@@ -134,6 +150,7 @@ void CircuitBreakerSlice::TripHalfOpenToOpen(const char* trigger) {
     half_open_inflight_ = 0;
     half_open_successes_ = 0;
     half_open_saw_failure_ = false;
+    first_reject_logged_for_open_ = false;
 
     trips_.fetch_add(1, std::memory_order_relaxed);
 
@@ -165,31 +182,20 @@ Decision CircuitBreakerSlice::TryAcquire() {
             TransitionOpenToHalfOpen();
             s = State::HALF_OPEN;
         } else {
-            rejected_.fetch_add(1, std::memory_order_relaxed);
-            if (config_.dry_run) {
-                logging::Get()->info(
-                    "[dry-run] circuit breaker would reject {} state=open",
-                    host_label_);
-                return Decision::REJECTED_OPEN_DRYRUN;
-            }
-            logging::Get()->debug(
-                "circuit breaker rejected {} state=open", host_label_);
-            return Decision::REJECTED_OPEN;
+            return RejectWithLog("open", /*half_open_full=*/false);
         }
     }
 
     if (s == State::HALF_OPEN) {
-        if (half_open_inflight_ >= config_.permitted_half_open_calls) {
-            rejected_.fetch_add(1, std::memory_order_relaxed);
-            if (config_.dry_run) {
-                logging::Get()->info(
-                    "[dry-run] circuit breaker would reject {} state=half_open_full",
-                    host_label_);
-                return Decision::REJECTED_OPEN_DRYRUN;
-            }
-            logging::Get()->debug(
-                "circuit breaker rejected {} state=half_open_full", host_label_);
-            return Decision::REJECTED_OPEN;
+        // Short-circuit as soon as any probe has failed: the breaker is
+        // guaranteed to re-trip once the remaining in-flight probes drain, so
+        // admitting more probes just wastes capacity on a known-bad upstream.
+        // Previously this path kept admitting probes until `permitted_half_open_calls`
+        // in-flight was reached, which under continued failure could keep
+        // traffic flowing indefinitely instead of converging back to OPEN.
+        if (half_open_saw_failure_ ||
+            half_open_inflight_ >= config_.permitted_half_open_calls) {
+            return RejectWithLog("half_open_full", /*half_open_full=*/true);
         }
         half_open_inflight_++;
         return Decision::ADMITTED_PROBE;
@@ -197,6 +203,41 @@ Decision CircuitBreakerSlice::TryAcquire() {
 
     // CLOSED: fast path.
     return Decision::ADMITTED;
+}
+
+Decision CircuitBreakerSlice::RejectWithLog(const char* state_label,
+                                            bool half_open_full) {
+    rejected_.fetch_add(1, std::memory_order_relaxed);
+    if (half_open_full) {
+        rejected_half_open_full_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // First reject in this OPEN/HALF_OPEN cycle is info — gives operators
+    // looking at a flurry of 503s a single high-level breadcrumb in default-
+    // warn logs without flooding them. Subsequent rejects are debug.
+    const bool first = !first_reject_logged_for_open_;
+    if (first) first_reject_logged_for_open_ = true;
+
+    if (config_.dry_run) {
+        if (first) {
+            logging::Get()->info(
+                "[dry-run] circuit breaker would reject {} state={}",
+                host_label_, state_label);
+        } else {
+            logging::Get()->debug(
+                "[dry-run] circuit breaker would reject {} state={}",
+                host_label_, state_label);
+        }
+        return Decision::REJECTED_OPEN_DRYRUN;
+    }
+    if (first) {
+        logging::Get()->info(
+            "circuit breaker rejecting {} state={} (first reject this cycle)",
+            host_label_, state_label);
+    } else {
+        logging::Get()->debug(
+            "circuit breaker rejected {} state={}", host_label_, state_label);
+    }
+    return Decision::REJECTED_OPEN;
 }
 
 void CircuitBreakerSlice::ReportSuccess(bool probe) {
@@ -222,7 +263,12 @@ void CircuitBreakerSlice::ReportSuccess(bool probe) {
         return;
     }
 
-    // CLOSED success: reset consecutive counter, record in window.
+    // Non-probe success: only meaningful when state is CLOSED. If the slice
+    // has since transitioned (e.g., other requests in this burst tripped it),
+    // this late outcome must NOT retroactively reset `consecutive_failures_`
+    // or pollute the window — a fresh CLOSED cycle after recovery would start
+    // with bogus success history.
+    if (state_.load(std::memory_order_acquire) != State::CLOSED) return;
     consecutive_failures_ = 0;
     window_.AddSuccess(Now());
 }
@@ -243,7 +289,14 @@ void CircuitBreakerSlice::ReportFailure(FailureKind kind, bool probe) {
         return;
     }
 
-    // CLOSED failure path.
+    // Non-probe failure: only count when CLOSED. Late failures from requests
+    // admitted in CLOSED but completing after a trip must NOT re-enter
+    // `TripClosedToOpen` — doing so double-increments `consecutive_trips_`
+    // (inflating open_duration) and fires a spurious CLOSED→OPEN transition
+    // edge that downstream consumers (wait-queue drain, snapshot telemetry)
+    // would see as a ghost trip.
+    if (state_.load(std::memory_order_acquire) != State::CLOSED) return;
+
     consecutive_failures_++;
     window_.AddFailure(Now());
 

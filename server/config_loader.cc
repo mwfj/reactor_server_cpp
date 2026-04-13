@@ -822,33 +822,40 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     "'): proxy.retry.max_retries must be >= 0 and <= 10");
             }
 
-            // Circuit breaker validation
+            // Circuit breaker validation.
+            //
+            // Upper bounds on counting fields are generous — they exist to
+            // catch pathological configs (typo like "10_000_000_000" or a
+            // missing unit conversion), not to constrain legitimate tuning.
+            // Defaults are 5 / 20 / 5; limits are 1000× to 50000× the defaults.
             {
                 const auto& cb = u.circuit_breaker;
-                if (cb.consecutive_failure_threshold < 1) {
+                if (cb.consecutive_failure_threshold < 1 ||
+                    cb.consecutive_failure_threshold > 10000) {
                     throw std::invalid_argument(
                         idx + " ('" + u.name +
-                        "'): circuit_breaker.consecutive_failure_threshold must be >= 1");
+                        "'): circuit_breaker.consecutive_failure_threshold must be in [1, 10000]");
                 }
                 if (cb.failure_rate_threshold < 0 || cb.failure_rate_threshold > 100) {
                     throw std::invalid_argument(
                         idx + " ('" + u.name +
                         "'): circuit_breaker.failure_rate_threshold must be in [0, 100]");
                 }
-                if (cb.minimum_volume < 1) {
+                if (cb.minimum_volume < 1 || cb.minimum_volume > 10000000) {
                     throw std::invalid_argument(
                         idx + " ('" + u.name +
-                        "'): circuit_breaker.minimum_volume must be >= 1");
+                        "'): circuit_breaker.minimum_volume must be in [1, 10000000]");
                 }
                 if (cb.window_seconds < 1 || cb.window_seconds > 3600) {
                     throw std::invalid_argument(
                         idx + " ('" + u.name +
                         "'): circuit_breaker.window_seconds must be in [1, 3600]");
                 }
-                if (cb.permitted_half_open_calls < 1) {
+                if (cb.permitted_half_open_calls < 1 ||
+                    cb.permitted_half_open_calls > 1000) {
                     throw std::invalid_argument(
                         idx + " ('" + u.name +
-                        "'): circuit_breaker.permitted_half_open_calls must be >= 1");
+                        "'): circuit_breaker.permitted_half_open_calls must be in [1, 1000]");
                 }
                 if (cb.base_open_duration_ms < 100) {
                     throw std::invalid_argument(

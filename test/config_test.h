@@ -506,13 +506,13 @@ namespace ConfigTests {
         std::cout << "\n[TEST] Circuit Breaker Validation..." << std::endl;
         ExpectValidationFailure("CB Validation: consecutive_failure_threshold<1",
             R"({"consecutive_failure_threshold": 0})",
-            "consecutive_failure_threshold must be >= 1");
+            "consecutive_failure_threshold must be in [1, 10000]");
         ExpectValidationFailure("CB Validation: failure_rate_threshold>100",
             R"({"failure_rate_threshold": 101})",
             "failure_rate_threshold must be in [0, 100]");
         ExpectValidationFailure("CB Validation: minimum_volume<1",
             R"({"minimum_volume": 0})",
-            "minimum_volume must be >= 1");
+            "minimum_volume must be in [1, 10000000]");
         ExpectValidationFailure("CB Validation: window_seconds<1",
             R"({"window_seconds": 0})",
             "window_seconds must be in [1, 3600]");
@@ -536,7 +536,17 @@ namespace ConfigTests {
             "max_ejection_percent_per_host_set must be in [0, 100]");
         ExpectValidationFailure("CB Validation: permitted_half_open_calls<1",
             R"({"permitted_half_open_calls": 0})",
-            "permitted_half_open_calls must be >= 1");
+            "permitted_half_open_calls must be in [1, 1000]");
+        // Upper-bound regressions — pathological configs must be rejected.
+        ExpectValidationFailure("CB Validation: consecutive_failure_threshold>10000",
+            R"({"consecutive_failure_threshold": 10001})",
+            "consecutive_failure_threshold must be in [1, 10000]");
+        ExpectValidationFailure("CB Validation: minimum_volume>10000000",
+            R"({"minimum_volume": 10000001})",
+            "minimum_volume must be in [1, 10000000]");
+        ExpectValidationFailure("CB Validation: permitted_half_open_calls>1000",
+            R"({"permitted_half_open_calls": 1001})",
+            "permitted_half_open_calls must be in [1, 1000]");
     }
 
     // Test 14: Equality operator covers circuit_breaker field

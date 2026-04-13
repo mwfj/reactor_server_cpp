@@ -2,6 +2,19 @@
 
 namespace circuit_breaker {
 
+// Map an epoch-second value into a non-negative bucket index. C++ built-in `%`
+// can return a negative result when the dividend is negative — and while
+// `steady_clock::time_since_epoch()` is zero-based on all mainstream
+// libstdc++/libc++ implementations, the standard does not strictly guarantee a
+// non-negative epoch across every implementation. The extra `+ w` and second
+// `% w` costs a single add + mod on the slow (negative) branch, zero observable
+// overhead on the common positive branch after the compiler eliminates the
+// redundant math.
+static inline size_t BucketIndex(int64_t epoch_sec, int window_seconds) {
+    const int64_t w = window_seconds;
+    return static_cast<size_t>(((epoch_sec % w) + w) % w);
+}
+
 CircuitBreakerWindow::CircuitBreakerWindow(int window_seconds)
     : window_seconds_(window_seconds),
       buckets_(window_seconds > 0 ? static_cast<size_t>(window_seconds) : 1) {
@@ -26,7 +39,7 @@ void CircuitBreakerWindow::Advance(int64_t now_sec) {
     } else {
         // Zero buckets from head+1..now_sec inclusive.
         for (int64_t s = head_epoch_sec_ + 1; s <= now_sec; ++s) {
-            size_t idx = static_cast<size_t>(s % window_seconds_);
+            size_t idx = BucketIndex(s, window_seconds_);
             buckets_[idx].total = 0;
             buckets_[idx].failures = 0;
         }
@@ -38,15 +51,14 @@ void CircuitBreakerWindow::AddSuccess(
     std::chrono::steady_clock::time_point now) {
     int64_t now_sec = ToEpochSec(now);
     Advance(now_sec);
-    size_t idx = static_cast<size_t>(now_sec % window_seconds_);
-    buckets_[idx].total++;
+    buckets_[BucketIndex(now_sec, window_seconds_)].total++;
 }
 
 void CircuitBreakerWindow::AddFailure(
     std::chrono::steady_clock::time_point now) {
     int64_t now_sec = ToEpochSec(now);
     Advance(now_sec);
-    size_t idx = static_cast<size_t>(now_sec % window_seconds_);
+    size_t idx = BucketIndex(now_sec, window_seconds_);
     buckets_[idx].total++;
     buckets_[idx].failures++;
 }
