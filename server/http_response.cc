@@ -59,6 +59,30 @@ HttpResponse& HttpResponse::Header(const std::string& key, const std::string& va
     return *this;
 }
 
+bool HttpResponse::RemoveHeader(const std::string& key) {
+    // Stateless case-insensitive comparator — avoids the O(N) string
+    // allocations that a lowercase-copy-per-comparison approach would incur.
+    // Takes `char` (the string iterator value_type) and casts to unsigned
+    // char inside std::tolower to avoid UB on platforms where char is
+    // signed and the input exceeds 0x7F.
+    auto eq_ci = [](char a, char b) {
+        return std::tolower(static_cast<unsigned char>(a)) ==
+               std::tolower(static_cast<unsigned char>(b));
+    };
+    auto before = headers_.size();
+    headers_.erase(
+        std::remove_if(headers_.begin(), headers_.end(),
+            [&key, &eq_ci](const std::pair<std::string, std::string>& hdr) {
+                // 4-iterator std::equal form performs the size check
+                // internally; safer than the 3-iterator form if a future
+                // refactor accidentally drops the explicit size guard.
+                return std::equal(hdr.first.begin(), hdr.first.end(),
+                                  key.begin(), key.end(), eq_ci);
+            }),
+        headers_.end());
+    return headers_.size() < before;
+}
+
 HttpResponse& HttpResponse::AppendHeader(const std::string& key, const std::string& value) {
     // Same sanitization as Header() — prevent response splitting
     std::string safe_key = key;

@@ -391,6 +391,10 @@ void HttpRouter::Use(Middleware middleware) {
     middlewares_.push_back(std::move(middleware));
 }
 
+void HttpRouter::PrependMiddleware(Middleware middleware) {
+    middlewares_.insert(middlewares_.begin(), std::move(middleware));
+}
+
 bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     // Clear params from any previous dispatch on this request object.
     request.params.clear();

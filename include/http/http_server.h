@@ -7,6 +7,7 @@
 #include "http2/protocol_detector.h"
 #include "config/server_config.h"
 #include "tls/tls_context.h"
+#include "rate_limit/rate_limiter.h"
 
 #include <atomic>
 #include <map>
@@ -319,6 +320,10 @@ private:
     // Upstream connection pool
     std::vector<UpstreamConfig> upstream_configs_;
     std::unique_ptr<UpstreamManager> upstream_manager_;
+
+    // Rate limiting
+    RateLimitConfig rate_limit_config_;
+    std::unique_ptr<RateLimitManager> rate_limit_manager_;
 
     // Proxy handlers keyed by (upstream_service_name + normalized prefix).
     // shared_ptr (not unique_ptr) so that route lambdas capture shared

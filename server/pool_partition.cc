@@ -1224,18 +1224,16 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
     // garbage, half-close preamble). Force-close instead of letting
     // ConnectionHandler silently buffer the bytes — otherwise the next
     // checkout would see stale data prepended to its own response.
-    UpstreamConnection* raw_conn_idle = conn;
     std::weak_ptr<std::atomic<bool>> alive_weak_idle = alive_;
     transport->SetOnMessageCb(
-        [raw_conn_idle, alive_weak_idle]
+        [alive_weak_idle]
         (std::shared_ptr<ConnectionHandler> handler, std::string&) {
             auto alive = alive_weak_idle.lock();
             if (!alive || !alive->load(std::memory_order_acquire)) return;
             // Only poison if still idle (not mid-checkout — borrower's
             // on_message_callback is installed during checkout).
-            // raw_conn_idle->IsIdle() would be ideal, but by this point
-            // the borrower has overridden the callback. Any data here
-            // means no borrower callback — treat as poison.
+            // Any data arriving on this callback means no borrower
+            // has overridden it — treat as poison.
             logging::Get()->debug("Idle upstream connection received "
                                   "unexpected data fd={}, force-closing",
                                   handler ? handler->fd() : -1);

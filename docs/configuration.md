@@ -291,6 +291,102 @@ Throws `std::invalid_argument` on validation failure.
 - `size_t` fields (`max_header_size`, `max_body_size`, `max_ws_message_size`) use `is_number_unsigned()` to reject negative JSON values (prevents unsigned wrap-around)
 - Integer env vars use `std::stoi()` (not `atoi()`) for proper error detection on non-numeric input
 
+## Rate Limiting
+
+Request rate limiting is provided as middleware via a token bucket algorithm. Zones are defined in the `rate_limit` config section and can be hot-reloaded via SIGHUP.
+
+### Configuration Example
+
+```json
+{
+  "rate_limit": {
+    "enabled": true,
+    "dry_run": false,
+    "status_code": 429,
+    "include_headers": true,
+    "zones": [
+      {
+        "name": "per_ip",
+        "rate": 100,
+        "capacity": 200,
+        "key_type": "client_ip",
+        "max_entries": 100000,
+        "applies_to": []
+      },
+      {
+        "name": "per_api_key",
+        "rate": 50,
+        "capacity": 100,
+        "key_type": "header:X-API-Key",
+        "max_entries": 50000,
+        "applies_to": ["/api/"]
+      }
+    ]
+  }
+}
+```
+
+### Field Reference
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | bool | Master switch. When false, the middleware is a no-op (one atomic load per request). |
+| `dry_run` | bool | Shadow mode: log denials but allow all requests through. `Retry-After` is stripped on allowed dry-run responses to prevent client backoff. |
+| `status_code` | int | HTTP status for rejected requests (400-599). Response body is `"{code} {reason}"` derived from the standard reason phrase. |
+| `include_headers` | bool | Emit `RateLimit-Policy` / `RateLimit` / `Retry-After` response headers per IETF draft-ietf-httpapi-ratelimit-headers-10. |
+| `zones[].name` | string | Zone name. Must be unique and non-empty. Used in logs/stats. |
+| `zones[].rate` | double | Sustained rate in requests/second. Range `[0.001, 1e9]`. Values below 0.001 truncate to 0 and would starve the bucket. |
+| `zones[].capacity` | int64 | Max burst (bucket capacity). Range `[1, 1e12]`. |
+| `zones[].key_type` | string | Key extractor: `client_ip`, `path`, `header:<name>`, `client_ip+path`, or `client_ip+header:<name>`. Bare `header:` (no name) is rejected. |
+| `zones[].max_entries` | int | Soft cap on tracked keys per zone. Must be `>= 16` (the shard count). Runtime cap is rounded down to a multiple of the shard count. Enforced synchronously on insert to protect against high-cardinality bursts. |
+| `zones[].applies_to` | array | Route prefixes the zone applies to. Empty = all routes. Matching respects segment boundaries (`/api` matches `/api` and `/api/users`, NOT `/apis`). Empty strings are rejected. |
+
+### Environment Overrides
+
+```
+REACTOR_RATE_LIMIT_ENABLED=true
+REACTOR_RATE_LIMIT_DRY_RUN=false
+REACTOR_RATE_LIMIT_STATUS_CODE=429
+```
+
+Zone configuration (the `zones[]` array) is JSON-only — env vars cover only the global flags.
+
+### Response Headers (IETF draft-10)
+
+On every response (when `include_headers` is true) and at least one zone applied:
+
+```
+RateLimit-Policy: {capacity};w={window_seconds}
+RateLimit: limit={L}, remaining={R}, reset={T}
+```
+
+Where `window_seconds = ceil(capacity / rate)` — the time to refill from empty. For example, `rate=10, capacity=100` emits `RateLimit-Policy: 100;w=10` (100 requests per 10-second window). Zones that did not govern the request (applies_to miss or empty extracted key) do NOT drive headers.
+
+On denied responses (unless `dry_run=true`):
+
+```
+Retry-After: {seconds}
+```
+
+`Retry-After` reflects the first-denying zone (iteration stops there to avoid unnecessary token consumption in later zones). Operators should list narrower/shorter-retry zones first in the config.
+
+### Hot-Reload Semantics
+
+Live-reloadable fields (via SIGHUP):
+- Scalar flags: `enabled`, `dry_run`, `status_code`, `include_headers`
+- Zone rate/capacity/max_entries/applies_to: applied via atomic policy-snapshot swap
+- Add/remove zones: atomic zone-list swap
+- Zones matched by name + key_type are reused (preserve bucket state)
+- `key_type` change on an existing zone name → new zone (old state discarded)
+
+In-flight requests see consistent snapshots — the old policy/zone-list stays alive until all readers release it.
+
+### Operational Notes
+
+- Config validation is applied during reload — bad `rate_limit` (rate≤0, unknown key_type, duplicate names, empty applies_to entry, etc.) is rejected and the running config is kept.
+- Reducing `max_entries` drastically (e.g., 100k → 16) can cause a one-time latency spike on the next insert into each over-capacity shard (synchronous eviction). Rare in practice.
+- The rate limit middleware is always registered at startup even when disabled, so enabling it via reload never requires a restart.
+
 ## Structured Logging
 
 ### API

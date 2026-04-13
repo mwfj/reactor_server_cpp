@@ -53,6 +53,10 @@ public:
     // Middleware registration (executed in registration order)
     void Use(Middleware middleware);
 
+    // Prepend middleware at the front of the chain (runs before Use()-registered middleware).
+    // Used by HttpServer to ensure rate limiting runs first.
+    void PrependMiddleware(Middleware middleware);
+
     // Dispatch request to matching handler.
     // Returns true if route found, false if no match (caller should send 404).
     bool Dispatch(const HttpRequest& request, HttpResponse& response);

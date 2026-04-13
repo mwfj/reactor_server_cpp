@@ -6,6 +6,7 @@
 #include "upstream/upstream_manager.h"
 #include "upstream/proxy_handler.h"
 #include "log/logger.h"
+#include "log/log_utils.h"
 #include <algorithm>
 #include <set>
 
@@ -307,6 +308,44 @@ void HttpServer::MarkServerReady() {
         dispatchers[i]->SetDispatcherIndex(static_cast<int>(i));
     }
 
+    // Rate limit: always create manager + register middleware, even when
+    // disabled or no zones. Reload() can enable/add zones later, and
+    // middleware cannot be registered after MarkServerReady() returns.
+    rate_limit_manager_ = std::make_unique<RateLimitManager>(rate_limit_config_);
+    {
+        RateLimitManager* rl = rate_limit_manager_.get();
+        router_.PrependMiddleware([rl](
+            const HttpRequest& request, HttpResponse& response) -> bool {
+            if (!rl->enabled()) return true;
+
+            if (!rl->Check(request, response)) {
+                if (rl->dry_run()) {
+                    // Shadow mode: Check() already wrote Retry-After
+                    // and RateLimit headers. Strip Retry-After because
+                    // the request is being allowed through — leaving it
+                    // would advertise a retry delay on a 200 response,
+                    // which may trigger incorrect client backoff.
+                    // The RateLimit headers are kept (they carry
+                    // informational data on quota state).
+                    response.RemoveHeader("Retry-After");
+                    logging::Get()->info(
+                        "Rate limit dry-run: would deny {} {} from {}",
+                        request.method,
+                        logging::SanitizePath(request.path),
+                        request.client_ip);
+                    return true;
+                }
+                int code = rl->status_code();
+                response.Status(code);
+                std::string reason = response.GetStatusReason();
+                response.Header("Content-Type", "text/plain")
+                        .Text(std::to_string(code) + " " + reason);
+                return false;
+            }
+            return true;
+        });
+    }
+
     // Create upstream pool manager if upstreams are configured.
     // This is fatal: if upstreams are explicitly configured, the server
     // cannot serve proxy traffic without them. On failure, stop the server
@@ -521,10 +560,18 @@ void HttpServer::WireNetServerCallbacks() {
     // load synchronizes with the release store in MarkServerReady().
     net_server_.SetTimerCb(
         [this](std::shared_ptr<Dispatcher> disp) {
-            if (server_ready_.load(std::memory_order_acquire) &&
-                upstream_manager_ && disp->dispatcher_index() >= 0) {
+            if (!server_ready_.load(std::memory_order_acquire)) return;
+
+            if (upstream_manager_ && disp->dispatcher_index() >= 0) {
                 upstream_manager_->EvictExpired(
                     static_cast<size_t>(disp->dispatcher_index()));
+            }
+
+            // Rate limit entry eviction (partitioned by dispatcher index)
+            if (rate_limit_manager_ && disp->dispatcher_index() >= 0) {
+                rate_limit_manager_->EvictExpired(
+                    static_cast<size_t>(disp->dispatcher_index()),
+                    static_cast<size_t>(resolved_worker_threads_));
             }
         });
 }
@@ -637,6 +684,9 @@ HttpServer::HttpServer(const ServerConfig& config)
 
     // Store upstream configurations for pool creation in Start()
     upstream_configs_ = config.upstreams;
+
+    // Store rate limit config for MarkServerReady()
+    rate_limit_config_ = config.rate_limit;
 }
 
 size_t HttpServer::ComputeInputCap() const {
@@ -3142,6 +3192,11 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // Upstream configs are restart-only — clear them so staged edits
         // in the config file don't block live-safe field reloads.
         validation_copy.upstreams.clear();
+        // Rate limit config IS live-reloadable and MUST be validated.
+        // Unlike upstreams (restart-only), rate_limit changes are applied
+        // immediately via rate_limit_manager_->Reload(), so bad values
+        // (rate<=0, invalid key_type, duplicate zone names) must be caught.
+        validation_copy.rate_limit = new_config.rate_limit;
         try {
             ConfigLoader::Validate(validation_copy);
         } catch (const std::invalid_argument& e) {
@@ -3316,6 +3371,11 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         h2_settings_.initial_window_size    = new_config.http2.initial_window_size;
         h2_settings_.max_frame_size         = new_config.http2.max_frame_size;
         h2_settings_.max_header_list_size   = new_config.http2.max_header_list_size;
+    }
+
+    // Rate limit reload — always safe because manager is always created
+    if (rate_limit_manager_) {
+        rate_limit_manager_->Reload(new_config.rate_limit);
     }
 
     // Upstream pool changes require a restart — pools are built once in Start()

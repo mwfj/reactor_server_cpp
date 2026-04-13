@@ -17,6 +17,12 @@ public:
     // repeated upstream headers (Cache-Control, Link, Via, etc.) that
     // Header()'s set-semantics would collapse.
     HttpResponse& AppendHeader(const std::string& key, const std::string& value);
+
+    // Remove all headers matching `key` (case-insensitive). Returns true if
+    // at least one header was removed, false if no match found. Used by
+    // the rate limit middleware's dry-run path to strip Retry-After
+    // before allowing a request that would otherwise have been denied.
+    bool RemoveHeader(const std::string& key);
     HttpResponse& Body(const std::string& content);
     HttpResponse& Body(std::string&& content);
     HttpResponse& Body(const std::string& content, const std::string& content_type);

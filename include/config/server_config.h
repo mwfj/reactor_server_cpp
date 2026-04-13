@@ -146,6 +146,37 @@ struct UpstreamConfig {
     bool operator!=(const UpstreamConfig& o) const { return !(*this == o); }
 };
 
+struct RateLimitZoneConfig {
+    std::string name;                        // Zone name (for logging/stats)
+    double rate = 0;                         // Requests per second
+    int64_t capacity = 0;                    // Max burst size (bucket capacity)
+    std::string key_type = "client_ip";      // Key extraction method
+    int max_entries = 100000;                // Max tracked keys (LRU eviction beyond this)
+    std::vector<std::string> applies_to;     // Route prefixes (empty = all routes)
+
+    bool operator==(const RateLimitZoneConfig& o) const {
+        return name == o.name && rate == o.rate && capacity == o.capacity &&
+               key_type == o.key_type && max_entries == o.max_entries &&
+               applies_to == o.applies_to;
+    }
+    bool operator!=(const RateLimitZoneConfig& o) const { return !(*this == o); }
+};
+
+struct RateLimitConfig {
+    bool enabled = false;                    // Master switch
+    bool dry_run = false;                    // Shadow mode: log but don't enforce
+    int status_code = 429;                   // HTTP status for rejected requests
+    bool include_headers = true;             // Include RateLimit-* response headers
+    std::vector<RateLimitZoneConfig> zones;  // Rate limit zones/rules
+
+    bool operator==(const RateLimitConfig& o) const {
+        return enabled == o.enabled && dry_run == o.dry_run &&
+               status_code == o.status_code && include_headers == o.include_headers &&
+               zones == o.zones;
+    }
+    bool operator!=(const RateLimitConfig& o) const { return !(*this == o); }
+};
+
 // NOTE: When adding fields, also update ConfigLoader::LoadFromString(),
 // ConfigLoader::ToJson(), ConfigLoader::ApplyEnvOverrides(), and
 // ConfigLoader::Validate() to keep serialization/deserialization in sync.
@@ -164,4 +195,5 @@ struct ServerConfig {
     int shutdown_drain_timeout_sec = 30; // Max seconds to wait for in-flight H2 streams during shutdown. 0 = immediate.
     Http2Config http2;
     std::vector<UpstreamConfig> upstreams;
+    RateLimitConfig rate_limit;
 };
