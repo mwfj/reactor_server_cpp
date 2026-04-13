@@ -262,6 +262,36 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 }
             }
 
+            if (item.contains("circuit_breaker")) {
+                if (!item["circuit_breaker"].is_object())
+                    throw std::runtime_error("upstream circuit_breaker must be an object");
+                auto& cb = item["circuit_breaker"];
+                upstream.circuit_breaker.enabled =
+                    cb.value("enabled", false);
+                upstream.circuit_breaker.dry_run =
+                    cb.value("dry_run", false);
+                upstream.circuit_breaker.consecutive_failure_threshold =
+                    cb.value("consecutive_failure_threshold", 5);
+                upstream.circuit_breaker.failure_rate_threshold =
+                    cb.value("failure_rate_threshold", 50);
+                upstream.circuit_breaker.minimum_volume =
+                    cb.value("minimum_volume", 20);
+                upstream.circuit_breaker.window_seconds =
+                    cb.value("window_seconds", 10);
+                upstream.circuit_breaker.permitted_half_open_calls =
+                    cb.value("permitted_half_open_calls", 5);
+                upstream.circuit_breaker.base_open_duration_ms =
+                    cb.value("base_open_duration_ms", 5000);
+                upstream.circuit_breaker.max_open_duration_ms =
+                    cb.value("max_open_duration_ms", 60000);
+                upstream.circuit_breaker.max_ejection_percent_per_host_set =
+                    cb.value("max_ejection_percent_per_host_set", 50);
+                upstream.circuit_breaker.retry_budget_percent =
+                    cb.value("retry_budget_percent", 20);
+                upstream.circuit_breaker.retry_budget_min_concurrency =
+                    cb.value("retry_budget_min_concurrency", 3);
+            }
+
             config.upstreams.push_back(std::move(upstream));
         }
     }
@@ -791,6 +821,62 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     idx + " ('" + u.name +
                     "'): proxy.retry.max_retries must be >= 0 and <= 10");
             }
+
+            // Circuit breaker validation
+            {
+                const auto& cb = u.circuit_breaker;
+                if (cb.consecutive_failure_threshold < 1) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.consecutive_failure_threshold must be >= 1");
+                }
+                if (cb.failure_rate_threshold < 0 || cb.failure_rate_threshold > 100) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.failure_rate_threshold must be in [0, 100]");
+                }
+                if (cb.minimum_volume < 1) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.minimum_volume must be >= 1");
+                }
+                if (cb.window_seconds < 1 || cb.window_seconds > 3600) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.window_seconds must be in [1, 3600]");
+                }
+                if (cb.permitted_half_open_calls < 1) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.permitted_half_open_calls must be >= 1");
+                }
+                if (cb.base_open_duration_ms < 100) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.base_open_duration_ms must be >= 100");
+                }
+                if (cb.max_open_duration_ms < cb.base_open_duration_ms) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.max_open_duration_ms must be >= base_open_duration_ms");
+                }
+                if (cb.max_ejection_percent_per_host_set < 0 ||
+                    cb.max_ejection_percent_per_host_set > 100) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.max_ejection_percent_per_host_set must be in [0, 100]");
+                }
+                if (cb.retry_budget_percent < 0 || cb.retry_budget_percent > 100) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.retry_budget_percent must be in [0, 100]");
+                }
+                if (cb.retry_budget_min_concurrency < 0) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.retry_budget_min_concurrency must be >= 0");
+                }
+            }
             // Validate method names — reject unknowns and duplicates.
             // Duplicates would cause RouteAsync to throw at startup.
             {
@@ -1051,6 +1137,31 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             pj["retry"] = rj;
 
             uj["proxy"] = pj;
+        }
+        // Always serialize circuit_breaker — same rationale as proxy block.
+        if (u.circuit_breaker != CircuitBreakerConfig{}) {
+            nlohmann::json cbj;
+            cbj["enabled"] = u.circuit_breaker.enabled;
+            cbj["dry_run"] = u.circuit_breaker.dry_run;
+            cbj["consecutive_failure_threshold"] =
+                u.circuit_breaker.consecutive_failure_threshold;
+            cbj["failure_rate_threshold"] =
+                u.circuit_breaker.failure_rate_threshold;
+            cbj["minimum_volume"] = u.circuit_breaker.minimum_volume;
+            cbj["window_seconds"] = u.circuit_breaker.window_seconds;
+            cbj["permitted_half_open_calls"] =
+                u.circuit_breaker.permitted_half_open_calls;
+            cbj["base_open_duration_ms"] =
+                u.circuit_breaker.base_open_duration_ms;
+            cbj["max_open_duration_ms"] =
+                u.circuit_breaker.max_open_duration_ms;
+            cbj["max_ejection_percent_per_host_set"] =
+                u.circuit_breaker.max_ejection_percent_per_host_set;
+            cbj["retry_budget_percent"] =
+                u.circuit_breaker.retry_budget_percent;
+            cbj["retry_budget_min_concurrency"] =
+                u.circuit_breaker.retry_budget_min_concurrency;
+            uj["circuit_breaker"] = cbj;
         }
         j["upstreams"].push_back(uj);
     }
