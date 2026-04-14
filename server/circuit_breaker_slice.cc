@@ -81,9 +81,23 @@ bool CircuitBreakerSlice::ShouldTripClosed(
 }
 
 void CircuitBreakerSlice::TripClosedToOpen(const char* trigger) {
+    auto now = Now();
+    // Capture pre-reset observability context BEFORE mutating state.
+    // §11.1 log format asks for consecutive_failures + window_total +
+    // window_fail_rate at the trip event so operators can distinguish a
+    // "100 consecutive bad responses" trip from a "55% failure rate over
+    // a wide call window" trip — two very different operational stories
+    // that the `trigger` string alone doesn't fully capture.
+    int consec_at_trip = consecutive_failures_;
+    int64_t window_total = window_.TotalCount(now);
+    int64_t window_failures = window_.FailureCount(now);
+    int window_fail_rate_pct =
+        (window_total > 0)
+            ? static_cast<int>((window_failures * 100) / window_total)
+            : 0;
+
     auto duration = ComputeOpenDuration();   // uses current consecutive_trips_
     consecutive_trips_.fetch_add(1, std::memory_order_relaxed);
-    auto now = Now();
     auto open_until = now + duration;
     int64_t open_until_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -107,8 +121,10 @@ void CircuitBreakerSlice::TripClosedToOpen(const char* trigger) {
     trips_.fetch_add(1, std::memory_order_relaxed);
 
     logging::Get()->warn(
-        "circuit breaker tripped {} trigger={} open_for_ms={} consecutive_trips={}",
-        host_label_, trigger,
+        "circuit breaker tripped {} trigger={} consecutive_failures={} "
+        "window_total={} window_fail_rate={} open_for_ms={} consecutive_trips={}",
+        host_label_, trigger, consec_at_trip,
+        window_total, window_fail_rate_pct,
         std::chrono::duration_cast<std::chrono::milliseconds>(duration).count(),
         consecutive_trips_.load(std::memory_order_relaxed));
 

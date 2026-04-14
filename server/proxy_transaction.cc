@@ -724,10 +724,19 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                     "client_fd={} service={} attempt={}",
                     client_fd_, service_name_, attempt_);
             } else {
+                // §11.1 format: log per-host budget state so operators
+                // can diagnose retry-storm throttling without hitting
+                // an admin endpoint. `cap` is the live effective ceiling
+                // (may have shifted since the failing TryConsumeRetry
+                // due to other transactions' in_flight changes).
                 logging::Get()->warn(
-                    "ProxyTransaction retry budget exhausted "
-                    "client_fd={} service={} attempt={}",
-                    client_fd_, service_name_, attempt_);
+                    "retry budget exhausted service={} in_flight={} "
+                    "retries_in_flight={} cap={} client_fd={} attempt={}",
+                    service_name_,
+                    retry_budget_->InFlight(),
+                    retry_budget_->RetriesInFlight(),
+                    retry_budget_->ComputeCap(),
+                    client_fd_, attempt_);
                 state_ = State::FAILED;
                 DeliverResponse(MakeRetryBudgetResponse());
                 return;

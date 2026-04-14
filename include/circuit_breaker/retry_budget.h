@@ -105,6 +105,23 @@ public:
     int64_t InFlight() const {
         return in_flight_.load(std::memory_order_relaxed);
     }
+    // Compute the current effective retry cap for observability / log
+    // enrichment. Uses the same formula as TryConsumeRetry but without
+    // mutating retries_in_flight_. Returns the point-in-time cap against
+    // which a would-be retry admission would be compared. Slightly racy
+    // (separate loads of in_flight_ and retries_in_flight_ aren't atomic
+    // relative to each other), but the result is for dashboards / logs
+    // where a one-entry drift is noise.
+    int64_t ComputeCap() const {
+        int64_t in_flight = in_flight_.load(std::memory_order_relaxed);
+        int64_t retries = retries_in_flight_.load(std::memory_order_relaxed);
+        int pct = percent_.load(std::memory_order_relaxed);
+        int min_conc = min_concurrency_.load(std::memory_order_relaxed);
+        int64_t non_retry = in_flight - retries;
+        if (non_retry < 0) non_retry = 0;
+        int64_t pct_cap = (non_retry * pct) / 100;
+        return pct_cap > min_conc ? pct_cap : min_conc;
+    }
     int64_t RetriesInFlight() const {
         return retries_in_flight_.load(std::memory_order_relaxed);
     }
