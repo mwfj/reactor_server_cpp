@@ -2346,17 +2346,37 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 // 500 and close normally (CloseAfterWrite won't be blocked
                 // by shutdown_exempt_, and OnRawData won't buffer into
                 // the deferred stash).
-                // Real H1 send_interim: captures a weak_ptr to the handler
-                // and calls SendInterimResponse. We're on the dispatcher
-                // thread by virtue of being inside the sync request-callback
-                // body. Off-thread callers (async work post-upstream) must
-                // hop via RunOnDispatcher themselves.
-                // Phase 4 replaces push_resource on the H2 site; H1 stays no-op.
+                // Real H1 send_interim: captures weak_ptr to the handler
+                // AND the per-request `completed` flag. Off-thread callers
+                // may freely invoke — SendInterimResponse itself hops to
+                // the dispatcher internally if not already there.
+                //
+                // The `completed` capture closes a pipelining race: on a
+                // keep-alive connection, CompleteAsyncResponse for request
+                // A synchronously parses any pipelined bytes and can
+                // invoke BeginAsyncResponse for request B, which RESETS
+                // final_response_sent_ to false. Without per-request
+                // scoping, a stale send_interim lambda queued for request
+                // A would then see final_response_sent_=false (reset by
+                // B) and emit a 103 into B's response window.
+                //
+                // `completed` is flipped to true synchronously inside
+                // complete() before the CompleteAsyncResponse lambda is
+                // enqueued, so checking it in the hopped send_interim
+                // path correctly identifies "complete has been called
+                // for my request" — whether or not the lambda has run.
                 std::weak_ptr<HttpConnectionHandler> weak_h1_self = self;
                 auto send_interim =
-                    [weak_h1_self](
+                    [weak_h1_self, completed](
                         int status_code,
                         const std::vector<std::pair<std::string, std::string>>& hdrs) {
+                    if (completed->load(std::memory_order_acquire)) {
+                        // Request A's complete() has been called. Any
+                        // interim queued now would land after the final
+                        // response lambda and potentially into the next
+                        // pipelined request's window. Drop.
+                        return;
+                    }
                     auto h = weak_h1_self.lock();
                     if (!h) return;
                     h->SendInterimResponse(status_code, hdrs);

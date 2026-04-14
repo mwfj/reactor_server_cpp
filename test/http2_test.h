@@ -2904,12 +2904,14 @@ void TestH2_EarlyHints_100ContinueThen103() {
     }
 }
 
-// T4.7: Off-dispatcher-thread send_interim is rejected. The handler spawns
-// a thread that calls send_interim BEFORE complete() runs. The H2 contract
-// is dispatcher-thread-only, so the call must return false (warn-logged)
-// and no 103 must reach the wire. The handler then completes 200 normally.
+// Off-dispatcher-thread send_interim now auto-hops to the dispatcher
+// so async handlers that resume on a worker thread (e.g. after an
+// upstream completion) can still emit 103 Early Hints without a
+// manual RunOnDispatcher. The handler spawns a worker thread that
+// calls send_interim BEFORE complete(); the 103 must reach the wire
+// and arrive BEFORE the final 200.
 void TestH2_EarlyHints_OffDispatcherThread() {
-    std::cout << "\n[TEST] H2 103 Early Hints: off-dispatcher-thread rejected..."
+    std::cout << "\n[TEST] H2 103 Early Hints: off-dispatcher-thread hops..."
               << std::endl;
     try {
         HttpServer server(MakeH2Config(0));
@@ -2918,8 +2920,10 @@ void TestH2_EarlyHints_OffDispatcherThread() {
                HttpRouter::InterimResponseSender send_interim,
                HttpRouter::ResourcePusher        /*push_resource*/,
                HttpRouter::AsyncCompletionCallback complete) {
+                // Worker-thread send_interim: must auto-hop and
+                // emit BEFORE the handler calls complete().
                 std::thread t([send_interim]() {
-                    send_interim(103, {{"link", "</late.css>; rel=preload"}});
+                    send_interim(103, {{"link", "</style.css>; rel=preload"}});
                 });
                 t.join();
                 HttpResponse r;
@@ -2939,21 +2943,27 @@ void TestH2_EarlyHints_OffDispatcherThread() {
             auto resp = client.Get("/offthread");
             if (resp.error)         { pass = false; err += "transport error; "; }
             if (resp.status != 200) { pass = false; err += "final status != 200; "; }
-            if (!resp.interim_statuses.empty()) {
+            // The worker-thread interim is expected to land: we joined
+            // the thread before calling complete(), so the hopped
+            // send_interim lambda is enqueued before the final response
+            // submission — the 103 must precede the 200.
+            if (resp.interim_statuses.size() != 1) {
                 pass = false;
-                err += "off-thread 103 must be dropped, got " +
-                       std::to_string(resp.interim_statuses.size()) +
-                       " interim(s); ";
+                err += "expected 1 interim after off-thread hop, got " +
+                       std::to_string(resp.interim_statuses.size()) + "; ";
+            } else if (resp.interim_statuses[0] != 103) {
+                pass = false;
+                err += "interim status != 103; ";
             }
         }
         client.Disconnect();
 
         TestFramework::RecordTest(
-            "H2 103 Early Hints: off-dispatcher-thread rejected",
+            "H2 103 Early Hints: off-dispatcher-thread hops to dispatcher",
             pass, err, TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "H2 103 Early Hints: off-dispatcher-thread rejected",
+            "H2 103 Early Hints: off-dispatcher-thread hops to dispatcher",
             false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
@@ -3682,6 +3692,65 @@ void TestH2_Push_AsyncViaRunOnDispatcher() {
     }
 }
 
+// T9.13c: H2 push_resource called from a worker thread must auto-hop
+// to the dispatcher and still land a PUSH_PROMISE + response. Before
+// auto-hop, off-thread callers were silently dropped with a warn log,
+// which made the API unusable for real async handlers that resume on
+// a worker thread after an upstream completion.
+void TestH2_Push_OffDispatcherThreadHops() {
+    std::cout << "\n[TEST] H2 Push: off-dispatcher-thread hops to dispatcher..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        server.GetAsync("/",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher push_resource,
+               HttpRouter::AsyncCompletionCallback complete) {
+                // Worker thread issues the push. Must auto-hop and
+                // the pushed stream must appear alongside the parent.
+                std::thread t([push_resource]() {
+                    HttpResponse pushed;
+                    pushed.Status(200).Body(kPushedBody, "text/css");
+                    push_resource("GET", "http", "localhost",
+                                  "/style.css", pushed);
+                });
+                t.join();
+                HttpResponse main;
+                main.Status(200).Body("<html/>", "text/html");
+                complete(std::move(main));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.pushed.size() != 1) {
+                pass = false;
+                err += "expected 1 pushed stream after off-thread push, got " +
+                       std::to_string(resp.pushed.size()) + "; ";
+            } else if (resp.pushed[0].body != kPushedBody) {
+                pass = false; err += "pushed body mismatch; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 Push: off-dispatcher-thread hops to dispatcher", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Push: off-dispatcher-thread hops to dispatcher", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
 // T9.13b: Regression guard for PR #18 comment 1 — pushed streams must
 // fire stream_open_callback symmetrically with the close callback so
 // /stats.active_h2_streams stays balanced. Without the fix, each push
@@ -3900,6 +3969,7 @@ void RunAllTests() {
     TestH2_Push_SyncHandlerViaThreadLocal();
     TestH2_Push_OnHttp1Connection();
     TestH2_Push_AsyncViaRunOnDispatcher();
+    TestH2_Push_OffDispatcherThreadHops();
     TestH2_Push_ActiveH2StreamsBalanced();
     TestH2_Push_ReloadTogglesEnablePush();
 }

@@ -457,11 +457,28 @@ bool Http2ConnectionHandler::SendInterimResponse(
     // Dispatcher-thread-only contract. An off-thread caller would race
     // nghttp2's non-thread-safe session state against sync request
     // processing, so refuse rather than silently corrupting the session.
-    if (!conn_ || !conn_->IsOnDispatcherThread()) {
-        logging::Get()->warn(
-            "H2 SendInterimResponse off-dispatcher-thread stream={} status={}; drop",
-            stream_id, status_code);
-        return false;
+    if (!conn_) return false;
+    // Off-dispatcher callers (async handlers resuming on a worker
+    // thread after an upstream completion) auto-hop so the API is
+    // actually usable from async code — consistent with HTTP/1.1.
+    // Previously this returned false and logged a warn, which meant
+    // any real-world async handler could never emit 103 Early Hints
+    // because it had no public dispatcher handle to satisfy a manual
+    // RunOnDispatcher() requirement. The hopped re-entry runs on the
+    // dispatcher and either submits (stream still open, no final
+    // response yet) or drops silently (stream closed, final already
+    // submitted) — matching the sync-on-dispatcher code path.
+    if (!conn_->IsOnDispatcherThread()) {
+        std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
+        auto headers_copy = headers;
+        conn_->RunOnDispatcher(
+            [weak_self, stream_id, status_code,
+             headers_copy = std::move(headers_copy)]() {
+            if (auto self = weak_self.lock()) {
+                self->SendInterimResponse(stream_id, status_code, headers_copy);
+            }
+        });
+        return true;  // queued; actual drop/emit decided on dispatcher
     }
     if (!session_) {
         logging::Get()->debug(
@@ -484,15 +501,27 @@ int32_t Http2ConnectionHandler::PushResource(
     const std::string& method, const std::string& scheme,
     const std::string& authority, const std::string& path,
     const HttpResponse& response) {
-    // Same dispatcher-thread guard as SendInterimResponse — nghttp2's
-    // session state is not thread-safe, and PUSH_PROMISE submission
-    // mutates stream tracking. Off-thread callers (async handlers
-    // resuming on a worker thread) must hop via RunOnDispatcher().
-    if (!conn_ || !conn_->IsOnDispatcherThread()) {
-        logging::Get()->warn(
-            "PushResource off-dispatcher-thread parent={} (hop via RunOnDispatcher first)",
-            parent_stream_id);
-        return -1;
+    if (!conn_) return -1;
+    // Off-dispatcher callers auto-hop — same reasoning as
+    // SendInterimResponse above. The hopped re-entry returns the
+    // promised id (if the submit succeeds on the dispatcher) or -1
+    // (shutdown, stream closed, validation failure). The return
+    // value from THIS call is not meaningful for the off-thread
+    // caller — it can't synchronously observe the promised id —
+    // but the push itself proceeds. Handlers that need the id
+    // should call from the dispatcher directly (inside a sync
+    // handler or inside the complete-callback lambda).
+    if (!conn_->IsOnDispatcherThread()) {
+        std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
+        conn_->RunOnDispatcher(
+            [weak_self, parent_stream_id, method, scheme,
+             authority, path, response]() {
+            if (auto self = weak_self.lock()) {
+                self->PushResource(parent_stream_id, method, scheme,
+                                    authority, path, response);
+            }
+        });
+        return 0;  // queued; async callers use push for its side effect
     }
     if (!session_) {
         logging::Get()->debug(

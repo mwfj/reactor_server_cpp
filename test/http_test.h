@@ -1576,14 +1576,18 @@ namespace HttpTests {
             if (pos200 == std::string::npos) {
                 pass = false; err += "missing 200; ";
             }
-            // The 103 must either NOT appear, or appear BEFORE the 200.
-            // Given the worker calls complete() before send_interim(),
-            // the dispatcher runs the final lambda first and the hopped
-            // interim observes final_response_sent_=true → drops.
-            if (pos103 != std::string::npos && pos200 != std::string::npos &&
-                pos103 > pos200) {
+            // The 103 must be fully dropped. Given the worker calls
+            // complete() (flipping the per-request `completed` flag)
+            // BEFORE send_interim(), the send_interim closure's
+            // synchronous check observes completed==true and returns
+            // without even hopping. Under no scheduler interleaving
+            // should a 103 reach the wire — asserting pos103 == npos
+            // is the strict form. A 103-before-200 ordering would also
+            // indicate a regression (it'd mean the completed guard was
+            // bypassed), not a legitimate-but-weak pass.
+            if (pos103 != std::string::npos) {
                 pass = false;
-                err += "103 queued AFTER 200 (ordering race — should be dropped); ";
+                err += "103 reached the wire — completed-guard bypassed; ";
             }
             TestFramework::RecordTest(
                 "H1 103 Early Hints: worker-thread ordering safe",

@@ -220,6 +220,25 @@ public:
     void DispatchStreamRequest(Http2Stream* stream, int32_t stream_id);
 
 private:
+    // Helper: submit a GOAWAY frame and only latch goaway_sent_ on
+    // successful submit. Used by SendGoaway + every flood-protection
+    // branch in OnFrameRecvCallback. Centralizing avoids the "set flag,
+    // discard rv" anti-pattern that made drain wait for the full
+    // shutdown_drain_timeout_sec when a submit failed. Must be called
+    // from the dispatcher thread.
+    //
+    // last_stream_id_override — used by flood branches that need the
+    // nghttp2 live last-proc-stream-id (last_stream_id_ is a cached
+    // snapshot that may be stale mid-recv); pass -1 to fall back to
+    // the atomic last_stream_id_.
+    //
+    // flush — pass false when called from inside an nghttp2_session_mem_recv2
+    // callback (flood branches) because flushing from within a recv
+    // callback is unsafe. The caller must flush after recv returns.
+    void SubmitGoawayChecked(uint32_t error_code,
+                              int32_t last_stream_id_override,
+                              bool flush);
+
     // Pimpl for nghttp2
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -70,11 +70,15 @@ public:
     void SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
 
     // Submit a non-final 1xx informational response (e.g. 103 Early Hints)
-    // on a specific stream and flush nghttp2 output. The contract is
-    // dispatcher-thread-only — off-thread calls are refused with a warn
-    // log so a mis-routed call never corrupts nghttp2 state. Returns
-    // true on successful submission, false on validation / state failure
-    // (missing stream, final already submitted, off-thread, invalid status).
+    // on a specific stream and flush nghttp2 output.
+    //
+    // Thread-safe: off-dispatcher callers are internally hopped to the
+    // dispatcher so nghttp2 state is always touched on the correct
+    // thread. On-dispatcher return value: true on success, false on
+    // validation failure (missing stream, final already submitted,
+    // invalid status). Off-dispatcher return value: always true (the
+    // call was queued); the actual submit decision runs on the
+    // dispatcher when the hop fires.
     bool SendInterimResponse(
         int32_t stream_id,
         int status_code,
@@ -82,15 +86,23 @@ public:
 
     // HTTP/2 server push primitive — atomically issues PUSH_PROMISE on
     // `parent_stream_id` and the associated response on the freshly
-    // promised stream, then flushes nghttp2 output. Returns the promised
-    // stream_id (>0) on success, -1 otherwise (off-thread, shutdown
-    // requested, push disabled, validation failure, nghttp2 failure —
-    // see Http2Session::SubmitPushPromise for the full validation list).
+    // promised stream, then flushes nghttp2 output.
     //
-    // Dispatcher-thread-only contract — off-thread callers must hop via
-    // RunOnDispatcher() first. Application code should use the bound
-    // ResourcePusher closure (async routes) or http::PushResource (sync
-    // routes) rather than calling this directly.
+    // Thread-safe: off-dispatcher callers are internally hopped to the
+    // dispatcher. Return value semantics:
+    //   - On dispatcher: the promised stream_id (>0) on success, -1
+    //     on validation / state failure (shutdown requested, push
+    //     disabled, GOAWAY sent, parent closed, invalid method/scheme/
+    //     path/authority, nghttp2 failure — see Http2Session::
+    //     SubmitPushPromise for the full validation list).
+    //   - Off dispatcher: returns 0 (queued — async callers cannot
+    //     synchronously observe the promised id). Handlers that need
+    //     the id should invoke this from the dispatcher thread (sync
+    //     handler or inside a RunOnDispatcher lambda).
+    //
+    // Application code should use the bound ResourcePusher closure
+    // (async routes) or http::PushResource (sync routes) rather than
+    // calling this directly.
     int32_t PushResource(
         int32_t parent_stream_id,
         const std::string& method,

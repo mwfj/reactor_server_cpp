@@ -369,15 +369,32 @@ static int OnFrameRecvCallback(
                 while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
                     expect.pop_back();
                 if (expect == "100-continue") {
-                    // Send 100 Continue — the client can proceed with body
+                    // Send 100 Continue — the client can proceed with body.
+                    // Silent-failure scenario: nghttp2_submit_headers could
+                    // fail (NGHTTP2_ERR_NOMEM etc.). Without a check, the
+                    // client waits forever for 100 before sending the body
+                    // and the stream slot stays occupied until request
+                    // timeout. RST the stream as a fallback so the client
+                    // retries without Expect.
                     nghttp2_nv nva_100[] = {
                         {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
                          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("100")),
                          7, 3, NGHTTP2_NV_FLAG_NONE}
                     };
-                    nghttp2_submit_headers(session, NGHTTP2_FLAG_NONE,
-                                           frame->hd.stream_id, nullptr,
-                                           nva_100, 1, nullptr);
+                    int rv100 = nghttp2_submit_headers(
+                        session, NGHTTP2_FLAG_NONE,
+                        frame->hd.stream_id, nullptr,
+                        nva_100, 1, nullptr);
+                    if (rv100 != 0) {
+                        logging::Get()->warn(
+                            "HTTP/2 100-Continue submit failed stream={} rv={} ({})",
+                            frame->hd.stream_id, rv100, nghttp2_strerror(rv100));
+                        nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                                  frame->hd.stream_id,
+                                                  NGHTTP2_INTERNAL_ERROR);
+                        stream->MarkRejected();
+                        break;
+                    }
                 } else {
                     // Unsupported Expect value — reject with 417.
                     logging::Get()->warn("HTTP/2 stream {} unsupported Expect: {}",
@@ -385,20 +402,42 @@ static int OnFrameRecvCallback(
                     if (self->Callbacks().request_count_callback)
                         self->Callbacks().request_count_callback();
                     // submit_response2 queues the HTTP response (END_STREAM).
+                    // A silent failure here would leave the client hanging
+                    // until request timeout; RST as fallback so the stream
+                    // is cleanly torn down and the client fails fast.
                     nghttp2_nv nva_417[] = {
                         {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
                          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("417")),
                          7, 3, NGHTTP2_NV_FLAG_NONE}
                     };
-                    nghttp2_submit_response2(session, frame->hd.stream_id,
-                                             nva_417, 1, nullptr);
+                    int rv417 = nghttp2_submit_response2(
+                        session, frame->hd.stream_id, nva_417, 1, nullptr);
+                    if (rv417 != 0) {
+                        logging::Get()->warn(
+                            "HTTP/2 417 response submit failed stream={} rv={} ({})",
+                            frame->hd.stream_id, rv417, nghttp2_strerror(rv417));
+                        // Fall through to RST below — force stream teardown.
+                    }
                     // RST only when the client side is still open (no END_STREAM
                     // on request). If HEADERS had END_STREAM, submit_response2
                     // closes both sides cleanly — RST would be redundant and
-                    // some clients treat it as a transport failure.
-                    if (!(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
-                        nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                                  frame->hd.stream_id, NGHTTP2_NO_ERROR);
+                    // some clients treat it as a transport failure. When the
+                    // response submit itself failed, always RST so the client
+                    // stops waiting on a response that will never arrive.
+                    if (rv417 != 0 ||
+                        !(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+                        uint32_t rst_code = (rv417 != 0)
+                            ? NGHTTP2_INTERNAL_ERROR
+                            : NGHTTP2_NO_ERROR;
+                        int rv_rst = nghttp2_submit_rst_stream(
+                            session, NGHTTP2_FLAG_NONE,
+                            frame->hd.stream_id, rst_code);
+                        if (rv_rst != 0) {
+                            logging::Get()->warn(
+                                "HTTP/2 417 RST submit failed stream={} rv={} ({})",
+                                frame->hd.stream_id, rv_rst,
+                                nghttp2_strerror(rv_rst));
+                        }
                     }
                     stream->MarkRejected();
                     break;
@@ -1085,8 +1124,33 @@ int32_t Http2Session::SubmitPushPromise(
         // +1 on both counters per failed push. The normal cleanup path
         // (MarkStreamForRemoval + FlushDeferredRemovals) handles final
         // erase.
-        nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
-                                  promised, NGHTTP2_INTERNAL_ERROR);
+        int rv_rst = nghttp2_submit_rst_stream(
+            impl_->session, NGHTTP2_FLAG_NONE,
+            promised, NGHTTP2_INTERNAL_ERROR);
+        if (rv_rst != 0) {
+            // Extremely unlikely path, but if the RST itself fails
+            // nghttp2 will never fire on_stream_close for this stream,
+            // so the counter +1 from stream_open_callback would leak.
+            // Fire a synthetic close_callback + MarkStreamForRemoval
+            // to reconcile. We can safely MarkStreamForRemoval because
+            // the next FlushDeferredRemovals will erase the entry and
+            // nghttp2 treats its internal stream as already-reset
+            // (or will at session teardown).
+            logging::Get()->warn(
+                "push: rollback RST submit failed stream={} rv={} ({}) — "
+                "firing synthetic close_callback to reconcile counters",
+                promised, rv_rst, nghttp2_strerror(rv_rst));
+            if (callbacks_.stream_close_callback) {
+                try {
+                    callbacks_.stream_close_callback(
+                        Owner(), promised, NGHTTP2_INTERNAL_ERROR);
+                } catch (const std::exception& e) {
+                    logging::Get()->error(
+                        "Synthetic close_callback threw: {}", e.what());
+                }
+            }
+            MarkStreamForRemoval(promised);
+        }
         return -1;
     }
     logging::Get()->debug(
@@ -1169,32 +1233,37 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
     SubmitResponse(stream_id, response);
 }
 
-void Http2Session::SendGoaway(uint32_t error_code) {
+void Http2Session::SubmitGoawayChecked(uint32_t error_code,
+                                        int32_t last_stream_id_override,
+                                        bool flush) {
     if (goaway_sent_) return;
-    logging::Get()->info("H2 sending GOAWAY fd={}", conn_->fd());
 
-    // Only latch goaway_sent_ on a successful submit. Previously we set
-    // the flag unconditionally before calling nghttp2 — a failed
-    // nghttp2_submit_goaway would leave the session advertising "GOAWAY
-    // sent" to the drain-wait logic, causing WaitForH2Drain to block
-    // until shutdown_drain_timeout_sec fully expires instead of
-    // re-attempting or proceeding. The goaway_sent_ guard still
-    // prevents duplicate submits on a retry because we only retry on
-    // the rv==0 path.
+    int32_t last_id = (last_stream_id_override >= 0)
+        ? last_stream_id_override
+        : last_stream_id_.load(std::memory_order_acquire);
+
     int rv = nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
-                                    last_stream_id_, error_code,
-                                    nullptr, 0);
+                                    last_id, error_code, nullptr, 0);
     if (rv != 0) {
+        // A failed submit does NOT latch the flag — leaving goaway_sent_
+        // false lets later logic retry or proceed. Previously the flag
+        // was set before the rv check, so a failed submit would make
+        // WaitForH2Drain wait for the full shutdown_drain_timeout_sec
+        // even though no GOAWAY was ever queued.
         logging::Get()->warn(
             "nghttp2_submit_goaway failed fd={} rv={} ({}) — drain may wait",
-            conn_->fd(), rv, nghttp2_strerror(rv));
-        // Still flush any already-pending frames before returning;
-        // callers typically proceed to drain regardless.
-        SendPendingFrames();
+            conn_ ? conn_->fd() : -1, rv, nghttp2_strerror(rv));
+        if (flush) SendPendingFrames();
         return;
     }
     goaway_sent_ = true;
-    SendPendingFrames();
+    if (flush) SendPendingFrames();
+}
+
+void Http2Session::SendGoaway(uint32_t error_code) {
+    if (goaway_sent_) return;
+    logging::Get()->info("H2 sending GOAWAY fd={}", conn_ ? conn_->fd() : -1);
+    SubmitGoawayChecked(error_code, /*last_stream_id_override=*/-1, /*flush=*/true);
 }
 
 void Http2Session::ResetStream(int32_t stream_id, uint32_t error_code) {
@@ -1392,20 +1461,14 @@ bool Http2Session::CheckFloodProtection(
             if (settings_count_ > HTTP2_CONSTANTS::MAX_SETTINGS_PER_INTERVAL) {
                 logging::Get()->warn("HTTP/2 SETTINGS flood detected fd={}",
                                      conn_ ? conn_->fd() : -1);
-                // Queue GOAWAY only — do NOT call SendPendingFrames() here.
-                // This callback runs inside nghttp2_session_mem_recv2; flushing
-                // output now (via mem_send2) while mem_recv2 is on the call stack
-                // is unsafe. SendPendingFrames() will be called after ReceiveData
-                // returns in Http2ConnectionHandler::OnRawData().
-                if (!goaway_sent_) {
-                    goaway_sent_ = true;
-                    // Use live stream ID — last_stream_id_ may be stale mid-recv
-                    int32_t live_last = nghttp2_session_get_last_proc_stream_id(
-                        impl_->session);
-                    nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
-                                         live_last, NGHTTP2_ENHANCE_YOUR_CALM,
-                                         nullptr, 0);
-                }
+                // Queue GOAWAY via the checked helper. flush=false because
+                // this runs inside nghttp2_session_mem_recv2; the caller
+                // flushes after recv returns. Use live stream ID — the
+                // cached last_stream_id_ may be stale mid-recv.
+                int32_t live_last = nghttp2_session_get_last_proc_stream_id(
+                    impl_->session);
+                SubmitGoawayChecked(NGHTTP2_ENHANCE_YOUR_CALM,
+                                    live_last, /*flush=*/false);
                 return false;
             }
         }
@@ -1416,14 +1479,10 @@ bool Http2Session::CheckFloodProtection(
             if (ping_count_ > HTTP2_CONSTANTS::MAX_PING_PER_INTERVAL) {
                 logging::Get()->warn("HTTP/2 PING flood detected fd={}",
                                      conn_ ? conn_->fd() : -1);
-                if (!goaway_sent_) {
-                    goaway_sent_ = true;
-                    int32_t live_last = nghttp2_session_get_last_proc_stream_id(
-                        impl_->session);
-                    nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
-                                         live_last, NGHTTP2_ENHANCE_YOUR_CALM,
-                                         nullptr, 0);
-                }
+                int32_t live_last = nghttp2_session_get_last_proc_stream_id(
+                    impl_->session);
+                SubmitGoawayChecked(NGHTTP2_ENHANCE_YOUR_CALM,
+                                    live_last, /*flush=*/false);
                 return false;
             }
         }
@@ -1433,14 +1492,10 @@ bool Http2Session::CheckFloodProtection(
         if (rst_stream_count_ > HTTP2_CONSTANTS::MAX_RST_STREAM_PER_INTERVAL) {
             logging::Get()->warn("HTTP/2 RST_STREAM flood detected (rapid reset) fd={}",
                                  conn_ ? conn_->fd() : -1);
-            if (!goaway_sent_) {
-                goaway_sent_ = true;
-                int32_t live_last = nghttp2_session_get_last_proc_stream_id(
-                    impl_->session);
-                nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
-                                     live_last, NGHTTP2_ENHANCE_YOUR_CALM,
-                                     nullptr, 0);
-            }
+            int32_t live_last = nghttp2_session_get_last_proc_stream_id(
+                impl_->session);
+            SubmitGoawayChecked(NGHTTP2_ENHANCE_YOUR_CALM,
+                                live_last, /*flush=*/false);
             return false;
         }
         break;

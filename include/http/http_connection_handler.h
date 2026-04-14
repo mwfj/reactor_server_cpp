@@ -31,15 +31,25 @@ public:
     void SendResponse(const HttpResponse& response);
 
     // Send a non-final 1xx response (103 Early Hints, 102 Processing, etc.).
-    // Dispatcher-thread-only. Returns true if the interim was written to the
-    // output buffer; false if rejected (wrong thread, HTTP/1.0 request, final
-    // response already serialized, invalid status code, or oversized header
-    // block). Multiple interims on the same request are legal per RFC 8297.
+    // Thread-safe: off-dispatcher callers are internally hopped to the
+    // dispatcher so write order is preserved with the final response.
     //
+    // Return value semantics:
+    //   - On dispatcher: true if the interim was written to the output
+    //     buffer; false if rejected synchronously (HTTP/1.0 request,
+    //     final response already serialized, invalid status code, or
+    //     oversized header block).
+    //   - Off dispatcher: always returns true (the call was queued).
+    //     The final drop/emit decision happens when the hopped lambda
+    //     runs — if complete() was called before this invocation, the
+    //     queued interim is dropped to preserve response ordering.
+    //
+    // Multiple interims on the same request are legal per RFC 8297.
     // Forbidden headers (Connection, Keep-Alive, Transfer-Encoding,
     // Content-Length, TE, Upgrade, Proxy-*) are silently stripped.
-    // Status code must be in [102,199]. 101 is reserved for WebSocket upgrade
-    // (dedicated path). 100 is framework-managed (internal 100-continue).
+    // CR/LF in header key or value is stripped to prevent response
+    // splitting. Status code must be in [102,199]. 101 is reserved for
+    // WebSocket upgrade. 100 is framework-managed (internal 100-continue).
     bool SendInterimResponse(
         int status_code,
         const std::vector<std::pair<std::string, std::string>>& headers);
