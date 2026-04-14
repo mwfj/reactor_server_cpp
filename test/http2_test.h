@@ -10,6 +10,7 @@
 #include "http/http_server.h"
 #include "http/http_request.h"
 #include "http/http_response.h"
+#include "http/http_status.h"
 #include "http/push_helper.h"
 
 #include <nghttp2/nghttp2.h>
@@ -1743,6 +1744,77 @@ void TestH2C_Middleware() {
     }
 }
 
+// Security regression: middleware REJECTION (returning false) must be
+// honored on the sync HTTP/2 path, identical to H1. HttpRouter::Dispatch
+// runs the middleware chain internally before dispatching to the
+// handler, so a middleware returning false must prevent the handler
+// from running AND must override the final status with the rejection
+// response. Without this guarantee, deployments that rely on middleware
+// for access control (auth, rate limiting, CORS preflight rejection)
+// would be bypassed.
+void TestH2C_MiddlewareRejectionHonored() {
+    std::cout << "\n[TEST] H2C: sync middleware rejection honored..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+        HttpServer server(cfg);
+
+        std::atomic<bool> handler_ran{false};
+        // Auth-like middleware: reject everything.
+        server.Use([](const HttpRequest&, HttpResponse& res) {
+            // FORBIDDEN by convention — FillDefaultRejectionResponse
+            // would default to FORBIDDEN too when no status is set by mw.
+            res.Status(HttpStatus::FORBIDDEN).Text("blocked by middleware");
+            return false;  // reject
+        });
+        // Sync H2 route — the rejection must prevent this handler.
+        server.Get("/protected",
+            [&handler_ran](const HttpRequest&, HttpResponse& res) {
+                handler_ran.store(true, std::memory_order_release);
+                res.Status(200).Text("leaked");
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            auto resp = client.Get("/protected");
+            if (resp.error) {
+                pass = false; err = "transport error";
+            }
+            // Rejection must manifest as a non-2xx response, not the 200
+            // the handler would have sent.
+            if (resp.status == 200 && resp.body.find("leaked") != std::string::npos) {
+                pass = false;
+                err += "handler's 200 body reached the client — middleware "
+                       "rejection was bypassed; ";
+            }
+            if (resp.status == 200) {
+                pass = false;
+                err += "response was 200 despite middleware returning false; ";
+            }
+            if (handler_ran.load(std::memory_order_acquire)) {
+                pass = false;
+                err += "handler was invoked even though middleware rejected; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest("H2C: sync middleware rejection honored",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2C: sync middleware rejection honored",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Three concurrent streams on one connection must all receive correct responses.
 void TestH2C_MultipleStreams() {
     std::cout << "\n[TEST] H2C: multiple concurrent streams..." << std::endl;
@@ -2501,6 +2573,91 @@ void TestH2_AuthorityCaseInsensitiveHostDefaultPort() {
         TestFramework::RecordTest(
             "H2 Authority: case-insensitive hostname + default port", false, e.what(),
             TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Regression: when :authority and host match via default-port
+// normalization (e.g. :authority=example.com:80 vs host=example.com,
+// scheme=http), the request_.headers["host"] value must reflect the
+// CLIENT's literal Host header — not the :authority form that was
+// stored first when :authority was parsed. This matters for proxy
+// pass-through routes (HeaderRewriter::RewriteRequest with
+// rewrite_host=false): the backend must see the Host value the client
+// actually sent, not a server-synthesized default-port form that
+// breaks backend virtual-host routing.
+void TestH2_AuthorityMatch_PreservesClientHostHeader() {
+    std::cout << "\n[TEST] H2 Authority: client Host header preserved on default-port match..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        // Echo the received Host header in the response body so the
+        // test can observe what the handler saw.
+        server.Get("/", [](const HttpRequest& req, HttpResponse& res) {
+            auto it = req.headers.find("host");
+            std::string host_val = (it != req.headers.end()) ? it->second : "<absent>";
+            res.Status(200).Text(host_val);
+        });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            // Case A: :authority has explicit default port, host does not.
+            // Proxy-pass-through would forward whichever string the
+            // handler sees. The client literally wrote "example.com";
+            // that MUST be what the handler observes, not the
+            // server-synthesized ":80" form.
+            {
+                auto resp = client.SendRequestRaw("GET", "/", "http",
+                                                  "example.com:80",
+                                                  {{"host", "example.com"}});
+                if (resp.error || resp.rst || resp.status != 200) {
+                    pass = false;
+                    err += "case A: expected 200, got " +
+                           std::to_string(resp.status) + "; ";
+                } else if (resp.body != "example.com") {
+                    pass = false;
+                    err += "case A: handler saw host='" + resp.body +
+                           "' — expected 'example.com' (client's literal Host); ";
+                }
+            }
+            // Case B: :authority absent port, host has explicit port.
+            // Reverse direction — still the client's literal wins.
+            {
+                auto resp = client.SendRequestRaw("GET", "/", "http",
+                                                  "example.com",
+                                                  {{"host", "example.com:80"}});
+                if (resp.error || resp.rst || resp.status != 200) {
+                    pass = false;
+                    err += "case B: expected 200, got " +
+                           std::to_string(resp.status) + "; ";
+                } else if (resp.body != "example.com:80") {
+                    pass = false;
+                    err += "case B: handler saw host='" + resp.body +
+                           "' — expected 'example.com:80' (client's literal Host); ";
+                }
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: client Host preserved on default-port match",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: client Host preserved on default-port match",
+            false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
 
@@ -4309,6 +4466,7 @@ void RunAllTests() {
     TestH2C_SimplePost();
     TestH2C_NotFound();
     TestH2C_Middleware();
+    TestH2C_MiddlewareRejectionHonored();
     TestH2C_MultipleStreams();
     TestH2C_LargeBody();
 
@@ -4329,6 +4487,7 @@ void RunAllTests() {
     TestH2_AuthorityIPv6WithDefaultPort();
     TestH2_AuthorityCaseInsensitiveHostDefaultPort();
     TestH2_AuthorityMixedCaseSchemeDefaultPort();
+    TestH2_AuthorityMatch_PreservesClientHostHeader();
 
     // --- Category 8: 103 Early Hints / SubmitInterimHeaders ---
     TestH2_EarlyHints_Basic();

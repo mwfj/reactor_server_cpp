@@ -164,15 +164,29 @@ int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
     }
 
     // Host header handling:
-    // - If :authority was set and matches (case-insensitive hostname), skip
-    // - If :authority was set and conflicts, reject
-    // - Duplicate host headers (without :authority) rejected below as singleton
+    // - If :authority was set and matches (case-insensitive hostname), prefer
+    //   the client's literal host value as the canonical "host" header so
+    //   proxy pass-through (rewrite_host=false) forwards exactly what the
+    //   client wrote. Without this, a client that sent :authority=
+    //   example.com:443 + host=example.com would be normalized to
+    //   request_.headers["host"]="example.com:443" (set when :authority
+    //   was parsed), and backends that distinguish virtual hosts by the
+    //   default-port form would see a synthesized Host value the client
+    //   never sent. Match-via-default-port must be transparent to the
+    //   upstream — the normalization is purely for equivalence, not for
+    //   overwriting the client's canonical intent.
+    // - If :authority was set and conflicts, reject.
+    // - Duplicate host headers (without :authority) rejected below as singleton.
     if (lower_name == "host" && has_authority_) {
         if (!AuthorityMatch(scheme_, authority_, value)) {
             logging::Get()->debug("H2 stream {} conflicting :authority and host", stream_id_);
             return -1;  // Malformed: conflicting :authority and host
         }
-        return 0;  // Matches :authority — already set, skip
+        // Match — preserve the client's literal host value (may differ
+        // textually from :authority but is equivalent after default-port
+        // normalization).
+        request_.headers["host"] = value;
+        return 0;
     }
 
     // Handle duplicate headers consistently with the HTTP/1.x parser:
