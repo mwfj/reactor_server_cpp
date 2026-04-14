@@ -9,6 +9,25 @@ CircuitBreakerManager::CircuitBreakerManager(
         size_t partition_count,
         std::vector<std::shared_ptr<Dispatcher>> dispatchers)
     : dispatchers_(std::move(dispatchers)) {
+    // Invariant (production path): slices are indexed by dispatcher,
+    // so partition_count must match dispatcher count. Any divergence
+    // would cause every subsequent host->Reload() to silently skip
+    // (size-mismatch guard in CircuitBreakerHost::Reload) — fail
+    // loudly at startup instead of on reload.
+    //
+    // Exception: pure unit tests that don't exercise Reload pass an
+    // empty dispatcher list; skip the check in that case so those
+    // tests can continue to allocate slices without wiring up live
+    // dispatchers.
+    if (!dispatchers_.empty() && partition_count != dispatchers_.size()) {
+        logging::Get()->critical(
+            "CircuitBreakerManager: partition_count ({}) != dispatcher count "
+            "({}) — topology mismatch",
+            partition_count, dispatchers_.size());
+        throw std::invalid_argument(
+            "CircuitBreakerManager: partition_count must equal dispatcher count");
+    }
+
     // Build one Host per upstream regardless of .circuit_breaker.enabled.
     // Disabled hosts still need a live Slice so a later reload can flip
     // them on without re-wiring transition callbacks (design §3.1).

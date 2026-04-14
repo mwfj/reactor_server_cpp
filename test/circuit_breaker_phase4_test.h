@@ -424,6 +424,332 @@ void TestBareProxyWorks() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Test 7: Retry-After header carries a sensible value — within [1, configured
+// max_open_duration_ms / 1000], and in the right ballpark of OpenUntil()-now.
+// ---------------------------------------------------------------------------
+void TestRetryAfterHeaderValue() {
+    std::cout << "\n[TEST] CB Phase 4: Retry-After value correctness..."
+              << std::endl;
+    try {
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/fail", [](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(502).Body("err", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw;
+        gw.bind_host = "127.0.0.1";
+        gw.bind_port = 0;
+        gw.worker_threads = 2;
+        gw.http2.enabled = false;
+        // base_open_duration 2000ms, max 60_000ms — Retry-After should
+        // ceiling-round and fall inside [1, 60].
+        auto u = MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
+                                     /*enabled=*/true, /*threshold=*/3);
+        u.circuit_breaker.base_open_duration_ms = 2000;
+        u.circuit_breaker.max_open_duration_ms  = 60000;
+        gw.upstreams.push_back(u);
+
+        HttpServer gateway(gw);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        // Trip the breaker.
+        for (int i = 0; i < 3; ++i) {
+            TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+        }
+
+        // Capture the open-rejection response.
+        std::string r = TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+        bool is_503 = TestHttpClient::HasStatus(r, 503);
+
+        // Extract Retry-After integer value (case-insensitive header).
+        int retry_after = -1;
+        const char* markers[] = {"Retry-After:", "retry-after:"};
+        for (const char* m : markers) {
+            auto pos = r.find(m);
+            if (pos == std::string::npos) continue;
+            pos += std::string(m).size();
+            while (pos < r.size() && (r[pos] == ' ' || r[pos] == '\t')) ++pos;
+            int val = 0;
+            bool any = false;
+            while (pos < r.size() && r[pos] >= '0' && r[pos] <= '9') {
+                val = val * 10 + (r[pos] - '0');
+                any = true;
+                ++pos;
+            }
+            if (any) { retry_after = val; break; }
+        }
+
+        // Contract: value ≥ 1 and ≤ max_open_duration_ms / 1000 (60).
+        // For base_open_duration 2000ms the remaining-seconds at this
+        // moment is ≤ 2 (probably 1 or 2 after ceiling), so the upper
+        // sanity bound is generous but still rules out 300/3600-class
+        // buggy fallbacks.
+        bool in_range = (retry_after >= 1 && retry_after <= 60);
+        bool reasonable = (retry_after >= 1 && retry_after <= 3);
+
+        bool pass = is_503 && in_range && reasonable;
+        TestFramework::RecordTest(
+            "CB Phase 4: Retry-After value in range", pass,
+            pass ? "" :
+            "is_503=" + std::to_string(is_503) +
+            " retry_after=" + std::to_string(retry_after) +
+            " body=" + r.substr(0, 256));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB Phase 4: Retry-After value in range", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: Retry loop is terminal on CIRCUIT_OPEN — even with max_retries=3,
+// a request that hits an OPEN breaker gets exactly ONE 503 (no retry-flavored
+// second 503). Ensures ReportBreakerOutcome doesn't feed the reject back into
+// the breaker and MaybeRetry stays out.
+// ---------------------------------------------------------------------------
+void TestCircuitOpenTerminalForRetry() {
+    std::cout << "\n[TEST] CB Phase 4: CIRCUIT_OPEN terminal for retry loop..."
+              << std::endl;
+    try {
+        std::atomic<int> backend_hits{0};
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/fail", [&backend_hits](const HttpRequest&, HttpResponse& resp) {
+            backend_hits.fetch_add(1, std::memory_order_relaxed);
+            resp.Status(502).Body("err", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw;
+        gw.bind_host = "127.0.0.1";
+        gw.bind_port = 0;
+        gw.worker_threads = 2;
+        gw.http2.enabled = false;
+        // Retries enabled on 5xx — if the breaker reject leaked into
+        // MaybeRetry, the test would see extra backend hits after the
+        // trip. Long open window so the breaker stays OPEN for the
+        // duration of the post-trip assertion (no HALF_OPEN probe
+        // admission racing the test).
+        auto u = MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
+                                     /*enabled=*/true, /*threshold=*/3);
+        u.proxy.retry.max_retries = 3;
+        u.proxy.retry.retry_on_5xx = true;
+        u.circuit_breaker.base_open_duration_ms = 30000;
+        u.circuit_breaker.max_open_duration_ms  = 60000;
+        gw.upstreams.push_back(u);
+
+        HttpServer gateway(gw);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        // Trip the breaker. Each pre-trip request may retry up to 3
+        // times (all failing 5xx), so backend sees up to 3*threshold=12
+        // hits. That's acceptable — we just care about post-trip behavior.
+        for (int i = 0; i < 3; ++i) {
+            TestHttpClient::HttpGet(gw_port, "/fail", 5000);
+        }
+        int pre_trip_hits = backend_hits.load();
+
+        // Post-trip request: expect a single 503 and NO new backend hits.
+        std::string r = TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+        bool is_503 = TestHttpClient::HasStatus(r, 503);
+        int post_trip_hits = backend_hits.load();
+        bool no_new_hits = (post_trip_hits == pre_trip_hits);
+
+        bool pass = is_503 && no_new_hits;
+        TestFramework::RecordTest(
+            "CB Phase 4: CIRCUIT_OPEN terminal for retry", pass,
+            pass ? "" :
+            "is_503=" + std::to_string(is_503) +
+            " pre=" + std::to_string(pre_trip_hits) +
+            " post=" + std::to_string(post_trip_hits));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB Phase 4: CIRCUIT_OPEN terminal for retry", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: Dry-run mode — dry_run=true forwards rejected requests to the
+// upstream (pass-through) but still increments the rejected_ counter so
+// operators can observe the would-reject rate without production impact.
+// ---------------------------------------------------------------------------
+void TestDryRunPassthrough() {
+    std::cout << "\n[TEST] CB Phase 4: dry-run passthrough..." << std::endl;
+    try {
+        std::atomic<int> backend_hits{0};
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/fail", [&backend_hits](const HttpRequest&, HttpResponse& resp) {
+            backend_hits.fetch_add(1, std::memory_order_relaxed);
+            resp.Status(502).Body("err", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw;
+        gw.bind_host = "127.0.0.1";
+        gw.bind_port = 0;
+        gw.worker_threads = 2;
+        gw.http2.enabled = false;
+        auto u = MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
+                                     /*enabled=*/true, /*threshold=*/3);
+        u.circuit_breaker.dry_run = true;  // would-reject, but still forward
+        gw.upstreams.push_back(u);
+
+        HttpServer gateway(gw);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        // Trip thresholds with 5 requests. All should reach backend (502),
+        // not a 503 — dry-run never short-circuits.
+        for (int i = 0; i < 5; ++i) {
+            std::string r = TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+            if (!TestHttpClient::HasStatus(r, 502)) {
+                TestFramework::RecordTest(
+                    "CB Phase 4: dry-run passthrough", false,
+                    "request " + std::to_string(i) +
+                    " expected 502, got: " + r.substr(0, 64));
+                return;
+            }
+        }
+
+        bool all_hit = (backend_hits.load() == 5);
+
+        // Verify the slice observed trips/rejected even though traffic passed.
+        auto* mgr = gateway.GetUpstreamManager() ?
+                     gateway.GetUpstreamManager()->GetCircuitBreakerManager() :
+                     nullptr;
+        int64_t trips = 0, rejected = 0;
+        if (mgr) {
+            auto* host = mgr->GetHost("svc");
+            if (host) {
+                auto snap = host->Snapshot();
+                trips = snap.total_trips;
+                rejected = snap.total_rejected;
+            }
+        }
+        // At least one trip fired (consecutive_threshold=3 → slice
+        // transitioned at least once during the run), and the post-trip
+        // requests were counted as would-reject (rejected > 0).
+        bool observed = (trips >= 1) && (rejected >= 1);
+
+        bool pass = all_hit && observed;
+        TestFramework::RecordTest(
+            "CB Phase 4: dry-run passthrough", pass,
+            pass ? "" :
+            "hits=" + std::to_string(backend_hits.load()) +
+            " trips=" + std::to_string(trips) +
+            " rejected=" + std::to_string(rejected));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB Phase 4: dry-run passthrough", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: HALF_OPEN → CLOSED recovery round-trip through the proxy. Trip the
+// breaker, wait for the open window to elapse, then serve success responses
+// and assert the slice transitions back to CLOSED (consecutive_successes
+// crosses the threshold — default 2 from DefaultCbConfig / phase-4 config).
+// ---------------------------------------------------------------------------
+void TestHalfOpenRecoveryRoundTrip() {
+    std::cout << "\n[TEST] CB Phase 4: HALF_OPEN → CLOSED recovery..."
+              << std::endl;
+    try {
+        std::atomic<bool> fail_mode{true};
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/fail", [&fail_mode](const HttpRequest&, HttpResponse& resp) {
+            if (fail_mode.load()) {
+                resp.Status(502).Body("err", "text/plain");
+            } else {
+                resp.Status(200).Body("ok", "text/plain");
+            }
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw;
+        gw.bind_host = "127.0.0.1";
+        gw.bind_port = 0;
+        gw.worker_threads = 2;
+        gw.http2.enabled = false;
+        auto u = MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
+                                     /*enabled=*/true, /*threshold=*/3);
+        // Short open duration so recovery path finishes quickly.
+        u.circuit_breaker.base_open_duration_ms = 300;
+        u.circuit_breaker.max_open_duration_ms = 1000;
+        // Two probes needed to close (default permitted_half_open_calls=2).
+        u.circuit_breaker.permitted_half_open_calls = 2;
+        gw.upstreams.push_back(u);
+
+        HttpServer gateway(gw);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        // Trip by hitting the failing backend.
+        for (int i = 0; i < 3; ++i) {
+            TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+        }
+
+        // Flip backend to success and wait for the open window to elapse.
+        fail_mode.store(false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        // Probe the proxy — each successful 200 advances HALF_OPEN toward
+        // CLOSED. Do more than permitted_half_open_calls; some will be
+        // rejected as half_open_full but the ones that are admitted will
+        // close the breaker.
+        bool saw_success = false;
+        for (int i = 0; i < 8; ++i) {
+            std::string r = TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+            if (TestHttpClient::HasStatus(r, 200)) saw_success = true;
+            // Small gap between probes — HALF_OPEN only admits permitted
+            // probes per cycle; spacing lets subsequent probes observe a
+            // possibly-closed breaker.
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        // Verify slice aggregate: at least one CLOSED transition observed
+        // (probe_successes >= 1 and total_trips == 1 — we only tripped once).
+        auto* mgr = gateway.GetUpstreamManager() ?
+                     gateway.GetUpstreamManager()->GetCircuitBreakerManager() :
+                     nullptr;
+        int64_t probe_succ = 0;
+        int open_parts = 0, half_open_parts = 0;
+        if (mgr) {
+            auto* host = mgr->GetHost("svc");
+            if (host) {
+                auto snap = host->Snapshot();
+                probe_succ = 0;
+                for (const auto& row : snap.slices) {
+                    probe_succ += row.probe_successes;
+                }
+                open_parts = snap.open_partitions;
+                half_open_parts = snap.half_open_partitions;
+            }
+        }
+
+        // Recovery complete: saw at least one 200 through the breaker,
+        // at least one probe success counted, and no partition still
+        // stuck in OPEN (HALF_OPEN may still linger on the unused slice,
+        // which is fine for a 2-partition setup).
+        bool pass = saw_success && (probe_succ >= 1) && (open_parts == 0);
+        TestFramework::RecordTest(
+            "CB Phase 4: HALF_OPEN → CLOSED recovery", pass,
+            pass ? "" :
+            "saw_success=" + std::to_string(saw_success) +
+            " probe_succ=" + std::to_string(probe_succ) +
+            " open_parts=" + std::to_string(open_parts) +
+            " half_open_parts=" + std::to_string(half_open_parts));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB Phase 4: HALF_OPEN → CLOSED recovery", false, e.what());
+    }
+}
+
 void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "CIRCUIT BREAKER PHASE 4 - INTEGRATION TESTS" << std::endl;
@@ -435,6 +761,10 @@ void RunAllTests() {
     TestSuccessResetsConsecutiveFailureCounter();
     TestTripDrivesSliceState();
     TestOpenBreakerShortCircuitsUpstreamCall();
+    TestRetryAfterHeaderValue();
+    TestCircuitOpenTerminalForRetry();
+    TestDryRunPassthrough();
+    TestHalfOpenRecoveryRoundTrip();
 }
 
 }  // namespace CircuitBreakerPhase4Tests

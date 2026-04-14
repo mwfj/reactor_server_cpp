@@ -978,9 +978,18 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
         return MakeRetryBudgetResponse();
     }
     if (result_code == RESULT_CIRCUIT_OPEN) {
-        // MakeErrorResponse is static and has no `this` — the richer
-        // MakeCircuitOpenResponse(slice_) path is preferred. Fall back
-        // to a plain 503 here for the rare static-context invocation.
+        // The static factory has no `this`, so it cannot build the
+        // §12.1-compliant response (Retry-After / X-Circuit-Breaker /
+        // X-Upstream-Host). All in-class paths for CIRCUIT_OPEN use
+        // the non-static MakeCircuitOpenResponse() — reaching this
+        // branch means a future caller forgot that rule, and would
+        // silently serve a non-compliant 503. Log loudly so the
+        // mistake shows up in logs instead of producing a stealth
+        // regression against the public contract.
+        logging::Get()->error(
+            "ProxyTransaction::MakeErrorResponse(RESULT_CIRCUIT_OPEN) "
+            "invoked from static context — use MakeCircuitOpenResponse() "
+            "to emit §12.1-compliant headers");
         return HttpResponse::ServiceUnavailable();
     }
     if (result_code == RESULT_CHECKOUT_FAILED ||
@@ -998,24 +1007,29 @@ HttpResponse ProxyTransaction::MakeCircuitOpenResponse() const {
     // (shouldn't happen on the circuit-open path — that path requires a
     // slice — but defense in depth).
     int retry_after_secs = 1;
-    if (slice_) {
+    if (slice_ && slice_->IsOpenDeadlineSet()) {
         auto open_until = slice_->OpenUntil();
-        // OpenUntil returns a zero time_point when NOT OPEN. Checking
-        // against zero with steady_clock::time_point is fiddly; use
-        // time_since_epoch().count() > 0 as the "is-set" check.
-        if (open_until.time_since_epoch().count() > 0) {
-            auto now = std::chrono::steady_clock::now();
-            auto diff = std::chrono::duration_cast<std::chrono::seconds>(
-                open_until - now).count();
-            // Clamp to [1, 300] — Retry-After=0 is silly, and an hour+
-            // is misleading (ops usually want operators to check
-            // sooner). The breaker's open duration caps out around
-            // minutes; anything larger means we're dealing with a
-            // cascade and we should hint sooner.
-            if (diff < 1) diff = 1;
-            if (diff > 300) diff = 300;
-            retry_after_secs = static_cast<int>(diff);
-        }
+        auto now = std::chrono::steady_clock::now();
+        auto ms_remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            open_until - now).count();
+        // Ceiling-round to seconds so we never advertise a window
+        // shorter than the actual remaining backoff (e.g. 5.9s → 6,
+        // not 5). Truncating by one second is enough to cause a
+        // well-behaved client to retry while the breaker is still OPEN
+        // and get another avoidable 503.
+        int64_t diff = (ms_remaining + 999) / 1000;
+        // Clamp: Retry-After=0 is silly; upper bound tracks the
+        // configured max_open_duration_ms (clamped to 1s min), so we
+        // don't under-report backoff windows on operators who tune the
+        // breaker longer than 5 minutes. Absolute safety ceiling of
+        // 3600s (1 hour) — anything longer likely means the breaker
+        // is mis-configured and the hint is noise.
+        int cfg_cap_secs = static_cast<int>(
+            std::max<long long>(1, slice_->config().max_open_duration_ms / 1000));
+        int upper = std::min(cfg_cap_secs, 3600);
+        if (diff < 1) diff = 1;
+        if (diff > upper) diff = upper;
+        retry_after_secs = static_cast<int>(diff);
     }
 
     HttpResponse resp;

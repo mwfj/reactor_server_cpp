@@ -30,9 +30,11 @@ CircuitBreakerHost::CircuitBreakerHost(std::string service_name,
     slices_.reserve(partition_count);
     for (size_t i = 0; i < partition_count; ++i) {
         // Per-slice label for logs — lets operators grep logs for a
-        // specific host:partition pair.
-        std::string label = service_name_ + ":" + host_ + ":" +
-                            std::to_string(port_) + " p=" + std::to_string(i);
+        // specific host:partition pair. Key=value form matches the
+        // format documented in circuit_breaker_slice.h:host_label_.
+        std::string label = "service=" + service_name_ +
+                            " host=" + host_ + ":" + std::to_string(port_) +
+                            " partition=" + std::to_string(i);
         slices_.emplace_back(std::make_unique<CircuitBreakerSlice>(
             std::move(label), i, config_));
     }

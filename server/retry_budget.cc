@@ -33,12 +33,10 @@ RetryBudget::InFlightGuard RetryBudget::TrackInFlight() {
 }
 
 bool RetryBudget::TryConsumeRetry() {
-    // Snapshot counters with relaxed — the gate is an approximate
-    // capacity check, not a strict admission lock. Racing callers may
-    // both read cap=N and both try to reserve; the worst case is that
-    // both succeed and we momentarily sit at retries_in_flight_ =
-    // cap+1, which is acceptable for a traffic-shaping gate (unlike a
-    // security-critical gate).
+    // Snapshot tuning + in_flight once — cap is computed against a
+    // consistent slice. Retrying the cap math inside the CAS loop would
+    // just churn without improving accuracy (in_flight is inherently a
+    // moving target).
     int64_t in_flight = in_flight_.load(std::memory_order_relaxed);
     int pct = percent_.load(std::memory_order_relaxed);
     int min_conc = min_concurrency_.load(std::memory_order_relaxed);
@@ -50,13 +48,25 @@ bool RetryBudget::TryConsumeRetry() {
     int64_t pct_cap = (in_flight * pct) / 100;
     int64_t cap = pct_cap > min_conc ? pct_cap : min_conc;
 
+    // Atomically reserve a slot: load current, verify under cap, CAS up
+    // by 1. Separate load + fetch_add would let N concurrent callers
+    // all observe current < cap and all increment past the cap — under
+    // the cross-dispatcher load the retry budget is meant to protect
+    // against, the gate would stop bounding anything.
     int64_t current = retries_in_flight_.load(std::memory_order_relaxed);
-    if (current >= cap) {
-        retries_rejected_.fetch_add(1, std::memory_order_relaxed);
-        return false;
+    while (current < cap) {
+        if (retries_in_flight_.compare_exchange_weak(
+                current, current + 1,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            return true;
+        }
+        // CAS failure — `current` was updated with the latest value;
+        // loop re-evaluates against cap. Spurious wakeups on weak CAS
+        // are also handled by the retry.
     }
-    retries_in_flight_.fetch_add(1, std::memory_order_relaxed);
-    return true;
+    retries_rejected_.fetch_add(1, std::memory_order_relaxed);
+    return false;
 }
 
 void RetryBudget::ReleaseRetry() {

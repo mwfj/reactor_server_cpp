@@ -175,11 +175,11 @@ private:
     uint64_t admission_generation_ = 0;
     bool is_probe_ = false;
 
-    // Retry-budget token held by this transaction's most recent retry
-    // attempt. Phase 5 flips this to true on successful TryConsumeRetry
-    // and clears it on ReleaseRetry. Phase 4 declares the field so
-    // Cleanup() and Cancel() have something to check, but the retry
-    // loop does not yet consume the budget.
+    // TODO(phase-5): retry-budget token held by this transaction's most
+    // recent retry attempt. Phase 5 flips this to true on successful
+    // TryConsumeRetry and clears it on ReleaseRetry. Phase 4 declares
+    // the field so Cleanup() and Cancel() have something to check, but
+    // the retry loop does not yet consume the budget.
     bool retry_token_held_ = false;
 
     // Internal methods

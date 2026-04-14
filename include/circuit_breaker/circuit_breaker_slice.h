@@ -129,9 +129,22 @@ public:
     const std::string& host_label() const { return host_label_; }
     size_t dispatcher_index() const { return dispatcher_index_; }
 
+    // Read-only view of the live config. Dispatcher-thread-owned for
+    // writes (Reload only mutates here); readers on other threads get a
+    // potentially-torn read, which is acceptable for observability hints
+    // like Retry-After clamping.
+    const CircuitBreakerConfig& config() const { return config_; }
+
     // Current open_until time. Used by ProxyTransaction to compute
     // Retry-After. Returns zero ns when not OPEN.
     std::chrono::steady_clock::time_point OpenUntil() const;
+
+    // Convenience predicate: whether OpenUntil() currently holds a
+    // non-zero deadline. Avoids callers hand-rolling the zero-epoch
+    // check against `time_since_epoch().count() > 0`.
+    bool IsOpenDeadlineSet() const {
+        return open_until_steady_ns_.load(std::memory_order_relaxed) > 0;
+    }
 
 private:
     // Logging label: "service=X host=Y:Z partition=N" built once.
