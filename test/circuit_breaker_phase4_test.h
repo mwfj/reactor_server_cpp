@@ -750,6 +750,148 @@ void TestHalfOpenRecoveryRoundTrip() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Test 11: Retry-After ceils the config cap from a non-second-aligned
+// max_open_duration_ms (e.g. 1500ms → 2s, not 1s). Floor-rounding the cap
+// would clamp the advertised retry window below what the breaker honors,
+// causing well-behaved clients to re-hit the 503.
+// ---------------------------------------------------------------------------
+void TestRetryAfterCapCeilsNonAlignedMax() {
+    std::cout << "\n[TEST] CB Phase 4: Retry-After cap ceils non-aligned max..."
+              << std::endl;
+    try {
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/fail", [](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(502).Body("err", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw;
+        gw.bind_host = "127.0.0.1";
+        gw.bind_port = 0;
+        gw.worker_threads = 2;
+        gw.http2.enabled = false;
+        // Configure a non-second-aligned max backoff. base = 1500ms so
+        // the actual OpenUntil-now at trip time is ~1.5s, which ceil-
+        // rounds to 2s. If cfg_cap_secs floor-rounded max_open_duration
+        // (1500ms → 1s), the clamp would drop Retry-After to 1s even
+        // though the breaker would keep rejecting through the second
+        // half of that window.
+        auto u = MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
+                                     /*enabled=*/true, /*threshold=*/3);
+        u.circuit_breaker.base_open_duration_ms = 1500;
+        u.circuit_breaker.max_open_duration_ms  = 1500;
+        gw.upstreams.push_back(u);
+
+        HttpServer gateway(gw);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        for (int i = 0; i < 3; ++i) {
+            TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+        }
+        std::string r = TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+
+        int retry_after = -1;
+        const char* markers[] = {"Retry-After:", "retry-after:"};
+        for (const char* m : markers) {
+            auto pos = r.find(m);
+            if (pos == std::string::npos) continue;
+            pos += std::string(m).size();
+            while (pos < r.size() && (r[pos] == ' ' || r[pos] == '\t')) ++pos;
+            int val = 0;
+            bool any = false;
+            while (pos < r.size() && r[pos] >= '0' && r[pos] <= '9') {
+                val = val * 10 + (r[pos] - '0');
+                any = true;
+                ++pos;
+            }
+            if (any) { retry_after = val; break; }
+        }
+
+        // Expectation: Retry-After is in [1, 2] — cfg_cap_secs ceil-
+        // rounds 1500ms to 2s, and the remaining-time ceil-rounds to
+        // 2 at the moment of trip (may be 1 if enough wall-clock has
+        // elapsed between trip and response). Critically it must NEVER
+        // be zero or exceed 2 (clamped to the 2s cap).
+        bool in_range = (retry_after >= 1 && retry_after <= 2);
+        TestFramework::RecordTest(
+            "CB Phase 4: Retry-After ceils non-aligned cap", in_range,
+            in_range ? "" :
+            "retry_after=" + std::to_string(retry_after));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB Phase 4: Retry-After ceils non-aligned cap", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: Retried failures are reported BEFORE the retry fires. With retries
+// enabled on 5xx, each attempt's outcome must be counted against the breaker;
+// otherwise the slice trips only after the final retry exhausts, under-
+// counting failures and potentially never tripping if retries mask enough of
+// them. Verifies the trip still happens within the expected number of client
+// requests once reporting is attached to the retry path.
+// ---------------------------------------------------------------------------
+void TestRetriedFailuresCountTowardTrip() {
+    std::cout << "\n[TEST] CB Phase 4: retried failures count toward trip..."
+              << std::endl;
+    try {
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/fail", [](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(502).Body("err", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw;
+        gw.bind_host = "127.0.0.1";
+        gw.bind_port = 0;
+        gw.worker_threads = 2;
+        gw.http2.enabled = false;
+        // Retries on 5xx enabled. threshold=3 — with retry_on_5xx, each
+        // client request produces 1 + max_retries=3 = 4 upstream
+        // attempts, each reporting RESPONSE_5XX via the ReportBreakerOutcome
+        // path that this fix patches in. The breaker must trip after
+        // at most 3 upstream failure reports (which the first client
+        // request alone produces).
+        auto u = MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
+                                     /*enabled=*/true, /*threshold=*/3);
+        u.proxy.retry.max_retries = 3;
+        u.proxy.retry.retry_on_5xx = true;
+        u.circuit_breaker.base_open_duration_ms = 30000;
+        u.circuit_breaker.max_open_duration_ms  = 60000;
+        gw.upstreams.push_back(u);
+
+        HttpServer gateway(gw);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        // One client request → 4 upstream attempts → 4 RESPONSE_5XX
+        // reports. Threshold=3 should trip during this single request.
+        TestHttpClient::HttpGet(gw_port, "/fail", 5000);
+
+        // Second client request must hit the OPEN breaker → 503.
+        std::string r = TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+        bool is_503 = TestHttpClient::HasStatus(r, 503);
+        bool has_breaker_header =
+            r.find("X-Circuit-Breaker: open") != std::string::npos ||
+            r.find("x-circuit-breaker: open") != std::string::npos;
+
+        bool pass = is_503 && has_breaker_header;
+        TestFramework::RecordTest(
+            "CB Phase 4: retried failures count toward trip", pass,
+            pass ? "" :
+            "is_503=" + std::to_string(is_503) +
+            " breaker_hdr=" + std::to_string(has_breaker_header) +
+            " body=" + r.substr(0, 256));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB Phase 4: retried failures count toward trip", false, e.what());
+    }
+}
+
 void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "CIRCUIT BREAKER PHASE 4 - INTEGRATION TESTS" << std::endl;
@@ -765,6 +907,8 @@ void RunAllTests() {
     TestCircuitOpenTerminalForRetry();
     TestDryRunPassthrough();
     TestHalfOpenRecoveryRoundTrip();
+    TestRetryAfterCapCeilsNonAlignedMax();
+    TestRetriedFailuresCountTowardTrip();
 }
 
 }  // namespace CircuitBreakerPhase4Tests

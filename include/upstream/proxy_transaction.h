@@ -245,4 +245,16 @@ private:
     // result; the caller passes the appropriate kind for 5xx vs disconnect
     // vs timeout since the slice treats them differently only for logs.
     void ReportBreakerOutcome(int result_code);
+
+    // ReleaseBreakerAdmissionNeutral: release the admission slot without
+    // counting a success or failure. Used when the transaction is aborted
+    // locally (Cancel() on client disconnect, cancelled_ early-return
+    // after checkout, etc.) before an upstream health signal was observed.
+    //
+    // Without this, a HALF_OPEN probe slot is stranded if the client
+    // disconnects mid-probe — the slice stays in half_open_full until an
+    // external reset. No-op if admission_generation_ == 0. Clears
+    // admission_generation_ so a following ReportBreakerOutcome is a
+    // no-op.
+    void ReleaseBreakerAdmissionNeutral();
 };

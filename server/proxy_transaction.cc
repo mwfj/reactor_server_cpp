@@ -179,6 +179,11 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
         // returns to the pool for another request to use, instead of
         // sitting idle attached to a torn-down transaction.
         lease.Release();
+        // Release the breaker admission neutrally — the upstream was
+        // never exercised, and stranding the slot would wedge a
+        // HALF_OPEN probe cycle. Cancel() may already have released;
+        // the helper is no-op in that case.
+        ReleaseBreakerAdmissionNeutral();
         return;
     }
     if (state_ != State::CHECKOUT_PENDING) {
@@ -330,6 +335,13 @@ void ProxyTransaction::SendUpstreamRequest() {
         logging::Get()->warn("ProxyTransaction stale connection before send "
                              "client_fd={} service={} attempt={}",
                              client_fd_, service_name_, attempt_);
+        // Report to the breaker BEFORE retrying — MaybeRetry's
+        // AttemptCheckout will overwrite admission_generation_ on the
+        // next ConsultBreaker. Without this call, a probe in HALF_OPEN
+        // would leak its slot and the slice could stall in
+        // half_open_full; in CLOSED, the failure would be under-counted
+        // until the last retry ran through OnError.
+        ReportBreakerOutcome(RESULT_UPSTREAM_DISCONNECT);
         MaybeRetry(RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT);
         return;
     }
@@ -407,6 +419,8 @@ void ProxyTransaction::OnUpstreamData(
                              "state={} attempt={}",
                              client_fd_, service_name_, upstream_fd,
                              static_cast<int>(state_), attempt_);
+        // Report BEFORE retry — see stale-connection path above for why.
+        ReportBreakerOutcome(RESULT_UPSTREAM_DISCONNECT);
         MaybeRetry(RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT);
         return;
     }
@@ -822,6 +836,13 @@ void ProxyTransaction::Cancel() {
     if (state_ != State::INIT && state_ != State::CHECKOUT_PENDING) {
         poison_connection_ = true;
     }
+    // Release any held breaker admission neutrally before tearing down.
+    // A client disconnect during CHECKOUT_PENDING, mid-send, or mid-
+    // response leaves admission_generation_ set; without this neutral
+    // release a probe slot stays occupied and HALF_OPEN can stall in
+    // half_open_full until an external reset. No-op when no admission
+    // is held (INIT, or an outcome already reported).
+    ReleaseBreakerAdmissionNeutral();
     // Release the upstream lease back to the pool (or destroy it if
     // poisoned) and clear transport callbacks so any in-flight upstream
     // bytes land harmlessly.
@@ -939,6 +960,13 @@ void ProxyTransaction::ArmResponseTimeout(int explicit_budget_ms) {
         if (self->state_ == State::SENDING_REQUEST ||
             self->state_ == State::AWAITING_RESPONSE ||
             self->state_ == State::RECEIVING_BODY) {
+            // Report BEFORE retry — MaybeRetry's AttemptCheckout will
+            // overwrite admission_generation_ on the next
+            // ConsultBreaker, stranding the current attempt's
+            // admission (probe slot leaks in HALF_OPEN; CLOSED
+            // under-counts the failure until the last retry hits
+            // OnError).
+            self->ReportBreakerOutcome(RESULT_RESPONSE_TIMEOUT);
             self->MaybeRetry(RetryPolicy::RetryCondition::RESPONSE_TIMEOUT);
         } else {
             self->OnError(RESULT_RESPONSE_TIMEOUT, "Response timeout");
@@ -1024,8 +1052,16 @@ HttpResponse ProxyTransaction::MakeCircuitOpenResponse() const {
         // breaker longer than 5 minutes. Absolute safety ceiling of
         // 3600s (1 hour) — anything longer likely means the breaker
         // is mis-configured and the hint is noise.
+        //
+        // Ceil the cap: floor-rounding max_open_duration_ms would
+        // under-report non-second-aligned configs. E.g. a 1500ms or
+        // 6500ms (exponential-backoff saturation) max floor-rounds to
+        // 1s/6s, advertising a shorter window than the breaker will
+        // actually honor. Clients retrying on the hint would hit
+        // another avoidable 503.
+        long long cfg_ms = slice_->config().max_open_duration_ms;
         int cfg_cap_secs = static_cast<int>(
-            std::max<long long>(1, slice_->config().max_open_duration_ms / 1000));
+            std::max<long long>(1, (cfg_ms + 999) / 1000));
         int upper = std::min(cfg_cap_secs, 3600);
         if (diff < 1) diff = 1;
         if (diff > upper) diff = upper;
@@ -1093,6 +1129,21 @@ bool ProxyTransaction::ConsultBreaker() {
     // it; caller proceeds to the upstream. Fall through as admitted.
     // ADMITTED / ADMITTED_PROBE: proceed.
     return true;
+}
+
+void ProxyTransaction::ReleaseBreakerAdmissionNeutral() {
+    if (!slice_ || admission_generation_ == 0) return;
+
+    uint64_t gen = admission_generation_;
+    admission_generation_ = 0;
+    bool probe = is_probe_;
+    is_probe_ = false;
+
+    // Neutral release — no upstream health signal. Decrements the
+    // per-partition inflight (CLOSED) or the HALF_OPEN probe admitted
+    // counter, so a cancelled probe doesn't wedge the slice in
+    // half_open_full.
+    slice_->ReportNeutral(probe, gen);
 }
 
 void ProxyTransaction::ReportBreakerOutcome(int result_code) {
