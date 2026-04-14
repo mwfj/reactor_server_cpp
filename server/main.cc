@@ -328,7 +328,26 @@ static bool ReloadConfig(const std::string& config_path,
             }
         }
     }
+    // Hot-reloadable fields (today: per-upstream `circuit_breaker.*`)
+    // are the only ones that go LIVE on a SIGHUP reload. Validate
+    // them strictly — a bad value here would be pushed into running
+    // slices and keep running until an operator-driven restart fixes
+    // the config file. Hard-reject so operators see the error
+    // immediately instead of discovering drift the next time the
+    // startup path rejects the same file.
+    try {
+        ConfigLoader::ValidateHotReloadable(new_config);
+    } catch (const std::invalid_argument& e) {
+        logging::Get()->error("Config reload rejected: {}", e.what());
+        reopen_existing_logs();
+        return false;
+    }
+
     // Warn about restart-required field issues (not applied during reload).
+    // Full Validate() includes both hot-reloadable rules (already checked
+    // above) and restart-only rules; by the time we reach this point the
+    // hot-reloadable subset is known valid, so any exception thrown here
+    // is from restart-only rules and is legitimately a warn, not an error.
     try {
         ConfigLoader::Validate(new_config);
     } catch (const std::invalid_argument& e) {

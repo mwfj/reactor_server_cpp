@@ -561,6 +561,73 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     if (val) config.rate_limit.status_code = EnvToInt(val, "REACTOR_RATE_LIMIT_STATUS_CODE");
 }
 
+void ConfigLoader::ValidateHotReloadable(const ServerConfig& config) {
+    // Mirrors the circuit_breaker validation block in Validate().
+    // Kept in lock-step with that block — any rule added there for a
+    // hot-reloadable field must be added here too, or the SIGHUP
+    // reload path would silently accept values the startup path
+    // rejects (which is exactly the regression this helper exists
+    // to prevent).
+    for (size_t i = 0; i < config.upstreams.size(); ++i) {
+        const auto& u = config.upstreams[i];
+        const std::string idx = "upstreams[" + std::to_string(i) + "]";
+        const auto& cb = u.circuit_breaker;
+        if (cb.consecutive_failure_threshold < 1 ||
+            cb.consecutive_failure_threshold > 10000) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.consecutive_failure_threshold must be in [1, 10000]");
+        }
+        if (cb.failure_rate_threshold < 0 || cb.failure_rate_threshold > 100) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.failure_rate_threshold must be in [0, 100]");
+        }
+        if (cb.minimum_volume < 1 || cb.minimum_volume > 10000000) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.minimum_volume must be in [1, 10000000]");
+        }
+        if (cb.window_seconds < 1 || cb.window_seconds > 3600) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.window_seconds must be in [1, 3600]");
+        }
+        if (cb.permitted_half_open_calls < 1 ||
+            cb.permitted_half_open_calls > 1000) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.permitted_half_open_calls must be in [1, 1000]");
+        }
+        if (cb.base_open_duration_ms < 100) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.base_open_duration_ms must be >= 100");
+        }
+        if (cb.max_open_duration_ms < cb.base_open_duration_ms) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.max_open_duration_ms must be >= base_open_duration_ms");
+        }
+        if (cb.max_ejection_percent_per_host_set < 0 ||
+            cb.max_ejection_percent_per_host_set > 100) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.max_ejection_percent_per_host_set must be in [0, 100]");
+        }
+        if (cb.retry_budget_percent < 0 || cb.retry_budget_percent > 100) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.retry_budget_percent must be in [0, 100]");
+        }
+        if (cb.retry_budget_min_concurrency < 0) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.retry_budget_min_concurrency must be >= 0");
+        }
+    }
+}
+
 void ConfigLoader::Validate(const ServerConfig& config) {
     // Validate bind_host is a strict dotted-quad IPv4 address.
     // Use inet_pton (not inet_addr) to reject legacy shorthand forms

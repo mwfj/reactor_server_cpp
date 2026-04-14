@@ -27,6 +27,20 @@ public:
     // Throws std::invalid_argument if validation fails.
     static void Validate(const ServerConfig& config);
 
+    // Validate ONLY the fields that are live-reloadable without a
+    // restart — today this is the per-upstream circuit_breaker block.
+    // Used by the SIGHUP reload path, which downgrades the full
+    // `Validate()` failure to a warn because most of its rules cover
+    // restart-only fields. That downgrade is unsafe for live-
+    // reloadable fields: an invalid breaker threshold would be
+    // pushed into live slices even though the same value would be
+    // rejected at startup. Call this BEFORE applying a reloaded
+    // config and abort the reload if it throws.
+    //
+    // Throws std::invalid_argument with a message identifying the
+    // offending upstream and field.
+    static void ValidateHotReloadable(const ServerConfig& config);
+
     // Return a ServerConfig with all default values.
     static ServerConfig Default();
 

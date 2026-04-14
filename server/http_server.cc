@@ -462,15 +462,33 @@ void HttpServer::MarkServerReady() {
                         [um, service, i](circuit_breaker::State old_s,
                                          circuit_breaker::State new_s,
                                          const char* /*trigger*/) {
-                            // Drain only on CLOSED→OPEN. HALF_OPEN→OPEN
-                            // doesn't need draining — in HALF_OPEN, non-
-                            // probe admissions are already REJECTED_OPEN
-                            // before reaching the pool queue, so the
-                            // queue stays empty (or holds only probes,
-                            // which are in-flight by the time HALF_OPEN
-                            // trips back).
-                            if (old_s == circuit_breaker::State::CLOSED &&
-                                new_s == circuit_breaker::State::OPEN) {
+                            // Drain the partition's wait queue whenever
+                            // the slice enters OPEN — from CLOSED (fresh
+                            // trip) OR from HALF_OPEN (probe cycle re-
+                            // tripped).
+                            //
+                            // CLOSED→OPEN is the classic case: queued
+                            // non-probe waiters need to fail fast with
+                            // CHECKOUT_CIRCUIT_OPEN rather than wait for
+                            // the full open duration.
+                            //
+                            // HALF_OPEN→OPEN (probe_fail) matters
+                            // because probe admissions pass
+                            // ConsultBreaker() BEFORE CheckoutAsync() —
+                            // if the pool was saturated during the
+                            // probe cycle, those admitted probes may
+                            // still be queued when the cycle re-trips.
+                            // Without draining, a saw_failure probe
+                            // cycle can leave the pool with queued
+                            // waiters that still eventually dispatch to
+                            // a known-bad upstream. Draining also
+                            // sweeps any non-probe waiters that
+                            // somehow queued during HALF_OPEN (defense
+                            // in depth — TryAcquire normally rejects
+                            // non-probes before they reach the pool).
+                            if (new_s == circuit_breaker::State::OPEN &&
+                                (old_s == circuit_breaker::State::CLOSED ||
+                                 old_s == circuit_breaker::State::HALF_OPEN)) {
                                 if (auto* part = um->GetPoolPartition(
                                         service, i)) {
                                     part->DrainWaitQueueOnTrip();

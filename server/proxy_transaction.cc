@@ -124,19 +124,13 @@ void ProxyTransaction::Start() {
             auto* host = cbm->GetHost(service_name_);
             if (host) {
                 slice_ = host->GetSlice(static_cast<size_t>(dispatcher_index_));
-                // Retry budget is part of the circuit-breaker feature and
-                // must inherit its opt-in default. CircuitBreakerHost
-                // unconditionally constructs a RetryBudget (one-per-host)
-                // so the pointer is always available — but engaging it
-                // when `circuit_breaker.enabled=false` would silently
-                // regress deployments that set `proxy.retry.max_retries>0`
-                // without ever opting into circuit breaking: a retry
-                // storm would suddenly see 503+X-Retry-Budget-Exhausted.
-                // Gate on the slice's live config so the enabled-toggle
-                // flip is the sole switch for the whole feature.
-                if (slice_ && slice_->config().enabled) {
-                    retry_budget_ = host->GetRetryBudget();
-                }
+                // Cache the retry-budget pointer unconditionally when
+                // the host exists — usage at each attempt is gated by
+                // the live `slice_->config().enabled` flag so that
+                // SIGHUP toggles take effect on the next retry within
+                // a running transaction. Resolution-time gating would
+                // miss the flip in either direction.
+                retry_budget_ = host->GetRetryBudget();
             }
         }
     }
@@ -164,17 +158,22 @@ void ProxyTransaction::AttemptCheckout() {
     // during its backoff sleep — the budget's `retries_in_flight`
     // reflects only retries that are actually about to reach (or are
     // reaching) the upstream, matching the "aggregate upstream load"
-    // semantics of the %-of-in-flight cap. Gating in MaybeRetry
-    // instead would count queued-but-sleeping retries toward the cap
-    // and trigger X-Retry-Budget-Exhausted even when no retry has
-    // actually contacted the upstream yet.
+    // semantics of the %-of-in-flight cap.
+    //
+    // Live-check `slice_->config().enabled` at each attempt — the
+    // cached `retry_budget_` pointer is resolved once in Start(), but
+    // the `enabled` flag is the documented live master switch. A
+    // SIGHUP flipping enabled=true→false mid-flight must stop
+    // enforcing the budget on subsequent retries; enabled=false→true
+    // mid-flight must start. Gating at the pointer level would miss
+    // both directions.
     //
     // The `!retry_token_held_` guard is defensive — Cleanup() between
-    // retry attempts always releases the prior token, so this branch
-    // never normally sees an already-held token; the check only
-    // prevents a re-entrant AttemptCheckout from double-consuming.
-    if (retry_budget_ && attempt_ > 0 && !retry_token_held_) {
-        bool is_dry_run = slice_ && slice_->config().dry_run;
+    // retry attempts always releases the prior token.
+    bool breaker_live_enabled = slice_ && slice_->config().enabled;
+    if (retry_budget_ && breaker_live_enabled &&
+        attempt_ > 0 && !retry_token_held_) {
+        bool is_dry_run = slice_->config().dry_run;
         if (retry_budget_->TryConsumeRetry()) {
             retry_token_held_ = true;
         } else if (is_dry_run) {
@@ -191,6 +190,17 @@ void ProxyTransaction::AttemptCheckout() {
                 retry_budget_->RetriesInFlight(),
                 retry_budget_->ComputeCap(),
                 client_fd_, attempt_);
+            // CRITICAL: release the slice admission before bailing.
+            // ConsultBreaker() already admitted this attempt — in
+            // HALF_OPEN that means a probe slot was reserved
+            // (half_open_inflight_ / half_open_admitted_ both
+            // incremented). Returning here without releasing would
+            // strand that slot forever, wedging the slice in
+            // half_open_full until an operator-driven reload/reset.
+            // Neutral release decrements both counters for probes;
+            // no-op for non-probe (CLOSED) admissions, matching the
+            // general "local cause, no upstream signal" semantic.
+            ReleaseBreakerAdmissionNeutral();
             state_ = State::FAILED;
             DeliverResponse(MakeRetryBudgetResponse());
             return;
@@ -198,12 +208,11 @@ void ProxyTransaction::AttemptCheckout() {
     }
 
     // Track this attempt against the host-level retry budget's
-    // in_flight counter. Replaces any prior guard (from the previous
-    // attempt of the same transaction) — move-assignment decrements
-    // the old counter and takes ownership of the new, so a retrying
-    // transaction stays at exactly one in_flight unit throughout. No-op
-    // when retry_budget_ is null (no breaker attached for this service).
-    if (retry_budget_) {
+    // in_flight counter. Gated by the live `enabled` flag so disabling
+    // the breaker mid-flight stops tracking immediately; enabling it
+    // starts tracking at the next attempt. No-op when retry_budget_
+    // is null (no breaker manager / unknown host).
+    if (retry_budget_ && breaker_live_enabled) {
         inflight_guard_ = retry_budget_->TrackInFlight();
     }
 
