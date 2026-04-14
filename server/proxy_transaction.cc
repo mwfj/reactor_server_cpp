@@ -124,13 +124,19 @@ void ProxyTransaction::Start() {
             auto* host = cbm->GetHost(service_name_);
             if (host) {
                 slice_ = host->GetSlice(static_cast<size_t>(dispatcher_index_));
-                // Retry budget is host-level (shared across partitions).
-                // Resolve from the same host so retry admission math stays
-                // consistent with the slice's dispatcher routing. Always
-                // non-null when the host exists (budget is unconditionally
-                // constructed by the host ctor). Null only when `host`
-                // itself is null.
-                retry_budget_ = host->GetRetryBudget();
+                // Retry budget is part of the circuit-breaker feature and
+                // must inherit its opt-in default. CircuitBreakerHost
+                // unconditionally constructs a RetryBudget (one-per-host)
+                // so the pointer is always available — but engaging it
+                // when `circuit_breaker.enabled=false` would silently
+                // regress deployments that set `proxy.retry.max_retries>0`
+                // without ever opting into circuit breaking: a retry
+                // storm would suddenly see 503+X-Retry-Budget-Exhausted.
+                // Gate on the slice's live config so the enabled-toggle
+                // flip is the sole switch for the whole feature.
+                if (slice_ && slice_->config().enabled) {
+                    retry_budget_ = host->GetRetryBudget();
+                }
             }
         }
     }
@@ -151,6 +157,44 @@ void ProxyTransaction::AttemptCheckout() {
     // the decision enum (REJECTED_OPEN_DRYRUN), so ConsultBreaker proceeds.
     if (!ConsultBreaker()) {
         return;
+    }
+
+    // Retry-budget gate for retry attempts (attempt_ > 0). Gating here
+    // rather than in MaybeRetry means a delayed retry holds no token
+    // during its backoff sleep — the budget's `retries_in_flight`
+    // reflects only retries that are actually about to reach (or are
+    // reaching) the upstream, matching the "aggregate upstream load"
+    // semantics of the %-of-in-flight cap. Gating in MaybeRetry
+    // instead would count queued-but-sleeping retries toward the cap
+    // and trigger X-Retry-Budget-Exhausted even when no retry has
+    // actually contacted the upstream yet.
+    //
+    // The `!retry_token_held_` guard is defensive — Cleanup() between
+    // retry attempts always releases the prior token, so this branch
+    // never normally sees an already-held token; the check only
+    // prevents a re-entrant AttemptCheckout from double-consuming.
+    if (retry_budget_ && attempt_ > 0 && !retry_token_held_) {
+        bool is_dry_run = slice_ && slice_->config().dry_run;
+        if (retry_budget_->TryConsumeRetry()) {
+            retry_token_held_ = true;
+        } else if (is_dry_run) {
+            logging::Get()->info(
+                "ProxyTransaction retry budget would-reject (dry-run) "
+                "client_fd={} service={} attempt={}",
+                client_fd_, service_name_, attempt_);
+        } else {
+            logging::Get()->warn(
+                "retry budget exhausted service={} in_flight={} "
+                "retries_in_flight={} cap={} client_fd={} attempt={}",
+                service_name_,
+                retry_budget_->InFlight(),
+                retry_budget_->RetriesInFlight(),
+                retry_budget_->ComputeCap(),
+                client_fd_, attempt_);
+            state_ = State::FAILED;
+            DeliverResponse(MakeRetryBudgetResponse());
+            return;
+        }
     }
 
     // Track this attempt against the host-level retry budget's
@@ -691,8 +735,12 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
 
         // Release old lease, clear callbacks, poison if tainted.
         // Cleanup also releases any retry token held by the previous
-        // retry attempt (attempt_ > 1) so the next TryConsumeRetry sees
-        // a fresh counter.
+        // retry attempt so the next TryConsumeRetry in AttemptCheckout
+        // sees a fresh counter. The retry-budget gate itself now lives
+        // at the top of AttemptCheckout — that way a delayed retry
+        // doesn't hold a token during its backoff sleep, which would
+        // otherwise pollute the budget's retries_in_flight with
+        // queued-but-sleeping work that hasn't reached the upstream.
         Cleanup();
         codec_.Reset();
         // Re-apply request method after reset — llhttp_init() zeroes
@@ -700,49 +748,6 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
         // carry a body, causing the retried request to hang.
         codec_.SetRequestMethod(method_);
         poison_connection_ = false;
-
-        // Retry-budget gate. `attempt_ > 0` here is guaranteed — we
-        // just incremented. The budget bounds how many retries can be
-        // concurrently in flight against this upstream HOST (aggregated
-        // across all transactions for the service), preventing a retry
-        // storm from amplifying traffic to a struggling backend.
-        //
-        // Dry-run: log the would-reject but still proceed (consistent
-        // with REJECTED_OPEN_DRYRUN on the slice path). No token is
-        // consumed, so no ReleaseRetry is needed on the dry-run path.
-        //
-        // Full mode: deliver the §12.2 retry-budget response (503 +
-        // X-Retry-Budget-Exhausted) and terminate. Does NOT call
-        // ReportBreakerOutcome — our own reject must not feed back
-        // into the slice's failure math.
-        if (retry_budget_) {
-            bool is_dry_run = slice_ && slice_->config().dry_run;
-            if (retry_budget_->TryConsumeRetry()) {
-                retry_token_held_ = true;
-            } else if (is_dry_run) {
-                logging::Get()->info(
-                    "ProxyTransaction retry budget would-reject (dry-run) "
-                    "client_fd={} service={} attempt={}",
-                    client_fd_, service_name_, attempt_);
-            } else {
-                // §11.1 format: log per-host budget state so operators
-                // can diagnose retry-storm throttling without hitting
-                // an admin endpoint. `cap` is the live effective ceiling
-                // (may have shifted since the failing TryConsumeRetry
-                // due to other transactions' in_flight changes).
-                logging::Get()->warn(
-                    "retry budget exhausted service={} in_flight={} "
-                    "retries_in_flight={} cap={} client_fd={} attempt={}",
-                    service_name_,
-                    retry_budget_->InFlight(),
-                    retry_budget_->RetriesInFlight(),
-                    retry_budget_->ComputeCap(),
-                    client_fd_, attempt_);
-                state_ = State::FAILED;
-                DeliverResponse(MakeRetryBudgetResponse());
-                return;
-            }
-        }
 
         // Condition-dependent first-retry policy:
         // Connection-level failures (stale keep-alive, connect refused)
@@ -1089,18 +1094,26 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
     }
     if (result_code == RESULT_CIRCUIT_OPEN) {
         // The static factory has no `this`, so it cannot build the
-        // §12.1-compliant response (Retry-After / X-Circuit-Breaker /
-        // X-Upstream-Host). All in-class paths for CIRCUIT_OPEN use
-        // the non-static MakeCircuitOpenResponse() — reaching this
-        // branch means a future caller forgot that rule, and would
-        // silently serve a non-compliant 503. Log loudly so the
-        // mistake shows up in logs instead of producing a stealth
-        // regression against the public contract.
+        // fully §12.1-compliant response (Retry-After derived from
+        // slice state, X-Upstream-Host). All in-class paths for
+        // CIRCUIT_OPEN use the non-static MakeCircuitOpenResponse()
+        // — reaching this branch means a future caller forgot that
+        // rule. Log loudly so the mistake shows up in logs instead
+        // of producing a stealth regression against the contract.
+        //
+        // Still emit `X-Circuit-Breaker: open` + `Connection: close`
+        // so the response remains self-identifying as a circuit-open
+        // reject. Clients inspecting that header will correctly back
+        // off via their own client-side logic rather than treating
+        // this as an anonymous 503.
         logging::Get()->error(
             "ProxyTransaction::MakeErrorResponse(RESULT_CIRCUIT_OPEN) "
             "invoked from static context — use MakeCircuitOpenResponse() "
             "to emit §12.1-compliant headers");
-        return HttpResponse::ServiceUnavailable();
+        HttpResponse resp = HttpResponse::ServiceUnavailable();
+        resp.Header("X-Circuit-Breaker", "open");
+        resp.Header("Connection", "close");
+        return resp;
     }
     if (result_code == RESULT_CHECKOUT_FAILED ||
         result_code == RESULT_SEND_FAILED ||

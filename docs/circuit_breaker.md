@@ -134,7 +134,7 @@ Topology edits (`host`, `port`, `pool.*`, `proxy.*`, `tls.*`) still require a re
 
 ### Snapshot API
 
-`CircuitBreakerManager::SnapshotAll()` returns one `CircuitBreakerHostSnapshot` per upstream with per-slice rows (`state`, `trips`, `rejected`, `probe_successes`, `probe_failures`) plus host-level aggregates (`total_trips`, `total_rejected`, `open_partitions`, `half_open_partitions`, `retries_in_flight`, `retries_rejected`, `in_flight`). A future `/admin/breakers` endpoint would JSON-serialize this.
+`CircuitBreakerManager::SnapshotAll()` returns one `CircuitBreakerHostSnapshot` per upstream with per-slice rows (`state`, `trips`, `rejected`, `probe_successes`, `probe_failures`) plus host-level aggregates (`total_trips`, `total_rejected`, `open_partitions`, `half_open_partitions`, `retries_in_flight`, `retries_rejected`, `in_flight`). A `/admin/breakers` HTTP endpoint that JSON-serializes this snapshot is **planned but not yet exposed** — the API is ready for future wiring.
 
 ---
 
