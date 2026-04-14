@@ -49,11 +49,11 @@ std::chrono::nanoseconds CircuitBreakerSlice::ComputeOpenDuration() const {
     return std::chrono::milliseconds(scaled_ms);
 }
 
-bool CircuitBreakerSlice::ShouldTripClosed() {
+bool CircuitBreakerSlice::ShouldTripClosed(
+        std::chrono::steady_clock::time_point now) {
     if (consecutive_failures_ >= config_.consecutive_failure_threshold) {
         return true;
     }
-    auto now = Now();
     int64_t total = window_.TotalCount(now);
     if (total < config_.minimum_volume) return false;
     int64_t fails = window_.FailureCount(now);
@@ -406,9 +406,15 @@ void CircuitBreakerSlice::ReportFailure(FailureKind kind, bool probe,
     if (state_.load(std::memory_order_acquire) != State::CLOSED) return;
 
     consecutive_failures_++;
-    window_.AddFailure(Now());
+    // Capture Now() once and reuse for both the record and the trip check.
+    // Separate Now() calls can cross a second boundary, letting TotalCount's
+    // internal Advance() zero the bucket we just wrote — with window_seconds=1,
+    // a 1-second delta trips the Advance full-reset path and the just-recorded
+    // failure disappears from the ring, missing a rate trip that should fire.
+    auto now = Now();
+    window_.AddFailure(now);
 
-    if (ShouldTripClosed()) {
+    if (ShouldTripClosed(now)) {
         const char* trigger =
             (consecutive_failures_ >= config_.consecutive_failure_threshold)
                 ? "consecutive" : "rate";

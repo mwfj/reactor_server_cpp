@@ -362,9 +362,8 @@ namespace ConfigTests {
                         cb.permitted_half_open_calls == 5 &&
                         cb.base_open_duration_ms == 5000 &&
                         cb.max_open_duration_ms == 60000 &&
-                        cb.max_ejection_percent_per_host_set == 50 &&
-                        cb.retry_budget_percent == 20 &&
-                        cb.retry_budget_min_concurrency == 3;
+                        cb.max_ejection_percent_per_host_set == 50;
+            // retry_budget_* fields removed from Phase 2 — Phase 3 adds.
             TestFramework::RecordTest("Circuit Breaker Defaults", pass,
                 pass ? "" : "default value mismatch",
                 TestFramework::TestCategory::OTHER);
@@ -393,9 +392,7 @@ namespace ConfigTests {
                         "permitted_half_open_calls": 3,
                         "base_open_duration_ms": 2000,
                         "max_open_duration_ms": 120000,
-                        "max_ejection_percent_per_host_set": 33,
-                        "retry_budget_percent": 10,
-                        "retry_budget_min_concurrency": 5
+                        "max_ejection_percent_per_host_set": 33
                     }
                 }]
             })";
@@ -409,9 +406,7 @@ namespace ConfigTests {
                         cb.permitted_half_open_calls == 3 &&
                         cb.base_open_duration_ms == 2000 &&
                         cb.max_open_duration_ms == 120000 &&
-                        cb.max_ejection_percent_per_host_set == 33 &&
-                        cb.retry_budget_percent == 10 &&
-                        cb.retry_budget_min_concurrency == 5;
+                        cb.max_ejection_percent_per_host_set == 33;
             TestFramework::RecordTest("Circuit Breaker JSON Parse", pass,
                 pass ? "" : "parsed values mismatch",
                 TestFramework::TestCategory::OTHER);
@@ -525,12 +520,8 @@ namespace ConfigTests {
         ExpectValidationFailure("CB Validation: max<base",
             R"({"base_open_duration_ms": 5000, "max_open_duration_ms": 1000})",
             "max_open_duration_ms must be >= base_open_duration_ms");
-        ExpectValidationFailure("CB Validation: retry_budget_percent>100",
-            R"({"retry_budget_percent": 200})",
-            "retry_budget_percent must be in [0, 100]");
-        ExpectValidationFailure("CB Validation: retry_budget_min_concurrency<0",
-            R"({"retry_budget_min_concurrency": -1})",
-            "retry_budget_min_concurrency must be >= 0");
+        // retry_budget_percent / retry_budget_min_concurrency validation
+        // cases removed — fields moved to Phase 3.
         ExpectValidationFailure("CB Validation: max_ejection_percent>100",
             R"({"max_ejection_percent_per_host_set": 150})",
             "max_ejection_percent_per_host_set must be in [0, 100]");

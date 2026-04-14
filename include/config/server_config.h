@@ -152,10 +152,12 @@ struct CircuitBreakerConfig {
     // Safety valve (future-proof for load-balanced services; no-op v1).
     int max_ejection_percent_per_host_set = 50;
 
-    // Retry budget (orthogonal to the breaker). Caps concurrent retries to
-    // max(retry_budget_min_concurrency, in_flight * retry_budget_percent/100).
-    int retry_budget_percent = 20;
-    int retry_budget_min_concurrency = 3;
+    // NOTE: retry_budget_percent and retry_budget_min_concurrency have been
+    // REMOVED from Phase 2. They'll be re-added in Phase 3 when the
+    // RetryBudget class is introduced (design §4.5). Exposing them here as
+    // config knobs without any runtime code reading them was misleading to
+    // operators — setting them produced no protection against retry storms
+    // since ProxyHandler's RetryPolicy reads proxy.retry.*, not these fields.
 
     bool operator==(const CircuitBreakerConfig& o) const {
         return enabled == o.enabled &&
@@ -167,9 +169,7 @@ struct CircuitBreakerConfig {
                permitted_half_open_calls == o.permitted_half_open_calls &&
                base_open_duration_ms == o.base_open_duration_ms &&
                max_open_duration_ms == o.max_open_duration_ms &&
-               max_ejection_percent_per_host_set == o.max_ejection_percent_per_host_set &&
-               retry_budget_percent == o.retry_budget_percent &&
-               retry_budget_min_concurrency == o.retry_budget_min_concurrency;
+               max_ejection_percent_per_host_set == o.max_ejection_percent_per_host_set;
     }
     bool operator!=(const CircuitBreakerConfig& o) const { return !(*this == o); }
 };

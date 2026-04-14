@@ -286,10 +286,9 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     cb.value("max_open_duration_ms", 60000);
                 upstream.circuit_breaker.max_ejection_percent_per_host_set =
                     cb.value("max_ejection_percent_per_host_set", 50);
-                upstream.circuit_breaker.retry_budget_percent =
-                    cb.value("retry_budget_percent", 20);
-                upstream.circuit_breaker.retry_budget_min_concurrency =
-                    cb.value("retry_budget_min_concurrency", 3);
+                // retry_budget_* fields removed from Phase 2 — re-added in
+                // Phase 3 when the RetryBudget class lands. Unknown keys in
+                // input JSON are silently ignored by nlohmann::json.
             }
 
             config.upstreams.push_back(std::move(upstream));
@@ -873,16 +872,7 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                         idx + " ('" + u.name +
                         "'): circuit_breaker.max_ejection_percent_per_host_set must be in [0, 100]");
                 }
-                if (cb.retry_budget_percent < 0 || cb.retry_budget_percent > 100) {
-                    throw std::invalid_argument(
-                        idx + " ('" + u.name +
-                        "'): circuit_breaker.retry_budget_percent must be in [0, 100]");
-                }
-                if (cb.retry_budget_min_concurrency < 0) {
-                    throw std::invalid_argument(
-                        idx + " ('" + u.name +
-                        "'): circuit_breaker.retry_budget_min_concurrency must be >= 0");
-                }
+                // retry_budget_* validation removed — fields moved to Phase 3.
             }
             // Validate method names — reject unknowns and duplicates.
             // Duplicates would cause RouteAsync to throw at startup.
@@ -1164,10 +1154,7 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
                 u.circuit_breaker.max_open_duration_ms;
             cbj["max_ejection_percent_per_host_set"] =
                 u.circuit_breaker.max_ejection_percent_per_host_set;
-            cbj["retry_budget_percent"] =
-                u.circuit_breaker.retry_budget_percent;
-            cbj["retry_budget_min_concurrency"] =
-                u.circuit_breaker.retry_budget_min_concurrency;
+            // retry_budget_* fields dropped from serialization — Phase 3 adds.
             uj["circuit_breaker"] = cbj;
         }
         j["upstreams"].push_back(uj);

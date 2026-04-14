@@ -205,7 +205,12 @@ private:
     std::chrono::nanoseconds ComputeOpenDuration() const;
 
     // Check whether CLOSED trip conditions are met. Called after every failure.
-    bool ShouldTripClosed();
+    // Takes `now` as a parameter so the caller can record the failure and
+    // evaluate the trip against THE SAME timestamp — otherwise a clock tick
+    // between AddFailure() and ShouldTripClosed() can advance the ring and
+    // wipe the just-recorded failure (critical when window_seconds is small:
+    // with window=1, a 1-second delta triggers the full-reset path).
+    bool ShouldTripClosed(std::chrono::steady_clock::time_point now);
 
     std::chrono::steady_clock::time_point Now() const;
 };

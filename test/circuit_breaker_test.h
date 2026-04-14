@@ -1538,6 +1538,70 @@ void TestWindowResizeResetConsecutiveFailures() {
     }
 }
 
+// BUG (review round 9, P2-1): ReportFailure captured Now() separately in
+// AddFailure() and ShouldTripClosed()'s internal TotalCount/FailureCount
+// calls. If a second boundary elapsed between the two calls, Advance() could
+// wipe the just-recorded failure — with window_seconds=1, the 1-second delta
+// hits the delta >= window_seconds full-reset path and the failure
+// disappears before the trip evaluation runs. Fix: capture Now() once in
+// ReportFailure and thread it through ShouldTripClosed(now), AddFailure(now).
+//
+// Regression test injects a time source that returns T on the first call
+// and T+1s on every subsequent call, simulating the boundary crossing.
+// Post-fix, ReportFailure only calls Now() once — the fix is effective.
+// Pre-fix, the second Now() call inside ShouldTripClosed would advance the
+// ring and wipe the failure → no trip.
+void TestReportFailureUsesOneTimestampAcrossTripEval() {
+    std::cout << "\n[TEST] CB: ReportFailure uses single timestamp for trip eval..."
+              << std::endl;
+    try {
+        CircuitBreakerConfig cb;
+        cb.enabled = true;
+        cb.consecutive_failure_threshold = 1000;  // disable consec path
+        cb.failure_rate_threshold = 100;          // rate=100% to trip on fail
+        cb.minimum_volume = 1;                    // single failure suffices
+        cb.window_seconds = 1;                    // boundary-sensitive
+        cb.permitted_half_open_calls = 5;
+        cb.base_open_duration_ms = 5000;
+        cb.max_open_duration_ms = 60000;
+
+        // Time source returns base on call #1 and base+1s on every call after.
+        // This simulates a clock tick between AddFailure (call 1) and any
+        // subsequent Now() inside ShouldTripClosed (call 2+).
+        auto base = std::chrono::steady_clock::time_point(
+            std::chrono::seconds(1'000'000));
+        int call_count = 0;
+        auto time_source = [&call_count, base]() {
+            int n = call_count++;
+            return n == 0 ? base : base + std::chrono::seconds(1);
+        };
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb, time_source);
+
+        // Admit + fail one request.
+        // Pre-fix trace (BUGGY): AddFailure(base) records in bucket[0]. Then
+        //   ShouldTripClosed()'s internal TotalCount(base+1s) calls Advance
+        //   → delta=1 >= window=1 → full reset wipes the bucket → total=0 <
+        //   minimum_volume=1 → NO TRIP. Rate trip missed.
+        // Post-fix: ReportFailure captures Now() once (=base), passes to
+        //   AddFailure(base) AND ShouldTripClosed(base). Ring stays aligned;
+        //   total=1, failures=1 → rate fires → TRIP to OPEN.
+        auto a = slice.TryAcquire();
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, false, a.generation);
+
+        bool pass = slice.CurrentState() == State::OPEN;
+        TestFramework::RecordTest(
+            "CB: ReportFailure uses single timestamp for trip eval",
+            pass, pass ? "" :
+                  "expected OPEN, got state=" +
+                  std::to_string(static_cast<int>(slice.CurrentState())),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: ReportFailure uses single timestamp for trip eval",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // BUG (review round 8, P2): CircuitBreakerWindow's constructor allocated
 // `max(1, window_seconds)` buckets but stored the RAW window_seconds_ value.
 // Programmatic callers bypassing ConfigLoader::Validate() (tests, future
@@ -1656,6 +1720,7 @@ void RunAllTests() {
     TestWindowResizeResetConsecutiveFailures();
     TestHalfOpenBudgetFrozenAcrossReload();
     TestWindowNonPositiveWindowSizeClamp();
+    TestReportFailureUsesOneTimestampAcrossTripEval();
     TestTransitionCallbackInvoked();
 }
 
