@@ -20,7 +20,14 @@
 //
 // All -1 paths log a debug entry rather than throwing — push is best-
 // effort by design; a failed push must never break the parent response.
-namespace http {
+//
+// Namespace naming: follows the project convention (CODE_CONVENTIONS.md)
+// of UPPER_SNAKE_CASE namespace identifiers, matching the sibling
+// HTTP_CALLBACKS_NAMESPACE / HTTP2_CALLBACKS_NAMESPACE / UPSTREAM_CALLBACKS_NAMESPACE
+// pattern. The name is HTTP2-specific (not generic "http") because
+// server push is defined in RFC 9113 §8.4 and is not available on
+// HTTP/1.x — calling the helper on an H1 connection returns -1.
+namespace HTTP2_PUSH_NAMESPACE {
 
 int32_t PushResource(const std::string& method,
                      const std::string& scheme,
@@ -28,4 +35,4 @@ int32_t PushResource(const std::string& method,
                      const std::string& path,
                      const HttpResponse& response);
 
-}  // namespace http
+}  // namespace HTTP2_PUSH_NAMESPACE

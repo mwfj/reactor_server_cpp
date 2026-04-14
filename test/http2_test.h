@@ -3742,10 +3742,10 @@ void TestH2_Push_NotCountedInTotalRequests() {
     }
 }
 
-// T9.10: Sync handler can issue a push via http::PushResource(), which
+// T9.10: Sync handler can issue a push via HTTP2_PUSH_NAMESPACE::PushResource(), which
 // reads HttpServer::current_sync_pusher_ installed around router_.Dispatch.
 void TestH2_Push_SyncHandlerViaThreadLocal() {
-    std::cout << "\n[TEST] H2 Push: sync handler via http::PushResource..."
+    std::cout << "\n[TEST] H2 Push: sync handler via HTTP2_PUSH_NAMESPACE::PushResource..."
               << std::endl;
     try {
         ServerConfig cfg = MakeH2Config(0);
@@ -3753,11 +3753,11 @@ void TestH2_Push_SyncHandlerViaThreadLocal() {
         HttpServer server(cfg);
         // Register a SYNC handler — only the H2 sync dispatch path
         // installs the thread-local pusher; the sync handler invokes
-        // http::PushResource() directly.
+        // HTTP2_PUSH_NAMESPACE::PushResource() directly.
         server.Get("/", [](const HttpRequest&, HttpResponse& res) {
             HttpResponse pushed;
             pushed.Status(200).Body(kPushedBody, "text/css");
-            int32_t promised = http::PushResource(
+            int32_t promised = HTTP2_PUSH_NAMESPACE::PushResource(
                 "GET", "http", "localhost", "/style.css", pushed);
             (void)promised;  // best-effort; the wire effect is the assertion
             res.Status(200).Body("<html/>", "text/html");
@@ -3783,20 +3783,20 @@ void TestH2_Push_SyncHandlerViaThreadLocal() {
         }
         client.Disconnect();
         TestFramework::RecordTest(
-            "H2 Push: sync handler via http::PushResource", pass, err,
+            "H2 Push: sync handler via HTTP2_PUSH_NAMESPACE::PushResource", pass, err,
             TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "H2 Push: sync handler via http::PushResource", false, e.what(),
+            "H2 Push: sync handler via HTTP2_PUSH_NAMESPACE::PushResource", false, e.what(),
             TestFramework::TestCategory::OTHER);
     }
 }
 
 // T9.11: HTTP/1 connection — the framework does not install a pusher
-// slot for H1 sync dispatch (push is HTTP/2 only). http::PushResource
+// slot for H1 sync dispatch (push is HTTP/2 only). HTTP2_PUSH_NAMESPACE::PushResource
 // returns -1 with a debug log; no pushed stream is fabricated.
 void TestH2_Push_OnHttp1Connection() {
-    std::cout << "\n[TEST] H2 Push: http::PushResource on H1 returns -1..."
+    std::cout << "\n[TEST] H2 Push: HTTP2_PUSH_NAMESPACE::PushResource on H1 returns -1..."
               << std::endl;
     try {
         ServerConfig cfg = MakeH2Config(0);
@@ -3807,7 +3807,7 @@ void TestH2_Push_OnHttp1Connection() {
         server.Get("/", [last_promised](const HttpRequest&, HttpResponse& res) {
             HttpResponse pushed;
             pushed.Status(200).Body(kPushedBody, "text/css");
-            int32_t r = http::PushResource(
+            int32_t r = HTTP2_PUSH_NAMESPACE::PushResource(
                 "GET", "http", "localhost", "/style.css", pushed);
             last_promised->store(r, std::memory_order_relaxed);
             res.Status(200).Body("ok", "text/plain");
@@ -3847,15 +3847,15 @@ void TestH2_Push_OnHttp1Connection() {
         }
         if (last_promised->load() != -1) {
             pass = false;
-            err += "http::PushResource on H1 must return -1, got " +
+            err += "HTTP2_PUSH_NAMESPACE::PushResource on H1 must return -1, got " +
                    std::to_string(last_promised->load()) + "; ";
         }
         TestFramework::RecordTest(
-            "H2 Push: http::PushResource on H1 returns -1", pass, err,
+            "H2 Push: HTTP2_PUSH_NAMESPACE::PushResource on H1 returns -1", pass, err,
             TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "H2 Push: http::PushResource on H1 returns -1", false, e.what(),
+            "H2 Push: HTTP2_PUSH_NAMESPACE::PushResource on H1 returns -1", false, e.what(),
             TestFramework::TestCategory::OTHER);
     }
 }

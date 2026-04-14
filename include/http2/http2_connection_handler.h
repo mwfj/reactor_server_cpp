@@ -108,8 +108,9 @@ public:
     //     lambda before enqueuing complete()).
     //
     // Application code should use the bound ResourcePusher closure
-    // (async routes) or http::PushResource (sync routes) rather than
-    // calling this directly.
+    // (async routes) or HTTP2_PUSH_NAMESPACE::PushResource (sync
+    // routes — see include/http/push_helper.h) rather than calling
+    // this directly.
     int32_t PushResource(
         int32_t parent_stream_id,
         const std::string& method,

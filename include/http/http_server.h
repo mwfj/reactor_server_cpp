@@ -166,11 +166,11 @@ public:
     // currently executing on this thread. Installed by the H1 / H2 sync
     // dispatch sites around router_.Dispatch with a scope guard so it is
     // never dangling outside a dispatch. Read by the free helper
-    // http::PushResource() so synchronous handlers can issue HTTP/2 pushes
+    // HTTP2_PUSH_NAMESPACE::PushResource() so synchronous handlers can issue HTTP/2 pushes
     // without changing the sync handler signature. Always nullptr outside
     // a dispatch (the helper returns -1 with a debug log in that case).
     //
-    // Public-not-private because http::PushResource (declared in
+    // Public-not-private because HTTP2_PUSH_NAMESPACE::PushResource (declared in
     // include/http/push_helper.h) needs direct access; kept inside the
     // class so it is namespaced under HttpServer:: rather than polluting
     // the global / http namespace with a free thread-local.

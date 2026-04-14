@@ -13,8 +13,8 @@
 
 // Definition of the per-thread sync push slot. See declaration in
 // include/http/http_server.h. Initial value is nullptr — the helper
-// http::PushResource() returns -1 with a debug log when the slot is
-// null (called outside any sync dispatch).
+// HTTP2_PUSH_NAMESPACE::PushResource() returns -1 with a debug log
+// when the slot is null (called outside any sync dispatch).
 thread_local HTTP_CALLBACKS_NAMESPACE::ResourcePusher*
     HttpServer::current_sync_pusher_ = nullptr;
 
@@ -38,7 +38,7 @@ MakeH2ResourcePusher(std::weak_ptr<Http2ConnectionHandler> h2_weak,
     };
 }
 
-namespace http {
+namespace HTTP2_PUSH_NAMESPACE {
 
 int32_t PushResource(const std::string& method,
                      const std::string& scheme,
@@ -51,13 +51,13 @@ int32_t PushResource(const std::string& method,
         // was installed but the closure itself is empty. Either way,
         // treat as "push not available right now" rather than crashing.
         logging::Get()->debug(
-            "http::PushResource called outside a sync dispatch; ignored");
+            "HTTP2_PUSH_NAMESPACE::PushResource called outside a sync dispatch; ignored");
         return -1;
     }
     return (*p)(method, scheme, authority, path, response);
 }
 
-}  // namespace http
+}  // namespace HTTP2_PUSH_NAMESPACE
 
 // RAII guard: decrements an atomic counter on scope exit. Used in request
 // dispatch callbacks to ensure active_requests_ is decremented even on throw.
@@ -3353,7 +3353,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
 
             // Sync H2 dispatch path: install a thread-local ResourcePusher
             // so synchronous handlers can issue HTTP/2 server push via
-            // http::PushResource() without changing the sync handler
+            // HTTP2_PUSH_NAMESPACE::PushResource() without changing the sync handler
             // signature. Push remains opt-in via http2.enable_push and
             // is gated per-connection by the peer's SETTINGS_ENABLE_PUSH
             // — the closure delegates to PushResource which enforces
