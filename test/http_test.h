@@ -1460,6 +1460,141 @@ namespace HttpTests {
         }
     }
 
+    // T7: CR/LF in interim header values must not inject extra headers
+    // or body bytes into the 1xx block. Without sanitization, a handler
+    // that forwards a Link header whose value contains "\r\nInjected:
+    // foo" would leak a forged downstream header into the client's view
+    // of the response — a classic response-splitting pathway. The
+    // interim serializer mirrors HttpResponse::Header's strip policy.
+    void TestH1_EarlyHints_CRLFSanitized() {
+        std::cout << "\n[TEST] H1 103 Early Hints: CR/LF header sanitized..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync("/inject",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender send_interim,
+                   HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::AsyncCompletionCallback complete) {
+                    send_interim(103, {
+                        {"Link", "</a.css>; rel=preload\r\nInjected: leaked"}
+                    });
+                    HttpResponse r;
+                    r.Status(200).Text("ok");
+                    complete(std::move(r));
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(port,
+                "GET /inject HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            if (resp.find("HTTP/1.1 103") == std::string::npos) {
+                pass = false; err += "missing 103; ";
+            }
+            if (resp.find("HTTP/1.1 200") == std::string::npos) {
+                pass = false; err += "missing 200; ";
+            }
+            // Attack succeeds only if "Injected:" appears at the start
+            // of its own header line (preceded by CRLF). After
+            // sanitization the CR and LF are removed, so the attempted
+            // injection collapses into the Link value — the substring
+            // "Injected:" is still present, but NOT as a standalone
+            // header. Assert on the standalone-line form.
+            if (resp.find("\r\nInjected:") != std::string::npos) {
+                pass = false; err += "CRLF injection observed (standalone header line); ";
+            }
+            TestFramework::RecordTest("H1 103 Early Hints: CR/LF header sanitized",
+                                      pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("H1 103 Early Hints: CR/LF header sanitized",
+                                      false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // T8: Worker-thread interleave — a handler that calls complete() from
+    // a worker thread followed by send_interim() from the same worker
+    // must not be able to queue a 103 AFTER the 200 on the wire.
+    // Without the off-dispatcher hop, send_interim would observe
+    // final_response_sent_=false (not yet set by the queued final
+    // lambda), build the 103, and SendRaw would enqueue AFTER the
+    // final-response lambda — clients would observe 200 followed by
+    // 103. The hop re-orders the check through the dispatcher so it
+    // runs after the final write and drops.
+    void TestH1_EarlyHints_WorkerThreadOrderingSafe() {
+        std::cout << "\n[TEST] H1 103 Early Hints: worker-thread ordering safe..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+
+            // Shared signal: the handler stores complete + send_interim
+            // so the watcher thread can invoke BOTH from a single worker
+            // thread in rapid succession — the race scenario.
+            struct Payload {
+                HttpRouter::AsyncCompletionCallback complete;
+                HttpRouter::InterimResponseSender   send_interim;
+            };
+            auto p = std::make_shared<std::promise<Payload>>();
+            auto f = p->get_future().share();
+
+            server.GetAsync("/race",
+                [p](const HttpRequest&,
+                    HttpRouter::InterimResponseSender send_interim,
+                    HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::AsyncCompletionCallback complete) {
+                    p->set_value(Payload{std::move(complete),
+                                         std::move(send_interim)});
+                });
+
+            std::thread watcher([f]() mutable {
+                auto pl = f.get();
+                HttpResponse r;
+                r.Status(200).Text("final");
+                pl.complete(std::move(r));
+                // Same-worker follow-up call: would race without the hop.
+                pl.send_interim(103, {{"Link", "</late.css>; rel=preload"}});
+            });
+            struct JoinGuard {
+                std::thread& t;
+                ~JoinGuard() { if (t.joinable()) t.join(); }
+            };
+            JoinGuard g{watcher};
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(port,
+                "GET /race HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            auto pos200 = resp.find("HTTP/1.1 200");
+            auto pos103 = resp.find("HTTP/1.1 103");
+            if (pos200 == std::string::npos) {
+                pass = false; err += "missing 200; ";
+            }
+            // The 103 must either NOT appear, or appear BEFORE the 200.
+            // Given the worker calls complete() before send_interim(),
+            // the dispatcher runs the final lambda first and the hopped
+            // interim observes final_response_sent_=true → drops.
+            if (pos103 != std::string::npos && pos200 != std::string::npos &&
+                pos103 > pos200) {
+                pass = false;
+                err += "103 queued AFTER 200 (ordering race — should be dropped); ";
+            }
+            TestFramework::RecordTest(
+                "H1 103 Early Hints: worker-thread ordering safe",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 103 Early Hints: worker-thread ordering safe",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // Run all HTTP tests
     void RunAllTests() {
         std::cout << "\n" << std::string(60, '=') << std::endl;
@@ -1506,6 +1641,8 @@ namespace HttpTests {
         TestH1_EarlyHints_ForbiddenHeaderStripped();
         TestH1_EarlyHints_DroppedAfterFinal();
         TestH1_EarlyHints_100ContinueThen103();
+        TestH1_EarlyHints_CRLFSanitized();
+        TestH1_EarlyHints_WorkerThreadOrderingSafe();
     }
 
 }  // namespace HttpTests

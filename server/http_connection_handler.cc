@@ -385,12 +385,44 @@ bool HttpConnectionHandler::SendInterimResponse(
 
     // Valid range: [PROCESSING (102), OK). 100 is framework-managed
     // (internal Continue); 101 is reserved for WebSocket upgrade.
+    // Validate synchronously so we don't enqueue work for a bad status.
     if (status_code < HttpStatus::PROCESSING || status_code >= HttpStatus::OK) {
         logging::Get()->warn(
             "SendInterimResponse invalid status {} fd={}",
             status_code, conn_->fd());
         return false;
     }
+
+    // Off-dispatcher hop: preserve write ordering against CompleteAsync
+    // Response. When a handler on a worker thread calls complete() then
+    // send_interim() in sequence, complete() enqueues the final response
+    // lambda onto the dispatcher; final_response_sent_ only becomes true
+    // when that lambda RUNS. If we checked the flag here and called
+    // SendRaw directly from the worker, SendRaw would enqueue its own
+    // lambda AFTER complete's — and the flag check would pass even though
+    // the client would observe 200 followed by 103 on the wire. Hopping
+    // so both the flag check AND the wire write happen on the dispatcher
+    // after complete's lambda has run makes the drop/emit decision
+    // strictly ordered. The EnQueue preserves the worker's call order:
+    // if complete() was called before send_interim(), the final lambda
+    // runs first, final_response_sent_ is set, and the hopped interim
+    // observes it and drops. If the interim was called first (legal on
+    // a sync request before calling complete), it runs first and emits.
+    if (!conn_->IsOnDispatcherThread()) {
+        std::weak_ptr<HttpConnectionHandler> weak_self = weak_from_this();
+        auto headers_copy = headers;  // deep-copy strings for the hop
+        conn_->RunOnDispatcher(
+            [weak_self, status_code,
+             headers_copy = std::move(headers_copy)]() {
+            if (auto self = weak_self.lock()) {
+                self->SendInterimResponse(status_code, headers_copy);
+            }
+        });
+        return true;  // queued; final drop/emit decided on dispatcher
+    }
+
+    // ---- On dispatcher thread from here on ----
+
     // Drop if the final response has already been written.
     if (final_response_sent_.load(std::memory_order_acquire)) {
         logging::Get()->warn(
@@ -399,16 +431,25 @@ bool HttpConnectionHandler::SendInterimResponse(
         return false;
     }
     // HTTP/1.0: interim responses require HTTP/1.1+ (RFC 8297).
-    // current_http_minor_ is updated by the parser (dispatcher thread)
-    // with release; the acquire load here pairs so off-thread callers
-    // see the last value the parser published before the handler ran.
     if (current_http_minor_.load(std::memory_order_acquire) < 1) {
         logging::Get()->debug(
             "SendInterimResponse rejected on HTTP/1.0 fd={}", conn_->fd());
         return false;
     }
 
-    // Build the wire bytes: status line + filtered headers + blank line.
+    // Build the wire bytes: status line + filtered/sanitized headers +
+    // blank line. We mirror HttpResponse::Header's CR/LF sanitization
+    // because this path appends raw bytes to the transport — without
+    // stripping \r and \n, a handler that forwards a header value
+    // containing CRLF (e.g. an upstream Link header spliced with
+    // attacker-controlled data) could inject arbitrary response
+    // headers or body bytes into the 1xx block. Response splitting.
+    auto strip_crlf = [](std::string s) -> std::string {
+        s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());
+        s.erase(std::remove(s.begin(), s.end(), '\n'), s.end());
+        return s;
+    };
+
     std::string out;
     out.reserve(256);
     out += "HTTP/1.1 ";
@@ -425,9 +466,9 @@ bool HttpConnectionHandler::SendInterimResponse(
                 "Interim: forbidden header '{}' stripped fd={}", key, conn_->fd());
             continue;
         }
-        out += key;
+        out += strip_crlf(key);
         out += ": ";
-        out += value;
+        out += strip_crlf(value);
         out += "\r\n";
     }
     out += "\r\n";

@@ -3708,10 +3708,21 @@ void TestH2_Push_ActiveH2StreamsBalanced() {
                 (void)r;
             }
         }
-        // Allow close callbacks to propagate on the dispatcher thread.
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
+        // Poll for close-callback propagation rather than a fixed sleep.
+        // A fixed 100ms sleep could flake under CI scheduler contention;
+        // the counter must settle to `before` once both the parent and
+        // all pushed streams have run their close_callback on the
+        // dispatcher thread. Bound by 2s deadline so a real leak still
+        // fails fast instead of spinning forever.
+        auto deadline = std::chrono::steady_clock::now() +
+                         std::chrono::seconds(2);
         int64_t after = server.GetStats().active_h2_streams;
+        while (after != before &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            after = server.GetStats().active_h2_streams;
+        }
+
         bool pass = (after == before);
         std::string err;
         if (!pass) {

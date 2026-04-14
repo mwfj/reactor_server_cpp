@@ -167,14 +167,14 @@ private:
     // HTTP version of the current request (for echoing in responses).
     // Defaults to 1.1; updated when a complete request is parsed.
     //
-    // Atomic because SendInterimResponse may be invoked off the
-    // dispatcher thread (contract: H1 tolerates cross-thread callers —
-    // exercised by TestH1_EarlyHints_DroppedAfterFinal) and reads this
-    // to reject 1xx on HTTP/1.0 peers. Writers run on the dispatcher
-    // (parser header-complete) with release; readers use acquire so they
-    // observe the final value the parser published before the handler
-    // ran. Overhead is negligible — aligned 32-bit loads on all
-    // supported platforms compile to a plain mov.
+    // Atomic as defense in depth. All writers run on the dispatcher
+    // (parser header-complete). The primary cross-thread reader,
+    // SendInterimResponse, now hops to the dispatcher before reading
+    // this, so release/acquire ordering is not strictly required via
+    // this field alone — but keeping the atomic is zero-cost on modern
+    // platforms (aligned 32-bit load compiles to a plain mov) and
+    // forecloses future regressions if a new caller reads from a worker
+    // thread without hopping.
     std::atomic<int> current_http_minor_{1};
 
     // Tracks whether we've sent 100 Continue for the current request.

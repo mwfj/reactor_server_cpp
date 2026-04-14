@@ -1010,6 +1010,21 @@ int32_t Http2Session::SubmitPushPromise(
             "push: parent stream {} not open", parent_stream_id);
         return -1;
     }
+    // Pre-validate the pushed response BEFORE we announce a PUSH_PROMISE
+    // on the wire. If we skipped this, a handler passing an invalid
+    // response (e.g. status < 200) would cause the promise to go out,
+    // followed by an immediate RST when SubmitResponse rejects the
+    // response in the post-announce path — a benign but observable
+    // failure on the wire. Gating here keeps the wire clean in the
+    // expected rejection case. SubmitResponse itself rejects any 1xx
+    // as a final response, so mirror that single check.
+    if (response.GetStatusCode() < HttpStatus::OK) {
+        logging::Get()->warn(
+            "push: invalid response status {} (< 200) parent={}; rejecting "
+            "before PUSH_PROMISE",
+            response.GetStatusCode(), parent_stream_id);
+        return -1;
+    }
 
     // ---- Build the promise pseudo-headers ----
     // Local storage holds the pseudo-header strings until nghttp2 has
@@ -1058,12 +1073,20 @@ int32_t Http2Session::SubmitPushPromise(
         logging::Get()->warn(
             "push: SubmitResponse failed on promised stream {} rv={}",
             promised, rv);
-        // Best-effort RST so the client can release any bookkeeping
-        // it allocated for the promised id. The synthetic stream entry
-        // is also rolled back so OnStreamCloseCallback won't double-fire.
+        // Best-effort RST so the client releases bookkeeping for the
+        // promised id. Do NOT EraseStream here — nghttp2 will fire
+        // on_stream_close for the RST'd stream, and our
+        // OnStreamCloseCallback must see the stream in streams_ so
+        // stream_close_callback runs and decrements active_h2_streams_
+        // + local_stream_count_ symmetrically with the +1 CreateServer
+        // InitiatedStream applied via stream_open_callback. Erasing
+        // eagerly would leave FindStream() returning nullptr when the
+        // close callback fires, skipping the decrements and leaking
+        // +1 on both counters per failed push. The normal cleanup path
+        // (MarkStreamForRemoval + FlushDeferredRemovals) handles final
+        // erase.
         nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
                                   promised, NGHTTP2_INTERNAL_ERROR);
-        EraseStream(promised);
         return -1;
     }
     logging::Get()->debug(
@@ -1148,12 +1171,29 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
 
 void Http2Session::SendGoaway(uint32_t error_code) {
     if (goaway_sent_) return;
-    goaway_sent_ = true;
     logging::Get()->info("H2 sending GOAWAY fd={}", conn_->fd());
 
-    nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
-                          last_stream_id_, error_code,
-                          nullptr, 0);
+    // Only latch goaway_sent_ on a successful submit. Previously we set
+    // the flag unconditionally before calling nghttp2 — a failed
+    // nghttp2_submit_goaway would leave the session advertising "GOAWAY
+    // sent" to the drain-wait logic, causing WaitForH2Drain to block
+    // until shutdown_drain_timeout_sec fully expires instead of
+    // re-attempting or proceeding. The goaway_sent_ guard still
+    // prevents duplicate submits on a retry because we only retry on
+    // the rv==0 path.
+    int rv = nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
+                                    last_stream_id_, error_code,
+                                    nullptr, 0);
+    if (rv != 0) {
+        logging::Get()->warn(
+            "nghttp2_submit_goaway failed fd={} rv={} ({}) — drain may wait",
+            conn_->fd(), rv, nghttp2_strerror(rv));
+        // Still flush any already-pending frames before returning;
+        // callers typically proceed to drain regardless.
+        SendPendingFrames();
+        return;
+    }
+    goaway_sent_ = true;
     SendPendingFrames();
 }
 
