@@ -14,6 +14,7 @@
 #include "proxy_test.h"
 #include "rate_limit_test.h"
 #include "circuit_breaker_test.h"
+#include "circuit_breaker_phase3_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -80,6 +81,9 @@ void RunAllTest(){
 
     // Run circuit breaker tests
     CircuitBreakerTests::RunAllTests();
+
+    // Run circuit breaker Phase 3 tests (host / manager / retry budget)
+    CircuitBreakerPhase3Tests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;
 }
