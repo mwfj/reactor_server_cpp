@@ -3759,6 +3759,123 @@ void TestH2_Push_OffDispatcherThreadHops() {
     }
 }
 
+// Regression for PR #18 round-5 comment 2: H2 async handler that
+// calls complete() and then send_interim() inline on the dispatcher
+// thread (before returning from the handler body) must NOT land the
+// 103 on the wire. The per-stream FinalResponseSubmitted flag won't
+// be set yet (CompleteAsyncResponse runs via RunOnDispatcher later),
+// so without the `completed` capture in the send_interim closure,
+// the 103 would submit after complete() was logically done.
+void TestH2_EarlyHints_DroppedAfterCompleteSameThread() {
+    std::cout << "\n[TEST] H2 103 Early Hints: dropped after complete() same-thread..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync("/samecomplete",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender send_interim,
+               HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::AsyncCompletionCallback complete) {
+                // Inline on dispatcher: complete() first, then
+                // send_interim. The completed guard in the send_interim
+                // closure must drop the 103.
+                HttpResponse r;
+                r.Status(200).Text("done");
+                complete(std::move(r));
+                send_interim(103, {{"link", "</late.css>; rel=preload"}});
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/samecomplete");
+            if (resp.status != 200) {
+                pass = false; err += "final status != 200; ";
+            }
+            if (!resp.interim_statuses.empty()) {
+                pass = false;
+                err += "post-complete 103 reached the wire — completed-guard "
+                       "bypassed; got " +
+                       std::to_string(resp.interim_statuses.size()) +
+                       " interim(s); ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: dropped after complete() same-thread",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: dropped after complete() same-thread",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Same regression for H2 push: an async handler that calls complete()
+// then push_resource() inline on the dispatcher thread must not land
+// a PUSH_PROMISE. The per-request `completed` guard in the
+// push_resource closure catches this before PushResource can even
+// reach the FinalResponseSubmitted check (which would also drop it
+// once CompleteAsync runs — but the completed guard is earlier and
+// consistent with H1 semantics).
+void TestH2_Push_DroppedAfterCompleteSameThread() {
+    std::cout << "\n[TEST] H2 Push: dropped after complete() same-thread..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        server.GetAsync("/samecomplete_push",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher push_resource,
+               HttpRouter::AsyncCompletionCallback complete) {
+                HttpResponse main;
+                main.Status(200).Body("<html/>", "text/html");
+                complete(std::move(main));
+                HttpResponse pushed;
+                pushed.Status(200).Body(kPushedBody, "text/css");
+                // Should be dropped by the completed guard in the
+                // push_resource closure — not reaching SubmitPushPromise.
+                push_resource("GET", "http", "localhost",
+                              "/style.css", pushed);
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/samecomplete_push");
+            if (resp.status != 200) {
+                pass = false; err += "final status != 200; ";
+            }
+            if (!resp.pushed.empty()) {
+                pass = false;
+                err += "post-complete push reached the wire — completed-guard "
+                       "bypassed; got " +
+                       std::to_string(resp.pushed.size()) + " pushed; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 Push: dropped after complete() same-thread", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Push: dropped after complete() same-thread", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression test for the "stale push after complete()" race: an async
 // handler on a worker thread calls complete(200) followed by
 // push_resource(). The complete enqueues SubmitStreamResponse onto the
@@ -4036,6 +4153,7 @@ void RunAllTests() {
     TestH2_EarlyHints_StreamClosedByPeerSafe();
     TestH2_EarlyHints_100ContinueThen103();
     TestH2_EarlyHints_OffDispatcherThread();
+    TestH2_EarlyHints_DroppedAfterCompleteSameThread();
 
     // --- Category 9: SETTINGS_ENABLE_PUSH wire format ---
     TestH2_SettingsEnablePushWire_Disabled();
@@ -4056,6 +4174,7 @@ void RunAllTests() {
     TestH2_Push_AsyncViaRunOnDispatcher();
     TestH2_Push_OffDispatcherThreadHops();
     TestH2_Push_RejectedAfterFinalResponseSubmitted();
+    TestH2_Push_DroppedAfterCompleteSameThread();
     TestH2_Push_ActiveH2StreamsBalanced();
     TestH2_Push_ReloadTogglesEnablePush();
 }

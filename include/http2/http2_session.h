@@ -34,6 +34,14 @@ public:
     // call SendPendingFrames() if true.
     ssize_t ReceiveData(const char* data, size_t len);
 
+    // True while ReceiveData() is on the call stack (i.e. we are inside
+    // nghttp2_session_mem_recv2). Used by primitives that may be invoked
+    // from an inline sync handler running inside on_frame_recv to avoid
+    // reentrant nghttp2_session_mem_send2 calls — the caller of
+    // ReceiveData() always flushes on the way out, so these primitives
+    // can safely skip the inline flush.
+    bool InReceiveData() const { return in_receive_data_; }
+
     // Pull pending output bytes from nghttp2 and send via
     // ConnectionHandler::SendRaw(). Returns true if any bytes were sent.
     // MUST be called after every operation that may produce output.
@@ -254,6 +262,11 @@ private:
     std::atomic<int32_t> last_stream_id_{0};
     bool goaway_sent_ = false;
     bool output_deferred_ = false;  // dispatcher-thread only
+    // True while ReceiveData() is on the stack. Used to detect and
+    // suppress reentrant SendPendingFrames() calls when an inline sync
+    // handler invokes send_interim / push_resource from within an
+    // on_frame_recv callback. See Http2Session::InReceiveData().
+    bool in_receive_data_ = false;
     size_t max_body_size_ = 0;
     size_t incomplete_stream_count_ = 0;
     size_t max_header_list_size_ = 0;

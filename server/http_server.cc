@@ -3158,15 +3158,41 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 // callers (async work resuming on a worker) must hop
                 // via RunOnDispatcher() before invoking the closure.
                 std::weak_ptr<Http2ConnectionHandler> h2_weak = self;
+                // Capture the per-request `completed` flag so H2
+                // interims / pushes behave the same as H1 interims:
+                // once complete() has been invoked for this request,
+                // subsequent control-frame emissions are dropped. On
+                // H2 this protects against the case where a handler
+                // calls complete() and then send_interim() /
+                // push_resource() inline on the dispatcher thread
+                // before returning — the FinalResponseSubmitted flag
+                // on the stream won't be set until CompleteAsync's
+                // enqueued lambda runs, so the per-stream guard alone
+                // is too late. `completed` is flipped synchronously
+                // inside complete() BEFORE the lambda is enqueued, so
+                // checking it here reliably gates late emissions.
                 auto send_interim =
-                    [h2_weak, stream_id](
+                    [h2_weak, stream_id, completed](
                         int status_code,
                         const std::vector<std::pair<std::string, std::string>>& hdrs) {
+                    if (completed->load(std::memory_order_acquire)) return;
                     auto h2 = h2_weak.lock();
                     if (!h2) return;
                     h2->SendInterimResponse(stream_id, status_code, hdrs);
                 };
-                auto push_resource = MakeH2ResourcePusher(h2_weak, stream_id);
+                auto push_resource =
+                    [h2_weak, stream_id, completed](
+                        const std::string& method,
+                        const std::string& scheme,
+                        const std::string& authority,
+                        const std::string& path,
+                        const HttpResponse& resp) -> int32_t {
+                    if (completed->load(std::memory_order_acquire)) return -1;
+                    auto h2 = h2_weak.lock();
+                    if (!h2) return -1;
+                    return h2->PushResource(stream_id, method, scheme,
+                                             authority, path, resp);
+                };
                 try {
                     if (async_head_fallback) {
                         HttpRequest get_req = request;

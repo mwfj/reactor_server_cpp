@@ -682,6 +682,19 @@ void Http2Session::SendServerPreface() {
 }
 
 ssize_t Http2Session::ReceiveData(const char* data, size_t len) {
+    // Mark that we are inside nghttp2_session_mem_recv2 so that any
+    // send_interim / push_resource invocation from an inline sync
+    // handler (running inside an on_frame_recv callback) can skip its
+    // inline SendPendingFrames() — calling nghttp2_session_mem_send2
+    // reentrantly from a recv callback is unsafe. The caller of
+    // ReceiveData() flushes on the way out (see OnRawData tail).
+    // RAII guard covers both the normal return and the error return.
+    in_receive_data_ = true;
+    struct RecvGuard {
+        bool& flag;
+        ~RecvGuard() { flag = false; }
+    } recv_guard{in_receive_data_};
+
     ssize_t rv = nghttp2_session_mem_recv2(
         impl_->session,
         reinterpret_cast<const uint8_t*>(data), len);

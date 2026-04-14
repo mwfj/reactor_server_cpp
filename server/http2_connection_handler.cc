@@ -489,10 +489,17 @@ bool Http2ConnectionHandler::SendInterimResponse(
     if (session_->SubmitInterimHeaders(stream_id, status_code, headers) != 0) {
         return false;
     }
-    // Mirror SubmitStreamResponse's flush reasoning: async paths don't have
-    // the tail flush in OnRawData, so we must push frames onto the
-    // transport ourselves or the 103 sits queued until unrelated I/O.
-    session_->SendPendingFrames();
+    // Flush EXCEPT when we're inside nghttp2_session_mem_recv2 — an
+    // inline sync handler emitting a 103 would otherwise cause a
+    // reentrant mem_send2 call (the same hazard the flood branches
+    // avoid). OnRawData's tail always flushes after ReceiveData
+    // returns, so the 103 still reaches the wire without an inline
+    // flush here. Non-recv contexts (async completion, worker-hop
+    // re-entry) need the inline flush because no outer code guarantees
+    // a follow-up flush.
+    if (!session_->InReceiveData()) {
+        session_->SendPendingFrames();
+    }
     return true;
 }
 
@@ -548,9 +555,14 @@ int32_t Http2ConnectionHandler::PushResource(
     // stream_open_callback, symmetric with the close path. We must NOT
     // increment here or the counters would drift +1 per push.
 
-    // Same flush reasoning as SubmitStreamResponse — async/post-handler
-    // submissions don't ride the tail flush in OnRawData.
-    session_->SendPendingFrames();
+    // Flush EXCEPT when we're inside nghttp2_session_mem_recv2. See
+    // SendInterimResponse above for the same reasoning — an inline
+    // sync handler issuing a push must not reenter mem_send2. The
+    // OnRawData tail flushes after ReceiveData returns, so the
+    // PUSH_PROMISE + response still reach the wire.
+    if (!session_->InReceiveData()) {
+        session_->SendPendingFrames();
+    }
     return promised;
 }
 
