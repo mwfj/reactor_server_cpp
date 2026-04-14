@@ -176,7 +176,7 @@ bool HttpConnectionHandler::NormalizeOutgoingResponse(HttpResponse& response,
     // HTTP/1.0 persistence requires explicit Connection: keep-alive in the
     // response; without it a compliant 1.0 client treats the response as
     // close-delimited.
-    if (current_http_minor_ == 0 && client_keep_alive && !resp_close) {
+    if (current_http_minor_.load(std::memory_order_acquire) == 0 && client_keep_alive && !resp_close) {
         response.Header("Connection", "keep-alive");
     }
     // When the client did not request keep-alive, echo Connection: close so
@@ -294,11 +294,12 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
          callbacks_.shutdown_check_callback()) ||
         (conn_ && conn_->IsCloseDeferred());
     const bool effective_keep_alive = deferred_keep_alive_ && !shutting_down;
+    const int http_minor = current_http_minor_.load(std::memory_order_acquire);
     const bool should_close = NormalizeOutgoingResponse(
-        response, effective_keep_alive, current_http_minor_);
+        response, effective_keep_alive, http_minor);
 
     final_response_sent_.store(true, std::memory_order_release);
-    response.Version(1, current_http_minor_);
+    response.Version(1, http_minor);
     std::string wire = response.Serialize();
     if (was_head) StripResponseBodyForHead(wire);
     conn_->SendRaw(wire.data(), wire.size());
@@ -368,11 +369,11 @@ void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
     // The framework sends 1xx responses (e.g. 100 Continue) through this path
     // before the request is complete; those MUST NOT set the flag so that
     // SendInterimResponse (103 Early Hints) can still fire after the 100.
-    if (response.GetStatusCode() >= 200) {
+    if (response.GetStatusCode() >= HttpStatus::OK) {
         final_response_sent_.store(true, std::memory_order_release);
     }
     HttpResponse versioned = response;
-    versioned.Version(1, current_http_minor_);
+    versioned.Version(1, current_http_minor_.load(std::memory_order_acquire));
     std::string wire = versioned.Serialize();
     conn_->SendRaw(wire.data(), wire.size());
 }
@@ -382,9 +383,9 @@ bool HttpConnectionHandler::SendInterimResponse(
     const std::vector<std::pair<std::string, std::string>>& headers) {
     if (!conn_) return false;
 
-    // Valid range: [102, 199]. 100 is framework-managed (internal Continue);
-    // 101 is reserved for WebSocket upgrade.
-    if (status_code < 102 || status_code >= 200) {
+    // Valid range: [PROCESSING (102), OK). 100 is framework-managed
+    // (internal Continue); 101 is reserved for WebSocket upgrade.
+    if (status_code < HttpStatus::PROCESSING || status_code >= HttpStatus::OK) {
         logging::Get()->warn(
             "SendInterimResponse invalid status {} fd={}",
             status_code, conn_->fd());
@@ -398,9 +399,10 @@ bool HttpConnectionHandler::SendInterimResponse(
         return false;
     }
     // HTTP/1.0: interim responses require HTTP/1.1+ (RFC 8297).
-    // current_http_minor_ is updated by the parser when headers complete
-    // and persists across the deferred-response window.
-    if (current_http_minor_ < 1) {
+    // current_http_minor_ is updated by the parser (dispatcher thread)
+    // with release; the acquire load here pairs so off-thread callers
+    // see the last value the parser published before the handler ran.
+    if (current_http_minor_.load(std::memory_order_acquire) < 1) {
         logging::Get()->debug(
             "SendInterimResponse rejected on HTTP/1.0 fd={}", conn_->fd());
         return false;
@@ -526,7 +528,9 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
 
     // Track the request's HTTP version so SendResponse echoes it correctly
     // (e.g. HTTP/1.0 for 1.0 clients). Must be set after the version check.
-    current_http_minor_ = req.http_minor;
+    // Release store pairs with the acquire loads in SendInterimResponse
+    // / NormalizeOutgoingResponse paths that may read from worker threads.
+    current_http_minor_.store(req.http_minor, std::memory_order_release);
 
     // RFC 7230 §5.4: HTTP/1.1 requests MUST include Host header
     if (req.http_minor >= 1 && !req.HasHeader("host")) {
@@ -928,7 +932,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         // the framework's auto-computed Content-Length is preserved, then
         // strip the body from the wire.
         if (req.method == "HEAD") {
-            response.Version(1, current_http_minor_);
+            response.Version(1, current_http_minor_.load(std::memory_order_acquire));
             std::string wire = response.Serialize();
             StripResponseBodyForHead(wire);
             conn_->SendRaw(wire.data(), wire.size());
@@ -1174,7 +1178,8 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
         if (parser_.GetRequest().headers_complete &&
             parser_.GetRequest().http_major == 1 &&
             (parser_.GetRequest().http_minor == 0 || parser_.GetRequest().http_minor == 1)) {
-            current_http_minor_ = parser_.GetRequest().http_minor;
+            current_http_minor_.store(parser_.GetRequest().http_minor,
+                                       std::memory_order_release);
         }
 
         if (parser_.HasError()) {

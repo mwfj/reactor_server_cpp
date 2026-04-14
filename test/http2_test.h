@@ -3682,6 +3682,55 @@ void TestH2_Push_AsyncViaRunOnDispatcher() {
     }
 }
 
+// T9.13b: Regression guard for PR #18 comment 1 — pushed streams must
+// fire stream_open_callback symmetrically with the close callback so
+// /stats.active_h2_streams stays balanced. Without the fix, each push
+// drifts the counter negative by one. We probe GetStats() after the
+// request/push finishes and the connection is closed; the value must
+// settle back to zero (both parent and pushed streams closed cleanly).
+void TestH2_Push_ActiveH2StreamsBalanced() {
+    std::cout << "\n[TEST] H2 Push: active_h2_streams balanced across push..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        RegisterPushHandlerOnRoot(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+        int64_t before = server.GetStats().active_h2_streams;
+
+        {
+            Http2TestClient client;
+            if (client.Connect("127.0.0.1", port)) {
+                auto r = client.Get("/");
+                (void)r;
+            }
+        }
+        // Allow close callbacks to propagate on the dispatcher thread.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        int64_t after = server.GetStats().active_h2_streams;
+        bool pass = (after == before);
+        std::string err;
+        if (!pass) {
+            err = "active_h2_streams drifted from " +
+                  std::to_string(before) + " to " +
+                  std::to_string(after) +
+                  " (expected 0 net change — pushed streams must fire both "
+                  "open and close callbacks)";
+        }
+        TestFramework::RecordTest("H2 Push: active_h2_streams balanced",
+                                  pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Push: active_h2_streams balanced",
+                                  false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
 // T9.13: Reload toggling enable_push — a brand-new connection after
 // Reload sees the new value. Existing connections keep their preface
 // (RFC 9113 §6.5.2 forbids sending ENABLE_PUSH after the preface).
@@ -3840,6 +3889,7 @@ void RunAllTests() {
     TestH2_Push_SyncHandlerViaThreadLocal();
     TestH2_Push_OnHttp1Connection();
     TestH2_Push_AsyncViaRunOnDispatcher();
+    TestH2_Push_ActiveH2StreamsBalanced();
     TestH2_Push_ReloadTogglesEnablePush();
 }
 

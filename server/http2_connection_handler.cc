@@ -507,13 +507,12 @@ int32_t Http2ConnectionHandler::PushResource(
     }
     int32_t promised = session_->SubmitPushPromise(
         parent_stream_id, method, scheme, authority, path, response);
-    if (promised > 0) {
-        // Pushed streams count toward the per-connection stream counter
-        // so abrupt-close compensation in HttpServer::RemoveConnection
-        // doesn't under-count their close. The stream-close callback
-        // decrements symmetrically when the promised stream finalizes.
-        IncrementLocalStreamCount();
-    }
+    // NOTE: stream-counter accounting (local_stream_count_ and the
+    // server-wide active_h2_streams_) is handled inside
+    // Http2Session::CreateServerInitiatedStream via the shared
+    // stream_open_callback, symmetric with the close path. We must NOT
+    // increment here or the counters would drift +1 per push.
+
     // Same flush reasoning as SubmitStreamResponse — async/post-handler
     // submissions don't ride the tail flush in OnRawData.
     session_->SendPendingFrames();

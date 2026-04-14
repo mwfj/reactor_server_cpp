@@ -823,10 +823,10 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
 int Http2Session::SubmitInterimHeaders(
     int32_t stream_id, int status_code,
     const std::vector<std::pair<std::string, std::string>>& headers) {
-    // Valid range: [102, 199]. 100 is framework-managed (auto-emitted for
-    // Expect: 100-continue); 101 is an HTTP/1 Upgrade status and MUST NOT
-    // appear in HTTP/2 (RFC 9113 Section 8.6).
-    if (status_code < 102 || status_code >= 200) {
+    // Valid range: [PROCESSING (102), OK). 100 is framework-managed
+    // (auto-emitted for Expect: 100-continue); 101 is an HTTP/1 Upgrade
+    // status and MUST NOT appear in HTTP/2 (RFC 9113 Section 8.6).
+    if (status_code < HttpStatus::PROCESSING || status_code >= HttpStatus::OK) {
         logging::Get()->warn(
             "H2 SubmitInterimHeaders invalid status {} stream={}",
             status_code, stream_id);
@@ -940,6 +940,20 @@ Http2Stream* Http2Session::CreateServerInitiatedStream(int32_t stream_id) {
     // push begins streaming, matching the contract of regular async
     // responses entering their handler-response budget.
     it->second->MarkCounterDecremented();
+    // Fire stream_open_callback symmetrically with CreateStream so
+    // per-connection (local_stream_count_) and per-server (active_h2_streams_)
+    // counters stay balanced against the stream_close_callback that nghttp2
+    // WILL fire when the pushed stream finalizes. Without this, pushed
+    // streams would only decrement those counters — /stats would drift
+    // negative by one per push and CompensateH2Streams could over-subtract
+    // on abrupt close.
+    if (callbacks_.stream_open_callback) {
+        try { callbacks_.stream_open_callback(Owner(), stream_id); }
+        catch (const std::exception& e) {
+            logging::Get()->error("Stream open callback error (pushed): {}",
+                                  e.what());
+        }
+    }
     return it->second.get();
 }
 
