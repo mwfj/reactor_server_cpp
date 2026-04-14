@@ -2371,14 +2371,52 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         int status_code,
                         const std::vector<std::pair<std::string, std::string>>& hdrs) {
                     if (completed->load(std::memory_order_acquire)) {
-                        // Request A's complete() has been called. Any
-                        // interim queued now would land after the final
-                        // response lambda and potentially into the next
-                        // pipelined request's window. Drop.
+                        // Request A's complete() has already been called.
+                        // Drop synchronously — no hop needed.
                         return;
                     }
                     auto h = weak_h1_self.lock();
                     if (!h) return;
+                    auto conn = h->GetConnection();
+                    if (!conn) return;
+                    // Off-dispatcher hop MUST be request-scoped. Without
+                    // re-checking `completed` on the dispatcher side, the
+                    // connection-wide `final_response_sent_` flag that
+                    // SendInterimResponse consults is not sufficient:
+                    // CompleteAsyncResponse for request A can resume
+                    // parsing pipelined bytes and synchronously invoke
+                    // BeginAsyncResponse for request B, which resets
+                    // final_response_sent_ to false. A hop lambda queued
+                    // by request A's send_interim would then pass the
+                    // dispatcher-side check and emit a 103 into request
+                    // B's response window.
+                    //
+                    // The request-scoped `completed` flag is captured by
+                    // THIS closure (one-per-request) and never reset, so
+                    // re-checking it inside the hop lambda reliably gates
+                    // late emissions even across pipelined keep-alive.
+                    // Trade-off: a legitimate pre-complete 103 that was
+                    // issued just before complete() on the worker thread
+                    // MAY be dropped if the dispatcher picks up the hop
+                    // after complete flipped the flag — which is
+                    // acceptable vs. the alternative of a stale 103
+                    // corrupting request B's response window.
+                    if (!conn->IsOnDispatcherThread()) {
+                        std::weak_ptr<HttpConnectionHandler> weak = h;
+                        auto hdrs_copy = hdrs;
+                        conn->RunOnDispatcher(
+                            [weak, completed, status_code,
+                             hdrs_copy = std::move(hdrs_copy)]() {
+                            if (completed->load(std::memory_order_acquire)) return;
+                            if (auto self2 = weak.lock()) {
+                                self2->SendInterimResponse(status_code, hdrs_copy);
+                            }
+                        });
+                        return;
+                    }
+                    // Already on dispatcher — call directly. Internal
+                    // hop inside SendInterimResponse will short-circuit
+                    // on IsOnDispatcherThread() == true.
                     h->SendInterimResponse(status_code, hdrs);
                 };
                 auto push_resource =

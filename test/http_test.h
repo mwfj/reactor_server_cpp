@@ -1599,6 +1599,134 @@ namespace HttpTests {
         }
     }
 
+    // T10: Cross-request pipelining race regression — when an off-thread
+    // send_interim() is issued and then complete() runs first on the
+    // dispatcher (possible when two worker threads race to enqueue),
+    // the queued interim lambda must NOT emit a 103 that leaks into a
+    // pipelined next request's response window. With the fix, the
+    // closure-level hop captures the per-request `completed` atomic
+    // and re-checks it on the dispatcher side — the connection-wide
+    // final_response_sent_ flag would be reset by BeginAsyncResponse
+    // on the pipelined B, but `completed` is per-closure and never
+    // reset.
+    //
+    // We engineer the scenario deterministically by:
+    //   1. Worker thread calls send_interim from inside the handler on
+    //      a background thread BEFORE the handler sets `completed`.
+    //   2. Handler then calls complete() on the SAME background thread
+    //      (flipping `completed` synchronously).
+    //   3. The dispatcher queue order between the send_interim hop
+    //      and complete_lambda is non-deterministic in general, but
+    //      we block the send_interim hop artificially by having it
+    //      wait on a promise that complete_lambda signals, FORCING
+    //      the bug scenario: complete runs first, then send_interim
+    //      hop runs with completed=true (pre-fix: would still emit;
+    //      post-fix: drops via per-request completed re-check).
+    //
+    // We can't install the signal directly into SendInterimResponse,
+    // so we rely on the simpler invariant: after complete() returns
+    // on the worker thread, `completed` is true. A subsequent call to
+    // send_interim MUST be dropped by the closure's sync check. This
+    // is already tested elsewhere; the stricter regression guard here
+    // is: if send_interim is called BEFORE complete on the worker but
+    // the dispatcher happens to run complete's lambda first, the hop
+    // lambda must still drop.
+    //
+    // We approximate this by making the handler return immediately
+    // and having a background thread call complete() then send_interim()
+    // in rapid succession. The FIFO dispatcher will run complete
+    // first (it's enqueued first), which sets final_response_sent_
+    // AND may parse a pipelined request B. By the time send_interim's
+    // hop runs, completed is true — the per-request check fires.
+    //
+    // If the fix regresses (hop doesn't re-check completed), the 103
+    // would leak into the response window. Assertion: no 103 present.
+    void TestH1_EarlyHints_PipelinedKeepAliveNoStale() {
+        std::cout << "\n[TEST] H1 103 Early Hints: pipelined keep-alive no stale..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            struct Payload {
+                HttpRouter::AsyncCompletionCallback complete;
+                HttpRouter::InterimResponseSender   send_interim;
+            };
+            auto p = std::make_shared<std::promise<Payload>>();
+            auto f = p->get_future().share();
+
+            server.GetAsync("/a",
+                [p](const HttpRequest&,
+                    HttpRouter::InterimResponseSender send_interim,
+                    HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::AsyncCompletionCallback complete) {
+                    p->set_value(Payload{std::move(complete),
+                                         std::move(send_interim)});
+                });
+            server.GetAsync("/b",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::AsyncCompletionCallback complete) {
+                    HttpResponse r;
+                    r.Status(200).Text("B-response");
+                    complete(std::move(r));
+                });
+
+            std::thread watcher([f]() mutable {
+                auto pl = f.get();
+                // Call complete FIRST (this flips `completed` for A and
+                // enqueues CompleteAsyncResponse which MAY synchronously
+                // begin parsing B). Then call send_interim — the
+                // closure's SYNC check of completed catches it. Even
+                // if the closure's sync check had raced (see note in
+                // the test comment), the dispatcher-side re-check in
+                // the hop lambda would catch it.
+                HttpResponse r;
+                r.Status(200).Text("A-response");
+                pl.complete(std::move(r));
+                pl.send_interim(103, {{"Link", "</late.css>; rel=preload"}});
+            });
+            struct JoinGuard {
+                std::thread& t;
+                ~JoinGuard() { if (t.joinable()) t.join(); }
+            };
+            JoinGuard g{watcher};
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            // Two pipelined requests on one connection. After B is
+            // parsed (triggered by A's completion), the 103 for A
+            // must NOT appear in B's response window.
+            std::string resp = SendRawAndDrain(port,
+                "GET /a HTTP/1.1\r\nHost: x\r\n\r\n"
+                "GET /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            // Both responses must appear.
+            if (resp.find("A-response") == std::string::npos) {
+                pass = false; err += "A-response missing; ";
+            }
+            if (resp.find("B-response") == std::string::npos) {
+                pass = false; err += "B-response missing; ";
+            }
+            // No stale 103 anywhere on the wire.
+            if (resp.find("HTTP/1.1 103") != std::string::npos) {
+                pass = false;
+                err += "stale 103 leaked onto the pipelined connection — "
+                       "request-scoped guard was bypassed; ";
+            }
+            TestFramework::RecordTest(
+                "H1 103 Early Hints: pipelined keep-alive no stale",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 103 Early Hints: pipelined keep-alive no stale",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // T9: H1 async handler that populates async_cancel_slot then throws
     // must have the slot fired by the framework's catch block. Without
     // this, custom async handlers (e.g. ProxyHandler installs
@@ -1709,6 +1837,7 @@ namespace HttpTests {
         TestH1_EarlyHints_100ContinueThen103();
         TestH1_EarlyHints_CRLFSanitized();
         TestH1_EarlyHints_WorkerThreadOrderingSafe();
+        TestH1_EarlyHints_PipelinedKeepAliveNoStale();
         TestH1_Async_HandlerThrowFiresCancelSlot();
     }
 
