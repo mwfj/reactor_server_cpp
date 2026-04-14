@@ -90,6 +90,28 @@ public:
     // completion. Same pattern as ScheduleInitiateShutdown.
     void ScheduleForceCloseActive();
 
+    // Drain the wait queue on a CLOSED → OPEN breaker trip.
+    //
+    // Every live waiter receives CHECKOUT_CIRCUIT_OPEN (mapped by
+    // ProxyTransaction::OnCheckoutError to RESULT_CIRCUIT_OPEN, emitting
+    // the §12.1 circuit-open response). Cancelled waiters are dropped
+    // silently — the transaction already tore its side down via the
+    // framework abort hook. Does NOT set shutting_down_ (this is a
+    // transient drain, not a shutdown); the partition keeps its
+    // connections for HALF_OPEN probing when the open window elapses.
+    //
+    // Dispatcher-thread-only. The breaker's transition callback fires
+    // on the slice's owning dispatcher thread — the SAME dispatcher
+    // that owns this partition (one slice ↔ one partition by
+    // dispatcher_index). No enqueue needed.
+    //
+    // Rationale: without this drain, a queued waiter admitted by
+    // ConsultBreaker just before the trip would wait out the full
+    // `open_duration_ms` (up to 60s by default) before the pool's
+    // queue timeout rejects it. That's a visible latency spike for
+    // clients who are about to be served 503 anyway.
+    void DrainWaitQueueOnTrip();
+
     bool IsShuttingDown() const { return shutting_down_; }
 
     // Stats (dispatcher-thread-only reads)

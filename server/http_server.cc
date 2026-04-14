@@ -6,6 +6,9 @@
 #include "upstream/upstream_manager.h"
 #include "upstream/proxy_handler.h"
 #include "circuit_breaker/circuit_breaker_manager.h"
+#include "circuit_breaker/circuit_breaker_host.h"
+#include "circuit_breaker/circuit_breaker_slice.h"
+#include "upstream/pool_partition.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
 #include <algorithm>
@@ -377,6 +380,56 @@ void HttpServer::MarkServerReady() {
                     upstream_configs_, dispatchers.size(), dispatchers);
             upstream_manager_->AttachCircuitBreakerManager(
                 circuit_breaker_manager_.get());
+
+            // Wire CLOSED→OPEN transition callbacks for every slice of every
+            // host — regardless of `enabled=false`, per design §3.1 R3-1. A
+            // disabled slice never fires transitions (TryAcquire short-
+            // circuits to ADMITTED); wiring the callback costs nothing but
+            // lets a live reload flip enable=false→true without re-wiring.
+            //
+            // The callback routes trip events to the corresponding
+            // PoolPartition's DrainWaitQueueOnTrip so queued waiters fail
+            // fast with CHECKOUT_CIRCUIT_OPEN instead of waiting out the
+            // open window. Each slice gets a distinct callback that
+            // captures its (service, dispatcher_index) pair — we can't use
+            // SetTransitionCallbackOnAllSlices because that would install a
+            // single callback across slices that need different partition
+            // lookups.
+            //
+            // Safe to capture raw `UpstreamManager*`: CircuitBreakerManager
+            // destructs BEFORE UpstreamManager (§3.1 ownership), and slice
+            // callbacks only fire on dispatcher threads which are stopped
+            // before either manager is destroyed. So any live callback
+            // invocation sees a valid UpstreamManager.
+            UpstreamManager* um = upstream_manager_.get();
+            for (const auto& u : upstream_configs_) {
+                auto* host = circuit_breaker_manager_->GetHost(u.name);
+                if (!host) continue;
+                std::string service = u.name;
+                for (size_t i = 0; i < host->partition_count(); ++i) {
+                    auto* slice = host->GetSlice(i);
+                    if (!slice) continue;
+                    slice->SetTransitionCallback(
+                        [um, service, i](circuit_breaker::State old_s,
+                                         circuit_breaker::State new_s,
+                                         const char* /*trigger*/) {
+                            // Drain only on CLOSED→OPEN. HALF_OPEN→OPEN
+                            // doesn't need draining — in HALF_OPEN, non-
+                            // probe admissions are already REJECTED_OPEN
+                            // before reaching the pool queue, so the
+                            // queue stays empty (or holds only probes,
+                            // which are in-flight by the time HALF_OPEN
+                            // trips back).
+                            if (old_s == circuit_breaker::State::CLOSED &&
+                                new_s == circuit_breaker::State::OPEN) {
+                                if (auto* part = um->GetPoolPartition(
+                                        service, i)) {
+                                    part->DrainWaitQueueOnTrip();
+                                }
+                            }
+                        });
+                }
+            }
         } catch (...) {
             logging::Get()->error(
                 "Circuit breaker init failed, stopping server");

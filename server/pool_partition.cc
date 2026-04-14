@@ -549,6 +549,41 @@ void PoolPartition::InitiateShutdown() {
     MaybeSignalDrain();
 }
 
+void PoolPartition::DrainWaitQueueOnTrip() {
+    // Hoist alive_ — a waiter's error_callback may synchronously trigger
+    // a request completion path that tears down the partition (e.g. the
+    // test harness). Same pattern used by InitiateShutdown.
+    auto alive = alive_;
+
+    if (shutting_down_) {
+        // Already draining via InitiateShutdown — that path will send
+        // CHECKOUT_SHUTTING_DOWN to every waiter. Don't double-fire.
+        return;
+    }
+
+    if (wait_queue_.empty()) return;
+
+    logging::Get()->info(
+        "PoolPartition draining wait queue on breaker trip: {}:{} "
+        "queue_size={}",
+        upstream_host_, upstream_port_, wait_queue_.size());
+
+    while (!wait_queue_.empty()) {
+        auto entry = std::move(wait_queue_.front());
+        wait_queue_.pop_front();
+        // Cancelled waiters have no callback to fire — the transaction
+        // already tore its side down via the framework abort hook.
+        if (IsEntryCancelled(entry)) {
+            continue;
+        }
+        // CHECKOUT_CIRCUIT_OPEN — ProxyTransaction::OnCheckoutError maps
+        // to RESULT_CIRCUIT_OPEN and delivers MakeCircuitOpenResponse()
+        // without touching the breaker (our own reject, don't feed back).
+        entry.error_callback(CHECKOUT_CIRCUIT_OPEN);
+        if (!alive->load(std::memory_order_acquire)) return;
+    }
+}
+
 void PoolPartition::ForceCloseActive() {
     // Collect transports + borrower callbacks, then move to zombie, then
     // close transports, then notify borrowers. This ordering ensures:

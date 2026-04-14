@@ -63,6 +63,16 @@ public:
     // Check if an upstream service is configured
     bool HasUpstream(const std::string& service_name) const;
 
+    // Look up the PoolPartition for (service_name, dispatcher_index).
+    // Returns nullptr if service is unknown or dispatcher_index is out
+    // of range. Used by the circuit-breaker transition callback (wired
+    // in HttpServer::MarkServerReady) to drain the wait queue on a
+    // CLOSED → OPEN trip. Must be called on the dispatcher thread
+    // identified by `dispatcher_index` — the returned partition's
+    // DrainWaitQueueOnTrip is dispatcher-thread-only.
+    PoolPartition* GetPoolPartition(const std::string& service_name,
+                                    size_t dispatcher_index);
+
     // Install a non-owning pointer to the server's CircuitBreakerManager.
     // Called once from HttpServer::MarkServerReady after both managers are
     // constructed (§3.1). Lifetime guarantee: the CircuitBreakerManager

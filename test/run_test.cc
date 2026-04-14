@@ -17,6 +17,7 @@
 #include "circuit_breaker_phase3_test.h"
 #include "circuit_breaker_phase4_test.h"
 #include "circuit_breaker_phase5_test.h"
+#include "circuit_breaker_phase6_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -93,6 +94,9 @@ void RunAllTest(){
 
     // Run circuit breaker Phase 5 retry-budget integration tests
     CircuitBreakerPhase5Tests::RunAllTests();
+
+    // Run circuit breaker Phase 6 wait-queue-drain-on-trip tests
+    CircuitBreakerPhase6Tests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;
 }
@@ -172,12 +176,13 @@ int main(int argc, char* argv[]) {
         // Run rate limit tests
         }else if(mode == "rate_limit" || mode == "-L"){
             RateLimitTests::RunAllTests();
-        // Run circuit breaker tests (phases 1-5: unit + phase3 + phase4 + phase5)
+        // Run circuit breaker tests (phases 1-6: unit + phase3 + phase4 + phase5 + phase6)
         }else if(mode == "circuit_breaker" || mode == "-B"){
             CircuitBreakerTests::RunAllTests();
             CircuitBreakerPhase3Tests::RunAllTests();
             CircuitBreakerPhase4Tests::RunAllTests();
             CircuitBreakerPhase5Tests::RunAllTests();
+            CircuitBreakerPhase6Tests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);
