@@ -1921,6 +1921,62 @@ void TestReportNeutralLastProbeAfterFailureReTrips() {
     }
 }
 
+// BUG (review round 12, P2): ComputeOpenDuration read base/max durations
+// straight from config_, so a programmatic caller bypassing
+// ConfigLoader::Validate() with base_open_duration_ms <= 0 or max < base
+// would compute scaled_ms <= 0. open_until = now + 0 → next TryAcquire
+// sees now_ns >= open_until_ns → transition to HALF_OPEN immediately.
+// The breaker never actually backed off. Fix: clamp base to >= 1ms and
+// max to >= base at the compute site, matching the window and probe
+// budget clamps.
+void TestComputeOpenDurationClampsInvalidBase() {
+    std::cout << "\n[TEST] CB: ComputeOpenDuration clamps invalid base/max..."
+              << std::endl;
+    try {
+        CircuitBreakerConfig cb;
+        cb.enabled = true;
+        cb.consecutive_failure_threshold = 2;
+        cb.failure_rate_threshold = 100;
+        cb.minimum_volume = 1000;
+        cb.window_seconds = 10;
+        cb.permitted_half_open_calls = 1;
+        cb.base_open_duration_ms = 0;    // bypass — would kill backoff
+        cb.max_open_duration_ms = 0;     // bypass — would kill backoff
+
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Trip to OPEN.
+        for (int i = 0; i < 2; ++i) {
+            auto a = slice.TryAcquire();
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, a.generation);
+        }
+        bool is_open = slice.CurrentState() == State::OPEN;
+
+        // Immediate TryAcquire: clock hasn't moved, so if the clamp holds
+        // (open_until >= now + 1ms), this MUST reject as "open" (not drain
+        // to HALF_OPEN). Without the fix, scaled_ms=0 → open_until==now →
+        // admission path immediately transitions to HALF_OPEN.
+        auto immediate = slice.TryAcquire();
+        bool rejected_as_open = immediate.decision == Decision::REJECTED_OPEN;
+        bool still_open = slice.CurrentState() == State::OPEN;
+
+        bool pass = is_open && rejected_as_open && still_open;
+        TestFramework::RecordTest(
+            "CB: ComputeOpenDuration clamps invalid base/max",
+            pass, pass ? "" :
+                  "is_open=" + std::to_string(is_open) +
+                  " rejected_as_open=" + std::to_string(rejected_as_open) +
+                  " still_open=" + std::to_string(still_open),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: ComputeOpenDuration clamps invalid base/max",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestTransitionCallbackInvoked() {
     std::cout << "\n[TEST] CB: transition callback invoked..." << std::endl;
     try {
@@ -2007,6 +2063,7 @@ void RunAllTests() {
     TestHalfOpenDoesNotReuseProbeSlots();
     TestReportNeutralReleasesProbeSlot();
     TestReportNeutralLastProbeAfterFailureReTrips();
+    TestComputeOpenDurationClampsInvalidBase();
     TestTransitionCallbackInvoked();
 }
 

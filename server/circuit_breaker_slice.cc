@@ -40,8 +40,21 @@ std::chrono::nanoseconds CircuitBreakerSlice::ComputeOpenDuration() const {
     // Callers must increment consecutive_trips_ AFTER calling this method.
     int trips = consecutive_trips_.load(std::memory_order_relaxed);
     if (trips > MAX_OPEN_DURATION_SHIFT) trips = MAX_OPEN_DURATION_SHIFT;
-    int64_t base_ms = config_.base_open_duration_ms;
-    int64_t max_ms  = config_.max_open_duration_ms;
+    // Clamp base/max for programmatic callers that bypass ConfigLoader::Validate
+    // (same hardening as CircuitBreakerWindow's ctor and the HALF_OPEN probe
+    // budget snapshot). Without these clamps:
+    //   - base_open_duration_ms <= 0: `base_ms << trips` is <= 0 → open_until
+    //     <= now → next TryAcquire immediately drains OPEN→HALF_OPEN,
+    //     disabling the backoff entirely.
+    //   - max_open_duration_ms < base_open_duration_ms: the overflow/clamp
+    //     branch (`scaled_ms > max_ms`) fires on every trip, pinning the
+    //     duration to a value smaller than base — same "no meaningful
+    //     backoff" effect.
+    // Clamp floors: base >= 1ms, max >= base.
+    int64_t base_ms = config_.base_open_duration_ms > 0
+                          ? config_.base_open_duration_ms : 1;
+    int64_t max_ms  = config_.max_open_duration_ms >= base_ms
+                          ? config_.max_open_duration_ms : base_ms;
     int64_t scaled_ms = base_ms << trips;
     if (scaled_ms < base_ms /* overflow */ || scaled_ms > max_ms) {
         scaled_ms = max_ms;
