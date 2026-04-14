@@ -5,6 +5,7 @@
 #include "http2/http2_constants.h"
 #include "upstream/upstream_manager.h"
 #include "upstream/proxy_handler.h"
+#include "circuit_breaker/circuit_breaker_manager.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
 #include <algorithm>
@@ -357,6 +358,28 @@ void HttpServer::MarkServerReady() {
                 upstream_configs_, dispatchers);
         } catch (...) {
             logging::Get()->error("Upstream pool init failed, stopping server");
+            net_server_.Stop();
+            throw;
+        }
+
+        // Circuit breaker — built alongside the pool. One host per
+        // configured upstream (regardless of enabled), with one slice
+        // per dispatcher so hot-path TryAcquire is lock-free. Attached
+        // to UpstreamManager via a non-owning pointer so ProxyTransaction
+        // can reach it on the hot path via upstream_manager_->
+        // GetCircuitBreakerManager(). The manager is declared AFTER
+        // upstream_manager_ on HttpServer (see header) so teardown runs
+        // breaker-first, which matches the dangling-pointer safety rule
+        // in UpstreamManager::breaker_manager_.
+        try {
+            circuit_breaker_manager_ =
+                std::make_unique<circuit_breaker::CircuitBreakerManager>(
+                    upstream_configs_, dispatchers.size(), dispatchers);
+            upstream_manager_->AttachCircuitBreakerManager(
+                circuit_breaker_manager_.get());
+        } catch (...) {
+            logging::Get()->error(
+                "Circuit breaker init failed, stopping server");
             net_server_.Stop();
             throw;
         }

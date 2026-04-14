@@ -2,6 +2,9 @@
 #include "upstream/upstream_manager.h"
 #include "upstream/upstream_connection.h"
 #include "upstream/http_request_serializer.h"
+#include "circuit_breaker/circuit_breaker_manager.h"
+#include "circuit_breaker/circuit_breaker_host.h"
+#include "circuit_breaker/circuit_breaker_slice.h"
 #include "connection_handler.h"
 #include "dispatcher.h"
 // config/server_config.h provided by proxy_transaction.h (ProxyConfig stored by value)
@@ -110,11 +113,38 @@ void ProxyTransaction::Start() {
                           upstream_host_, upstream_port_,
                           method_, upstream_path);
 
+    // Resolve the circuit-breaker slice once. Null when no breaker is
+    // attached (server has no upstreams configured, or Phase 4 skipped
+    // on this deployment), or when the service/dispatcher pair is out of
+    // range. In any null case the breaker is simply bypassed — the
+    // transaction proceeds as if circuit breaking were disabled.
+    if (upstream_manager_ && dispatcher_index_ >= 0) {
+        auto* cbm = upstream_manager_->GetCircuitBreakerManager();
+        if (cbm) {
+            auto* host = cbm->GetHost(service_name_);
+            if (host) {
+                slice_ = host->GetSlice(static_cast<size_t>(dispatcher_index_));
+            }
+        }
+    }
+
     AttemptCheckout();
 }
 
 void ProxyTransaction::AttemptCheckout() {
     state_ = State::CHECKOUT_PENDING;
+
+    // Circuit breaker gate — consulted before every attempt (first try and
+    // retries both). Each attempt gets a fresh admission stamped with the
+    // slice's current generation. If the slice rejects with REJECTED_OPEN,
+    // ConsultBreaker delivers the §12.1 response and returns false; the
+    // retry loop treats RESULT_CIRCUIT_OPEN as terminal (§8) so a rejected
+    // retry produces a single 503 to the client, not a nested retry.
+    // Dry-run reject logs inside TryAcquire and returns ADMITTED through
+    // the decision enum (REJECTED_OPEN_DRYRUN), so ConsultBreaker proceeds.
+    if (!ConsultBreaker()) {
+        return;
+    }
 
     auto self = shared_from_this();
 
@@ -224,21 +254,58 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
     // Only retry actual network connect failures. Pool saturation
     // (POOL_EXHAUSTED, QUEUE_TIMEOUT) and shutdown should fail fast —
     // retrying under backpressure amplifies load on an already-stressed
-    // pool and stretches client latency with no benefit.
+    // pool and stretches client latency with no benefit. A breaker-drain
+    // reject (CHECKOUT_CIRCUIT_OPEN, Phase 6) is also terminal: the
+    // client gets the same circuit-open response a fresh requester
+    // would, and the retry loop must not retry it.
+    //
+    // Breaker reporting: connect failures (both timeout and refused) are
+    // upstream-health signals → ReportFailure(CONNECT_FAILURE). Local
+    // capacity (POOL_EXHAUSTED, QUEUE_TIMEOUT) and shutdown are NOT
+    // reported — they don't imply upstream unhealthiness (design §7).
+    // CHECKOUT_CIRCUIT_OPEN is also not reported to the breaker (would
+    // be a feedback loop — our own reject counting against the upstream).
+    //
     // Import error codes from PoolPartition:
-    //   CHECKOUT_CONNECT_FAILED  = -2  → retryable
-    //   CHECKOUT_CONNECT_TIMEOUT = -3  → retryable
-    //   CHECKOUT_POOL_EXHAUSTED  = -1  → not retryable
-    //   CHECKOUT_QUEUE_TIMEOUT   = -5  → not retryable
-    //   CHECKOUT_SHUTTING_DOWN   = -4  → not retryable
+    //   CHECKOUT_CONNECT_FAILED  = -2  → retryable, report CONNECT_FAILURE
+    //   CHECKOUT_CONNECT_TIMEOUT = -3  → retryable, report CONNECT_FAILURE
+    //   CHECKOUT_POOL_EXHAUSTED  = -1  → not retryable, neutral-release probe
+    //   CHECKOUT_QUEUE_TIMEOUT   = -5  → not retryable, neutral-release probe
+    //   CHECKOUT_SHUTTING_DOWN   = -4  → not retryable, neutral-release probe
+    //   CHECKOUT_CIRCUIT_OPEN    = -6  → not retryable, do NOT report
     static constexpr int CONNECT_FAILED  = -2;
     static constexpr int CONNECT_TIMEOUT = -3;
+    static constexpr int CIRCUIT_OPEN    = -6;
+
+    if (error_code == CIRCUIT_OPEN) {
+        // Drain path: breaker tripped while this transaction was queued
+        // (Phase 6 implements the drain). Do NOT Report to the slice —
+        // our own reject must not feed back into the failure math. Emit
+        // the §12.1 circuit-open response directly.
+        logging::Get()->info(
+            "ProxyTransaction checkout drained by circuit breaker "
+            "client_fd={} service={}",
+            client_fd_, service_name_);
+        DeliverResponse(MakeCircuitOpenResponse());
+        // Clear admission_generation_ so Cleanup / destructor doesn't
+        // double-report. The admission was already fire-and-forget —
+        // slice-side bookkeeping is intact (the drain itself doesn't
+        // touch inflight counters because the breaker didn't admit).
+        admission_generation_ = 0;
+        return;
+    }
 
     if (error_code == CONNECT_FAILED || error_code == CONNECT_TIMEOUT) {
+        // Report connect failure to the breaker BEFORE retrying —
+        // otherwise the retry's ConsultBreaker might admit against a
+        // stale success count, delaying trip detection.
+        ReportBreakerOutcome(RESULT_CHECKOUT_FAILED);
         MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
     } else {
         // Pool exhaustion, queue timeout, or shutdown — local capacity issue.
         // Use RESULT_POOL_EXHAUSTED → 503 (not 502 which implies upstream failure).
+        // Release the breaker slot neutrally — admission never reached upstream.
+        ReportBreakerOutcome(RESULT_POOL_EXHAUSTED);
         OnError(RESULT_POOL_EXHAUSTED,
                 "Pool checkout failed (local capacity, error=" +
                 std::to_string(error_code) + ")");
@@ -517,9 +584,19 @@ void ProxyTransaction::OnResponseComplete() {
                              "service={} status={} attempt={}",
                              client_fd_, service_name_,
                              response.status_code, attempt_);
+        // Report failure BEFORE MaybeRetry — the retry's fresh
+        // ConsultBreaker must see the just-added failure in the window
+        // (and potentially reject if this was the trip-causing call).
+        // Pass a synthetic RESULT_CHECKOUT_FAILED-like signal; the
+        // classifier maps 5xx → FailureKind::RESPONSE_5XX.
+        ReportBreakerOutcome(/* sentinel */ -1000);
         MaybeRetry(RetryPolicy::RetryCondition::RESPONSE_5XX);
         return;
     }
+
+    // 2xx / 3xx / 4xx: upstream is healthy (from the breaker's
+    // perspective — 4xx is a client-side problem). Report success.
+    ReportBreakerOutcome(RESULT_SUCCESS);
 
     state_ = State::COMPLETE;
 
@@ -550,8 +627,19 @@ void ProxyTransaction::OnError(int result_code,
                          client_fd_, service_name_, result_code,
                          attempt_, duration.count(), log_message);
 
+    // Report the outcome if an admission is still held. Most error paths
+    // call ReportBreakerOutcome themselves BEFORE reaching OnError (so a
+    // retry's ConsultBreaker sees the fresh signal) — this is a safety
+    // net for error paths that skipped reporting, e.g., RESULT_SEND_FAILED
+    // and RESULT_RESPONSE_TIMEOUT from the on-upstream-data paths.
+    // ReportBreakerOutcome is idempotent: it clears admission_generation_
+    // on the first call so a double-call drops harmlessly.
+    ReportBreakerOutcome(result_code);
+
     state_ = State::FAILED;
-    HttpResponse error_response = MakeErrorResponse(result_code);
+    HttpResponse error_response = (result_code == RESULT_CIRCUIT_OPEN)
+        ? MakeCircuitOpenResponse()
+        : MakeErrorResponse(result_code);
     DeliverResponse(std::move(error_response));
 }
 
@@ -886,6 +974,15 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
     if (result_code == RESULT_POOL_EXHAUSTED) {
         return HttpResponse::ServiceUnavailable();
     }
+    if (result_code == RESULT_RETRY_BUDGET_EXHAUSTED) {
+        return MakeRetryBudgetResponse();
+    }
+    if (result_code == RESULT_CIRCUIT_OPEN) {
+        // MakeErrorResponse is static and has no `this` — the richer
+        // MakeCircuitOpenResponse(slice_) path is preferred. Fall back
+        // to a plain 503 here for the rare static-context invocation.
+        return HttpResponse::ServiceUnavailable();
+    }
     if (result_code == RESULT_CHECKOUT_FAILED ||
         result_code == RESULT_SEND_FAILED ||
         result_code == RESULT_PARSE_ERROR ||
@@ -893,4 +990,168 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
         return HttpResponse::BadGateway();
     }
     return HttpResponse::InternalError();
+}
+
+HttpResponse ProxyTransaction::MakeCircuitOpenResponse() const {
+    // Compute Retry-After from slice->OpenUntil() if the slice is known.
+    // Falls back to a conservative 1-second hint if the slice is null
+    // (shouldn't happen on the circuit-open path — that path requires a
+    // slice — but defense in depth).
+    int retry_after_secs = 1;
+    if (slice_) {
+        auto open_until = slice_->OpenUntil();
+        // OpenUntil returns a zero time_point when NOT OPEN. Checking
+        // against zero with steady_clock::time_point is fiddly; use
+        // time_since_epoch().count() > 0 as the "is-set" check.
+        if (open_until.time_since_epoch().count() > 0) {
+            auto now = std::chrono::steady_clock::now();
+            auto diff = std::chrono::duration_cast<std::chrono::seconds>(
+                open_until - now).count();
+            // Clamp to [1, 300] — Retry-After=0 is silly, and an hour+
+            // is misleading (ops usually want operators to check
+            // sooner). The breaker's open duration caps out around
+            // minutes; anything larger means we're dealing with a
+            // cascade and we should hint sooner.
+            if (diff < 1) diff = 1;
+            if (diff > 300) diff = 300;
+            retry_after_secs = static_cast<int>(diff);
+        }
+    }
+
+    HttpResponse resp;
+    resp.Status(HttpStatus::SERVICE_UNAVAILABLE);
+    resp.Text("Upstream circuit breaker is open; please retry later.\n");
+    resp.Header("Retry-After", std::to_string(retry_after_secs));
+    resp.Header("X-Circuit-Breaker", "open");
+    // Hint operators (not clients) at which upstream tripped. Useful
+    // when a gateway fronts multiple backends; without this header, a
+    // 503 is opaque.
+    resp.Header("X-Upstream-Host",
+                   upstream_host_ + ":" + std::to_string(upstream_port_));
+    resp.Header("Connection", "close");
+    return resp;
+}
+
+HttpResponse ProxyTransaction::MakeRetryBudgetResponse() {
+    HttpResponse resp;
+    resp.Status(HttpStatus::SERVICE_UNAVAILABLE);
+    resp.Text("Upstream retry budget exhausted.\n");
+    resp.Header("X-Retry-Budget-Exhausted", "1");
+    resp.Header("Connection", "close");
+    return resp;
+}
+
+bool ProxyTransaction::ConsultBreaker() {
+    if (!slice_) {
+        // No breaker attached for this service. Proceed as if the
+        // breaker layer didn't exist. admission_generation_ stays 0 so
+        // any accidental ReportBreakerOutcome call is a no-op.
+        is_probe_ = false;
+        admission_generation_ = 0;
+        return true;
+    }
+    auto admission = slice_->TryAcquire();
+
+    // Stash the admission metadata for the paired Report*() call. Note
+    // we record this EVEN for REJECTED_OPEN (where generation_==0 is a
+    // sentinel) — it's harmless and keeps the branches simpler.
+    admission_generation_ = admission.generation;
+    is_probe_ = (admission.decision ==
+                 circuit_breaker::Decision::ADMITTED_PROBE);
+
+    if (admission.decision == circuit_breaker::Decision::REJECTED_OPEN) {
+        // Hard reject — slice counted it, logged it, and we must not
+        // touch the upstream. Emit §12.1 response and DO NOT Report
+        // back (would create a feedback loop — our own reject counting
+        // as a failure against the already-OPEN slice).
+        state_ = State::FAILED;
+        logging::Get()->info(
+            "ProxyTransaction circuit-open reject client_fd={} service={} "
+            "attempt={}",
+            client_fd_, service_name_, attempt_);
+        DeliverResponse(MakeCircuitOpenResponse());
+        // Clear admission_generation_ — there's nothing to Report.
+        admission_generation_ = 0;
+        return false;
+    }
+
+    // REJECTED_OPEN_DRYRUN: slice logged the would-reject and counted
+    // it; caller proceeds to the upstream. Fall through as admitted.
+    // ADMITTED / ADMITTED_PROBE: proceed.
+    return true;
+}
+
+void ProxyTransaction::ReportBreakerOutcome(int result_code) {
+    // No slice, or already reported: bail. admission_generation_==0 is
+    // the sentinel — slice domain generations start at 1, so a 0 gen
+    // would be rejected as stale anyway; the early return just avoids
+    // an unnecessary atomic load. The Report* methods themselves are
+    // idempotent against stale gens, but we also must not increment a
+    // probe_*/rejected_ counter for a non-event.
+    if (!slice_ || admission_generation_ == 0) return;
+
+    // Capture + clear in one go so concurrent / re-entrant calls bail.
+    uint64_t gen = admission_generation_;
+    admission_generation_ = 0;
+    bool probe = is_probe_;
+    is_probe_ = false;
+
+    using circuit_breaker::FailureKind;
+
+    // Synthetic sentinel for the OnResponseComplete 5xx path — maps to
+    // RESPONSE_5XX without needing a new public result code. Callers
+    // other than OnResponseComplete never use this value.
+    static constexpr int SENTINEL_5XX = -1000;
+
+    switch (result_code) {
+        case RESULT_SUCCESS:
+            slice_->ReportSuccess(probe, gen);
+            return;
+
+        case SENTINEL_5XX:
+            slice_->ReportFailure(FailureKind::RESPONSE_5XX, probe, gen);
+            return;
+
+        case RESULT_CHECKOUT_FAILED:
+            slice_->ReportFailure(FailureKind::CONNECT_FAILURE, probe, gen);
+            return;
+
+        case RESULT_RESPONSE_TIMEOUT:
+            slice_->ReportFailure(FailureKind::RESPONSE_TIMEOUT, probe, gen);
+            return;
+
+        case RESULT_UPSTREAM_DISCONNECT:
+        case RESULT_SEND_FAILED:
+            slice_->ReportFailure(FailureKind::UPSTREAM_DISCONNECT, probe, gen);
+            return;
+
+        case RESULT_POOL_EXHAUSTED:
+        case RESULT_PARSE_ERROR:
+            // Local outcomes — no upstream health signal. Release the
+            // admission slot neutrally so a probe doesn't leak the
+            // HALF_OPEN slot.
+            slice_->ReportNeutral(probe, gen);
+            return;
+
+        case RESULT_CIRCUIT_OPEN:
+        case RESULT_RETRY_BUDGET_EXHAUSTED:
+            // Our own rejects — MUST NOT feed back into the slice.
+            // These paths should not reach ReportBreakerOutcome (both
+            // clear admission_generation_ before delivering), but the
+            // defensive branch keeps the class-wide invariant: these
+            // outcomes are invisible to the breaker.
+            return;
+
+        default:
+            // Unknown result code — log and neutral-release to keep the
+            // probe bookkeeping consistent. A runtime log here is
+            // cheaper than a slice stuck in HALF_OPEN forever because a
+            // new result code slipped through unclassified.
+            logging::Get()->error(
+                "ReportBreakerOutcome: unclassified result_code={} "
+                "service={} — releasing neutrally",
+                result_code, service_name_);
+            slice_->ReportNeutral(probe, gen);
+            return;
+    }
 }

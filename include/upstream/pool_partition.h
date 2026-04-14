@@ -25,6 +25,11 @@ public:
     static constexpr int CHECKOUT_CONNECT_TIMEOUT = -3;
     static constexpr int CHECKOUT_SHUTTING_DOWN   = -4;
     static constexpr int CHECKOUT_QUEUE_TIMEOUT   = -5;
+    // Delivered to wait-queue waiters drained on a breaker trip (Phase 6
+    // implements the drain path). ProxyTransaction::OnCheckoutError maps
+    // this to RESULT_CIRCUIT_OPEN so the queued client gets the same
+    // circuit-open response a fresh requester would get.
+    static constexpr int CHECKOUT_CIRCUIT_OPEN    = -6;
 
     PoolPartition(std::shared_ptr<Dispatcher> dispatcher,
                   const std::string& upstream_host, int upstream_port,
