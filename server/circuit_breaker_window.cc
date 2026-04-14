@@ -16,8 +16,14 @@ static inline size_t BucketIndex(int64_t epoch_sec, int window_seconds) {
 }
 
 CircuitBreakerWindow::CircuitBreakerWindow(int window_seconds)
-    : window_seconds_(window_seconds),
-      buckets_(window_seconds > 0 ? static_cast<size_t>(window_seconds) : 1) {
+    // Clamp to a minimum of 1 bucket. ConfigLoader::Validate() rejects
+    // window_seconds <= 0 on the production path, but the constructor is a
+    // public API and programmatic callers (tests, future direct users) may
+    // bypass that validation. Without the clamp, BucketIndex() does `% 0` on
+    // the first Add/TotalCount and crashes; negative values violate the ring
+    // math. Matches Resize()'s clamp so the two entry points are symmetric.
+    : window_seconds_(window_seconds > 0 ? window_seconds : 1),
+      buckets_(static_cast<size_t>(window_seconds_)) {
 }
 
 int64_t CircuitBreakerWindow::ToEpochSec(

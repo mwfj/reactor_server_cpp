@@ -1538,6 +1538,43 @@ void TestWindowResizeResetConsecutiveFailures() {
     }
 }
 
+// BUG (review round 8, P2): CircuitBreakerWindow's constructor allocated
+// `max(1, window_seconds)` buckets but stored the RAW window_seconds_ value.
+// Programmatic callers bypassing ConfigLoader::Validate() (tests, future
+// direct users) that passed window_seconds <= 0 would trigger BucketIndex's
+// `% window_seconds_` on the first Add*/TotalCount call — dividing by zero
+// for 0, or violating ring math for negatives. Resize() already clamped.
+// Fix: constructor applies the same clamp so both entry points are symmetric.
+void TestWindowNonPositiveWindowSizeClamp() {
+    std::cout << "\n[TEST] CB: window ctor clamps non-positive sizes..."
+              << std::endl;
+    try {
+        // Zero would have crashed on % 0 before the fix.
+        CircuitBreakerWindow w0(0);
+        auto t = std::chrono::steady_clock::time_point(std::chrono::seconds(1000));
+        w0.AddSuccess(t);
+        w0.AddFailure(t);
+        bool zero_ok = (w0.TotalCount(t) == 2) && (w0.FailureCount(t) == 1);
+
+        // Negative values would have violated the ring math.
+        CircuitBreakerWindow wn(-5);
+        wn.AddSuccess(t);
+        bool negative_ok = wn.TotalCount(t) == 1;
+
+        bool pass = zero_ok && negative_ok;
+        TestFramework::RecordTest(
+            "CB: window ctor clamps non-positive sizes",
+            pass, pass ? "" :
+                  "zero_ok=" + std::to_string(zero_ok) +
+                  " negative_ok=" + std::to_string(negative_ok),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: window ctor clamps non-positive sizes",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestTransitionCallbackInvoked() {
     std::cout << "\n[TEST] CB: transition callback invoked..." << std::endl;
     try {
@@ -1618,6 +1655,7 @@ void RunAllTests() {
     TestWindowResizeStillInvalidatesClosedAdmissions();
     TestWindowResizeResetConsecutiveFailures();
     TestHalfOpenBudgetFrozenAcrossReload();
+    TestWindowNonPositiveWindowSizeClamp();
     TestTransitionCallbackInvoked();
 }
 
