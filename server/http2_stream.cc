@@ -4,9 +4,29 @@
 
 // Returns the default port for a given HTTP(S) scheme. Empty string if
 // scheme is unknown (caller falls back to strict exact-match).
+// Scheme comparison is ASCII-case-insensitive per RFC 3986 §3.1:
+// "Although schemes are case-insensitive, the canonical form is
+// lowercase." A client that sends :scheme=HTTPS with
+// :authority=example.com:443 and host=example.com is still sending a
+// legal H2 request — without case-folding here, the default-port
+// fallback never runs and the authority-vs-host conflict check
+// incorrectly rejects the request.
 static std::string DefaultPortForScheme(const std::string& scheme) {
-    if (scheme == "http") return "80";
-    if (scheme == "https") return "443";
+    if (scheme.size() == 4 &&
+        (scheme[0] == 'h' || scheme[0] == 'H') &&
+        (scheme[1] == 't' || scheme[1] == 'T') &&
+        (scheme[2] == 't' || scheme[2] == 'T') &&
+        (scheme[3] == 'p' || scheme[3] == 'P')) {
+        return "80";
+    }
+    if (scheme.size() == 5 &&
+        (scheme[0] == 'h' || scheme[0] == 'H') &&
+        (scheme[1] == 't' || scheme[1] == 'T') &&
+        (scheme[2] == 't' || scheme[2] == 'T') &&
+        (scheme[3] == 'p' || scheme[3] == 'P') &&
+        (scheme[4] == 's' || scheme[4] == 'S')) {
+        return "443";
+    }
     return "";
 }
 

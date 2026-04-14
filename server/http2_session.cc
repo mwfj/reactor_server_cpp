@@ -1090,7 +1090,17 @@ int32_t Http2Session::SubmitPushPromise(
             method, parent_stream_id);
         return -1;
     }
-    if (scheme != "http" && scheme != "https") {
+    // URI schemes are case-insensitive per RFC 3986 §3.1. Lowercase once
+    // for validation AND for the value we put on the wire — pseudo-header
+    // values in HTTP/2 should be in canonical (lowercase) form so the
+    // peer's HPACK decoder doesn't trip and so a misbehaving client that
+    // passes :scheme=HTTPS here does not cause us to emit the same
+    // non-canonical value in the PUSH_PROMISE.
+    std::string scheme_lower = scheme;
+    std::transform(scheme_lower.begin(), scheme_lower.end(),
+                   scheme_lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (scheme_lower != "http" && scheme_lower != "https") {
         logging::Get()->warn(
             "push: invalid scheme '{}' parent={}", scheme, parent_stream_id);
         return -1;
@@ -1172,7 +1182,10 @@ int32_t Http2Session::SubmitPushPromise(
         });
     };
     add_ph(":method",    7, method);
-    add_ph(":scheme",    7, scheme);
+    // Emit the canonical (lowercase) scheme regardless of what the
+    // caller passed — consistent with HTTP/2 lowercase conventions and
+    // ensures a peer's HPACK decoder sees a well-formed value.
+    add_ph(":scheme",    7, scheme_lower);
     add_ph(":authority", 10, authority);
     add_ph(":path",      5, path);
 

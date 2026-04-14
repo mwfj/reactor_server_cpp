@@ -2504,6 +2504,61 @@ void TestH2_AuthorityCaseInsensitiveHostDefaultPort() {
     }
 }
 
+// Regression guard: URI schemes are case-insensitive per RFC 3986
+// §3.1. A client that sends :scheme=HTTPS must get the same
+// default-port normalization as :scheme=https; prior to the fix,
+// DefaultPortForScheme() returned "" for mixed case so the host /
+// :authority equivalence (example.com vs example.com:443) was
+// rejected as a conflict. The test uses :scheme=HTTP (http-default
+// port 80) to avoid needing a TLS client in the test harness.
+void TestH2_AuthorityMixedCaseSchemeDefaultPort() {
+    std::cout << "\n[TEST] H2 Authority: mixed-case scheme default port..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            // :scheme=HTTP (uppercase), :authority=example.com,
+            // host=example.com:80 — authorities are equivalent ONLY
+            // after the default-port fallback runs, which requires
+            // the mixed-case scheme to be recognized.
+            auto resp = client.SendRequestRaw("GET", "/", "HTTP", "example.com",
+                                              {{"host", "example.com:80"}});
+            if (resp.error || resp.rst) {
+                pass = false;
+                err = "transport error or RST for mixed-case :scheme=HTTP";
+            } else if (resp.status != 200) {
+                pass = false;
+                err = "expected 200, got " + std::to_string(resp.status);
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: mixed-case scheme default port", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: mixed-case scheme default port", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ============================================================
 // Category 8: HTTP/2 103 Early Hints (SubmitInterimHeaders /
 // SendInterimResponse). See plan Task 4 / design doc §4.2.
@@ -3759,6 +3814,72 @@ void TestH2_Push_OffDispatcherThreadHops() {
     }
 }
 
+// Regression guard: URI schemes are case-insensitive per RFC 3986.
+// push_resource("GET", "HTTP", ...) must succeed, and the emitted
+// PUSH_PROMISE must carry the canonical lowercase :scheme value.
+// Before the fix, SubmitPushPromise rejected non-lowercase schemes
+// with -1, making the API fragile against callers that forward a
+// scheme string from config/URL parsing without normalizing.
+void TestH2_Push_MixedCaseSchemeAccepted() {
+    std::cout << "\n[TEST] H2 Push: mixed-case scheme accepted..." << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        // Register a handler that pushes with mixed-case scheme.
+        server.GetAsync("/",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher push_resource,
+               HttpRouter::AsyncCompletionCallback complete) {
+                HttpResponse pushed;
+                pushed.Status(200).Body(kPushedBody, "text/css");
+                push_resource("GET", "HTTP", "localhost",
+                              "/style.css", pushed);
+                HttpResponse main;
+                main.Status(200).Body("<html/>", "text/html");
+                complete(std::move(main));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.status != 200) {
+                pass = false;
+                err += "parent status != 200 (got " +
+                       std::to_string(resp.status) + "); ";
+            }
+            if (resp.pushed.size() != 1) {
+                pass = false;
+                err += "expected 1 pushed stream for mixed-case scheme, got " +
+                       std::to_string(resp.pushed.size()) + "; ";
+            } else {
+                // Wire emission must normalize to lowercase per our
+                // canonical-form guarantee.
+                if (resp.pushed[0].scheme != "http") {
+                    pass = false;
+                    err += "PUSH_PROMISE :scheme emitted as '" +
+                           resp.pushed[0].scheme + "' — expected lowercase 'http'; ";
+                }
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 Push: mixed-case scheme accepted + normalized", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Push: mixed-case scheme accepted + normalized", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression for PR #18 round-5 comment 2: H2 async handler that
 // calls complete() and then send_interim() inline on the dispatcher
 // thread (before returning from the handler body) must NOT land the
@@ -4144,6 +4265,7 @@ void RunAllTests() {
     TestH2_AuthorityMismatchWrongDefault();
     TestH2_AuthorityIPv6WithDefaultPort();
     TestH2_AuthorityCaseInsensitiveHostDefaultPort();
+    TestH2_AuthorityMixedCaseSchemeDefaultPort();
 
     // --- Category 8: 103 Early Hints / SubmitInterimHeaders ---
     TestH2_EarlyHints_Basic();
@@ -4167,6 +4289,7 @@ void RunAllTests() {
     TestH2_Push_EmptyPath();
     TestH2_Push_EmptyAuthority();
     TestH2_Push_InvalidSchemeFtp();
+    TestH2_Push_MixedCaseSchemeAccepted();
     TestH2_Push_HeadResponseBodySuppressed();
     TestH2_Push_NotCountedInTotalRequests();
     TestH2_Push_SyncHandlerViaThreadLocal();
