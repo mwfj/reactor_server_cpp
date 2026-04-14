@@ -266,26 +266,50 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 if (!item["circuit_breaker"].is_object())
                     throw std::runtime_error("upstream circuit_breaker must be an object");
                 auto& cb = item["circuit_breaker"];
+                // Strict integer accessor: rejects float/bool/string inputs
+                // that nlohmann's default value<int>() would silently coerce
+                // (e.g., 1.9 → 1, true → 1). Without this, malformed configs
+                // pass Validate() and change breaker behavior in production.
+                auto cb_int = [&cb](const char* name, int default_val) -> int {
+                    if (!cb.contains(name)) return default_val;
+                    const auto& v = cb[name];
+                    if (!v.is_number_integer()) {
+                        throw std::invalid_argument(
+                            std::string("circuit_breaker.") + name +
+                            " must be an integer");
+                    }
+                    return v.get<int>();
+                };
+                auto cb_bool = [&cb](const char* name, bool default_val) -> bool {
+                    if (!cb.contains(name)) return default_val;
+                    const auto& v = cb[name];
+                    if (!v.is_boolean()) {
+                        throw std::invalid_argument(
+                            std::string("circuit_breaker.") + name +
+                            " must be a boolean");
+                    }
+                    return v.get<bool>();
+                };
                 upstream.circuit_breaker.enabled =
-                    cb.value("enabled", false);
+                    cb_bool("enabled", false);
                 upstream.circuit_breaker.dry_run =
-                    cb.value("dry_run", false);
+                    cb_bool("dry_run", false);
                 upstream.circuit_breaker.consecutive_failure_threshold =
-                    cb.value("consecutive_failure_threshold", 5);
+                    cb_int("consecutive_failure_threshold", 5);
                 upstream.circuit_breaker.failure_rate_threshold =
-                    cb.value("failure_rate_threshold", 50);
+                    cb_int("failure_rate_threshold", 50);
                 upstream.circuit_breaker.minimum_volume =
-                    cb.value("minimum_volume", 20);
+                    cb_int("minimum_volume", 20);
                 upstream.circuit_breaker.window_seconds =
-                    cb.value("window_seconds", 10);
+                    cb_int("window_seconds", 10);
                 upstream.circuit_breaker.permitted_half_open_calls =
-                    cb.value("permitted_half_open_calls", 5);
+                    cb_int("permitted_half_open_calls", 5);
                 upstream.circuit_breaker.base_open_duration_ms =
-                    cb.value("base_open_duration_ms", 5000);
+                    cb_int("base_open_duration_ms", 5000);
                 upstream.circuit_breaker.max_open_duration_ms =
-                    cb.value("max_open_duration_ms", 60000);
+                    cb_int("max_open_duration_ms", 60000);
                 upstream.circuit_breaker.max_ejection_percent_per_host_set =
-                    cb.value("max_ejection_percent_per_host_set", 50);
+                    cb_int("max_ejection_percent_per_host_set", 50);
                 // retry_budget_* fields removed from Phase 2 — re-added in
                 // Phase 3 when the RetryBudget class lands. Unknown keys in
                 // input JSON are silently ignored by nlohmann::json.

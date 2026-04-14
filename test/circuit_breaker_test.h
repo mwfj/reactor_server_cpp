@@ -1639,6 +1639,70 @@ void TestWindowNonPositiveWindowSizeClamp() {
     }
 }
 
+// BUG (review round 9, P3): CircuitBreakerSlice copied permitted_half_open_calls
+// into the HALF_OPEN snapshot verbatim. For programmatic callers bypassing
+// ConfigLoader::Validate() (same class as the window ctor clamp), a zero or
+// negative budget would permanently wedge the breaker in HALF_OPEN:
+//   TryAcquire (HALF_OPEN, case B): half_open_inflight_(0) >= snapshot(0)
+//   → every probe rejected as half_open_full → no probe ever admitted
+//   → no report ever fires → half_open_inflight_ stays at 0 forever.
+//
+// Fix: clamp the snapshot to min 1 at TransitionOpenToHalfOpen. Symmetric
+// with CircuitBreakerWindow's constructor clamp from round 8.
+void TestHalfOpenClampsNonPositiveProbeBudget() {
+    std::cout << "\n[TEST] CB: HALF_OPEN clamps non-positive probe budget..."
+              << std::endl;
+    try {
+        CircuitBreakerConfig cb;
+        cb.enabled = true;
+        cb.consecutive_failure_threshold = 2;
+        cb.failure_rate_threshold = 100;
+        cb.minimum_volume = 1000;
+        cb.window_seconds = 10;
+        cb.permitted_half_open_calls = 0;   // bypasses Validate() — direct ctor
+        cb.base_open_duration_ms = 100;
+        cb.max_open_duration_ms = 60000;
+
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Trip to OPEN.
+        for (int i = 0; i < 2; ++i) {
+            auto a = slice.TryAcquire();
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, a.generation);
+        }
+
+        // Advance past open_until → OPEN→HALF_OPEN on next TryAcquire.
+        clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
+
+        // First TryAcquire triggers the transition. With the clamp, snapshot=1
+        // and this probe is admitted. Without the clamp, snapshot=0 → rejected
+        // as half_open_full → breaker stuck forever.
+        auto a0 = slice.TryAcquire();
+        bool probe_admitted = a0.decision == Decision::ADMITTED_PROBE;
+
+        // A successful probe closes the cycle (successes(1) >= snapshot(1)).
+        // Without the clamp this branch would never execute.
+        if (probe_admitted) {
+            slice.ReportSuccess(true, a0.generation);
+        }
+        bool recovered = slice.CurrentState() == State::CLOSED;
+
+        bool pass = probe_admitted && recovered;
+        TestFramework::RecordTest(
+            "CB: HALF_OPEN clamps non-positive probe budget",
+            pass, pass ? "" :
+                  "probe_admitted=" + std::to_string(probe_admitted) +
+                  " recovered=" + std::to_string(recovered),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: HALF_OPEN clamps non-positive probe budget",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestTransitionCallbackInvoked() {
     std::cout << "\n[TEST] CB: transition callback invoked..." << std::endl;
     try {
@@ -1721,6 +1785,7 @@ void RunAllTests() {
     TestHalfOpenBudgetFrozenAcrossReload();
     TestWindowNonPositiveWindowSizeClamp();
     TestReportFailureUsesOneTimestampAcrossTripEval();
+    TestHalfOpenClampsNonPositiveProbeBudget();
     TestTransitionCallbackInvoked();
 }
 

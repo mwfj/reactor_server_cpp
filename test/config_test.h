@@ -538,6 +538,19 @@ namespace ConfigTests {
         ExpectValidationFailure("CB Validation: permitted_half_open_calls>1000",
             R"({"permitted_half_open_calls": 1001})",
             "permitted_half_open_calls must be in [1, 1000]");
+        // Type-strictness guards: nlohmann's value<int>() silently coerces
+        // float/bool to int (1.9 → 1, true → 1). Rejecting at parse time is
+        // safer than letting malformed configs pass Validate() and change
+        // production breaker behavior.
+        ExpectValidationFailure("CB Validation: float rejected for int field",
+            R"({"window_seconds": 1.9})",
+            "circuit_breaker.window_seconds must be an integer");
+        ExpectValidationFailure("CB Validation: bool rejected for int field",
+            R"({"consecutive_failure_threshold": true})",
+            "circuit_breaker.consecutive_failure_threshold must be an integer");
+        ExpectValidationFailure("CB Validation: int rejected for bool field",
+            R"({"enabled": 1})",
+            "circuit_breaker.enabled must be a boolean");
     }
 
     // Test 14: UpstreamConfig::operator== INCLUDES circuit_breaker until Phase 8.

@@ -116,7 +116,17 @@ void CircuitBreakerSlice::TransitionOpenToHalfOpen() {
     // (first success satisfies the reduced count → TransitionHalfOpenToClosed
     // bumps halfopen_gen_ → remaining admitted probes become stale → their
     // failures are silently dropped and the breaker falsely closes).
-    half_open_permitted_snapshot_ = config_.permitted_half_open_calls;
+    //
+    // Clamp to a minimum of 1. ConfigLoader::Validate() enforces >= 1 on the
+    // production path, but programmatic callers (tests, future direct users)
+    // that bypass validation could set permitted_half_open_calls <= 0. With
+    // snapshot=0, TryAcquire's Case B check (`inflight >= snapshot`) is
+    // immediately true for every probe → no probe ever admitted → no probe
+    // ever completes → half_open_inflight_ stays at 0 forever → slice is
+    // permanently stuck in HALF_OPEN rejecting all traffic. Matches the
+    // symmetric clamp in CircuitBreakerWindow's ctor.
+    int permitted = config_.permitted_half_open_calls;
+    half_open_permitted_snapshot_ = permitted > 0 ? permitted : 1;
     // Reset the info-log "first reject" breadcrumb so the first rejection
     // observed in the HALF_OPEN phase surfaces at info, not debug. HALF_OPEN
     // rejection (recovery attempt failing or probe budget full) is
