@@ -2403,6 +2403,28 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     // deferred state so the outer catch's 500 + close works.
                     completed->store(true, std::memory_order_relaxed);
                     cancelled->store(true, std::memory_order_release);
+                    // Fire the handler-installed cancel slot if it was
+                    // populated before the throw. ProxyHandler and other
+                    // custom async handlers store an abort hook there
+                    // (e.g. tx->Cancel()) BEFORE starting background
+                    // work — without firing it here, an exception thrown
+                    // AFTER background work has been kicked off would
+                    // leak that work (upstream pool capacity, timers,
+                    // etc.) since the safety-cap abort hook below is
+                    // only installed on the non-throw path. Move-and-
+                    // clear pattern matches the abort hook to make
+                    // double-fire impossible if a later code path also
+                    // tries to cancel.
+                    if (cancel_slot && *cancel_slot) {
+                        auto local = std::move(*cancel_slot);
+                        *cancel_slot = nullptr;
+                        try { local(); }
+                        catch (const std::exception& e) {
+                            logging::Get()->error(
+                                "Async cancel slot threw during handler "
+                                "exception cleanup: {}", e.what());
+                        }
+                    }
                     self->CancelAsyncResponse();
                     throw;  // outer catch sends 500 + closes
                 }
@@ -3204,6 +3226,26 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 } catch (...) {
                     completed->store(true, std::memory_order_relaxed);
                     cancelled->store(true, std::memory_order_release);
+                    // Same cleanup as the H1 catch: fire the handler's
+                    // cancel slot if populated before the throw, so
+                    // already-started background work (proxy txn,
+                    // upstream lease, timers) is released instead of
+                    // running to its own timeout against a stream that
+                    // the outer catch is about to fail back to the
+                    // client. The per-stream abort hook below is only
+                    // installed on the non-throw path, so this catch
+                    // is the sole cleanup site for handlers that throw
+                    // AFTER kicking off background work.
+                    if (cancel_slot && *cancel_slot) {
+                        auto local = std::move(*cancel_slot);
+                        *cancel_slot = nullptr;
+                        try { local(); }
+                        catch (const std::exception& e) {
+                            logging::Get()->error(
+                                "Async cancel slot threw during H2 handler "
+                                "exception cleanup: {}", e.what());
+                        }
+                    }
                     throw;
                 }
                 // Handler returned without throwing — install a

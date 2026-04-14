@@ -1599,6 +1599,68 @@ namespace HttpTests {
         }
     }
 
+    // T9: H1 async handler that populates async_cancel_slot then throws
+    // must have the slot fired by the framework's catch block. Without
+    // this, custom async handlers (e.g. ProxyHandler installs
+    // tx->Cancel() in the slot before starting upstream work) would
+    // leak the in-flight work — it would hold pool capacity and
+    // resources until its own internal timeout, even after the outer
+    // catch sent a 500 and closed the client connection.
+    void TestH1_Async_HandlerThrowFiresCancelSlot() {
+        std::cout << "\n[TEST] H1 async: handler throw fires cancel slot..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            auto cancel_fired = std::make_shared<std::atomic<bool>>(false);
+            server.GetAsync("/throws",
+                [cancel_fired](
+                    const HttpRequest& req,
+                    HttpRouter::InterimResponseSender /*send_interim*/,
+                    HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    // Simulate ProxyHandler::Handle: install cleanup
+                    // hook in the cancel slot BEFORE kicking off the
+                    // (simulated) background work, then throw.
+                    if (req.async_cancel_slot) {
+                        *req.async_cancel_slot = [cancel_fired]() {
+                            cancel_fired->store(true,
+                                                std::memory_order_release);
+                        };
+                    }
+                    throw std::runtime_error("handler synthetic failure");
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(port,
+                "GET /throws HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            // Outer catch should have sent 500 and closed.
+            if (resp.find("HTTP/1.1 500") == std::string::npos) {
+                pass = false; err += "missing 500 response; ";
+            }
+            // Critical: the cancel slot must have been fired so any
+            // background work (in real code: proxy upstream) is
+            // released, not leaked until its own timeout.
+            if (!cancel_fired->load(std::memory_order_acquire)) {
+                pass = false;
+                err += "cancel_slot was NOT fired — async background "
+                       "work would leak; ";
+            }
+            TestFramework::RecordTest(
+                "H1 async: handler throw fires cancel slot",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 async: handler throw fires cancel slot",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // Run all HTTP tests
     void RunAllTests() {
         std::cout << "\n" << std::string(60, '=') << std::endl;
@@ -1647,6 +1709,7 @@ namespace HttpTests {
         TestH1_EarlyHints_100ContinueThen103();
         TestH1_EarlyHints_CRLFSanitized();
         TestH1_EarlyHints_WorkerThreadOrderingSafe();
+        TestH1_Async_HandlerThrowFiresCancelSlot();
     }
 
 }  // namespace HttpTests

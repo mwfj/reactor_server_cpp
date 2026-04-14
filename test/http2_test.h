@@ -3880,6 +3880,69 @@ void TestH2_Push_MixedCaseSchemeAccepted() {
     }
 }
 
+// Regression: H2 async handler that populates async_cancel_slot then
+// throws must have the slot fired by the framework's catch block.
+// Same scenario as the H1 test (TestH1_Async_HandlerThrowFiresCancelSlot)
+// — without firing the cancel slot in the catch path, custom async
+// handlers (proxy, upstream, etc.) leak their in-flight work even
+// though the outer catch synthesizes a 500 onto the stream.
+void TestH2_Async_HandlerThrowFiresCancelSlot() {
+    std::cout << "\n[TEST] H2 async: handler throw fires cancel slot..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        auto cancel_fired = std::make_shared<std::atomic<bool>>(false);
+        server.GetAsync("/throws",
+            [cancel_fired](
+                const HttpRequest& req,
+                HttpRouter::InterimResponseSender /*send_interim*/,
+                HttpRouter::ResourcePusher        /*push_resource*/,
+                HttpRouter::AsyncCompletionCallback /*complete*/) {
+                if (req.async_cancel_slot) {
+                    *req.async_cancel_slot = [cancel_fired]() {
+                        cancel_fired->store(true,
+                                            std::memory_order_release);
+                    };
+                }
+                throw std::runtime_error("h2 handler synthetic failure");
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/throws");
+            // Outer catch should send 500 on the stream (or RST it).
+            // Either way, the cancel slot MUST have been fired.
+            (void)resp;
+        }
+        client.Disconnect();
+        // Allow the dispatcher to settle the catch path.
+        auto deadline = std::chrono::steady_clock::now() +
+                         std::chrono::seconds(2);
+        while (!cancel_fired->load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!cancel_fired->load(std::memory_order_acquire)) {
+            pass = false;
+            err += "cancel_slot was NOT fired — async background work "
+                   "would leak on H2 handler throw; ";
+        }
+        TestFramework::RecordTest(
+            "H2 async: handler throw fires cancel slot", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 async: handler throw fires cancel slot", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression for PR #18 round-5 comment 2: H2 async handler that
 // calls complete() and then send_interim() inline on the dispatcher
 // thread (before returning from the handler body) must NOT land the
@@ -4276,6 +4339,7 @@ void RunAllTests() {
     TestH2_EarlyHints_100ContinueThen103();
     TestH2_EarlyHints_OffDispatcherThread();
     TestH2_EarlyHints_DroppedAfterCompleteSameThread();
+    TestH2_Async_HandlerThrowFiresCancelSlot();
 
     // --- Category 9: SETTINGS_ENABLE_PUSH wire format ---
     TestH2_SettingsEnablePushWire_Disabled();
