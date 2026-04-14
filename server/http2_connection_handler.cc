@@ -451,6 +451,121 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
     }
 }
 
+bool Http2ConnectionHandler::SendInterimResponse(
+    int32_t stream_id, int status_code,
+    const std::vector<std::pair<std::string, std::string>>& headers) {
+    // Dispatcher-thread-only contract. An off-thread caller would race
+    // nghttp2's non-thread-safe session state against sync request
+    // processing, so refuse rather than silently corrupting the session.
+    if (!conn_) return false;
+    // Off-dispatcher callers (async handlers resuming on a worker
+    // thread after an upstream completion) auto-hop so the API is
+    // actually usable from async code — consistent with HTTP/1.1.
+    // Previously this returned false and logged a warn, which meant
+    // any real-world async handler could never emit 103 Early Hints
+    // because it had no public dispatcher handle to satisfy a manual
+    // RunOnDispatcher() requirement. The hopped re-entry runs on the
+    // dispatcher and either submits (stream still open, no final
+    // response yet) or drops silently (stream closed, final already
+    // submitted) — matching the sync-on-dispatcher code path.
+    if (!conn_->IsOnDispatcherThread()) {
+        std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
+        auto headers_copy = headers;
+        conn_->RunOnDispatcher(
+            [weak_self, stream_id, status_code,
+             headers_copy = std::move(headers_copy)]() {
+            if (auto self = weak_self.lock()) {
+                self->SendInterimResponse(stream_id, status_code, headers_copy);
+            }
+        });
+        return true;  // queued; actual drop/emit decided on dispatcher
+    }
+    if (!session_) {
+        logging::Get()->debug(
+            "H2 SendInterimResponse on destroyed session stream={}; drop",
+            stream_id);
+        return false;
+    }
+    if (session_->SubmitInterimHeaders(stream_id, status_code, headers) != 0) {
+        return false;
+    }
+    // Flush EXCEPT when we're inside nghttp2_session_mem_recv2 — an
+    // inline sync handler emitting a 103 would otherwise cause a
+    // reentrant mem_send2 call (the same hazard the flood branches
+    // avoid). OnRawData's tail always flushes after ReceiveData
+    // returns, so the 103 still reaches the wire without an inline
+    // flush here. Non-recv contexts (async completion, worker-hop
+    // re-entry) need the inline flush because no outer code guarantees
+    // a follow-up flush.
+    if (!session_->InReceiveData()) {
+        session_->SendPendingFrames();
+    }
+    return true;
+}
+
+int32_t Http2ConnectionHandler::PushResource(
+    int32_t parent_stream_id,
+    const std::string& method, const std::string& scheme,
+    const std::string& authority, const std::string& path,
+    const HttpResponse& response) {
+    if (!conn_) return -1;
+    // Off-dispatcher callers auto-hop so the API is usable from async
+    // handlers. Because we can't synchronously observe the submit
+    // outcome from the worker thread, we return -1 — the same sentinel
+    // used for any other failure — rather than inventing a third state
+    // (the previous 0 return broke the ResourcePusher contract, which
+    // the async caller may test with `if (id > 0)` or `if (id != -1)`
+    // to decide on a Link-header fallback; 0 would misclassify queued
+    // calls whose dispatcher-side submit later fails for real reasons
+    // like shutdown / peer refused / GOAWAY sent).
+    //
+    // Handlers that need the promised id MUST call from the dispatcher
+    // (sync handler, inside a RunOnDispatcher lambda, or inside the
+    // complete-callback before enqueuing complete()). Off-thread calls
+    // are "best effort": the push still goes through on the dispatcher,
+    // but caller treats the return as failure for decision purposes.
+    if (!conn_->IsOnDispatcherThread()) {
+        std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
+        conn_->RunOnDispatcher(
+            [weak_self, parent_stream_id, method, scheme,
+             authority, path, response]() {
+            if (auto self = weak_self.lock()) {
+                self->PushResource(parent_stream_id, method, scheme,
+                                    authority, path, response);
+            }
+        });
+        return -1;  // queued; caller treats as "id not available" → fallback
+    }
+    if (!session_) {
+        logging::Get()->debug(
+            "PushResource on destroyed session parent={}; drop",
+            parent_stream_id);
+        return -1;
+    }
+    if (shutdown_requested_.load(std::memory_order_acquire)) {
+        logging::Get()->debug(
+            "PushResource: shutdown requested parent={}", parent_stream_id);
+        return -1;
+    }
+    int32_t promised = session_->SubmitPushPromise(
+        parent_stream_id, method, scheme, authority, path, response);
+    // NOTE: stream-counter accounting (local_stream_count_ and the
+    // server-wide active_h2_streams_) is handled inside
+    // Http2Session::CreateServerInitiatedStream via the shared
+    // stream_open_callback, symmetric with the close path. We must NOT
+    // increment here or the counters would drift +1 per push.
+
+    // Flush EXCEPT when we're inside nghttp2_session_mem_recv2. See
+    // SendInterimResponse above for the same reasoning — an inline
+    // sync handler issuing a push must not reenter mem_send2. The
+    // OnRawData tail flushes after ReceiveData returns, so the
+    // PUSH_PROMISE + response still reach the wire.
+    if (!session_->InReceiveData()) {
+        session_->SendPendingFrames();
+    }
+    return promised;
+}
+
 void Http2ConnectionHandler::NotifyDrainComplete() {
     if (drain_notified_) return;
     drain_notified_ = true;

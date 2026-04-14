@@ -60,6 +60,46 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     // completion via EnQueue.
     using AsyncCompletionCallback = std::function<void(HttpResponse)>;
 
+    // Send a non-final 1xx response (RFC 8297 Early Hints, etc.).
+    // May be called zero or more times BEFORE the final AsyncCompletionCallback.
+    //
+    // Thread-safe: off-dispatcher callers are auto-hopped internally so the
+    // final drop/emit decision happens on the dispatcher thread, preserving
+    // ordering against the eventual final response. Calls that arrive after
+    // complete() has been invoked for the originating request are dropped
+    // silently (request-scoped guard) so stale interims never leak into a
+    // pipelined next request's response window. See design spec §4.2.
+    using InterimResponseSender = std::function<void(
+        int status_code,
+        const std::vector<std::pair<std::string, std::string>>& headers
+    )>;
+
+    // Push an HTTP/2 resource alongside the current response.
+    // Contract: success returns the promised stream_id (>0); failure
+    // returns -1. Reasons for -1 include: config disabled, peer
+    // refused via SETTINGS_ENABLE_PUSH=0, non-H2 transport, invalid
+    // method/scheme/path/authority, session shutting down or GOAWAY
+    // sent, parent stream closed OR its final response already
+    // submitted, nghttp2 submit failure.
+    //
+    // Thread-safe: off-dispatcher callers are auto-hopped internally.
+    // Off-thread callers cannot synchronously observe the submit
+    // outcome, so they receive -1 (the failure sentinel) — a
+    // "caller-friendly" choice that lets `if (id > 0)` and
+    // `if (id != -1)` correctly branch into the Link-header / preload
+    // fallback path. The push itself still proceeds on the dispatcher
+    // on a best-effort basis. Application code that needs the promised
+    // id MUST call from the dispatcher thread (sync handler, inside a
+    // RunOnDispatcher lambda, or before enqueuing complete()).
+    // See design spec §2.2.
+    using ResourcePusher = std::function<int32_t(
+        const std::string& method,
+        const std::string& scheme,
+        const std::string& authority,
+        const std::string& path,
+        const HttpResponse& response
+    )>;
+
     // Async handler for HTTP requests. Used when the request handler needs to
     // dispatch async work (e.g. upstream proxy via UpstreamManager::CheckoutAsync)
     // and deliver the response later. The handler receives the request plus
@@ -72,8 +112,12 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     //     pending so graceful shutdown waits for the reply
     //   - Applies Connection: close / keep-alive / HEAD body-stripping to
     //     the completion response using the original request's metadata
+    // Invoked by HttpServer (NOT HttpRouter — the router has no transport
+    // context). See design §2.2 and §4.2.
     using AsyncHandler = std::function<void(
         const HttpRequest& request,
+        InterimResponseSender send_interim,
+        ResourcePusher        push_resource,
         AsyncCompletionCallback complete
     )>;
 

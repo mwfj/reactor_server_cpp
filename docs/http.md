@@ -146,9 +146,17 @@ Async routes are for handlers that need to perform async work (e.g., upstream pr
 
 HttpServer server(config);
 
-// Async route — receives request + completion callback
-server.GetAsync("/proxy/users", [&](const HttpRequest& req,
-                                     HttpRouter::AsyncCompletionCallback complete) {
+// Async route — request + non-final senders + completion callback
+server.GetAsync("/proxy/users",
+    [&](const HttpRequest& req,
+        HttpRouter::InterimResponseSender send_interim,
+        HttpRouter::ResourcePusher        push_resource,
+        HttpRouter::AsyncCompletionCallback complete) {
+    // Optionally emit a 103 Early Hints BEFORE the final response,
+    // so the browser can start preloading resources in parallel with
+    // the upstream round-trip. See "Early Hints (103)" below.
+    send_interim(103, {{"Link", "</style.css>; rel=preload; as=style"}});
+
     // Checkout an upstream connection (non-blocking)
     upstream_manager->CheckoutAsync("api-backend", dispatcher_index,
         [complete](UpstreamLease lease) {
@@ -173,11 +181,27 @@ server.RouteAsync("PATCH", "/proxy/data", async_handler);
 
 ```cpp
 using AsyncCompletionCallback = std::function<void(HttpResponse)>;
+using InterimResponseSender   = std::function<void(
+    int status_code,
+    const std::vector<std::pair<std::string, std::string>>& headers)>;
+using ResourcePusher          = std::function<int32_t(
+    const std::string& method,
+    const std::string& scheme,
+    const std::string& authority,
+    const std::string& path,
+    const HttpResponse& headers)>;
 using AsyncHandler = std::function<void(const HttpRequest& request,
+                                         InterimResponseSender send_interim,
+                                         ResourcePusher push_resource,
                                          AsyncCompletionCallback complete)>;
 ```
 
-The handler receives a const request reference and a completion callback. Call `complete(response)` exactly once to deliver the response. Both types are defined in `include/http/http_callbacks.h` (`HTTP_CALLBACKS_NAMESPACE`).
+The handler receives the request plus three callables:
+- **`send_interim(status, headers)`** — emit a non-final 1xx response (e.g. 103 Early Hints). Safe to call zero, one, or many times before `complete()`. See *Early Hints (103)* below.
+- **`push_resource(...)`** — HTTP/2 server push. Returns a pushed stream id, or -1 if push is disabled (always -1 on HTTP/1.1; H1 ignores this sender). Implementation landed in Phase 5 of the plan.
+- **`complete(response)`** — must be called exactly once to deliver the final response.
+
+All four types are defined in `include/http/http_callbacks.h` (`HTTP_CALLBACKS_NAMESPACE`). The senders are always bound (never null) — no need to check before calling.
 
 ### Async Route Behavior
 
@@ -188,6 +212,55 @@ The handler receives a const request reference and a completion callback. Call `
 - **405 Allow** — async routes are included in the `Allow` header for 405 responses
 - **Thread safety** — the completion callback MUST be invoked on the dispatcher thread that owns the connection. Upstream pool `CheckoutAsync` naturally routes callbacks to the correct dispatcher.
 - **HTTP/2 support** — async routes work identically for H2 streams; the framework binds `SubmitStreamResponse` internally
+
+## Early Hints (103)
+
+HTTP/1.1 async routes can emit one or more `103 Early Hints` responses before the final response via the `InterimResponseSender` passed to the handler. This lets the client start preloading `Link: rel=preload` resources while the server is still waiting on an upstream, a database query, or disk I/O.
+
+Defined in [RFC 8297](https://datatracker.ietf.org/doc/html/rfc8297).
+
+### Basic usage
+
+```cpp
+server.GetAsync("/page",
+    [&](const HttpRequest& req,
+        HttpRouter::InterimResponseSender send_interim,
+        HttpRouter::ResourcePusher        /*push_resource*/,
+        HttpRouter::AsyncCompletionCallback complete) {
+    send_interim(103, {
+        {"Link", "</style.css>; rel=preload; as=style"},
+        {"Link", "</app.js>;    rel=preload; as=script"}
+    });
+    // ... kick off upstream work, eventually call complete(...) ...
+});
+```
+
+On the wire, the client sees:
+
+```
+HTTP/1.1 103 Early Hints
+Link: </style.css>; rel=preload; as=style
+Link: </app.js>;    rel=preload; as=script
+
+HTTP/1.1 200 OK
+Content-Type: text/html
+...
+```
+
+### Contract
+
+- **Allowed status codes** — `[102, 200)` except `101` (which is reserved for `Upgrade` and is rejected). `100` is framework-managed (auto-emitted for `Expect: 100-continue`) and cannot be sent via `send_interim`.
+- **HTTP/1.0 clients** — interims require HTTP/1.1+ per RFC. Calls on `HTTP/1.0` connections are silently dropped (debug-logged).
+- **Post-final calls** — once `complete()` has been invoked and the final response is written, further `send_interim` calls are dropped with a warn log. The framework tracks this via an atomic flag so off-thread callers race-safely.
+- **Thread safety** — `send_interim` is safe to call from any thread on HTTP/1.1. Cross-thread publication is handled via acquire/release on the final-response flag.
+- **Forbidden headers** — `Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Transfer-Encoding`, `Upgrade`, and `Content-Length` are stripped before serialization (debug-logged). `Link` and similar preload-targeted headers pass through unchanged.
+- **Oversize protection** — interim responses that exceed `max_header_size` are dropped with a warn log.
+
+### What 103 is NOT for
+
+- It is not a final response — do not include a body, and always follow it with a `complete()` call.
+- It does not commit the server to the final status (the browser treats the 103 preload as advisory).
+- Do not use it to convey business logic — the browser may discard 103 responses on redirects.
 
 ## Proxy Routes
 

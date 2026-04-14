@@ -269,14 +269,116 @@ Resume happens at two points:
 
 If the connection is closing (`IsClosing()`), `SendPendingFrames` breaks the loop early to avoid wasting CPU serializing frames for a disconnected peer.
 
+## Early Hints (103)
+
+HTTP/2 async routes can emit `103 Early Hints` responses before the final response via the `InterimResponseSender` passed to the handler — the same API as HTTP/1.1 (see [docs/http.md](http.md#early-hints-103) for the basic usage and contract). On HTTP/2 the interim is sent as a non-final HEADERS frame **without** `END_STREAM`, so the same stream carries both the 103 and the eventual 200.
+
+Defined in [RFC 8297](https://datatracker.ietf.org/doc/html/rfc8297); HTTP/2 wire format in [RFC 9113 §8.1](https://datatracker.ietf.org/doc/html/rfc9113#section-8.1).
+
+### Implementation notes specific to HTTP/2
+
+- **`SubmitInterimHeaders`** on `Http2Session` submits a HEADERS frame with `NGHTTP2_FLAG_NONE` and no data provider, leaving the stream in `HALF_CLOSED_REMOTE` so the subsequent `SubmitResponse` can emit the final block on the same stream.
+- **`final_response_submitted_`** — per-stream boolean flag set in `SubmitResponse` on success. `SubmitInterimHeaders` refuses to submit when the flag is set, preventing a late 1xx from racing or corrupting a stream nghttp2 already considers half-closed.
+- **Dispatcher-thread-only contract** — `Http2ConnectionHandler::SendInterimResponse` rejects calls from foreign threads with a warn log, rather than silently mutating nghttp2 state across a thread boundary. Async code that lives off-dispatcher (e.g. an upstream completion thread) must hop via `RunOnDispatcher()` before calling `send_interim`.
+- **Peer-closed-stream safety** — if the client RST's the stream or drops the transport before the interim fires, `SubmitInterimHeaders` observes a missing/closed stream and drops the submit without crashing. No special teardown is needed in the handler.
+- **`send_interim(100, ...)`** — rejected. The framework already emits `100 Continue` automatically when the client includes `Expect: 100-continue`; application code cannot emit additional 100s.
+- **`send_interim(101, ...)`** — rejected. `101 Switching Protocols` is invalid in HTTP/2 (RFC 9113 §8.6).
+- **Forbidden headers** — `Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Transfer-Encoding`, `Upgrade`, `Content-Length`, any `Proxy-*`, and the HTTP/2 pseudo-headers are stripped before serialization.
+
+## Server Push
+
+HTTP/2 server push (RFC 9113 §8.4) is **opt-in** via `http2.enable_push` (default `false`). When enabled, request handlers can pre-send resources the client is about to need — typically critical CSS / JS referenced from a parent HTML response — before the client has parsed the parent and discovered the dependency.
+
+> **⚠ Modern browser caveat:** Chrome and Firefox have **removed client-side push support**. As of this writing, the only realistic consumers are tooling, internal RPC clients, and curated deployments where the client is known to honor pushes. For browser performance, prefer 103 Early Hints (preload hints) over server push.
+
+### Enabling
+
+```jsonc
+// config/server.json
+{
+  "http2": {
+    "enabled": true,
+    "enable_push": true
+  }
+}
+```
+
+Or via env: `REACTOR_HTTP2_ENABLE_PUSH=true`.
+
+The flag controls the outbound `SETTINGS_ENABLE_PUSH` byte in the server preface (RFC 9113 §7):
+- `enable_push=false`: server advertises `{ENABLE_PUSH, 0}` — clients are notified push is disabled.
+- `enable_push=true`: the entry is **omitted entirely** — a server MUST NOT advertise the value `1` per the RFC. nghttp2's local default of 1 then applies internally so push submission works.
+
+### Async handler — bound `ResourcePusher`
+
+```cpp
+server.GetAsync("/page",
+    [&](const HttpRequest&,
+        HttpRouter::InterimResponseSender /*send_interim*/,
+        HttpRouter::ResourcePusher        push_resource,
+        HttpRouter::AsyncCompletionCallback complete) {
+    HttpResponse pushed_css;
+    pushed_css.Status(200).Body(css_bytes, "text/css");
+    int32_t promised_id = push_resource(
+        "GET", "https", "example.com", "/style.css", pushed_css);
+    // promised_id > 0 on success; -1 on validation/state failure
+    // (push disabled, peer refused, parent closed, GOAWAY, etc.)
+
+    HttpResponse main;
+    main.Status(200).Body(html_bytes, "text/html");
+    complete(std::move(main));
+});
+```
+
+### Sync handler — `http::PushResource()`
+
+Sync handlers can't grow extra parameters without breaking every existing signature, so push is exposed via a free function that reads a thread-local pointer installed around `router_.Dispatch`:
+
+```cpp
+#include "http/push_helper.h"
+
+server.Get("/page", [](const HttpRequest&, HttpResponse& res) {
+    HttpResponse pushed_css;
+    pushed_css.Status(200).Body(css_bytes, "text/css");
+    int32_t promised = http::PushResource(
+        "GET", "https", "example.com", "/style.css", pushed_css);
+    (void)promised;  // best-effort
+    res.Status(200).Body(html_bytes, "text/html");
+});
+```
+
+`http::PushResource()` returns `-1` (with a debug log) when called outside a sync H2 dispatch — including from any HTTP/1.x handler. **Push is HTTP/2 only.**
+
+### Contract
+
+| Constraint | Behavior |
+|---|---|
+| Method | Only `GET` or `HEAD` (RFC 9113 §8.4 — server push is for safe, body-less methods). Anything else returns -1 + warn. |
+| Scheme | Only `http` or `https`. |
+| Path | Must be non-empty and start with `/`. |
+| Authority | Must be non-empty. |
+| Local config | `http2.enable_push` must be true. |
+| Peer | Client's `SETTINGS_ENABLE_PUSH` must not be 0 (peer can refuse via its preface). |
+| Parent stream | Must exist and be open at submit time. |
+| Connection | `GOAWAY` must not have been sent. |
+| Thread | **Dispatcher-thread only.** Off-thread callers must hop via `conn->RunOnDispatcher()`. |
+| HEAD body | Pushed `HEAD` responses get headers but **no DATA frame** (per RFC 9110 §9.3.2). |
+| Failure mode | Best-effort. A failed push (any reason) returns -1 and **never breaks** the parent response. |
+
+### Stream accounting
+
+Pushed (server-initiated) streams have their own lifecycle that intentionally bypasses the request-parsing safety nets:
+
+- **Not counted in `total_requests`** — that counter is for client-initiated requests only.
+- **Not eligible for `parse_timeout_sec`** — pushed streams skip `OnStreamBecameIncomplete()` so `OldestIncompleteStreamStart()` never observes them, and `ResetExpiredStreams`'s parse-timeout branch can't RST a push mid-response.
+- **Counted in per-connection `local_stream_count_`** — incremented by `PushResource` on success, decremented by the stream-close callback. Used for abrupt-close compensation.
+- **Drained at shutdown** — pushed streams are normal HTTP/2 streams from nghttp2's perspective, so the existing graceful-shutdown drain (`shutdown_drain_timeout_sec`) waits for them like any other active stream.
+
 ## Limitations
 
-- Server push disabled (SETTINGS_ENABLE_PUSH = 0)
 - No WebSocket-over-HTTP/2 (Extended CONNECT, RFC 8441)
 - No HTTP/2 priority tree optimization (nghttp2 handles basic priority)
 - No manual flow control (nghttp2 automatic mode)
-- No non-final 1xx API for app handlers (103 Early Hints requires internal submit_headers; SubmitResponse rejects all `status < 200`)
-- Default-port authority normalization deferred (e.g. `example.com` vs `example.com:80` treated as different)
 
 ## Third-Party Dependency
 

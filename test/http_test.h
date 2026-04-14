@@ -652,7 +652,10 @@ namespace HttpTests {
             });
 
             server.GetAsync("/secret/data",
-                [&](const HttpRequest&, HttpRouter::AsyncCompletionCallback complete) {
+                [&](const HttpRequest&,
+                    HttpRouter::InterimResponseSender /*send_interim*/,
+                    HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::AsyncCompletionCallback complete) {
                     handler_called.store(true);
                     HttpResponse r;
                     r.Status(200).Text("should-not-reach");
@@ -694,6 +697,8 @@ namespace HttpTests {
 
             server.GetAsync("/slow",
                 [&sched](const HttpRequest&,
+                         HttpRouter::InterimResponseSender /*send_interim*/,
+                         HttpRouter::ResourcePusher        /*push_resource*/,
                          HttpRouter::AsyncCompletionCallback complete) {
                     // Defer completion by ~150 ms on a background thread.
                     auto shared = std::make_shared<
@@ -752,6 +757,8 @@ namespace HttpTests {
             std::atomic<bool> saw_head{false};
             server.GetAsync("/r",
                 [&](const HttpRequest& req,
+                    HttpRouter::InterimResponseSender /*send_interim*/,
+                    HttpRouter::ResourcePusher        /*push_resource*/,
                     HttpRouter::AsyncCompletionCallback complete) {
                     if (req.method == "GET")  saw_get.store(true);
                     if (req.method == "HEAD") saw_head.store(true);
@@ -791,7 +798,10 @@ namespace HttpTests {
         try {
             HttpServer server("127.0.0.1", 0);
             server.PostAsync("/jobs",
-                [](const HttpRequest&, HttpRouter::AsyncCompletionCallback c) {
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::AsyncCompletionCallback c) {
                     HttpResponse r;
                     r.Status(202).Text("accepted");
                     c(std::move(r));
@@ -834,6 +844,8 @@ namespace HttpTests {
             HttpServer server("127.0.0.1", 0);
             server.GetAsync("/res",
                 [&sched](const HttpRequest&,
+                         HttpRouter::InterimResponseSender /*send_interim*/,
+                         HttpRouter::ResourcePusher        /*push_resource*/,
                          HttpRouter::AsyncCompletionCallback complete) {
                     auto shared = std::make_shared<
                         HttpRouter::AsyncCompletionCallback>(std::move(complete));
@@ -882,6 +894,8 @@ namespace HttpTests {
             HttpServer server("127.0.0.1", 0);
             server.GetAsync("/r",
                 [&sched](const HttpRequest&,
+                         HttpRouter::InterimResponseSender /*send_interim*/,
+                         HttpRouter::ResourcePusher        /*push_resource*/,
                          HttpRouter::AsyncCompletionCallback complete) {
                     auto shared = std::make_shared<
                         HttpRouter::AsyncCompletionCallback>(std::move(complete));
@@ -943,7 +957,10 @@ namespace HttpTests {
                 return false;
             });
             server.GetAsync("/x",
-                [&](const HttpRequest&, HttpRouter::AsyncCompletionCallback c) {
+                [&](const HttpRequest&,
+                    HttpRouter::InterimResponseSender /*send_interim*/,
+                    HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::AsyncCompletionCallback c) {
                     handler_called.store(true);
                     HttpResponse r;
                     r.Status(200).Text("unreachable");
@@ -1001,6 +1018,777 @@ namespace HttpTests {
     // and the existing http2 suite verifies SendPendingFrames is invoked
     // on each request boundary.
 
+    // ===== HTTP/1.1 103 Early Hints / SendInterimResponse tests =====
+
+    // T1: Basic 103 Early Hints — async handler emits a 103 with a Link header
+    // before completing with 200. Verify the wire bytes contain HTTP/1.1 103
+    // before HTTP/1.1 200, and the Link header is present in the 103 block.
+    void TestH1_EarlyHints_Basic() {
+        std::cout << "\n[TEST] H1 103 Early Hints: basic..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync("/hints",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender send_interim,
+                   HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::AsyncCompletionCallback complete) {
+                    send_interim(103, {{"Link", "</style.css>; rel=preload; as=style"}});
+                    HttpResponse r;
+                    r.Status(200).Text("done");
+                    complete(std::move(r));
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(port,
+                "GET /hints HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 3000);
+
+            bool pass = true;
+            std::string err;
+            auto pos103 = resp.find("HTTP/1.1 103");
+            auto pos200 = resp.find("HTTP/1.1 200");
+            if (pos103 == std::string::npos) {
+                pass = false; err += "missing HTTP/1.1 103; ";
+            }
+            if (pos200 == std::string::npos) {
+                pass = false; err += "missing HTTP/1.1 200; ";
+            }
+            if (pass && pos103 >= pos200) {
+                pass = false; err += "103 not before 200; ";
+            }
+            // Check Link header is inside the 103 block (before pos200)
+            auto link_pos = resp.find("Link:");
+            if (link_pos == std::string::npos) {
+                pass = false; err += "missing Link header; ";
+            } else if (link_pos >= pos200) {
+                pass = false; err += "Link header not in 103 block; ";
+            }
+            // Assert no body bytes between the 103 block terminator and the 200
+            // status line: end103 + 4 ("\r\n\r\n") must equal pos200.
+            if (pass && pos103 != std::string::npos && pos200 != std::string::npos) {
+                auto end103 = resp.find("\r\n\r\n", pos103);
+                if (end103 == std::string::npos) {
+                    pass = false; err += "103 block not terminated with CRLF CRLF; ";
+                } else if (end103 + 4 != pos200) {
+                    pass = false; err += "body bytes between 103 and 200; ";
+                }
+            }
+            TestFramework::RecordTest("H1 103 Early Hints: basic",
+                                      pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("H1 103 Early Hints: basic",
+                                      false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // T2: Multiple 103s before the final 200. Assert both 103s appear and
+    // both precede the 200 line.
+    void TestH1_EarlyHints_MultipleBeforeFinal() {
+        std::cout << "\n[TEST] H1 103 Early Hints: multiple before final..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync("/multi",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender send_interim,
+                   HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::AsyncCompletionCallback complete) {
+                    send_interim(103, {{"Link", "</a.css>; rel=preload"}});
+                    send_interim(103, {{"Link", "</b.js>; rel=preload"}});
+                    HttpResponse r;
+                    r.Status(200).Text("done");
+                    complete(std::move(r));
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(port,
+                "GET /multi HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 3000);
+
+            bool pass = true;
+            std::string err;
+
+            // Count occurrences of "HTTP/1.1 103"
+            size_t count103 = 0;
+            size_t search_pos = 0;
+            while ((search_pos = resp.find("HTTP/1.1 103", search_pos)) != std::string::npos) {
+                ++count103;
+                ++search_pos;
+            }
+            if (count103 != 2) {
+                pass = false;
+                err += "expected 2 x HTTP/1.1 103, got " + std::to_string(count103) + "; ";
+            }
+            if (resp.find("HTTP/1.1 200") == std::string::npos) {
+                pass = false; err += "missing HTTP/1.1 200; ";
+            }
+            TestFramework::RecordTest("H1 103 Early Hints: multiple before final",
+                                      pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("H1 103 Early Hints: multiple before final",
+                                      false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // T3: 103 rejected on HTTP/1.0. The framework must silently drop the interim
+    // (HTTP/1.0 cannot handle 1xx interims per RFC 8297). The final 200 must
+    // still arrive.
+    void TestH1_EarlyHints_RejectedOn10() {
+        std::cout << "\n[TEST] H1 103 Early Hints: rejected on HTTP/1.0..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync("/hints10",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender send_interim,
+                   HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::AsyncCompletionCallback complete) {
+                    send_interim(103, {{"Link", "</x.css>; rel=preload"}});
+                    HttpResponse r;
+                    r.Status(200).Text("ok10");
+                    complete(std::move(r));
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            // HTTP/1.0 request — Connection: close is implied
+            std::string resp = SendRawAndDrain(port,
+                "GET /hints10 HTTP/1.0\r\nHost: x\r\n\r\n", 3000);
+
+            bool pass = true;
+            std::string err;
+            if (resp.find("HTTP/1.1 103") != std::string::npos ||
+                resp.find(" 103 ") != std::string::npos) {
+                pass = false; err += "103 must not appear for HTTP/1.0 clients; ";
+            }
+            bool has_200 = resp.find("HTTP/1.1 200") != std::string::npos ||
+                           resp.find("HTTP/1.0 200") != std::string::npos;
+            if (!has_200) {
+                pass = false; err += "missing final 200; ";
+            }
+            TestFramework::RecordTest("H1 103 Early Hints: rejected on HTTP/1.0",
+                                      pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("H1 103 Early Hints: rejected on HTTP/1.0",
+                                      false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // T4: Forbidden header stripped from 103 block. The 103 must contain the
+    // Link header but NOT Content-Length.
+    void TestH1_EarlyHints_ForbiddenHeaderStripped() {
+        std::cout << "\n[TEST] H1 103 Early Hints: forbidden header stripped..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync("/strip",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender send_interim,
+                   HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::AsyncCompletionCallback complete) {
+                    send_interim(103, {
+                        {"Link", "</a.css>; rel=preload"},
+                        {"Content-Length", "999"},
+                        {"Connection", "keep-alive"}
+                    });
+                    HttpResponse r;
+                    r.Status(200).Text("done");
+                    complete(std::move(r));
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(port,
+                "GET /strip HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 3000);
+
+            bool pass = true;
+            std::string err;
+
+            // Isolate the 103 block: from "HTTP/1.1 103" up to the \r\n\r\n
+            // that terminates that interim response.
+            auto pos103 = resp.find("HTTP/1.1 103");
+            if (pos103 == std::string::npos) {
+                pass = false; err += "missing HTTP/1.1 103; ";
+                TestFramework::RecordTest(
+                    "H1 103 Early Hints: forbidden header stripped",
+                    pass, err, TestFramework::TestCategory::OTHER);
+                return;
+            }
+            auto end103 = resp.find("\r\n\r\n", pos103);
+            if (end103 == std::string::npos) {
+                pass = false; err += "103 block not terminated; ";
+                TestFramework::RecordTest(
+                    "H1 103 Early Hints: forbidden header stripped",
+                    pass, err, TestFramework::TestCategory::OTHER);
+                return;
+            }
+            std::string block103 = resp.substr(pos103, end103 - pos103);
+
+            if (block103.find("Link:") == std::string::npos) {
+                pass = false; err += "Link header missing from 103 block; ";
+            }
+            if (block103.find("Content-Length") != std::string::npos) {
+                pass = false; err += "Content-Length must not appear in 103 block; ";
+            }
+            if (block103.find("Connection") != std::string::npos) {
+                pass = false; err += "Connection must not appear in 103 block; ";
+            }
+            TestFramework::RecordTest("H1 103 Early Hints: forbidden header stripped",
+                                      pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("H1 103 Early Hints: forbidden header stripped",
+                                      false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // T5: Interim dropped after final response.
+    //
+    // complete() enqueues CompleteAsyncResponse on the dispatcher (task A)
+    // via RunOnDispatcher. The handler then signals a promise with send_interim.
+    // A background watcher thread waits on the promise (no spin-wait), then
+    // sleeps 50 ms — well above a single dispatcher cycle — to let task A run.
+    // It then calls send_interim from the background thread.
+    //
+    // Because final_response_sent_ is now std::atomic<bool> with acquire/release
+    // ordering, the background thread's load(acquire) in SendInterimResponse
+    // observes the store(true, release) written by CompleteAsyncResponse on the
+    // dispatcher thread. There is no data race (C++ UB). The 50 ms budget is
+    // purely a reliability margin for task A to finish; the atomic ordering
+    // guarantees correctness even if A finishes in < 1 µs.
+    void TestH1_EarlyHints_DroppedAfterFinal() {
+        std::cout << "\n[TEST] H1 103 Early Hints: dropped after final..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+
+            // Shared signal: the handler fills this with the send_interim sender
+            // after calling complete(), so the watcher thread can call it.
+            auto p_sender = std::make_shared<std::promise<HttpRouter::InterimResponseSender>>();
+            auto f_sender = p_sender->get_future().share();
+
+            server.GetAsync("/postfinal",
+                [p_sender](
+                    const HttpRequest&,
+                    HttpRouter::InterimResponseSender send_interim,
+                    HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::AsyncCompletionCallback complete) {
+                    // Complete with the final 200 first. This enqueues
+                    // CompleteAsyncResponse on the dispatcher (task A).
+                    HttpResponse r;
+                    r.Status(200).Text("done");
+                    complete(std::move(r));
+
+                    // Signal the watcher with the sender.  The watcher's sleep
+                    // ensures task A has run before send_interim is called.
+                    p_sender->set_value(send_interim);
+                });
+
+            // Background watcher: blocks on the future (no spin-wait), then
+            // sleeps 50 ms for the dispatcher to process task A before calling
+            // send_interim. With final_response_sent_ atomic, this is race-free.
+            std::thread watcher([f_sender]() mutable {
+                auto send_interim = f_sender.get();   // blocks until complete() called
+                // Margin for dispatcher to drain the enqueued CompleteAsyncResponse;
+                // 50ms is plenty even on loaded CI. Atomic acquire/release ordering
+                // inside SendInterimResponse provides the actual correctness guarantee.
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                send_interim(103, {{"Link", "</dropped.css>; rel=preload"}});
+            });
+
+            // RAII guard: join the watcher on all exit paths (including exceptions
+            // thrown by SendRawAndDrain). Without this, stack-unwinding hits the
+            // std::thread destructor while the thread is still joinable → std::terminate.
+            struct JoinGuard {
+                std::thread& t;
+                ~JoinGuard() { if (t.joinable()) t.join(); }
+            };
+            JoinGuard watcher_guard{watcher};
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(port,
+                "GET /postfinal HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            if (resp.find("HTTP/1.1 103") != std::string::npos) {
+                pass = false; err += "post-final 103 must be dropped; ";
+            }
+            if (resp.find("HTTP/1.1 200") == std::string::npos) {
+                pass = false; err += "missing HTTP/1.1 200; ";
+            }
+            TestFramework::RecordTest("H1 103 Early Hints: dropped after final",
+                                      pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("H1 103 Early Hints: dropped after final",
+                                      false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // T6: 100 Continue + 103 Early Hints + 200 ordering. Client sends POST
+    // headers with Expect: 100-continue (no body yet), waits for the 100,
+    // then sends the body. The handler then emits 103 and completes with 200.
+    // Assert wire order: 100 < 103 < 200.
+    void TestH1_EarlyHints_100ContinueThen103() {
+        std::cout << "\n[TEST] H1 103 Early Hints: 100-continue then 103 then 200..."
+                  << std::endl;
+        AsyncScheduler sched;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.PostAsync("/upload",
+                [&sched](const HttpRequest&,
+                          HttpRouter::InterimResponseSender send_interim,
+                          HttpRouter::ResourcePusher        /*push_resource*/,
+                          HttpRouter::AsyncCompletionCallback complete) {
+                    // 103 emitted synchronously; final 200 via background task.
+                    send_interim(103, {{"Link", "</style.css>; rel=preload"}});
+                    sched.Schedule(10, [complete = std::move(complete)]() {
+                        HttpResponse r;
+                        r.Status(200).Text("uploaded");
+                        complete(std::move(r));
+                    });
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            // Phase 1: open socket, send only the request headers (no body).
+            // The server sends 100 Continue when it sees headers_complete but
+            // the body hasn't arrived yet (HandleIncompleteRequest path).
+            // Phase 2: send the body bytes.
+            // Phase 3: drain all responses until peer closes.
+            int fd = socket(AF_INET, SOCK_STREAM, 0);
+            bool pass = true;
+            std::string err;
+            std::string all_resp;
+
+            if (fd < 0) {
+                pass = false; err += "socket() failed; ";
+            } else {
+                sockaddr_in addr{};
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons(port);
+                addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+                if (connect(fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+                    pass = false; err += "connect() failed; ";
+                    close(fd); fd = -1;
+                }
+            }
+
+            if (pass && fd >= 0) {
+                std::string body = "payload=hello";
+                std::string headers =
+                    "POST /upload HTTP/1.1\r\n"
+                    "Host: x\r\n"
+                    "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                    "Expect: 100-continue\r\n"
+                    "Connection: close\r\n"
+                    "\r\n";
+
+                // Send headers only.
+                send(fd, headers.data(), headers.size(), 0);
+
+                // Wait up to 500ms for the 100 Continue response.
+                char buf[1024];
+                auto t0 = std::chrono::steady_clock::now();
+                while (all_resp.find("HTTP/1.1 100") == std::string::npos) {
+                    auto elapsed = std::chrono::duration_cast<
+                        std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    if (elapsed > 500) break;
+                    pollfd pfd{fd, POLLIN, 0};
+                    int r = poll(&pfd, 1, 50);
+                    if (r > 0 && (pfd.revents & POLLIN)) {
+                        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+                        if (n > 0) all_resp.append(buf, n);
+                        else break;
+                    }
+                }
+
+                // Now send the body to unblock the async handler.
+                send(fd, body.data(), body.size(), 0);
+
+                // Drain until peer closes (Connection: close).
+                auto t1 = std::chrono::steady_clock::now();
+                while (true) {
+                    auto elapsed = std::chrono::duration_cast<
+                        std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t1).count();
+                    if (elapsed > 2500) break;
+                    pollfd pfd2{fd, POLLIN, 0};
+                    int r = poll(&pfd2, 1, 100);
+                    if (r > 0 && (pfd2.revents & POLLIN)) {
+                        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+                        if (n > 0) all_resp.append(buf, n);
+                        else break;
+                    }
+                }
+                close(fd);
+
+                auto pos100 = all_resp.find("HTTP/1.1 100");
+                auto pos103 = all_resp.find("HTTP/1.1 103");
+                auto pos200 = all_resp.find("HTTP/1.1 200");
+                if (pos100 == std::string::npos) {
+                    pass = false; err += "missing HTTP/1.1 100; ";
+                }
+                if (pos103 == std::string::npos) {
+                    pass = false; err += "missing HTTP/1.1 103; ";
+                }
+                if (pos200 == std::string::npos) {
+                    pass = false; err += "missing HTTP/1.1 200; ";
+                }
+                if (pass) {
+                    // Wire order must be: 100 < 103 < 200
+                    if (!(pos100 < pos103 && pos103 < pos200)) {
+                        pass = false;
+                        err += "wrong order (100=" + std::to_string(pos100) +
+                               " 103=" + std::to_string(pos103) +
+                               " 200=" + std::to_string(pos200) + "); ";
+                    }
+                }
+            }
+            TestFramework::RecordTest(
+                "H1 103 Early Hints: 100-continue then 103 then 200",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 103 Early Hints: 100-continue then 103 then 200",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // T7: CR/LF in interim header values must not inject extra headers
+    // or body bytes into the 1xx block. Without sanitization, a handler
+    // that forwards a Link header whose value contains "\r\nInjected:
+    // foo" would leak a forged downstream header into the client's view
+    // of the response — a classic response-splitting pathway. The
+    // interim serializer mirrors HttpResponse::Header's strip policy.
+    void TestH1_EarlyHints_CRLFSanitized() {
+        std::cout << "\n[TEST] H1 103 Early Hints: CR/LF header sanitized..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync("/inject",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender send_interim,
+                   HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::AsyncCompletionCallback complete) {
+                    send_interim(103, {
+                        {"Link", "</a.css>; rel=preload\r\nInjected: leaked"}
+                    });
+                    HttpResponse r;
+                    r.Status(200).Text("ok");
+                    complete(std::move(r));
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(port,
+                "GET /inject HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            if (resp.find("HTTP/1.1 103") == std::string::npos) {
+                pass = false; err += "missing 103; ";
+            }
+            if (resp.find("HTTP/1.1 200") == std::string::npos) {
+                pass = false; err += "missing 200; ";
+            }
+            // Attack succeeds only if "Injected:" appears at the start
+            // of its own header line (preceded by CRLF). After
+            // sanitization the CR and LF are removed, so the attempted
+            // injection collapses into the Link value — the substring
+            // "Injected:" is still present, but NOT as a standalone
+            // header. Assert on the standalone-line form.
+            if (resp.find("\r\nInjected:") != std::string::npos) {
+                pass = false; err += "CRLF injection observed (standalone header line); ";
+            }
+            TestFramework::RecordTest("H1 103 Early Hints: CR/LF header sanitized",
+                                      pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("H1 103 Early Hints: CR/LF header sanitized",
+                                      false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // T8: Worker-thread interleave — a handler that calls complete() from
+    // a worker thread followed by send_interim() from the same worker
+    // must not be able to queue a 103 AFTER the 200 on the wire.
+    // Without the off-dispatcher hop, send_interim would observe
+    // final_response_sent_=false (not yet set by the queued final
+    // lambda), build the 103, and SendRaw would enqueue AFTER the
+    // final-response lambda — clients would observe 200 followed by
+    // 103. The hop re-orders the check through the dispatcher so it
+    // runs after the final write and drops.
+    void TestH1_EarlyHints_WorkerThreadOrderingSafe() {
+        std::cout << "\n[TEST] H1 103 Early Hints: worker-thread ordering safe..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+
+            // Shared signal: the handler stores complete + send_interim
+            // so the watcher thread can invoke BOTH from a single worker
+            // thread in rapid succession — the race scenario.
+            struct Payload {
+                HttpRouter::AsyncCompletionCallback complete;
+                HttpRouter::InterimResponseSender   send_interim;
+            };
+            auto p = std::make_shared<std::promise<Payload>>();
+            auto f = p->get_future().share();
+
+            server.GetAsync("/race",
+                [p](const HttpRequest&,
+                    HttpRouter::InterimResponseSender send_interim,
+                    HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::AsyncCompletionCallback complete) {
+                    p->set_value(Payload{std::move(complete),
+                                         std::move(send_interim)});
+                });
+
+            std::thread watcher([f]() mutable {
+                auto pl = f.get();
+                HttpResponse r;
+                r.Status(200).Text("final");
+                pl.complete(std::move(r));
+                // Same-worker follow-up call: would race without the hop.
+                pl.send_interim(103, {{"Link", "</late.css>; rel=preload"}});
+            });
+            struct JoinGuard {
+                std::thread& t;
+                ~JoinGuard() { if (t.joinable()) t.join(); }
+            };
+            JoinGuard g{watcher};
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(port,
+                "GET /race HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            auto pos200 = resp.find("HTTP/1.1 200");
+            auto pos103 = resp.find("HTTP/1.1 103");
+            if (pos200 == std::string::npos) {
+                pass = false; err += "missing 200; ";
+            }
+            // The 103 must be fully dropped. Given the worker calls
+            // complete() (flipping the per-request `completed` flag)
+            // BEFORE send_interim(), the send_interim closure's
+            // synchronous check observes completed==true and returns
+            // without even hopping. Under no scheduler interleaving
+            // should a 103 reach the wire — asserting pos103 == npos
+            // is the strict form. A 103-before-200 ordering would also
+            // indicate a regression (it'd mean the completed guard was
+            // bypassed), not a legitimate-but-weak pass.
+            if (pos103 != std::string::npos) {
+                pass = false;
+                err += "103 reached the wire — completed-guard bypassed; ";
+            }
+            TestFramework::RecordTest(
+                "H1 103 Early Hints: worker-thread ordering safe",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 103 Early Hints: worker-thread ordering safe",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // T10: Cross-request pipelining race regression — when an off-thread
+    // send_interim() is issued and then complete() runs first on the
+    // dispatcher (possible when two worker threads race to enqueue),
+    // the queued interim lambda must NOT emit a 103 that leaks into a
+    // pipelined next request's response window. With the fix, the
+    // closure-level hop captures the per-request `completed` atomic
+    // and re-checks it on the dispatcher side — the connection-wide
+    // final_response_sent_ flag would be reset by BeginAsyncResponse
+    // on the pipelined B, but `completed` is per-closure and never
+    // reset.
+    //
+    // We engineer the scenario deterministically by:
+    //   1. Worker thread calls send_interim from inside the handler on
+    //      a background thread BEFORE the handler sets `completed`.
+    //   2. Handler then calls complete() on the SAME background thread
+    //      (flipping `completed` synchronously).
+    //   3. The dispatcher queue order between the send_interim hop
+    //      and complete_lambda is non-deterministic in general, but
+    //      we block the send_interim hop artificially by having it
+    //      wait on a promise that complete_lambda signals, FORCING
+    //      the bug scenario: complete runs first, then send_interim
+    //      hop runs with completed=true (pre-fix: would still emit;
+    //      post-fix: drops via per-request completed re-check).
+    //
+    // We can't install the signal directly into SendInterimResponse,
+    // so we rely on the simpler invariant: after complete() returns
+    // on the worker thread, `completed` is true. A subsequent call to
+    // send_interim MUST be dropped by the closure's sync check. This
+    // is already tested elsewhere; the stricter regression guard here
+    // is: if send_interim is called BEFORE complete on the worker but
+    // the dispatcher happens to run complete's lambda first, the hop
+    // lambda must still drop.
+    //
+    // We approximate this by making the handler return immediately
+    // and having a background thread call complete() then send_interim()
+    // in rapid succession. The FIFO dispatcher will run complete
+    // first (it's enqueued first), which sets final_response_sent_
+    // AND may parse a pipelined request B. By the time send_interim's
+    // hop runs, completed is true — the per-request check fires.
+    //
+    // If the fix regresses (hop doesn't re-check completed), the 103
+    // would leak into the response window. Assertion: no 103 present.
+    void TestH1_EarlyHints_PipelinedKeepAliveNoStale() {
+        std::cout << "\n[TEST] H1 103 Early Hints: pipelined keep-alive no stale..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            struct Payload {
+                HttpRouter::AsyncCompletionCallback complete;
+                HttpRouter::InterimResponseSender   send_interim;
+            };
+            auto p = std::make_shared<std::promise<Payload>>();
+            auto f = p->get_future().share();
+
+            server.GetAsync("/a",
+                [p](const HttpRequest&,
+                    HttpRouter::InterimResponseSender send_interim,
+                    HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::AsyncCompletionCallback complete) {
+                    p->set_value(Payload{std::move(complete),
+                                         std::move(send_interim)});
+                });
+            server.GetAsync("/b",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::AsyncCompletionCallback complete) {
+                    HttpResponse r;
+                    r.Status(200).Text("B-response");
+                    complete(std::move(r));
+                });
+
+            std::thread watcher([f]() mutable {
+                auto pl = f.get();
+                // Call complete FIRST (this flips `completed` for A and
+                // enqueues CompleteAsyncResponse which MAY synchronously
+                // begin parsing B). Then call send_interim — the
+                // closure's SYNC check of completed catches it. Even
+                // if the closure's sync check had raced (see note in
+                // the test comment), the dispatcher-side re-check in
+                // the hop lambda would catch it.
+                HttpResponse r;
+                r.Status(200).Text("A-response");
+                pl.complete(std::move(r));
+                pl.send_interim(103, {{"Link", "</late.css>; rel=preload"}});
+            });
+            struct JoinGuard {
+                std::thread& t;
+                ~JoinGuard() { if (t.joinable()) t.join(); }
+            };
+            JoinGuard g{watcher};
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            // Two pipelined requests on one connection. After B is
+            // parsed (triggered by A's completion), the 103 for A
+            // must NOT appear in B's response window.
+            std::string resp = SendRawAndDrain(port,
+                "GET /a HTTP/1.1\r\nHost: x\r\n\r\n"
+                "GET /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            // Both responses must appear.
+            if (resp.find("A-response") == std::string::npos) {
+                pass = false; err += "A-response missing; ";
+            }
+            if (resp.find("B-response") == std::string::npos) {
+                pass = false; err += "B-response missing; ";
+            }
+            // No stale 103 anywhere on the wire.
+            if (resp.find("HTTP/1.1 103") != std::string::npos) {
+                pass = false;
+                err += "stale 103 leaked onto the pipelined connection — "
+                       "request-scoped guard was bypassed; ";
+            }
+            TestFramework::RecordTest(
+                "H1 103 Early Hints: pipelined keep-alive no stale",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 103 Early Hints: pipelined keep-alive no stale",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // T9: H1 async handler that populates async_cancel_slot then throws
+    // must have the slot fired by the framework's catch block. Without
+    // this, custom async handlers (e.g. ProxyHandler installs
+    // tx->Cancel() in the slot before starting upstream work) would
+    // leak the in-flight work — it would hold pool capacity and
+    // resources until its own internal timeout, even after the outer
+    // catch sent a 500 and closed the client connection.
+    void TestH1_Async_HandlerThrowFiresCancelSlot() {
+        std::cout << "\n[TEST] H1 async: handler throw fires cancel slot..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            auto cancel_fired = std::make_shared<std::atomic<bool>>(false);
+            server.GetAsync("/throws",
+                [cancel_fired](
+                    const HttpRequest& req,
+                    HttpRouter::InterimResponseSender /*send_interim*/,
+                    HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    // Simulate ProxyHandler::Handle: install cleanup
+                    // hook in the cancel slot BEFORE kicking off the
+                    // (simulated) background work, then throw.
+                    if (req.async_cancel_slot) {
+                        *req.async_cancel_slot = [cancel_fired]() {
+                            cancel_fired->store(true,
+                                                std::memory_order_release);
+                        };
+                    }
+                    throw std::runtime_error("handler synthetic failure");
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(port,
+                "GET /throws HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            // Outer catch should have sent 500 and closed.
+            if (resp.find("HTTP/1.1 500") == std::string::npos) {
+                pass = false; err += "missing 500 response; ";
+            }
+            // Critical: the cancel slot must have been fired so any
+            // background work (in real code: proxy upstream) is
+            // released, not leaked until its own timeout.
+            if (!cancel_fired->load(std::memory_order_acquire)) {
+                pass = false;
+                err += "cancel_slot was NOT fired — async background "
+                       "work would leak; ";
+            }
+            TestFramework::RecordTest(
+                "H1 async: handler throw fires cancel slot",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 async: handler throw fires cancel slot",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // Run all HTTP tests
     void RunAllTests() {
         std::cout << "\n" << std::string(60, '=') << std::endl;
@@ -1039,6 +1827,18 @@ namespace HttpTests {
 
         // Timeout tests
         TestRequestTimeout();
+
+        // 103 Early Hints / SendInterimResponse tests
+        TestH1_EarlyHints_Basic();
+        TestH1_EarlyHints_MultipleBeforeFinal();
+        TestH1_EarlyHints_RejectedOn10();
+        TestH1_EarlyHints_ForbiddenHeaderStripped();
+        TestH1_EarlyHints_DroppedAfterFinal();
+        TestH1_EarlyHints_100ContinueThen103();
+        TestH1_EarlyHints_CRLFSanitized();
+        TestH1_EarlyHints_WorkerThreadOrderingSafe();
+        TestH1_EarlyHints_PipelinedKeepAliveNoStale();
+        TestH1_Async_HandlerThrowFiresCancelSlot();
     }
 
 }  // namespace HttpTests

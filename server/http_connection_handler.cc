@@ -17,6 +17,34 @@ constexpr size_t DEFERRED_STASH_OVERHEAD = 8192;
 // accepting large uploads (the parser enforces the real per-request
 // limits when it processes the buffered bytes after the async response).
 constexpr size_t DEFERRED_STASH_FALLBACK_CAP = 64 * 1024 * 1024;  // 64 MiB
+
+// Returns true if `lower_name` (must already be lowercased) is a
+// hop-by-hop or framing header that is forbidden in 1xx interim responses
+// per RFC 9110 §15.2 and RFC 7230 §6.1.
+bool IsForbiddenInterimHeader(const std::string& lower_name) {
+    if (lower_name == "connection" || lower_name == "keep-alive" ||
+        lower_name == "proxy-connection" ||
+        lower_name == "transfer-encoding" || lower_name == "content-length" ||
+        lower_name == "te" || lower_name == "upgrade") {
+        return true;
+    }
+    // Proxy-*  (Proxy-Authenticate, Proxy-Authorization, etc.)
+    if (lower_name.size() >= 6 && lower_name.compare(0, 6, "proxy-") == 0) {
+        return true;
+    }
+    return false;
+}
+
+// Returns the standard reason phrase for 1xx status codes.
+const char* InterimReasonPhrase(int code) {
+    switch (code) {
+        case 100: return "Continue";
+        case 102: return "Processing";
+        case 103: return "Early Hints";
+        default:  return "Interim";
+    }
+}
+
 }  // namespace
 
 HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn)
@@ -148,7 +176,7 @@ bool HttpConnectionHandler::NormalizeOutgoingResponse(HttpResponse& response,
     // HTTP/1.0 persistence requires explicit Connection: keep-alive in the
     // response; without it a compliant 1.0 client treats the response as
     // close-delimited.
-    if (current_http_minor_ == 0 && client_keep_alive && !resp_close) {
+    if (current_http_minor_.load(std::memory_order_acquire) == 0 && client_keep_alive && !resp_close) {
         response.Header("Connection", "keep-alive");
     }
     // When the client did not request keep-alive, echo Connection: close so
@@ -171,6 +199,11 @@ void HttpConnectionHandler::BeginAsyncResponse(const HttpRequest& req) {
     deferred_response_pending_ = true;
     deferred_was_head_ = (req.method == "HEAD");
     deferred_keep_alive_ = req.keep_alive;
+    // Reset so interim responses can be emitted before the final response
+    // on this new async cycle. Without this, back-to-back requests on a
+    // keep-alive connection would inherit the previous request's
+    // final_response_sent_ = true and block all interims.
+    final_response_sent_.store(false, std::memory_order_release);
     // current_http_minor_ was updated by the parser when headers completed
     // and persists across the deferred window, so no separate capture is
     // needed. Mark the transport exempt from NetServer::Stop()'s close
@@ -261,10 +294,12 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
          callbacks_.shutdown_check_callback()) ||
         (conn_ && conn_->IsCloseDeferred());
     const bool effective_keep_alive = deferred_keep_alive_ && !shutting_down;
+    const int http_minor = current_http_minor_.load(std::memory_order_acquire);
     const bool should_close = NormalizeOutgoingResponse(
-        response, effective_keep_alive, current_http_minor_);
+        response, effective_keep_alive, http_minor);
 
-    response.Version(1, current_http_minor_);
+    final_response_sent_.store(true, std::memory_order_release);
+    response.Version(1, http_minor);
     std::string wire = response.Serialize();
     if (was_head) StripResponseBodyForHead(wire);
     conn_->SendRaw(wire.data(), wire.size());
@@ -329,10 +364,127 @@ void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
     // Stamp the response with the current request's HTTP version so the
     // status line matches (e.g. HTTP/1.0 for 1.0 clients, HTTP/1.1 for 1.1).
     // For pre-parse errors, current_http_minor_ is 1 (default = HTTP/1.1).
+    //
+    // Mark the final response sent only for actual terminal (2xx+) responses.
+    // The framework sends 1xx responses (e.g. 100 Continue) through this path
+    // before the request is complete; those MUST NOT set the flag so that
+    // SendInterimResponse (103 Early Hints) can still fire after the 100.
+    if (response.GetStatusCode() >= HttpStatus::OK) {
+        final_response_sent_.store(true, std::memory_order_release);
+    }
     HttpResponse versioned = response;
-    versioned.Version(1, current_http_minor_);
+    versioned.Version(1, current_http_minor_.load(std::memory_order_acquire));
     std::string wire = versioned.Serialize();
     conn_->SendRaw(wire.data(), wire.size());
+}
+
+bool HttpConnectionHandler::SendInterimResponse(
+    int status_code,
+    const std::vector<std::pair<std::string, std::string>>& headers) {
+    if (!conn_) return false;
+
+    // Valid range: [PROCESSING (102), OK). 100 is framework-managed
+    // (internal Continue); 101 is reserved for WebSocket upgrade.
+    // Validate synchronously so we don't enqueue work for a bad status.
+    if (status_code < HttpStatus::PROCESSING || status_code >= HttpStatus::OK) {
+        logging::Get()->warn(
+            "SendInterimResponse invalid status {} fd={}",
+            status_code, conn_->fd());
+        return false;
+    }
+
+    // Off-dispatcher hop: preserve write ordering against CompleteAsync
+    // Response. When a handler on a worker thread calls complete() then
+    // send_interim() in sequence, complete() enqueues the final response
+    // lambda onto the dispatcher; final_response_sent_ only becomes true
+    // when that lambda RUNS. If we checked the flag here and called
+    // SendRaw directly from the worker, SendRaw would enqueue its own
+    // lambda AFTER complete's — and the flag check would pass even though
+    // the client would observe 200 followed by 103 on the wire. Hopping
+    // so both the flag check AND the wire write happen on the dispatcher
+    // after complete's lambda has run makes the drop/emit decision
+    // strictly ordered. The EnQueue preserves the worker's call order:
+    // if complete() was called before send_interim(), the final lambda
+    // runs first, final_response_sent_ is set, and the hopped interim
+    // observes it and drops. If the interim was called first (legal on
+    // a sync request before calling complete), it runs first and emits.
+    if (!conn_->IsOnDispatcherThread()) {
+        std::weak_ptr<HttpConnectionHandler> weak_self = weak_from_this();
+        auto headers_copy = headers;  // deep-copy strings for the hop
+        conn_->RunOnDispatcher(
+            [weak_self, status_code,
+             headers_copy = std::move(headers_copy)]() {
+            if (auto self = weak_self.lock()) {
+                self->SendInterimResponse(status_code, headers_copy);
+            }
+        });
+        return true;  // queued; final drop/emit decided on dispatcher
+    }
+
+    // ---- On dispatcher thread from here on ----
+
+    // Drop if the final response has already been written.
+    if (final_response_sent_.load(std::memory_order_acquire)) {
+        logging::Get()->warn(
+            "SendInterimResponse after final fd={} status={}; dropped",
+            conn_->fd(), status_code);
+        return false;
+    }
+    // HTTP/1.0: interim responses require HTTP/1.1+ (RFC 8297).
+    if (current_http_minor_.load(std::memory_order_acquire) < 1) {
+        logging::Get()->debug(
+            "SendInterimResponse rejected on HTTP/1.0 fd={}", conn_->fd());
+        return false;
+    }
+
+    // Build the wire bytes: status line + filtered/sanitized headers +
+    // blank line. We mirror HttpResponse::Header's CR/LF sanitization
+    // because this path appends raw bytes to the transport — without
+    // stripping \r and \n, a handler that forwards a header value
+    // containing CRLF (e.g. an upstream Link header spliced with
+    // attacker-controlled data) could inject arbitrary response
+    // headers or body bytes into the 1xx block. Response splitting.
+    auto strip_crlf = [](std::string s) -> std::string {
+        s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());
+        s.erase(std::remove(s.begin(), s.end(), '\n'), s.end());
+        return s;
+    };
+
+    std::string out;
+    out.reserve(256);
+    out += "HTTP/1.1 ";
+    out += std::to_string(status_code);
+    out += ' ';
+    out += InterimReasonPhrase(status_code);
+    out += "\r\n";
+    for (const auto& [key, value] : headers) {
+        std::string lower = key;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (IsForbiddenInterimHeader(lower)) {
+            logging::Get()->debug(
+                "Interim: forbidden header '{}' stripped fd={}", key, conn_->fd());
+            continue;
+        }
+        out += strip_crlf(key);
+        out += ": ";
+        out += strip_crlf(value);
+        out += "\r\n";
+    }
+    out += "\r\n";
+
+    // Size cap using max_header_size_ (0 means unlimited — skip the check).
+    if (max_header_size_ > 0 && out.size() > max_header_size_) {
+        logging::Get()->warn(
+            "SendInterimResponse oversize ({} > {}) fd={}",
+            out.size(), max_header_size_, conn_->fd());
+        return false;
+    }
+
+    conn_->SendRaw(out.data(), out.size());
+    logging::Get()->debug(
+        "SendInterimResponse sent status={} fd={}", status_code, conn_->fd());
+    return true;
 }
 
 void HttpConnectionHandler::CloseConnection() {
@@ -417,7 +569,9 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
 
     // Track the request's HTTP version so SendResponse echoes it correctly
     // (e.g. HTTP/1.0 for 1.0 clients). Must be set after the version check.
-    current_http_minor_ = req.http_minor;
+    // Release store pairs with the acquire loads in SendInterimResponse
+    // / NormalizeOutgoingResponse paths that may read from worker threads.
+    current_http_minor_.store(req.http_minor, std::memory_order_release);
 
     // RFC 7230 §5.4: HTTP/1.1 requests MUST include Host header
     if (req.http_minor >= 1 && !req.HasHeader("host")) {
@@ -819,7 +973,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         // the framework's auto-computed Content-Length is preserved, then
         // strip the body from the wire.
         if (req.method == "HEAD") {
-            response.Version(1, current_http_minor_);
+            response.Version(1, current_http_minor_.load(std::memory_order_acquire));
             std::string wire = response.Serialize();
             StripResponseBodyForHead(wire);
             conn_->SendRaw(wire.data(), wire.size());
@@ -1065,7 +1219,8 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
         if (parser_.GetRequest().headers_complete &&
             parser_.GetRequest().http_major == 1 &&
             (parser_.GetRequest().http_minor == 0 || parser_.GetRequest().http_minor == 1)) {
-            current_http_minor_ = parser_.GetRequest().http_minor;
+            current_http_minor_.store(parser_.GetRequest().http_minor,
+                                       std::memory_order_release);
         }
 
         if (parser_.HasError()) {

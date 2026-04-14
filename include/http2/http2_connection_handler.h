@@ -69,6 +69,56 @@ public:
     // Http2Session handles the missing-stream case internally.
     void SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
 
+    // Submit a non-final 1xx informational response (e.g. 103 Early Hints)
+    // on a specific stream and flush nghttp2 output.
+    //
+    // Thread-safe: off-dispatcher callers are internally hopped to the
+    // dispatcher so nghttp2 state is always touched on the correct
+    // thread. On-dispatcher return value: true on success, false on
+    // validation failure (missing stream, final already submitted,
+    // invalid status). Off-dispatcher return value: always true (the
+    // call was queued); the actual submit decision runs on the
+    // dispatcher when the hop fires.
+    bool SendInterimResponse(
+        int32_t stream_id,
+        int status_code,
+        const std::vector<std::pair<std::string, std::string>>& headers);
+
+    // HTTP/2 server push primitive — atomically issues PUSH_PROMISE on
+    // `parent_stream_id` and the associated response on the freshly
+    // promised stream, then flushes nghttp2 output.
+    //
+    // Thread-safe: off-dispatcher callers are internally hopped to the
+    // dispatcher. Return value semantics (consistent with the
+    // ResourcePusher public contract: >0 = promised id, -1 = failure):
+    //   - On dispatcher: the promised stream_id (>0) on success, -1
+    //     on validation / state failure (shutdown requested, push
+    //     disabled, GOAWAY sent, parent closed or final response
+    //     already submitted, invalid method/scheme/path/authority,
+    //     nghttp2 failure — see Http2Session::SubmitPushPromise for
+    //     the full validation list).
+    //   - Off dispatcher: returns -1 (the call was queued, but the
+    //     off-thread caller cannot synchronously observe the submit
+    //     outcome, so we return the failure sentinel — callers that
+    //     use the return value to decide on a Link-header fallback
+    //     see "no id available" and fall back correctly). The push
+    //     still proceeds on the dispatcher on a best-effort basis.
+    //     Handlers that need the promised id MUST call from the
+    //     dispatcher thread (sync handler or inside a RunOnDispatcher
+    //     lambda before enqueuing complete()).
+    //
+    // Application code should use the bound ResourcePusher closure
+    // (async routes) or HTTP2_PUSH_NAMESPACE::PushResource (sync
+    // routes — see include/http/push_helper.h) rather than calling
+    // this directly.
+    int32_t PushResource(
+        int32_t parent_stream_id,
+        const std::string& method,
+        const std::string& scheme,
+        const std::string& authority,
+        const std::string& path,
+        const HttpResponse& response);
+
     // Check if session is still active
     bool IsAlive() const { return session_ && session_->IsAlive(); }
 

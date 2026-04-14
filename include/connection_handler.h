@@ -148,6 +148,15 @@ public:
     // execution from other threads (e.g., HTTP/2 graceful shutdown).
     void RunOnDispatcher(std::function<void()> task);
 
+    // True when the caller is running on the dispatcher thread that owns
+    // this connection's channel. Protocol layers whose public API must be
+    // dispatcher-thread-only (e.g., HTTP/2 SendInterimResponse, PushResource)
+    // use this as a cheap safety check and log-on-violation path instead of
+    // silently corrupting nghttp2 state from a foreign thread.
+    bool IsOnDispatcherThread() const {
+        return event_dispatcher_ && event_dispatcher_->is_on_loop_thread();
+    }
+
     // Get the ALPN-negotiated protocol from the TLS connection.
     // Returns empty string if no TLS or ALPN not negotiated.
     std::string GetAlpnProtocol() const;

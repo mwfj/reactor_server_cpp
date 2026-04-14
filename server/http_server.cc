@@ -1,5 +1,6 @@
 #include "http/http_server.h"
 #include "http/http_status.h"
+#include "http/push_helper.h"
 #include "config/config_loader.h"
 #include "ws/websocket_frame.h"
 #include "http2/http2_constants.h"
@@ -9,6 +10,54 @@
 #include "log/log_utils.h"
 #include <algorithm>
 #include <set>
+
+// Definition of the per-thread sync push slot. See declaration in
+// include/http/http_server.h. Initial value is nullptr — the helper
+// HTTP2_PUSH_NAMESPACE::PushResource() returns -1 with a debug log
+// when the slot is null (called outside any sync dispatch).
+thread_local HTTP_CALLBACKS_NAMESPACE::ResourcePusher*
+    HttpServer::current_sync_pusher_ = nullptr;
+
+// Factory for the H2 ResourcePusher closure. Both the async (bound on
+// the AsyncHandler signature) and sync (installed into
+// HttpServer::current_sync_pusher_) paths need the same weak_ptr +
+// stream_id capture; factoring here avoids drift between them and keeps
+// the binding logic in one place.
+static HTTP_CALLBACKS_NAMESPACE::ResourcePusher
+MakeH2ResourcePusher(std::weak_ptr<Http2ConnectionHandler> h2_weak,
+                     int32_t stream_id) {
+    return [h2_weak, stream_id](const std::string& method,
+                                 const std::string& scheme,
+                                 const std::string& authority,
+                                 const std::string& path,
+                                 const HttpResponse& resp) -> int32_t {
+        auto h2 = h2_weak.lock();
+        if (!h2) return -1;
+        return h2->PushResource(stream_id, method, scheme,
+                                authority, path, resp);
+    };
+}
+
+namespace HTTP2_PUSH_NAMESPACE {
+
+int32_t PushResource(const std::string& method,
+                     const std::string& scheme,
+                     const std::string& authority,
+                     const std::string& path,
+                     const HttpResponse& response) {
+    auto* p = HttpServer::current_sync_pusher_;
+    if (!p || !*p) {
+        // No active sync dispatch on this thread, or the pusher slot
+        // was installed but the closure itself is empty. Either way,
+        // treat as "push not available right now" rather than crashing.
+        logging::Get()->debug(
+            "HTTP2_PUSH_NAMESPACE::PushResource called outside a sync dispatch; ignored");
+        return -1;
+    }
+    return (*p)(method, scheme, authority, path, response);
+}
+
+}  // namespace HTTP2_PUSH_NAMESPACE
 
 // RAII guard: decrements an atomic counter on scope exit. Used in request
 // dispatch callbacks to ensure active_requests_ is decremented even on throw.
@@ -681,6 +730,7 @@ HttpServer::HttpServer(const ServerConfig& config)
     h2_settings_.initial_window_size    = config.http2.initial_window_size;
     h2_settings_.max_frame_size         = config.http2.max_frame_size;
     h2_settings_.max_header_list_size   = config.http2.max_header_list_size;
+    h2_settings_.enable_push            = config.http2.enable_push;
 
     // Store upstream configurations for pool creation in Start()
     upstream_configs_ = config.upstreams;
@@ -1126,6 +1176,8 @@ void HttpServer::Proxy(const std::string& route_pattern,
             // don't destroy this handler while this route is still live.
             router_.RouteAsync(mr.method, pattern,
                 [handler](const HttpRequest& request,
+                          HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
+                          HTTP_CALLBACKS_NAMESPACE::ResourcePusher        /*push_resource*/,
                           HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                     handler->Handle(request, std::move(complete));
                 });
@@ -1530,6 +1582,8 @@ void HttpServer::RegisterProxyRoutes() {
                 // ownership and survives any later overwrite.
                 router_.RouteAsync(mr.method, pattern,
                     [handler](const HttpRequest& request,
+                              HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
+                              HTTP_CALLBACKS_NAMESPACE::ResourcePusher        /*push_resource*/,
                               HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                         handler->Handle(request, std::move(complete));
                     });
@@ -2292,13 +2346,110 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 // 500 and close normally (CloseAfterWrite won't be blocked
                 // by shutdown_exempt_, and OnRawData won't buffer into
                 // the deferred stash).
+                // Real H1 send_interim: captures weak_ptr to the handler
+                // AND the per-request `completed` flag. Off-thread callers
+                // may freely invoke — SendInterimResponse itself hops to
+                // the dispatcher internally if not already there.
+                //
+                // The `completed` capture closes a pipelining race: on a
+                // keep-alive connection, CompleteAsyncResponse for request
+                // A synchronously parses any pipelined bytes and can
+                // invoke BeginAsyncResponse for request B, which RESETS
+                // final_response_sent_ to false. Without per-request
+                // scoping, a stale send_interim lambda queued for request
+                // A would then see final_response_sent_=false (reset by
+                // B) and emit a 103 into B's response window.
+                //
+                // `completed` is flipped to true synchronously inside
+                // complete() before the CompleteAsyncResponse lambda is
+                // enqueued, so checking it in the hopped send_interim
+                // path correctly identifies "complete has been called
+                // for my request" — whether or not the lambda has run.
+                std::weak_ptr<HttpConnectionHandler> weak_h1_self = self;
+                auto send_interim =
+                    [weak_h1_self, completed](
+                        int status_code,
+                        const std::vector<std::pair<std::string, std::string>>& hdrs) {
+                    if (completed->load(std::memory_order_acquire)) {
+                        // Request A's complete() has already been called.
+                        // Drop synchronously — no hop needed.
+                        return;
+                    }
+                    auto h = weak_h1_self.lock();
+                    if (!h) return;
+                    auto conn = h->GetConnection();
+                    if (!conn) return;
+                    // Off-dispatcher hop MUST be request-scoped. Without
+                    // re-checking `completed` on the dispatcher side, the
+                    // connection-wide `final_response_sent_` flag that
+                    // SendInterimResponse consults is not sufficient:
+                    // CompleteAsyncResponse for request A can resume
+                    // parsing pipelined bytes and synchronously invoke
+                    // BeginAsyncResponse for request B, which resets
+                    // final_response_sent_ to false. A hop lambda queued
+                    // by request A's send_interim would then pass the
+                    // dispatcher-side check and emit a 103 into request
+                    // B's response window.
+                    //
+                    // The request-scoped `completed` flag is captured by
+                    // THIS closure (one-per-request) and never reset, so
+                    // re-checking it inside the hop lambda reliably gates
+                    // late emissions even across pipelined keep-alive.
+                    // Trade-off: a legitimate pre-complete 103 that was
+                    // issued just before complete() on the worker thread
+                    // MAY be dropped if the dispatcher picks up the hop
+                    // after complete flipped the flag — which is
+                    // acceptable vs. the alternative of a stale 103
+                    // corrupting request B's response window.
+                    if (!conn->IsOnDispatcherThread()) {
+                        std::weak_ptr<HttpConnectionHandler> weak = h;
+                        auto hdrs_copy = hdrs;
+                        conn->RunOnDispatcher(
+                            [weak, completed, status_code,
+                             hdrs_copy = std::move(hdrs_copy)]() {
+                            if (completed->load(std::memory_order_acquire)) return;
+                            if (auto self2 = weak.lock()) {
+                                self2->SendInterimResponse(status_code, hdrs_copy);
+                            }
+                        });
+                        return;
+                    }
+                    // Already on dispatcher — call directly. Internal
+                    // hop inside SendInterimResponse will short-circuit
+                    // on IsOnDispatcherThread() == true.
+                    h->SendInterimResponse(status_code, hdrs);
+                };
+                auto push_resource =
+                    [](const std::string&, const std::string&, const std::string&,
+                       const std::string&, const HttpResponse&) -> int32_t {
+                    logging::Get()->debug("push_resource no-op (H1)");
+                    return -1;
+                };
                 try {
                     if (async_head_fallback) {
                         HttpRequest get_req = request;
                         get_req.method = "GET";
-                        async_handler(get_req, std::move(complete));
+                        async_handler(get_req, send_interim, push_resource, std::move(complete));
+                        // Propagate request-scoped overrides the handler
+                        // may have written to the clone back to the
+                        // live request object. Only fields handlers are
+                        // allowed to mutate (via `mutable` qualifier)
+                        // need this: async_cap_sec_override is an int
+                        // with value-semantics, so a clone diverges
+                        // silently; async_cancel_slot is a shared_ptr
+                        // that already points to shared storage across
+                        // copies so the assignment through *slot is
+                        // observed by both. Without this copy-back,
+                        // ProxyHandler's response_timeout_ms=0 opt-out
+                        // (which sets async_cap_sec_override=0 to
+                        // disable the global safety cap for that
+                        // request) is lost on HEAD→GET fallback, and
+                        // long-lived proxied HEAD requests get
+                        // prematurely 504'd by the async heartbeat.
+                        request.async_cap_sec_override =
+                            get_req.async_cap_sec_override;
                     } else {
-                        async_handler(request, std::move(complete));
+                        async_handler(request, send_interim, push_resource, std::move(complete));
                     }
                 } catch (...) {
                     // Mark both flags: completed stops a stored callback
@@ -2308,6 +2459,28 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     // deferred state so the outer catch's 500 + close works.
                     completed->store(true, std::memory_order_relaxed);
                     cancelled->store(true, std::memory_order_release);
+                    // Fire the handler-installed cancel slot if it was
+                    // populated before the throw. ProxyHandler and other
+                    // custom async handlers store an abort hook there
+                    // (e.g. tx->Cancel()) BEFORE starting background
+                    // work — without firing it here, an exception thrown
+                    // AFTER background work has been kicked off would
+                    // leak that work (upstream pool capacity, timers,
+                    // etc.) since the safety-cap abort hook below is
+                    // only installed on the non-throw path. Move-and-
+                    // clear pattern matches the abort hook to make
+                    // double-fire impossible if a later code path also
+                    // tries to cancel.
+                    if (cancel_slot && *cancel_slot) {
+                        auto local = std::move(*cancel_slot);
+                        *cancel_slot = nullptr;
+                        try { local(); }
+                        catch (const std::exception& e) {
+                            logging::Get()->error(
+                                "Async cancel slot threw during handler "
+                                "exception cleanup: {}", e.what());
+                        }
+                    }
                     self->CancelAsyncResponse();
                     throw;  // outer catch sends 500 + closes
                 }
@@ -3056,17 +3229,91 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         });
                     };
 
+                // Real H2 send_interim + push_resource. Both capture a
+                // weak_ptr to the H2 handler and the per-stream id and
+                // delegate to the handler's primitives, which enforce
+                // the dispatcher-thread-only contract — off-thread
+                // callers (async work resuming on a worker) must hop
+                // via RunOnDispatcher() before invoking the closure.
+                std::weak_ptr<Http2ConnectionHandler> h2_weak = self;
+                // Capture the per-request `completed` flag so H2
+                // interims / pushes behave the same as H1 interims:
+                // once complete() has been invoked for this request,
+                // subsequent control-frame emissions are dropped. On
+                // H2 this protects against the case where a handler
+                // calls complete() and then send_interim() /
+                // push_resource() inline on the dispatcher thread
+                // before returning — the FinalResponseSubmitted flag
+                // on the stream won't be set until CompleteAsync's
+                // enqueued lambda runs, so the per-stream guard alone
+                // is too late. `completed` is flipped synchronously
+                // inside complete() BEFORE the lambda is enqueued, so
+                // checking it here reliably gates late emissions.
+                auto send_interim =
+                    [h2_weak, stream_id, completed](
+                        int status_code,
+                        const std::vector<std::pair<std::string, std::string>>& hdrs) {
+                    if (completed->load(std::memory_order_acquire)) return;
+                    auto h2 = h2_weak.lock();
+                    if (!h2) return;
+                    h2->SendInterimResponse(stream_id, status_code, hdrs);
+                };
+                auto push_resource =
+                    [h2_weak, stream_id, completed](
+                        const std::string& method,
+                        const std::string& scheme,
+                        const std::string& authority,
+                        const std::string& path,
+                        const HttpResponse& resp) -> int32_t {
+                    if (completed->load(std::memory_order_acquire)) return -1;
+                    auto h2 = h2_weak.lock();
+                    if (!h2) return -1;
+                    return h2->PushResource(stream_id, method, scheme,
+                                             authority, path, resp);
+                };
                 try {
                     if (async_head_fallback) {
                         HttpRequest get_req = request;
                         get_req.method = "GET";
-                        async_handler(get_req, std::move(complete));
+                        async_handler(get_req, send_interim, push_resource, std::move(complete));
+                        // Propagate handler-written request-scoped state
+                        // back to the live request (same rationale as
+                        // the H1 HEAD-fallback path): the value-type
+                        // async_cap_sec_override would otherwise diverge
+                        // silently and Http2ConnectionHandler's
+                        // ResetExpiredStreams would read the default -1
+                        // from the stream's original request, applying
+                        // the global async cap and 504'ing proxied HEAD
+                        // requests whose upstream response_timeout_ms
+                        // is explicitly 0 (unbounded).
+                        request.async_cap_sec_override =
+                            get_req.async_cap_sec_override;
                     } else {
-                        async_handler(request, std::move(complete));
+                        async_handler(request, send_interim, push_resource, std::move(complete));
                     }
                 } catch (...) {
                     completed->store(true, std::memory_order_relaxed);
                     cancelled->store(true, std::memory_order_release);
+                    // Same cleanup as the H1 catch: fire the handler's
+                    // cancel slot if populated before the throw, so
+                    // already-started background work (proxy txn,
+                    // upstream lease, timers) is released instead of
+                    // running to its own timeout against a stream that
+                    // the outer catch is about to fail back to the
+                    // client. The per-stream abort hook below is only
+                    // installed on the non-throw path, so this catch
+                    // is the sole cleanup site for handlers that throw
+                    // AFTER kicking off background work.
+                    if (cancel_slot && *cancel_slot) {
+                        auto local = std::move(*cancel_slot);
+                        *cancel_slot = nullptr;
+                        try { local(); }
+                        catch (const std::exception& e) {
+                            logging::Get()->error(
+                                "Async cancel slot threw during H2 handler "
+                                "exception cleanup: {}", e.what());
+                        }
+                    }
                     throw;
                 }
                 // Handler returned without throwing — install a
@@ -3103,6 +3350,21 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 guard.release();
                 return;
             }
+
+            // Sync H2 dispatch path: install a thread-local ResourcePusher
+            // so synchronous handlers can issue HTTP/2 server push via
+            // HTTP2_PUSH_NAMESPACE::PushResource() without changing the sync handler
+            // signature. Push remains opt-in via http2.enable_push and
+            // is gated per-connection by the peer's SETTINGS_ENABLE_PUSH
+            // — the closure delegates to PushResource which enforces
+            // both checks. The scope guard guarantees the thread-local
+            // never dangles past the dispatch (even on exception).
+            HTTP_CALLBACKS_NAMESPACE::ResourcePusher sync_pusher =
+                MakeH2ResourcePusher(self, stream_id);
+            HttpServer::current_sync_pusher_ = &sync_pusher;
+            struct PusherSlotGuard {
+                ~PusherSlotGuard() { HttpServer::current_sync_pusher_ = nullptr; }
+            } pusher_slot_guard;
 
             if (!router_.Dispatch(request, response)) {
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
@@ -3371,6 +3633,11 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         h2_settings_.initial_window_size    = new_config.http2.initial_window_size;
         h2_settings_.max_frame_size         = new_config.http2.max_frame_size;
         h2_settings_.max_header_list_size   = new_config.http2.max_header_list_size;
+        // enable_push only takes effect for new connections (the SETTINGS
+        // preface is sent once at session creation). Existing connections
+        // keep the value they were created with — RFC 9113 §6.5.2 forbids
+        // a server from sending ENABLE_PUSH after the preface.
+        h2_settings_.enable_push            = new_config.http2.enable_push;
     }
 
     // Rate limit reload — always safe because manager is always created

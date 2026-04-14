@@ -1362,7 +1362,10 @@ void TestIntegrationGetProxied() {
 
         HttpServer gateway(gw_config);
         // Register an async route for testing async dispatch path
-        gateway.GetAsync("/async-test", [](const HttpRequest&, HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
+        gateway.GetAsync("/async-test", [](const HttpRequest&,
+                                           HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
+                                           HTTP_CALLBACKS_NAMESPACE::ResourcePusher        /*push_resource*/,
+                                           HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
             HttpResponse resp;
             resp.Status(200).Body("async-ok", "text/plain");
             complete(std::move(resp));

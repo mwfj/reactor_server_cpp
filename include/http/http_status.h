@@ -11,6 +11,13 @@ struct HttpStatus {
     // 1xx Informational
     static constexpr int CONTINUE            = 100;
     static constexpr int SWITCHING_PROTOCOLS = 101;
+    // RFC 2518 §10.1 (WebDAV) — the lowest valid non-final 1xx that
+    // can be emitted via InterimResponseSender. Codes 100 and 101 are
+    // framework-managed (internal Continue / protocol upgrade).
+    static constexpr int PROCESSING          = 102;
+    // RFC 8297 — 103 Early Hints. Canonical user-facing 1xx for
+    // pre-announcing preload resources.
+    static constexpr int EARLY_HINTS         = 103;
 
     // 2xx Success
     static constexpr int OK                  = 200;

@@ -23,7 +23,9 @@ public:
     // Async callback types — defined in http_callbacks.h for centralization,
     // aliased here for backward compatibility with existing call sites.
     using AsyncCompletionCallback = HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback;
-    using AsyncHandler = HTTP_CALLBACKS_NAMESPACE::AsyncHandler;
+    using InterimResponseSender   = HTTP_CALLBACKS_NAMESPACE::InterimResponseSender;
+    using ResourcePusher          = HTTP_CALLBACKS_NAMESPACE::ResourcePusher;
+    using AsyncHandler            = HTTP_CALLBACKS_NAMESPACE::AsyncHandler;
 
     // Middleware -- return true to continue, false to stop
     using Middleware = std::function<bool(
