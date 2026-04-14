@@ -892,6 +892,108 @@ void TestRetriedFailuresCountTowardTrip() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Test 13: HALF_OPEN rejects emit a distinct X-Circuit-Breaker label.
+// TryAcquire returns REJECTED_OPEN for three situations (true OPEN,
+// half_open_full, half_open_recovery_failing). When the slice is in
+// HALF_OPEN, OpenUntil is cleared and a generic MakeCircuitOpenResponse
+// would fall back to Retry-After=1 + X-Circuit-Breaker:open — misleading
+// clients. The fix emits X-Circuit-Breaker:half_open for HALF_OPEN rejects
+// with a more conservative Retry-After hint.
+//
+// Strategy: trip the breaker, wait for the open window to elapse so the
+// slice transitions HALF_OPEN on the next admission attempt, then flood
+// concurrent requests so some hit half_open_full.
+// ---------------------------------------------------------------------------
+void TestHalfOpenRejectLabel() {
+    std::cout << "\n[TEST] CB Phase 4: HALF_OPEN reject label..."
+              << std::endl;
+    try {
+        // Backend hangs to keep probes in-flight so later concurrent
+        // requests hit half_open_full.
+        std::atomic<bool> hang{false};
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/fail", [&hang](const HttpRequest&, HttpResponse& resp) {
+            if (hang.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(600));
+            }
+            resp.Status(502).Body("err", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw;
+        gw.bind_host = "127.0.0.1";
+        gw.bind_port = 0;
+        gw.worker_threads = 2;
+        gw.http2.enabled = false;
+        auto u = MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
+                                     /*enabled=*/true, /*threshold=*/3);
+        u.circuit_breaker.base_open_duration_ms = 200;
+        u.circuit_breaker.max_open_duration_ms  = 500;
+        u.circuit_breaker.permitted_half_open_calls = 1;  // tiny budget
+        gw.upstreams.push_back(u);
+
+        HttpServer gateway(gw);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        // Trip the breaker.
+        for (int i = 0; i < 3; ++i) {
+            TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+        }
+        // Wait for the open window to elapse so the next admission
+        // flips the slice to HALF_OPEN.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // Flip backend to hang so the probe occupies the single probe
+        // slot while we fire sibling requests that must hit half_open_full.
+        hang.store(true);
+
+        std::atomic<bool> saw_half_open{false};
+        std::atomic<bool> saw_open{false};
+        auto probe = [&](int id) {
+            (void)id;
+            std::string r = TestHttpClient::HttpGet(gw_port, "/fail", 1500);
+            if (!TestHttpClient::HasStatus(r, 503)) return;
+            if (r.find("X-Circuit-Breaker: half_open") != std::string::npos ||
+                r.find("x-circuit-breaker: half_open") != std::string::npos) {
+                saw_half_open.store(true);
+            }
+            if (r.find("X-Circuit-Breaker: open") != std::string::npos ||
+                r.find("x-circuit-breaker: open") != std::string::npos) {
+                // We want to distinguish the labels; the "open" substring
+                // also matches "half_open". Only count true "open" if
+                // "half_open" didn't appear in THIS response.
+                if (r.find("half_open") == std::string::npos) {
+                    saw_open.store(true);
+                }
+            }
+        };
+
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 6; ++i) {
+            threads.emplace_back(probe, i);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        for (auto& t : threads) t.join();
+
+        // Pass if at least one HALF_OPEN-labelled reject was observed.
+        // saw_open may or may not be observed (some rejects could have
+        // hit between cycles) — the key contract is that HALF_OPEN
+        // rejects no longer get the plain "open" label.
+        bool pass = saw_half_open.load();
+        TestFramework::RecordTest(
+            "CB Phase 4: HALF_OPEN reject label", pass,
+            pass ? "" :
+            "saw_half_open=" + std::to_string(saw_half_open.load()) +
+            " saw_open=" + std::to_string(saw_open.load()));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB Phase 4: HALF_OPEN reject label", false, e.what());
+    }
+}
+
 void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "CIRCUIT BREAKER PHASE 4 - INTEGRATION TESTS" << std::endl;
@@ -909,6 +1011,7 @@ void RunAllTests() {
     TestHalfOpenRecoveryRoundTrip();
     TestRetryAfterCapCeilsNonAlignedMax();
     TestRetriedFailuresCountTowardTrip();
+    TestHalfOpenRejectLabel();
 }
 
 }  // namespace CircuitBreakerPhase4Tests

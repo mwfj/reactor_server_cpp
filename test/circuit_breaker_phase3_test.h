@@ -96,17 +96,27 @@ void TestRetryBudgetPercentCap() {
     try {
         RetryBudget rb(20, 0);  // no min floor — pure percent
 
-        // Push in_flight to 50 via guards that we intentionally keep alive.
+        // Push in_flight to 50 via guards that we intentionally keep
+        // alive. Per the documented API, callers hold TrackInFlight()
+        // for BOTH first attempts and retries — but TryConsumeRetry
+        // subtracts retries_in_flight from the base so the budget
+        // doesn't self-inflate as retries are admitted.
         std::vector<RetryBudget::InFlightGuard> guards;
         for (int i = 0; i < 50; ++i) guards.push_back(rb.TrackInFlight());
 
-        // 50 * 20% = 10 retries allowed.
+        // With 50 non-retry in-flight and 20% budget the first
+        // admission is against cap=10, but each admission shrinks the
+        // non-retry base by 1. The admission count converges at r
+        // where r >= floor((50-r) * 20 / 100). Solving: r = 8. The
+        // pre-fix formula (cap computed from raw in_flight) would
+        // admit 10, drifting the effective ratio above 20% of
+        // originals.
         int admitted = 0;
         for (int i = 0; i < 20; ++i) {
             if (rb.TryConsumeRetry()) ++admitted;
         }
-        bool cap_hit = admitted == 10;
-        bool rejected_count = rb.RetriesRejected() == 10;
+        bool cap_hit = admitted == 8;
+        bool rejected_count = rb.RetriesRejected() == 12;
 
         // Release guards — in_flight drops to 0; future TryConsumeRetry with
         // min=0 and in_flight=0 rejects everything.

@@ -833,16 +833,30 @@ void ProxyTransaction::Cancel() {
     // In INIT and CHECKOUT_PENDING no bytes have left the client side
     // toward the upstream yet, so the connection (if any) is still
     // clean and safe to return to the pool.
-    if (state_ != State::INIT && state_ != State::CHECKOUT_PENDING) {
+    const bool upstream_exercised =
+        (state_ != State::INIT && state_ != State::CHECKOUT_PENDING);
+    if (upstream_exercised) {
         poison_connection_ = true;
     }
-    // Release any held breaker admission neutrally before tearing down.
-    // A client disconnect during CHECKOUT_PENDING, mid-send, or mid-
-    // response leaves admission_generation_ set; without this neutral
-    // release a probe slot stays occupied and HALF_OPEN can stall in
-    // half_open_full until an external reset. No-op when no admission
-    // is held (INIT, or an outcome already reported).
-    ReleaseBreakerAdmissionNeutral();
+    // Release any held breaker admission before tearing down. Two paths:
+    //   * Pre-upstream (INIT / CHECKOUT_PENDING): upstream was never
+    //     touched — neutral release so a HALF_OPEN probe slot stays
+    //     eligible for replacement (matches ReportNeutral's design
+    //     contract: "the upstream wasn't actually exercised").
+    //   * Post-send (SENDING_REQUEST / AWAITING_RESPONSE / RECEIVING_BODY):
+    //     we poisoned the pooled connection, which from the upstream's
+    //     point of view is indistinguishable from a mid-flight disconnect.
+    //     Report as UPSTREAM_DISCONNECT so the probe counts against the
+    //     HALF_OPEN cycle (no replacement, re-trip on saw_failure drain)
+    //     and CLOSED-state accounting sees the disruption instead of
+    //     silently dropping a real signal.
+    // Both branches clear admission_generation_ internally, so late
+    // transport callbacks (if any) become no-ops.
+    if (upstream_exercised) {
+        ReportBreakerOutcome(RESULT_UPSTREAM_DISCONNECT);
+    } else {
+        ReleaseBreakerAdmissionNeutral();
+    }
     // Release the upstream lease back to the pool (or destroy it if
     // poisoned) and clear transport callbacks so any in-flight upstream
     // bytes land harmlessly.
@@ -1030,49 +1044,67 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
 }
 
 HttpResponse ProxyTransaction::MakeCircuitOpenResponse() const {
-    // Compute Retry-After from slice->OpenUntil() if the slice is known.
-    // Falls back to a conservative 1-second hint if the slice is null
-    // (shouldn't happen on the circuit-open path — that path requires a
-    // slice — but defense in depth).
+    // TryAcquire() returns REJECTED_OPEN for three distinct situations:
+    //   * True OPEN: slice is in OPEN state, IsOpenDeadlineSet() is true,
+    //     Retry-After reflects remaining backoff from OpenUntil().
+    //   * HALF_OPEN reject (half_open_full or half_open_recovery_failing):
+    //     slice transitioned HALF_OPEN via TransitionOpenToHalfOpen, which
+    //     clears open_until. IsOpenDeadlineSet() is false. These rejects
+    //     wait on the in-flight probe cycle completing (success → CLOSED,
+    //     failure → re-trip with fresh backoff). Retry-After = 1 in this
+    //     branch would under-report the likely wait on a re-trip; ceil to
+    //     base_open_duration_ms as a conservative hint (the worst case is
+    //     re-trip + fresh backoff window).
+    // Emit a distinct X-Circuit-Breaker label for observability so
+    // operators can separate "true OPEN" from "HALF_OPEN recovery back-
+    // pressure" on dashboards.
     int retry_after_secs = 1;
-    if (slice_ && slice_->IsOpenDeadlineSet()) {
-        auto open_until = slice_->OpenUntil();
-        auto now = std::chrono::steady_clock::now();
-        auto ms_remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            open_until - now).count();
-        // Ceiling-round to seconds so we never advertise a window
-        // shorter than the actual remaining backoff (e.g. 5.9s → 6,
-        // not 5). Truncating by one second is enough to cause a
-        // well-behaved client to retry while the breaker is still OPEN
-        // and get another avoidable 503.
-        int64_t diff = (ms_remaining + 999) / 1000;
-        // Clamp: Retry-After=0 is silly; upper bound tracks the
-        // configured max_open_duration_ms (clamped to 1s min), so we
-        // don't under-report backoff windows on operators who tune the
-        // breaker longer than 5 minutes. Absolute safety ceiling of
-        // 3600s (1 hour) — anything longer likely means the breaker
-        // is mis-configured and the hint is noise.
-        //
-        // Ceil the cap: floor-rounding max_open_duration_ms would
-        // under-report non-second-aligned configs. E.g. a 1500ms or
-        // 6500ms (exponential-backoff saturation) max floor-rounds to
-        // 1s/6s, advertising a shorter window than the breaker will
-        // actually honor. Clients retrying on the hint would hit
-        // another avoidable 503.
-        long long cfg_ms = slice_->config().max_open_duration_ms;
-        int cfg_cap_secs = static_cast<int>(
-            std::max<long long>(1, (cfg_ms + 999) / 1000));
-        int upper = std::min(cfg_cap_secs, 3600);
-        if (diff < 1) diff = 1;
-        if (diff > upper) diff = upper;
-        retry_after_secs = static_cast<int>(diff);
+    const char* breaker_label = "open";
+    if (slice_) {
+        if (slice_->IsOpenDeadlineSet()) {
+            // True OPEN — Retry-After from actual deadline.
+            auto open_until = slice_->OpenUntil();
+            auto now = std::chrono::steady_clock::now();
+            auto ms_remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                open_until - now).count();
+            // Ceiling-round to seconds so we never advertise a window
+            // shorter than the actual remaining backoff.
+            int64_t diff = (ms_remaining + 999) / 1000;
+            // Upper bound tracks the configured max_open_duration_ms
+            // (ceiling-rounded to avoid under-reporting non-second-
+            // aligned configs), with an absolute safety ceiling at
+            // 3600s.
+            long long cfg_ms = slice_->config().max_open_duration_ms;
+            int cfg_cap_secs = static_cast<int>(
+                std::max<long long>(1, (cfg_ms + 999) / 1000));
+            int upper = std::min(cfg_cap_secs, 3600);
+            if (diff < 1) diff = 1;
+            if (diff > upper) diff = upper;
+            retry_after_secs = static_cast<int>(diff);
+            breaker_label = "open";
+        } else if (slice_->CurrentState() ==
+                   circuit_breaker::State::HALF_OPEN) {
+            // HALF_OPEN reject — no deadline to read; hint the operator
+            // with a ceiled base_open_duration so retrying clients wait
+            // for at least the worst-case re-trip window instead of
+            // bouncing immediately on Retry-After=1.
+            long long base_ms = slice_->config().base_open_duration_ms;
+            int hint = static_cast<int>(
+                std::max<long long>(1, (base_ms + 999) / 1000));
+            retry_after_secs = std::min(hint, 3600);
+            breaker_label = "half_open";
+        }
+        // Any other state (CLOSED): shouldn't reach here — ConsultBreaker
+        // only calls this on REJECTED_OPEN. Fall through with the
+        // conservative defaults (Retry-After=1, label="open") so a
+        // regression can't silently emit Retry-After=0.
     }
 
     HttpResponse resp;
     resp.Status(HttpStatus::SERVICE_UNAVAILABLE);
     resp.Text("Upstream circuit breaker is open; please retry later.\n");
     resp.Header("Retry-After", std::to_string(retry_after_secs));
-    resp.Header("X-Circuit-Breaker", "open");
+    resp.Header("X-Circuit-Breaker", breaker_label);
     // Hint operators (not clients) at which upstream tripped. Useful
     // when a gateway fronts multiple backends; without this header, a
     // 503 is opaque.

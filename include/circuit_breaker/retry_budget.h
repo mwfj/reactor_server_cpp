@@ -16,7 +16,15 @@ namespace circuit_breaker {
 // Fix: cap concurrent retries as a fraction of concurrent non-retry
 // traffic plus a floor for low-volume correctness.
 //
-//   allowed_retries = max(min_concurrency, in_flight * percent / 100)
+//   allowed_retries = max(min_concurrency,
+//                          (in_flight - retries_in_flight) * percent / 100)
+//
+// The subtraction is load-bearing: callers hold TrackInFlight() for
+// BOTH first attempts and retries (so the guard's RAII paired with
+// ReleaseRetry doesn't need a second counter on the hot path).
+// Without subtracting retries, admitting a retry increases in_flight
+// which increases the cap, and in steady state the effective ratio
+// converges above the configured percent of original traffic.
 //
 // The retry budget is PER-HOST (one instance owned by CircuitBreakerHost,
 // shared across its partitions — the percent math is about aggregate
