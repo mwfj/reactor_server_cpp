@@ -389,9 +389,41 @@ static int OnFrameRecvCallback(
                         logging::Get()->warn(
                             "HTTP/2 100-Continue submit failed stream={} rv={} ({})",
                             frame->hd.stream_id, rv100, nghttp2_strerror(rv100));
-                        nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                                  frame->hd.stream_id,
-                                                  NGHTTP2_INTERNAL_ERROR);
+                        int rv_rst = nghttp2_submit_rst_stream(
+                            session, NGHTTP2_FLAG_NONE,
+                            frame->hd.stream_id, NGHTTP2_INTERNAL_ERROR);
+                        if (rv_rst != 0) {
+                            // Dual-NOMEM path: neither the 100 nor the RST
+                            // was queued, so nghttp2 will never fire
+                            // on_stream_close for this stream. The
+                            // stream_open_callback already fired in
+                            // CreateStream, leaving active_h2_streams_ and
+                            // local_stream_count_ both +1. Mirror the
+                            // push-rollback reconciliation pattern: fire a
+                            // synthetic stream_close_callback +
+                            // MarkStreamForRemoval so counters stay
+                            // balanced. FlushDeferredRemovals will erase
+                            // the entry. Any later spurious nghttp2 close
+                            // callback for this id is a FindStream no-op.
+                            logging::Get()->warn(
+                                "HTTP/2 100-Continue RST submit also failed "
+                                "stream={} rv={} ({}) — firing synthetic "
+                                "close_callback to reconcile counters",
+                                frame->hd.stream_id, rv_rst,
+                                nghttp2_strerror(rv_rst));
+                            if (self->Callbacks().stream_close_callback) {
+                                try {
+                                    self->Callbacks().stream_close_callback(
+                                        self->Owner(), frame->hd.stream_id,
+                                        NGHTTP2_INTERNAL_ERROR);
+                                } catch (const std::exception& e) {
+                                    logging::Get()->error(
+                                        "Synthetic close_callback threw: {}",
+                                        e.what());
+                                }
+                            }
+                            self->MarkStreamForRemoval(frame->hd.stream_id);
+                        }
                         stream->MarkRejected();
                         break;
                     }
@@ -437,6 +469,36 @@ static int OnFrameRecvCallback(
                                 "HTTP/2 417 RST submit failed stream={} rv={} ({})",
                                 frame->hd.stream_id, rv_rst,
                                 nghttp2_strerror(rv_rst));
+                            // Dual-failure reconciliation: when both the
+                            // response and the RST submits fail (NOMEM),
+                            // nghttp2 never fires on_stream_close and the
+                            // stream_open_callback's +1 on active_h2_streams_
+                            // / local_stream_count_ leaks. Fire a synthetic
+                            // close_callback to balance, matching the
+                            // 100-Continue and push-rollback paths. Only
+                            // reconcile when the response submit ALSO
+                            // failed — if only the RST failed but the
+                            // response succeeded, submit_response2 closes
+                            // both sides cleanly and nghttp2 will fire
+                            // close on its own via END_STREAM.
+                            if (rv417 != 0) {
+                                logging::Get()->warn(
+                                    "HTTP/2 417 dual-failure stream={} — "
+                                    "firing synthetic close_callback",
+                                    frame->hd.stream_id);
+                                if (self->Callbacks().stream_close_callback) {
+                                    try {
+                                        self->Callbacks().stream_close_callback(
+                                            self->Owner(), frame->hd.stream_id,
+                                            NGHTTP2_INTERNAL_ERROR);
+                                    } catch (const std::exception& e) {
+                                        logging::Get()->error(
+                                            "Synthetic close_callback threw: {}",
+                                            e.what());
+                                    }
+                                }
+                                self->MarkStreamForRemoval(frame->hd.stream_id);
+                            }
                         }
                     }
                     stream->MarkRejected();
@@ -1049,6 +1111,23 @@ int32_t Http2Session::SubmitPushPromise(
             "push: parent stream {} not open", parent_stream_id);
         return -1;
     }
+    // Reject pushes once the parent's final response has been handed to
+    // nghttp2. IsClosed() only transitions when nghttp2 actually closes
+    // the stream (after the last DATA frame is sent to the peer); on a
+    // large or backpressured body the parent can remain Open for a long
+    // time AFTER SubmitResponse has already committed the terminal
+    // response. Without this check, a stale push_resource closure
+    // captured by an async handler could land a PUSH_PROMISE after
+    // complete() — violating the ordering guarantee that pushes must
+    // precede the final response bytes. FinalResponseSubmitted() is
+    // set synchronously inside SubmitResponse on success, so it closes
+    // the window regardless of how slowly the peer drains.
+    if (parent->FinalResponseSubmitted()) {
+        logging::Get()->debug(
+            "push: parent stream {} final response already submitted; "
+            "rejecting stale push", parent_stream_id);
+        return -1;
+    }
     // Pre-validate the pushed response BEFORE we announce a PUSH_PROMISE
     // on the wire. If we skipped this, a handler passing an invalid
     // response (e.g. status < 200) would cause the promise to go out,
@@ -1242,6 +1321,14 @@ void Http2Session::SubmitGoawayChecked(uint32_t error_code,
         ? last_stream_id_override
         : last_stream_id_.load(std::memory_order_acquire);
 
+    // Audit log BEFORE submit so flood-triggered GOAWAYs are visible in
+    // operator logs alongside the flood warn — previously only the
+    // dedicated SendGoaway() path emitted an info line, leaving the
+    // SETTINGS/PING/RST flood branches with no GOAWAY audit trail.
+    logging::Get()->info(
+        "H2 sending GOAWAY fd={} last_stream_id={} error_code={}",
+        conn_ ? conn_->fd() : -1, last_id, error_code);
+
     int rv = nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
                                     last_id, error_code, nullptr, 0);
     if (rv != 0) {
@@ -1261,8 +1348,8 @@ void Http2Session::SubmitGoawayChecked(uint32_t error_code,
 }
 
 void Http2Session::SendGoaway(uint32_t error_code) {
-    if (goaway_sent_) return;
-    logging::Get()->info("H2 sending GOAWAY fd={}", conn_ ? conn_->fd() : -1);
+    // Audit log is emitted inside SubmitGoawayChecked so flood-path
+    // callers get the same entry.
     SubmitGoawayChecked(error_code, /*last_stream_id_override=*/-1, /*flush=*/true);
 }
 

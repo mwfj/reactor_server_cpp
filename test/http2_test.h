@@ -3732,6 +3732,14 @@ void TestH2_Push_OffDispatcherThreadHops() {
             pass = false; err += "connect failed; ";
         } else {
             auto resp = client.Get("/");
+            // Regression guard: a future break where off-thread push
+            // corrupts the main response must fail this test, not
+            // silently pass on the pushed-stream assertion alone.
+            if (resp.status != 200) {
+                pass = false;
+                err += "parent status != 200 (got " +
+                       std::to_string(resp.status) + "); ";
+            }
             if (resp.pushed.size() != 1) {
                 pass = false;
                 err += "expected 1 pushed stream after off-thread push, got " +
@@ -3747,6 +3755,83 @@ void TestH2_Push_OffDispatcherThreadHops() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "H2 Push: off-dispatcher-thread hops to dispatcher", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Regression test for the "stale push after complete()" race: an async
+// handler on a worker thread calls complete(200) followed by
+// push_resource(). The complete enqueues SubmitStreamResponse onto the
+// dispatcher; the hopped push_resource lambda is enqueued after it.
+// Before the FinalResponseSubmitted() check in SubmitPushPromise, the
+// hopped push lambda would land a PUSH_PROMISE AFTER the terminal
+// response was committed, violating ordering. With the check, the
+// stale push is dropped (parent still "open" because the response body
+// hasn't finished sending, but final has been handed to nghttp2).
+void TestH2_Push_RejectedAfterFinalResponseSubmitted() {
+    std::cout << "\n[TEST] H2 Push: rejected after complete() (stale push)..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+
+        server.GetAsync("/",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher push_resource,
+               HttpRouter::AsyncCompletionCallback complete) {
+                // Issue from a worker thread: complete THEN push.
+                // The complete() call enqueues SubmitStreamResponse; the
+                // push_resource call hops and enqueues itself AFTER.
+                std::thread t([complete = std::move(complete),
+                               push_resource]() {
+                    HttpResponse main;
+                    // Body big enough that nghttp2 can't finish sending
+                    // before the hopped push lambda runs (keeps the
+                    // stream Open so the IsClosed() check alone wouldn't
+                    // reject — FinalResponseSubmitted() IS the check
+                    // doing the work).
+                    main.Status(200).Body(std::string(32 * 1024, 'X'), "text/html");
+                    complete(std::move(main));
+                    HttpResponse pushed;
+                    pushed.Status(200).Body(kPushedBody, "text/css");
+                    push_resource("GET", "http", "localhost",
+                                  "/style.css", pushed);
+                });
+                t.join();
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.status != 200) {
+                pass = false;
+                err += "parent status != 200 (got " +
+                       std::to_string(resp.status) + "); ";
+            }
+            // The stale push must be dropped — ordering against the
+            // final response is the correctness guarantee.
+            if (!resp.pushed.empty()) {
+                pass = false;
+                err += "stale push accepted after complete() — "
+                       "FinalResponseSubmitted guard bypassed; got " +
+                       std::to_string(resp.pushed.size()) + " pushed; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 Push: rejected after complete() (stale push)", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Push: rejected after complete() (stale push)", false, e.what(),
             TestFramework::TestCategory::OTHER);
     }
 }
@@ -3970,6 +4055,7 @@ void RunAllTests() {
     TestH2_Push_OnHttp1Connection();
     TestH2_Push_AsyncViaRunOnDispatcher();
     TestH2_Push_OffDispatcherThreadHops();
+    TestH2_Push_RejectedAfterFinalResponseSubmitted();
     TestH2_Push_ActiveH2StreamsBalanced();
     TestH2_Push_ReloadTogglesEnablePush();
 }
