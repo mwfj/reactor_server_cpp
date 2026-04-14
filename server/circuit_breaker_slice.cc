@@ -79,6 +79,7 @@ void CircuitBreakerSlice::TripClosedToOpen(const char* trigger) {
     half_open_inflight_ = 0;
     half_open_successes_ = 0;
     half_open_saw_failure_ = false;
+    half_open_admitted_ = 0;
     first_reject_logged_for_open_ = false;
     // Bump closed_gen_: non-probe admissions from the closing CLOSED cycle
     // are now stale. Late Report(false, ...) calls for those requests drop.
@@ -108,6 +109,7 @@ void CircuitBreakerSlice::TransitionOpenToHalfOpen() {
     half_open_inflight_ = 0;
     half_open_successes_ = 0;
     half_open_saw_failure_ = false;
+    half_open_admitted_ = 0;
     // Snapshot the probe budget for this cycle. A live Reload() during this
     // HALF_OPEN episode may lower or raise config_.permitted_half_open_calls,
     // but TryAcquire's slot gate (Case B) and ReportSuccess's close check must
@@ -163,6 +165,7 @@ void CircuitBreakerSlice::TransitionHalfOpenToClosed() {
     half_open_inflight_ = 0;
     half_open_successes_ = 0;
     half_open_saw_failure_ = false;
+    half_open_admitted_ = 0;
     first_reject_logged_for_open_ = false;
     // Bump halfopen_gen_: the just-completed HALF_OPEN cycle's probe
     // admissions are now stale. closed_gen_ is NOT bumped — pre-trip
@@ -194,6 +197,7 @@ void CircuitBreakerSlice::TripHalfOpenToOpen(const char* trigger) {
     half_open_inflight_ = 0;
     half_open_successes_ = 0;
     half_open_saw_failure_ = false;
+    half_open_admitted_ = 0;
     first_reject_logged_for_open_ = false;
     // Bump halfopen_gen_: probe admissions from the closing HALF_OPEN
     // cycle are now stale. closed_gen_ is NOT bumped — no CLOSED
@@ -255,16 +259,29 @@ CircuitBreakerSlice::Admission CircuitBreakerSlice::TryAcquire() {
                                            /*half_open_full=*/false),
                              /*generation=*/0};
         }
-        // Case B: probe budget fully in flight. "No capacity" — bump the
-        // dedicated counter so dashboards can tell these two apart.
-        // Use the cycle snapshot, not config_, so a live Reload() that
-        // lowers permitted_half_open_calls mid-cycle doesn't change how many
-        // probes were promised to this cycle.
-        if (half_open_inflight_ >= half_open_permitted_snapshot_) {
+        // Case B: probe budget exhausted for this cycle. "No capacity" — bump
+        // the dedicated counter so dashboards can tell this apart from
+        // saw_failure rejects.
+        //
+        // Gate on `half_open_admitted_` (total cycle admissions, never
+        // decrements), NOT on `half_open_inflight_`. Inflight drops when a
+        // probe completes, so gating on it would reuse the freed slot and let
+        // the cycle admit more than `snapshot` total probes. Consequences of
+        // that bug: the close check `successes >= snapshot` could fire before
+        // ALL admitted probes have reported (the reused-slot probe is still
+        // in flight); TransitionHalfOpenToClosed would bump halfopen_gen_;
+        // the late probe's failure would drop as stale — falsely marking an
+        // unhealthy host recovered.
+        //
+        // Use the cycle snapshot so a live Reload() that lowers
+        // permitted_half_open_calls mid-cycle doesn't change how many probes
+        // were promised to this cycle.
+        if (half_open_admitted_ >= half_open_permitted_snapshot_) {
             return Admission{RejectWithLog("half_open_full",
                                            /*half_open_full=*/true),
                              /*generation=*/0};
         }
+        half_open_admitted_++;
         half_open_inflight_++;
         // Probe admission — stamp with halfopen_gen_.
         return Admission{Decision::ADMITTED_PROBE, halfopen_gen_};

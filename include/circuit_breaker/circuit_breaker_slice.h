@@ -138,6 +138,18 @@ private:
     int half_open_inflight_ = 0;
     int half_open_successes_ = 0;
     bool half_open_saw_failure_ = false;
+    // Total probes admitted in the CURRENT HALF_OPEN cycle. Never decrements
+    // within a cycle; resets on every cycle entry (TransitionOpenToHalfOpen)
+    // and cycle exit (TransitionHalfOpenToClosed / TripHalfOpenToOpen). This
+    // is what caps the cycle's probe budget — NOT half_open_inflight_, which
+    // can free slots as probes complete. Gating on inflight would let an
+    // early-completing probe's slot be reused, causing the cycle to admit
+    // more than permitted_half_open_calls total probes. The close check
+    // (successes >= snapshot) could then fire while a late-admitted probe
+    // is still running; its eventual failure would drop as stale (generation
+    // bumped by the transition) and the breaker would falsely mark an
+    // unhealthy host recovered.
+    int half_open_admitted_ = 0;
     // Probe budget for the CURRENT HALF_OPEN cycle. Snapshotted from
     // config_.permitted_half_open_calls at the moment TransitionOpenToHalfOpen
     // fires. A live Reload() may lower (or raise) the config field mid-cycle;

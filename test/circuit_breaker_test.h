@@ -1703,6 +1703,91 @@ void TestHalfOpenClampsNonPositiveProbeBudget() {
     }
 }
 
+// BUG (review round 10, P1): TryAcquire gated HALF_OPEN admission on
+// half_open_inflight_, so a probe slot was reused once an earlier probe
+// completed. With permitted_half_open_calls=2:
+//
+//   admit A → inflight=1, admitted=1
+//   admit B → inflight=2, admitted=2
+//   Report success on A → inflight=1, successes=1
+//   admit C → inflight(1) < snapshot(2) → ACCEPTED (BUG: 3rd admission)
+//   Report success on B → inflight=0, successes=2
+//   successes(2) >= snapshot(2) → TransitionHalfOpenToClosed fires
+//   → halfopen_gen_ bumped → C's eventual failure DROPPED as stale
+//   → breaker falsely marked recovered despite the probe failing.
+//
+// Fix: gate on half_open_admitted_ (total cycle admissions, never
+// decrements) instead of half_open_inflight_. The cycle can admit at most
+// `snapshot` probes total, regardless of how quickly earlier probes drain.
+void TestHalfOpenDoesNotReuseProbeSlots() {
+    std::cout << "\n[TEST] CB: HALF_OPEN does not reuse probe slots..."
+              << std::endl;
+    try {
+        CircuitBreakerConfig cb;
+        cb.enabled = true;
+        cb.consecutive_failure_threshold = 2;
+        cb.failure_rate_threshold = 100;
+        cb.minimum_volume = 1000;
+        cb.window_seconds = 10;
+        cb.permitted_half_open_calls = 2;
+        cb.base_open_duration_ms = 100;
+        cb.max_open_duration_ms = 60000;
+
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Trip to OPEN.
+        for (int i = 0; i < 2; ++i) {
+            auto a = slice.TryAcquire();
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, a.generation);
+        }
+        clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
+
+        // Admit 2 probes (budget=2).
+        auto a = slice.TryAcquire();
+        auto b = slice.TryAcquire();
+        bool both_admitted = a.decision == Decision::ADMITTED_PROBE &&
+                             b.decision == Decision::ADMITTED_PROBE;
+
+        // Report success on A — freeing its inflight slot.
+        slice.ReportSuccess(true, a.generation);
+        bool still_halfopen = slice.CurrentState() == State::HALF_OPEN;
+
+        // Third admission attempt. With the fix: admitted(2) >= snapshot(2)
+        // → REJECTED. Without the fix: inflight(1) < snapshot(2) → ADMITTED,
+        // creating a ghost probe.
+        auto c = slice.TryAcquire();
+        bool third_rejected = c.decision == Decision::REJECTED_OPEN;
+
+        // Close the cycle by succeeding B.
+        slice.ReportSuccess(true, b.generation);
+        bool closed = slice.CurrentState() == State::CLOSED;
+
+        // Verify no stale-generation reports accumulated — if the 3rd admission
+        // had slipped through, its (dropped) report after the close would have
+        // bumped this counter. Since the admission is now rejected up front,
+        // this should stay zero.
+        bool no_stale_reports = slice.ReportsStaleGeneration() == 0;
+
+        bool pass = both_admitted && still_halfopen && third_rejected &&
+                    closed && no_stale_reports;
+        TestFramework::RecordTest(
+            "CB: HALF_OPEN does not reuse probe slots",
+            pass, pass ? "" :
+                  "both_admitted=" + std::to_string(both_admitted) +
+                  " still_halfopen=" + std::to_string(still_halfopen) +
+                  " third_rejected=" + std::to_string(third_rejected) +
+                  " closed=" + std::to_string(closed) +
+                  " no_stale_reports=" + std::to_string(no_stale_reports),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: HALF_OPEN does not reuse probe slots",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestTransitionCallbackInvoked() {
     std::cout << "\n[TEST] CB: transition callback invoked..." << std::endl;
     try {
@@ -1786,6 +1871,7 @@ void RunAllTests() {
     TestWindowNonPositiveWindowSizeClamp();
     TestReportFailureUsesOneTimestampAcrossTripEval();
     TestHalfOpenClampsNonPositiveProbeBudget();
+    TestHalfOpenDoesNotReuseProbeSlots();
     TestTransitionCallbackInvoked();
 }
 
