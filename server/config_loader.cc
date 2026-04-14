@@ -153,6 +153,11 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 throw std::runtime_error("http2.max_header_list_size must be a non-negative integer");
             config.http2.max_header_list_size = h2["max_header_list_size"].get<uint32_t>();
         }
+        if (h2.contains("enable_push")) {
+            if (!h2["enable_push"].is_boolean())
+                throw std::runtime_error("http2.enable_push must be a boolean");
+            config.http2.enable_push = h2["enable_push"].get<bool>();
+        }
     }
 
     // Log section
@@ -502,6 +507,21 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
         if (v < 0) throw std::runtime_error(
             "REACTOR_HTTP2_MAX_HEADER_LIST_SIZE must be non-negative");
         config.http2.max_header_list_size = static_cast<uint32_t>(v);
+    }
+    val = std::getenv("REACTOR_HTTP2_ENABLE_PUSH");
+    if (val) {
+        std::string s(val);
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        if (s == "1" || s == "true" || s == "yes" || s == "on") {
+            config.http2.enable_push = true;
+        } else if (s == "0" || s == "false" || s == "no" || s == "off") {
+            config.http2.enable_push = false;
+        } else {
+            throw std::invalid_argument(
+                "Invalid REACTOR_HTTP2_ENABLE_PUSH: '" + std::string(val) +
+                "' (must be true/false/yes/no/on/off/1/0)");
+        }
     }
 
     // No per-upstream environment variable overrides. Upstream configuration
@@ -1121,6 +1141,7 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
     j["http2"]["initial_window_size"]    = config.http2.initial_window_size;
     j["http2"]["max_frame_size"]         = config.http2.max_frame_size;
     j["http2"]["max_header_list_size"]   = config.http2.max_header_list_size;
+    j["http2"]["enable_push"]            = config.http2.enable_push;
 
     j["upstreams"] = nlohmann::json::array();
     for (const auto& u : config.upstreams) {

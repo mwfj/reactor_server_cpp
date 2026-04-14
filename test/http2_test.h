@@ -10,6 +10,8 @@
 #include "http/http_server.h"
 #include "http/http_request.h"
 #include "http/http_response.h"
+#include "http/http_status.h"
+#include "http/push_helper.h"
 
 #include <nghttp2/nghttp2.h>
 
@@ -20,6 +22,8 @@
 #include <vector>
 #include <mutex>
 #include <condition_variable>
+#include <future>
+#include <optional>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -53,15 +57,51 @@ static constexpr int IO_TIMEOUT_MS    = 5000;
 
 class Http2TestClient {
 public:
+    // Forward declare for the recursive PushedStream type below.
+    struct PushedStream;
+
     struct Response {
         int         status  = 0;
         std::string body;
         bool        rst     = false;   // stream was RST'd
         bool        error   = false;   // transport or session error
+        // Interim 1xx response blocks observed BEFORE the final status,
+        // in arrival order. interim_headers[i] are the headers carried by
+        // interim_statuses[i]. Used by 103 Early Hints and 100 Continue tests.
+        std::vector<int> interim_statuses;
+        std::vector<std::vector<std::pair<std::string, std::string>>> interim_headers;
+        // PUSH_PROMISE-initiated streams whose parent is this response's
+        // stream. Populated when the wait loop drains all pushes that were
+        // promised before the parent stream completed. Used by H2 server
+        // push tests.
+        std::vector<PushedStream> pushed;
+    };
+
+    struct PushedStream {
+        int32_t      promised_stream_id = 0;
+        // Pseudo-header values from the PUSH_PROMISE frame (the
+        // synthetic request the server is satisfying).
+        std::string  method;
+        std::string  scheme;
+        std::string  authority;
+        std::string  path;
+        // Response on the promised stream
+        int          status = 0;
+        std::string  body;
+        bool         rst    = false;
+        bool         done   = false;
     };
 
     Http2TestClient() = default;
     ~Http2TestClient() { Disconnect(); }
+
+    // Configure the next Connect() to advertise SETTINGS_ENABLE_PUSH=0 in
+    // the client preface, simulating a client that refuses server push.
+    // Used by H2 push tests to exercise the peer-refused branch of
+    // Http2Session::PushEnabled().
+    void SetRefusePushes(bool refuse) {
+        refuse_pushes_in_client_settings_ = refuse;
+    }
 
     // Non-copyable
     Http2TestClient(const Http2TestClient&) = delete;
@@ -100,11 +140,22 @@ public:
         nghttp2_session_callbacks_del(cbs);
         if (rv != 0) { ::close(fd_); fd_ = -1; return false; }
 
-        // Submit empty SETTINGS (client hello settings).
+        // Submit client SETTINGS. Empty by default. When
+        // refuse_pushes_in_client_settings_ is set (push tests), include
+        // SETTINGS_ENABLE_PUSH=0 so the server's Http2Session::PushEnabled()
+        // observes a peer that refuses pushes.
         // NOTE: Do NOT manually send the 24-byte connection preface magic.
         // nghttp2_session_mem_send2 automatically prepends the magic as the first
         // output of a client session (RFC 9113 Section 3.4 "Prior Knowledge").
-        rv = nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, nullptr, 0);
+        if (refuse_pushes_in_client_settings_) {
+            nghttp2_settings_entry iv[] = {
+                {NGHTTP2_SETTINGS_ENABLE_PUSH, 0}
+            };
+            rv = nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE,
+                                         iv, sizeof(iv) / sizeof(iv[0]));
+        } else {
+            rv = nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, nullptr, 0);
+        }
         if (rv != 0) { Disconnect(); return false; }
         if (!FlushOutput()) { Disconnect(); return false; }
 
@@ -206,20 +257,74 @@ public:
                         std::chrono::milliseconds(IO_TIMEOUT_MS);
 
         while (true) {
-            auto it = streams_.find(stream_id);
-            if (it != streams_.end() && it->second.done) {
-                Response resp;
-                resp.status = it->second.status;
-                resp.body   = it->second.body;
-                resp.rst    = it->second.rst;
-                streams_.erase(it);
-                return resp;
+            if (auto done = CollectCompletedResponse(stream_id)) {
+                return std::move(*done);
             }
-
             if (std::chrono::steady_clock::now() >= deadline) {
                 Response r; r.error = true; return r;
             }
+            if (!ReadAndProcess(100)) {
+                Response r; r.error = true; return r;
+            }
+        }
+    }
 
+    // Send a request with explicit :scheme and :authority (for authority/host tests).
+    // extra_headers may include a "host" header to test :authority vs host matching.
+    Response SendRequestRaw(
+        const std::string& method,
+        const std::string& path,
+        const std::string& scheme,
+        const std::string& authority,
+        const std::vector<std::pair<std::string,std::string>>& extra_headers = {}) {
+
+        if (!session_ || fd_ < 0) {
+            Response r; r.error = true; return r;
+        }
+
+        std::vector<std::pair<std::string, std::string>> header_pairs;
+        header_pairs.reserve(4 + extra_headers.size());
+        header_pairs.emplace_back(":method", method);
+        header_pairs.emplace_back(":path", path);
+        header_pairs.emplace_back(":scheme", scheme);
+        header_pairs.emplace_back(":authority", authority);
+        for (const auto& h : extra_headers) {
+            header_pairs.push_back(h);
+        }
+
+        std::vector<nghttp2_nv> nva;
+        nva.reserve(header_pairs.size());
+        for (const auto& hp : header_pairs) {
+            nva.push_back({
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.first.c_str())),
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.second.c_str())),
+                hp.first.size(), hp.second.size(),
+                NGHTTP2_NV_FLAG_NONE
+            });
+        }
+
+        int32_t stream_id = nghttp2_submit_request2(
+            session_, nullptr, nva.data(), nva.size(), nullptr, this);
+
+        if (stream_id < 0) {
+            Response r; r.error = true; return r;
+        }
+
+        streams_[stream_id] = StreamState{};
+        if (!FlushOutput()) {
+            Response r; r.error = true; return r;
+        }
+
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(IO_TIMEOUT_MS);
+
+        while (true) {
+            if (auto done = CollectCompletedResponse(stream_id)) {
+                return std::move(*done);
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                Response r; r.error = true; return r;
+            }
             if (!ReadAndProcess(100)) {
                 Response r; r.error = true; return r;
             }
@@ -239,8 +344,69 @@ private:
         std::string body;
         bool        done   = false;
         bool        rst    = false;
+        // Interim 1xx tracking. A new entry is appended to interim_statuses
+        // when ":status" with a code in [100, 200) is observed; subsequent
+        // header callbacks for the same HEADERS frame are appended to
+        // interim_headers.back() until a non-1xx ":status" arrives.
+        std::vector<int> interim_statuses;
+        std::vector<std::vector<std::pair<std::string, std::string>>> interim_headers;
+        bool current_block_interim = false;
+        // PUSH_PROMISE bookkeeping (server-initiated streams).
+        // parent_id == 0 means client-initiated; >0 means promised by server.
+        int32_t parent_id = 0;
+        // Pseudo-headers carried by the PUSH_PROMISE frame for promised
+        // streams; recorded as the on_header callbacks for that frame fire.
+        std::string promise_method;
+        std::string promise_scheme;
+        std::string promise_authority;
+        std::string promise_path;
+        // True while OnHeader is filling the PUSH_PROMISE pseudo-headers
+        // (separate from interim/final response headers on the same id).
+        bool current_block_push_promise = false;
     };
     std::map<int32_t, StreamState> streams_;
+    // True when the client should advertise SETTINGS_ENABLE_PUSH=0 in its
+    // initial SETTINGS — used by tests verifying the server's
+    // peer-refused branch in PushEnabled().
+    bool refuse_pushes_in_client_settings_ = false;
+
+    // Build the Response for `stream_id` once the parent is done AND every
+    // promised child has finished. Returns nullopt while any child is still
+    // in flight so the caller keeps polling. Extracted so SendRequest and
+    // SendRequestRaw share identical completion semantics.
+    std::optional<Response> CollectCompletedResponse(int32_t stream_id) {
+        auto it = streams_.find(stream_id);
+        if (it == streams_.end() || !it->second.done) return std::nullopt;
+        for (const auto& [id, st] : streams_) {
+            if (st.parent_id == stream_id && !st.done) return std::nullopt;
+        }
+        Response resp;
+        resp.status           = it->second.status;
+        resp.body             = it->second.body;
+        resp.rst              = it->second.rst;
+        resp.interim_statuses = std::move(it->second.interim_statuses);
+        resp.interim_headers  = std::move(it->second.interim_headers);
+        for (auto sit = streams_.begin(); sit != streams_.end();) {
+            if (sit->second.parent_id == stream_id) {
+                PushedStream ps;
+                ps.promised_stream_id = sit->first;
+                ps.method    = std::move(sit->second.promise_method);
+                ps.scheme    = std::move(sit->second.promise_scheme);
+                ps.authority = std::move(sit->second.promise_authority);
+                ps.path      = std::move(sit->second.promise_path);
+                ps.status    = sit->second.status;
+                ps.body      = std::move(sit->second.body);
+                ps.rst       = sit->second.rst;
+                ps.done      = sit->second.done;
+                resp.pushed.push_back(std::move(ps));
+                sit = streams_.erase(sit);
+            } else {
+                ++sit;
+            }
+        }
+        streams_.erase(stream_id);
+        return resp;
+    }
 
     // ---- Raw I/O ----
 
@@ -318,6 +484,17 @@ private:
                 it->second.rst  = true;
                 it->second.done = true;
             }
+        } else if (frame->hd.type == NGHTTP2_PUSH_PROMISE) {
+            // A new server-initiated stream id has been promised. Register
+            // a tracking entry and stamp the parent stream id so the
+            // parent's wait loop knows how many promised streams remain.
+            // PUSH_PROMISE pseudo-headers (:method, :scheme, :authority,
+            // :path) were already routed to OnHeader against the same
+            // promised id, so the StreamState may already have been
+            // created with promise_* fields set — preserve those.
+            int32_t promised = frame->push_promise.promised_stream_id;
+            auto& s = self->streams_[promised];
+            s.parent_id = sid;
         }
         return 0;
     }
@@ -328,16 +505,48 @@ private:
                         const uint8_t* value,  size_t valuelen,
                         uint8_t /*flags*/, void* user_data) {
         auto* self = static_cast<Http2TestClient*>(user_data);
-        int32_t sid = frame->hd.stream_id;
 
         std::string n(reinterpret_cast<const char*>(name),  namelen);
         std::string v(reinterpret_cast<const char*>(value), valuelen);
 
+        // PUSH_PROMISE pseudo-headers describe the synthetic request the
+        // server is promising. nghttp2 routes them with frame->hd.stream_id
+        // == the parent stream and frame->push_promise.promised_stream_id
+        // == the new id. Record them against the promised stream so the
+        // test can later assert on the request that was promised.
+        if (frame->hd.type == NGHTTP2_PUSH_PROMISE) {
+            int32_t promised = frame->push_promise.promised_stream_id;
+            auto& s = self->streams_[promised];
+            s.parent_id = frame->hd.stream_id;
+            s.current_block_push_promise = true;
+            if      (n == ":method")    s.promise_method    = std::move(v);
+            else if (n == ":scheme")    s.promise_scheme    = std::move(v);
+            else if (n == ":authority") s.promise_authority = std::move(v);
+            else if (n == ":path")      s.promise_path      = std::move(v);
+            return 0;
+        }
+
+        int32_t sid = frame->hd.stream_id;
+        auto it = self->streams_.find(sid);
+        if (it == self->streams_.end()) return 0;
+        StreamState& s = it->second;
+        // Header on a non-PUSH_PROMISE frame ends any prior promise block.
+        s.current_block_push_promise = false;
+
         if (n == ":status") {
-            auto it = self->streams_.find(sid);
-            if (it != self->streams_.end()) {
-                try { it->second.status = std::stoi(v); } catch (...) {}
+            int code = 0;
+            try { code = std::stoi(v); } catch (...) {}
+            if (code >= 100 && code < 200) {
+                // Interim 1xx — start a new interim block.
+                s.interim_statuses.push_back(code);
+                s.interim_headers.emplace_back();
+                s.current_block_interim = true;
+            } else {
+                s.status = code;
+                s.current_block_interim = false;
             }
+        } else if (s.current_block_interim && !s.interim_headers.empty()) {
+            s.interim_headers.back().emplace_back(std::move(n), std::move(v));
         }
         return 0;
     }
@@ -426,6 +635,10 @@ void TestH2ConfigDefaults() {
             pass = false;
             err += "max_header_list_size != 65536; ";
         }
+        if (cfg.http2.enable_push) {
+            pass = false;
+            err += "enable_push should be false by default; ";
+        }
 
         TestFramework::RecordTest("H2 Config: Default Values", pass, err,
                                   TestFramework::TestCategory::OTHER);
@@ -445,7 +658,8 @@ void TestH2ConfigFromJson() {
                 "max_concurrent_streams": 200,
                 "initial_window_size": 131070,
                 "max_frame_size": 32768,
-                "max_header_list_size": 32768
+                "max_header_list_size": 32768,
+                "enable_push": true
             }
         })";
 
@@ -468,6 +682,9 @@ void TestH2ConfigFromJson() {
         }
         if (cfg.http2.max_header_list_size != 32768) {
             pass = false; err += "max_header_list_size mismatch; ";
+        }
+        if (!cfg.http2.enable_push) {
+            pass = false; err += "enable_push not parsed as true; ";
         }
 
         TestFramework::RecordTest("H2 Config: Parse From JSON", pass, err,
@@ -588,12 +805,14 @@ void TestH2ConfigEnvOverride() {
         unsetenv("REACTOR_HTTP2_INITIAL_WINDOW_SIZE");
         unsetenv("REACTOR_HTTP2_MAX_FRAME_SIZE");
         unsetenv("REACTOR_HTTP2_MAX_HEADER_LIST_SIZE");
+        unsetenv("REACTOR_HTTP2_ENABLE_PUSH");
 
         setenv("REACTOR_HTTP2_ENABLED",                  "false", 1);
         setenv("REACTOR_HTTP2_MAX_CONCURRENT_STREAMS",   "50",    1);
         setenv("REACTOR_HTTP2_INITIAL_WINDOW_SIZE",      "32768", 1);
         setenv("REACTOR_HTTP2_MAX_FRAME_SIZE",           "32768", 1);
         setenv("REACTOR_HTTP2_MAX_HEADER_LIST_SIZE",     "16384", 1);
+        setenv("REACTOR_HTTP2_ENABLE_PUSH",              "true",  1);
 
         ServerConfig cfg = ConfigLoader::Default();
         ConfigLoader::ApplyEnvOverrides(cfg);
@@ -616,6 +835,9 @@ void TestH2ConfigEnvOverride() {
         if (cfg.http2.max_header_list_size != 16384) {
             pass = false; err += "max_header_list_size not overridden; ";
         }
+        if (!cfg.http2.enable_push) {
+            pass = false; err += "enable_push not overridden to true; ";
+        }
 
         // Cleanup
         unsetenv("REACTOR_HTTP2_ENABLED");
@@ -623,6 +845,7 @@ void TestH2ConfigEnvOverride() {
         unsetenv("REACTOR_HTTP2_INITIAL_WINDOW_SIZE");
         unsetenv("REACTOR_HTTP2_MAX_FRAME_SIZE");
         unsetenv("REACTOR_HTTP2_MAX_HEADER_LIST_SIZE");
+        unsetenv("REACTOR_HTTP2_ENABLE_PUSH");
 
         TestFramework::RecordTest("H2 Config: Env Overrides", pass, err,
                                   TestFramework::TestCategory::OTHER);
@@ -632,6 +855,7 @@ void TestH2ConfigEnvOverride() {
         unsetenv("REACTOR_HTTP2_INITIAL_WINDOW_SIZE");
         unsetenv("REACTOR_HTTP2_MAX_FRAME_SIZE");
         unsetenv("REACTOR_HTTP2_MAX_HEADER_LIST_SIZE");
+        unsetenv("REACTOR_HTTP2_ENABLE_PUSH");
         TestFramework::RecordTest("H2 Config: Env Overrides", false, e.what(),
                                   TestFramework::TestCategory::OTHER);
     }
@@ -677,6 +901,7 @@ void TestH2ConfigSerialization() {
         cfg.http2.initial_window_size    = 131070;
         cfg.http2.max_frame_size         = 32768;
         cfg.http2.max_header_list_size   = 16384;
+        cfg.http2.enable_push            = true;
 
         std::string json = ConfigLoader::ToJson(cfg);
 
@@ -705,6 +930,9 @@ void TestH2ConfigSerialization() {
         if (json.find("\"max_header_list_size\"") == std::string::npos) {
             pass = false; err += "missing max_header_list_size; ";
         }
+        if (json.find("\"enable_push\"") == std::string::npos) {
+            pass = false; err += "missing enable_push; ";
+        }
 
         // Verify round-trip: parse back what we serialized
         ServerConfig cfg2 = ConfigLoader::LoadFromString(json);
@@ -713,6 +941,9 @@ void TestH2ConfigSerialization() {
         }
         if (cfg2.http2.initial_window_size != 131070) {
             pass = false; err += "round-trip initial_window_size mismatch; ";
+        }
+        if (!cfg2.http2.enable_push) {
+            pass = false; err += "round-trip enable_push mismatch; ";
         }
 
         TestFramework::RecordTest("H2 Config: Serialization", pass, err,
@@ -1513,6 +1744,77 @@ void TestH2C_Middleware() {
     }
 }
 
+// Security regression: middleware REJECTION (returning false) must be
+// honored on the sync HTTP/2 path, identical to H1. HttpRouter::Dispatch
+// runs the middleware chain internally before dispatching to the
+// handler, so a middleware returning false must prevent the handler
+// from running AND must override the final status with the rejection
+// response. Without this guarantee, deployments that rely on middleware
+// for access control (auth, rate limiting, CORS preflight rejection)
+// would be bypassed.
+void TestH2C_MiddlewareRejectionHonored() {
+    std::cout << "\n[TEST] H2C: sync middleware rejection honored..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+        HttpServer server(cfg);
+
+        std::atomic<bool> handler_ran{false};
+        // Auth-like middleware: reject everything.
+        server.Use([](const HttpRequest&, HttpResponse& res) {
+            // FORBIDDEN by convention — FillDefaultRejectionResponse
+            // would default to FORBIDDEN too when no status is set by mw.
+            res.Status(HttpStatus::FORBIDDEN).Text("blocked by middleware");
+            return false;  // reject
+        });
+        // Sync H2 route — the rejection must prevent this handler.
+        server.Get("/protected",
+            [&handler_ran](const HttpRequest&, HttpResponse& res) {
+                handler_ran.store(true, std::memory_order_release);
+                res.Status(200).Text("leaked");
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            auto resp = client.Get("/protected");
+            if (resp.error) {
+                pass = false; err = "transport error";
+            }
+            // Rejection must manifest as a non-2xx response, not the 200
+            // the handler would have sent.
+            if (resp.status == 200 && resp.body.find("leaked") != std::string::npos) {
+                pass = false;
+                err += "handler's 200 body reached the client — middleware "
+                       "rejection was bypassed; ";
+            }
+            if (resp.status == 200) {
+                pass = false;
+                err += "response was 200 despite middleware returning false; ";
+            }
+            if (handler_ran.load(std::memory_order_acquire)) {
+                pass = false;
+                err += "handler was invoked even though middleware rejected; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest("H2C: sync middleware rejection honored",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2C: sync middleware rejection honored",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Three concurrent streams on one connection must all receive correct responses.
 void TestH2C_MultipleStreams() {
     std::cout << "\n[TEST] H2C: multiple concurrent streams..." << std::endl;
@@ -1946,6 +2248,2176 @@ void TestH2_MinDetectionBytes() {
 }
 
 // ============================================================
+// ============================================================
+// TEST CATEGORY 7: :authority vs host default-port normalization
+// ============================================================
+// ============================================================
+
+// Helper: spin up a minimal HTTP/2 server with GET / → 200, return port.
+// Caller owns the server lifetime via TestServerRunner.
+static void SetupH2AuthorityServer(HttpServer& server) {
+    server.Get("/", [](const HttpRequest&, HttpResponse& res) {
+        res.Status(200).Text("ok");
+    });
+}
+
+// :authority=example.com  host=example.com:80  scheme=http  → 200
+// Absent port on :authority normalized to default 80.
+void TestH2_AuthorityMatchesHostWithDefaultHttpPort() {
+    std::cout << "\n[TEST] H2 Authority: absent port == default http port (80)..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            auto resp = client.SendRequestRaw("GET", "/", "http", "example.com",
+                                             {{"host", "example.com:80"}});
+            if (resp.error || resp.rst) {
+                pass = false; err = "transport error or RST (authority mismatch rejected)";
+            } else if (resp.status != 200) {
+                pass = false;
+                err = "expected 200, got " + std::to_string(resp.status);
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: absent port == default http port (80)", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: absent port == default http port (80)", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// :authority=example.com:80  host=example.com  scheme=http  → 200
+// Absent port on host normalized to default 80 (reverse of test 1).
+void TestH2_AuthorityMatchesHostReverseOrder() {
+    std::cout << "\n[TEST] H2 Authority: explicit :80 on authority, absent on host..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            auto resp = client.SendRequestRaw("GET", "/", "http", "example.com:80",
+                                             {{"host", "example.com"}});
+            if (resp.error || resp.rst) {
+                pass = false; err = "transport error or RST (authority mismatch rejected)";
+            } else if (resp.status != 200) {
+                pass = false;
+                err = "expected 200, got " + std::to_string(resp.status);
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: explicit :80 on authority, absent on host", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: explicit :80 on authority, absent on host", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// :authority=example.com:443  host=example.com  scheme=https  → 200
+// Absent port on host normalized to default 443.
+void TestH2_AuthorityMatchesHostWithDefaultHttpsPort() {
+    std::cout << "\n[TEST] H2 Authority: absent port == default https port (443)..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            auto resp = client.SendRequestRaw("GET", "/", "https", "example.com:443",
+                                             {{"host", "example.com"}});
+            if (resp.error || resp.rst) {
+                pass = false; err = "transport error or RST (authority mismatch rejected)";
+            } else if (resp.status != 200) {
+                pass = false;
+                err = "expected 200, got " + std::to_string(resp.status);
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: absent port == default https port (443)", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: absent port == default https port (443)", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// :authority=example.com:8080  host=example.com  scheme=http  → rejected
+// Non-default explicit port on authority does not match absent (→80) host port.
+void TestH2_AuthorityMismatchExplicitNonDefaultPort() {
+    std::cout << "\n[TEST] H2 Authority: non-default port mismatch rejected..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            // :authority carries port 8080, host carries no port (→ default 80).
+            // 8080 != 80 → server must reject with RST or error status.
+            auto resp = client.SendRequestRaw("GET", "/", "http", "example.com:8080",
+                                             {{"host", "example.com"}});
+            if (!resp.rst && !resp.error && resp.status == 200) {
+                pass = false;
+                err = "expected rejection but got 200 (conflicting ports not detected)";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: non-default port mismatch rejected", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: non-default port mismatch rejected", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// :authority=example.com  host=example.com:443  scheme=http  → rejected
+// Default for http is 80, not 443. Absent :authority port → 80, host:443 → mismatch.
+void TestH2_AuthorityMismatchWrongDefault() {
+    std::cout << "\n[TEST] H2 Authority: wrong default port mismatch rejected..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            // scheme=http → default 80. :authority absent port → 80. host:443 → 443.
+            // 80 != 443 → server must reject.
+            auto resp = client.SendRequestRaw("GET", "/", "http", "example.com",
+                                             {{"host", "example.com:443"}});
+            if (!resp.rst && !resp.error && resp.status == 200) {
+                pass = false;
+                err = "expected rejection but got 200 (http default 80 vs host:443 not caught)";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: wrong default port mismatch rejected", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: wrong default port mismatch rejected", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// :authority=[::1]  host=[::1]:80  scheme=http  → 200
+// IPv6 bare address normalized with default port 80.
+void TestH2_AuthorityIPv6WithDefaultPort() {
+    std::cout << "\n[TEST] H2 Authority: IPv6 absent port == default http port..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            auto resp = client.SendRequestRaw("GET", "/", "http", "[::1]",
+                                             {{"host", "[::1]:80"}});
+            if (resp.error || resp.rst) {
+                pass = false; err = "transport error or RST (IPv6 authority mismatch)";
+            } else if (resp.status != 200) {
+                pass = false;
+                err = "expected 200, got " + std::to_string(resp.status);
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: IPv6 absent port == default http port", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: IPv6 absent port == default http port", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// :authority=Example.COM  host=example.com:80  scheme=http  → 200
+// Case-insensitive hostname match combined with default-port normalization.
+void TestH2_AuthorityCaseInsensitiveHostDefaultPort() {
+    std::cout << "\n[TEST] H2 Authority: case-insensitive hostname + default port..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            auto resp = client.SendRequestRaw("GET", "/", "http", "Example.COM",
+                                             {{"host", "example.com:80"}});
+            if (resp.error || resp.rst) {
+                pass = false; err = "transport error or RST (case/port mismatch)";
+            } else if (resp.status != 200) {
+                pass = false;
+                err = "expected 200, got " + std::to_string(resp.status);
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: case-insensitive hostname + default port", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: case-insensitive hostname + default port", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Regression: when :authority and host match via default-port
+// normalization (e.g. :authority=example.com:80 vs host=example.com,
+// scheme=http), the request_.headers["host"] value must reflect the
+// CLIENT's literal Host header — not the :authority form that was
+// stored first when :authority was parsed. This matters for proxy
+// pass-through routes (HeaderRewriter::RewriteRequest with
+// rewrite_host=false): the backend must see the Host value the client
+// actually sent, not a server-synthesized default-port form that
+// breaks backend virtual-host routing.
+void TestH2_AuthorityMatch_PreservesClientHostHeader() {
+    std::cout << "\n[TEST] H2 Authority: client Host header preserved on default-port match..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        // Echo the received Host header in the response body so the
+        // test can observe what the handler saw.
+        server.Get("/", [](const HttpRequest& req, HttpResponse& res) {
+            auto it = req.headers.find("host");
+            std::string host_val = (it != req.headers.end()) ? it->second : "<absent>";
+            res.Status(200).Text(host_val);
+        });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            // Case A: :authority has explicit default port, host does not.
+            // Proxy-pass-through would forward whichever string the
+            // handler sees. The client literally wrote "example.com";
+            // that MUST be what the handler observes, not the
+            // server-synthesized ":80" form.
+            {
+                auto resp = client.SendRequestRaw("GET", "/", "http",
+                                                  "example.com:80",
+                                                  {{"host", "example.com"}});
+                if (resp.error || resp.rst || resp.status != 200) {
+                    pass = false;
+                    err += "case A: expected 200, got " +
+                           std::to_string(resp.status) + "; ";
+                } else if (resp.body != "example.com") {
+                    pass = false;
+                    err += "case A: handler saw host='" + resp.body +
+                           "' — expected 'example.com' (client's literal Host); ";
+                }
+            }
+            // Case B: :authority absent port, host has explicit port.
+            // Reverse direction — still the client's literal wins.
+            {
+                auto resp = client.SendRequestRaw("GET", "/", "http",
+                                                  "example.com",
+                                                  {{"host", "example.com:80"}});
+                if (resp.error || resp.rst || resp.status != 200) {
+                    pass = false;
+                    err += "case B: expected 200, got " +
+                           std::to_string(resp.status) + "; ";
+                } else if (resp.body != "example.com:80") {
+                    pass = false;
+                    err += "case B: handler saw host='" + resp.body +
+                           "' — expected 'example.com:80' (client's literal Host); ";
+                }
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: client Host preserved on default-port match",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: client Host preserved on default-port match",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Regression guard: URI schemes are case-insensitive per RFC 3986
+// §3.1. A client that sends :scheme=HTTPS must get the same
+// default-port normalization as :scheme=https; prior to the fix,
+// DefaultPortForScheme() returned "" for mixed case so the host /
+// :authority equivalence (example.com vs example.com:443) was
+// rejected as a conflict. The test uses :scheme=HTTP (http-default
+// port 80) to avoid needing a TLS client in the test harness.
+void TestH2_AuthorityMixedCaseSchemeDefaultPort() {
+    std::cout << "\n[TEST] H2 Authority: mixed-case scheme default port..." << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host      = "127.0.0.1";
+        cfg.bind_port      = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled  = true;
+
+        HttpServer server(cfg);
+        SetupH2AuthorityServer(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err = "client connect failed";
+        } else {
+            // :scheme=HTTP (uppercase), :authority=example.com,
+            // host=example.com:80 — authorities are equivalent ONLY
+            // after the default-port fallback runs, which requires
+            // the mixed-case scheme to be recognized.
+            auto resp = client.SendRequestRaw("GET", "/", "HTTP", "example.com",
+                                              {{"host", "example.com:80"}});
+            if (resp.error || resp.rst) {
+                pass = false;
+                err = "transport error or RST for mixed-case :scheme=HTTP";
+            } else if (resp.status != 200) {
+                pass = false;
+                err = "expected 200, got " + std::to_string(resp.status);
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 Authority: mixed-case scheme default port", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Authority: mixed-case scheme default port", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ============================================================
+// Category 8: HTTP/2 103 Early Hints (SubmitInterimHeaders /
+// SendInterimResponse). See plan Task 4 / design doc §4.2.
+// ============================================================
+
+// Helper: small wrapper that builds a default H2-enabled config bound to
+// the given port and 2 worker threads — matches surrounding H2 tests.
+static ServerConfig MakeH2Config(uint16_t port) {
+    ServerConfig cfg;
+    cfg.bind_host      = "127.0.0.1";
+    cfg.bind_port      = port;
+    cfg.worker_threads = 2;
+    cfg.http2.enabled  = true;
+    return cfg;
+}
+
+// T4.1: Basic 103 → 200. Handler emits one 103 with a Link header, then
+// completes 200. Client must observe one interim_status == 103 with the
+// Link header, followed by a final status == 200.
+void TestH2_EarlyHints_Basic() {
+    std::cout << "\n[TEST] H2 103 Early Hints: basic..." << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync("/hints",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender send_interim,
+               HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::AsyncCompletionCallback complete) {
+                send_interim(103, {{"link", "</style.css>; rel=preload; as=style"}});
+                HttpResponse r;
+                r.Status(200).Text("done");
+                complete(std::move(r));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/hints");
+            if (resp.error)              { pass = false; err += "transport error; "; }
+            if (resp.status != 200)      { pass = false; err += "final status != 200; "; }
+            if (resp.body.find("done") == std::string::npos)
+                                          { pass = false; err += "body mismatch; "; }
+            if (resp.interim_statuses.size() != 1) {
+                pass = false;
+                err += "expected 1 interim, got " +
+                       std::to_string(resp.interim_statuses.size()) + "; ";
+            } else {
+                if (resp.interim_statuses[0] != 103) {
+                    pass = false; err += "interim status != 103; ";
+                }
+                bool has_link = false;
+                for (const auto& [k, v] : resp.interim_headers[0]) {
+                    if (k == "link") { has_link = true; break; }
+                }
+                if (!has_link) { pass = false; err += "Link header missing from 103; "; }
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest("H2 103 Early Hints: basic", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 103 Early Hints: basic", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T4.2: Two 103s before the final 200. Client must observe interim_statuses
+// == [103, 103] with each block's Link header attached.
+void TestH2_EarlyHints_Multiple() {
+    std::cout << "\n[TEST] H2 103 Early Hints: multiple before final..." << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync("/multi",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender send_interim,
+               HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::AsyncCompletionCallback complete) {
+                send_interim(103, {{"link", "</a.css>; rel=preload"}});
+                send_interim(103, {{"link", "</b.js>; rel=preload"}});
+                HttpResponse r;
+                r.Status(200).Text("done");
+                complete(std::move(r));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/multi");
+            if (resp.error)         { pass = false; err += "transport error; "; }
+            if (resp.status != 200) { pass = false; err += "final status != 200; "; }
+            if (resp.interim_statuses.size() != 2) {
+                pass = false;
+                err += "expected 2 interims, got " +
+                       std::to_string(resp.interim_statuses.size()) + "; ";
+            } else {
+                if (resp.interim_statuses[0] != 103 ||
+                    resp.interim_statuses[1] != 103) {
+                    pass = false; err += "interim statuses must both be 103; ";
+                }
+                if (resp.interim_headers.size() != 2 ||
+                    resp.interim_headers[0].empty() ||
+                    resp.interim_headers[1].empty()) {
+                    pass = false; err += "interim header blocks empty; ";
+                }
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest("H2 103 Early Hints: multiple before final",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 103 Early Hints: multiple before final",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T4.3: 103 attempted from a background thread AFTER the handler completed
+// the final 200. The H2 SendInterimResponse contract is dispatcher-thread-
+// only AND drops post-final calls — both guards together must ensure the
+// late 103 never reaches the wire. Mirrors H1's TestH1_EarlyHints_DroppedAfterFinal.
+void TestH2_EarlyHints_DroppedAfterFinal() {
+    std::cout << "\n[TEST] H2 103 Early Hints: dropped after final..." << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+
+        auto p_sender = std::make_shared<std::promise<HttpRouter::InterimResponseSender>>();
+        auto f_sender = p_sender->get_future().share();
+
+        server.GetAsync("/postfinal",
+            [p_sender](
+                const HttpRequest&,
+                HttpRouter::InterimResponseSender send_interim,
+                HttpRouter::ResourcePusher        /*push_resource*/,
+                HttpRouter::AsyncCompletionCallback complete) {
+                HttpResponse r;
+                r.Status(200).Text("done");
+                complete(std::move(r));
+                p_sender->set_value(send_interim);
+            });
+
+        std::thread watcher([f_sender]() mutable {
+            auto send_interim = f_sender.get();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            send_interim(103, {{"link", "</late.css>; rel=preload"}});
+        });
+        struct JoinGuard {
+            std::thread& t;
+            ~JoinGuard() { if (t.joinable()) t.join(); }
+        };
+        JoinGuard watcher_guard{watcher};
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/postfinal");
+            if (resp.error)         { pass = false; err += "transport error; "; }
+            if (resp.status != 200) { pass = false; err += "final status != 200; "; }
+            // The late 103 must never appear on the wire. The watcher's
+            // delayed call may still be in flight at this point, so wait
+            // a little to let any errant frame arrive (it won't).
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!resp.interim_statuses.empty()) {
+                pass = false;
+                err += "post-final 103 must be dropped, got " +
+                       std::to_string(resp.interim_statuses.size()) +
+                       " interim(s); ";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest("H2 103 Early Hints: dropped after final",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 103 Early Hints: dropped after final",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T4.4: Invalid status codes are rejected by SubmitInterimHeaders.
+// 50 / 200 / 101 / 100 must all be dropped (51-99 below 1xx; 200 >= 200 final;
+// 101 reserved for upgrade and invalid in H2; 100 framework-managed only).
+// Only the final 200 from complete() reaches the client; no interim arrives.
+void TestH2_EarlyHints_InvalidStatusDropped() {
+    std::cout << "\n[TEST] H2 103 Early Hints: invalid status dropped..." << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync("/badstatus",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender send_interim,
+               HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::AsyncCompletionCallback complete) {
+                send_interim(50,  {{"link", "</a>; rel=preload"}});
+                send_interim(200, {{"link", "</b>; rel=preload"}});
+                send_interim(101, {{"link", "</c>; rel=preload"}});
+                send_interim(100, {{"link", "</d>; rel=preload"}});
+                HttpResponse r;
+                r.Status(200).Text("done");
+                complete(std::move(r));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/badstatus");
+            if (resp.error)         { pass = false; err += "transport error; "; }
+            if (resp.status != 200) { pass = false; err += "final status != 200; "; }
+            if (!resp.interim_statuses.empty()) {
+                pass = false;
+                err += "expected 0 interims, got " +
+                       std::to_string(resp.interim_statuses.size()) + "; ";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest("H2 103 Early Hints: invalid status dropped",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 103 Early Hints: invalid status dropped",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T4.5: Calling SendInterimResponse on a stream that the peer has already
+// reset must not crash. We can't easily cancel a stream from the test
+// client AFTER opening it, so we approximate by tearing down the client
+// connection mid-handler: the watcher disconnects the test client (which
+// closes the H2 transport), then fires the late 103. With session_-> being
+// torn down on the server side, SendInterimResponse must observe missing
+// stream / closed session and return false without crashing.
+void TestH2_EarlyHints_StreamClosedByPeerSafe() {
+    std::cout << "\n[TEST] H2 103 Early Hints: stream closed by peer is safe..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+
+        auto p_sender = std::make_shared<std::promise<HttpRouter::InterimResponseSender>>();
+        auto f_sender = p_sender->get_future().share();
+
+        // Handler: defer indefinitely and hand the sender to the watcher.
+        // We never call complete() in this test — the response is abandoned
+        // when the transport tears down.
+        server.GetAsync("/peerclose",
+            [p_sender](
+                const HttpRequest&,
+                HttpRouter::InterimResponseSender send_interim,
+                HttpRouter::ResourcePusher        /*push_resource*/,
+                HttpRouter::AsyncCompletionCallback /*complete*/) {
+                p_sender->set_value(send_interim);
+            });
+
+        std::thread watcher([f_sender]() mutable {
+            auto send_interim = f_sender.get();
+            // Give the client time to disconnect (test main thread does so
+            // immediately after issuing the request below). The off-thread
+            // guard alone catches this on the H2 side, but we also want to
+            // exercise the closed-session path defensively.
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            // Must not crash regardless of stream/session state.
+            send_interim(103, {{"link", "</late.css>; rel=preload"}});
+        });
+        struct JoinGuard {
+            std::thread& t;
+            ~JoinGuard() { if (t.joinable()) t.join(); }
+        };
+        JoinGuard watcher_guard{watcher};
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            // Fire-and-forget: send the request, then disconnect immediately.
+            // Do NOT wait for a response (handler never completes).
+            // We rely on the watcher firing the 103 after the client is gone.
+            // Reuse Get() with a very short response wait by closing the
+            // socket mid-poll: just disconnect after sending the headers.
+            std::vector<std::pair<std::string, std::string>> nh;
+            std::vector<std::pair<std::string, std::string>> hp;
+            hp.emplace_back(":method",    "GET");
+            hp.emplace_back(":path",      "/peerclose");
+            hp.emplace_back(":scheme",    "http");
+            hp.emplace_back(":authority", "localhost");
+            std::vector<nghttp2_nv> nva;
+            nva.reserve(hp.size());
+            for (const auto& p : hp) {
+                nva.push_back({
+                    const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(p.first.c_str())),
+                    const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(p.second.c_str())),
+                    p.first.size(), p.second.size(),
+                    NGHTTP2_NV_FLAG_NONE
+                });
+            }
+            // Submit + flush headers via the public API path is not exposed;
+            // simplest portable path: send a normal request with a short wait,
+            // accept a transport timeout (resp.error = true), then disconnect.
+            // The test passes if the server didn't crash by the time we Stop.
+            (void)nh; (void)nva;
+            auto resp = client.Get("/peerclose");
+            // resp.error may be true (timeout) — that's expected.
+            (void)resp;
+        }
+        client.Disconnect();
+
+        // Give the watcher time to fire its late send_interim.
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+        // Reaching here without a server crash is the assertion.
+        TestFramework::RecordTest("H2 103 Early Hints: stream closed by peer is safe",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 103 Early Hints: stream closed by peer is safe",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T4.6: 100 Continue followed by 103 Early Hints, then final 200.
+// The server emits 100 Continue automatically when the client includes
+// Expect: 100-continue; the handler then emits a 103 and completes 200.
+// Client must observe interim_statuses == [100, 103] in order, then 200.
+void TestH2_EarlyHints_100ContinueThen103() {
+    std::cout << "\n[TEST] H2 103 Early Hints: 100-continue then 103 then 200..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync("/upload",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender send_interim,
+               HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::AsyncCompletionCallback complete) {
+                send_interim(103, {{"link", "</style.css>; rel=preload"}});
+                HttpResponse r;
+                r.Status(200).Text("uploaded");
+                complete(std::move(r));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/upload", {{"expect", "100-continue"}});
+            if (resp.error)         { pass = false; err += "transport error; "; }
+            if (resp.status != 200) { pass = false; err += "final status != 200; "; }
+            if (resp.interim_statuses.size() != 2) {
+                pass = false;
+                err += "expected 2 interims (100, 103), got " +
+                       std::to_string(resp.interim_statuses.size()) + "; ";
+            } else if (resp.interim_statuses[0] != 100 ||
+                       resp.interim_statuses[1] != 103) {
+                pass = false;
+                err += "expected order 100,103 — got " +
+                       std::to_string(resp.interim_statuses[0]) + "," +
+                       std::to_string(resp.interim_statuses[1]) + "; ";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: 100-continue then 103 then 200",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: 100-continue then 103 then 200",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Off-dispatcher-thread send_interim now auto-hops to the dispatcher
+// so async handlers that resume on a worker thread (e.g. after an
+// upstream completion) can still emit 103 Early Hints without a
+// manual RunOnDispatcher. The handler spawns a worker thread that
+// calls send_interim BEFORE complete(); the 103 must reach the wire
+// and arrive BEFORE the final 200.
+void TestH2_EarlyHints_OffDispatcherThread() {
+    std::cout << "\n[TEST] H2 103 Early Hints: off-dispatcher-thread hops..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync("/offthread",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender send_interim,
+               HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::AsyncCompletionCallback complete) {
+                // Worker-thread send_interim: must auto-hop and
+                // emit BEFORE the handler calls complete().
+                std::thread t([send_interim]() {
+                    send_interim(103, {{"link", "</style.css>; rel=preload"}});
+                });
+                t.join();
+                HttpResponse r;
+                r.Status(200).Text("done");
+                complete(std::move(r));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/offthread");
+            if (resp.error)         { pass = false; err += "transport error; "; }
+            if (resp.status != 200) { pass = false; err += "final status != 200; "; }
+            // The worker-thread interim is expected to land: we joined
+            // the thread before calling complete(), so the hopped
+            // send_interim lambda is enqueued before the final response
+            // submission — the 103 must precede the 200.
+            if (resp.interim_statuses.size() != 1) {
+                pass = false;
+                err += "expected 1 interim after off-thread hop, got " +
+                       std::to_string(resp.interim_statuses.size()) + "; ";
+            } else if (resp.interim_statuses[0] != 103) {
+                pass = false;
+                err += "interim status != 103; ";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: off-dispatcher-thread hops to dispatcher",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: off-dispatcher-thread hops to dispatcher",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ============================================================
+// Category 9: SETTINGS_ENABLE_PUSH wire-format regression tests
+// ============================================================
+
+// Helper: connect a raw TCP socket, send the H2 client preface + an
+// empty client SETTINGS, and read the server's preface SETTINGS frame.
+// Returns the server SETTINGS payload bytes on success, empty on failure.
+// Does NOT use nghttp2 — we are intentionally validating wire bytes here
+// because the SETTINGS_ENABLE_PUSH semantics are direction-asymmetric and
+// must be observable at the byte level.
+static std::vector<uint8_t> ReadServerSettingsPayload(int port) {
+    std::vector<uint8_t> empty;
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return empty;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(static_cast<uint16_t>(port));
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(fd); return empty;
+    }
+    timeval tv{};
+    tv.tv_sec = IO_TIMEOUT_MS / 1000;
+    tv.tv_usec = (IO_TIMEOUT_MS % 1000) * 1000;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    // Client preface (RFC 9113 §3.4) followed by an empty client SETTINGS
+    // frame so the server completes its preface exchange.
+    static constexpr char kPreface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    static constexpr size_t kPrefaceLen = 24;
+    static constexpr uint8_t kEmptySettings[9] = {
+        0, 0, 0,        // length = 0
+        0x04,           // type = SETTINGS
+        0x00,           // flags = 0 (no ACK)
+        0, 0, 0, 0      // stream_id = 0
+    };
+    if (::send(fd, kPreface, kPrefaceLen, 0) != static_cast<ssize_t>(kPrefaceLen)) {
+        ::close(fd); return empty;
+    }
+    if (::send(fd, kEmptySettings, sizeof(kEmptySettings), 0) !=
+        static_cast<ssize_t>(sizeof(kEmptySettings))) {
+        ::close(fd); return empty;
+    }
+
+    // Read the server's frame header (9 bytes). Loop because recv may return
+    // partial data even on a hot loopback.
+    auto recv_exact = [&](uint8_t* buf, size_t need) -> bool {
+        size_t got = 0;
+        while (got < need) {
+            ssize_t n = ::recv(fd, buf + got, need - got, 0);
+            if (n <= 0) return false;
+            got += static_cast<size_t>(n);
+        }
+        return true;
+    };
+    uint8_t header[9];
+    if (!recv_exact(header, 9)) { ::close(fd); return empty; }
+
+    uint32_t length = (static_cast<uint32_t>(header[0]) << 16) |
+                      (static_cast<uint32_t>(header[1]) << 8)  |
+                      static_cast<uint32_t>(header[2]);
+    uint8_t  type   = header[3];
+    uint8_t  flags  = header[4];
+    if (type != 0x04 || (flags & 0x01) != 0) {
+        // Not a non-ACK SETTINGS frame — bail.
+        ::close(fd); return empty;
+    }
+    std::vector<uint8_t> payload(length, 0);
+    if (length > 0 && !recv_exact(payload.data(), length)) {
+        ::close(fd); return empty;
+    }
+    ::close(fd);
+    return payload;
+}
+
+// Walk a SETTINGS payload and return the value of the first matching entry,
+// or std::nullopt if not present. RFC 9113 §6.5: each entry is 6 bytes —
+// 16-bit identifier (big-endian) + 32-bit value (big-endian).
+static bool FindSettingsEntry(const std::vector<uint8_t>& payload,
+                               uint16_t id, uint32_t& out_value) {
+    for (size_t i = 0; i + 6 <= payload.size(); i += 6) {
+        uint16_t entry_id =
+            (static_cast<uint16_t>(payload[i]) << 8) | payload[i + 1];
+        if (entry_id == id) {
+            out_value = (static_cast<uint32_t>(payload[i + 2]) << 24) |
+                        (static_cast<uint32_t>(payload[i + 3]) << 16) |
+                        (static_cast<uint32_t>(payload[i + 4]) << 8)  |
+                        static_cast<uint32_t>(payload[i + 5]);
+            return true;
+        }
+    }
+    return false;
+}
+
+// SETTINGS_ENABLE_PUSH wire format with push DISABLED (default):
+// the server preface MUST contain {ENABLE_PUSH (0x02), 0}.
+void TestH2_SettingsEnablePushWire_Disabled() {
+    std::cout << "\n[TEST] H2 SETTINGS: ENABLE_PUSH=0 advertised when disabled..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = false;  // explicit, default is also false
+        HttpServer server(cfg);
+        server.Get("/", [](const HttpRequest&, HttpResponse& r) { r.Text("ok"); });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        auto payload = ReadServerSettingsPayload(port);
+        bool pass = true;
+        std::string err;
+        if (payload.empty()) {
+            pass = false; err += "no SETTINGS payload received; ";
+        } else {
+            uint32_t value = 0;
+            if (!FindSettingsEntry(payload, 0x0002, value)) {
+                pass = false;
+                err += "ENABLE_PUSH (0x02) entry MISSING when push disabled; ";
+            } else if (value != 0) {
+                pass = false;
+                err += "ENABLE_PUSH value must be 0 when push disabled, got " +
+                       std::to_string(value) + "; ";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "H2 SETTINGS: ENABLE_PUSH=0 advertised when disabled",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 SETTINGS: ENABLE_PUSH=0 advertised when disabled",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// SETTINGS_ENABLE_PUSH wire format with push ENABLED:
+// the entry MUST be ABSENT (a server MUST NOT write a value of 1 per
+// RFC 9113 §7). nghttp2's local default of 1 then applies internally.
+void TestH2_SettingsEnablePushWire_Enabled() {
+    std::cout << "\n[TEST] H2 SETTINGS: ENABLE_PUSH entry omitted when enabled..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        server.Get("/", [](const HttpRequest&, HttpResponse& r) { r.Text("ok"); });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        auto payload = ReadServerSettingsPayload(port);
+        bool pass = true;
+        std::string err;
+        if (payload.empty()) {
+            pass = false; err += "no SETTINGS payload received; ";
+        } else {
+            uint32_t value = 0;
+            if (FindSettingsEntry(payload, 0x0002, value)) {
+                pass = false;
+                err += "ENABLE_PUSH must be ABSENT when push enabled, got value " +
+                       std::to_string(value) + "; ";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "H2 SETTINGS: ENABLE_PUSH entry omitted when enabled",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 SETTINGS: ENABLE_PUSH entry omitted when enabled",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ============================================================
+// Category 10: HTTP/2 server push tests
+// ============================================================
+//
+// Helper: handler that pushes a single resource then completes 200.
+// `push_method` lets a few tests vary the synthetic method (GET vs HEAD).
+//
+// Each test runs a server with explicit http2.enable_push (default off).
+// Pushed responses arrive via Http2TestClient::Response::pushed.
+//
+// Some scenarios from the plan are exercised indirectly via the
+// observable wire effect (e.g. ParentStreamClosed and GoawaySent both
+// reduce to "no pushed stream arrives"); a few advanced scenarios that
+// require deep server-internal access (counter accounting across the
+// lifecycle, drain-ordering coordination, nghttp2 failure injection) are
+// validated indirectly or marked as future work — see comments inline.
+
+// Default-pushed asset: tiny CSS body so the test asserts exact body bytes.
+static constexpr const char* kPushedBody = "body{color:red}";
+
+static void RegisterPushHandlerOnRoot(HttpServer& server,
+                                       const std::string& push_method = "GET",
+                                       const std::string& push_path   = "/style.css",
+                                       const std::string& push_authority = "localhost",
+                                       const std::string& push_scheme = "http") {
+    server.GetAsync("/",
+        [=](const HttpRequest&,
+            HttpRouter::InterimResponseSender /*send_interim*/,
+            HttpRouter::ResourcePusher push_resource,
+            HttpRouter::AsyncCompletionCallback complete) {
+            HttpResponse pushed;
+            pushed.Status(200).Body(kPushedBody, "text/css");
+            push_resource(push_method, push_scheme, push_authority,
+                          push_path, pushed);
+            HttpResponse main;
+            main.Status(200).Body("<html/>", "text/html");
+            complete(std::move(main));
+        });
+}
+
+// T9.1: Basic push — handler enabled, peer accepts. Client must observe
+// the parent 200 and exactly one promised stream with the pushed body.
+void TestH2_Push_Basic() {
+    std::cout << "\n[TEST] H2 Push: basic..." << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        RegisterPushHandlerOnRoot(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.error)         { pass = false; err += "transport error; "; }
+            if (resp.status != 200) { pass = false; err += "parent status != 200; "; }
+            if (resp.pushed.size() != 1) {
+                pass = false;
+                err += "expected 1 pushed stream, got " +
+                       std::to_string(resp.pushed.size()) + "; ";
+            } else {
+                const auto& p = resp.pushed[0];
+                if (p.method   != "GET")            { pass = false; err += "push method != GET; "; }
+                if (p.path     != "/style.css")     { pass = false; err += "push path mismatch; "; }
+                if (p.scheme   != "http")           { pass = false; err += "push scheme mismatch; "; }
+                if (p.authority!= "localhost")      { pass = false; err += "push authority mismatch; "; }
+                if (p.status   != 200)              { pass = false; err += "push status != 200; "; }
+                if (p.body     != kPushedBody)      { pass = false; err += "push body mismatch; "; }
+                if (p.rst)                          { pass = false; err += "push was RST'd; "; }
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest("H2 Push: basic", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Push: basic", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.2: Peer refused — client advertises SETTINGS_ENABLE_PUSH=0 in its
+// initial SETTINGS. Server's PushEnabled() returns false; no pushed
+// stream arrives even though server config has enable_push=true.
+void TestH2_Push_PeerRefused() {
+    std::cout << "\n[TEST] H2 Push: peer refused via client SETTINGS..." << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        RegisterPushHandlerOnRoot(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        client.SetRefusePushes(true);
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.status != 200) { pass = false; err += "parent status != 200; "; }
+            if (!resp.pushed.empty()) {
+                pass = false;
+                err += "expected 0 pushed (peer refused), got " +
+                       std::to_string(resp.pushed.size()) + "; ";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest("H2 Push: peer refused via client SETTINGS",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Push: peer refused via client SETTINGS",
+                                  false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.3: Config disabled — http2.enable_push=false. Server's
+// PushEnabled() returns false locally; no pushed stream arrives, and
+// the SETTINGS preface (verified separately) advertises ENABLE_PUSH=0.
+void TestH2_Push_ConfigDisabled() {
+    std::cout << "\n[TEST] H2 Push: disabled by config..." << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = false;  // explicit
+        HttpServer server(cfg);
+        RegisterPushHandlerOnRoot(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.status != 200) { pass = false; err += "parent status != 200; "; }
+            if (!resp.pushed.empty()) {
+                pass = false;
+                err += "expected 0 pushed (config disabled), got " +
+                       std::to_string(resp.pushed.size()) + "; ";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest("H2 Push: disabled by config", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Push: disabled by config", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.4: Invalid method (POST) — Push restricts to GET/HEAD. The push
+// returns -1 silently and the parent response is unaffected.
+void TestH2_Push_InvalidMethodPOST() {
+    std::cout << "\n[TEST] H2 Push: invalid method POST rejected..." << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        RegisterPushHandlerOnRoot(server, "POST");
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.status != 200) { pass = false; err += "parent status != 200; "; }
+            if (!resp.pushed.empty()) {
+                pass = false;
+                err += "POST push must be rejected; got " +
+                       std::to_string(resp.pushed.size()) + " pushed; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest("H2 Push: invalid method POST rejected",
+                                  pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Push: invalid method POST rejected",
+                                  false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.5: Empty path — must be rejected.
+void TestH2_Push_EmptyPath() {
+    std::cout << "\n[TEST] H2 Push: empty path rejected..." << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        RegisterPushHandlerOnRoot(server, "GET", "");
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.status != 200) { pass = false; err += "parent status != 200; "; }
+            if (!resp.pushed.empty()) {
+                pass = false;
+                err += "empty path must be rejected; got " +
+                       std::to_string(resp.pushed.size()) + " pushed; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest("H2 Push: empty path rejected", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Push: empty path rejected", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.6: Empty authority — must be rejected.
+void TestH2_Push_EmptyAuthority() {
+    std::cout << "\n[TEST] H2 Push: empty authority rejected..." << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        RegisterPushHandlerOnRoot(server, "GET", "/style.css", "");
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.status != 200) { pass = false; err += "parent status != 200; "; }
+            if (!resp.pushed.empty()) {
+                pass = false;
+                err += "empty authority must be rejected; got " +
+                       std::to_string(resp.pushed.size()) + " pushed; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest("H2 Push: empty authority rejected", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Push: empty authority rejected", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.7: Invalid scheme (ftp) — must be rejected.
+void TestH2_Push_InvalidSchemeFtp() {
+    std::cout << "\n[TEST] H2 Push: invalid scheme ftp rejected..." << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        RegisterPushHandlerOnRoot(server, "GET", "/style.css", "localhost", "ftp");
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.status != 200) { pass = false; err += "parent status != 200; "; }
+            if (!resp.pushed.empty()) {
+                pass = false;
+                err += "ftp scheme must be rejected; got " +
+                       std::to_string(resp.pushed.size()) + " pushed; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest("H2 Push: invalid scheme ftp rejected", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Push: invalid scheme ftp rejected", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.8: HEAD push — body must NOT appear on the promised stream
+// (RFC 9110 §9.3.2: HEAD response carries headers as if for GET but
+// no body). Mirrors SubmitResponse's HEAD handling for client-initiated
+// streams and proves it works for pushed streams too.
+void TestH2_Push_HeadResponseBodySuppressed() {
+    std::cout << "\n[TEST] H2 Push: HEAD response body suppressed..." << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        RegisterPushHandlerOnRoot(server, "HEAD");
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.status != 200) { pass = false; err += "parent status != 200; "; }
+            if (resp.pushed.size() != 1) {
+                pass = false;
+                err += "expected 1 pushed; got " +
+                       std::to_string(resp.pushed.size()) + "; ";
+            } else {
+                const auto& p = resp.pushed[0];
+                if (p.method != "HEAD") { pass = false; err += "push method != HEAD; "; }
+                if (p.status != 200)    { pass = false; err += "push status != 200; "; }
+                if (!p.body.empty()) {
+                    pass = false;
+                    err += "HEAD push must have empty body, got " +
+                           std::to_string(p.body.size()) + " bytes; ";
+                }
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest("H2 Push: HEAD response body suppressed", pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Push: HEAD response body suppressed", false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.9: Pushed streams must NOT increment the public total_requests
+// counter — that counter is for client-initiated requests only.
+void TestH2_Push_NotCountedInTotalRequests() {
+    std::cout << "\n[TEST] H2 Push: not counted in total_requests..." << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        RegisterPushHandlerOnRoot(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        int64_t before = server.GetStats().total_requests;
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.pushed.size() != 1) {
+                pass = false;
+                err += "push setup: expected 1 pushed, got " +
+                       std::to_string(resp.pushed.size()) + "; ";
+            }
+        }
+        client.Disconnect();
+        // Settle: stats are async-relaxed, so let the server propagate.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        int64_t after = server.GetStats().total_requests;
+        if (after - before != 1) {
+            pass = false;
+            err += "total_requests delta should be 1 (parent only), got " +
+                   std::to_string(after - before) + "; ";
+        }
+        TestFramework::RecordTest("H2 Push: not counted in total_requests",
+                                  pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Push: not counted in total_requests",
+                                  false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.10: Sync handler can issue a push via HTTP2_PUSH_NAMESPACE::PushResource(), which
+// reads HttpServer::current_sync_pusher_ installed around router_.Dispatch.
+void TestH2_Push_SyncHandlerViaThreadLocal() {
+    std::cout << "\n[TEST] H2 Push: sync handler via HTTP2_PUSH_NAMESPACE::PushResource..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        // Register a SYNC handler — only the H2 sync dispatch path
+        // installs the thread-local pusher; the sync handler invokes
+        // HTTP2_PUSH_NAMESPACE::PushResource() directly.
+        server.Get("/", [](const HttpRequest&, HttpResponse& res) {
+            HttpResponse pushed;
+            pushed.Status(200).Body(kPushedBody, "text/css");
+            int32_t promised = HTTP2_PUSH_NAMESPACE::PushResource(
+                "GET", "http", "localhost", "/style.css", pushed);
+            (void)promised;  // best-effort; the wire effect is the assertion
+            res.Status(200).Body("<html/>", "text/html");
+        });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.status != 200) { pass = false; err += "parent status != 200; "; }
+            if (resp.pushed.size() != 1) {
+                pass = false;
+                err += "sync handler push: expected 1 pushed, got " +
+                       std::to_string(resp.pushed.size()) + "; ";
+            } else if (resp.pushed[0].body != kPushedBody) {
+                pass = false; err += "pushed body mismatch; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 Push: sync handler via HTTP2_PUSH_NAMESPACE::PushResource", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Push: sync handler via HTTP2_PUSH_NAMESPACE::PushResource", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.11: HTTP/1 connection — the framework does not install a pusher
+// slot for H1 sync dispatch (push is HTTP/2 only). HTTP2_PUSH_NAMESPACE::PushResource
+// returns -1 with a debug log; no pushed stream is fabricated.
+void TestH2_Push_OnHttp1Connection() {
+    std::cout << "\n[TEST] H2 Push: HTTP2_PUSH_NAMESPACE::PushResource on H1 returns -1..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        // Capture the return value from a sync handler invoked over H1.
+        auto last_promised = std::make_shared<std::atomic<int32_t>>(0);
+        server.Get("/", [last_promised](const HttpRequest&, HttpResponse& res) {
+            HttpResponse pushed;
+            pushed.Status(200).Body(kPushedBody, "text/css");
+            int32_t r = HTTP2_PUSH_NAMESPACE::PushResource(
+                "GET", "http", "localhost", "/style.css", pushed);
+            last_promised->store(r, std::memory_order_relaxed);
+            res.Status(200).Body("ok", "text/plain");
+        });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        // H1 client — raw socket is overkill; use a TCP fd + minimal
+        // request. This intentionally does NOT use Http2TestClient.
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        bool pass = true; std::string err;
+        if (fd < 0) { pass = false; err += "socket(); "; }
+        else {
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_port   = htons(static_cast<uint16_t>(port));
+            a.sin_addr.s_addr = inet_addr("127.0.0.1");
+            if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) < 0) {
+                pass = false; err += "connect; ";
+            } else {
+                static constexpr char kReq[] =
+                    "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+                ::send(fd, kReq, sizeof(kReq) - 1, 0);
+                char buf[1024];
+                std::string resp;
+                while (true) {
+                    ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+                    if (n <= 0) break;
+                    resp.append(buf, n);
+                }
+                if (resp.find("HTTP/1.1 200") == std::string::npos) {
+                    pass = false; err += "missing 200; ";
+                }
+            }
+            ::close(fd);
+        }
+        if (last_promised->load() != -1) {
+            pass = false;
+            err += "HTTP2_PUSH_NAMESPACE::PushResource on H1 must return -1, got " +
+                   std::to_string(last_promised->load()) + "; ";
+        }
+        TestFramework::RecordTest(
+            "H2 Push: HTTP2_PUSH_NAMESPACE::PushResource on H1 returns -1", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Push: HTTP2_PUSH_NAMESPACE::PushResource on H1 returns -1", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.12: Async handler that runs synchronously inside the dispatcher
+// (no thread hop) can push via the bound ResourcePusher closure.
+// The "AsyncViaRunOnDispatcher" name in the plan covers callers that
+// hop a worker thread back to the dispatcher; for our test harness the
+// simpler in-dispatcher async path exercises the same code paths
+// (ResourcePusher closure → Http2ConnectionHandler::PushResource →
+// Http2Session::SubmitPushPromise).
+void TestH2_Push_AsyncViaRunOnDispatcher() {
+    std::cout << "\n[TEST] H2 Push: async handler push (in-dispatcher)..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        // Async handler that pushes inside the dispatcher invocation
+        // (no thread hop) — exercises the bound ResourcePusher closure.
+        RegisterPushHandlerOnRoot(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.pushed.size() != 1) {
+                pass = false;
+                err += "expected 1 pushed, got " +
+                       std::to_string(resp.pushed.size()) + "; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 Push: async handler push (in-dispatcher)", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Push: async handler push (in-dispatcher)", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.13c: H2 push_resource called from a worker thread must auto-hop
+// to the dispatcher and still land a PUSH_PROMISE + response. Before
+// auto-hop, off-thread callers were silently dropped with a warn log,
+// which made the API unusable for real async handlers that resume on
+// a worker thread after an upstream completion.
+void TestH2_Push_OffDispatcherThreadHops() {
+    std::cout << "\n[TEST] H2 Push: off-dispatcher-thread hops to dispatcher..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        server.GetAsync("/",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher push_resource,
+               HttpRouter::AsyncCompletionCallback complete) {
+                // Worker thread issues the push. Must auto-hop and
+                // the pushed stream must appear alongside the parent.
+                std::thread t([push_resource]() {
+                    HttpResponse pushed;
+                    pushed.Status(200).Body(kPushedBody, "text/css");
+                    push_resource("GET", "http", "localhost",
+                                  "/style.css", pushed);
+                });
+                t.join();
+                HttpResponse main;
+                main.Status(200).Body("<html/>", "text/html");
+                complete(std::move(main));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            // Regression guard: a future break where off-thread push
+            // corrupts the main response must fail this test, not
+            // silently pass on the pushed-stream assertion alone.
+            if (resp.status != 200) {
+                pass = false;
+                err += "parent status != 200 (got " +
+                       std::to_string(resp.status) + "); ";
+            }
+            if (resp.pushed.size() != 1) {
+                pass = false;
+                err += "expected 1 pushed stream after off-thread push, got " +
+                       std::to_string(resp.pushed.size()) + "; ";
+            } else if (resp.pushed[0].body != kPushedBody) {
+                pass = false; err += "pushed body mismatch; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 Push: off-dispatcher-thread hops to dispatcher", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Push: off-dispatcher-thread hops to dispatcher", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Regression guard: URI schemes are case-insensitive per RFC 3986.
+// push_resource("GET", "HTTP", ...) must succeed, and the emitted
+// PUSH_PROMISE must carry the canonical lowercase :scheme value.
+// Before the fix, SubmitPushPromise rejected non-lowercase schemes
+// with -1, making the API fragile against callers that forward a
+// scheme string from config/URL parsing without normalizing.
+void TestH2_Push_MixedCaseSchemeAccepted() {
+    std::cout << "\n[TEST] H2 Push: mixed-case scheme accepted..." << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        // Register a handler that pushes with mixed-case scheme.
+        server.GetAsync("/",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher push_resource,
+               HttpRouter::AsyncCompletionCallback complete) {
+                HttpResponse pushed;
+                pushed.Status(200).Body(kPushedBody, "text/css");
+                push_resource("GET", "HTTP", "localhost",
+                              "/style.css", pushed);
+                HttpResponse main;
+                main.Status(200).Body("<html/>", "text/html");
+                complete(std::move(main));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.status != 200) {
+                pass = false;
+                err += "parent status != 200 (got " +
+                       std::to_string(resp.status) + "); ";
+            }
+            if (resp.pushed.size() != 1) {
+                pass = false;
+                err += "expected 1 pushed stream for mixed-case scheme, got " +
+                       std::to_string(resp.pushed.size()) + "; ";
+            } else {
+                // Wire emission must normalize to lowercase per our
+                // canonical-form guarantee.
+                if (resp.pushed[0].scheme != "http") {
+                    pass = false;
+                    err += "PUSH_PROMISE :scheme emitted as '" +
+                           resp.pushed[0].scheme + "' — expected lowercase 'http'; ";
+                }
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 Push: mixed-case scheme accepted + normalized", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Push: mixed-case scheme accepted + normalized", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Regression: H2 async handler that populates async_cancel_slot then
+// throws must have the slot fired by the framework's catch block.
+// Same scenario as the H1 test (TestH1_Async_HandlerThrowFiresCancelSlot)
+// — without firing the cancel slot in the catch path, custom async
+// handlers (proxy, upstream, etc.) leak their in-flight work even
+// though the outer catch synthesizes a 500 onto the stream.
+void TestH2_Async_HandlerThrowFiresCancelSlot() {
+    std::cout << "\n[TEST] H2 async: handler throw fires cancel slot..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        auto cancel_fired = std::make_shared<std::atomic<bool>>(false);
+        server.GetAsync("/throws",
+            [cancel_fired](
+                const HttpRequest& req,
+                HttpRouter::InterimResponseSender /*send_interim*/,
+                HttpRouter::ResourcePusher        /*push_resource*/,
+                HttpRouter::AsyncCompletionCallback /*complete*/) {
+                if (req.async_cancel_slot) {
+                    *req.async_cancel_slot = [cancel_fired]() {
+                        cancel_fired->store(true,
+                                            std::memory_order_release);
+                    };
+                }
+                throw std::runtime_error("h2 handler synthetic failure");
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/throws");
+            // Outer catch should send 500 on the stream (or RST it).
+            // Either way, the cancel slot MUST have been fired.
+            (void)resp;
+        }
+        client.Disconnect();
+        // Allow the dispatcher to settle the catch path.
+        auto deadline = std::chrono::steady_clock::now() +
+                         std::chrono::seconds(2);
+        while (!cancel_fired->load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!cancel_fired->load(std::memory_order_acquire)) {
+            pass = false;
+            err += "cancel_slot was NOT fired — async background work "
+                   "would leak on H2 handler throw; ";
+        }
+        TestFramework::RecordTest(
+            "H2 async: handler throw fires cancel slot", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 async: handler throw fires cancel slot", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Regression for PR #18 round-5 comment 2: H2 async handler that
+// calls complete() and then send_interim() inline on the dispatcher
+// thread (before returning from the handler body) must NOT land the
+// 103 on the wire. The per-stream FinalResponseSubmitted flag won't
+// be set yet (CompleteAsyncResponse runs via RunOnDispatcher later),
+// so without the `completed` capture in the send_interim closure,
+// the 103 would submit after complete() was logically done.
+void TestH2_EarlyHints_DroppedAfterCompleteSameThread() {
+    std::cout << "\n[TEST] H2 103 Early Hints: dropped after complete() same-thread..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync("/samecomplete",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender send_interim,
+               HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::AsyncCompletionCallback complete) {
+                // Inline on dispatcher: complete() first, then
+                // send_interim. The completed guard in the send_interim
+                // closure must drop the 103.
+                HttpResponse r;
+                r.Status(200).Text("done");
+                complete(std::move(r));
+                send_interim(103, {{"link", "</late.css>; rel=preload"}});
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/samecomplete");
+            if (resp.status != 200) {
+                pass = false; err += "final status != 200; ";
+            }
+            if (!resp.interim_statuses.empty()) {
+                pass = false;
+                err += "post-complete 103 reached the wire — completed-guard "
+                       "bypassed; got " +
+                       std::to_string(resp.interim_statuses.size()) +
+                       " interim(s); ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: dropped after complete() same-thread",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: dropped after complete() same-thread",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Same regression for H2 push: an async handler that calls complete()
+// then push_resource() inline on the dispatcher thread must not land
+// a PUSH_PROMISE. The per-request `completed` guard in the
+// push_resource closure catches this before PushResource can even
+// reach the FinalResponseSubmitted check (which would also drop it
+// once CompleteAsync runs — but the completed guard is earlier and
+// consistent with H1 semantics).
+void TestH2_Push_DroppedAfterCompleteSameThread() {
+    std::cout << "\n[TEST] H2 Push: dropped after complete() same-thread..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        server.GetAsync("/samecomplete_push",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher push_resource,
+               HttpRouter::AsyncCompletionCallback complete) {
+                HttpResponse main;
+                main.Status(200).Body("<html/>", "text/html");
+                complete(std::move(main));
+                HttpResponse pushed;
+                pushed.Status(200).Body(kPushedBody, "text/css");
+                // Should be dropped by the completed guard in the
+                // push_resource closure — not reaching SubmitPushPromise.
+                push_resource("GET", "http", "localhost",
+                              "/style.css", pushed);
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/samecomplete_push");
+            if (resp.status != 200) {
+                pass = false; err += "final status != 200; ";
+            }
+            if (!resp.pushed.empty()) {
+                pass = false;
+                err += "post-complete push reached the wire — completed-guard "
+                       "bypassed; got " +
+                       std::to_string(resp.pushed.size()) + " pushed; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 Push: dropped after complete() same-thread", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Push: dropped after complete() same-thread", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Regression test for the "stale push after complete()" race: an async
+// handler on a worker thread calls complete(200) followed by
+// push_resource(). The complete enqueues SubmitStreamResponse onto the
+// dispatcher; the hopped push_resource lambda is enqueued after it.
+// Before the FinalResponseSubmitted() check in SubmitPushPromise, the
+// hopped push lambda would land a PUSH_PROMISE AFTER the terminal
+// response was committed, violating ordering. With the check, the
+// stale push is dropped (parent still "open" because the response body
+// hasn't finished sending, but final has been handed to nghttp2).
+void TestH2_Push_RejectedAfterFinalResponseSubmitted() {
+    std::cout << "\n[TEST] H2 Push: rejected after complete() (stale push)..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+
+        server.GetAsync("/",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher push_resource,
+               HttpRouter::AsyncCompletionCallback complete) {
+                // Issue from a worker thread: complete THEN push.
+                // The complete() call enqueues SubmitStreamResponse; the
+                // push_resource call hops and enqueues itself AFTER.
+                std::thread t([complete = std::move(complete),
+                               push_resource]() {
+                    HttpResponse main;
+                    // Body big enough that nghttp2 can't finish sending
+                    // before the hopped push lambda runs (keeps the
+                    // stream Open so the IsClosed() check alone wouldn't
+                    // reject — FinalResponseSubmitted() IS the check
+                    // doing the work).
+                    main.Status(200).Body(std::string(32 * 1024, 'X'), "text/html");
+                    complete(std::move(main));
+                    HttpResponse pushed;
+                    pushed.Status(200).Body(kPushedBody, "text/css");
+                    push_resource("GET", "http", "localhost",
+                                  "/style.css", pushed);
+                });
+                t.join();
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true; std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false; err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/");
+            if (resp.status != 200) {
+                pass = false;
+                err += "parent status != 200 (got " +
+                       std::to_string(resp.status) + "); ";
+            }
+            // The stale push must be dropped — ordering against the
+            // final response is the correctness guarantee.
+            if (!resp.pushed.empty()) {
+                pass = false;
+                err += "stale push accepted after complete() — "
+                       "FinalResponseSubmitted guard bypassed; got " +
+                       std::to_string(resp.pushed.size()) + " pushed; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 Push: rejected after complete() (stale push)", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Push: rejected after complete() (stale push)", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.13b: Regression guard for PR #18 comment 1 — pushed streams must
+// fire stream_open_callback symmetrically with the close callback so
+// /stats.active_h2_streams stays balanced. Without the fix, each push
+// drifts the counter negative by one. We probe GetStats() after the
+// request/push finishes and the connection is closed; the value must
+// settle back to zero (both parent and pushed streams closed cleanly).
+void TestH2_Push_ActiveH2StreamsBalanced() {
+    std::cout << "\n[TEST] H2 Push: active_h2_streams balanced across push..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = true;
+        HttpServer server(cfg);
+        RegisterPushHandlerOnRoot(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+        int64_t before = server.GetStats().active_h2_streams;
+
+        {
+            Http2TestClient client;
+            if (client.Connect("127.0.0.1", port)) {
+                auto r = client.Get("/");
+                (void)r;
+            }
+        }
+        // Poll for close-callback propagation rather than a fixed sleep.
+        // A fixed 100ms sleep could flake under CI scheduler contention;
+        // the counter must settle to `before` once both the parent and
+        // all pushed streams have run their close_callback on the
+        // dispatcher thread. Bound by 2s deadline so a real leak still
+        // fails fast instead of spinning forever.
+        auto deadline = std::chrono::steady_clock::now() +
+                         std::chrono::seconds(2);
+        int64_t after = server.GetStats().active_h2_streams;
+        while (after != before &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            after = server.GetStats().active_h2_streams;
+        }
+
+        bool pass = (after == before);
+        std::string err;
+        if (!pass) {
+            err = "active_h2_streams drifted from " +
+                  std::to_string(before) + " to " +
+                  std::to_string(after) +
+                  " (expected 0 net change — pushed streams must fire both "
+                  "open and close callbacks)";
+        }
+        TestFramework::RecordTest("H2 Push: active_h2_streams balanced",
+                                  pass, err,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2 Push: active_h2_streams balanced",
+                                  false, e.what(),
+                                  TestFramework::TestCategory::OTHER);
+    }
+}
+
+// T9.13: Reload toggling enable_push — a brand-new connection after
+// Reload sees the new value. Existing connections keep their preface
+// (RFC 9113 §6.5.2 forbids sending ENABLE_PUSH after the preface).
+void TestH2_Push_ReloadTogglesEnablePush() {
+    std::cout << "\n[TEST] H2 Push: Reload toggles enable_push for new conns..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.http2.enable_push = false;  // start disabled
+        HttpServer server(cfg);
+        RegisterPushHandlerOnRoot(server);
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        bool pass = true; std::string err;
+
+        // First connection: push disabled → no pushed stream.
+        {
+            Http2TestClient c;
+            if (!c.Connect("127.0.0.1", port)) {
+                pass = false; err += "first connect; ";
+            } else {
+                auto r = c.Get("/");
+                if (!r.pushed.empty()) {
+                    pass = false;
+                    err += "before reload: expected 0 pushed; ";
+                }
+            }
+        }
+
+        // Reload with push enabled.
+        ServerConfig cfg2 = cfg;
+        cfg2.http2.enable_push = true;
+        if (!server.Reload(cfg2)) {
+            pass = false; err += "reload returned false; ";
+        }
+
+        // New connection sees the new value and gets a push.
+        {
+            Http2TestClient c;
+            if (!c.Connect("127.0.0.1", port)) {
+                pass = false; err += "second connect; ";
+            } else {
+                auto r = c.Get("/");
+                if (r.pushed.size() != 1) {
+                    pass = false;
+                    err += "after reload: expected 1 pushed, got " +
+                           std::to_string(r.pushed.size()) + "; ";
+                }
+            }
+        }
+
+        TestFramework::RecordTest(
+            "H2 Push: Reload toggles enable_push for new conns", pass, err,
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 Push: Reload toggles enable_push for new conns", false, e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ============================================================
 // Entry point
 // ============================================================
 
@@ -1994,6 +4466,7 @@ void RunAllTests() {
     TestH2C_SimplePost();
     TestH2C_NotFound();
     TestH2C_Middleware();
+    TestH2C_MiddlewareRejectionHonored();
     TestH2C_MultipleStreams();
     TestH2C_LargeBody();
 
@@ -2004,6 +4477,52 @@ void RunAllTests() {
     // --- Category 6: Race Conditions ---
     TestH2C_ConcurrentClients();
     TestH2C_MixedProtocolClients();
+
+    // --- Category 7: :authority vs host default-port normalization ---
+    TestH2_AuthorityMatchesHostWithDefaultHttpPort();
+    TestH2_AuthorityMatchesHostReverseOrder();
+    TestH2_AuthorityMatchesHostWithDefaultHttpsPort();
+    TestH2_AuthorityMismatchExplicitNonDefaultPort();
+    TestH2_AuthorityMismatchWrongDefault();
+    TestH2_AuthorityIPv6WithDefaultPort();
+    TestH2_AuthorityCaseInsensitiveHostDefaultPort();
+    TestH2_AuthorityMixedCaseSchemeDefaultPort();
+    TestH2_AuthorityMatch_PreservesClientHostHeader();
+
+    // --- Category 8: 103 Early Hints / SubmitInterimHeaders ---
+    TestH2_EarlyHints_Basic();
+    TestH2_EarlyHints_Multiple();
+    TestH2_EarlyHints_DroppedAfterFinal();
+    TestH2_EarlyHints_InvalidStatusDropped();
+    TestH2_EarlyHints_StreamClosedByPeerSafe();
+    TestH2_EarlyHints_100ContinueThen103();
+    TestH2_EarlyHints_OffDispatcherThread();
+    TestH2_EarlyHints_DroppedAfterCompleteSameThread();
+    TestH2_Async_HandlerThrowFiresCancelSlot();
+
+    // --- Category 9: SETTINGS_ENABLE_PUSH wire format ---
+    TestH2_SettingsEnablePushWire_Disabled();
+    TestH2_SettingsEnablePushWire_Enabled();
+
+    // --- Category 10: HTTP/2 server push ---
+    TestH2_Push_Basic();
+    TestH2_Push_PeerRefused();
+    TestH2_Push_ConfigDisabled();
+    TestH2_Push_InvalidMethodPOST();
+    TestH2_Push_EmptyPath();
+    TestH2_Push_EmptyAuthority();
+    TestH2_Push_InvalidSchemeFtp();
+    TestH2_Push_MixedCaseSchemeAccepted();
+    TestH2_Push_HeadResponseBodySuppressed();
+    TestH2_Push_NotCountedInTotalRequests();
+    TestH2_Push_SyncHandlerViaThreadLocal();
+    TestH2_Push_OnHttp1Connection();
+    TestH2_Push_AsyncViaRunOnDispatcher();
+    TestH2_Push_OffDispatcherThreadHops();
+    TestH2_Push_RejectedAfterFinalResponseSubmitted();
+    TestH2_Push_DroppedAfterCompleteSameThread();
+    TestH2_Push_ActiveH2StreamsBalanced();
+    TestH2_Push_ReloadTogglesEnablePush();
 }
 
 }  // namespace Http2Tests

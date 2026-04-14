@@ -369,15 +369,64 @@ static int OnFrameRecvCallback(
                 while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
                     expect.pop_back();
                 if (expect == "100-continue") {
-                    // Send 100 Continue — the client can proceed with body
+                    // Send 100 Continue — the client can proceed with body.
+                    // Silent-failure scenario: nghttp2_submit_headers could
+                    // fail (NGHTTP2_ERR_NOMEM etc.). Without a check, the
+                    // client waits forever for 100 before sending the body
+                    // and the stream slot stays occupied until request
+                    // timeout. RST the stream as a fallback so the client
+                    // retries without Expect.
                     nghttp2_nv nva_100[] = {
                         {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
                          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("100")),
                          7, 3, NGHTTP2_NV_FLAG_NONE}
                     };
-                    nghttp2_submit_headers(session, NGHTTP2_FLAG_NONE,
-                                           frame->hd.stream_id, nullptr,
-                                           nva_100, 1, nullptr);
+                    int rv100 = nghttp2_submit_headers(
+                        session, NGHTTP2_FLAG_NONE,
+                        frame->hd.stream_id, nullptr,
+                        nva_100, 1, nullptr);
+                    if (rv100 != 0) {
+                        logging::Get()->warn(
+                            "HTTP/2 100-Continue submit failed stream={} rv={} ({})",
+                            frame->hd.stream_id, rv100, nghttp2_strerror(rv100));
+                        int rv_rst = nghttp2_submit_rst_stream(
+                            session, NGHTTP2_FLAG_NONE,
+                            frame->hd.stream_id, NGHTTP2_INTERNAL_ERROR);
+                        if (rv_rst != 0) {
+                            // Dual-NOMEM path: neither the 100 nor the RST
+                            // was queued, so nghttp2 will never fire
+                            // on_stream_close for this stream. The
+                            // stream_open_callback already fired in
+                            // CreateStream, leaving active_h2_streams_ and
+                            // local_stream_count_ both +1. Mirror the
+                            // push-rollback reconciliation pattern: fire a
+                            // synthetic stream_close_callback +
+                            // MarkStreamForRemoval so counters stay
+                            // balanced. FlushDeferredRemovals will erase
+                            // the entry. Any later spurious nghttp2 close
+                            // callback for this id is a FindStream no-op.
+                            logging::Get()->warn(
+                                "HTTP/2 100-Continue RST submit also failed "
+                                "stream={} rv={} ({}) — firing synthetic "
+                                "close_callback to reconcile counters",
+                                frame->hd.stream_id, rv_rst,
+                                nghttp2_strerror(rv_rst));
+                            if (self->Callbacks().stream_close_callback) {
+                                try {
+                                    self->Callbacks().stream_close_callback(
+                                        self->Owner(), frame->hd.stream_id,
+                                        NGHTTP2_INTERNAL_ERROR);
+                                } catch (const std::exception& e) {
+                                    logging::Get()->error(
+                                        "Synthetic close_callback threw: {}",
+                                        e.what());
+                                }
+                            }
+                            self->MarkStreamForRemoval(frame->hd.stream_id);
+                        }
+                        stream->MarkRejected();
+                        break;
+                    }
                 } else {
                     // Unsupported Expect value — reject with 417.
                     logging::Get()->warn("HTTP/2 stream {} unsupported Expect: {}",
@@ -385,20 +434,72 @@ static int OnFrameRecvCallback(
                     if (self->Callbacks().request_count_callback)
                         self->Callbacks().request_count_callback();
                     // submit_response2 queues the HTTP response (END_STREAM).
+                    // A silent failure here would leave the client hanging
+                    // until request timeout; RST as fallback so the stream
+                    // is cleanly torn down and the client fails fast.
                     nghttp2_nv nva_417[] = {
                         {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
                          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>("417")),
                          7, 3, NGHTTP2_NV_FLAG_NONE}
                     };
-                    nghttp2_submit_response2(session, frame->hd.stream_id,
-                                             nva_417, 1, nullptr);
+                    int rv417 = nghttp2_submit_response2(
+                        session, frame->hd.stream_id, nva_417, 1, nullptr);
+                    if (rv417 != 0) {
+                        logging::Get()->warn(
+                            "HTTP/2 417 response submit failed stream={} rv={} ({})",
+                            frame->hd.stream_id, rv417, nghttp2_strerror(rv417));
+                        // Fall through to RST below — force stream teardown.
+                    }
                     // RST only when the client side is still open (no END_STREAM
                     // on request). If HEADERS had END_STREAM, submit_response2
                     // closes both sides cleanly — RST would be redundant and
-                    // some clients treat it as a transport failure.
-                    if (!(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
-                        nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                                  frame->hd.stream_id, NGHTTP2_NO_ERROR);
+                    // some clients treat it as a transport failure. When the
+                    // response submit itself failed, always RST so the client
+                    // stops waiting on a response that will never arrive.
+                    if (rv417 != 0 ||
+                        !(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+                        uint32_t rst_code = (rv417 != 0)
+                            ? NGHTTP2_INTERNAL_ERROR
+                            : NGHTTP2_NO_ERROR;
+                        int rv_rst = nghttp2_submit_rst_stream(
+                            session, NGHTTP2_FLAG_NONE,
+                            frame->hd.stream_id, rst_code);
+                        if (rv_rst != 0) {
+                            logging::Get()->warn(
+                                "HTTP/2 417 RST submit failed stream={} rv={} ({})",
+                                frame->hd.stream_id, rv_rst,
+                                nghttp2_strerror(rv_rst));
+                            // Dual-failure reconciliation: when both the
+                            // response and the RST submits fail (NOMEM),
+                            // nghttp2 never fires on_stream_close and the
+                            // stream_open_callback's +1 on active_h2_streams_
+                            // / local_stream_count_ leaks. Fire a synthetic
+                            // close_callback to balance, matching the
+                            // 100-Continue and push-rollback paths. Only
+                            // reconcile when the response submit ALSO
+                            // failed — if only the RST failed but the
+                            // response succeeded, submit_response2 closes
+                            // both sides cleanly and nghttp2 will fire
+                            // close on its own via END_STREAM.
+                            if (rv417 != 0) {
+                                logging::Get()->warn(
+                                    "HTTP/2 417 dual-failure stream={} — "
+                                    "firing synthetic close_callback",
+                                    frame->hd.stream_id);
+                                if (self->Callbacks().stream_close_callback) {
+                                    try {
+                                        self->Callbacks().stream_close_callback(
+                                            self->Owner(), frame->hd.stream_id,
+                                            NGHTTP2_INTERNAL_ERROR);
+                                    } catch (const std::exception& e) {
+                                        logging::Get()->error(
+                                            "Synthetic close_callback threw: {}",
+                                            e.what());
+                                    }
+                                }
+                                self->MarkStreamForRemoval(frame->hd.stream_id);
+                            }
+                        }
                     }
                     stream->MarkRejected();
                     break;
@@ -545,19 +646,32 @@ Http2Session::Http2Session(std::shared_ptr<ConnectionHandler> conn,
 Http2Session::~Http2Session() = default;
 
 void Http2Session::SendServerPreface() {
-    // Submit SETTINGS frame with our server settings
-    nghttp2_settings_entry iv[] = {
-        {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, settings_.max_concurrent_streams},
-        {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,    settings_.initial_window_size},
-        {NGHTTP2_SETTINGS_MAX_FRAME_SIZE,         settings_.max_frame_size},
-        {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE,   settings_.max_header_list_size},
-        // Disable server push
-        {NGHTTP2_SETTINGS_ENABLE_PUSH, 0}
-    };
+    // Submit SETTINGS frame with our server settings.
+    //
+    // SETTINGS_ENABLE_PUSH (RFC 9113 §6.5.2 + §7) is direction-asymmetric on
+    // the server: a server MUST NOT send a value of 1, and the absence of
+    // an entry leaves the peer's view at the protocol default of 1. So:
+    //   - enable_push = false (default): advertise {ENABLE_PUSH, 0} so the
+    //     client knows we will never push and can reject a stray
+    //     PUSH_PROMISE. nghttp2's local_settings ENABLE_PUSH stays 0,
+    //     refusing PUSH_PROMISE submission.
+    //   - enable_push = true: OMIT the entry entirely. nghttp2's local
+    //     setting falls back to its internal default of 1, allowing
+    //     PUSH_PROMISE emission, while we never write the forbidden value
+    //     1 onto the wire.
+    std::vector<nghttp2_settings_entry> iv;
+    iv.reserve(5);
+    iv.push_back({NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, settings_.max_concurrent_streams});
+    iv.push_back({NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,    settings_.initial_window_size});
+    iv.push_back({NGHTTP2_SETTINGS_MAX_FRAME_SIZE,         settings_.max_frame_size});
+    iv.push_back({NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE,   settings_.max_header_list_size});
+    if (!settings_.enable_push) {
+        iv.push_back({NGHTTP2_SETTINGS_ENABLE_PUSH, 0});
+    }
 
     int rv = nghttp2_submit_settings(
         impl_->session, NGHTTP2_FLAG_NONE,
-        iv, sizeof(iv) / sizeof(iv[0]));
+        iv.data(), iv.size());
     if (rv != 0) {
         logging::Get()->error("Failed to submit SETTINGS: {}",
                               nghttp2_strerror(rv));
@@ -568,6 +682,19 @@ void Http2Session::SendServerPreface() {
 }
 
 ssize_t Http2Session::ReceiveData(const char* data, size_t len) {
+    // Mark that we are inside nghttp2_session_mem_recv2 so that any
+    // send_interim / push_resource invocation from an inline sync
+    // handler (running inside an on_frame_recv callback) can skip its
+    // inline SendPendingFrames() — calling nghttp2_session_mem_send2
+    // reentrantly from a recv callback is unsafe. The caller of
+    // ReceiveData() flushes on the way out (see OnRawData tail).
+    // RAII guard covers both the normal return and the error return.
+    in_receive_data_ = true;
+    struct RecvGuard {
+        bool& flag;
+        ~RecvGuard() { flag = false; }
+    } recv_guard{in_receive_data_};
+
     ssize_t rv = nghttp2_session_mem_recv2(
         impl_->session,
         reinterpret_cast<const uint8_t*>(data), len);
@@ -800,7 +927,341 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
     }
 
     stream->MarkResponseHeadersSent();
+    // Final response (>=200) is now in nghttp2's send queue. Lock out any
+    // late SubmitInterimHeaders so a stray 1xx cannot interleave with — or
+    // race ahead of — the final block on the wire.
+    stream->MarkFinalResponseSubmitted();
     return 0;
+}
+
+int Http2Session::SubmitInterimHeaders(
+    int32_t stream_id, int status_code,
+    const std::vector<std::pair<std::string, std::string>>& headers) {
+    // Valid range: [PROCESSING (102), OK). 100 is framework-managed
+    // (auto-emitted for Expect: 100-continue); 101 is an HTTP/1 Upgrade
+    // status and MUST NOT appear in HTTP/2 (RFC 9113 Section 8.6).
+    if (status_code < HttpStatus::PROCESSING || status_code >= HttpStatus::OK) {
+        logging::Get()->warn(
+            "H2 SubmitInterimHeaders invalid status {} stream={}",
+            status_code, stream_id);
+        return -1;
+    }
+    auto* stream = FindStream(stream_id);
+    if (!stream || stream->IsClosed()) {
+        logging::Get()->debug(
+            "H2 SubmitInterimHeaders: stream {} missing/closed; drop",
+            stream_id);
+        return -1;
+    }
+    if (stream->FinalResponseSubmitted()) {
+        logging::Get()->warn(
+            "H2 SubmitInterimHeaders after final stream={} status={}; drop",
+            stream_id, status_code);
+        return -1;
+    }
+
+    // Build the nva. nghttp2 copies bytes because we do not use
+    // NGHTTP2_NV_FLAG_NO_COPY_NAME/VALUE, so local storage is safe.
+    std::string status_str = std::to_string(status_code);
+    std::vector<nghttp2_nv> nva;
+    nva.reserve(1 + headers.size());
+    nva.push_back({
+        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
+        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(status_str.c_str())),
+        7, status_str.size(),
+        NGHTTP2_NV_FLAG_NONE
+    });
+
+    // Forbidden-header strip: same list SubmitResponse enforces, plus
+    // pseudo-headers which are response-only on the server side (":status")
+    // or request-only but defensively scrubbed here.
+    std::vector<std::string> lowered_names;
+    lowered_names.reserve(headers.size());
+    for (const auto& [key, value] : headers) {
+        std::string lower = key;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lower == "connection" || lower == "keep-alive" ||
+            lower == "proxy-connection" || lower == "te" ||
+            lower == "transfer-encoding" || lower == "upgrade" ||
+            lower == "content-length" ||
+            (lower.size() >= 6 && lower.compare(0, 6, "proxy-") == 0) ||
+            lower == ":status" || lower == ":path" || lower == ":method" ||
+            lower == ":scheme" || lower == ":authority") {
+            logging::Get()->debug(
+                "H2 interim: forbidden header '{}' stripped stream={}",
+                key, stream_id);
+            continue;
+        }
+        lowered_names.push_back(std::move(lower));
+        nva.push_back({
+            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(lowered_names.back().c_str())),
+            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(value.c_str())),
+            lowered_names.back().size(), value.size(),
+            NGHTTP2_NV_FLAG_NONE
+        });
+    }
+
+    // NGHTTP2_FLAG_NONE — no END_STREAM so the stream stays open for the
+    // subsequent final response. nghttp2 itself treats 1xx headers as
+    // non-final and allows further HEADERS on the same stream.
+    int rv = nghttp2_submit_headers(impl_->session, NGHTTP2_FLAG_NONE,
+                                    stream_id, nullptr,
+                                    nva.data(), nva.size(), nullptr);
+    if (rv != 0) {
+        logging::Get()->warn(
+            "nghttp2_submit_headers(interim) stream={} status={} rv={} ({})",
+            stream_id, status_code, rv, nghttp2_strerror(rv));
+        return -1;
+    }
+    logging::Get()->debug(
+        "H2 SubmitInterimHeaders queued stream={} status={}",
+        stream_id, status_code);
+    return 0;
+}
+
+// ---- HTTP/2 server push (RFC 9113 §8.4) ----
+
+bool Http2Session::PushEnabled() const {
+    if (!settings_.enable_push) return false;
+    // nghttp2 tracks the peer's most-recently-ACKed remote settings; the
+    // getter returns the protocol default (1 for ENABLE_PUSH) until the
+    // peer ACKs an explicit value, so a brand-new connection treats push
+    // as allowed unless the peer explicitly refuses.
+    uint32_t remote = nghttp2_session_get_remote_settings(
+        impl_->session, NGHTTP2_SETTINGS_ENABLE_PUSH);
+    return remote != 0;
+}
+
+Http2Stream* Http2Session::CreateServerInitiatedStream(int32_t stream_id) {
+    auto [it, inserted] = streams_.emplace(
+        stream_id, std::make_unique<Http2Stream>(stream_id));
+    if (!inserted) {
+        logging::Get()->warn(
+            "CreateServerInitiatedStream: stream {} already exists; reusing",
+            stream_id);
+        return it->second.get();
+    }
+    // IMPORTANT: do NOT call OnStreamBecameIncomplete() here. Pushed streams
+    // bypass the request-parsing lifecycle entirely — they are synthetic
+    // server-side responses with no client request to parse. Including them
+    // in the incomplete counter would (a) inflate OldestIncompleteStreamStart,
+    // and (b) make the parse_timeout_sec branch of ResetExpiredStreams RST
+    // a perfectly healthy push mid-response.
+    //
+    // MarkCounterDecremented sets dispatched_at_ to now() so the
+    // async-deferred safety-cap timer is anchored from the moment the
+    // push begins streaming, matching the contract of regular async
+    // responses entering their handler-response budget.
+    it->second->MarkCounterDecremented();
+    // Fire stream_open_callback symmetrically with CreateStream so
+    // per-connection (local_stream_count_) and per-server (active_h2_streams_)
+    // counters stay balanced against the stream_close_callback that nghttp2
+    // WILL fire when the pushed stream finalizes. Without this, pushed
+    // streams would only decrement those counters — /stats would drift
+    // negative by one per push and CompensateH2Streams could over-subtract
+    // on abrupt close.
+    if (callbacks_.stream_open_callback) {
+        try { callbacks_.stream_open_callback(Owner(), stream_id); }
+        catch (const std::exception& e) {
+            logging::Get()->error("Stream open callback error (pushed): {}",
+                                  e.what());
+        }
+    }
+    return it->second.get();
+}
+
+void Http2Session::EraseStream(int32_t stream_id) {
+    streams_.erase(stream_id);
+}
+
+int32_t Http2Session::SubmitPushPromise(
+    int32_t parent_stream_id,
+    const std::string& method, const std::string& scheme,
+    const std::string& authority, const std::string& path,
+    const HttpResponse& response) {
+    // ---- Boundary validation ----
+    // RFC 9113 §8.4: a server MUST only push GET or HEAD; clients MUST
+    // reject anything else with PROTOCOL_ERROR. Reject locally so we
+    // never produce a non-conforming PUSH_PROMISE on the wire.
+    if (method != "GET" && method != "HEAD") {
+        logging::Get()->warn(
+            "push: invalid method '{}' (must be GET or HEAD) parent={}",
+            method, parent_stream_id);
+        return -1;
+    }
+    // URI schemes are case-insensitive per RFC 3986 §3.1. Lowercase once
+    // for validation AND for the value we put on the wire — pseudo-header
+    // values in HTTP/2 should be in canonical (lowercase) form so the
+    // peer's HPACK decoder doesn't trip and so a misbehaving client that
+    // passes :scheme=HTTPS here does not cause us to emit the same
+    // non-canonical value in the PUSH_PROMISE.
+    std::string scheme_lower = scheme;
+    std::transform(scheme_lower.begin(), scheme_lower.end(),
+                   scheme_lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (scheme_lower != "http" && scheme_lower != "https") {
+        logging::Get()->warn(
+            "push: invalid scheme '{}' parent={}", scheme, parent_stream_id);
+        return -1;
+    }
+    if (authority.empty()) {
+        logging::Get()->warn(
+            "push: empty authority parent={}", parent_stream_id);
+        return -1;
+    }
+    if (path.empty() || path[0] != '/') {
+        logging::Get()->warn(
+            "push: invalid path '{}' (must start with /) parent={}",
+            path, parent_stream_id);
+        return -1;
+    }
+    if (!PushEnabled()) {
+        logging::Get()->debug(
+            "push: disabled (local config or peer refused) parent={}",
+            parent_stream_id);
+        return -1;
+    }
+    if (IsGoawaySent()) {
+        logging::Get()->debug(
+            "push: GOAWAY already sent — refusing new promise parent={}",
+            parent_stream_id);
+        return -1;
+    }
+    auto* parent = FindStream(parent_stream_id);
+    if (!parent || parent->IsClosed()) {
+        logging::Get()->debug(
+            "push: parent stream {} not open", parent_stream_id);
+        return -1;
+    }
+    // Reject pushes once the parent's final response has been handed to
+    // nghttp2. IsClosed() only transitions when nghttp2 actually closes
+    // the stream (after the last DATA frame is sent to the peer); on a
+    // large or backpressured body the parent can remain Open for a long
+    // time AFTER SubmitResponse has already committed the terminal
+    // response. Without this check, a stale push_resource closure
+    // captured by an async handler could land a PUSH_PROMISE after
+    // complete() — violating the ordering guarantee that pushes must
+    // precede the final response bytes. FinalResponseSubmitted() is
+    // set synchronously inside SubmitResponse on success, so it closes
+    // the window regardless of how slowly the peer drains.
+    if (parent->FinalResponseSubmitted()) {
+        logging::Get()->debug(
+            "push: parent stream {} final response already submitted; "
+            "rejecting stale push", parent_stream_id);
+        return -1;
+    }
+    // Pre-validate the pushed response BEFORE we announce a PUSH_PROMISE
+    // on the wire. If we skipped this, a handler passing an invalid
+    // response (e.g. status < 200) would cause the promise to go out,
+    // followed by an immediate RST when SubmitResponse rejects the
+    // response in the post-announce path — a benign but observable
+    // failure on the wire. Gating here keeps the wire clean in the
+    // expected rejection case. SubmitResponse itself rejects any 1xx
+    // as a final response, so mirror that single check.
+    if (response.GetStatusCode() < HttpStatus::OK) {
+        logging::Get()->warn(
+            "push: invalid response status {} (< 200) parent={}; rejecting "
+            "before PUSH_PROMISE",
+            response.GetStatusCode(), parent_stream_id);
+        return -1;
+    }
+
+    // ---- Build the promise pseudo-headers ----
+    // Local storage holds the pseudo-header strings until nghttp2 has
+    // copied them. nghttp2 copies because we don't pass NO_COPY flags.
+    std::vector<nghttp2_nv> promise_nva;
+    promise_nva.reserve(4);
+    auto add_ph = [&](const char* name, size_t name_len,
+                      const std::string& value) {
+        promise_nva.push_back({
+            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(name)),
+            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(value.c_str())),
+            name_len, value.size(),
+            NGHTTP2_NV_FLAG_NONE
+        });
+    };
+    add_ph(":method",    7, method);
+    // Emit the canonical (lowercase) scheme regardless of what the
+    // caller passed — consistent with HTTP/2 lowercase conventions and
+    // ensures a peer's HPACK decoder sees a well-formed value.
+    add_ph(":scheme",    7, scheme_lower);
+    add_ph(":authority", 10, authority);
+    add_ph(":path",      5, path);
+
+    int32_t promised = nghttp2_submit_push_promise(
+        impl_->session, NGHTTP2_FLAG_NONE, parent_stream_id,
+        promise_nva.data(), promise_nva.size(), nullptr);
+    if (promised < 0) {
+        logging::Get()->warn(
+            "nghttp2_submit_push_promise failed parent={} rv={} ({})",
+            parent_stream_id, promised, nghttp2_strerror(promised));
+        return -1;
+    }
+
+    // ---- Register the synthetic stream AFTER nghttp2 accepted ----
+    // Populate the request so SubmitResponse's HEAD body suppression
+    // (req.method == "HEAD") and req.headers["host"] (used by header
+    // rewriting / log correlation) reflect the pushed request.
+    Http2Stream* pushed = CreateServerInitiatedStream(promised);
+    HttpRequest& req = pushed->GetRequest();
+    req.method  = method;
+    req.path    = path;
+    req.headers["host"] = authority;
+    pushed->MarkHeadersComplete();
+    pushed->MarkEndStream();
+
+    // ---- Submit the response on the promised stream ----
+    int rv = SubmitResponse(promised, response);
+    if (rv != 0) {
+        logging::Get()->warn(
+            "push: SubmitResponse failed on promised stream {} rv={}",
+            promised, rv);
+        // Best-effort RST so the client releases bookkeeping for the
+        // promised id. Do NOT EraseStream here — nghttp2 will fire
+        // on_stream_close for the RST'd stream, and our
+        // OnStreamCloseCallback must see the stream in streams_ so
+        // stream_close_callback runs and decrements active_h2_streams_
+        // + local_stream_count_ symmetrically with the +1 CreateServer
+        // InitiatedStream applied via stream_open_callback. Erasing
+        // eagerly would leave FindStream() returning nullptr when the
+        // close callback fires, skipping the decrements and leaking
+        // +1 on both counters per failed push. The normal cleanup path
+        // (MarkStreamForRemoval + FlushDeferredRemovals) handles final
+        // erase.
+        int rv_rst = nghttp2_submit_rst_stream(
+            impl_->session, NGHTTP2_FLAG_NONE,
+            promised, NGHTTP2_INTERNAL_ERROR);
+        if (rv_rst != 0) {
+            // Extremely unlikely path, but if the RST itself fails
+            // nghttp2 will never fire on_stream_close for this stream,
+            // so the counter +1 from stream_open_callback would leak.
+            // Fire a synthetic close_callback + MarkStreamForRemoval
+            // to reconcile. We can safely MarkStreamForRemoval because
+            // the next FlushDeferredRemovals will erase the entry and
+            // nghttp2 treats its internal stream as already-reset
+            // (or will at session teardown).
+            logging::Get()->warn(
+                "push: rollback RST submit failed stream={} rv={} ({}) — "
+                "firing synthetic close_callback to reconcile counters",
+                promised, rv_rst, nghttp2_strerror(rv_rst));
+            if (callbacks_.stream_close_callback) {
+                try {
+                    callbacks_.stream_close_callback(
+                        Owner(), promised, NGHTTP2_INTERNAL_ERROR);
+                } catch (const std::exception& e) {
+                    logging::Get()->error(
+                        "Synthetic close_callback threw: {}", e.what());
+                }
+            }
+            MarkStreamForRemoval(promised);
+        }
+        return -1;
+    }
+    logging::Get()->debug(
+        "push: PUSH_PROMISE+response queued parent={} promised={} {} {}",
+        parent_stream_id, promised, method, path);
+    return promised;
 }
 
 void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id) {
@@ -877,15 +1338,45 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
     SubmitResponse(stream_id, response);
 }
 
-void Http2Session::SendGoaway(uint32_t error_code) {
+void Http2Session::SubmitGoawayChecked(uint32_t error_code,
+                                        int32_t last_stream_id_override,
+                                        bool flush) {
     if (goaway_sent_) return;
-    goaway_sent_ = true;
-    logging::Get()->info("H2 sending GOAWAY fd={}", conn_->fd());
 
-    nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
-                          last_stream_id_, error_code,
-                          nullptr, 0);
-    SendPendingFrames();
+    int32_t last_id = (last_stream_id_override >= 0)
+        ? last_stream_id_override
+        : last_stream_id_.load(std::memory_order_acquire);
+
+    // Audit log BEFORE submit so flood-triggered GOAWAYs are visible in
+    // operator logs alongside the flood warn — previously only the
+    // dedicated SendGoaway() path emitted an info line, leaving the
+    // SETTINGS/PING/RST flood branches with no GOAWAY audit trail.
+    logging::Get()->info(
+        "H2 sending GOAWAY fd={} last_stream_id={} error_code={}",
+        conn_ ? conn_->fd() : -1, last_id, error_code);
+
+    int rv = nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
+                                    last_id, error_code, nullptr, 0);
+    if (rv != 0) {
+        // A failed submit does NOT latch the flag — leaving goaway_sent_
+        // false lets later logic retry or proceed. Previously the flag
+        // was set before the rv check, so a failed submit would make
+        // WaitForH2Drain wait for the full shutdown_drain_timeout_sec
+        // even though no GOAWAY was ever queued.
+        logging::Get()->warn(
+            "nghttp2_submit_goaway failed fd={} rv={} ({}) — drain may wait",
+            conn_ ? conn_->fd() : -1, rv, nghttp2_strerror(rv));
+        if (flush) SendPendingFrames();
+        return;
+    }
+    goaway_sent_ = true;
+    if (flush) SendPendingFrames();
+}
+
+void Http2Session::SendGoaway(uint32_t error_code) {
+    // Audit log is emitted inside SubmitGoawayChecked so flood-path
+    // callers get the same entry.
+    SubmitGoawayChecked(error_code, /*last_stream_id_override=*/-1, /*flush=*/true);
 }
 
 void Http2Session::ResetStream(int32_t stream_id, uint32_t error_code) {
@@ -1083,20 +1574,14 @@ bool Http2Session::CheckFloodProtection(
             if (settings_count_ > HTTP2_CONSTANTS::MAX_SETTINGS_PER_INTERVAL) {
                 logging::Get()->warn("HTTP/2 SETTINGS flood detected fd={}",
                                      conn_ ? conn_->fd() : -1);
-                // Queue GOAWAY only — do NOT call SendPendingFrames() here.
-                // This callback runs inside nghttp2_session_mem_recv2; flushing
-                // output now (via mem_send2) while mem_recv2 is on the call stack
-                // is unsafe. SendPendingFrames() will be called after ReceiveData
-                // returns in Http2ConnectionHandler::OnRawData().
-                if (!goaway_sent_) {
-                    goaway_sent_ = true;
-                    // Use live stream ID — last_stream_id_ may be stale mid-recv
-                    int32_t live_last = nghttp2_session_get_last_proc_stream_id(
-                        impl_->session);
-                    nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
-                                         live_last, NGHTTP2_ENHANCE_YOUR_CALM,
-                                         nullptr, 0);
-                }
+                // Queue GOAWAY via the checked helper. flush=false because
+                // this runs inside nghttp2_session_mem_recv2; the caller
+                // flushes after recv returns. Use live stream ID — the
+                // cached last_stream_id_ may be stale mid-recv.
+                int32_t live_last = nghttp2_session_get_last_proc_stream_id(
+                    impl_->session);
+                SubmitGoawayChecked(NGHTTP2_ENHANCE_YOUR_CALM,
+                                    live_last, /*flush=*/false);
                 return false;
             }
         }
@@ -1107,14 +1592,10 @@ bool Http2Session::CheckFloodProtection(
             if (ping_count_ > HTTP2_CONSTANTS::MAX_PING_PER_INTERVAL) {
                 logging::Get()->warn("HTTP/2 PING flood detected fd={}",
                                      conn_ ? conn_->fd() : -1);
-                if (!goaway_sent_) {
-                    goaway_sent_ = true;
-                    int32_t live_last = nghttp2_session_get_last_proc_stream_id(
-                        impl_->session);
-                    nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
-                                         live_last, NGHTTP2_ENHANCE_YOUR_CALM,
-                                         nullptr, 0);
-                }
+                int32_t live_last = nghttp2_session_get_last_proc_stream_id(
+                    impl_->session);
+                SubmitGoawayChecked(NGHTTP2_ENHANCE_YOUR_CALM,
+                                    live_last, /*flush=*/false);
                 return false;
             }
         }
@@ -1124,14 +1605,10 @@ bool Http2Session::CheckFloodProtection(
         if (rst_stream_count_ > HTTP2_CONSTANTS::MAX_RST_STREAM_PER_INTERVAL) {
             logging::Get()->warn("HTTP/2 RST_STREAM flood detected (rapid reset) fd={}",
                                  conn_ ? conn_->fd() : -1);
-            if (!goaway_sent_) {
-                goaway_sent_ = true;
-                int32_t live_last = nghttp2_session_get_last_proc_stream_id(
-                    impl_->session);
-                nghttp2_submit_goaway(impl_->session, NGHTTP2_FLAG_NONE,
-                                     live_last, NGHTTP2_ENHANCE_YOUR_CALM,
-                                     nullptr, 0);
-            }
+            int32_t live_last = nghttp2_session_get_last_proc_stream_id(
+                impl_->session);
+            SubmitGoawayChecked(NGHTTP2_ENHANCE_YOUR_CALM,
+                                live_last, /*flush=*/false);
             return false;
         }
         break;

@@ -1329,6 +1329,8 @@ void TestRouterProxyHeadFollowsRegistrationOwner() {
         auto proxy_a_hit = std::make_shared<bool>(false);
         router.RouteAsync("GET", "/api/*rest",
             [proxy_a_hit](const HttpRequest&,
+                          HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
+                          HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
                           HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *proxy_a_hit = true;
             });
@@ -1342,6 +1344,8 @@ void TestRouterProxyHeadFollowsRegistrationOwner() {
         auto proxy_b_head_hit = std::make_shared<bool>(false);
         router.RouteAsync("HEAD", "/api/*rest",
             [proxy_b_head_hit](const HttpRequest&,
+                               HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
+                               HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
                                HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *proxy_b_head_hit = true;
             });
@@ -1359,7 +1363,11 @@ void TestRouterProxyHeadFollowsRegistrationOwner() {
         bool got_handler = (handler != nullptr);
         bool fallback_flag = head_fallback;
         if (got_handler) {
-            handler(req, [](HttpResponse) {});
+            handler(req,
+                    [](int, const std::vector<std::pair<std::string,std::string>>&) {},
+                    [](const std::string&, const std::string&, const std::string&,
+                       const std::string&, const HttpResponse&) -> int32_t { return -1; },
+                    [](HttpResponse) {});
         }
 
         bool pass = got_handler && fallback_flag &&
@@ -1392,11 +1400,15 @@ void TestRouterProxyHeadKeptWhenSameRegistrationPair() {
         auto head_hit = std::make_shared<bool>(false);
         router.RouteAsync("GET", "/items/*rest",
             [get_hit](const HttpRequest&,
+                      HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
+                      HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
                       HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *get_hit = true;
             });
         router.RouteAsync("HEAD", "/items/*rest",
             [head_hit](const HttpRequest&,
+                       HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
+                       HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
                        HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *head_hit = true;
             });
@@ -1409,7 +1421,11 @@ void TestRouterProxyHeadKeptWhenSameRegistrationPair() {
         bool head_fallback = false;
         auto handler = router.GetAsyncHandler(req, &head_fallback);
 
-        if (handler) handler(req, [](HttpResponse) {});
+        if (handler) handler(req,
+                             [](int, const std::vector<std::pair<std::string,std::string>>&) {},
+                             [](const std::string&, const std::string&, const std::string&,
+                                const std::string&, const HttpResponse&) -> int32_t { return -1; },
+                             [](HttpResponse) {});
 
         // HEAD stays on the proxy's HEAD handler (not via HEAD→GET fallback).
         bool pass = (handler != nullptr) && !head_fallback &&
@@ -1452,6 +1468,8 @@ void TestRouterProxyCompanionScopedByMethod() {
         auto async_get_hit = std::make_shared<bool>(false);
         router.RouteAsync("GET", "/api",
             [async_get_hit](const HttpRequest&,
+                            HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
+                            HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
                             HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *async_get_hit = true;
             });
@@ -1463,6 +1481,8 @@ void TestRouterProxyCompanionScopedByMethod() {
         auto async_post_hit = std::make_shared<bool>(false);
         router.RouteAsync("POST", "/api",
             [async_post_hit](const HttpRequest&,
+                             HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
+                             HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
                              HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *async_post_hit = true;
             });
@@ -1474,7 +1494,11 @@ void TestRouterProxyCompanionScopedByMethod() {
         req.method = "POST";
         req.path = "/api";
         auto handler = router.GetAsyncHandler(req, nullptr);
-        if (handler) handler(req, [](HttpResponse) {});
+        if (handler) handler(req,
+                             [](int, const std::vector<std::pair<std::string,std::string>>&) {},
+                             [](const std::string&, const std::string&, const std::string&,
+                                const std::string&, const HttpResponse&) -> int32_t { return -1; },
+                             [](HttpResponse) {});
 
         bool pass = (handler != nullptr) &&
                     *async_post_hit && !*sync_post_hit;
@@ -1512,6 +1536,8 @@ void TestRouterProxyCompanionYieldsForMarkedMethod() {
         auto async_get_hit = std::make_shared<bool>(false);
         router.RouteAsync("GET", "/api",
             [async_get_hit](const HttpRequest&,
+                            HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
+                            HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
                             HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *async_get_hit = true;
             });
@@ -1575,6 +1601,8 @@ void TestRouterProxyDefaultHeadPairingPerPattern() {
         auto user_get_hit = std::make_shared<bool>(false);
         router.RouteAsync("GET", "/api",
             [user_get_hit](const HttpRequest&,
+                           HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
+                           HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
                            HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *user_get_hit = true;
             });
@@ -1586,6 +1614,8 @@ void TestRouterProxyDefaultHeadPairingPerPattern() {
         auto proxy_head_api_hit = std::make_shared<bool>(false);
         router.RouteAsync("HEAD", "/api",
             [proxy_head_api_hit](const HttpRequest&,
+                                 HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
+                                 HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
                                  HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *proxy_head_api_hit = true;
             });
@@ -1598,11 +1628,15 @@ void TestRouterProxyDefaultHeadPairingPerPattern() {
         auto proxy_head_catchall_hit = std::make_shared<bool>(false);
         router.RouteAsync("GET", "/api/*rest",
             [proxy_get_catchall_hit](const HttpRequest&,
+                                      HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
+                                      HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
                                       HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *proxy_get_catchall_hit = true;
             });
         router.RouteAsync("HEAD", "/api/*rest",
             [proxy_head_catchall_hit](const HttpRequest&,
+                                       HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
+                                       HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
                                        HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *proxy_head_catchall_hit = true;
             });
@@ -1617,7 +1651,11 @@ void TestRouterProxyDefaultHeadPairingPerPattern() {
             req.path = "/api";
             bool head_fallback = false;
             auto handler = router.GetAsyncHandler(req, &head_fallback);
-            if (handler) handler(req, [](HttpResponse) {});
+            if (handler) handler(req,
+                                 [](int, const std::vector<std::pair<std::string,std::string>>&) {},
+                                 [](const std::string&, const std::string&, const std::string&,
+                                    const std::string&, const HttpResponse&) -> int32_t { return -1; },
+                                 [](HttpResponse) {});
 
             bool api_ok = (handler != nullptr) && head_fallback &&
                           *user_get_hit && !*proxy_head_api_hit;
@@ -1644,7 +1682,11 @@ void TestRouterProxyDefaultHeadPairingPerPattern() {
             req.path = "/api/foo";
             bool head_fallback = false;
             auto handler = router.GetAsyncHandler(req, &head_fallback);
-            if (handler) handler(req, [](HttpResponse) {});
+            if (handler) handler(req,
+                                 [](int, const std::vector<std::pair<std::string,std::string>>&) {},
+                                 [](const std::string&, const std::string&, const std::string&,
+                                    const std::string&, const HttpResponse&) -> int32_t { return -1; },
+                                 [](HttpResponse) {});
 
             bool catchall_ok = (handler != nullptr) && !head_fallback &&
                                *proxy_head_catchall_hit &&
@@ -1684,6 +1726,8 @@ void TestRouterProxyCompanionDisjointRegex() {
         auto async_hit = std::make_shared<bool>(false);
         router.RouteAsync("GET", "/users/:slug([a-z]+)",
             [async_hit](const HttpRequest&,
+                        HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
+                        HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
                         HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *async_hit = true;
             });
@@ -1696,7 +1740,11 @@ void TestRouterProxyCompanionDisjointRegex() {
         req.method = "GET";
         req.path = "/users/abc";
         auto handler = router.GetAsyncHandler(req, nullptr);
-        if (handler) handler(req, [](HttpResponse) {});
+        if (handler) handler(req,
+                             [](int, const std::vector<std::pair<std::string,std::string>>&) {},
+                             [](const std::string&, const std::string&, const std::string&,
+                                const std::string&, const HttpResponse&) -> int32_t { return -1; },
+                             [](HttpResponse) {});
 
         bool pass = (handler != nullptr) && *async_hit;
         std::string err;
