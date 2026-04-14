@@ -6,6 +6,7 @@
 #include "upstream/header_rewriter.h"
 #include "upstream/retry_policy.h"
 #include "config/server_config.h"        // ProxyConfig (stored by value)
+#include "circuit_breaker/retry_budget.h" // RetryBudget::InFlightGuard (member-by-value)
 #include "http/http_callbacks.h"
 #include "http/http_response.h"
 // <string>, <map>, <unordered_map>, <memory>, <functional>, <chrono> provided by common.h
@@ -17,7 +18,7 @@ class Dispatcher;
 
 namespace circuit_breaker {
 class CircuitBreakerSlice;
-}
+}  // RetryBudget already defined via retry_budget.h
 
 class ProxyTransaction : public std::enable_shared_from_this<ProxyTransaction> {
 public:
@@ -166,6 +167,23 @@ private:
     // CircuitBreakerManager on HttpServer, which outlives this transaction.
     circuit_breaker::CircuitBreakerSlice* slice_ = nullptr;
 
+    // Per-host retry budget, resolved alongside `slice_` in Start() from
+    // the same CircuitBreakerHost. Null when there's no breaker attached
+    // for this service — in that case the transaction skips budget
+    // tracking entirely. Lifetime: the budget is owned by the host,
+    // which outlives this transaction (destruction order guaranteed by
+    // HttpServer member declaration).
+    circuit_breaker::RetryBudget* retry_budget_ = nullptr;
+
+    // Per-attempt in-flight tracker. Held for the duration of each
+    // attempt (first try and retries alike). Replaced on every
+    // AttemptCheckout — move-assignment decrements the counter for the
+    // prior attempt and increments for the new one, so a retrying
+    // transaction stays at a single in_flight unit. Default-constructed
+    // guard is empty (counter_ = nullptr): used when retry_budget_ is
+    // null or before the first ConsultBreaker admission.
+    circuit_breaker::RetryBudget::InFlightGuard inflight_guard_;
+
     // Per-ATTEMPT admission state. Reset on each call to ConsultBreaker();
     // paired Report*() calls thread the `generation` back so the slice
     // can drop stale completions across state transitions (see
@@ -175,11 +193,11 @@ private:
     uint64_t admission_generation_ = 0;
     bool is_probe_ = false;
 
-    // TODO(phase-5): retry-budget token held by this transaction's most
-    // recent retry attempt. Phase 5 flips this to true on successful
-    // TryConsumeRetry and clears it on ReleaseRetry. Phase 4 declares
-    // the field so Cleanup() and Cancel() have something to check, but
-    // the retry loop does not yet consume the budget.
+    // Retry-budget token held by this transaction's current retry
+    // attempt (attempt_ > 0). Set true after a successful
+    // TryConsumeRetry in MaybeRetry; cleared by ReleaseRetryToken in
+    // Cleanup. Dry-run rejects proceed but the flag stays false — no
+    // token was consumed, so no ReleaseRetry is required.
     bool retry_token_held_ = false;
 
     // Internal methods
@@ -257,4 +275,13 @@ private:
     // admission_generation_ so a following ReportBreakerOutcome is a
     // no-op.
     void ReleaseBreakerAdmissionNeutral();
+
+    // Release the retry-budget token held by this attempt, if any.
+    // Idempotent via the retry_token_held_ flag — called from Cleanup
+    // between attempts (so the next retry's TryConsumeRetry sees a
+    // freshly-released counter) AND from the destructor / Cancel as
+    // safety nets. No-op when no budget was attached or no token was
+    // consumed (e.g. first attempt, or dry-run reject that didn't
+    // consume).
+    void ReleaseRetryToken();
 };

@@ -124,6 +124,13 @@ void ProxyTransaction::Start() {
             auto* host = cbm->GetHost(service_name_);
             if (host) {
                 slice_ = host->GetSlice(static_cast<size_t>(dispatcher_index_));
+                // Retry budget is host-level (shared across partitions).
+                // Resolve from the same host so retry admission math stays
+                // consistent with the slice's dispatcher routing. Always
+                // non-null when the host exists (budget is unconditionally
+                // constructed by the host ctor). Null only when `host`
+                // itself is null.
+                retry_budget_ = host->GetRetryBudget();
             }
         }
     }
@@ -144,6 +151,16 @@ void ProxyTransaction::AttemptCheckout() {
     // the decision enum (REJECTED_OPEN_DRYRUN), so ConsultBreaker proceeds.
     if (!ConsultBreaker()) {
         return;
+    }
+
+    // Track this attempt against the host-level retry budget's
+    // in_flight counter. Replaces any prior guard (from the previous
+    // attempt of the same transaction) — move-assignment decrements
+    // the old counter and takes ownership of the new, so a retrying
+    // transaction stays at exactly one in_flight unit throughout. No-op
+    // when retry_budget_ is null (no breaker attached for this service).
+    if (retry_budget_) {
+        inflight_guard_ = retry_budget_->TrackInFlight();
     }
 
     auto self = shared_from_this();
@@ -671,7 +688,10 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                              client_fd_, service_name_, attempt_,
                              static_cast<int>(condition));
 
-        // Release old lease, clear callbacks, poison if tainted
+        // Release old lease, clear callbacks, poison if tainted.
+        // Cleanup also releases any retry token held by the previous
+        // retry attempt (attempt_ > 1) so the next TryConsumeRetry sees
+        // a fresh counter.
         Cleanup();
         codec_.Reset();
         // Re-apply request method after reset — llhttp_init() zeroes
@@ -679,6 +699,40 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
         // carry a body, causing the retried request to hang.
         codec_.SetRequestMethod(method_);
         poison_connection_ = false;
+
+        // Retry-budget gate. `attempt_ > 0` here is guaranteed — we
+        // just incremented. The budget bounds how many retries can be
+        // concurrently in flight against this upstream HOST (aggregated
+        // across all transactions for the service), preventing a retry
+        // storm from amplifying traffic to a struggling backend.
+        //
+        // Dry-run: log the would-reject but still proceed (consistent
+        // with REJECTED_OPEN_DRYRUN on the slice path). No token is
+        // consumed, so no ReleaseRetry is needed on the dry-run path.
+        //
+        // Full mode: deliver the §12.2 retry-budget response (503 +
+        // X-Retry-Budget-Exhausted) and terminate. Does NOT call
+        // ReportBreakerOutcome — our own reject must not feed back
+        // into the slice's failure math.
+        if (retry_budget_) {
+            bool is_dry_run = slice_ && slice_->config().dry_run;
+            if (retry_budget_->TryConsumeRetry()) {
+                retry_token_held_ = true;
+            } else if (is_dry_run) {
+                logging::Get()->info(
+                    "ProxyTransaction retry budget would-reject (dry-run) "
+                    "client_fd={} service={} attempt={}",
+                    client_fd_, service_name_, attempt_);
+            } else {
+                logging::Get()->warn(
+                    "ProxyTransaction retry budget exhausted "
+                    "client_fd={} service={} attempt={}",
+                    client_fd_, service_name_, attempt_);
+                state_ = State::FAILED;
+                DeliverResponse(MakeRetryBudgetResponse());
+                return;
+            }
+        }
 
         // Condition-dependent first-retry policy:
         // Connection-level failures (stale keep-alive, connect refused)
@@ -862,6 +916,12 @@ void ProxyTransaction::Cancel() {
 }
 
 void ProxyTransaction::Cleanup() {
+    // Release any retry-budget token held by the attempt that just
+    // ended. Must happen BEFORE the next TryConsumeRetry in MaybeRetry
+    // so the new attempt sees accurate retries_in_flight. Idempotent
+    // via the retry_token_held_ flag.
+    ReleaseRetryToken();
+
     if (lease_) {
         auto* conn = lease_.Get();
         if (conn) {
@@ -1164,6 +1224,13 @@ bool ProxyTransaction::ConsultBreaker() {
     // it; caller proceeds to the upstream. Fall through as admitted.
     // ADMITTED / ADMITTED_PROBE: proceed.
     return true;
+}
+
+void ProxyTransaction::ReleaseRetryToken() {
+    if (retry_token_held_ && retry_budget_) {
+        retry_budget_->ReleaseRetry();
+    }
+    retry_token_held_ = false;
 }
 
 void ProxyTransaction::ReleaseBreakerAdmissionNeutral() {
