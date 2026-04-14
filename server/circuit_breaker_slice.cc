@@ -62,6 +62,11 @@ std::chrono::nanoseconds CircuitBreakerSlice::ComputeOpenDuration() const {
     return std::chrono::milliseconds(scaled_ms);
 }
 
+int64_t CircuitBreakerSlice::NextOpenDurationMs() const {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        ComputeOpenDuration()).count();
+}
+
 bool CircuitBreakerSlice::ShouldTripClosed(
         std::chrono::steady_clock::time_point now) {
     if (consecutive_failures_ >= config_.consecutive_failure_threshold) {

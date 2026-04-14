@@ -833,30 +833,28 @@ void ProxyTransaction::Cancel() {
     // In INIT and CHECKOUT_PENDING no bytes have left the client side
     // toward the upstream yet, so the connection (if any) is still
     // clean and safe to return to the pool.
-    const bool upstream_exercised =
-        (state_ != State::INIT && state_ != State::CHECKOUT_PENDING);
-    if (upstream_exercised) {
+    if (state_ != State::INIT && state_ != State::CHECKOUT_PENDING) {
         poison_connection_ = true;
     }
-    // Release any held breaker admission before tearing down. Two paths:
-    //   * Pre-upstream (INIT / CHECKOUT_PENDING): upstream was never
-    //     touched — neutral release so a HALF_OPEN probe slot stays
-    //     eligible for replacement (matches ReportNeutral's design
-    //     contract: "the upstream wasn't actually exercised").
-    //   * Post-send (SENDING_REQUEST / AWAITING_RESPONSE / RECEIVING_BODY):
-    //     we poisoned the pooled connection, which from the upstream's
-    //     point of view is indistinguishable from a mid-flight disconnect.
-    //     Report as UPSTREAM_DISCONNECT so the probe counts against the
-    //     HALF_OPEN cycle (no replacement, re-trip on saw_failure drain)
-    //     and CLOSED-state accounting sees the disruption instead of
-    //     silently dropping a real signal.
-    // Both branches clear admission_generation_ internally, so late
-    // transport callbacks (if any) become no-ops.
-    if (upstream_exercised) {
-        ReportBreakerOutcome(RESULT_UPSTREAM_DISCONNECT);
-    } else {
-        ReleaseBreakerAdmissionNeutral();
-    }
+    // Release any held breaker admission neutrally. Cancel() is always
+    // a LOCAL termination — client disconnect, framework-level abort,
+    // H2 stream reset, etc. Even when we poisoned a pooled connection
+    // mid-request, counting that as an upstream-health failure would
+    // trip the breaker against a backend that may be perfectly healthy
+    // (browser cancels, user-initiated timeouts, etc. are all common
+    // causes). The reviewer guidance is explicit: client-initiated
+    // aborts must be neutral from the breaker's perspective.
+    //
+    // Trade-off: in HALF_OPEN, ReportNeutral on a probe decrements
+    // both inflight and admitted, so a cancelled probe makes the slot
+    // eligible for a replacement admission in the same cycle. That is
+    // the documented design contract of ReportNeutral ("the upstream
+    // wasn't actually exercised by this admission" from the breaker's
+    // decision-math point of view — we didn't observe a success or
+    // failure), and it is acceptable: probes that genuinely succeed
+    // or fail still close / re-trip the cycle normally, and a broken
+    // upstream under cancel-spam will still fail those real probes.
+    ReleaseBreakerAdmissionNeutral();
     // Release the upstream lease back to the pool (or destroy it if
     // poisoned) and clear transport callbacks so any in-flight upstream
     // bytes land harmlessly.
@@ -1060,9 +1058,18 @@ HttpResponse ProxyTransaction::MakeCircuitOpenResponse() const {
     // pressure" on dashboards.
     int retry_after_secs = 1;
     const char* breaker_label = "open";
+    // Absolute sanity ceiling — independent of config. Protects against
+    // ridiculous programmatic values that might slip past validation.
+    static constexpr int RETRY_AFTER_ABS_MAX_SECS = 3600;  // 1 hour
     if (slice_) {
         if (slice_->IsOpenDeadlineSet()) {
-            // True OPEN — Retry-After from actual deadline.
+            // True OPEN — Retry-After from the actual stored deadline.
+            // The deadline is authoritative: it's what the slice will
+            // actually honor, regardless of any subsequent config
+            // reload that might lower max_open_duration_ms. Clamping
+            // below the stored deadline would tell well-behaved clients
+            // to retry early and bounce on more 503s until the original
+            // deadline elapses.
             auto open_until = slice_->OpenUntil();
             auto now = std::chrono::steady_clock::now();
             auto ms_remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1070,28 +1077,24 @@ HttpResponse ProxyTransaction::MakeCircuitOpenResponse() const {
             // Ceiling-round to seconds so we never advertise a window
             // shorter than the actual remaining backoff.
             int64_t diff = (ms_remaining + 999) / 1000;
-            // Upper bound tracks the configured max_open_duration_ms
-            // (ceiling-rounded to avoid under-reporting non-second-
-            // aligned configs), with an absolute safety ceiling at
-            // 3600s.
-            long long cfg_ms = slice_->config().max_open_duration_ms;
-            int cfg_cap_secs = static_cast<int>(
-                std::max<long long>(1, (cfg_ms + 999) / 1000));
-            int upper = std::min(cfg_cap_secs, 3600);
             if (diff < 1) diff = 1;
-            if (diff > upper) diff = upper;
+            if (diff > RETRY_AFTER_ABS_MAX_SECS) diff = RETRY_AFTER_ABS_MAX_SECS;
             retry_after_secs = static_cast<int>(diff);
             breaker_label = "open";
         } else if (slice_->CurrentState() ==
                    circuit_breaker::State::HALF_OPEN) {
-            // HALF_OPEN reject — no deadline to read; hint the operator
-            // with a ceiled base_open_duration so retrying clients wait
-            // for at least the worst-case re-trip window instead of
-            // bouncing immediately on Retry-After=1.
-            long long base_ms = slice_->config().base_open_duration_ms;
+            // HALF_OPEN reject — no deadline to read. Hint with the
+            // NEXT expected open duration (base << consecutive_trips_,
+            // clamped by max_open_duration_ms) rather than base alone:
+            // after multiple trips, exponential backoff has already
+            // grown the OPEN window, and advertising bare base would
+            // tell clients to retry far earlier than the breaker will
+            // admit even in the worst case (probe cycle fails, slice
+            // re-trips into the larger backoff).
+            int64_t next_ms = slice_->NextOpenDurationMs();
             int hint = static_cast<int>(
-                std::max<long long>(1, (base_ms + 999) / 1000));
-            retry_after_secs = std::min(hint, 3600);
+                std::max<int64_t>(1, (next_ms + 999) / 1000));
+            retry_after_secs = std::min(hint, RETRY_AFTER_ABS_MAX_SECS);
             breaker_label = "half_open";
         }
         // Any other state (CLOSED): shouldn't reach here — ConsultBreaker

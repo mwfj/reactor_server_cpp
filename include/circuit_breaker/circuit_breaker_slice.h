@@ -146,6 +146,20 @@ public:
         return open_until_steady_ns_.load(std::memory_order_relaxed) > 0;
     }
 
+    // Expected next open-duration in milliseconds if the slice re-trips
+    // from its current state. Computed from base_open_duration_ms
+    // shifted by the current `consecutive_trips_` count and clamped by
+    // max_open_duration_ms. Used by the Retry-After hint path for
+    // HALF_OPEN rejections, where there's no stored deadline but the
+    // next OPEN window (if the probe cycle fails) will follow the
+    // exponential-backoff curve — base alone would under-report after
+    // multiple trips.
+    //
+    // Safe from any thread (atomic load of consecutive_trips_ + plain
+    // reads of config_ fields). Config fields are dispatcher-owned but
+    // a slightly-torn read is fine for an observability hint.
+    int64_t NextOpenDurationMs() const;
+
 private:
     // Logging label: "service=X host=Y:Z partition=N" built once.
     std::string host_label_;
