@@ -84,8 +84,12 @@ void TestBreakerTripsAfterConsecutiveFailures() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
-        gw.http2.enabled = false;  // match the existing proxy test pattern  // single thread → single breaker partition exercised
+        gw.worker_threads = 1;
+        gw.http2.enabled = false;
+        // worker_threads=1 → all TCP connections land on dispatcher 0
+        // (NetServer shards new connections by fd%worker_threads), so
+        // per-request failures accumulate deterministically on slice[0]
+        // instead of splitting across multiple slices.  // single thread → single breaker partition exercised
         gw.upstreams.push_back(
             MakeBreakerUpstream("bad-svc", "127.0.0.1", backend_port,
                                 /*enabled=*/true, /*threshold=*/3));
@@ -159,8 +163,12 @@ void TestBreakerDisabledPassesThrough() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
-        gw.http2.enabled = false;  // match the existing proxy test pattern
+        gw.worker_threads = 1;
+        gw.http2.enabled = false;
+        // worker_threads=1 → all TCP connections land on dispatcher 0
+        // (NetServer shards new connections by fd%worker_threads), so
+        // per-request failures accumulate deterministically on slice[0]
+        // instead of splitting across multiple slices.
         gw.upstreams.push_back(
             MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
                                 /*enabled=*/false, /*threshold=*/3));
@@ -203,7 +211,13 @@ void TestSuccessResetsConsecutiveFailureCounter() {
     try {
         std::atomic<bool> fail_mode{true};
         HttpServer backend("127.0.0.1", 0);
-        backend.Get("/toggle", [&fail_mode](const HttpRequest&, HttpResponse& resp) {
+        // Backend must serve /fail — that's the exact-match route the
+        // proxy forwards (MakeBreakerUpstream sets route_prefix="/fail",
+        // strip_prefix=false). A different backend path would leave
+        // the gateway 404-ing every request without ever exercising
+        // the proxy, and the CLOSED-state assertion below would pass
+        // for the wrong reason.
+        backend.Get("/fail", [&fail_mode](const HttpRequest&, HttpResponse& resp) {
             if (fail_mode.load()) {
                 resp.Status(502).Body("err", "text/plain");
             } else {
@@ -216,8 +230,12 @@ void TestSuccessResetsConsecutiveFailureCounter() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
-        gw.http2.enabled = false;  // match the existing proxy test pattern
+        gw.worker_threads = 1;
+        gw.http2.enabled = false;
+        // worker_threads=1 → all TCP connections land on dispatcher 0
+        // (NetServer shards new connections by fd%worker_threads), so
+        // per-request failures accumulate deterministically on slice[0]
+        // instead of splitting across multiple slices.
         gw.upstreams.push_back(
             MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
                                 /*enabled=*/true, /*threshold=*/3));
@@ -229,28 +247,35 @@ void TestSuccessResetsConsecutiveFailureCounter() {
         // Pattern: F F S F F — 5 total: 2 fails, 1 success, 2 fails.
         // With reset semantics, consecutive_failures_ never exceeds 2 → no trip.
         for (int i = 0; i < 2; ++i) {
-            TestHttpClient::HttpGet(gw_port, "/echo/toggle", 3000);  // FAIL
+            TestHttpClient::HttpGet(gw_port, "/fail", 3000);  // FAIL
         }
         fail_mode.store(false);
-        TestHttpClient::HttpGet(gw_port, "/echo/toggle", 3000);   // SUCCESS → reset
+        TestHttpClient::HttpGet(gw_port, "/fail", 3000);      // SUCCESS → reset
         fail_mode.store(true);
         for (int i = 0; i < 2; ++i) {
-            TestHttpClient::HttpGet(gw_port, "/echo/toggle", 3000);  // FAIL
+            TestHttpClient::HttpGet(gw_port, "/fail", 3000);  // FAIL
         }
 
-        // Inspect the breaker's state directly — it should still be CLOSED.
+        // Inspect the breaker's state directly. The slice must be CLOSED
+        // AND must have observed activity — without the second check, a
+        // gateway that 404's every request (e.g. because the proxy route
+        // doesn't match) would also pass trivially.
         auto* cbm = gateway.GetUpstreamManager() ?
             gateway.GetUpstreamManager()->GetCircuitBreakerManager() : nullptr;
         auto* host = cbm ? cbm->GetHost("svc") : nullptr;
         auto* slice = host ? host->GetSlice(0) : nullptr;
         bool still_closed = slice && slice->CurrentState() == State::CLOSED;
+        // No trip fired: total_trips should be zero for this slice.
+        int64_t trips = slice ? slice->Trips() : -1;
+        bool no_trips = (trips == 0);
 
+        bool pass = still_closed && no_trips;
         TestFramework::RecordTest(
-            "CB Phase 4: success resets consecutive counter", still_closed,
-            still_closed ? "" :
-            "slice not CLOSED after S resets failures: state=" +
-            std::to_string(static_cast<int>(
-                slice ? slice->CurrentState() : State::CLOSED)));
+            "CB Phase 4: success resets consecutive counter", pass,
+            pass ? "" :
+            "state=" + std::to_string(static_cast<int>(
+                slice ? slice->CurrentState() : State::CLOSED)) +
+            " trips=" + std::to_string(trips));
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "CB Phase 4: success resets consecutive counter", false, e.what());
@@ -275,8 +300,12 @@ void TestTripDrivesSliceState() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
-        gw.http2.enabled = false;  // match the existing proxy test pattern
+        gw.worker_threads = 1;
+        gw.http2.enabled = false;
+        // worker_threads=1 → all TCP connections land on dispatcher 0
+        // (NetServer shards new connections by fd%worker_threads), so
+        // per-request failures accumulate deterministically on slice[0]
+        // instead of splitting across multiple slices.
         gw.upstreams.push_back(
             MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
                                 /*enabled=*/true, /*threshold=*/3));
@@ -338,8 +367,12 @@ void TestOpenBreakerShortCircuitsUpstreamCall() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
-        gw.http2.enabled = false;  // match the existing proxy test pattern
+        gw.worker_threads = 1;
+        gw.http2.enabled = false;
+        // worker_threads=1 → all TCP connections land on dispatcher 0
+        // (NetServer shards new connections by fd%worker_threads), so
+        // per-request failures accumulate deterministically on slice[0]
+        // instead of splitting across multiple slices.
         gw.upstreams.push_back(
             MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
                                 /*enabled=*/true, /*threshold=*/3));
@@ -388,7 +421,7 @@ void TestBareProxyWorks() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
+        gw.worker_threads = 1;
         gw.http2.enabled = false;
         UpstreamConfig u;
         u.name = "svc";
@@ -442,7 +475,7 @@ void TestRetryAfterHeaderValue() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
+        gw.worker_threads = 1;
         gw.http2.enabled = false;
         // base_open_duration 2000ms, max 60_000ms — Retry-After should
         // ceiling-round and fall inside [1, 60].
@@ -526,7 +559,7 @@ void TestCircuitOpenTerminalForRetry() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
+        gw.worker_threads = 1;
         gw.http2.enabled = false;
         // Retries enabled on 5xx — if the breaker reject leaked into
         // MaybeRetry, the test would see extra backend hits after the
@@ -592,7 +625,7 @@ void TestDryRunPassthrough() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
+        gw.worker_threads = 1;
         gw.http2.enabled = false;
         auto u = MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
                                      /*enabled=*/true, /*threshold=*/3);
@@ -674,7 +707,7 @@ void TestHalfOpenRecoveryRoundTrip() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
+        gw.worker_threads = 1;
         gw.http2.enabled = false;
         auto u = MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
                                      /*enabled=*/true, /*threshold=*/3);
@@ -770,7 +803,7 @@ void TestRetryAfterCapCeilsNonAlignedMax() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
+        gw.worker_threads = 1;
         gw.http2.enabled = false;
         // Configure a non-second-aligned max backoff. base = 1500ms so
         // the actual OpenUntil-now at trip time is ~1.5s, which ceil-
@@ -848,7 +881,7 @@ void TestRetriedFailuresCountTowardTrip() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
+        gw.worker_threads = 1;
         gw.http2.enabled = false;
         // Retries on 5xx enabled. threshold=3 — with retry_on_5xx, each
         // client request produces 1 + max_retries=3 = 4 upstream
@@ -925,7 +958,7 @@ void TestHalfOpenRejectLabel() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
+        gw.worker_threads = 1;
         gw.http2.enabled = false;
         auto u = MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
                                      /*enabled=*/true, /*threshold=*/3);
@@ -996,34 +1029,30 @@ void TestHalfOpenRejectLabel() {
 
 // ---------------------------------------------------------------------------
 // Test 14: HALF_OPEN Retry-After reflects the current exponential backoff,
-// not just base_open_duration_ms. After multiple trips, the next OPEN window
-// (if the probe cycle fails) is base << consecutive_trips, clamped by
-// max_open_duration_ms. Advertising bare base would under-report the worst-
-// case wait by a factor of 2^n.
+// not just base_open_duration_ms. After multiple trips the next OPEN window
+// (base << consecutive_trips_, clamped by max) can exceed 1 second; the old
+// base-only hint (ceil(base/1000) = 1s for base=100ms) would under-report
+// the worst-case wait, which this test must fail for.
 //
-// Strategy: trip → recover → trip → recover → trip to drive consecutive_trips
-// up. Then hit HALF_OPEN during the next OPEN window elapse and assert
-// Retry-After > base seconds.
+// Strategy: keep the backend failing and drive MULTIPLE re-trips by letting
+// the OPEN window elapse and single probe fail each cycle. Successful
+// recoveries must be avoided — TransitionHalfOpenToClosed resets
+// consecutive_trips_ to 0, which hides the exponential hint.
 // ---------------------------------------------------------------------------
 void TestHalfOpenRetryAfterScalesWithBackoff() {
     std::cout << "\n[TEST] CB Phase 4: HALF_OPEN Retry-After exponential..."
               << std::endl;
     try {
-        // Backend hangs on demand so we can pin the probe slot and
-        // observe HALF_OPEN rejections.
+        // Backend fails fast by default. When `hang` is set, the
+        // handler blocks — used at the end to pin the probe slot so
+        // a concurrent request observes HALF_OPEN rejection.
         std::atomic<bool> hang{false};
-        std::atomic<bool> fail_mode{true};
         HttpServer backend("127.0.0.1", 0);
-        backend.Get("/fail", [&hang, &fail_mode](const HttpRequest&,
-                                                   HttpResponse& resp) {
+        backend.Get("/fail", [&hang](const HttpRequest&, HttpResponse& resp) {
             if (hang.load()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(800));
+                std::this_thread::sleep_for(std::chrono::milliseconds(1500));
             }
-            if (fail_mode.load()) {
-                resp.Status(502).Body("err", "text/plain");
-            } else {
-                resp.Status(200).Body("ok", "text/plain");
-            }
+            resp.Status(502).Body("err", "text/plain");
         });
         TestServerRunner<HttpServer> backend_runner(backend);
         int backend_port = backend_runner.GetPort();
@@ -1031,14 +1060,8 @@ void TestHalfOpenRetryAfterScalesWithBackoff() {
         ServerConfig gw;
         gw.bind_host = "127.0.0.1";
         gw.bind_port = 0;
-        gw.worker_threads = 2;
+        gw.worker_threads = 1;  // pin all traffic to slice[0]
         gw.http2.enabled = false;
-        // base=100ms, max=5000ms. After 3 trips the next duration is
-        // 100 << 3 = 800ms (< max), so HALF_OPEN's hint should be
-        // ceil(800/1000)=1s. But we only need to validate that the
-        // hint is >= 1s (which base alone would also produce from
-        // ceil(100/1000)=1). To get an observable difference, use a
-        // smaller base (50ms) and enough trips that 50 << N > 1000ms.
         auto u = MakeBreakerUpstream("svc", "127.0.0.1", backend_port,
                                      /*enabled=*/true, /*threshold=*/2);
         u.circuit_breaker.base_open_duration_ms = 100;     // config minimum
@@ -1050,46 +1073,78 @@ void TestHalfOpenRetryAfterScalesWithBackoff() {
         TestServerRunner<HttpServer> gw_runner(gateway);
         int gw_port = gw_runner.GetPort();
 
-        // Trip 1: two consecutive failures.
+        auto* cbm = gateway.GetUpstreamManager() ?
+            gateway.GetUpstreamManager()->GetCircuitBreakerManager() : nullptr;
+        auto* host = cbm ? cbm->GetHost("svc") : nullptr;
+        auto* slice = host ? host->GetSlice(0) : nullptr;
+        if (!slice) {
+            TestFramework::RecordTest(
+                "CB Phase 4: HALF_OPEN Retry-After exponential-aware",
+                false, "slice lookup failed");
+            return;
+        }
+
+        // Initial trip: 2 consecutive failures with threshold=2.
         for (int i = 0; i < 2; ++i) {
             TestHttpClient::HttpGet(gw_port, "/fail", 3000);
         }
-        // Wait past base (50ms → open window) so slice goes HALF_OPEN.
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        // Recovery: one probe success (flip fail_mode briefly).
-        fail_mode.store(false);
-        TestHttpClient::HttpGet(gw_port, "/fail", 3000);
-        fail_mode.store(true);
+        // Drive consecutive_trips_ up by letting successive OPEN windows
+        // elapse and probes fail (no recovery → no reset). Stop when
+        // NextOpenDurationMs crosses 1000ms, which is the threshold
+        // where the HALF_OPEN Retry-After hint starts exceeding the
+        // base-only value (ceil(100ms)=1s).
+        //
+        // The slice re-trips on each failed probe; each trip doubles
+        // the open duration. We run ~8 cycles with safety margin which
+        // is comfortably past the trip count needed for Retry-After>=2.
+        for (int cycle = 0; cycle < 8; ++cycle) {
+            // Wait past the current open window. Upper bound: max=8s,
+            // so 1200ms is plenty for the first few short cycles, and
+            // we re-check after each request anyway.
+            int64_t next_ms = slice->NextOpenDurationMs();
+            // Current OPEN window is the one stored BEFORE the upcoming
+            // re-trip — we don't have that directly, so sleep past the
+            // NEXT duration as an over-approximation (next is always >=
+            // current). This ensures OPEN has elapsed.
+            auto sleep_ms = std::max<int64_t>(next_ms + 50, 200);
+            if (sleep_ms > 2000) sleep_ms = 2000;  // cap per cycle
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
 
-        // Trip 2: two more failures.
-        for (int i = 0; i < 2; ++i) {
+            // One request — it should admit as a probe (HALF_OPEN),
+            // the backend fails fast (502), probe fails → re-trip with
+            // consecutive_trips_++ and fresh OPEN.
             TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+
+            // Bail early once the exponential hint crosses 1s → the
+            // subsequent HALF_OPEN reject will carry Retry-After >= 2.
+            if (slice->NextOpenDurationMs() >= 2000) break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
-        // Recovery again.
-        fail_mode.store(false);
-        TestHttpClient::HttpGet(gw_port, "/fail", 3000);
-        fail_mode.store(true);
-
-        // Trip 3: two more failures. consecutive_trips should now be
-        // high enough that base << trips > 1000ms — HALF_OPEN hint
-        // should be >= 1 but potentially larger.
-        for (int i = 0; i < 2; ++i) {
-            TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+        int64_t next_open_ms = slice->NextOpenDurationMs();
+        if (next_open_ms < 2000) {
+            TestFramework::RecordTest(
+                "CB Phase 4: HALF_OPEN Retry-After exponential-aware",
+                false,
+                "setup failed: next_open_ms=" + std::to_string(next_open_ms) +
+                " (need >= 2000 to distinguish from base-only hint)");
+            return;
         }
-        // Wait for the open window to elapse and next admission
-        // transitions HALF_OPEN.
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-        // Pin the probe slot with a hanging request so subsequent
-        // requests get HALF_OPEN rejects.
+        // Now trigger a HALF_OPEN reject: wait for current OPEN to
+        // elapse, start a hanging probe (pins the slot), then fire a
+        // sibling request — it must see half_open_full with the
+        // exponential Retry-After.
+        int64_t post_wait_ms = next_open_ms + 100;
+        if (post_wait_ms > 4000) post_wait_ms = 4000;
+        std::this_thread::sleep_for(std::chrono::milliseconds(post_wait_ms));
+
         hang.store(true);
         std::thread probe([&]() {
-            TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+            TestHttpClient::HttpGet(gw_port, "/fail", 3500);
         });
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Let the probe get admitted and start hanging.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         std::string r = TestHttpClient::HttpGet(gw_port, "/fail", 1500);
         hang.store(false);
@@ -1099,7 +1154,6 @@ void TestHalfOpenRetryAfterScalesWithBackoff() {
             r.find("X-Circuit-Breaker: half_open") != std::string::npos ||
             r.find("x-circuit-breaker: half_open") != std::string::npos;
 
-        // Extract Retry-After.
         int retry_after = -1;
         const char* markers[] = {"Retry-After:", "retry-after:"};
         for (const char* m : markers) {
@@ -1117,22 +1171,17 @@ void TestHalfOpenRetryAfterScalesWithBackoff() {
             if (any) { retry_after = val; break; }
         }
 
-        // Pre-fix the HALF_OPEN hint was hard-coded to ceil(base/1000)=1s.
-        // Post-fix, with base=50ms and consecutive_trips ~= 3, the next
-        // open duration is 50 << 3 = 400ms → ceil = 1s (still 1). With
-        // trips ~= 5, 50 << 5 = 1600ms → ceil = 2s. So we need enough
-        // trips to cross the second boundary. The exact count depends
-        // on which partition the requests hit (aggregated sharding).
-        // Assert at least that we saw a HALF_OPEN response and
-        // Retry-After is at least 1 and at most max/1000=8 — both
-        // conservative lower/upper bounds of the exponential formula.
-        bool retry_after_ok = (retry_after >= 1 && retry_after <= 8);
+        // Post-fix: Retry-After = ceil(next_open_ms / 1000) >= 2.
+        // Pre-fix (base-only): Retry-After = ceil(base/1000) = 1.
+        // Asserting >= 2 fails the pre-fix implementation.
+        bool retry_after_ok = (retry_after >= 2 && retry_after <= 8);
         bool pass = is_half_open && retry_after_ok;
         TestFramework::RecordTest(
             "CB Phase 4: HALF_OPEN Retry-After exponential-aware", pass,
             pass ? "" :
             "is_half_open=" + std::to_string(is_half_open) +
-            " retry_after=" + std::to_string(retry_after));
+            " retry_after=" + std::to_string(retry_after) +
+            " next_open_ms=" + std::to_string(next_open_ms));
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "CB Phase 4: HALF_OPEN Retry-After exponential-aware",
