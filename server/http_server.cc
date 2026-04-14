@@ -2430,6 +2430,24 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         HttpRequest get_req = request;
                         get_req.method = "GET";
                         async_handler(get_req, send_interim, push_resource, std::move(complete));
+                        // Propagate request-scoped overrides the handler
+                        // may have written to the clone back to the
+                        // live request object. Only fields handlers are
+                        // allowed to mutate (via `mutable` qualifier)
+                        // need this: async_cap_sec_override is an int
+                        // with value-semantics, so a clone diverges
+                        // silently; async_cancel_slot is a shared_ptr
+                        // that already points to shared storage across
+                        // copies so the assignment through *slot is
+                        // observed by both. Without this copy-back,
+                        // ProxyHandler's response_timeout_ms=0 opt-out
+                        // (which sets async_cap_sec_override=0 to
+                        // disable the global safety cap for that
+                        // request) is lost on HEAD→GET fallback, and
+                        // long-lived proxied HEAD requests get
+                        // prematurely 504'd by the async heartbeat.
+                        request.async_cap_sec_override =
+                            get_req.async_cap_sec_override;
                     } else {
                         async_handler(request, send_interim, push_resource, std::move(complete));
                     }
@@ -3258,6 +3276,18 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         HttpRequest get_req = request;
                         get_req.method = "GET";
                         async_handler(get_req, send_interim, push_resource, std::move(complete));
+                        // Propagate handler-written request-scoped state
+                        // back to the live request (same rationale as
+                        // the H1 HEAD-fallback path): the value-type
+                        // async_cap_sec_override would otherwise diverge
+                        // silently and Http2ConnectionHandler's
+                        // ResetExpiredStreams would read the default -1
+                        // from the stream's original request, applying
+                        // the global async cap and 504'ing proxied HEAD
+                        // requests whose upstream response_timeout_ms
+                        // is explicitly 0 (unbounded).
+                        request.async_cap_sec_override =
+                            get_req.async_cap_sec_override;
                     } else {
                         async_handler(request, send_interim, push_resource, std::move(complete));
                     }
