@@ -154,7 +154,8 @@ struct CircuitBreakerConfig {
 
     // Retry budget (orthogonal to the breaker). Caps concurrent retries to
     // max(retry_budget_min_concurrency, in_flight * retry_budget_percent/100).
-    // Wired into the request path in Phase 5; in Phase 3 these are read by
+    // Wired into the request path via ProxyTransaction's retry-budget
+    // gate in MaybeRetry; also read by
     // CircuitBreakerHost to construct its owned RetryBudget.
     int retry_budget_percent = 20;
     int retry_budget_min_concurrency = 3;
@@ -185,20 +186,19 @@ struct UpstreamConfig {
     ProxyConfig proxy;
     CircuitBreakerConfig circuit_breaker;
 
-    // Includes circuit_breaker until Phase 8 ships CircuitBreakerManager::Reload.
-    // A CB-only SIGHUP currently has no propagation path into live slice state,
-    // so operator== must return false to trigger the "restart required" warning
-    // rather than silently committing the new config object while the live slices
-    // continue running with the old settings.
+    // Excludes `circuit_breaker` — breaker fields are live-reloadable via
+    // `CircuitBreakerManager::Reload`, which `HttpServer::Reload` invokes on
+    // every reload. Topology fields (name, host, port, tls, pool,
+    // proxy) remain restart-only; a mismatch here triggers the
+    // "restart required" warning in the outer reload.
     //
-    // TODO(phase-8): once CircuitBreakerManager::Reload is wired into
-    // HttpServer::Reload, remove circuit_breaker from this operator and diff it
-    // separately (per-host CircuitBreakerConfig comparison) so breaker-only
-    // edits are hot-reloadable without a restart.
+    // Contract: a config pair that differs ONLY in circuit_breaker fields
+    // must compare EQUAL so the outer reload doesn't fire a spurious warn.
+    // Any future field whose propagation path is wired into a live
+    // `*Manager::Reload` should be removed from this operator symmetrically.
     bool operator==(const UpstreamConfig& o) const {
         return name == o.name && host == o.host && port == o.port &&
-               tls == o.tls && pool == o.pool && proxy == o.proxy &&
-               circuit_breaker == o.circuit_breaker;
+               tls == o.tls && pool == o.pool && proxy == o.proxy;
     }
     bool operator!=(const UpstreamConfig& o) const { return !(*this == o); }
 };

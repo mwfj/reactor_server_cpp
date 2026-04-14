@@ -97,7 +97,7 @@ public:
     // across partitions — callers that need partition-specific behavior
     // can read `slice->dispatcher_index()` inside the callback.
     // Must be called before live traffic; thread-safety depends on
-    // slice-dispatcher affinity at the Reload layer (Phase 8 wires this).
+    // slice-dispatcher affinity at the Reload layer.
     void SetTransitionCallbackOnAllSlices(StateTransitionCallback cb);
 
     // Accessors.

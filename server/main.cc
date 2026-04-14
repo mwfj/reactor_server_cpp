@@ -435,7 +435,7 @@ static bool ReloadConfig(const std::string& config_path,
     // server keeps running the startup values — /stats and other
     // current_config consumers would report phantom state, and subsequent
     // identical reloads could produce inconsistent diagnostics. Pin to
-    // the running values until Phase 8 implements
+    // the running values until CircuitBreakerManager::Reload implements
     // CircuitBreakerManager::Reload (the only upstream sub-field that
     // becomes hot-reloadable); at that point this save becomes a
     // partial-field save excluding circuit_breaker.

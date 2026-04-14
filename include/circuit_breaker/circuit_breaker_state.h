@@ -51,7 +51,7 @@ enum class FailureKind : uint8_t {
 // `trigger` is a short static string such as "consecutive" / "rate" /
 // "probe_success" / "probe_fail" / "open_elapsed" for logging.
 //
-// TODO(phase-7): once a snapshot / admin JSON endpoint lands, convert
+// TODO(post-v1): once a snapshot / admin JSON endpoint lands, convert
 // `trigger` to an `enum class TransitionTrigger` so the valid set is
 // compile-time checked rather than string-compared. See design doc §15.8.
 using StateTransitionCallback =

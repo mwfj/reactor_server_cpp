@@ -3454,12 +3454,40 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         rate_limit_manager_->Reload(new_config.rate_limit);
     }
 
-    // Upstream pool changes require a restart — pools are built once in Start()
-    // and cannot be rebuilt at runtime without a full drain cycle.
-    if (new_config.upstreams != upstream_configs_) {
-        logging::Get()->warn("Reload: upstream configuration changes require a "
-                             "restart to take effect (ignored)");
+    // Circuit breaker reload — live-propagates breaker-field edits on
+    // existing upstream services. CircuitBreakerManager::Reload is
+    // idempotent (atomic stores to unchanged values), so calling it
+    // unconditionally costs nothing when the operator didn't edit any
+    // breaker fields. Topology changes (added / removed service names)
+    // are logged as warn + skipped inside the manager; the outer
+    // restart-required warning still fires via the upstreams-inequality
+    // check below. After this call, update the breaker slices on every
+    // partition via per-dispatcher EnQueue — the manager handles that
+    // routing internally. The topology check itself now only diffs non-
+    // breaker fields (UpstreamConfig::operator== excludes circuit_breaker),
+    // so a CB-only SIGHUP is a clean hot reload with no spurious warn.
+    if (circuit_breaker_manager_) {
+        circuit_breaker_manager_->Reload(new_config.upstreams);
     }
+
+    // Upstream topology changes (host/port/pool/proxy/tls) require a
+    // restart — pools are built once in Start() and cannot be rebuilt
+    // at runtime without a full drain cycle. The equality operator on
+    // UpstreamConfig deliberately excludes `circuit_breaker` so a CB-
+    // only edit doesn't trigger this warning (the reload above already
+    // applied the new breaker settings to live slices).
+    if (new_config.upstreams != upstream_configs_) {
+        logging::Get()->warn("Reload: upstream topology changes require a "
+                             "restart to take effect (circuit-breaker "
+                             "field edits, if any, were applied live)");
+    }
+
+    // Persist the new upstreams (preserving the breaker propagation just
+    // applied). Subsequent reloads diff against this baseline, so without
+    // this update a second SIGHUP would re-propagate the same CB values
+    // and also see the original topology as "unchanged" rather than the
+    // attempted new state — confusing operators debugging reload behavior.
+    upstream_configs_ = new_config.upstreams;
 
     return true;
 }

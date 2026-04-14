@@ -134,7 +134,7 @@ void CircuitBreakerSlice::TripClosedToOpen(const char* trigger) {
 void CircuitBreakerSlice::TransitionOpenToHalfOpen() {
     state_.store(State::HALF_OPEN, std::memory_order_release);
     // Clear open_until_steady_ns_ per the OpenUntil() contract ("zero when
-    // not OPEN"). Leaving a stale deadline here would cause Phase 4's
+    // not OPEN"). Leaving a stale deadline here would cause
     // ProxyTransaction::MakeCircuitOpenResponse to compute a Retry-After
     // from a past time_point (negative delta → floor at 1s, misleading for
     // a reject in the HALF_OPEN probe-budget-full path). Retry-After for
@@ -384,7 +384,7 @@ void CircuitBreakerSlice::ReportSuccess(bool probe,
         // Stale probe defense: we admitted this probe in HALF_OPEN, but the
         // slice may have transitioned out (e.g., `Reload()` flipped enabled,
         // `TransitionHalfOpenToClosed` already fired on sibling probes, or —
-        // post-Phase 8 — an operator toggle transitioned us to CLOSED).
+        // operator toggle transitioned us to CLOSED via Reload().
         // Only touch HALF_OPEN bookkeeping / fire transitions when state is
         // STILL HALF_OPEN.
         if (state_.load(std::memory_order_acquire) != State::HALF_OPEN) return;
@@ -581,7 +581,8 @@ void CircuitBreakerSlice::Reload(const CircuitBreakerConfig& new_config) {
         // Silent reset — no transition callback. The change is operator-
         // initiated configuration, not a runtime state signal; firing the
         // callback would cause PoolPartition::DrainWaitQueueOnTrip-style
-        // consumers (Phase 6) to spuriously drain waiters on a config edit.
+        // consumers (the wait-queue drain transition callback) to spuriously
+        // drain waiters on a config edit.
         state_.store(State::CLOSED, std::memory_order_release);
         open_until_steady_ns_.store(0, std::memory_order_release);
         consecutive_trips_.store(0, std::memory_order_relaxed);

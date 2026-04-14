@@ -114,8 +114,8 @@ void ProxyTransaction::Start() {
                           method_, upstream_path);
 
     // Resolve the circuit-breaker slice once. Null when no breaker is
-    // attached (server has no upstreams configured, or Phase 4 skipped
-    // on this deployment), or when the service/dispatcher pair is out of
+    // attached (server has no upstreams configured), or when the
+    // service/dispatcher pair is out of
     // range. In any null case the breaker is simply bypassed — the
     // transaction proceeds as if circuit breaking were disabled.
     if (upstream_manager_ && dispatcher_index_ >= 0) {
@@ -277,7 +277,8 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
     // (POOL_EXHAUSTED, QUEUE_TIMEOUT) and shutdown should fail fast —
     // retrying under backpressure amplifies load on an already-stressed
     // pool and stretches client latency with no benefit. A breaker-drain
-    // reject (CHECKOUT_CIRCUIT_OPEN, Phase 6) is also terminal: the
+    // reject (CHECKOUT_CIRCUIT_OPEN from the wait-queue drain) is also
+    // terminal: the
     // client gets the same circuit-open response a fresh requester
     // would, and the retry loop must not retry it.
     //
@@ -301,7 +302,7 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
 
     if (error_code == CIRCUIT_OPEN) {
         // Drain path: breaker tripped while this transaction was queued
-        // (Phase 6 implements the drain). Do NOT Report to the slice —
+        // Do NOT Report to the slice —
         // our own reject must not feed back into the failure math. Emit
         // the §12.1 circuit-open response directly.
         logging::Get()->info(

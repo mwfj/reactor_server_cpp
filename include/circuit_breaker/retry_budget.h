@@ -32,7 +32,7 @@ namespace circuit_breaker {
 // relaxed — snapshots can be slightly stale, which is fine for a
 // capacity gate on a retry storm.
 //
-// Usage (Phase 5 wires this in):
+// Usage:
 //   1. On every attempt (first or retry), call TrackInFlight() and keep
 //      the returned guard alive until the attempt completes. The guard
 //      decrements in_flight_ in its destructor.

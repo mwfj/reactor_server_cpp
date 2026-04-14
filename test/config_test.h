@@ -562,14 +562,15 @@ namespace ConfigTests {
             "circuit_breaker.enabled must be a boolean");
     }
 
-    // Test 14: UpstreamConfig::operator== INCLUDES circuit_breaker until Phase 8.
-    // Until CircuitBreakerManager::Reload is wired in HttpServer::Reload, a
-    // CB-only SIGHUP has no propagation path. Keeping circuit_breaker in the
-    // equality check ensures the server fires the "restart required" warning
-    // rather than silently reporting "reload OK" with stale live settings.
-    // TODO(phase-8): flip this test when CB hot-reload is implemented.
+    // UpstreamConfig::operator== EXCLUDES circuit_breaker.
+    // CircuitBreakerManager::Reload is wired in HttpServer::Reload, so a
+    // CB-only SIGHUP is a clean hot reload. Excluding circuit_breaker from
+    // the equality check ensures the outer reload doesn't fire a spurious
+    // "restart required" warning on a pure CB-fields edit.
+    // Topology fields (name, host, port, tls, pool, proxy) remain
+    // restart-only and must still trigger inequality.
     void TestCircuitBreakerEquality() {
-        std::cout << "\n[TEST] Circuit Breaker Equality (CB included until Phase 8)..." << std::endl;
+        std::cout << "\n[TEST] Circuit Breaker Equality (CB excluded from UpstreamConfig::operator==)..." << std::endl;
         try {
             UpstreamConfig a;
             a.name = "svc"; a.host = "h"; a.port = 80;
@@ -578,16 +579,17 @@ namespace ConfigTests {
             // Default equal.
             bool equal_default = (a == b);
 
-            // Circuit-breaker-only edit DOES change UpstreamConfig equality
-            // (until Phase 8 ships the live-reload path).
+            // Circuit-breaker-only edit must NOT break equality — breaker
+            // fields are live-reloadable via CircuitBreakerManager::Reload.
             b.circuit_breaker.enabled = true;
             b.circuit_breaker.window_seconds = 30;
-            bool cb_edit_detected = (a != b);
+            bool cb_edit_invisible = (a == b);
 
-            // CircuitBreakerConfig::operator== agrees on the field diff.
+            // CircuitBreakerConfig::operator== still detects the field diff
+            // (CircuitBreakerManager::Reload relies on this inner comparison).
             bool cb_fields_differ = (a.circuit_breaker != b.circuit_breaker);
 
-            // Topology changes also make configs unequal.
+            // Topology changes still make configs unequal.
             UpstreamConfig c = a;
             c.host = "different";
             bool topology_changed = (a != c);
@@ -596,20 +598,20 @@ namespace ConfigTests {
             d.port = 9999;
             bool port_change_detected = (a != d);
 
-            bool pass = equal_default && cb_edit_detected &&
+            bool pass = equal_default && cb_edit_invisible &&
                         cb_fields_differ && topology_changed &&
                         port_change_detected;
-            TestFramework::RecordTest("Circuit Breaker Equality (CB included until Phase 8)",
+            TestFramework::RecordTest("Circuit Breaker Equality (CB excluded from UpstreamConfig::operator==)",
                 pass,
                 pass ? "" :
                 "equal_default=" + std::to_string(equal_default) +
-                " cb_edit_detected=" + std::to_string(cb_edit_detected) +
+                " cb_edit_invisible=" + std::to_string(cb_edit_invisible) +
                 " cb_fields_differ=" + std::to_string(cb_fields_differ) +
                 " topology_changed=" + std::to_string(topology_changed) +
                 " port_change_detected=" + std::to_string(port_change_detected),
                 TestFramework::TestCategory::OTHER);
         } catch (const std::exception& e) {
-            TestFramework::RecordTest("Circuit Breaker Equality (CB included until Phase 8)",
+            TestFramework::RecordTest("Circuit Breaker Equality (CB excluded from UpstreamConfig::operator==)",
                 false, e.what(), TestFramework::TestCategory::OTHER);
         }
     }
@@ -629,7 +631,7 @@ namespace ConfigTests {
         TestEnvOverrides();
         TestMissingFile();
 
-        // Phase 1: Circuit breaker config
+        // Circuit breaker config tests
         TestCircuitBreakerDefaults();
         TestCircuitBreakerJsonParse();
         TestCircuitBreakerJsonPartial();

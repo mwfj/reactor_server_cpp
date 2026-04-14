@@ -14,11 +14,12 @@
 #include "proxy_test.h"
 #include "rate_limit_test.h"
 #include "circuit_breaker_test.h"
-#include "circuit_breaker_phase3_test.h"
-#include "circuit_breaker_phase4_test.h"
-#include "circuit_breaker_phase5_test.h"
-#include "circuit_breaker_phase6_test.h"
-#include "circuit_breaker_phase7_test.h"
+#include "circuit_breaker_components_test.h"
+#include "circuit_breaker_integration_test.h"
+#include "circuit_breaker_retry_budget_test.h"
+#include "circuit_breaker_wait_queue_drain_test.h"
+#include "circuit_breaker_observability_test.h"
+#include "circuit_breaker_reload_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -86,21 +87,24 @@ void RunAllTest(){
     // Run circuit breaker tests
     CircuitBreakerTests::RunAllTests();
 
-    // Run circuit breaker Phase 3 tests (host / manager / retry budget)
-    CircuitBreakerPhase3Tests::RunAllTests();
+    // Run circuit-breaker component unit tests (RetryBudget / Host / Manager)
+    CircuitBreakerComponentsTests::RunAllTests();
 
-    // Run circuit breaker Phase 4 integration tests (end-to-end through
+    // Run circuit-breaker integration tests (end-to-end through
     // ProxyTransaction + UpstreamManager + HttpServer)
-    CircuitBreakerPhase4Tests::RunAllTests();
+    CircuitBreakerIntegrationTests::RunAllTests();
 
-    // Run circuit breaker Phase 5 retry-budget integration tests
-    CircuitBreakerPhase5Tests::RunAllTests();
+    // Run circuit-breaker retry-budget integration tests
+    CircuitBreakerRetryBudgetTests::RunAllTests();
 
-    // Run circuit breaker Phase 6 wait-queue-drain-on-trip tests
-    CircuitBreakerPhase6Tests::RunAllTests();
+    // Run circuit-breaker wait-queue-drain-on-trip tests
+    CircuitBreakerWaitQueueDrainTests::RunAllTests();
 
-    // Run circuit breaker Phase 7 observability tests
-    CircuitBreakerPhase7Tests::RunAllTests();
+    // Run circuit-breaker observability tests
+    CircuitBreakerObservabilityTests::RunAllTests();
+
+    // Run circuit-breaker hot-reload tests
+    CircuitBreakerReloadTests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;
 }
@@ -180,14 +184,15 @@ int main(int argc, char* argv[]) {
         // Run rate limit tests
         }else if(mode == "rate_limit" || mode == "-L"){
             RateLimitTests::RunAllTests();
-        // Run circuit breaker tests (phases 1-7: unit + phase3 + phase4 + phase5 + phase6 + phase7)
+        // Run circuit-breaker tests (unit + components + integration + retry-budget + drain + observability + reload)
         }else if(mode == "circuit_breaker" || mode == "-B"){
             CircuitBreakerTests::RunAllTests();
-            CircuitBreakerPhase3Tests::RunAllTests();
-            CircuitBreakerPhase4Tests::RunAllTests();
-            CircuitBreakerPhase5Tests::RunAllTests();
-            CircuitBreakerPhase6Tests::RunAllTests();
-            CircuitBreakerPhase7Tests::RunAllTests();
+            CircuitBreakerComponentsTests::RunAllTests();
+            CircuitBreakerIntegrationTests::RunAllTests();
+            CircuitBreakerRetryBudgetTests::RunAllTests();
+            CircuitBreakerWaitQueueDrainTests::RunAllTests();
+            CircuitBreakerObservabilityTests::RunAllTests();
+            CircuitBreakerReloadTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

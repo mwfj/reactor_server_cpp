@@ -732,7 +732,7 @@ void TestHalfOpenStopsAdmittingAfterFirstProbeFailure() {
 }
 
 // Verifies the dedicated HALF_OPEN-full counter is bumped separately from the
-// generic `rejected_` counter, so Phase 7 snapshots can distinguish
+// generic `rejected_` counter, so observability snapshots can distinguish
 // "open, backoff not elapsed" from "probing, no slots left".
 void TestHalfOpenFullCounterSeparate() {
     std::cout << "\n[TEST] CB: HALF_OPEN_FULL counter separate..." << std::endl;
@@ -958,7 +958,7 @@ void TestSawFailureDoesNotBumpHalfOpenFullCounter() {
 
 // BUG (review round 3, P2): TransitionOpenToHalfOpen deliberately left
 // `open_until_steady_ns_` populated, violating the documented OpenUntil()
-// contract ("zero when not OPEN"). A Phase 4 consumer computing Retry-After
+// contract ("zero when not OPEN"). A consumer computing Retry-After
 // from a HALF_OPEN slice would compute (stale_deadline - now), which is
 // negative once HALF_OPEN begins.
 void TestOpenUntilZeroWhenHalfOpen() {

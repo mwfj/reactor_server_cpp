@@ -25,7 +25,7 @@ namespace circuit_breaker {
 // upstream policy). This makes GetHost lock-free after construction,
 // which is critical for the hot path.
 //
-// Hot-reload (Phase 8): only `circuit_breaker` sub-fields on EXISTING
+// Hot-reload: only `circuit_breaker` sub-fields on EXISTING
 // upstream services can be live-reloaded. New or removed service names
 // log a warn and are skipped — the caller (HttpServer::Reload) still
 // fires the "restart required" diagnostic in that case.

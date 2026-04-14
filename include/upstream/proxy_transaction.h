@@ -34,10 +34,9 @@ public:
     // Carries Retry-After + X-Circuit-Breaker headers (§12.1).
     // Terminal — retry loop MUST NOT retry this outcome (§8).
     static constexpr int RESULT_CIRCUIT_OPEN        = -7;
-    // Retry budget exhausted (Phase 5 wires the actual gate; the code is
-    // reserved here so MakeErrorResponse and the retry loop both know it
-    // exists and terminal-classify it). No Retry-After; distinct header
-    // X-Retry-Budget-Exhausted so operators can tell the two 503s apart.
+    // Retry budget exhausted. No Retry-After; distinct header
+    // X-Retry-Budget-Exhausted so operators can tell the two 503s apart
+    // from circuit-open rejects.
     static constexpr int RESULT_RETRY_BUDGET_EXHAUSTED = -8;
 
     // Constructor copies all needed fields from client_request (method, path,
@@ -159,7 +158,7 @@ private:
     // Timing
     std::chrono::steady_clock::time_point start_time_;
 
-    // Circuit breaker integration (Phase 4). Resolved once in Start() from
+    // Circuit breaker integration — resolved once in Start() from
     // `service_name_` + `dispatcher_index_`. Null when there's no
     // CircuitBreakerManager attached (server has no upstreams, or the
     // breaker is being built lazily) — the breaker is simply skipped in
@@ -232,20 +231,17 @@ private:
     // plain 503 for those codes if called generically.
     static HttpResponse MakeErrorResponse(int result_code);
 
-    // Phase 4: emit the §12.1 circuit-open response.
+    // Emit the circuit-open response (design §12.1):
     //   503 + Retry-After (seconds until slice->OpenUntil())
     //       + X-Circuit-Breaker: open
     //       + X-Upstream-Host: service:host:port
     HttpResponse MakeCircuitOpenResponse() const;
 
-    // Phase 5 will emit this. Declared here so Phase 4's
-    // MakeErrorResponse RESULT_RETRY_BUDGET_EXHAUSTED branch has a
-    // target to dispatch to and so tests can assert the response shape
-    // even before the retry-budget gate is wired.
+    // Emit the retry-budget-exhausted response (design §12.2):
     //   503 + X-Retry-Budget-Exhausted: 1
     static HttpResponse MakeRetryBudgetResponse();
 
-    // Phase 4 helpers — breaker gate and outcome classification.
+    // Breaker helpers — gate and outcome classification.
     //
     // ConsultBreaker: call at the top of AttemptCheckout. Populates
     // admission_generation_ and is_probe_ on admission; delivers the
