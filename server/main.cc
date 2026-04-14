@@ -427,6 +427,19 @@ static bool ReloadConfig(const std::string& config_path,
     auto saved_tls = current_config.tls;
     auto saved_workers = current_config.worker_threads;
     auto saved_h2_enabled = current_config.http2.enabled;
+    // Preserve upstreams for the same reason: HttpServer::Reload treats
+    // the whole upstream block as restart-required (see http_server.cc
+    // upstream_configs_ comparison), and that internal copy never changes
+    // post-startup. If we overwrote current_config.upstreams here, a
+    // breaker-only edit would stage into current_config while the live
+    // server keeps running the startup values — /stats and other
+    // current_config consumers would report phantom state, and subsequent
+    // identical reloads could produce inconsistent diagnostics. Pin to
+    // the running values until Phase 8 implements
+    // CircuitBreakerManager::Reload (the only upstream sub-field that
+    // becomes hot-reloadable); at that point this save becomes a
+    // partial-field save excluding circuit_breaker.
+    auto saved_upstreams = current_config.upstreams;
 
     current_config = new_config;
 
@@ -435,6 +448,7 @@ static bool ReloadConfig(const std::string& config_path,
     current_config.tls = saved_tls;
     current_config.worker_threads = saved_workers;
     current_config.http2.enabled = saved_h2_enabled;
+    current_config.upstreams = std::move(saved_upstreams);
 
     // Commit file-backed state only after full success — a failed reload
     // must not flip this flag or future reloads lose the defaults+env fallback.

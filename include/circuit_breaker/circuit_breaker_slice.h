@@ -59,6 +59,23 @@ public:
     void ReportSuccess(bool probe, uint64_t admission_generation);
     void ReportFailure(FailureKind kind, bool probe, uint64_t admission_generation);
 
+    // Neutral completion — the admission never exercised the upstream.
+    // Use when the request was terminated locally before reaching the
+    // upstream (POOL_EXHAUSTED after admission, shutdown draining, client
+    // disconnect, RESULT_PARSE_ERROR self-attributable). Must NOT be used
+    // for upstream outcomes — those go to ReportSuccess / ReportFailure.
+    //
+    // For probe=true (HALF_OPEN admission): returns the probe slot to the
+    // cycle — decrements `half_open_inflight_` AND `half_open_admitted_`
+    // so a replacement probe can still exercise the upstream within this
+    // cycle's budget. Without this path, a probe that dies locally leaks
+    // its slot forever, eventually wedging the slice in HALF_OPEN.
+    //
+    // For probe=false (CLOSED admission): no-op — CLOSED admissions have
+    // no slot to release. The bool matches ReportSuccess/ReportFailure so
+    // callers can use the same dispatch pattern.
+    void ReportNeutral(bool probe, uint64_t admission_generation);
+
     // Apply a new config (called on this slice's dispatcher thread).
     // Preserves live state (CLOSED/OPEN/HALF_OPEN). Resets window if
     // window_seconds changed.

@@ -1788,6 +1788,139 @@ void TestHalfOpenDoesNotReuseProbeSlots() {
     }
 }
 
+// BUG (review round 11, P1): Admission contract has ReportSuccess and
+// ReportFailure but no path for probes that complete without touching the
+// upstream (POOL_EXHAUSTED after probe admission, shutdown, client
+// disconnect, PARSE_ERROR). Following the §7 "don't report these as
+// failures" contract strictly, such probes would leak their inflight slot
+// forever — once half_open_admitted_ reaches snapshot, all further
+// admissions reject as half_open_full and nothing ever drains the cycle,
+// wedging the slice in HALF_OPEN.
+//
+// Fix: ReportNeutral decrements BOTH inflight (so the last-probe re-trip
+// still fires) and admitted (so a replacement probe can still exercise
+// the upstream within the cycle budget). No touch to successes / fails.
+void TestReportNeutralReleasesProbeSlot() {
+    std::cout << "\n[TEST] CB: ReportNeutral releases probe slot..."
+              << std::endl;
+    try {
+        CircuitBreakerConfig cb;
+        cb.enabled = true;
+        cb.consecutive_failure_threshold = 2;
+        cb.failure_rate_threshold = 100;
+        cb.minimum_volume = 1000;
+        cb.window_seconds = 10;
+        cb.permitted_half_open_calls = 2;
+        cb.base_open_duration_ms = 100;
+        cb.max_open_duration_ms = 60000;
+
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        // Trip to OPEN, advance past backoff, fully consume probe budget.
+        for (int i = 0; i < 2; ++i) {
+            auto a = slice.TryAcquire();
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, a.generation);
+        }
+        clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
+
+        auto a = slice.TryAcquire();
+        auto b = slice.TryAcquire();
+        bool both_probes = a.decision == Decision::ADMITTED_PROBE &&
+                           b.decision == Decision::ADMITTED_PROBE;
+
+        // Budget full: 3rd admission rejected.
+        auto pre_release = slice.TryAcquire();
+        bool budget_full_before = pre_release.decision == Decision::REJECTED_OPEN;
+
+        // Neutral-release A: slot returns, replacement probe fits within budget.
+        slice.ReportNeutral(true, a.generation);
+
+        auto c = slice.TryAcquire();
+        bool replacement_admitted = c.decision == Decision::ADMITTED_PROBE;
+
+        // Cycle completes cleanly via B + C successes → CLOSED.
+        slice.ReportSuccess(true, b.generation);
+        slice.ReportSuccess(true, c.generation);
+        bool closed = slice.CurrentState() == State::CLOSED;
+
+        // Neutral release must NOT have bumped probe_failures / probe_successes.
+        bool counters_clean = slice.ProbeSuccesses() == 2 &&
+                              slice.ProbeFailures() == 0;
+
+        bool pass = both_probes && budget_full_before &&
+                    replacement_admitted && closed && counters_clean;
+        TestFramework::RecordTest(
+            "CB: ReportNeutral releases probe slot",
+            pass, pass ? "" :
+                  "both_probes=" + std::to_string(both_probes) +
+                  " budget_full_before=" + std::to_string(budget_full_before) +
+                  " replacement_admitted=" + std::to_string(replacement_admitted) +
+                  " closed=" + std::to_string(closed) +
+                  " counters_clean=" + std::to_string(counters_clean),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: ReportNeutral releases probe slot",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Companion: a neutral release that drains the last in-flight probe AFTER
+// a sibling failure must still trigger the HALF_OPEN→OPEN re-trip. Without
+// this last-probe hook in ReportNeutral, the slice would wedge in HALF_OPEN
+// with saw_failure=true rejecting every admission via Case A.
+void TestReportNeutralLastProbeAfterFailureReTrips() {
+    std::cout << "\n[TEST] CB: ReportNeutral re-trips as last probe after sibling fail..."
+              << std::endl;
+    try {
+        CircuitBreakerConfig cb;
+        cb.enabled = true;
+        cb.consecutive_failure_threshold = 2;
+        cb.failure_rate_threshold = 100;
+        cb.minimum_volume = 1000;
+        cb.window_seconds = 10;
+        cb.permitted_half_open_calls = 2;
+        cb.base_open_duration_ms = 100;
+        cb.max_open_duration_ms = 60000;
+
+        auto clock = std::make_shared<MockClock>();
+        CircuitBreakerSlice slice("svc:h:p p=0", 0, cb,
+            [clock]() { return clock->now; });
+
+        for (int i = 0; i < 2; ++i) {
+            auto a = slice.TryAcquire();
+            slice.ReportFailure(FailureKind::RESPONSE_5XX, false, a.generation);
+        }
+        clock->Advance(std::chrono::milliseconds(cb.base_open_duration_ms + 1));
+
+        auto a = slice.TryAcquire();
+        auto b = slice.TryAcquire();
+
+        // A fails → saw_failure=true, inflight=1 (B still running), no re-trip yet.
+        slice.ReportFailure(FailureKind::RESPONSE_5XX, true, a.generation);
+        bool still_halfopen = slice.CurrentState() == State::HALF_OPEN;
+
+        // B neutral-releases → last in-flight drains. With the fix, the
+        // sibling-failure + last-probe hook fires TripHalfOpenToOpen.
+        slice.ReportNeutral(true, b.generation);
+        bool retripped = slice.CurrentState() == State::OPEN;
+
+        bool pass = still_halfopen && retripped;
+        TestFramework::RecordTest(
+            "CB: ReportNeutral re-trips as last probe after sibling fail",
+            pass, pass ? "" :
+                  "still_halfopen=" + std::to_string(still_halfopen) +
+                  " retripped=" + std::to_string(retripped),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB: ReportNeutral re-trips as last probe after sibling fail",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestTransitionCallbackInvoked() {
     std::cout << "\n[TEST] CB: transition callback invoked..." << std::endl;
     try {
@@ -1872,6 +2005,8 @@ void RunAllTests() {
     TestReportFailureUsesOneTimestampAcrossTripEval();
     TestHalfOpenClampsNonPositiveProbeBudget();
     TestHalfOpenDoesNotReuseProbeSlots();
+    TestReportNeutralReleasesProbeSlot();
+    TestReportNeutralLastProbeAfterFailureReTrips();
     TestTransitionCallbackInvoked();
 }
 

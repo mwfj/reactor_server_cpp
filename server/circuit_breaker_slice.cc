@@ -449,6 +449,46 @@ void CircuitBreakerSlice::ReportFailure(FailureKind kind, bool probe,
     }
 }
 
+void CircuitBreakerSlice::ReportNeutral(bool probe,
+                                         uint64_t admission_generation) {
+    if (!config_.enabled) return;
+    if (!probe) {
+        // CLOSED-state admission: no slot to release. The bool parameter
+        // exists for API symmetry with ReportSuccess/ReportFailure; a
+        // neutral outcome in CLOSED simply means the breaker records
+        // nothing (which matches pre-neutral behavior — POOL_EXHAUSTED,
+        // shutdown, and similar local terminations were already "ignored"
+        // on the CLOSED path).
+        return;
+    }
+
+    // Probe: gate on halfopen_gen_ + current state, matching the other
+    // Report* paths. Stale (pre-transition or pre-reload) neutral
+    // completions drop silently into the stale-generation counter.
+    if (admission_generation != halfopen_gen_) {
+        reports_stale_generation_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (state_.load(std::memory_order_acquire) != State::HALF_OPEN) return;
+
+    // Return the slot to the cycle. Decrement BOTH inflight and admitted:
+    //   - inflight so the last-probe re-trip logic below fires correctly,
+    //   - admitted so a replacement probe can still be admitted within
+    //     this cycle's budget (the whole point of a neutral release —
+    //     the upstream wasn't actually exercised by this admission).
+    if (half_open_inflight_ > 0) half_open_inflight_--;
+    if (half_open_admitted_ > 0) half_open_admitted_--;
+
+    // If an earlier sibling probe failed and this neutral release drains
+    // the last in-flight probe, the cycle must re-trip — otherwise the
+    // slice would wedge in HALF_OPEN with saw_failure=true, rejecting all
+    // future admissions via Case A forever. Mirrors the failure-path
+    // last-probe trigger.
+    if (half_open_saw_failure_ && half_open_inflight_ == 0) {
+        TripHalfOpenToOpen("probe_fail");
+    }
+}
+
 void CircuitBreakerSlice::Reload(const CircuitBreakerConfig& new_config) {
     const bool enabled_changed = (config_.enabled != new_config.enabled);
     const bool window_changed =
