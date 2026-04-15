@@ -561,7 +561,9 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     if (val) config.rate_limit.status_code = EnvToInt(val, "REACTOR_RATE_LIMIT_STATUS_CODE");
 }
 
-void ConfigLoader::ValidateHotReloadable(const ServerConfig& config) {
+void ConfigLoader::ValidateHotReloadable(
+        const ServerConfig& config,
+        const std::unordered_set<std::string>& live_upstream_names) {
     // Mirrors the circuit_breaker validation block in Validate().
     // Kept in lock-step with that block — any rule added there for a
     // hot-reloadable field must be added here too, or the SIGHUP
@@ -570,12 +572,14 @@ void ConfigLoader::ValidateHotReloadable(const ServerConfig& config) {
     // to prevent).
 
     // Reject duplicate upstream service names BEFORE the per-upstream
-    // CB validation. CircuitBreakerManager::Reload iterates the new
-    // upstream list and applies each entry's `circuit_breaker` block
-    // to GetHost(name). With duplicates, the first entry's CB values
-    // are applied, then the second entry's overwrite them — last
-    // write silently wins. Startup's full Validate() rejects the
-    // file outright; the hot-reload path must match.
+    // CB validation. Even for new/renamed entries, the file is
+    // malformed if names collide: `CircuitBreakerManager::Reload`
+    // iterates the new upstream list and applies each entry's
+    // `circuit_breaker` block to GetHost(name); duplicates would
+    // silently overwrite (last-write wins). Startup's full Validate()
+    // rejects the file outright; the hot-reload path must match.
+    // This rule runs UNCONDITIONALLY on the new config — it doesn't
+    // depend on `live_upstream_names`.
     {
         std::unordered_set<std::string> seen;
         seen.reserve(config.upstreams.size());
@@ -593,6 +597,22 @@ void ConfigLoader::ValidateHotReloadable(const ServerConfig& config) {
     for (size_t i = 0; i < config.upstreams.size(); ++i) {
         const auto& u = config.upstreams[i];
         const std::string idx = "upstreams[" + std::to_string(i) + "]";
+
+        // CB-field validation is scoped to upstreams that are LIVE in
+        // the running server. CircuitBreakerManager::Reload only
+        // applies CB changes to pre-existing hosts — new/renamed
+        // entries are restart-only and skipped with a warn — so
+        // validating their CB blocks here would block otherwise-safe
+        // reloads (e.g. a reload that stages a new upstream alongside
+        // a log-level edit would abort even though the live server
+        // would never apply the new upstream's CB block).
+        //
+        // The empty-set case (no live upstreams yet) is handled by
+        // the same check: every entry is "new", so every entry is
+        // skipped — only the duplicate-name check runs.
+        if (live_upstream_names.find(u.name) == live_upstream_names.end()) {
+            continue;
+        }
         const auto& cb = u.circuit_breaker;
         if (cb.consecutive_failure_threshold < 1 ||
             cb.consecutive_failure_threshold > 10000) {

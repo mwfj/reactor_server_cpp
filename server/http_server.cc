@@ -3570,12 +3570,25 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // Strict gate for hot-reloadable CB fields + duplicate names.
         // Mirrors main.cc::ReloadConfig — both entry points must reject
         // invalid CB tuning before it reaches live slices.
-        try {
-            ConfigLoader::ValidateHotReloadable(new_config);
-        } catch (const std::invalid_argument& e) {
-            logging::Get()->error("Reload() rejected invalid config: {}",
-                                  e.what());
-            return false;
+        //
+        // CB validation is scoped to existing upstream names: only
+        // those entries get applied via CircuitBreakerManager::Reload,
+        // so validating CB blocks for new/renamed entries would
+        // block otherwise-safe reloads. `upstream_configs_` is the
+        // post-Start snapshot of running upstreams.
+        {
+            std::unordered_set<std::string> live_names;
+            live_names.reserve(upstream_configs_.size());
+            for (const auto& u : upstream_configs_) {
+                live_names.insert(u.name);
+            }
+            try {
+                ConfigLoader::ValidateHotReloadable(new_config, live_names);
+            } catch (const std::invalid_argument& e) {
+                logging::Get()->error("Reload() rejected invalid config: {}",
+                                      e.what());
+                return false;
+            }
         }
     }
 

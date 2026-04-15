@@ -328,19 +328,34 @@ static bool ReloadConfig(const std::string& config_path,
             }
         }
     }
-    // Hot-reloadable fields (today: per-upstream `circuit_breaker.*`)
-    // are the only ones that go LIVE on a SIGHUP reload. Validate
-    // them strictly — a bad value here would be pushed into running
-    // slices and keep running until an operator-driven restart fixes
-    // the config file. Hard-reject so operators see the error
-    // immediately instead of discovering drift the next time the
-    // startup path rejects the same file.
-    try {
-        ConfigLoader::ValidateHotReloadable(new_config);
-    } catch (const std::invalid_argument& e) {
-        logging::Get()->error("Config reload rejected: {}", e.what());
-        reopen_existing_logs();
-        return false;
+    // Hot-reloadable fields (today: per-upstream `circuit_breaker.*`
+    // on existing services + duplicate-name uniqueness across the
+    // new file) are the only ones that go LIVE on a SIGHUP reload.
+    // Validate them strictly — a bad value here would be pushed into
+    // running slices and keep running until an operator-driven
+    // restart fixes the config file. Hard-reject so operators see
+    // the error immediately instead of discovering drift the next
+    // time the startup path rejects the same file.
+    //
+    // CB validation is scoped to existing upstream names —
+    // CircuitBreakerManager::Reload only applies CB changes to those.
+    // New/renamed upstreams are restart-only; their CB blocks are
+    // skipped here so an intentional placeholder doesn't block other
+    // live-safe edits in the same reload (log/rate-limit/breaker
+    // edits on existing services).
+    {
+        std::unordered_set<std::string> live_names;
+        live_names.reserve(current_config.upstreams.size());
+        for (const auto& u : current_config.upstreams) {
+            live_names.insert(u.name);
+        }
+        try {
+            ConfigLoader::ValidateHotReloadable(new_config, live_names);
+        } catch (const std::invalid_argument& e) {
+            logging::Get()->error("Config reload rejected: {}", e.what());
+            reopen_existing_logs();
+            return false;
+        }
     }
 
     // Warn about restart-required field issues (not applied during reload).
