@@ -111,7 +111,9 @@ All `circuit_breaker` fields on existing upstream services are hot-reloadable vi
 | `window_seconds` change | Rolling window reset. In-flight reports admitted pre-reload are invalidated (by `closed_gen_` bump); `consecutive_failures_` reset so stale counts can't trip the fresh window. In-flight `HALF_OPEN` probes are NOT invalidated (separate `halfopen_gen_` counter) — probe cycles complete normally. |
 | `retry_budget_percent` / `retry_budget_min_concurrency` | Applied immediately (atomic stores). In-flight counters preserved. |
 
-Topology edits (`host`, `port`, `pool.*`, `proxy.*`, `tls.*`) still require a restart; the gateway logs `"Reload: upstream topology changes require a restart to take effect"` and keeps the old pool alive. Breaker edits on the same reload are still applied live.
+Topology edits (`host`, `port`, `pool.*`, `proxy.*`, `tls.*`) still require a restart; the gateway logs `"Reload: upstream topology changes require a restart to take effect"` and keeps the old pool alive. Breaker edits on the same reload are still applied live. Topology comparison is **name-keyed**: a pure reorder of otherwise-identical upstream entries is not treated as a topology change, so reformatting the upstream list in-place is safe.
+
+The SIGHUP handler returns only after every per-slice `Reload` has committed on its dispatcher (bounded 2s per host). Requests issued after you observe "reload OK" are guaranteed to see the new breaker tuning.
 
 ---
 
