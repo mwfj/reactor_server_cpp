@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cstdint>
 
+#include "auth/auth_config.h"
+
 struct TlsConfig {
     bool enabled = false;
     std::string cert_file;
@@ -127,6 +129,23 @@ struct ProxyConfig {
     // Retry policy configuration
     ProxyRetryConfig retry;
 
+    // Inline auth policy for this proxy (applies_to derived from route_prefix).
+    // Reload-propagated via AuthManager::Reload — EXCLUDED from operator==
+    // below so that proxy.auth edits do not trip the outer "restart required"
+    // warning in HttpServer::Reload(). See `DEVELOPMENT_RULES.md` under
+    // *"Live-reloadable config fields in restart-required equality operators
+    // — ordering matters"* for the rationale.
+    auth::AuthPolicy auth;
+
+    // Excludes `auth` — auth policy edits are live-reloadable via
+    // `AuthManager::Reload`, which `HttpServer::Reload` invokes on every
+    // reload. Topology fields (response_timeout_ms, route_prefix,
+    // strip_prefix, methods, header_rewrite, retry) remain restart-only.
+    //
+    // Contract: a config pair that differs ONLY in auth fields must compare
+    // EQUAL so the outer reload doesn't fire a spurious warn. This is the
+    // same discipline used by `UpstreamConfig::operator==` for the
+    // `circuit_breaker` field.
     bool operator==(const ProxyConfig& o) const {
         return response_timeout_ms == o.response_timeout_ms &&
                route_prefix == o.route_prefix &&
@@ -260,4 +279,5 @@ struct ServerConfig {
     Http2Config http2;
     std::vector<UpstreamConfig> upstreams;
     RateLimitConfig rate_limit;
+    auth::AuthConfig auth;
 };
