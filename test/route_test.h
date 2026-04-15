@@ -1571,7 +1571,7 @@ void TestRouterProxyCompanionYieldsForMarkedMethod() {
     }
 }
 
-// P2 (latest review): per-pattern paired_with_get. When a proxy
+// Per-pattern paired_with_get. When a proxy
 // registers both a companion pattern and a catch-all pattern, the
 // per-(method,pattern) async-conflict filter may drop GET on ONE
 // pattern while keeping it on the OTHER. MarkProxyDefaultHead must

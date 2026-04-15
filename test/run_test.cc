@@ -13,6 +13,13 @@
 #include "upstream_pool_test.h"
 #include "proxy_test.h"
 #include "rate_limit_test.h"
+#include "circuit_breaker_test.h"
+#include "circuit_breaker_components_test.h"
+#include "circuit_breaker_integration_test.h"
+#include "circuit_breaker_retry_budget_test.h"
+#include "circuit_breaker_wait_queue_drain_test.h"
+#include "circuit_breaker_observability_test.h"
+#include "circuit_breaker_reload_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -76,6 +83,28 @@ void RunAllTest(){
 
     // Run rate limit tests
     RateLimitTests::RunAllTests();
+
+    // Run circuit breaker tests
+    CircuitBreakerTests::RunAllTests();
+
+    // Run circuit-breaker component unit tests (RetryBudget / Host / Manager)
+    CircuitBreakerComponentsTests::RunAllTests();
+
+    // Run circuit-breaker integration tests (end-to-end through
+    // ProxyTransaction + UpstreamManager + HttpServer)
+    CircuitBreakerIntegrationTests::RunAllTests();
+
+    // Run circuit-breaker retry-budget integration tests
+    CircuitBreakerRetryBudgetTests::RunAllTests();
+
+    // Run circuit-breaker wait-queue-drain-on-trip tests
+    CircuitBreakerWaitQueueDrainTests::RunAllTests();
+
+    // Run circuit-breaker observability tests
+    CircuitBreakerObservabilityTests::RunAllTests();
+
+    // Run circuit-breaker hot-reload tests
+    CircuitBreakerReloadTests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;
 }
@@ -155,6 +184,15 @@ int main(int argc, char* argv[]) {
         // Run rate limit tests
         }else if(mode == "rate_limit" || mode == "-L"){
             RateLimitTests::RunAllTests();
+        // Run circuit-breaker tests (unit + components + integration + retry-budget + drain + observability + reload)
+        }else if(mode == "circuit_breaker" || mode == "-B"){
+            CircuitBreakerTests::RunAllTests();
+            CircuitBreakerComponentsTests::RunAllTests();
+            CircuitBreakerIntegrationTests::RunAllTests();
+            CircuitBreakerRetryBudgetTests::RunAllTests();
+            CircuitBreakerWaitQueueDrainTests::RunAllTests();
+            CircuitBreakerObservabilityTests::RunAllTests();
+            CircuitBreakerReloadTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

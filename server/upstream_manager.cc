@@ -296,3 +296,13 @@ Dispatcher* UpstreamManager::GetDispatcherForIndex(size_t index) const {
 bool UpstreamManager::HasUpstream(const std::string& service_name) const {
     return pools_.find(service_name) != pools_.end();
 }
+
+PoolPartition* UpstreamManager::GetPoolPartition(
+        const std::string& service_name,
+        size_t dispatcher_index) {
+    auto it = pools_.find(service_name);
+    if (it == pools_.end()) {
+        return nullptr;
+    }
+    return it->second->GetPartition(dispatcher_index);
+}

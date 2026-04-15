@@ -6,6 +6,10 @@
 #include "http2/http2_constants.h"
 #include "upstream/upstream_manager.h"
 #include "upstream/proxy_handler.h"
+#include "circuit_breaker/circuit_breaker_manager.h"
+#include "circuit_breaker/circuit_breaker_host.h"
+#include "circuit_breaker/circuit_breaker_slice.h"
+#include "upstream/pool_partition.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
 #include <algorithm>
@@ -406,6 +410,139 @@ void HttpServer::MarkServerReady() {
                 upstream_configs_, dispatchers);
         } catch (...) {
             logging::Get()->error("Upstream pool init failed, stopping server");
+            net_server_.Stop();
+            throw;
+        }
+
+        // Circuit breaker — built alongside the pool. One host per
+        // configured upstream (regardless of enabled), with one slice
+        // per dispatcher so hot-path TryAcquire is lock-free. Attached
+        // to UpstreamManager via a non-owning pointer so ProxyTransaction
+        // can reach it on the hot path via upstream_manager_->
+        // GetCircuitBreakerManager(). The manager is declared AFTER
+        // upstream_manager_ on HttpServer (see header) so teardown runs
+        // breaker-first, which matches the dangling-pointer safety rule
+        // in UpstreamManager::breaker_manager_.
+        try {
+            circuit_breaker_manager_ =
+                std::make_unique<CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerManager>(
+                    upstream_configs_, dispatchers.size(), dispatchers);
+            upstream_manager_->AttachCircuitBreakerManager(
+                circuit_breaker_manager_.get());
+
+            // Wire CLOSED→OPEN transition callbacks for every slice of every
+            // host — regardless of `enabled=false`. 
+            // A disabled slice never fires transitions (TryAcquire short-
+            // circuits to ADMITTED); wiring the callback costs nothing but
+            // lets a live reload flip enable=false→true without re-wiring.
+            //
+            // The callback routes trip events to the corresponding
+            // PoolPartition's DrainWaitQueueOnTrip so queued waiters fail
+            // fast with CHECKOUT_CIRCUIT_OPEN instead of waiting out the
+            // open window. Each slice gets a distinct callback that
+            // captures its (service, dispatcher_index) pair — we can't use
+            // SetTransitionCallbackOnAllSlices because that would install a
+            // single callback across slices that need different partition
+            // lookups.
+            //
+            // Safe to capture raw `UpstreamManager*`: CircuitBreakerManager
+            // destructs BEFORE UpstreamManager, and slice callbacks only fire on dispatcher threads 
+            // which are stopped before either manager is destroyed. So any live callback
+            // invocation sees a valid UpstreamManager.
+            UpstreamManager* um = upstream_manager_.get();
+            for (const auto& u : upstream_configs_) {
+                auto* host = circuit_breaker_manager_->GetHost(u.name);
+                if (!host) continue;
+                std::string service = u.name;
+                for (size_t i = 0; i < host->partition_count(); ++i) {
+                    auto* slice = host->GetSlice(i);
+                    if (!slice) continue;
+                    // Capture the slice pointer so the callback can read
+                    // the LIVE `dry_run` flag on every fire — operators
+                    // can toggle dry_run via SIGHUP, and the drain
+                    // decision must reflect the current setting, not a
+                    // snapshot from server startup. Slice lifetime is
+                    // tied to the manager (declared after upstream
+                    // manager → destructs first), so the raw pointer
+                    // outlives every possible callback invocation.
+                    auto* slice_ptr = slice;
+                    slice->SetTransitionCallback(
+                        [um, service, i, slice_ptr](
+                                CIRCUIT_BREAKER_NAMESPACE::State old_s,
+                                CIRCUIT_BREAKER_NAMESPACE::State new_s,
+                                const char* trigger) {
+                            // Three drain triggers, all entering OPEN:
+                            //   CLOSED→OPEN  : fresh trip; queued non-
+                            //     probe waiters need CHECKOUT_CIRCUIT_OPEN
+                            //     instead of waiting out the full open
+                            //     window.
+                            //   HALF_OPEN→OPEN : probe cycle re-tripped;
+                            //     probe admissions passed ConsultBreaker
+                            //     before CheckoutAsync, so saturated
+                            //     pools can leave them queued. Without
+                            //     draining they eventually dispatch to a
+                            //     known-bad upstream.
+                            //   OPEN→OPEN with trigger="dry_run_disabled"
+                            //     : synthetic signal from
+                            //     CircuitBreakerSlice::Reload when
+                            //     dry_run flips true→false on a slice
+                            //     that's still OPEN. The earlier trip
+                            //     skipped the drain (shadow mode); now
+                            //     enforcement is back on, queued
+                            //     waiters from that period must be
+                            //     flushed before the pool services
+                            //     them. Real transitions never use this
+                            //     trigger string with old==new==OPEN,
+                            //     so there's no overlap with normal
+                            //     state-machine signals.
+                            //     (The slice intentionally does NOT
+                            //     fire this signal in HALF_OPEN — see
+                            //     CircuitBreakerSlice::Reload for why
+                            //     valid probes must not be flushed.)
+                            const bool normal_trip =
+                                new_s == CIRCUIT_BREAKER_NAMESPACE::State::OPEN &&
+                                (old_s == CIRCUIT_BREAKER_NAMESPACE::State::CLOSED ||
+                                 old_s == CIRCUIT_BREAKER_NAMESPACE::State::HALF_OPEN);
+                            const bool dry_run_disable_drain =
+                                old_s == CIRCUIT_BREAKER_NAMESPACE::State::OPEN &&
+                                new_s == CIRCUIT_BREAKER_NAMESPACE::State::OPEN &&
+                                trigger != nullptr &&
+                                std::strcmp(trigger,
+                                            "dry_run_disabled") == 0;
+                            if (!normal_trip && !dry_run_disable_drain) {
+                                return;
+                            }
+                            // Dry-run shadow-mode contract: the slice
+                            // log-but-admits would-reject decisions, so
+                            // the wait-queue drain — which would
+                            // deliver hard 503s (CHECKOUT_CIRCUIT_OPEN
+                            // → RESULT_CIRCUIT_OPEN) to queued
+                            // waiters — must also be a no-op while
+                            // dry_run is true. Note: when this fires
+                            // via the dry_run_disabled trigger, the
+                            // slice's config_.dry_run was already
+                            // updated to false in Reload BEFORE the
+                            // synthetic callback, so this guard
+                            // correctly does NOT skip the drain in
+                            // that case.
+                            if (slice_ptr && slice_ptr->config().dry_run) {
+                                logging::Get()->info(
+                                    "[dry-run] circuit breaker would drain "
+                                    "wait queue on trip — skipping (shadow "
+                                    "mode) service={} partition={}",
+                                    service, i);
+                                return;
+                            }
+                            if (auto* part = um->GetPoolPartition(
+                                    service, i)) {
+                                part->DrainWaitQueueOnTrip();
+                            }
+                        });
+                }
+            }
+        } catch (...) {
+            logging::Get()->error(
+                "Circuit breaker init failed, stopping server");
             net_server_.Stop();
             throw;
         }
@@ -3451,8 +3588,16 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         //      field changes (timeouts, limits, log level).
         validation_copy.http2.enabled =
             http2_enabled_ && new_config.http2.enabled;
-        // Upstream configs are restart-only — clear them so staged edits
-        // in the config file don't block live-safe field reloads.
+        // Upstream configs are RESTART-ONLY for topology fields, but the
+        // per-upstream `circuit_breaker` block is HOT-RELOADABLE — clearing
+        // upstreams entirely from validation_copy would skip CB-field
+        // validation here. Instead: clear the topology-restart-only
+        // path (the full Validate would reject those) and run a separate
+        // ValidateHotReloadable on the original new_config so live-
+        // reloadable CB rules (range checks, duplicate names) are
+        // enforced symmetrically with the SIGHUP path in main.cc.
+        // Without this, in-process callers using HttpServer::Reload
+        // directly would bypass the gate that the CLI path enforces.
         validation_copy.upstreams.clear();
         // Rate limit config IS live-reloadable and MUST be validated.
         // Unlike upstreams (restart-only), rate_limit changes are applied
@@ -3464,6 +3609,29 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Reload() rejected invalid config: {}", e.what());
             return false;
+        }
+        // Strict gate for hot-reloadable CB fields + duplicate names.
+        // Mirrors main.cc::ReloadConfig — both entry points must reject
+        // invalid CB tuning before it reaches live slices.
+        //
+        // CB validation is scoped to existing upstream names: only
+        // those entries get applied via CircuitBreakerManager::Reload,
+        // so validating CB blocks for new/renamed entries would
+        // block otherwise-safe reloads. `upstream_configs_` is the
+        // post-Start snapshot of running upstreams.
+        {
+            std::unordered_set<std::string> live_names;
+            live_names.reserve(upstream_configs_.size());
+            for (const auto& u : upstream_configs_) {
+                live_names.insert(u.name);
+            }
+            try {
+                ConfigLoader::ValidateHotReloadable(new_config, live_names);
+            } catch (const std::invalid_argument& e) {
+                logging::Get()->error("Reload() rejected invalid config: {}",
+                                      e.what());
+                return false;
+            }
         }
     }
 
@@ -3645,11 +3813,80 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         rate_limit_manager_->Reload(new_config.rate_limit);
     }
 
-    // Upstream pool changes require a restart — pools are built once in Start()
-    // and cannot be rebuilt at runtime without a full drain cycle.
-    if (new_config.upstreams != upstream_configs_) {
-        logging::Get()->warn("Reload: upstream configuration changes require a "
-                             "restart to take effect (ignored)");
+    // Circuit breaker reload — live-propagates breaker-field edits on
+    // existing upstream services. CircuitBreakerManager::Reload is
+    // idempotent (atomic stores to unchanged values), so calling it
+    // unconditionally costs nothing when the operator didn't edit any
+    // breaker fields. Topology changes (added / removed service names)
+    // are logged as warn + skipped inside the manager; the outer
+    // restart-required warning still fires via the upstreams-inequality
+    // check below. After this call, update the breaker slices on every
+    // partition via per-dispatcher EnQueue — the manager handles that
+    // routing internally. The topology check itself now only diffs non-
+    // breaker fields (UpstreamConfig::operator== excludes circuit_breaker),
+    // so a CB-only SIGHUP is a clean hot reload with no spurious warn.
+    if (circuit_breaker_manager_) {
+        circuit_breaker_manager_->Reload(new_config.upstreams);
+    }
+
+    // Upstream topology changes (host/port/pool/proxy/tls) require a
+    // restart — pools are built once in Start() and cannot be rebuilt
+    // at runtime without a full drain cycle. The equality operator on
+    // UpstreamConfig deliberately excludes `circuit_breaker` so a CB-
+    // only edit doesn't trigger this warning (the reload above already
+    // applied the new breaker settings to live slices).
+    //
+    // When topology DIFFERS, we deliberately DO NOT copy the staged
+    // config into `upstream_configs_`: subsequent reloads (including
+    // the timer-cadence recomputation above) read from this vector to
+    // match live pool state. Adopting staged-but-inactive topology
+    // values would silently widen the dispatcher timer past the active
+    // pool timeouts — e.g. staging `pool.connect_timeout_ms=10000`
+    // (restart required) then reloading any unrelated field would
+    // recompute cadence from 10s while the live pool still uses 3s,
+    // firing connect-timeouts late. The CB-field portion of the edit
+    // was already applied live via `circuit_breaker_manager_->Reload`
+    // above, so the live slices carry the new tuning regardless of
+    // whether `upstream_configs_` shows it.
+    //
+    // When topology MATCHES (the common case, including CB-only
+    // edits), adopt the new snapshot as the fresh baseline so CB-
+    // field edits persist for later reload diffs.
+    //
+    // Compare as name-keyed maps rather than vectors: live pools and
+    // CircuitBreakerManager are both keyed by upstream name, so a pure
+    // reorder of otherwise-identical entries is NOT a topology change.
+    // Vector equality would fire a spurious "restart required" warning
+    // and skip the upstream_configs_ update, leaving every subsequent
+    // breaker-only reload on that reordered file forever looking like a
+    // topology change. UpstreamConfig::operator== already excludes the
+    // live-reloadable `circuit_breaker` field, so map equality reflects
+    // the true restart-vs-live partition. Duplicate names were rejected
+    // upstream by ValidateHotReloadable, so the map conversion is
+    // lossless here.
+    auto by_name = [](const std::vector<UpstreamConfig>& v) {
+        std::map<std::string, const UpstreamConfig*> m;
+        for (const auto& u : v) m[u.name] = &u;
+        return m;
+    };
+    const auto old_map = by_name(upstream_configs_);
+    const auto new_map = by_name(new_config.upstreams);
+    bool topology_match = old_map.size() == new_map.size();
+    if (topology_match) {
+        for (const auto& entry : old_map) {
+            auto it = new_map.find(entry.first);
+            if (it == new_map.end() || *entry.second != *it->second) {
+                topology_match = false;
+                break;
+            }
+        }
+    }
+    if (!topology_match) {
+        logging::Get()->warn("Reload: upstream topology changes require a "
+                             "restart to take effect (circuit-breaker "
+                             "field edits, if any, were applied live)");
+    } else {
+        upstream_configs_ = new_config.upstreams;
     }
 
     return true;

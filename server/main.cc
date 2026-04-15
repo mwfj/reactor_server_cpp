@@ -328,7 +328,41 @@ static bool ReloadConfig(const std::string& config_path,
             }
         }
     }
+    // Hot-reloadable fields (today: per-upstream `circuit_breaker.*`
+    // on existing services + duplicate-name uniqueness across the
+    // new file) are the only ones that go LIVE on a SIGHUP reload.
+    // Validate them strictly — a bad value here would be pushed into
+    // running slices and keep running until an operator-driven
+    // restart fixes the config file. Hard-reject so operators see
+    // the error immediately instead of discovering drift the next
+    // time the startup path rejects the same file.
+    //
+    // CB validation is scoped to existing upstream names —
+    // CircuitBreakerManager::Reload only applies CB changes to those.
+    // New/renamed upstreams are restart-only; their CB blocks are
+    // skipped here so an intentional placeholder doesn't block other
+    // live-safe edits in the same reload (log/rate-limit/breaker
+    // edits on existing services).
+    {
+        std::unordered_set<std::string> live_names;
+        live_names.reserve(current_config.upstreams.size());
+        for (const auto& u : current_config.upstreams) {
+            live_names.insert(u.name);
+        }
+        try {
+            ConfigLoader::ValidateHotReloadable(new_config, live_names);
+        } catch (const std::invalid_argument& e) {
+            logging::Get()->error("Config reload rejected: {}", e.what());
+            reopen_existing_logs();
+            return false;
+        }
+    }
+
     // Warn about restart-required field issues (not applied during reload).
+    // Full Validate() includes both hot-reloadable rules (already checked
+    // above) and restart-only rules; by the time we reach this point the
+    // hot-reloadable subset is known valid, so any exception thrown here
+    // is from restart-only rules and is legitimately a warn, not an error.
     try {
         ConfigLoader::Validate(new_config);
     } catch (const std::invalid_argument& e) {
@@ -427,6 +461,19 @@ static bool ReloadConfig(const std::string& config_path,
     auto saved_tls = current_config.tls;
     auto saved_workers = current_config.worker_threads;
     auto saved_h2_enabled = current_config.http2.enabled;
+    // Preserve upstreams for the same reason: HttpServer::Reload treats
+    // the whole upstream block as restart-required (see http_server.cc
+    // upstream_configs_ comparison), and that internal copy never changes
+    // post-startup. If we overwrote current_config.upstreams here, a
+    // breaker-only edit would stage into current_config while the live
+    // server keeps running the startup values — /stats and other
+    // current_config consumers would report phantom state, and subsequent
+    // identical reloads could produce inconsistent diagnostics. Pin to
+    // the running values until CircuitBreakerManager::Reload implements
+    // CircuitBreakerManager::Reload (the only upstream sub-field that
+    // becomes hot-reloadable); at that point this save becomes a
+    // partial-field save excluding circuit_breaker.
+    auto saved_upstreams = current_config.upstreams;
 
     current_config = new_config;
 
@@ -435,6 +482,7 @@ static bool ReloadConfig(const std::string& config_path,
     current_config.tls = saved_tls;
     current_config.worker_threads = saved_workers;
     current_config.http2.enabled = saved_h2_enabled;
+    current_config.upstreams = std::move(saved_upstreams);
 
     // Commit file-backed state only after full success — a failed reload
     // must not flip this flag or future reloads lose the defaults+env fallback.

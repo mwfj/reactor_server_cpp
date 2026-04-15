@@ -348,6 +348,274 @@ namespace ConfigTests {
         }
     }
 
+    // Test 9: Circuit breaker defaults
+    void TestCircuitBreakerDefaults() {
+        std::cout << "\n[TEST] Circuit Breaker Defaults..." << std::endl;
+        try {
+            CircuitBreakerConfig cb;   // value-initialized defaults
+            bool pass = cb.enabled == false &&
+                        cb.dry_run == false &&
+                        cb.consecutive_failure_threshold == 5 &&
+                        cb.failure_rate_threshold == 50 &&
+                        cb.minimum_volume == 20 &&
+                        cb.window_seconds == 10 &&
+                        cb.permitted_half_open_calls == 5 &&
+                        cb.base_open_duration_ms == 5000 &&
+                        cb.max_open_duration_ms == 60000 &&
+                        cb.max_ejection_percent_per_host_set == 50 &&
+                        cb.retry_budget_percent == 20 &&
+                        cb.retry_budget_min_concurrency == 3;
+            TestFramework::RecordTest("Circuit Breaker Defaults", pass,
+                pass ? "" : "default value mismatch",
+                TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("Circuit Breaker Defaults", false, e.what(),
+                TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // Test 10: Circuit breaker JSON parsing (populated block)
+    void TestCircuitBreakerJsonParse() {
+        std::cout << "\n[TEST] Circuit Breaker JSON Parse..." << std::endl;
+        try {
+            std::string json = R"({
+                "upstreams": [{
+                    "name": "svc",
+                    "host": "10.0.0.1",
+                    "port": 8080,
+                    "circuit_breaker": {
+                        "enabled": true,
+                        "dry_run": true,
+                        "consecutive_failure_threshold": 7,
+                        "failure_rate_threshold": 75,
+                        "minimum_volume": 50,
+                        "window_seconds": 30,
+                        "permitted_half_open_calls": 3,
+                        "base_open_duration_ms": 2000,
+                        "max_open_duration_ms": 120000,
+                        "max_ejection_percent_per_host_set": 33,
+                        "retry_budget_percent": 10,
+                        "retry_budget_min_concurrency": 5
+                    }
+                }]
+            })";
+            ServerConfig config = ConfigLoader::LoadFromString(json);
+            const auto& cb = config.upstreams.at(0).circuit_breaker;
+            bool pass = cb.enabled == true && cb.dry_run == true &&
+                        cb.consecutive_failure_threshold == 7 &&
+                        cb.failure_rate_threshold == 75 &&
+                        cb.minimum_volume == 50 &&
+                        cb.window_seconds == 30 &&
+                        cb.permitted_half_open_calls == 3 &&
+                        cb.base_open_duration_ms == 2000 &&
+                        cb.max_open_duration_ms == 120000 &&
+                        cb.max_ejection_percent_per_host_set == 33 &&
+                        cb.retry_budget_percent == 10 &&
+                        cb.retry_budget_min_concurrency == 5;
+            TestFramework::RecordTest("Circuit Breaker JSON Parse", pass,
+                pass ? "" : "parsed values mismatch",
+                TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("Circuit Breaker JSON Parse", false, e.what(),
+                TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // Test 11: Circuit breaker JSON partial block uses defaults for missing fields
+    void TestCircuitBreakerJsonPartial() {
+        std::cout << "\n[TEST] Circuit Breaker JSON Partial..." << std::endl;
+        try {
+            std::string json = R"({
+                "upstreams": [{
+                    "name": "svc", "host": "10.0.0.1", "port": 8080,
+                    "circuit_breaker": {"enabled": true}
+                }]
+            })";
+            ServerConfig config = ConfigLoader::LoadFromString(json);
+            const auto& cb = config.upstreams.at(0).circuit_breaker;
+            bool pass = cb.enabled == true &&
+                        cb.consecutive_failure_threshold == 5 &&
+                        cb.window_seconds == 10;
+            TestFramework::RecordTest("Circuit Breaker JSON Partial", pass,
+                pass ? "" : "expected defaults for unset fields",
+                TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("Circuit Breaker JSON Partial", false, e.what(),
+                TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // Test 12: Round-trip via ToJson() preserves circuit_breaker
+    void TestCircuitBreakerJsonRoundTrip() {
+        std::cout << "\n[TEST] Circuit Breaker JSON Round-Trip..." << std::endl;
+        try {
+            ServerConfig in;
+            UpstreamConfig u;
+            u.name = "svc"; u.host = "10.0.0.1"; u.port = 8080;
+            u.circuit_breaker.enabled = true;
+            u.circuit_breaker.window_seconds = 25;
+            u.circuit_breaker.failure_rate_threshold = 42;
+            in.upstreams.push_back(u);
+
+            std::string serialized = ConfigLoader::ToJson(in);
+            ServerConfig out = ConfigLoader::LoadFromString(serialized);
+
+            const auto& cb = out.upstreams.at(0).circuit_breaker;
+            bool pass = cb.enabled == true && cb.window_seconds == 25 &&
+                        cb.failure_rate_threshold == 42;
+            TestFramework::RecordTest("Circuit Breaker JSON Round-Trip", pass,
+                pass ? "" : "round-trip lost fields",
+                TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("Circuit Breaker JSON Round-Trip", false,
+                e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // Helper: assert a circuit_breaker JSON override is rejected by Validate().
+    static void ExpectValidationFailure(const std::string& name,
+                                        const std::string& cb_json_override,
+                                        const std::string& expected_substr) {
+        std::string json = std::string(R"({
+            "upstreams": [{
+                "name": "svc", "host": "10.0.0.1", "port": 8080,
+                "circuit_breaker": )") + cb_json_override + R"(
+            }]
+        })";
+        try {
+            ServerConfig config = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(config);
+            TestFramework::RecordTest(name, false,
+                "expected validation failure containing: " + expected_substr,
+                TestFramework::TestCategory::OTHER);
+        } catch (const std::invalid_argument& e) {
+            std::string msg(e.what());
+            bool pass = msg.find(expected_substr) != std::string::npos;
+            TestFramework::RecordTest(name, pass,
+                pass ? "" : std::string("wrong error: ") + msg,
+                TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(name, false,
+                std::string("wrong exception type: ") + e.what(),
+                TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // Test 13: Validation rejects bad circuit_breaker fields
+    void TestCircuitBreakerValidation() {
+        std::cout << "\n[TEST] Circuit Breaker Validation..." << std::endl;
+        ExpectValidationFailure("CB Validation: consecutive_failure_threshold<1",
+            R"({"consecutive_failure_threshold": 0})",
+            "consecutive_failure_threshold must be in [1, 10000]");
+        ExpectValidationFailure("CB Validation: failure_rate_threshold>100",
+            R"({"failure_rate_threshold": 101})",
+            "failure_rate_threshold must be in [0, 100]");
+        ExpectValidationFailure("CB Validation: minimum_volume<1",
+            R"({"minimum_volume": 0})",
+            "minimum_volume must be in [1, 10000000]");
+        ExpectValidationFailure("CB Validation: window_seconds<1",
+            R"({"window_seconds": 0})",
+            "window_seconds must be in [1, 3600]");
+        ExpectValidationFailure("CB Validation: window_seconds>3600",
+            R"({"window_seconds": 3601})",
+            "window_seconds must be in [1, 3600]");
+        ExpectValidationFailure("CB Validation: base_open_duration_ms<100",
+            R"({"base_open_duration_ms": 50})",
+            "base_open_duration_ms must be >= 100");
+        ExpectValidationFailure("CB Validation: max<base",
+            R"({"base_open_duration_ms": 5000, "max_open_duration_ms": 1000})",
+            "max_open_duration_ms must be >= base_open_duration_ms");
+        ExpectValidationFailure("CB Validation: retry_budget_percent>100",
+            R"({"retry_budget_percent": 200})",
+            "retry_budget_percent must be in [0, 100]");
+        ExpectValidationFailure("CB Validation: retry_budget_min_concurrency<0",
+            R"({"retry_budget_min_concurrency": -1})",
+            "retry_budget_min_concurrency must be >= 0");
+        ExpectValidationFailure("CB Validation: max_ejection_percent>100",
+            R"({"max_ejection_percent_per_host_set": 150})",
+            "max_ejection_percent_per_host_set must be in [0, 100]");
+        ExpectValidationFailure("CB Validation: permitted_half_open_calls<1",
+            R"({"permitted_half_open_calls": 0})",
+            "permitted_half_open_calls must be in [1, 1000]");
+        // Upper-bound regressions — pathological configs must be rejected.
+        ExpectValidationFailure("CB Validation: consecutive_failure_threshold>10000",
+            R"({"consecutive_failure_threshold": 10001})",
+            "consecutive_failure_threshold must be in [1, 10000]");
+        ExpectValidationFailure("CB Validation: minimum_volume>10000000",
+            R"({"minimum_volume": 10000001})",
+            "minimum_volume must be in [1, 10000000]");
+        ExpectValidationFailure("CB Validation: permitted_half_open_calls>1000",
+            R"({"permitted_half_open_calls": 1001})",
+            "permitted_half_open_calls must be in [1, 1000]");
+        // Type-strictness guards: nlohmann's value<int>() silently coerces
+        // float/bool to int (1.9 → 1, true → 1). Rejecting at parse time is
+        // safer than letting malformed configs pass Validate() and change
+        // production breaker behavior.
+        ExpectValidationFailure("CB Validation: float rejected for int field",
+            R"({"window_seconds": 1.9})",
+            "circuit_breaker.window_seconds must be an integer");
+        ExpectValidationFailure("CB Validation: bool rejected for int field",
+            R"({"consecutive_failure_threshold": true})",
+            "circuit_breaker.consecutive_failure_threshold must be an integer");
+        ExpectValidationFailure("CB Validation: int rejected for bool field",
+            R"({"enabled": 1})",
+            "circuit_breaker.enabled must be a boolean");
+    }
+
+    // UpstreamConfig::operator== EXCLUDES circuit_breaker.
+    // CircuitBreakerManager::Reload is wired in HttpServer::Reload, so a
+    // CB-only SIGHUP is a clean hot reload. Excluding circuit_breaker from
+    // the equality check ensures the outer reload doesn't fire a spurious
+    // "restart required" warning on a pure CB-fields edit.
+    // Topology fields (name, host, port, tls, pool, proxy) remain
+    // restart-only and must still trigger inequality.
+    void TestCircuitBreakerEquality() {
+        std::cout << "\n[TEST] Circuit Breaker Equality (CB excluded from UpstreamConfig::operator==)..." << std::endl;
+        try {
+            UpstreamConfig a;
+            a.name = "svc"; a.host = "h"; a.port = 80;
+            UpstreamConfig b = a;
+
+            // Default equal.
+            bool equal_default = (a == b);
+
+            // Circuit-breaker-only edit must NOT break equality — breaker
+            // fields are live-reloadable via CircuitBreakerManager::Reload.
+            b.circuit_breaker.enabled = true;
+            b.circuit_breaker.window_seconds = 30;
+            bool cb_edit_invisible = (a == b);
+
+            // CircuitBreakerConfig::operator== still detects the field diff
+            // (CircuitBreakerManager::Reload relies on this inner comparison).
+            bool cb_fields_differ = (a.circuit_breaker != b.circuit_breaker);
+
+            // Topology changes still make configs unequal.
+            UpstreamConfig c = a;
+            c.host = "different";
+            bool topology_changed = (a != c);
+
+            UpstreamConfig d = a;
+            d.port = 9999;
+            bool port_change_detected = (a != d);
+
+            bool pass = equal_default && cb_edit_invisible &&
+                        cb_fields_differ && topology_changed &&
+                        port_change_detected;
+            TestFramework::RecordTest("Circuit Breaker Equality (CB excluded from UpstreamConfig::operator==)",
+                pass,
+                pass ? "" :
+                "equal_default=" + std::to_string(equal_default) +
+                " cb_edit_invisible=" + std::to_string(cb_edit_invisible) +
+                " cb_fields_differ=" + std::to_string(cb_fields_differ) +
+                " topology_changed=" + std::to_string(topology_changed) +
+                " port_change_detected=" + std::to_string(port_change_detected),
+                TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest("Circuit Breaker Equality (CB excluded from UpstreamConfig::operator==)",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // Run all config tests
     void RunAllTests() {
         std::cout << "\n" << std::string(60, '=') << std::endl;
@@ -362,6 +630,14 @@ namespace ConfigTests {
         TestValidationTlsNoCert();
         TestEnvOverrides();
         TestMissingFile();
+
+        // Circuit breaker config tests
+        TestCircuitBreakerDefaults();
+        TestCircuitBreakerJsonParse();
+        TestCircuitBreakerJsonPartial();
+        TestCircuitBreakerJsonRoundTrip();
+        TestCircuitBreakerValidation();
+        TestCircuitBreakerEquality();
     }
 
 } // namespace ConfigTests

@@ -267,6 +267,60 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 }
             }
 
+            if (item.contains("circuit_breaker")) {
+                if (!item["circuit_breaker"].is_object())
+                    throw std::runtime_error("upstream circuit_breaker must be an object");
+                auto& cb = item["circuit_breaker"];
+                // Strict integer accessor: rejects float/bool/string inputs
+                // that nlohmann's default value<int>() would silently coerce
+                // (e.g., 1.9 → 1, true → 1). Without this, malformed configs
+                // pass Validate() and change breaker behavior in production.
+                auto cb_int = [&cb](const char* name, int default_val) -> int {
+                    if (!cb.contains(name)) return default_val;
+                    const auto& v = cb[name];
+                    if (!v.is_number_integer()) {
+                        throw std::invalid_argument(
+                            std::string("circuit_breaker.") + name +
+                            " must be an integer");
+                    }
+                    return v.get<int>();
+                };
+                auto cb_bool = [&cb](const char* name, bool default_val) -> bool {
+                    if (!cb.contains(name)) return default_val;
+                    const auto& v = cb[name];
+                    if (!v.is_boolean()) {
+                        throw std::invalid_argument(
+                            std::string("circuit_breaker.") + name +
+                            " must be a boolean");
+                    }
+                    return v.get<bool>();
+                };
+                upstream.circuit_breaker.enabled =
+                    cb_bool("enabled", false);
+                upstream.circuit_breaker.dry_run =
+                    cb_bool("dry_run", false);
+                upstream.circuit_breaker.consecutive_failure_threshold =
+                    cb_int("consecutive_failure_threshold", 5);
+                upstream.circuit_breaker.failure_rate_threshold =
+                    cb_int("failure_rate_threshold", 50);
+                upstream.circuit_breaker.minimum_volume =
+                    cb_int("minimum_volume", 20);
+                upstream.circuit_breaker.window_seconds =
+                    cb_int("window_seconds", 10);
+                upstream.circuit_breaker.permitted_half_open_calls =
+                    cb_int("permitted_half_open_calls", 5);
+                upstream.circuit_breaker.base_open_duration_ms =
+                    cb_int("base_open_duration_ms", 5000);
+                upstream.circuit_breaker.max_open_duration_ms =
+                    cb_int("max_open_duration_ms", 60000);
+                upstream.circuit_breaker.max_ejection_percent_per_host_set =
+                    cb_int("max_ejection_percent_per_host_set", 50);
+                upstream.circuit_breaker.retry_budget_percent =
+                    cb_int("retry_budget_percent", 20);
+                upstream.circuit_breaker.retry_budget_min_concurrency =
+                    cb_int("retry_budget_min_concurrency", 3);
+            }
+
             config.upstreams.push_back(std::move(upstream));
         }
     }
@@ -505,6 +559,115 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     }
     val = std::getenv("REACTOR_RATE_LIMIT_STATUS_CODE");
     if (val) config.rate_limit.status_code = EnvToInt(val, "REACTOR_RATE_LIMIT_STATUS_CODE");
+}
+
+void ConfigLoader::ValidateHotReloadable(
+        const ServerConfig& config,
+        const std::unordered_set<std::string>& live_upstream_names) {
+    // Mirrors the circuit_breaker validation block in Validate().
+    // Kept in lock-step with that block — any rule added there for a
+    // hot-reloadable field must be added here too, or the SIGHUP
+    // reload path would silently accept values the startup path
+    // rejects (which is exactly the regression this helper exists
+    // to prevent).
+
+    // Reject duplicate upstream service names BEFORE the per-upstream
+    // CB validation. Even for new/renamed entries, the file is
+    // malformed if names collide: `CircuitBreakerManager::Reload`
+    // iterates the new upstream list and applies each entry's
+    // `circuit_breaker` block to GetHost(name); duplicates would
+    // silently overwrite (last-write wins). Startup's full Validate()
+    // rejects the file outright; the hot-reload path must match.
+    // This rule runs UNCONDITIONALLY on the new config — it doesn't
+    // depend on `live_upstream_names`.
+    {
+        std::unordered_set<std::string> seen;
+        seen.reserve(config.upstreams.size());
+        for (size_t i = 0; i < config.upstreams.size(); ++i) {
+            const auto& name = config.upstreams[i].name;
+            if (!seen.insert(name).second) {
+                throw std::invalid_argument(
+                    "upstreams[" + std::to_string(i) +
+                    "] duplicate service name '" + name +
+                    "' (upstream service names must be unique)");
+            }
+        }
+    }
+
+    for (size_t i = 0; i < config.upstreams.size(); ++i) {
+        const auto& u = config.upstreams[i];
+        const std::string idx = "upstreams[" + std::to_string(i) + "]";
+
+        // CB-field validation is scoped to upstreams that are LIVE in
+        // the running server. CircuitBreakerManager::Reload only
+        // applies CB changes to pre-existing hosts — new/renamed
+        // entries are restart-only and skipped with a warn — so
+        // validating their CB blocks here would block otherwise-safe
+        // reloads (e.g. a reload that stages a new upstream alongside
+        // a log-level edit would abort even though the live server
+        // would never apply the new upstream's CB block).
+        //
+        // The empty-set case (no live upstreams yet) is handled by
+        // the same check: every entry is "new", so every entry is
+        // skipped — only the duplicate-name check runs.
+        if (live_upstream_names.find(u.name) == live_upstream_names.end()) {
+            continue;
+        }
+        const auto& cb = u.circuit_breaker;
+        if (cb.consecutive_failure_threshold < 1 ||
+            cb.consecutive_failure_threshold > 10000) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.consecutive_failure_threshold must be in [1, 10000]");
+        }
+        if (cb.failure_rate_threshold < 0 || cb.failure_rate_threshold > 100) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.failure_rate_threshold must be in [0, 100]");
+        }
+        if (cb.minimum_volume < 1 || cb.minimum_volume > 10000000) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.minimum_volume must be in [1, 10000000]");
+        }
+        if (cb.window_seconds < 1 || cb.window_seconds > 3600) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.window_seconds must be in [1, 3600]");
+        }
+        if (cb.permitted_half_open_calls < 1 ||
+            cb.permitted_half_open_calls > 1000) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.permitted_half_open_calls must be in [1, 1000]");
+        }
+        if (cb.base_open_duration_ms < 100) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.base_open_duration_ms must be >= 100");
+        }
+        if (cb.max_open_duration_ms < cb.base_open_duration_ms) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.max_open_duration_ms must be >= base_open_duration_ms");
+        }
+        if (cb.max_ejection_percent_per_host_set < 0 ||
+            cb.max_ejection_percent_per_host_set > 100) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.max_ejection_percent_per_host_set must be in [0, 100]");
+        }
+        if (cb.retry_budget_percent < 0 || cb.retry_budget_percent > 100) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.retry_budget_percent must be in [0, 100]");
+        }
+        if (cb.retry_budget_min_concurrency < 0) {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): circuit_breaker.retry_budget_min_concurrency must be >= 0");
+        }
+    }
 }
 
 void ConfigLoader::Validate(const ServerConfig& config) {
@@ -811,6 +974,69 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     idx + " ('" + u.name +
                     "'): proxy.retry.max_retries must be >= 0 and <= 10");
             }
+
+            // Circuit breaker validation.
+            //
+            // Upper bounds on counting fields are generous — they exist to
+            // catch pathological configs (typo like "10_000_000_000" or a
+            // missing unit conversion), not to constrain legitimate tuning.
+            // Defaults are 5 / 20 / 5; limits are 1000× to 50000× the defaults.
+            {
+                const auto& cb = u.circuit_breaker;
+                if (cb.consecutive_failure_threshold < 1 ||
+                    cb.consecutive_failure_threshold > 10000) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.consecutive_failure_threshold must be in [1, 10000]");
+                }
+                if (cb.failure_rate_threshold < 0 || cb.failure_rate_threshold > 100) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.failure_rate_threshold must be in [0, 100]");
+                }
+                if (cb.minimum_volume < 1 || cb.minimum_volume > 10000000) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.minimum_volume must be in [1, 10000000]");
+                }
+                if (cb.window_seconds < 1 || cb.window_seconds > 3600) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.window_seconds must be in [1, 3600]");
+                }
+                if (cb.permitted_half_open_calls < 1 ||
+                    cb.permitted_half_open_calls > 1000) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.permitted_half_open_calls must be in [1, 1000]");
+                }
+                if (cb.base_open_duration_ms < 100) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.base_open_duration_ms must be >= 100");
+                }
+                if (cb.max_open_duration_ms < cb.base_open_duration_ms) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.max_open_duration_ms must be >= base_open_duration_ms");
+                }
+                if (cb.max_ejection_percent_per_host_set < 0 ||
+                    cb.max_ejection_percent_per_host_set > 100) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.max_ejection_percent_per_host_set must be in [0, 100]");
+                }
+                if (cb.retry_budget_percent < 0 || cb.retry_budget_percent > 100) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.retry_budget_percent must be in [0, 100]");
+                }
+                if (cb.retry_budget_min_concurrency < 0) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): circuit_breaker.retry_budget_min_concurrency must be >= 0");
+                }
+            }
             // Validate method names — reject unknowns and duplicates.
             // Duplicates would cause RouteAsync to throw at startup.
             {
@@ -1072,6 +1298,31 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             pj["retry"] = rj;
 
             uj["proxy"] = pj;
+        }
+        // Always serialize circuit_breaker — same rationale as proxy block.
+        if (u.circuit_breaker != CircuitBreakerConfig{}) {
+            nlohmann::json cbj;
+            cbj["enabled"] = u.circuit_breaker.enabled;
+            cbj["dry_run"] = u.circuit_breaker.dry_run;
+            cbj["consecutive_failure_threshold"] =
+                u.circuit_breaker.consecutive_failure_threshold;
+            cbj["failure_rate_threshold"] =
+                u.circuit_breaker.failure_rate_threshold;
+            cbj["minimum_volume"] = u.circuit_breaker.minimum_volume;
+            cbj["window_seconds"] = u.circuit_breaker.window_seconds;
+            cbj["permitted_half_open_calls"] =
+                u.circuit_breaker.permitted_half_open_calls;
+            cbj["base_open_duration_ms"] =
+                u.circuit_breaker.base_open_duration_ms;
+            cbj["max_open_duration_ms"] =
+                u.circuit_breaker.max_open_duration_ms;
+            cbj["max_ejection_percent_per_host_set"] =
+                u.circuit_breaker.max_ejection_percent_per_host_set;
+            cbj["retry_budget_percent"] =
+                u.circuit_breaker.retry_budget_percent;
+            cbj["retry_budget_min_concurrency"] =
+                u.circuit_breaker.retry_budget_min_concurrency;
+            uj["circuit_breaker"] = cbj;
         }
         j["upstreams"].push_back(uj);
     }

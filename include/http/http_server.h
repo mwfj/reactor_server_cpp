@@ -22,6 +22,10 @@
 class UpstreamManager;
 class ProxyHandler;
 
+namespace CIRCUIT_BREAKER_NAMESPACE {
+class CircuitBreakerManager;
+}
+
 class HttpServer {
 public:
     // Snapshot of server runtime statistics. All values are approximate
@@ -335,6 +339,16 @@ private:
     // Upstream connection pool
     std::vector<UpstreamConfig> upstream_configs_;
     std::unique_ptr<UpstreamManager> upstream_manager_;
+
+    // Circuit breaker — declared AFTER upstream_manager_ so destruction
+    // order is breaker-FIRST, pool-SECOND (design §3.1). On shutdown the
+    // breaker's slices may still be consulted by in-flight
+    // ProxyTransactions until they drain; destroying the breaker first
+    // (before the pool) is safe because UpstreamManager's outstanding
+    // breaker_manager_ pointer is checked against null on every lookup.
+    // Destroying the pool first would leave breaker slices holding
+    // dangling references.
+    std::unique_ptr<CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerManager> circuit_breaker_manager_;
 
     // Rate limiting
     RateLimitConfig rate_limit_config_;

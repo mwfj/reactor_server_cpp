@@ -6,6 +6,7 @@
 #include "upstream/header_rewriter.h"
 #include "upstream/retry_policy.h"
 #include "config/server_config.h"        // ProxyConfig (stored by value)
+#include "circuit_breaker/retry_budget.h" // RetryBudget::InFlightGuard (member-by-value)
 #include "http/http_callbacks.h"
 #include "http/http_response.h"
 // <string>, <map>, <unordered_map>, <memory>, <functional>, <chrono> provided by common.h
@@ -15,16 +16,28 @@ class UpstreamManager;
 class ConnectionHandler;
 class Dispatcher;
 
+namespace CIRCUIT_BREAKER_NAMESPACE {
+class CircuitBreakerSlice;
+}  // RetryBudget already defined via retry_budget.h
+
 class ProxyTransaction : public std::enable_shared_from_this<ProxyTransaction> {
 public:
     // Result codes for internal state tracking
-    static constexpr int RESULT_SUCCESS            = 0;
-    static constexpr int RESULT_CHECKOUT_FAILED    = -1;  // Upstream connect failure → 502
-    static constexpr int RESULT_SEND_FAILED        = -2;
-    static constexpr int RESULT_PARSE_ERROR        = -3;
-    static constexpr int RESULT_RESPONSE_TIMEOUT   = -4;
+    static constexpr int RESULT_SUCCESS             = 0;
+    static constexpr int RESULT_CHECKOUT_FAILED     = -1;  // Upstream connect failure → 502
+    static constexpr int RESULT_SEND_FAILED         = -2;
+    static constexpr int RESULT_PARSE_ERROR         = -3;
+    static constexpr int RESULT_RESPONSE_TIMEOUT    = -4;
     static constexpr int RESULT_UPSTREAM_DISCONNECT = -5;
-    static constexpr int RESULT_POOL_EXHAUSTED     = -6;  // Local capacity → 503
+    static constexpr int RESULT_POOL_EXHAUSTED      = -6;  // Local capacity → 503
+    // Circuit breaker rejected this attempt before it touched the upstream.
+    // Carries Retry-After + X-Circuit-Breaker headers (§12.1).
+    // Terminal — retry loop MUST NOT retry this outcome (§8).
+    static constexpr int RESULT_CIRCUIT_OPEN        = -7;
+    // Retry budget exhausted. No Retry-After; distinct header
+    // X-Retry-Budget-Exhausted so operators can tell the two 503s apart
+    // from circuit-open rejects.
+    static constexpr int RESULT_RETRY_BUDGET_EXHAUSTED = -8;
 
     // Constructor copies all needed fields from client_request (method, path,
     // query, headers, body, params, dispatcher_index, client_ip, client_tls,
@@ -145,6 +158,47 @@ private:
     // Timing
     std::chrono::steady_clock::time_point start_time_;
 
+    // Circuit breaker integration — resolved once in Start() from
+    // `service_name_` + `dispatcher_index_`. Null when there's no
+    // CircuitBreakerManager attached (server has no upstreams, or the
+    // breaker is being built lazily) — the breaker is simply skipped in
+    // that case. Lifetime: the slice is owned by CircuitBreakerHost in
+    // CircuitBreakerManager on HttpServer, which outlives this transaction.
+    CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerSlice* slice_ = nullptr;
+
+    // Per-host retry budget, resolved alongside `slice_` in Start() from
+    // the same CircuitBreakerHost. Null when there's no breaker attached
+    // for this service — in that case the transaction skips budget
+    // tracking entirely. Lifetime: the budget is owned by the host,
+    // which outlives this transaction (destruction order guaranteed by
+    // HttpServer member declaration).
+    CIRCUIT_BREAKER_NAMESPACE::RetryBudget* retry_budget_ = nullptr;
+
+    // Per-attempt in-flight tracker. Held for the duration of each
+    // attempt (first try and retries alike). Replaced on every
+    // AttemptCheckout — move-assignment decrements the counter for the
+    // prior attempt and increments for the new one, so a retrying
+    // transaction stays at a single in_flight unit. Default-constructed
+    // guard is empty (counter_ = nullptr): used when retry_budget_ is
+    // null or before the first ConsultBreaker admission.
+    CIRCUIT_BREAKER_NAMESPACE::RetryBudget::InFlightGuard inflight_guard_;
+
+    // Per-ATTEMPT admission state. Reset on each call to ConsultBreaker();
+    // paired Report*() calls thread the `generation` back so the slice
+    // can drop stale completions across state transitions (see
+    // CircuitBreakerSlice::Admission doc). generation_==0 is a sentinel
+    // for "no admission held" — slice domain gens start at 1 so a 0-gen
+    // report always drops safely.
+    uint64_t admission_generation_ = 0;
+    bool is_probe_ = false;
+
+    // Retry-budget token held by this transaction's current retry
+    // attempt (attempt_ > 0). Set true after a successful
+    // TryConsumeRetry in MaybeRetry; cleared by ReleaseRetryToken in
+    // Cleanup. Dry-run rejects proceed but the flag stays false — no
+    // token was consumed, so no ReleaseRetry is required.
+    bool retry_token_held_ = false;
+
     // Internal methods
     void AttemptCheckout();
     void OnCheckoutReady(UpstreamLease lease);
@@ -170,6 +224,60 @@ private:
     void ArmResponseTimeout(int explicit_budget_ms = 0);
     void ClearResponseTimeout();
 
-    // Error response factory (maps result codes to HTTP responses)
+    // Error response factory (maps result codes to HTTP responses).
+    // Circuit-open and retry-budget responses need richer context
+    // (Retry-After from slice_, distinguishing header), so they have
+    // dedicated factories below — MakeErrorResponse falls back to a
+    // plain 503 for those codes if called generically.
     static HttpResponse MakeErrorResponse(int result_code);
+
+    // Emit the circuit-open response (design §12.1):
+    //   503 + Retry-After (seconds until slice->OpenUntil())
+    //       + X-Circuit-Breaker: open
+    //       + X-Upstream-Host: service:host:port
+    HttpResponse MakeCircuitOpenResponse() const;
+
+    // Emit the retry-budget-exhausted response (design §12.2):
+    //   503 + X-Retry-Budget-Exhausted: 1
+    static HttpResponse MakeRetryBudgetResponse();
+
+    // Breaker helpers — gate and outcome classification.
+    //
+    // ConsultBreaker: call at the top of AttemptCheckout. Populates
+    // admission_generation_ and is_probe_ on admission; delivers the
+    // circuit-open response and returns false on reject. Dry-run admits
+    // and returns true (slice already counted the would-reject).
+    // Returns true if the caller should proceed to CheckoutAsync.
+    bool ConsultBreaker();
+
+    // ReportBreakerOutcome: classify a result_code into
+    // success/failure/neutral (per design §7) and call slice->Report*
+    // with admission_generation_. Clears admission_generation_ so a
+    // double-report is impossible.
+    //
+    // failure_kind is ignored unless the outcome is a FailureKind-bearing
+    // result; the caller passes the appropriate kind for 5xx vs disconnect
+    // vs timeout since the slice treats them differently only for logs.
+    void ReportBreakerOutcome(int result_code);
+
+    // ReleaseBreakerAdmissionNeutral: release the admission slot without
+    // counting a success or failure. Used when the transaction is aborted
+    // locally (Cancel() on client disconnect, cancelled_ early-return
+    // after checkout, etc.) before an upstream health signal was observed.
+    //
+    // Without this, a HALF_OPEN probe slot is stranded if the client
+    // disconnects mid-probe — the slice stays in half_open_full until an
+    // external reset. No-op if admission_generation_ == 0. Clears
+    // admission_generation_ so a following ReportBreakerOutcome is a
+    // no-op.
+    void ReleaseBreakerAdmissionNeutral();
+
+    // Release the retry-budget token held by this attempt, if any.
+    // Idempotent via the retry_token_held_ flag — called from Cleanup
+    // between attempts (so the next retry's TryConsumeRetry sees a
+    // freshly-released counter) AND from the destructor / Cancel as
+    // safety nets. No-op when no budget was attached or no token was
+    // consumed (e.g. first attempt, or dry-run reject that didn't
+    // consume).
+    void ReleaseRetryToken();
 };
