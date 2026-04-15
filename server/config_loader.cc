@@ -230,6 +230,19 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 if (!item["proxy"].is_object())
                     throw std::runtime_error("upstream proxy must be an object");
                 auto& proxy = item["proxy"];
+                upstream.proxy.buffering = proxy.value("buffering", "auto");
+                upstream.proxy.relay_buffer_limit_bytes =
+                    proxy.value("relay_buffer_limit_bytes", 1048576u);
+                upstream.proxy.auto_stream_content_length_threshold_bytes =
+                    proxy.value("auto_stream_content_length_threshold_bytes", 262144u);
+                upstream.proxy.stream_idle_timeout_sec =
+                    proxy.value("stream_idle_timeout_sec", 30u);
+                upstream.proxy.stream_max_duration_sec =
+                    proxy.value("stream_max_duration_sec", 0u);
+                upstream.proxy.h10_streaming =
+                    proxy.value("h10_streaming", "close");
+                upstream.proxy.forward_trailers =
+                    proxy.value("forward_trailers", false);
                 upstream.proxy.route_prefix = proxy.value("route_prefix", "");
                 upstream.proxy.strip_prefix = proxy.value("strip_prefix", false);
                 upstream.proxy.response_timeout_ms = proxy.value("response_timeout_ms", 30000);
@@ -969,6 +982,51 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     "'): proxy.response_timeout_ms must be 0 (disabled) "
                     "or >= 1000 (timer scan resolution is 1s)");
             }
+            if (u.proxy.buffering != "always" &&
+                u.proxy.buffering != "never" &&
+                u.proxy.buffering != "auto") {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.buffering must be one of always|never|auto");
+            }
+            if (u.proxy.h10_streaming != "close" &&
+                u.proxy.h10_streaming != "buffer") {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.h10_streaming must be one of close|buffer");
+            }
+            if (u.proxy.relay_buffer_limit_bytes < 16384 ||
+                u.proxy.relay_buffer_limit_bytes > 67108864) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.relay_buffer_limit_bytes must be in [16384, 67108864]");
+            }
+            if (u.proxy.auto_stream_content_length_threshold_bytes >
+                u.proxy.relay_buffer_limit_bytes) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.auto_stream_content_length_threshold_bytes must be <= "
+                    "proxy.relay_buffer_limit_bytes");
+            }
+            if (u.proxy.stream_idle_timeout_sec > 3600) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.stream_idle_timeout_sec must be <= 3600");
+            }
+            if (u.proxy.stream_max_duration_sec > 86400) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.stream_max_duration_sec must be <= 86400");
+            }
+            if (u.proxy.stream_max_duration_sec > 0 &&
+                u.proxy.stream_idle_timeout_sec >
+                    u.proxy.stream_max_duration_sec) {
+                logging::Get()->warn(
+                    "{} ('{}'): proxy.stream_idle_timeout_sec ({}) exceeds "
+                    "proxy.stream_max_duration_sec ({})",
+                    idx, u.name, u.proxy.stream_idle_timeout_sec,
+                    u.proxy.stream_max_duration_sec);
+            }
             if (u.proxy.retry.max_retries < 0 || u.proxy.retry.max_retries > 10) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name +
@@ -1276,6 +1334,14 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
         // those settings on a ToJson() / LoadFromString() round-trip.
         if (u.proxy != ProxyConfig{}) {
             nlohmann::json pj;
+            pj["buffering"] = u.proxy.buffering;
+            pj["relay_buffer_limit_bytes"] = u.proxy.relay_buffer_limit_bytes;
+            pj["auto_stream_content_length_threshold_bytes"] =
+                u.proxy.auto_stream_content_length_threshold_bytes;
+            pj["stream_idle_timeout_sec"] = u.proxy.stream_idle_timeout_sec;
+            pj["stream_max_duration_sec"] = u.proxy.stream_max_duration_sec;
+            pj["h10_streaming"] = u.proxy.h10_streaming;
+            pj["forward_trailers"] = u.proxy.forward_trailers;
             pj["route_prefix"] = u.proxy.route_prefix;
             pj["strip_prefix"] = u.proxy.strip_prefix;
             pj["response_timeout_ms"] = u.proxy.response_timeout_ms;

@@ -32,6 +32,7 @@ public:
     // Captures `this` -- the ProxyHandler must outlive all transactions.
     // Called by the async handler framework after middleware has run.
     void Handle(const HttpRequest& request,
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender,
                 HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete);
 
     // Access configuration for tests/logging

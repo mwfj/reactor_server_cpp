@@ -1,6 +1,358 @@
 #include "http2/http2_connection_handler.h"
 #include "http/http_response.h"
 #include "log/logger.h"
+#include <nghttp2/nghttp2.h>
+
+namespace {
+
+class StreamingH2DataSource final : public ResponseDataSource,
+                                    public std::enable_shared_from_this<StreamingH2DataSource> {
+public:
+    explicit StreamingH2DataSource(std::shared_ptr<ConnectionHandler> conn)
+        : conn_(std::move(conn)) {
+        ConfigureWatermarks(1024 * 1024);
+    }
+
+    void ConfigureWatermarks(size_t high_water_bytes) {
+        if (high_water_bytes == 0) return;
+        high_water_ = high_water_bytes;
+        low_water_ = high_water_ / 2;
+        if (buffer_.size() < high_water_) {
+            buffer_.resize(high_water_);
+        }
+    }
+
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult Append(
+        const char* data, size_t len) {
+        if (aborted_ || finished_) {
+            return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
+        }
+        EnsureCapacity(size_ + len);
+        size_t first = std::min(len, buffer_.size() - write_off_);
+        std::memcpy(buffer_.data() + write_off_, data, first);
+        if (len > first) {
+            std::memcpy(buffer_.data(), data + first, len - first);
+        }
+        write_off_ = (write_off_ + len) % buffer_.size();
+        size_ += len;
+        if (size_ >= high_water_) {
+            above_high_water_ = true;
+            return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::
+                ACCEPTED_ABOVE_HIGH_WATER;
+        }
+        return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::
+            ACCEPTED_BELOW_WATER;
+    }
+
+    void Finish() {
+        finished_ = true;
+    }
+
+    void Abort() {
+        aborted_ = true;
+        finished_ = true;
+        size_ = 0;
+        read_off_ = 0;
+        write_off_ = 0;
+        drain_listener_ = nullptr;
+    }
+
+    void SetDrainListener(
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::DrainListener listener) {
+        drain_listener_ = std::move(listener);
+        if (!drain_listener_) {
+            above_high_water_ = false;
+            drain_listener_scheduled_ = false;
+        }
+    }
+
+    ssize_t ReadChunk(uint8_t* buf, size_t length,
+                      uint32_t* data_flags) override {
+        if (size_ == 0) {
+            if (finished_) {
+                *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+                return 0;
+            }
+            return NGHTTP2_ERR_DEFERRED;
+        }
+
+        size_t to_copy = std::min(length, size_);
+        size_t first = std::min(to_copy, buffer_.size() - read_off_);
+        std::memcpy(buf, buffer_.data() + read_off_, first);
+        if (to_copy > first) {
+            std::memcpy(buf + first, buffer_.data(), to_copy - first);
+        }
+        read_off_ = (read_off_ + to_copy) % buffer_.size();
+        size_ -= to_copy;
+
+        if (size_ == 0 && finished_) {
+            *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+        }
+        MaybeScheduleDrain();
+        return static_cast<ssize_t>(to_copy);
+    }
+
+private:
+    void EnsureCapacity(size_t required) {
+        if (buffer_.empty()) {
+            buffer_.resize(std::max(required, high_water_));
+            read_off_ = 0;
+            write_off_ = 0;
+            return;
+        }
+        if (required <= buffer_.size()) return;
+
+        size_t new_cap = std::max(required, buffer_.size() * 2);
+        std::vector<char> new_buf(new_cap);
+        if (size_ > 0) {
+            size_t first = std::min(size_, buffer_.size() - read_off_);
+            std::memcpy(new_buf.data(), buffer_.data() + read_off_, first);
+            if (size_ > first) {
+                std::memcpy(new_buf.data() + first, buffer_.data(), size_ - first);
+            }
+        }
+        buffer_.swap(new_buf);
+        read_off_ = 0;
+        write_off_ = size_;
+    }
+
+    void MaybeScheduleDrain() {
+        if (!above_high_water_ || !drain_listener_ || drain_listener_scheduled_) {
+            return;
+        }
+        if (size_ > low_water_) return;
+        above_high_water_ = false;
+        drain_listener_scheduled_ = true;
+        auto listener = drain_listener_;
+        std::weak_ptr<StreamingH2DataSource> weak_self =
+            shared_from_this();
+        conn_->RunOnDispatcher(
+            [weak_self, listener = std::move(listener)]() mutable {
+            if (auto self = weak_self.lock()) {
+                self->drain_listener_scheduled_ = false;
+                if (listener) listener();
+            }
+        });
+    }
+
+    std::shared_ptr<ConnectionHandler> conn_;
+    std::vector<char> buffer_;
+    size_t read_off_ = 0;
+    size_t write_off_ = 0;
+    size_t size_ = 0;
+    size_t high_water_ = 1024 * 1024;
+    size_t low_water_ = 512 * 1024;
+    bool finished_ = false;
+    bool aborted_ = false;
+    bool above_high_water_ = false;
+    bool drain_listener_scheduled_ = false;
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::DrainListener
+        drain_listener_;
+};
+
+class H2StreamingResponseSenderImpl final
+    : public HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::Impl {
+public:
+    using SendResult =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult;
+    using AbortReason =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason;
+    using DrainListener =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::DrainListener;
+
+    H2StreamingResponseSenderImpl(
+        std::weak_ptr<Http2ConnectionHandler> handler,
+        int32_t stream_id,
+        std::function<bool()> claim_response,
+        std::function<void()> finalize_request)
+        : handler_(std::move(handler)),
+          stream_id_(stream_id),
+          claim_response_(std::move(claim_response)),
+          finalize_request_(std::move(finalize_request)) {}
+
+    int SendHeaders(const HttpResponse& headers_only_response) override {
+        auto self = handler_.lock();
+        auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
+        auto conn = self ? self->GetConnection() : nullptr;
+        if (!self || !session || !conn || conn->IsClosing()) return -1;
+        if (!conn->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H2 streaming SendHeaders called off dispatcher stream={}",
+                stream_id_);
+            return -1;
+        }
+        if (terminal_ || programmer_error_ || headers_sent_) {
+            return -1;
+        }
+        if (!claimed_response_) {
+            if (!claim_response_ || !claim_response_()) {
+                terminal_ = true;
+                return -1;
+            }
+            claimed_response_ = true;
+        }
+        if (!data_source_) {
+            data_source_ = std::make_shared<StreamingH2DataSource>(conn);
+            data_source_->ConfigureWatermarks(high_water_);
+            if (pending_drain_listener_) {
+                data_source_->SetDrainListener(
+                    std::move(pending_drain_listener_));
+            }
+        }
+        if (session->SubmitStreamingResponse(
+                stream_id_, headers_only_response, data_source_) != 0) {
+            terminal_ = true;
+            if (finalize_request_) {
+                finalize_request_();
+            }
+            return -1;
+        }
+        headers_sent_ = true;
+        if (!session->InReceiveData()) {
+            session->SendPendingFrames();
+        }
+        return 0;
+    }
+
+    SendResult SendData(const char* data, size_t len) override {
+        if (!headers_sent_) {
+            return HandleProgrammerError("SendData");
+        }
+        if (terminal_ || programmer_error_ || !data_source_) {
+            return SendResult::CLOSED;
+        }
+        auto self = handler_.lock();
+        auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
+        if (!self || !session) {
+            return SendResult::CLOSED;
+        }
+        auto result = data_source_->Append(data, len);
+        if (result == SendResult::CLOSED) {
+            return result;
+        }
+        session->ResumeStreamData(stream_id_);
+        if (!session->InReceiveData()) {
+            session->SendPendingFrames();
+        }
+        return result;
+    }
+
+    SendResult End(
+        const std::vector<std::pair<std::string, std::string>>& trailers) override {
+        if (!headers_sent_) {
+            HandleProgrammerError("End");
+            return SendResult::CLOSED;
+        }
+        if (terminal_ || programmer_error_ || !data_source_) {
+            return SendResult::CLOSED;
+        }
+        if (!trailers.empty()) {
+            logging::Get()->debug(
+                "H2 streaming trailers currently ignored stream={}",
+                stream_id_);
+        }
+        auto self = handler_.lock();
+        auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
+        if (!self || !session) {
+            return SendResult::CLOSED;
+        }
+        terminal_ = true;
+        data_source_->Finish();
+        session->ResumeStreamData(stream_id_);
+        if (!session->InReceiveData()) {
+            session->SendPendingFrames();
+        }
+        if (finalize_request_) {
+            finalize_request_();
+        }
+        return SendResult::ACCEPTED_BELOW_WATER;
+    }
+
+    void Abort(AbortReason reason) override {
+        (void)reason;
+        AbortInternal(false);
+    }
+
+    void SetDrainListener(DrainListener listener) override {
+        if (data_source_) {
+            data_source_->SetDrainListener(std::move(listener));
+        } else {
+            pending_drain_listener_ = std::move(listener);
+        }
+    }
+
+    void ConfigureWatermarks(size_t high_water_bytes) override {
+        high_water_ = high_water_bytes;
+        if (data_source_) {
+            data_source_->ConfigureWatermarks(high_water_bytes);
+        }
+    }
+
+    Dispatcher* GetDispatcher() override {
+        auto self = handler_.lock();
+        auto conn = self ? self->GetConnection() : nullptr;
+        return conn ? conn->GetDispatcher() : nullptr;
+    }
+
+private:
+    SendResult HandleProgrammerError(const char* op) {
+        if (!programmer_error_) {
+            logging::Get()->error(
+                "H2 streaming {} called before SendHeaders — programmer error stream={}",
+                op, stream_id_);
+            programmer_error_ = true;
+            AbortInternal(true);
+        }
+        return SendResult::CLOSED;
+    }
+
+    void AbortInternal(bool from_programmer_error) {
+        if (terminal_ && !from_programmer_error) return;
+        terminal_ = true;
+        if (!claimed_response_) {
+            if (!claim_response_ || !claim_response_()) {
+                return;
+            }
+            claimed_response_ = true;
+        }
+
+        auto self = handler_.lock();
+        auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
+        auto conn = self ? self->GetConnection() : nullptr;
+        if (!data_source_ && conn) {
+            data_source_ = std::make_shared<StreamingH2DataSource>(conn);
+            data_source_->ConfigureWatermarks(high_water_);
+        }
+        if (data_source_) {
+            if (pending_drain_listener_) {
+                data_source_->SetDrainListener(
+                    std::move(pending_drain_listener_));
+            }
+            data_source_->Abort();
+        }
+        if (session) {
+            session->ResetStream(
+                stream_id_, HTTP2_CONSTANTS::ERROR_INTERNAL_ERROR);
+        }
+        if (finalize_request_) {
+            finalize_request_();
+        }
+    }
+
+    std::weak_ptr<Http2ConnectionHandler> handler_;
+    int32_t stream_id_;
+    std::function<bool()> claim_response_;
+    std::function<void()> finalize_request_;
+    std::shared_ptr<StreamingH2DataSource> data_source_;
+    DrainListener pending_drain_listener_;
+    bool claimed_response_ = false;
+    bool headers_sent_ = false;
+    bool terminal_ = false;
+    bool programmer_error_ = false;
+    size_t high_water_ = 1024 * 1024;
+};
+
+}  // namespace
 
 Http2ConnectionHandler::Http2ConnectionHandler(
     std::shared_ptr<ConnectionHandler> conn,
@@ -449,6 +801,17 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
         // or clears it when no streams remain (idle keep-alive).
         UpdateDeadline();
     }
+}
+
+HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender
+Http2ConnectionHandler::CreateStreamingResponseSender(
+    int32_t stream_id,
+    std::function<bool()> claim_response,
+    std::function<void()> finalize_request) {
+    auto impl = std::make_shared<H2StreamingResponseSenderImpl>(
+        weak_from_this(), stream_id, std::move(claim_response),
+        std::move(finalize_request));
+    return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender(std::move(impl));
 }
 
 bool Http2ConnectionHandler::SendInterimResponse(

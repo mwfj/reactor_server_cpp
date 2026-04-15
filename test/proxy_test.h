@@ -83,6 +83,169 @@ static bool WaitFor(std::function<bool()> pred,
     return false;
 }
 
+static bool SendAll(int fd, const std::string& data) {
+    int send_flags = 0;
+#ifdef MSG_NOSIGNAL
+    send_flags |= MSG_NOSIGNAL;
+#endif
+    size_t total_sent = 0;
+    while (total_sent < data.size()) {
+        ssize_t sent = send(
+            fd, data.data() + total_sent, data.size() - total_sent, send_flags);
+        if (sent < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        total_sent += static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+static std::string RecvOnce(int fd, int timeout_ms) {
+    struct pollfd pfd{fd, POLLIN, 0};
+    int rv;
+    do {
+        rv = poll(&pfd, 1, timeout_ms);
+    } while (rv < 0 && errno == EINTR);
+    if (rv <= 0 || !(pfd.revents & (POLLIN | POLLHUP))) {
+        return "";
+    }
+
+    char buf[4096];
+    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    if (n <= 0) return "";
+    return std::string(buf, static_cast<size_t>(n));
+}
+
+static std::string RecvUntilClose(int fd, int timeout_ms) {
+    std::string out;
+    while (true) {
+        struct pollfd pfd{fd, POLLIN, 0};
+        int rv;
+        do {
+            rv = poll(&pfd, 1, timeout_ms);
+        } while (rv < 0 && errno == EINTR);
+        if (rv <= 0) break;
+
+        char buf[4096];
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n == 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        out.append(buf, static_cast<size_t>(n));
+    }
+    return out;
+}
+
+static std::string RecvUntilContains(
+    int fd, const std::string& needle, int timeout_ms) {
+    std::string out;
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline &&
+           out.find(needle) == std::string::npos) {
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        std::string chunk = RecvOnce(fd, static_cast<int>(remaining.count()));
+        if (chunk.empty()) break;
+        out += chunk;
+    }
+    return out;
+}
+
+class RawHttpBackendServer {
+public:
+    using SessionHandler = std::function<void(int, const std::string&)>;
+
+    explicit RawHttpBackendServer(SessionHandler handler)
+        : handler_(std::move(handler)) {
+        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0) {
+            throw std::runtime_error("RawHttpBackendServer socket() failed");
+        }
+
+        int reuse = 1;
+        setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = 0;
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+        if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            int saved_errno = errno;
+            close(listen_fd_);
+            throw std::runtime_error(
+                "RawHttpBackendServer bind() failed: " + std::to_string(saved_errno));
+        }
+        if (listen(listen_fd_, 4) != 0) {
+            int saved_errno = errno;
+            close(listen_fd_);
+            throw std::runtime_error(
+                "RawHttpBackendServer listen() failed: " + std::to_string(saved_errno));
+        }
+
+        socklen_t len = sizeof(addr);
+        if (getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+            int saved_errno = errno;
+            close(listen_fd_);
+            throw std::runtime_error(
+                "RawHttpBackendServer getsockname() failed: " + std::to_string(saved_errno));
+        }
+        port_ = ntohs(addr.sin_port);
+
+        server_thread_ = std::thread([this]() { Run(); });
+    }
+
+    ~RawHttpBackendServer() {
+        if (listen_fd_ >= 0) {
+            shutdown(listen_fd_, SHUT_RDWR);
+            close(listen_fd_);
+            listen_fd_ = -1;
+        }
+        if (server_thread_.joinable()) {
+            server_thread_.join();
+        }
+    }
+
+    int GetPort() const { return port_; }
+
+private:
+    static std::string ReadRequestHead(int fd) {
+        std::string request;
+        char buf[2048];
+        while (request.find("\r\n\r\n") == std::string::npos) {
+            ssize_t n = recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            request.append(buf, static_cast<size_t>(n));
+        }
+        return request;
+    }
+
+    void Run() {
+        struct sockaddr_in peer{};
+        socklen_t peer_len = sizeof(peer);
+        int client_fd = accept(
+            listen_fd_, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+        if (client_fd < 0) {
+            return;
+        }
+
+        std::string request = ReadRequestHead(client_fd);
+        if (handler_) {
+            handler_(client_fd, request);
+        }
+        shutdown(client_fd, SHUT_RDWR);
+        close(client_fd);
+    }
+
+    SessionHandler handler_;
+    int listen_fd_ = -1;
+    int port_ = 0;
+    std::thread server_thread_;
+};
+
 // ---------------------------------------------------------------------------
 // Section 1: UpstreamHttpCodec unit tests
 // ---------------------------------------------------------------------------
@@ -1365,6 +1528,7 @@ void TestIntegrationGetProxied() {
         gateway.GetAsync("/async-test", [](const HttpRequest&,
                                            HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
                                            HTTP_CALLBACKS_NAMESPACE::ResourcePusher        /*push_resource*/,
+                                           HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*stream_sender*/,
                                            HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
             HttpResponse resp;
             resp.Status(200).Body("async-ok", "text/plain");
@@ -1811,7 +1975,276 @@ void TestIntegrationEarlyResponsePoolSafe() {
 }
 
 // ---------------------------------------------------------------------------
-// Section 12: RetryPolicy unit tests -- full jitter backoff (timer-based retry)
+// Section 12: Integration tests -- streaming relay
+// ---------------------------------------------------------------------------
+
+void TestIntegrationSmallContentLengthStaysBuffered() {
+    std::cout << "\n[TEST] Integration: small Content-Length response stays buffered..." << std::endl;
+    try {
+        RawHttpBackendServer backend([](int fd, const std::string&) {
+            SendAll(fd,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Length: 10\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "\r\n");
+            SendAll(fd, "hello");
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            SendAll(fd, "world");
+        });
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+        gw_config.upstreams.push_back(
+            MakeProxyUpstreamConfig("backend", "127.0.0.1", backend.GetPort(), "/buffered"));
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        int client_fd = TestHttpClient::ConnectRawSocket(gw_port);
+        if (client_fd < 0) throw std::runtime_error("gateway connect failed");
+
+        if (!SendAll(client_fd,
+                     "GET /buffered HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Connection: close\r\n"
+                     "\r\n")) {
+            close(client_fd);
+            throw std::runtime_error("gateway send failed");
+        }
+
+        std::string early = RecvOnce(client_fd, 80);
+        std::string full = early + RecvUntilClose(client_fd, 2000);
+        close(client_fd);
+
+        std::string full_lower = full;
+        std::transform(full_lower.begin(), full_lower.end(), full_lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        bool pass = true;
+        std::string err;
+        if (!early.empty()) err += "gateway emitted bytes before buffered completion; ";
+        if (!TestHttpClient::HasStatus(full, 200)) err += "status not 200; ";
+        if (TestHttpClient::ExtractBody(full) != "helloworld") err += "body mismatch; ";
+        if (full_lower.find("content-length: 10") == std::string::npos) {
+            err += "content-length missing; ";
+        }
+        pass = err.empty();
+
+        TestFramework::RecordTest(
+            "Integration: small Content-Length response stays buffered", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: small Content-Length response stays buffered", false, e.what());
+    }
+}
+
+void TestIntegrationLargeContentLengthStreamsAndPreservesLength() {
+    std::cout << "\n[TEST] Integration: large Content-Length response streams and preserves CL..." << std::endl;
+    try {
+        RawHttpBackendServer backend([](int fd, const std::string&) {
+            SendAll(fd,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Length: 10\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "\r\n");
+            SendAll(fd, "hello");
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            SendAll(fd, "world");
+        });
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+        UpstreamConfig u = MakeProxyUpstreamConfig(
+            "backend", "127.0.0.1", backend.GetPort(), "/stream-cl");
+        u.proxy.auto_stream_content_length_threshold_bytes = 4;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        int client_fd = TestHttpClient::ConnectRawSocket(gw_port);
+        if (client_fd < 0) throw std::runtime_error("gateway connect failed");
+
+        if (!SendAll(client_fd,
+                     "GET /stream-cl HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Connection: close\r\n"
+                     "\r\n")) {
+            close(client_fd);
+            throw std::runtime_error("gateway send failed");
+        }
+
+        std::string early = RecvUntilContains(client_fd, "hello", 400);
+        std::string full = early + RecvUntilClose(client_fd, 2000);
+        close(client_fd);
+
+        std::string early_lower = early;
+        std::transform(early_lower.begin(), early_lower.end(), early_lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        bool pass = true;
+        std::string err;
+        if (!TestHttpClient::HasStatus(full, 200)) err += "status not 200; ";
+        if (early.find("hello") == std::string::npos) err += "first body bytes not observed early; ";
+        if (early.find("world") != std::string::npos) err += "second body bytes arrived too early; ";
+        if (early_lower.find("content-length: 10") == std::string::npos) {
+            err += "content-length not preserved; ";
+        }
+        if (early_lower.find("transfer-encoding: chunked") != std::string::npos) {
+            err += "unexpected chunked transfer-encoding; ";
+        }
+        if (TestHttpClient::ExtractBody(full) != "helloworld") err += "body mismatch; ";
+        pass = err.empty();
+
+        TestFramework::RecordTest(
+            "Integration: large Content-Length response streams and preserves CL",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: large Content-Length response streams and preserves CL",
+            false, e.what());
+    }
+}
+
+void TestIntegrationChunkedUpstreamStreamsImmediately() {
+    std::cout << "\n[TEST] Integration: chunked upstream response streams immediately..." << std::endl;
+    try {
+        RawHttpBackendServer backend([](int fd, const std::string&) {
+            SendAll(fd,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "\r\n");
+            SendAll(fd, "5\r\nhello\r\n");
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            SendAll(fd, "5\r\nworld\r\n0\r\n\r\n");
+        });
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+        gw_config.upstreams.push_back(
+            MakeProxyUpstreamConfig("backend", "127.0.0.1", backend.GetPort(), "/chunked"));
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        int client_fd = TestHttpClient::ConnectRawSocket(gw_port);
+        if (client_fd < 0) throw std::runtime_error("gateway connect failed");
+
+        if (!SendAll(client_fd,
+                     "GET /chunked HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Connection: close\r\n"
+                     "\r\n")) {
+            close(client_fd);
+            throw std::runtime_error("gateway send failed");
+        }
+
+        std::string early = RecvUntilContains(client_fd, "hello", 400);
+        std::string full = early + RecvUntilClose(client_fd, 2000);
+        close(client_fd);
+
+        std::string early_lower = early;
+        std::transform(early_lower.begin(), early_lower.end(), early_lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        bool pass = true;
+        std::string err;
+        if (!TestHttpClient::HasStatus(full, 200)) err += "status not 200; ";
+        if (early_lower.find("transfer-encoding: chunked") == std::string::npos) {
+            err += "chunked transfer-encoding missing; ";
+        }
+        if (early.find("5\r\nhello\r\n") == std::string::npos) err += "first chunk not observed early; ";
+        if (early.find("world") != std::string::npos) err += "second chunk arrived too early; ";
+        if (full.find("5\r\nworld\r\n0\r\n\r\n") == std::string::npos) {
+            err += "final chunk or terminator missing; ";
+        }
+        pass = err.empty();
+
+        TestFramework::RecordTest(
+            "Integration: chunked upstream response streams immediately", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: chunked upstream response streams immediately", false, e.what());
+    }
+}
+
+void TestIntegrationStreamIdleTimeoutAbortsRelay() {
+    std::cout << "\n[TEST] Integration: stream idle timeout aborts committed relay..." << std::endl;
+    try {
+        RawHttpBackendServer backend([](int fd, const std::string&) {
+            SendAll(fd,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "\r\n");
+            SendAll(fd, "5\r\nhello\r\n");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        });
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+        UpstreamConfig u = MakeProxyUpstreamConfig(
+            "backend", "127.0.0.1", backend.GetPort(), "/idle-timeout");
+        u.proxy.buffering = "never";
+        u.proxy.response_timeout_ms = 0;
+        u.proxy.stream_idle_timeout_sec = 1;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        int client_fd = TestHttpClient::ConnectRawSocket(gw_port);
+        if (client_fd < 0) throw std::runtime_error("gateway connect failed");
+
+        if (!SendAll(client_fd,
+                     "GET /idle-timeout HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Connection: close\r\n"
+                     "\r\n")) {
+            close(client_fd);
+            throw std::runtime_error("gateway send failed");
+        }
+
+        std::string early = RecvUntilContains(client_fd, "hello", 400);
+        std::string full = early + RecvUntilClose(client_fd, 2500);
+        close(client_fd);
+
+        bool pass = true;
+        std::string err;
+        if (!TestHttpClient::HasStatus(full, 200)) err += "status not 200 before timeout; ";
+        if (early.find("hello") == std::string::npos) err += "first chunk missing; ";
+        if (full.find("0\r\n\r\n") != std::string::npos) {
+            err += "clean chunk terminator must not be emitted on abort; ";
+        }
+        pass = err.empty();
+
+        TestFramework::RecordTest(
+            "Integration: stream idle timeout aborts committed relay", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: stream idle timeout aborts committed relay", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Section 13: RetryPolicy unit tests -- full jitter backoff (timer-based retry)
 // ---------------------------------------------------------------------------
 
 // BackoffDelay(1) must always fall in [1, 50) — BASE * 2^1 = 50.
@@ -2353,13 +2786,17 @@ void RunAllTests() {
     TestIntegrationQueryStringForwarded();
     TestIntegrationConnectionReuse();
     TestIntegrationEarlyResponsePoolSafe();
+    TestIntegrationSmallContentLengthStaysBuffered();
+    TestIntegrationLargeContentLengthStreamsAndPreservesLength();
+    TestIntegrationChunkedUpstreamStreamsImmediately();
+    TestIntegrationStreamIdleTimeoutAbortsRelay();
 
-    // Section 12: RetryPolicy unit tests -- full jitter backoff
+    // Section 13: RetryPolicy unit tests -- full jitter backoff
     TestRetryFullJitterRange();
     TestRetryFullJitterAttempt0IsZero();
     TestRetryFullJitterCapAtMax();
 
-    // Section 13: Integration tests -- timer-based retry backoff
+    // Section 14: Integration tests -- timer-based retry backoff
     TestIntegration5xxFirstRetryBacksOff();
     TestIntegrationConnectFailureFirstRetryIsImmediate();
     TestIntegrationBackoffDoesNotBlockOtherRequests();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "http/http_callbacks.h"
 #include "http2/http2_session.h"
 #include "http2/http2_callbacks.h"
 #include "connection_handler.h"
@@ -68,6 +69,11 @@ public:
     // already closed (e.g. due to client RST_STREAM or connection drop) —
     // Http2Session handles the missing-stream case internally.
     void SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
+
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender CreateStreamingResponseSender(
+        int32_t stream_id,
+        std::function<bool()> claim_response,
+        std::function<void()> finalize_request);
 
     // Submit a non-final 1xx informational response (e.g. 103 Early Hints)
     // on a specific stream and flush nghttp2 output.

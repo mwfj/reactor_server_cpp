@@ -1,6 +1,8 @@
 #pragma once
 
 #include "upstream/upstream_response.h"
+#include "upstream/upstream_response_head.h"
+#include "upstream/upstream_response_sink.h"
 // <string>, <memory>, <cstddef> provided by common.h (via upstream_response.h)
 
 class UpstreamHttpCodec {
@@ -21,6 +23,15 @@ public:
     // Set the request method that produced this response. Must be called
     // before Parse() so llhttp knows HEAD responses have no body.
     void SetRequestMethod(const std::string& method);
+
+    void SetSink(UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink);
+    void PauseParsing();
+    void ResumeParsing();
+    UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing FramingHint() const {
+        return framing_hint_;
+    }
+    int64_t ExpectedLength() const { return expected_length_; }
+    bool IsPaused() const { return paused_; }
 
     // Feed raw bytes from upstream. Returns bytes consumed.
     // After this call, check GetResponse().complete.
@@ -53,6 +64,11 @@ public:
     std::string current_header_value_;
     bool parsing_header_value_ = false;
     bool in_header_field_ = false;  // true while accumulating same header field across fragments
+    UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink_ = nullptr;
+    UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing framing_hint_ =
+        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::NO_BODY;
+    int64_t expected_length_ = -1;
+    bool paused_ = false;
 
 private:
     // llhttp internals (pimpl -- llhttp.h only included in .cc)

@@ -61,6 +61,11 @@ public:
     // Submit HTTP response for a stream. Returns 0 on success.
     int SubmitResponse(int32_t stream_id, const HttpResponse& response);
 
+    int SubmitStreamingResponse(
+        int32_t stream_id,
+        const HttpResponse& response,
+        std::shared_ptr<ResponseDataSource> data_source);
+
     // Submit a non-final 1xx informational response on a stream WITHOUT
     // END_STREAM (RFC 9113 + RFC 8297). Status must be in [102, 200) and
     // not 101 (HTTP/2 forbids 101). Forbidden / pseudo / hop-by-hop
@@ -121,6 +126,7 @@ public:
 
     // Send RST_STREAM for a specific stream.
     void ResetStream(int32_t stream_id, uint32_t error_code);
+    int ResumeStreamData(int32_t stream_id);
 
     // Check if the session is still alive
     bool IsAlive() const;

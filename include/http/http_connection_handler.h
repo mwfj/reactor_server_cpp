@@ -30,6 +30,13 @@ public:
     // Send an HTTP response
     void SendResponse(const HttpResponse& response);
 
+    // Create a streaming final-response sender for the current deferred async
+    // request. Used by the proxy relay path to stream bytes without going
+    // through CompleteAsyncResponse(HttpResponse).
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender CreateStreamingResponseSender(
+        std::function<bool()> claim_response,
+        std::function<void()> finalize_request);
+
     // Send a non-final 1xx response (103 Early Hints, 102 Processing, etc.).
     // Thread-safe: off-dispatcher callers are internally hopped to the
     // dispatcher so write order is preserved with the final response.
@@ -62,6 +69,11 @@ public:
 
     // Access underlying connection
     std::shared_ptr<ConnectionHandler> GetConnection() const { return conn_; }
+
+    // Called from HttpServer's transport send-complete / write-progress
+    // routing so the active streaming sender can detect low-water drains.
+    void OnSendComplete();
+    void OnWriteProgress(size_t remaining_bytes);
 
     // Set request size limits (from ServerConfig)
     void SetMaxBodySize(size_t max);
@@ -260,4 +272,9 @@ private:
 
     // Safety-cap abort hook. See SetAsyncAbortHook.
     std::function<void()> async_abort_hook_;
+
+    // Active streaming sender for the current deferred async request.
+    // Weak to avoid creating a handler↔sender ownership cycle.
+    std::weak_ptr<HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::Impl>
+        active_stream_sender_impl_;
 };

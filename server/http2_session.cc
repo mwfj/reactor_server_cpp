@@ -27,19 +27,7 @@ static ssize_t DataSourceReadCallback(
     nghttp2_data_source* source, void* /*user_data*/) {
 
     auto* src = static_cast<ResponseDataSource*>(source->ptr);
-    size_t remaining = src->body.size() - src->offset;
-    size_t to_copy = std::min(remaining, length);
-
-    if (to_copy > 0) {
-        std::memcpy(buf, src->body.data() + src->offset, to_copy);
-        src->offset += to_copy;
-    }
-
-    if (src->offset >= src->body.size()) {
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-    }
-
-    return static_cast<ssize_t>(to_copy);
+    return src->ReadChunk(buf, length, data_flags);
 }
 
 // --- Static nghttp2 callback functions ---
@@ -900,10 +888,8 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
         rv = nghttp2_submit_response2(impl_->session, stream_id,
                                       nva.data(), nva.size(), nullptr);
     } else {
-        // Body present — use data provider.
-        // Store the ResponseDataSource on the stream so it is owned and freed
-        // when the stream is destroyed (avoids the prior raw-new leak).
-        auto src_owned = std::make_unique<ResponseDataSource>(ResponseDataSource{raw_body, 0});
+        auto src_owned =
+            std::make_shared<BufferedResponseDataSource>(raw_body);
         ResponseDataSource* src = src_owned.get();
 
         nghttp2_data_provider2 data_prd;
@@ -913,11 +899,8 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
         rv = nghttp2_submit_response2(impl_->session, stream_id,
                                       nva.data(), nva.size(), &data_prd);
         if (rv == 0) {
-            // Transfer ownership to the stream — src pointer remains valid
-            // for the lifetime of the stream (and thus the data provider).
             stream->SetDataSource(std::move(src_owned));
         }
-        // If rv != 0, src_owned goes out of scope here and frees the allocation.
     }
 
     if (rv != 0) {
@@ -1017,6 +1000,109 @@ int Http2Session::SubmitInterimHeaders(
     logging::Get()->debug(
         "H2 SubmitInterimHeaders queued stream={} status={}",
         stream_id, status_code);
+    return 0;
+}
+
+int Http2Session::SubmitStreamingResponse(
+    int32_t stream_id,
+    const HttpResponse& response,
+    std::shared_ptr<ResponseDataSource> data_source) {
+    auto* stream = FindStream(stream_id);
+    if (!stream || stream->IsClosed()) {
+        logging::Get()->debug(
+            "Cannot submit streaming response: stream {} not found or closed",
+            stream_id);
+        return -1;
+    }
+
+    int status_code = response.GetStatusCode();
+    if (status_code < HttpStatus::OK) {
+        logging::Get()->error(
+            "HTTP/2 stream {} SubmitStreamingResponse called with {} "
+            "(1xx not supported as app response)",
+            stream_id, status_code);
+        nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
+                                  stream_id, NGHTTP2_INTERNAL_ERROR);
+        return -1;
+    }
+
+    const HttpRequest& req = stream->GetRequest();
+    bool suppress_body = (req.method == "HEAD" ||
+                          status_code == HttpStatus::NO_CONTENT ||
+                          status_code == HttpStatus::RESET_CONTENT ||
+                          status_code == HttpStatus::NOT_MODIFIED);
+
+    std::string status_str = std::to_string(status_code);
+    std::vector<nghttp2_nv> nva;
+    nva.push_back({
+        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(":status")),
+        const_cast<uint8_t*>(
+            reinterpret_cast<const uint8_t*>(status_str.c_str())),
+        7, status_str.size(),
+        NGHTTP2_NV_FLAG_NONE
+    });
+
+    const auto& headers = response.GetHeaders();
+    std::vector<std::string> lowered_names;
+    lowered_names.reserve(headers.size());
+    for (const auto& hdr : headers) {
+        std::string key = hdr.first;
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (key == "connection" || key == "keep-alive" ||
+            key == "proxy-connection" || key == "te" ||
+            key == "transfer-encoding" || key == "upgrade") {
+            continue;
+        }
+        if (key == "content-length") continue;
+        lowered_names.push_back(std::move(key));
+        nva.push_back({
+            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(
+                lowered_names.back().c_str())),
+            const_cast<uint8_t*>(
+                reinterpret_cast<const uint8_t*>(hdr.second.c_str())),
+            lowered_names.back().size(), hdr.second.size(),
+            NGHTTP2_NV_FLAG_NONE
+        });
+    }
+
+    std::string content_length_str;
+    if (auto effective_cl = response.ComputeWireContentLength(status_code)) {
+        content_length_str = std::move(*effective_cl);
+        nva.push_back({
+            const_cast<uint8_t*>(
+                reinterpret_cast<const uint8_t*>("content-length")),
+            const_cast<uint8_t*>(
+                reinterpret_cast<const uint8_t*>(content_length_str.c_str())),
+            14, content_length_str.size(),
+            NGHTTP2_NV_FLAG_NONE
+        });
+    }
+
+    int rv;
+    if (suppress_body || !data_source) {
+        rv = nghttp2_submit_response2(
+            impl_->session, stream_id, nva.data(), nva.size(), nullptr);
+    } else {
+        nghttp2_data_provider2 data_prd;
+        data_prd.source.ptr = data_source.get();
+        data_prd.read_callback = DataSourceReadCallback;
+        rv = nghttp2_submit_response2(
+            impl_->session, stream_id, nva.data(), nva.size(), &data_prd);
+        if (rv == 0) {
+            stream->SetDataSource(std::move(data_source));
+        }
+    }
+
+    if (rv != 0) {
+        logging::Get()->error(
+            "Failed to submit streaming response for stream {}: {}",
+            stream_id, nghttp2_strerror(rv));
+        return rv;
+    }
+
+    stream->MarkResponseHeadersSent();
+    stream->MarkFinalResponseSubmitted();
     return 0;
 }
 
@@ -1383,6 +1469,10 @@ void Http2Session::ResetStream(int32_t stream_id, uint32_t error_code) {
     nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
                               stream_id, error_code);
     SendPendingFrames();
+}
+
+int Http2Session::ResumeStreamData(int32_t stream_id) {
+    return nghttp2_session_resume_data(impl_->session, stream_id);
 }
 
 // --- Stream management ---

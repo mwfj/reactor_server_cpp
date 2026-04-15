@@ -2743,6 +2743,7 @@ void TestH2_EarlyHints_Basic() {
             [](const HttpRequest&,
                HttpRouter::InterimResponseSender send_interim,
                HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::StreamingResponseSender /*stream_sender*/,
                HttpRouter::AsyncCompletionCallback complete) {
                 send_interim(103, {{"link", "</style.css>; rel=preload; as=style"}});
                 HttpResponse r;
@@ -2799,6 +2800,7 @@ void TestH2_EarlyHints_Multiple() {
             [](const HttpRequest&,
                HttpRouter::InterimResponseSender send_interim,
                HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::StreamingResponseSender /*stream_sender*/,
                HttpRouter::AsyncCompletionCallback complete) {
                 send_interim(103, {{"link", "</a.css>; rel=preload"}});
                 send_interim(103, {{"link", "</b.js>; rel=preload"}});
@@ -2862,6 +2864,7 @@ void TestH2_EarlyHints_DroppedAfterFinal() {
                 const HttpRequest&,
                 HttpRouter::InterimResponseSender send_interim,
                 HttpRouter::ResourcePusher        /*push_resource*/,
+                HttpRouter::StreamingResponseSender /*stream_sender*/,
                 HttpRouter::AsyncCompletionCallback complete) {
                 HttpResponse r;
                 r.Status(200).Text("done");
@@ -2925,6 +2928,7 @@ void TestH2_EarlyHints_InvalidStatusDropped() {
             [](const HttpRequest&,
                HttpRouter::InterimResponseSender send_interim,
                HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::StreamingResponseSender /*stream_sender*/,
                HttpRouter::AsyncCompletionCallback complete) {
                 send_interim(50,  {{"link", "</a>; rel=preload"}});
                 send_interim(200, {{"link", "</b>; rel=preload"}});
@@ -2987,6 +2991,7 @@ void TestH2_EarlyHints_StreamClosedByPeerSafe() {
                 const HttpRequest&,
                 HttpRouter::InterimResponseSender send_interim,
                 HttpRouter::ResourcePusher        /*push_resource*/,
+                HttpRouter::StreamingResponseSender /*stream_sender*/,
                 HttpRouter::AsyncCompletionCallback /*complete*/) {
                 p_sender->set_value(send_interim);
             });
@@ -3073,6 +3078,7 @@ void TestH2_EarlyHints_100ContinueThen103() {
             [](const HttpRequest&,
                HttpRouter::InterimResponseSender send_interim,
                HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::StreamingResponseSender /*stream_sender*/,
                HttpRouter::AsyncCompletionCallback complete) {
                 send_interim(103, {{"link", "</style.css>; rel=preload"}});
                 HttpResponse r;
@@ -3131,6 +3137,7 @@ void TestH2_EarlyHints_OffDispatcherThread() {
             [](const HttpRequest&,
                HttpRouter::InterimResponseSender send_interim,
                HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::StreamingResponseSender /*stream_sender*/,
                HttpRouter::AsyncCompletionCallback complete) {
                 // Worker-thread send_interim: must auto-hop and
                 // emit BEFORE the handler calls complete().
@@ -3383,6 +3390,7 @@ static void RegisterPushHandlerOnRoot(HttpServer& server,
         [=](const HttpRequest&,
             HttpRouter::InterimResponseSender /*send_interim*/,
             HttpRouter::ResourcePusher push_resource,
+            HttpRouter::StreamingResponseSender /*stream_sender*/,
             HttpRouter::AsyncCompletionCallback complete) {
             HttpResponse pushed;
             pushed.Status(200).Body(kPushedBody, "text/css");
@@ -3920,6 +3928,7 @@ void TestH2_Push_OffDispatcherThreadHops() {
             [](const HttpRequest&,
                HttpRouter::InterimResponseSender /*send_interim*/,
                HttpRouter::ResourcePusher push_resource,
+               HttpRouter::StreamingResponseSender /*stream_sender*/,
                HttpRouter::AsyncCompletionCallback complete) {
                 // Worker thread issues the push. Must auto-hop and
                 // the pushed stream must appear alongside the parent.
@@ -3988,6 +3997,7 @@ void TestH2_Push_MixedCaseSchemeAccepted() {
             [](const HttpRequest&,
                HttpRouter::InterimResponseSender /*send_interim*/,
                HttpRouter::ResourcePusher push_resource,
+               HttpRouter::StreamingResponseSender /*stream_sender*/,
                HttpRouter::AsyncCompletionCallback complete) {
                 HttpResponse pushed;
                 pushed.Status(200).Body(kPushedBody, "text/css");
@@ -4054,6 +4064,7 @@ void TestH2_Async_HandlerThrowFiresCancelSlot() {
                 const HttpRequest& req,
                 HttpRouter::InterimResponseSender /*send_interim*/,
                 HttpRouter::ResourcePusher        /*push_resource*/,
+                HttpRouter::StreamingResponseSender /*stream_sender*/,
                 HttpRouter::AsyncCompletionCallback /*complete*/) {
                 if (req.async_cancel_slot) {
                     *req.async_cancel_slot = [cancel_fired]() {
@@ -4116,6 +4127,7 @@ void TestH2_EarlyHints_DroppedAfterCompleteSameThread() {
             [](const HttpRequest&,
                HttpRouter::InterimResponseSender send_interim,
                HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::StreamingResponseSender /*stream_sender*/,
                HttpRouter::AsyncCompletionCallback complete) {
                 // Inline on dispatcher: complete() first, then
                 // send_interim. The completed guard in the send_interim
@@ -4175,6 +4187,7 @@ void TestH2_Push_DroppedAfterCompleteSameThread() {
             [](const HttpRequest&,
                HttpRouter::InterimResponseSender /*send_interim*/,
                HttpRouter::ResourcePusher push_resource,
+               HttpRouter::StreamingResponseSender /*stream_sender*/,
                HttpRouter::AsyncCompletionCallback complete) {
                 HttpResponse main;
                 main.Status(200).Body("<html/>", "text/html");
@@ -4238,6 +4251,7 @@ void TestH2_Push_RejectedAfterFinalResponseSubmitted() {
             [](const HttpRequest&,
                HttpRouter::InterimResponseSender /*send_interim*/,
                HttpRouter::ResourcePusher push_resource,
+               HttpRouter::StreamingResponseSender /*stream_sender*/,
                HttpRouter::AsyncCompletionCallback complete) {
                 // Issue from a worker thread: complete THEN push.
                 // The complete() call enqueues SubmitStreamResponse; the
@@ -4417,6 +4431,71 @@ void TestH2_Push_ReloadTogglesEnablePush() {
     }
 }
 
+// Proxying a large Content-Length response over an H2 downstream connection
+// must exercise the streaming relay path without resetting the stream.
+void TestH2_ProxyStreamingLargeContentLength() {
+    std::cout << "\n[TEST] H2 proxy: large Content-Length relays cleanly..."
+              << std::endl;
+    try {
+        const std::string body(32 * 1024, 'x');
+
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/big", [body](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(200).Body(body, "application/octet-stream");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig cfg = MakeH2Config(0);
+        UpstreamConfig upstream;
+        upstream.name = "backend";
+        upstream.host = "127.0.0.1";
+        upstream.port = backend_port;
+        upstream.proxy.route_prefix = "/relay";
+        upstream.proxy.strip_prefix = true;
+        upstream.proxy.auto_stream_content_length_threshold_bytes = 1024;
+        cfg.upstreams.push_back(upstream);
+
+        HttpServer gateway(cfg);
+        TestServerRunner<HttpServer> gateway_runner(gateway);
+        int gateway_port = gateway_runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", gateway_port)) {
+            pass = false;
+            err = "connect failed";
+        } else {
+            auto resp = client.Get("/relay/big");
+            if (resp.error) {
+                pass = false;
+                err += "client error; ";
+            }
+            if (resp.rst) {
+                pass = false;
+                err += "stream reset; ";
+            }
+            if (resp.status != 200) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) + "; ";
+            }
+            if (resp.body != body) {
+                pass = false;
+                err += "body mismatch len=" + std::to_string(resp.body.size()) + "; ";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "H2 proxy: large Content-Length relays cleanly",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 proxy: large Content-Length relays cleanly",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ============================================================
 // Entry point
 // ============================================================
@@ -4499,6 +4578,7 @@ void RunAllTests() {
     TestH2_EarlyHints_OffDispatcherThread();
     TestH2_EarlyHints_DroppedAfterCompleteSameThread();
     TestH2_Async_HandlerThrowFiresCancelSlot();
+    TestH2_ProxyStreamingLargeContentLength();
 
     // --- Category 9: SETTINGS_ENABLE_PUSH wire format ---
     TestH2_SettingsEnablePushWire_Disabled();

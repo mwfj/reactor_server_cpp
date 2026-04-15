@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "upstream/upstream_http_codec.h"
+#include "upstream/upstream_response_sink.h"
 #include "upstream/upstream_lease.h"
 #include "upstream/header_rewriter.h"
 #include "upstream/retry_policy.h"
@@ -20,7 +21,8 @@ namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerSlice;
 }  // RetryBudget already defined via retry_budget.h
 
-class ProxyTransaction : public std::enable_shared_from_this<ProxyTransaction> {
+class ProxyTransaction : public std::enable_shared_from_this<ProxyTransaction>,
+                         public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink {
 public:
     // Result codes for internal state tracking
     static constexpr int RESULT_SUCCESS             = 0;
@@ -45,6 +47,7 @@ public:
     // immediately after the async handler returns -- no references may be kept.
     ProxyTransaction(const std::string& service_name,
                      const HttpRequest& client_request,
+                     HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender,
                      HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete_cb,
                      UpstreamManager* upstream_manager,
                      const ProxyConfig& config,
@@ -82,6 +85,14 @@ public:
     // handler's abort hook, which always runs on the dispatcher).
     void Cancel();
 
+    bool OnHeaders(
+        const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) override;
+    bool OnBodyChunk(const char* data, size_t len) override;
+    void OnTrailers(
+        const std::vector<std::pair<std::string, std::string>>& trailers) override;
+    void OnComplete() override;
+    void OnError(int error_code, const std::string& message) override;
+
 private:
     // State machine states
     enum class State {
@@ -113,6 +124,8 @@ private:
     std::string method_;
     std::string path_;
     std::string query_;
+    int client_http_major_;
+    int client_http_minor_;
     std::map<std::string, std::string> client_headers_;
     std::string request_body_;
     int dispatcher_index_;
@@ -198,6 +211,25 @@ private:
     // Cleanup. Dry-run rejects proceed but the flag stays false — no
     // token was consumed, so no ReleaseRetry is required.
     bool retry_token_held_ = false;
+    enum class RelayMode {
+        BUFFERED,
+        STREAMING,
+    };
+    RelayMode relay_mode_ = RelayMode::BUFFERED;
+    bool response_headers_seen_ = false;
+    bool response_committed_ = false;
+    bool body_complete_ = false;
+    bool retry_from_headers_pending_ = false;
+    UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead response_head_;
+    std::vector<std::pair<std::string, std::string>> response_trailers_;
+    std::string response_body_;
+    std::string paused_parse_bytes_;
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender_;
+    std::chrono::steady_clock::time_point response_headers_at_{};
+    std::chrono::steady_clock::time_point last_body_progress_at_{};
+    uint64_t stream_idle_timer_generation_ = 0;
+    uint64_t stream_budget_timer_generation_ = 0;
+    bool sse_stream_ = false;
 
     // Internal methods
     void AttemptCheckout();
@@ -207,13 +239,31 @@ private:
     void OnUpstreamData(std::shared_ptr<ConnectionHandler> conn, std::string& data);
     void OnUpstreamWriteComplete(std::shared_ptr<ConnectionHandler> conn);
     void OnResponseComplete();
-    void OnError(int result_code, const std::string& log_message);
     void MaybeRetry(RetryPolicy::RetryCondition condition);
     void DeliverResponse(HttpResponse response);
     void Cleanup();
 
     // Build the final client-facing HttpResponse from the parsed upstream response
     HttpResponse BuildClientResponse();
+    HttpResponse BuildResponseFromHead(bool include_body) const;
+    HttpResponse BuildStreamingHeadersResponse() const;
+    bool CommitStreamingResponse();
+    RelayMode DecideRelayMode(
+        const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) const;
+    bool IsNoBodyResponse(
+        const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) const;
+    bool ShouldRetryResponse5xx() const;
+    void ProcessHeadersRetryDecision();
+    void ResumePausedParsing();
+    void HandleStreamSendResult(
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult result);
+    bool IsSseStream(
+        const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) const;
+    void RefreshStreamIdleTimer();
+    void ArmStreamBudgetTimer();
+    void InvalidateStreamTimers();
+    void OnStreamIdleTimeout(uint64_t generation);
+    void OnStreamBudgetTimeout(uint64_t generation);
 
     // Arm the upstream transport's deadline. When explicit_budget_ms > 0,
     // use that value directly (bypassing config_.response_timeout_ms).

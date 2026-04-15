@@ -25,6 +25,7 @@ public:
     using AsyncCompletionCallback = HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback;
     using InterimResponseSender   = HTTP_CALLBACKS_NAMESPACE::InterimResponseSender;
     using ResourcePusher          = HTTP_CALLBACKS_NAMESPACE::ResourcePusher;
+    using StreamingResponseSender = HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender;
     using AsyncHandler            = HTTP_CALLBACKS_NAMESPACE::AsyncHandler;
 
     // Middleware -- return true to continue, false to stop

@@ -45,6 +45,293 @@ const char* InterimReasonPhrase(int code) {
     }
 }
 
+std::optional<std::string> FirstHeaderValueCI(
+    const std::vector<std::pair<std::string, std::string>>& headers,
+    const std::string& lower_name) {
+    for (const auto& [key, value] : headers) {
+        std::string lower = key;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lower == lower_name) return value;
+    }
+    return std::nullopt;
+}
+
+struct PreparedStreamingHead {
+    std::string wire;
+    bool use_chunked = false;
+    bool should_close = false;
+    bool body_suppressed = false;
+};
+
+std::string SerializeStreamingHead(const HttpResponse& response,
+                                   int http_minor,
+                                   bool use_chunked,
+                                   bool strip_content_length) {
+    std::ostringstream oss;
+
+    oss << "HTTP/1." << http_minor << " " << response.GetStatusCode()
+        << " " << response.GetStatusReason() << "\r\n";
+    for (const auto& [key, value] : response.GetHeaders()) {
+        std::string lower = key;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lower == "transfer-encoding") continue;
+        if (strip_content_length && lower == "content-length") continue;
+        oss << key << ": " << value << "\r\n";
+    }
+    if (use_chunked) {
+        oss << "Transfer-Encoding: chunked\r\n";
+    }
+    oss << "\r\n";
+    return oss.str();
+}
+
+std::string EncodeChunk(const char* data, size_t len) {
+    std::ostringstream oss;
+    oss << std::hex << len << "\r\n";
+    oss.write(data, static_cast<std::streamsize>(len));
+    oss << "\r\n";
+    return oss.str();
+}
+
+std::string EncodeChunkTerminator(
+    const std::vector<std::pair<std::string, std::string>>& trailers) {
+    std::string out = "0\r\n";
+    for (const auto& [key, value] : trailers) {
+        out += key;
+        out += ": ";
+        out += value;
+        out += "\r\n";
+    }
+    out += "\r\n";
+    return out;
+}
+
+class H1StreamingResponseSenderImpl final
+    : public HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::Impl,
+      public std::enable_shared_from_this<H1StreamingResponseSenderImpl> {
+public:
+    using SendResult =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult;
+    using AbortReason =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason;
+    using DrainListener =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::DrainListener;
+
+    using PrepareHeadCallback = std::function<std::optional<PreparedStreamingHead>(
+        const HttpResponse&)>;
+    using FinalizeResponseCallback = std::function<void(bool)>;
+    using AbortResponseCallback = std::function<void()>;
+
+    H1StreamingResponseSenderImpl(
+        std::shared_ptr<ConnectionHandler> conn,
+        std::function<bool()> claim_response,
+        std::function<void()> finalize_request,
+        PrepareHeadCallback prepare_head,
+        FinalizeResponseCallback finalize_response,
+        AbortResponseCallback abort_response,
+        std::function<void()> mark_response_committed)
+        : conn_(std::move(conn)),
+          claim_response_(std::move(claim_response)),
+          finalize_request_(std::move(finalize_request)),
+          prepare_head_(std::move(prepare_head)),
+          finalize_response_(std::move(finalize_response)),
+          abort_response_(std::move(abort_response)),
+          mark_response_committed_(std::move(mark_response_committed)) {}
+
+    int SendHeaders(const HttpResponse& headers_only_response) override {
+        if (!conn_ || conn_->IsClosing()) return -1;
+        if (!conn_->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H1 streaming SendHeaders called off dispatcher fd={}",
+                conn_->fd());
+            return -1;
+        }
+        if (terminal_ || programmer_error_ || headers_sent_) {
+            return -1;
+        }
+        if (!claimed_response_) {
+            if (!claim_response_ || !claim_response_()) {
+                terminal_ = true;
+                return -1;
+            }
+            claimed_response_ = true;
+        }
+
+        auto prepared = prepare_head_ ? prepare_head_(headers_only_response)
+                                      : std::nullopt;
+        if (!prepared) {
+            terminal_ = true;
+            return -1;
+        }
+
+        use_chunked_ = prepared->use_chunked;
+        should_close_ = prepared->should_close;
+        body_suppressed_ = prepared->body_suppressed;
+        headers_sent_ = true;
+        if (mark_response_committed_) {
+            mark_response_committed_();
+        }
+        conn_->SendRaw(prepared->wire.data(), prepared->wire.size());
+        return 0;
+    }
+
+    SendResult SendData(const char* data, size_t len) override {
+        if (!headers_sent_) {
+            return HandleProgrammerError("SendData");
+        }
+        if (terminal_ || programmer_error_ || !conn_ || conn_->IsClosing()) {
+            return SendResult::CLOSED;
+        }
+        if (body_suppressed_) {
+            return SendResult::ACCEPTED_BELOW_WATER;
+        }
+        std::string wire = use_chunked_ ? EncodeChunk(data, len)
+                                        : std::string(data, len);
+        conn_->SendRaw(wire.data(), wire.size());
+        return EvaluateOccupancy();
+    }
+
+    SendResult End(
+        const std::vector<std::pair<std::string, std::string>>& trailers) override {
+        if (!headers_sent_) {
+            HandleProgrammerError("End");
+            return SendResult::CLOSED;
+        }
+        if (terminal_ || programmer_error_ || !conn_ || conn_->IsClosing()) {
+            return SendResult::CLOSED;
+        }
+        terminal_ = true;
+        if (use_chunked_) {
+            std::string final_chunk = EncodeChunkTerminator(trailers);
+            conn_->SendRaw(final_chunk.data(), final_chunk.size());
+        }
+        if (finalize_response_) {
+            finalize_response_(should_close_);
+        }
+        if (finalize_request_) {
+            finalize_request_();
+        }
+        return SendResult::ACCEPTED_BELOW_WATER;
+    }
+
+    void Abort(AbortReason reason) override {
+        (void)reason;
+        AbortInternal(false);
+    }
+
+    void SetDrainListener(DrainListener listener) override {
+        drain_listener_ = std::move(listener);
+        if (!drain_listener_) {
+            above_high_water_ = false;
+            drain_listener_scheduled_ = false;
+        }
+    }
+
+    void ConfigureWatermarks(size_t high_water_bytes) override {
+        if (high_water_bytes == 0) return;
+        high_water_ = high_water_bytes;
+        low_water_ = high_water_ / 2;
+    }
+
+    Dispatcher* GetDispatcher() override {
+        return conn_ ? conn_->GetDispatcher() : nullptr;
+    }
+
+    void OnDownstreamWriteProgress(size_t remaining_bytes) override {
+        MaybeFireDrainListener(remaining_bytes);
+    }
+
+    void OnDownstreamWriteComplete() override {
+        MaybeFireDrainListener(0);
+    }
+
+private:
+    SendResult HandleProgrammerError(const char* op) {
+        if (!programmer_error_) {
+            logging::Get()->error(
+                "H1 streaming {} called before SendHeaders — programmer error fd={}",
+                op, conn_ ? conn_->fd() : -1);
+            programmer_error_ = true;
+            AbortInternal(true);
+        }
+        return SendResult::CLOSED;
+    }
+
+    void AbortInternal(bool from_programmer_error) {
+        if (terminal_ && !from_programmer_error) return;
+        terminal_ = true;
+        if (!claimed_response_) {
+            if (!claim_response_ || !claim_response_()) {
+                return;
+            }
+            claimed_response_ = true;
+        }
+        if (mark_response_committed_) {
+            mark_response_committed_();
+        }
+        if (abort_response_) {
+            abort_response_();
+        }
+        if (finalize_request_) {
+            finalize_request_();
+        }
+    }
+
+    SendResult EvaluateOccupancy() {
+        if (!conn_ || conn_->IsClosing()) {
+            return SendResult::CLOSED;
+        }
+        if (conn_->OutputBufferSize() >= high_water_) {
+            above_high_water_ = true;
+            return SendResult::ACCEPTED_ABOVE_HIGH_WATER;
+        }
+        return SendResult::ACCEPTED_BELOW_WATER;
+    }
+
+    void MaybeFireDrainListener(size_t remaining_bytes) {
+        if (!above_high_water_ || !drain_listener_ || drain_listener_scheduled_) {
+            return;
+        }
+        if (remaining_bytes > low_water_) {
+            return;
+        }
+        above_high_water_ = false;
+        drain_listener_scheduled_ = true;
+        auto listener = drain_listener_;
+        std::weak_ptr<H1StreamingResponseSenderImpl> weak_self =
+            shared_from_this();
+        conn_->RunOnDispatcher(
+            [weak_self, listener = std::move(listener)]() mutable {
+            if (auto self = weak_self.lock()) {
+                self->drain_listener_scheduled_ = false;
+                if (listener) listener();
+            }
+        });
+    }
+
+    std::shared_ptr<ConnectionHandler> conn_;
+    std::function<bool()> claim_response_;
+    std::function<void()> finalize_request_;
+    PrepareHeadCallback prepare_head_;
+    FinalizeResponseCallback finalize_response_;
+    AbortResponseCallback abort_response_;
+    std::function<void()> mark_response_committed_;
+    DrainListener drain_listener_;
+    bool claimed_response_ = false;
+    bool headers_sent_ = false;
+    bool terminal_ = false;
+    bool programmer_error_ = false;
+    bool use_chunked_ = false;
+    bool should_close_ = false;
+    bool body_suppressed_ = false;
+    bool above_high_water_ = false;
+    bool drain_listener_scheduled_ = false;
+    size_t high_water_ = 1024 * 1024;
+    size_t low_water_ = 512 * 1024;
+};
+
 }  // namespace
 
 HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn)
@@ -64,6 +351,136 @@ void HttpConnectionHandler::SetMiddlewareCallback(MiddlewareCallback callback) {
 
 void HttpConnectionHandler::SetUpgradeCallback(UpgradeCallback callback) {
     callbacks_.upgrade_callback = std::move(callback);
+}
+
+HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender
+HttpConnectionHandler::CreateStreamingResponseSender(
+    std::function<bool()> claim_response,
+    std::function<void()> finalize_request) {
+    auto weak_self = weak_from_this();
+    auto prepare_head =
+        [weak_self](const HttpResponse& input)
+            -> std::optional<PreparedStreamingHead> {
+        auto self = weak_self.lock();
+        if (!self || !self->conn_ || self->conn_->IsClosing()) {
+            return std::nullopt;
+        }
+
+        HttpResponse response = input;
+        const int status_code = response.GetStatusCode();
+        bool body_suppressed =
+            self->deferred_was_head_ ||
+            status_code < HttpStatus::OK ||
+            status_code == HttpStatus::SWITCHING_PROTOCOLS ||
+            status_code == HttpStatus::NO_CONTENT ||
+            status_code == HttpStatus::RESET_CONTENT ||
+            status_code == HttpStatus::NOT_MODIFIED;
+        if (status_code == HttpStatus::RESET_CONTENT &&
+            !FirstHeaderValueCI(response.GetHeaders(), "content-length")) {
+            response.Header("Content-Length", "0");
+        }
+
+        const bool shutting_down =
+            (self->callbacks_.shutdown_check_callback &&
+             self->callbacks_.shutdown_check_callback()) ||
+            (self->conn_ && self->conn_->IsCloseDeferred());
+        const bool effective_keep_alive =
+            self->deferred_keep_alive_ && !shutting_down;
+        const int http_minor =
+            self->current_http_minor_.load(std::memory_order_acquire);
+        bool should_close = self->NormalizeOutgoingResponse(
+            response, effective_keep_alive, http_minor);
+
+        const bool has_content_length =
+            FirstHeaderValueCI(response.GetHeaders(), "content-length")
+                .has_value();
+        bool use_chunked = false;
+        if (!body_suppressed && !has_content_length) {
+            if (http_minor >= 1) {
+                use_chunked = true;
+            } else {
+                response.Header("Connection", "close");
+                should_close = true;
+            }
+        }
+
+        const bool strip_content_length =
+            use_chunked ||
+            status_code < HttpStatus::OK ||
+            status_code == HttpStatus::SWITCHING_PROTOCOLS ||
+            status_code == HttpStatus::NO_CONTENT;
+
+        return PreparedStreamingHead{
+            SerializeStreamingHead(response, http_minor, use_chunked,
+                                   strip_content_length),
+            use_chunked,
+            should_close,
+            body_suppressed};
+    };
+
+    auto finalize_response = [weak_self](bool should_close) {
+        auto self = weak_self.lock();
+        if (!self || !self->conn_) return;
+
+        self->deferred_response_pending_ = false;
+        self->deferred_was_head_ = false;
+        self->deferred_keep_alive_ = true;
+        self->deferred_start_ = std::chrono::steady_clock::time_point{};
+        self->async_abort_hook_ = nullptr;
+
+        if (self->conn_->IsClosing()) {
+            self->conn_->SetShutdownExempt(false);
+            self->deferred_pending_buf_.clear();
+            return;
+        }
+        if (should_close) {
+            self->deferred_pending_buf_.clear();
+            self->CloseConnection();
+            self->conn_->SetShutdownExempt(false);
+            return;
+        }
+
+        self->conn_->SetShutdownExempt(false);
+        self->conn_->ClearDeadline();
+        self->conn_->SetDeadlineTimeoutCb(nullptr);
+
+        if (!self->deferred_pending_buf_.empty()) {
+            std::string pending = std::move(self->deferred_pending_buf_);
+            self->deferred_pending_buf_.clear();
+            self->OnRawData(self->conn_, pending);
+        }
+    };
+
+    auto abort_response = [weak_self]() {
+        auto self = weak_self.lock();
+        if (!self || !self->conn_) return;
+
+        self->deferred_response_pending_ = false;
+        self->deferred_was_head_ = false;
+        self->deferred_keep_alive_ = true;
+        self->deferred_pending_buf_.clear();
+        self->deferred_start_ = std::chrono::steady_clock::time_point{};
+        self->async_abort_hook_ = nullptr;
+        self->conn_->SetShutdownExempt(false);
+        self->conn_->ClearDeadline();
+        self->conn_->SetDeadlineTimeoutCb(nullptr);
+        if (!self->conn_->IsClosing()) {
+            self->conn_->ForceClose();
+        }
+    };
+
+    auto mark_response_committed = [weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->final_response_sent_.store(true, std::memory_order_release);
+        }
+    };
+
+    auto impl = std::make_shared<H1StreamingResponseSenderImpl>(
+        conn_, std::move(claim_response), std::move(finalize_request),
+        std::move(prepare_head), std::move(finalize_response),
+        std::move(abort_response), std::move(mark_response_committed));
+    active_stream_sender_impl_ = impl;
+    return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender(std::move(impl));
 }
 
 void HttpConnectionHandler::SetRequestCountCallback(
@@ -485,6 +902,18 @@ bool HttpConnectionHandler::SendInterimResponse(
     logging::Get()->debug(
         "SendInterimResponse sent status={} fd={}", status_code, conn_->fd());
     return true;
+}
+
+void HttpConnectionHandler::OnSendComplete() {
+    if (auto impl = active_stream_sender_impl_.lock()) {
+        impl->OnDownstreamWriteComplete();
+    }
+}
+
+void HttpConnectionHandler::OnWriteProgress(size_t remaining_bytes) {
+    if (auto impl = active_stream_sender_impl_.lock()) {
+        impl->OnDownstreamWriteProgress(remaining_bytes);
+    }
 }
 
 void HttpConnectionHandler::CloseConnection() {

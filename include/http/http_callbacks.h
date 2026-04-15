@@ -7,6 +7,7 @@
 class HttpConnectionHandler;
 class ConnectionHandler;
 class WebSocketConnection;
+class Dispatcher;
 struct HttpRequest;
 class HttpResponse;
 
@@ -100,6 +101,72 @@ namespace HTTP_CALLBACKS_NAMESPACE {
         const HttpResponse& response
     )>;
 
+    class StreamingResponseSender {
+    public:
+        enum class SendResult {
+            ACCEPTED_BELOW_WATER = 0,
+            ACCEPTED_ABOVE_HIGH_WATER = 1,
+            CLOSED = 2,
+        };
+
+        enum class AbortReason {
+            UPSTREAM_TRUNCATED,
+            UPSTREAM_TIMEOUT,
+            UPSTREAM_ERROR,
+            CLIENT_DISCONNECT,
+            TIMER_EXPIRED,
+            SERVER_SHUTDOWN,
+        };
+
+        using DrainListener = std::function<void()>;
+
+        class Impl {
+        public:
+            virtual ~Impl() = default;
+            virtual int SendHeaders(const HttpResponse& headers_only_response) = 0;
+            virtual SendResult SendData(const char* data, size_t len) = 0;
+            virtual SendResult End(
+                const std::vector<std::pair<std::string, std::string>>& trailers) = 0;
+            virtual void Abort(AbortReason reason) = 0;
+            virtual void SetDrainListener(DrainListener listener) = 0;
+            virtual void ConfigureWatermarks(size_t high_water_bytes) = 0;
+            virtual Dispatcher* GetDispatcher() = 0;
+            virtual void OnDownstreamWriteProgress(size_t /*remaining_bytes*/) {}
+            virtual void OnDownstreamWriteComplete() {}
+        };
+
+        StreamingResponseSender() = default;
+        explicit StreamingResponseSender(std::shared_ptr<Impl> impl)
+            : impl_(std::move(impl)) {}
+
+        int SendHeaders(const HttpResponse& headers_only_response) const {
+            return impl_ ? impl_->SendHeaders(headers_only_response) : -1;
+        }
+        SendResult SendData(const char* data, size_t len) const {
+            return impl_ ? impl_->SendData(data, len) : SendResult::CLOSED;
+        }
+        SendResult End(
+            const std::vector<std::pair<std::string, std::string>>& trailers = {}) const {
+            return impl_ ? impl_->End(trailers) : SendResult::CLOSED;
+        }
+        void Abort(AbortReason reason) const {
+            if (impl_) impl_->Abort(reason);
+        }
+        void SetDrainListener(DrainListener listener) const {
+            if (impl_) impl_->SetDrainListener(std::move(listener));
+        }
+        void ConfigureWatermarks(size_t high_water_bytes) const {
+            if (impl_) impl_->ConfigureWatermarks(high_water_bytes);
+        }
+        Dispatcher* GetDispatcher() const {
+            return impl_ ? impl_->GetDispatcher() : nullptr;
+        }
+        explicit operator bool() const { return static_cast<bool>(impl_); }
+
+    private:
+        std::shared_ptr<Impl> impl_;
+    };
+
     // Async handler for HTTP requests. Used when the request handler needs to
     // dispatch async work (e.g. upstream proxy via UpstreamManager::CheckoutAsync)
     // and deliver the response later. The handler receives the request plus
@@ -118,6 +185,7 @@ namespace HTTP_CALLBACKS_NAMESPACE {
         const HttpRequest& request,
         InterimResponseSender send_interim,
         ResourcePusher        push_resource,
+        StreamingResponseSender stream_sender,
         AsyncCompletionCallback complete
     )>;
 

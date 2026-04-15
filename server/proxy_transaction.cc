@@ -12,9 +12,52 @@
 #include "http/http_status.h"
 #include "log/logger.h"
 
+namespace {
+
+std::string LowerCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return value;
+}
+
+bool HeaderValueEquals(const std::vector<std::pair<std::string, std::string>>& headers,
+                       const std::string& name,
+                       const std::string& expected_lower) {
+    for (const auto& [key, value] : headers) {
+        if (LowerCopy(key) == name) {
+            return LowerCopy(value) == expected_lower;
+        }
+    }
+    return false;
+}
+
+std::optional<std::string> FirstHeaderValue(
+    const std::vector<std::pair<std::string, std::string>>& headers,
+    const std::string& name_lower) {
+    for (const auto& [key, value] : headers) {
+        if (LowerCopy(key) == name_lower) return value;
+    }
+    return std::nullopt;
+}
+
+bool HeaderValueStartsWith(
+    const std::vector<std::pair<std::string, std::string>>& headers,
+    const std::string& name_lower,
+    const std::string& prefix_lower) {
+    for (const auto& [key, value] : headers) {
+        if (LowerCopy(key) != name_lower) continue;
+        std::string lower_value = LowerCopy(value);
+        return lower_value.rfind(prefix_lower, 0) == 0;
+    }
+    return false;
+}
+
+}  // namespace
+
 ProxyTransaction::ProxyTransaction(
     const std::string& service_name,
     const HttpRequest& client_request,
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender,
     HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete_cb,
     UpstreamManager* upstream_manager,
     const ProxyConfig& config,
@@ -30,6 +73,8 @@ ProxyTransaction::ProxyTransaction(
       method_(client_request.method),
       path_(client_request.path),
       query_(client_request.query),
+      client_http_major_(client_request.http_major),
+      client_http_minor_(client_request.http_minor),
       client_headers_(client_request.headers),
       request_body_(client_request.body),
       dispatcher_index_(client_request.dispatcher_index),
@@ -51,8 +96,10 @@ ProxyTransaction::ProxyTransaction(
       header_rewriter_(header_rewriter),
       retry_policy_(retry_policy),
       complete_cb_(std::move(complete_cb)),
-      start_time_(std::chrono::steady_clock::now())
+      start_time_(std::chrono::steady_clock::now()),
+      stream_sender_(std::move(stream_sender))
 {
+    stream_sender_.ConfigureWatermarks(config_.relay_buffer_limit_bytes);
     logging::Get()->debug("ProxyTransaction created client_fd={} service={} "
                           "{} {}", client_fd_, service_name_, method_, path_);
 }
@@ -74,6 +121,18 @@ void ProxyTransaction::Start() {
     // Tell the codec the request method so it handles HEAD correctly
     // (no body despite Content-Length/Transfer-Encoding in response).
     codec_.SetRequestMethod(method_);
+    codec_.SetSink(this);
+    relay_mode_ = RelayMode::BUFFERED;
+    response_headers_seen_ = false;
+    response_committed_ = false;
+    body_complete_ = false;
+    retry_from_headers_pending_ = false;
+    response_head_ = {};
+    response_trailers_.clear();
+    response_body_.clear();
+    paused_parse_bytes_.clear();
+    InvalidateStreamTimers();
+    sse_stream_ = false;
 
     // Compute rewritten headers (strip hop-by-hop, add X-Forwarded-For, etc.)
     rewritten_headers_ = header_rewriter_.RewriteRequest(
@@ -486,15 +545,26 @@ void ProxyTransaction::OnUpstreamData(
         return;
     }
 
+    std::string parse_input;
+    if (!paused_parse_bytes_.empty()) {
+        parse_input = std::move(paused_parse_bytes_);
+        paused_parse_bytes_.clear();
+        if (!data.empty()) parse_input.append(data);
+    } else {
+        parse_input = data;
+    }
+
     // Empty data signals upstream disconnect (EOF) from the pool's close
     // callback. For connection-close framing (no Content-Length / TE),
     // llhttp needs an EOF signal to finalize the response. Try Finish()
     // first — if it completes the response, deliver it instead of retrying.
-    if (data.empty()) {
+    if (parse_input.empty()) {
         if (codec_.Finish()) {
             // EOF-delimited response completed successfully
             poison_connection_ = true;  // connection-close: not reusable
-            OnResponseComplete();
+            if (body_complete_) {
+                OnResponseComplete();
+            }
             return;
         }
         int upstream_fd = conn ? conn->fd() : -1;
@@ -510,7 +580,7 @@ void ProxyTransaction::OnUpstreamData(
     }
 
     // Parse upstream response data
-    size_t consumed = codec_.Parse(data.data(), data.size());
+    size_t consumed = codec_.Parse(parse_input.data(), parse_input.size());
 
     // Check for parse error — the HTTP stream is desynchronized and the
     // connection must not be returned to the idle pool.
@@ -523,7 +593,15 @@ void ProxyTransaction::OnUpstreamData(
         return;
     }
 
-    const auto& response = codec_.GetResponse();
+    if (codec_.IsPaused() && consumed < parse_input.size()) {
+        paused_parse_bytes_.assign(parse_input.data() + consumed,
+                                   parse_input.size() - consumed);
+    }
+
+    if (retry_from_headers_pending_) {
+        ProcessHeadersRetryDecision();
+        return;
+    }
 
     // If a complete response was parsed but the read buffer still has
     // unconsumed bytes, the upstream sent trailing data after the
@@ -533,95 +611,123 @@ void ProxyTransaction::OnUpstreamData(
     // so it won't be returned to the idle pool even if keep_alive is
     // true, preventing the next borrower from seeing desynchronized
     // data on the same wire.
-    if (response.complete && consumed < data.size()) {
+    if (body_complete_ && consumed < parse_input.size()) {
         poison_connection_ = true;
         int upstream_fd = conn ? conn->fd() : -1;
         logging::Get()->warn(
             "ProxyTransaction upstream sent {} trailing bytes after "
             "response client_fd={} service={} upstream_fd={} status={}",
-            data.size() - consumed, client_fd_, service_name_,
-            upstream_fd, response.status_code);
+            parse_input.size() - consumed, client_fd_, service_name_,
+            upstream_fd, response_head_.status_code);
     }
 
-    // Handle early response (upstream responds while we're still sending)
-    if (state_ == State::SENDING_REQUEST) {
-        // Transition from send-phase (with the fallback stall deadline)
-        // to response-wait-phase, but only when a non-1xx response has
-        // begun. The codec discards standalone 1xx interim responses
-        // (100/102/103) and resets response_ to empty — status_code
-        // stays 0 in that case. The partial-stall hang is handled by
-        // the send-phase stall timer installed in SendUpstreamRequest
-        // (refreshed on write progress).
-        //
-        // When response_timeout_ms > 0: re-anchor the deadline at now
-        // with the configured response budget (overwrites the stall
-        // deadline via SetDeadline).
-        // When response_timeout_ms == 0 (explicitly disabled): clear
-        // the fallback stall deadline so legitimately slow responses
-        // aren't capped at the fallback — honoring the documented
-        // "disabled" semantic for the response-wait phase.
-        if (response.status_code > 0 || response.headers_complete || response.complete) {
-            if (config_.response_timeout_ms > 0) {
-                ArmResponseTimeout();
-            } else {
-                ClearResponseTimeout();
-            }
-        }
-
-        if (response.complete) {
-            // Full response received before request write completed
-            poison_connection_ = true;
-            int upstream_fd = conn ? conn->fd() : -1;
-            logging::Get()->debug("ProxyTransaction early response (complete) "
-                                  "client_fd={} service={} upstream_fd={} "
-                                  "status={}",
-                                  client_fd_, service_name_, upstream_fd,
-                                  response.status_code);
-            OnResponseComplete();
-            return;
-        }
-        if (response.headers_complete) {
-            // Headers arrived but body still incoming -- transition to
-            // RECEIVING_BODY. The write-complete callback will be a no-op.
-            poison_connection_ = true;
-            state_ = State::RECEIVING_BODY;
-            int upstream_fd = conn ? conn->fd() : -1;
-            logging::Get()->debug("ProxyTransaction early response (headers) "
-                                  "client_fd={} service={} upstream_fd={} "
-                                  "status={}",
-                                  client_fd_, service_name_, upstream_fd,
-                                  response.status_code);
-            return;
-        }
-        // Partial data, not enough to determine -- stay in SENDING_REQUEST
-        return;
-    }
-
-    // Normal response handling (AWAITING_RESPONSE or RECEIVING_BODY)
-    if (response.complete) {
+    if (body_complete_) {
         OnResponseComplete();
         return;
     }
 
-    if (state_ == State::AWAITING_RESPONSE && response.headers_complete) {
+    if (state_ == State::AWAITING_RESPONSE && response_headers_seen_) {
         state_ = State::RECEIVING_BODY;
     }
 
-    // Refresh deadline on body progress: response_timeout_ms guards the wait
-    // for headers, but once body data is flowing, a slow download that makes
-    // forward progress should not timeout. Re-arm the deadline from now so
-    // only stalls (no data for response_timeout_ms) trigger a timeout.
-    if (state_ == State::RECEIVING_BODY && config_.response_timeout_ms > 0) {
-        auto* upstream_conn = lease_.Get();
-        if (upstream_conn) {
-            auto transport = upstream_conn->GetTransport();
-            if (transport) {
-                transport->SetDeadline(
-                    std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(config_.response_timeout_ms));
-            }
+}
+
+bool ProxyTransaction::OnHeaders(
+    const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) {
+    if (cancelled_) return false;
+
+    response_headers_seen_ = true;
+    response_head_ = head;
+    response_headers_at_ = std::chrono::steady_clock::now();
+    last_body_progress_at_ = response_headers_at_;
+    response_body_.clear();
+    response_trailers_.clear();
+    relay_mode_ = DecideRelayMode(head);
+    sse_stream_ = IsSseStream(head);
+
+    if (!head.keep_alive) {
+        poison_connection_ = true;
+    }
+    if (state_ == State::SENDING_REQUEST) {
+        poison_connection_ = true;
+    }
+
+    // T1 is complete once the response head arrives. Body-phase timing uses
+    // the dedicated T2/T3 stream timers.
+    ClearResponseTimeout();
+
+    if (head.status_code >= HttpStatus::INTERNAL_SERVER_ERROR &&
+        head.status_code < 600) {
+        ReportBreakerOutcome(-1000);
+        if (ShouldRetryResponse5xx()) {
+            retry_from_headers_pending_ = true;
+            poison_connection_ = true;
+            codec_.PauseParsing();
+            return true;
+        }
+    } else if (head.status_code >= HttpStatus::BAD_REQUEST) {
+        ReleaseBreakerAdmissionNeutral();
+    } else {
+        ReportBreakerOutcome(RESULT_SUCCESS);
+    }
+
+    if (!IsNoBodyResponse(head)) {
+        RefreshStreamIdleTimer();
+        ArmStreamBudgetTimer();
+    }
+
+    if (relay_mode_ == RelayMode::STREAMING) {
+        if (!CommitStreamingResponse()) {
+            OnError(RESULT_SEND_FAILED,
+                    "downstream stream sender rejected response headers");
+            return false;
         }
     }
+
+    return true;
+}
+
+bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
+    if (cancelled_) return false;
+    last_body_progress_at_ = std::chrono::steady_clock::now();
+    if (state_ == State::AWAITING_RESPONSE) {
+        state_ = State::RECEIVING_BODY;
+    }
+    RefreshStreamIdleTimer();
+
+    if (relay_mode_ == RelayMode::BUFFERED) {
+        if (response_body_.size() >= UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE ||
+            len > UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE - response_body_.size()) {
+            OnError(RESULT_PARSE_ERROR,
+                    "Upstream response body exceeds maximum buffered size");
+            return false;
+        }
+        response_body_.append(data, len);
+        return true;
+    }
+
+    auto result = stream_sender_.SendData(data, len);
+    HandleStreamSendResult(result);
+    if (result == HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+        stream_sender_.Abort(
+            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::CLIENT_DISCONNECT);
+        state_ = State::FAILED;
+        complete_cb_invoked_ = true;
+        complete_cb_ = nullptr;
+        Cleanup();
+    }
+    return true;
+}
+
+void ProxyTransaction::OnTrailers(
+    const std::vector<std::pair<std::string, std::string>>& trailers) {
+    if (config_.forward_trailers) {
+        response_trailers_ = trailers;
+    }
+}
+
+void ProxyTransaction::OnComplete() {
+    body_complete_ = true;
 }
 
 void ProxyTransaction::OnUpstreamWriteComplete(
@@ -667,34 +773,7 @@ void ProxyTransaction::OnUpstreamWriteComplete(
 
 void ProxyTransaction::OnResponseComplete() {
     ClearResponseTimeout();
-
-    const auto& response = codec_.GetResponse();
-    if (!response.keep_alive) {
-        poison_connection_ = true;
-    }
-
-    // Check for 5xx and retry if policy allows — before setting COMPLETE.
-    // COMPLETE is terminal; resetting it back to INIT after setting it would
-    // be a logic error (and confusing for any future state assertions).
-    if (response.status_code >= HttpStatus::INTERNAL_SERVER_ERROR &&
-        response.status_code < 600) {
-        logging::Get()->warn("ProxyTransaction upstream 5xx client_fd={} "
-                             "service={} status={} attempt={}",
-                             client_fd_, service_name_,
-                             response.status_code, attempt_);
-        // Report failure BEFORE MaybeRetry — the retry's fresh
-        // ConsultBreaker must see the just-added failure in the window
-        // (and potentially reject if this was the trip-causing call).
-        // Pass a synthetic RESULT_CHECKOUT_FAILED-like signal; the
-        // classifier maps 5xx → FailureKind::RESPONSE_5XX.
-        ReportBreakerOutcome(/* sentinel */ -1000);
-        MaybeRetry(RetryPolicy::RetryCondition::RESPONSE_5XX);
-        return;
-    }
-
-    // 2xx / 3xx / 4xx: upstream is healthy (from the breaker's
-    // perspective — 4xx is a client-side problem). Report success.
-    ReportBreakerOutcome(RESULT_SUCCESS);
+    InvalidateStreamTimers();
 
     state_ = State::COMPLETE;
 
@@ -709,7 +788,19 @@ void ProxyTransaction::OnResponseComplete() {
     logging::Get()->info("ProxyTransaction complete client_fd={} service={} "
                          "upstream_fd={} status={} attempt={} duration={}ms",
                          client_fd_, service_name_, upstream_fd,
-                         response.status_code, attempt_, duration.count());
+                         response_head_.status_code, attempt_, duration.count());
+
+    if (relay_mode_ == RelayMode::STREAMING && response_committed_) {
+        auto result = stream_sender_.End(response_trailers_);
+        if (result == HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+            stream_sender_.Abort(
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
+        }
+        complete_cb_invoked_ = true;
+        complete_cb_ = nullptr;
+        Cleanup();
+        return;
+    }
 
     HttpResponse client_response = BuildClientResponse();
     DeliverResponse(std::move(client_response));
@@ -717,6 +808,7 @@ void ProxyTransaction::OnResponseComplete() {
 
 void ProxyTransaction::OnError(int result_code,
                                 const std::string& log_message) {
+    InvalidateStreamTimers();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time_);
 
@@ -735,6 +827,20 @@ void ProxyTransaction::OnError(int result_code,
     ReportBreakerOutcome(result_code);
 
     state_ = State::FAILED;
+    if (response_committed_ && relay_mode_ == RelayMode::STREAMING) {
+        using AbortReason = HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason;
+        AbortReason reason = AbortReason::UPSTREAM_ERROR;
+        if (result_code == RESULT_UPSTREAM_DISCONNECT) {
+            reason = AbortReason::UPSTREAM_TRUNCATED;
+        } else if (result_code == RESULT_RESPONSE_TIMEOUT) {
+            reason = AbortReason::UPSTREAM_TIMEOUT;
+        }
+        stream_sender_.Abort(reason);
+        complete_cb_invoked_ = true;
+        complete_cb_ = nullptr;
+        Cleanup();
+        return;
+    }
     HttpResponse error_response = (result_code == RESULT_CIRCUIT_OPEN)
         ? MakeCircuitOpenResponse()
         : MakeErrorResponse(result_code);
@@ -745,9 +851,7 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
     // Short-circuit on cancellation — no point retrying against a
     // disconnected client.
     if (cancelled_) return;
-    // In v1 (buffered), headers_sent is always false -- no response data
-    // has been sent to the client yet.
-    if (retry_policy_.ShouldRetry(attempt_, method_, condition, false)) {
+    if (retry_policy_.ShouldRetry(attempt_, method_, condition, response_committed_)) {
         attempt_++;
 
         logging::Get()->info("ProxyTransaction retrying client_fd={} "
@@ -769,7 +873,19 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
         // parser.method, so HEAD responses would be parsed as if they
         // carry a body, causing the retried request to hang.
         codec_.SetRequestMethod(method_);
+        codec_.SetSink(this);
         poison_connection_ = false;
+        relay_mode_ = RelayMode::BUFFERED;
+        response_headers_seen_ = false;
+        response_committed_ = false;
+        body_complete_ = false;
+        retry_from_headers_pending_ = false;
+        response_head_ = {};
+        response_body_.clear();
+        response_trailers_.clear();
+        paused_parse_bytes_.clear();
+        InvalidateStreamTimers();
+        sse_stream_ = false;
 
         // Condition-dependent first-retry policy:
         // Connection-level failures (stale keep-alive, connect refused)
@@ -927,6 +1043,7 @@ void ProxyTransaction::Cancel() {
     if (state_ != State::INIT && state_ != State::CHECKOUT_PENDING) {
         poison_connection_ = true;
     }
+    InvalidateStreamTimers();
     // Release any held breaker admission neutrally. Cancel() is always
     // a LOCAL termination — client disconnect, framework-level abort,
     // H2 stream reset, etc. Even when we poisoned a pooled connection
@@ -952,6 +1069,10 @@ void ProxyTransaction::Cancel() {
 }
 
 void ProxyTransaction::Cleanup() {
+    InvalidateStreamTimers();
+    stream_sender_.SetDrainListener(nullptr);
+    paused_parse_bytes_.clear();
+
     // Release any retry-budget token held by the attempt that just
     // ended. Must happen BEFORE the next TryConsumeRetry in MaybeRetry
     // so the new attempt sees accurate retries_in_flight. Idempotent
@@ -971,6 +1092,9 @@ void ProxyTransaction::Cleanup() {
     if (lease_) {
         auto* conn = lease_.Get();
         if (conn) {
+            if (conn->IsReadDisabled()) {
+                conn->DecReadDisable();
+            }
             auto transport = conn->GetTransport();
             if (transport) {
                 transport->SetOnMessageCb(nullptr);
@@ -1001,33 +1125,222 @@ void ProxyTransaction::Cleanup() {
 }
 
 HttpResponse ProxyTransaction::BuildClientResponse() {
-    auto& upstream_resp = codec_.GetResponse();
+    HttpResponse response = BuildResponseFromHead(true);
+    if (!response_body_.empty()) {
+        response.Body(std::move(response_body_));
+    }
+    return response;
+}
 
+HttpResponse ProxyTransaction::BuildResponseFromHead(bool include_body) const {
     HttpResponse response;
-    response.Status(upstream_resp.status_code, upstream_resp.status_reason);
+    response.Status(response_head_.status_code, response_head_.status_reason);
 
-    // Rewrite response headers (strip hop-by-hop, add Via).
-    // Use AppendHeader to preserve repeated upstream headers (Cache-Control,
-    // Link, Via, etc.) that Header()'s set-semantics would collapse.
-    auto rewritten = header_rewriter_.RewriteResponse(upstream_resp.headers);
+    auto rewritten = header_rewriter_.RewriteResponse(response_head_.headers);
     for (const auto& [name, value] : rewritten) {
         response.AppendHeader(name, value);
     }
 
-    // For HEAD responses, preserve the upstream's Content-Length header
-    // instead of auto-computing from body_.size() (which would be 0).
-    // RFC 7231 §4.3.2: HEAD responses carry the same Content-Length as
-    // the equivalent GET response.
-    if (method_ == "HEAD") {
+    if (method_ == "HEAD" ||
+        (response_head_.framing ==
+             UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH &&
+         !include_body && response_head_.expected_length >= 0)) {
         response.PreserveContentLength();
+        if (response_head_.expected_length >= 0 &&
+            !FirstHeaderValue(response.GetHeaders(), "content-length")) {
+            response.AppendHeader("Content-Length",
+                                  std::to_string(response_head_.expected_length));
+        }
     }
 
-    // Move body to avoid copying potentially large payloads (up to 64MB)
-    if (!upstream_resp.body.empty()) {
-        response.Body(std::move(upstream_resp.body));
+    if (include_body && !response_body_.empty()) {
+        response.Body(response_body_);
     }
-
     return response;
+}
+
+HttpResponse ProxyTransaction::BuildStreamingHeadersResponse() const {
+    return BuildResponseFromHead(false);
+}
+
+bool ProxyTransaction::CommitStreamingResponse() {
+    if (response_committed_) return true;
+    HttpResponse response = BuildStreamingHeadersResponse();
+    int rv = stream_sender_.SendHeaders(response);
+    if (rv < 0) {
+        return false;
+    }
+    response_committed_ = true;
+    return true;
+}
+
+ProxyTransaction::RelayMode ProxyTransaction::DecideRelayMode(
+    const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) const {
+    if (config_.buffering == "always") {
+        return RelayMode::BUFFERED;
+    }
+    if (client_http_major_ == 1 && client_http_minor_ == 0 &&
+        config_.h10_streaming == "buffer") {
+        return RelayMode::BUFFERED;
+    }
+    if (config_.buffering == "never") {
+        return RelayMode::STREAMING;
+    }
+    if (IsNoBodyResponse(head)) {
+        return RelayMode::BUFFERED;
+    }
+    if (HeaderValueEquals(head.headers, "content-type", "text/event-stream")) {
+        return RelayMode::STREAMING;
+    }
+    if (head.framing ==
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CHUNKED ||
+        head.framing ==
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::EOF_TERMINATED) {
+        return RelayMode::STREAMING;
+    }
+    if (head.framing ==
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH &&
+        head.expected_length >= 0 &&
+        static_cast<uint64_t>(head.expected_length) >
+            config_.auto_stream_content_length_threshold_bytes) {
+        return RelayMode::STREAMING;
+    }
+    return RelayMode::BUFFERED;
+}
+
+bool ProxyTransaction::IsNoBodyResponse(
+    const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) const {
+    return method_ == "HEAD" ||
+           head.framing ==
+               UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::NO_BODY;
+}
+
+bool ProxyTransaction::ShouldRetryResponse5xx() const {
+    if (response_head_.status_code < HttpStatus::INTERNAL_SERVER_ERROR ||
+        response_head_.status_code >= 600) {
+        return false;
+    }
+    return retry_policy_.ShouldRetry(
+        attempt_, method_, RetryPolicy::RetryCondition::RESPONSE_5XX, false);
+}
+
+bool ProxyTransaction::IsSseStream(
+    const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) const {
+    return HeaderValueStartsWith(
+        head.headers, "content-type", "text/event-stream");
+}
+
+void ProxyTransaction::ProcessHeadersRetryDecision() {
+    if (!retry_from_headers_pending_) return;
+    retry_from_headers_pending_ = false;
+    MaybeRetry(RetryPolicy::RetryCondition::RESPONSE_5XX);
+}
+
+void ProxyTransaction::ResumePausedParsing() {
+    if (!codec_.IsPaused()) return;
+    codec_.ResumeParsing();
+    if (paused_parse_bytes_.empty()) return;
+    auto pending = std::move(paused_parse_bytes_);
+    paused_parse_bytes_.clear();
+    auto* upstream_conn = lease_.Get();
+    auto transport = upstream_conn ? upstream_conn->GetTransport() : nullptr;
+    if (transport) {
+        OnUpstreamData(transport, pending);
+    }
+}
+
+void ProxyTransaction::HandleStreamSendResult(
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult result) {
+    using SendResult = HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult;
+    if (result != SendResult::ACCEPTED_ABOVE_HIGH_WATER) {
+        return;
+    }
+
+    auto* upstream_conn = lease_.Get();
+    if (!upstream_conn || upstream_conn->IsReadDisabled()) {
+        return;
+    }
+
+    upstream_conn->IncReadDisable();
+    codec_.PauseParsing();
+    std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
+    stream_sender_.SetDrainListener([weak_self]() {
+        auto self = weak_self.lock();
+        if (!self) return;
+        if (auto* conn = self->lease_.Get()) {
+            conn->DecReadDisable();
+        }
+        self->stream_sender_.SetDrainListener(nullptr);
+        self->ResumePausedParsing();
+    });
+}
+
+void ProxyTransaction::RefreshStreamIdleTimer() {
+    ++stream_idle_timer_generation_;
+    if (!dispatcher_ || !response_headers_seen_ || body_complete_ ||
+        cancelled_ || sse_stream_ ||
+        config_.stream_idle_timeout_sec == 0) {
+        return;
+    }
+
+    const uint64_t generation = stream_idle_timer_generation_;
+    std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
+    dispatcher_->EnQueueDelayed(
+        [weak_self, generation]() {
+            if (auto self = weak_self.lock()) {
+                self->OnStreamIdleTimeout(generation);
+            }
+        },
+        std::chrono::milliseconds(
+            static_cast<int64_t>(config_.stream_idle_timeout_sec) * 1000));
+}
+
+void ProxyTransaction::ArmStreamBudgetTimer() {
+    ++stream_budget_timer_generation_;
+    if (!dispatcher_ || !response_headers_seen_ || body_complete_ ||
+        cancelled_ || config_.stream_max_duration_sec == 0) {
+        return;
+    }
+
+    const uint64_t generation = stream_budget_timer_generation_;
+    std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
+    dispatcher_->EnQueueDelayed(
+        [weak_self, generation]() {
+            if (auto self = weak_self.lock()) {
+                self->OnStreamBudgetTimeout(generation);
+            }
+        },
+        std::chrono::milliseconds(
+            static_cast<int64_t>(config_.stream_max_duration_sec) * 1000));
+}
+
+void ProxyTransaction::InvalidateStreamTimers() {
+    ++stream_idle_timer_generation_;
+    ++stream_budget_timer_generation_;
+}
+
+void ProxyTransaction::OnStreamIdleTimeout(uint64_t generation) {
+    if (generation != stream_idle_timer_generation_ || cancelled_ ||
+        body_complete_ || !response_headers_seen_ ||
+        state_ == State::COMPLETE || state_ == State::FAILED) {
+        return;
+    }
+    logging::Get()->warn(
+        "proxy: stream_idle_timeout svc={} idle_sec={} client_fd={} attempt={}",
+        service_name_, config_.stream_idle_timeout_sec, client_fd_, attempt_);
+    OnError(RESULT_RESPONSE_TIMEOUT, "Stream idle timeout");
+}
+
+void ProxyTransaction::OnStreamBudgetTimeout(uint64_t generation) {
+    if (generation != stream_budget_timer_generation_ || cancelled_ ||
+        body_complete_ || !response_headers_seen_ ||
+        state_ == State::COMPLETE || state_ == State::FAILED) {
+        return;
+    }
+    logging::Get()->warn(
+        "proxy: stream_max_duration_exceeded svc={} max_sec={} client_fd={} attempt={}",
+        service_name_, config_.stream_max_duration_sec, client_fd_, attempt_);
+    OnError(RESULT_RESPONSE_TIMEOUT, "Stream max duration exceeded");
 }
 
 void ProxyTransaction::ArmResponseTimeout(int explicit_budget_ms) {

@@ -1,6 +1,7 @@
 # AI Agent
 .claude/
-AGENT.md
+.codex/
+AGENTS.md
 CLAUDE.md
 
 *.o

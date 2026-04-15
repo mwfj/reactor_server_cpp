@@ -44,6 +44,24 @@ void UpstreamConnection::IncrementRequestCount() {
     ++request_count_;
 }
 
+void UpstreamConnection::IncReadDisable() {
+    ++read_disable_count_;
+    if (read_disable_count_ == 1 && conn_) {
+        conn_->DisableReadMode();
+    }
+}
+
+void UpstreamConnection::DecReadDisable() {
+    if (read_disable_count_ <= 0) {
+        read_disable_count_ = 0;
+        return;
+    }
+    --read_disable_count_;
+    if (read_disable_count_ == 0 && conn_) {
+        conn_->EnableReadMode();
+    }
+}
+
 bool UpstreamConnection::IsAlive() const {
     int conn_fd = fd();
     if (conn_fd < 0) return false;

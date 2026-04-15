@@ -103,6 +103,14 @@ struct ProxyRetryConfig {
 };
 
 struct ProxyConfig {
+    std::string buffering = "auto";
+    uint32_t relay_buffer_limit_bytes = 1048576;
+    uint32_t auto_stream_content_length_threshold_bytes = 262144;
+    uint32_t stream_idle_timeout_sec = 30;
+    uint32_t stream_max_duration_sec = 0;
+    std::string h10_streaming = "close";
+    bool forward_trailers = false;
+
     // Response timeout: max time to wait for upstream response headers
     // after request is fully sent. 0 = disabled (no deadline). Otherwise
     // must be >= 1000 (timer scan has 1s resolution).
@@ -128,7 +136,15 @@ struct ProxyConfig {
     ProxyRetryConfig retry;
 
     bool operator==(const ProxyConfig& o) const {
-        return response_timeout_ms == o.response_timeout_ms &&
+        return buffering == o.buffering &&
+               relay_buffer_limit_bytes == o.relay_buffer_limit_bytes &&
+               auto_stream_content_length_threshold_bytes ==
+                   o.auto_stream_content_length_threshold_bytes &&
+               stream_idle_timeout_sec == o.stream_idle_timeout_sec &&
+               stream_max_duration_sec == o.stream_max_duration_sec &&
+               h10_streaming == o.h10_streaming &&
+               forward_trailers == o.forward_trailers &&
+               response_timeout_ms == o.response_timeout_ms &&
                route_prefix == o.route_prefix &&
                strip_prefix == o.strip_prefix &&
                methods == o.methods &&

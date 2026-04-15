@@ -132,6 +132,11 @@ public:
     void SetTlsConnection(std::unique_ptr<TlsConnection> tls);
     void SetMaxInputSize(size_t max) { max_input_size_ = max; }
     size_t OutputBufferSize() const { return output_bf_.Size(); }
+    Dispatcher* GetDispatcher() const { return event_dispatcher_.get(); }
+
+    void EnableReadMode();
+    void DisableReadMode();
+    bool IsReadModeEnabled() const;
 
     // Returns true if this connection has TLS (any state: handshake or ready).
     bool HasTls() const { return tls_state_ != TlsState::NONE; }

@@ -655,6 +655,7 @@ namespace HttpTests {
                 [&](const HttpRequest&,
                     HttpRouter::InterimResponseSender /*send_interim*/,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback complete) {
                     handler_called.store(true);
                     HttpResponse r;
@@ -699,6 +700,7 @@ namespace HttpTests {
                 [&sched](const HttpRequest&,
                          HttpRouter::InterimResponseSender /*send_interim*/,
                          HttpRouter::ResourcePusher        /*push_resource*/,
+                         HttpRouter::StreamingResponseSender /*stream_sender*/,
                          HttpRouter::AsyncCompletionCallback complete) {
                     // Defer completion by ~150 ms on a background thread.
                     auto shared = std::make_shared<
@@ -759,6 +761,7 @@ namespace HttpTests {
                 [&](const HttpRequest& req,
                     HttpRouter::InterimResponseSender /*send_interim*/,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback complete) {
                     if (req.method == "GET")  saw_get.store(true);
                     if (req.method == "HEAD") saw_head.store(true);
@@ -801,6 +804,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender /*send_interim*/,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback c) {
                     HttpResponse r;
                     r.Status(202).Text("accepted");
@@ -846,6 +850,7 @@ namespace HttpTests {
                 [&sched](const HttpRequest&,
                          HttpRouter::InterimResponseSender /*send_interim*/,
                          HttpRouter::ResourcePusher        /*push_resource*/,
+                         HttpRouter::StreamingResponseSender /*stream_sender*/,
                          HttpRouter::AsyncCompletionCallback complete) {
                     auto shared = std::make_shared<
                         HttpRouter::AsyncCompletionCallback>(std::move(complete));
@@ -896,6 +901,7 @@ namespace HttpTests {
                 [&sched](const HttpRequest&,
                          HttpRouter::InterimResponseSender /*send_interim*/,
                          HttpRouter::ResourcePusher        /*push_resource*/,
+                         HttpRouter::StreamingResponseSender /*stream_sender*/,
                          HttpRouter::AsyncCompletionCallback complete) {
                     auto shared = std::make_shared<
                         HttpRouter::AsyncCompletionCallback>(std::move(complete));
@@ -960,6 +966,7 @@ namespace HttpTests {
                 [&](const HttpRequest&,
                     HttpRouter::InterimResponseSender /*send_interim*/,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback c) {
                     handler_called.store(true);
                     HttpResponse r;
@@ -1031,6 +1038,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender send_interim,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback complete) {
                     send_interim(103, {{"Link", "</style.css>; rel=preload; as=style"}});
                     HttpResponse r;
@@ -1092,6 +1100,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender send_interim,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback complete) {
                     send_interim(103, {{"Link", "</a.css>; rel=preload"}});
                     send_interim(103, {{"Link", "</b.js>; rel=preload"}});
@@ -1142,6 +1151,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender send_interim,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback complete) {
                     send_interim(103, {{"Link", "</x.css>; rel=preload"}});
                     HttpResponse r;
@@ -1185,6 +1195,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender send_interim,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback complete) {
                     send_interim(103, {
                         {"Link", "</a.css>; rel=preload"},
@@ -1271,6 +1282,7 @@ namespace HttpTests {
                     const HttpRequest&,
                     HttpRouter::InterimResponseSender send_interim,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback complete) {
                     // Complete with the final 200 first. This enqueues
                     // CompleteAsyncResponse on the dispatcher (task A).
@@ -1341,6 +1353,7 @@ namespace HttpTests {
                 [&sched](const HttpRequest&,
                           HttpRouter::InterimResponseSender send_interim,
                           HttpRouter::ResourcePusher        /*push_resource*/,
+                          HttpRouter::StreamingResponseSender /*stream_sender*/,
                           HttpRouter::AsyncCompletionCallback complete) {
                     // 103 emitted synchronously; final 200 via background task.
                     send_interim(103, {{"Link", "</style.css>; rel=preload"}});
@@ -1474,6 +1487,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender send_interim,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback complete) {
                     send_interim(103, {
                         {"Link", "</a.css>; rel=preload\r\nInjected: leaked"}
@@ -1543,6 +1557,7 @@ namespace HttpTests {
                 [p](const HttpRequest&,
                     HttpRouter::InterimResponseSender send_interim,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback complete) {
                     p->set_value(Payload{std::move(complete),
                                          std::move(send_interim)});
@@ -1657,6 +1672,7 @@ namespace HttpTests {
                 [p](const HttpRequest&,
                     HttpRouter::InterimResponseSender send_interim,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback complete) {
                     p->set_value(Payload{std::move(complete),
                                          std::move(send_interim)});
@@ -1665,6 +1681,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender /*send_interim*/,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback complete) {
                     HttpResponse r;
                     r.Status(200).Text("B-response");
@@ -1745,6 +1762,7 @@ namespace HttpTests {
                     const HttpRequest& req,
                     HttpRouter::InterimResponseSender /*send_interim*/,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback /*complete*/) {
                     // Simulate ProxyHandler::Handle: install cleanup
                     // hook in the cancel slot BEFORE kicking off the

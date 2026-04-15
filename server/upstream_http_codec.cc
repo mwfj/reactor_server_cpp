@@ -20,6 +20,9 @@ static int on_message_begin(llhttp_t* parser) {
     self->has_error_ = false;
     self->error_message_.clear();
     self->error_type_ = UpstreamHttpCodec::ParseError::NONE;
+    self->framing_hint_ =
+        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::NO_BODY;
+    self->expected_length_ = -1;
     return 0;
 }
 
@@ -104,16 +107,65 @@ static int on_headers_complete(llhttp_t* parser) {
     self->response_.keep_alive = llhttp_should_keep_alive(parser) != 0;
 
     self->response_.headers_complete = true;
+    self->framing_hint_ =
+        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::NO_BODY;
+    self->expected_length_ = -1;
+    const int flags = parser->flags;
+    if (self->response_.status_code < HttpStatus::OK ||
+        self->response_.status_code == HttpStatus::NO_CONTENT ||
+        self->response_.status_code == HttpStatus::NOT_MODIFIED ||
+        (flags & F_SKIPBODY)) {
+        self->framing_hint_ =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::NO_BODY;
+    } else if (flags & F_CHUNKED) {
+        self->framing_hint_ =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CHUNKED;
+    } else if (flags & F_CONTENT_LENGTH) {
+        self->framing_hint_ =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH;
+        self->expected_length_ = static_cast<int64_t>(parser->content_length);
+    } else if (llhttp_message_needs_eof(parser) != 0) {
+        self->framing_hint_ =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::EOF_TERMINATED;
+    }
     // Reset parsing state so trailer fields (which reuse on_header_field/value
     // callbacks) don't incorrectly flush the cleared header fields as an empty
     // key-value pair into the headers vector.
     self->parsing_header_value_ = false;
     self->in_header_field_ = false;
+
+    if (self->sink_ && self->response_.status_code >= HttpStatus::OK) {
+        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead head;
+        head.status_code = self->response_.status_code;
+        head.status_reason = self->response_.status_reason;
+        head.http_major = self->response_.http_major;
+        head.http_minor = self->response_.http_minor;
+        head.headers = self->response_.headers;
+        head.keep_alive = self->response_.keep_alive;
+        head.framing = self->framing_hint_;
+        head.expected_length = self->expected_length_;
+        if (!self->sink_->OnHeaders(head)) {
+            self->has_error_ = true;
+            self->error_message_ = "upstream response sink rejected headers";
+            self->error_type_ = UpstreamHttpCodec::ParseError::PARSE_ERROR;
+            return HPE_USER;
+        }
+    }
     return 0;
 }
 
 static int on_body(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<UpstreamHttpCodec*>(parser->data);
+
+    if (self->sink_) {
+        if (!self->sink_->OnBodyChunk(at, length)) {
+            self->has_error_ = true;
+            self->error_message_ = "upstream response sink rejected body chunk";
+            self->error_type_ = UpstreamHttpCodec::ParseError::PARSE_ERROR;
+            return HPE_USER;
+        }
+        return 0;
+    }
 
     // Enforce hard cap on response body size to prevent memory exhaustion
     // from misconfigured upstreams. Guard against unsigned underflow.
@@ -140,6 +192,9 @@ static int on_message_complete(llhttp_t* parser) {
     }
 
     self->response_.complete = true;
+    if (self->sink_ && self->response_.status_code >= HttpStatus::OK) {
+        self->sink_->OnComplete();
+    }
 
     // Return HPE_PAUSED so llhttp_execute() stops immediately and returns
     // HPE_PAUSED. This prevents the parser from advancing into the next
@@ -172,6 +227,20 @@ UpstreamHttpCodec::UpstreamHttpCodec() : impl_(std::make_unique<Impl>()) {
 
 UpstreamHttpCodec::~UpstreamHttpCodec() = default;
 
+void UpstreamHttpCodec::SetSink(UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink) {
+    sink_ = sink;
+}
+
+void UpstreamHttpCodec::PauseParsing() {
+    paused_ = true;
+    llhttp_pause(&impl_->parser);
+}
+
+void UpstreamHttpCodec::ResumeParsing() {
+    paused_ = false;
+    llhttp_resume(&impl_->parser);
+}
+
 size_t UpstreamHttpCodec::Parse(const char* data, size_t len) {
     size_t total_consumed = 0;
     while (total_consumed < len) {
@@ -181,18 +250,25 @@ size_t UpstreamHttpCodec::Parse(const char* data, size_t len) {
         if (err == HPE_PAUSED) {
             size_t consumed = llhttp_get_error_pos(&impl_->parser) - (data + total_consumed);
             total_consumed += consumed;
+            if (paused_ && !response_.complete) {
+                return total_consumed;
+            }
             int status = llhttp_get_status_code(&impl_->parser);
             if (status >= HttpStatus::CONTINUE && status < HttpStatus::OK) {
                 // Interim 1xx response: discard, resume, continue parsing
                 // remaining bytes. The proxy does NOT forward 1xx to the
                 // client — it waits for the final response.
                 llhttp_resume(&impl_->parser);
+                paused_ = false;
                 response_.Reset();
                 has_error_ = false;
                 current_header_field_.clear();
                 current_header_value_.clear();
                 parsing_header_value_ = false;
                 in_header_field_ = false;
+                framing_hint_ =
+                    UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::NO_BODY;
+                expected_length_ = -1;
                 continue;
             }
             // Final response: return total consumed
@@ -222,6 +298,10 @@ void UpstreamHttpCodec::Reset() {
     current_header_value_.clear();
     parsing_header_value_ = false;
     in_header_field_ = false;
+    framing_hint_ =
+        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::NO_BODY;
+    expected_length_ = -1;
+    paused_ = false;
     llhttp_init(&impl_->parser, HTTP_RESPONSE, &impl_->settings);
     impl_->parser.data = this;
 }

@@ -892,6 +892,44 @@ void ConnectionHandler::SetTlsConnection(std::unique_ptr<TlsConnection> tls) {
     tls_state_ = TlsState::HANDSHAKE;
 }
 
+void ConnectionHandler::EnableReadMode() {
+    auto fn = [weak_self = weak_from_this()]() {
+        if (auto self = weak_self.lock()) {
+            if (self->client_channel_ && !self->client_channel_->is_channel_closed()) {
+                self->client_channel_->EnableReadMode();
+            }
+        }
+    };
+    if (event_dispatcher_ && event_dispatcher_->is_on_loop_thread()) {
+        fn();
+        return;
+    }
+    if (event_dispatcher_) {
+        event_dispatcher_->EnQueue(std::move(fn));
+    }
+}
+
+void ConnectionHandler::DisableReadMode() {
+    auto fn = [weak_self = weak_from_this()]() {
+        if (auto self = weak_self.lock()) {
+            if (self->client_channel_ && !self->client_channel_->is_channel_closed()) {
+                self->client_channel_->DisableReadMode();
+            }
+        }
+    };
+    if (event_dispatcher_ && event_dispatcher_->is_on_loop_thread()) {
+        fn();
+        return;
+    }
+    if (event_dispatcher_) {
+        event_dispatcher_->EnQueue(std::move(fn));
+    }
+}
+
+bool ConnectionHandler::IsReadModeEnabled() const {
+    return client_channel_ && client_channel_->isEnableReadMode();
+}
+
 void ConnectionHandler::RunOnDispatcher(std::function<void()> task) {
     if (event_dispatcher_) {
         event_dispatcher_->EnQueue(std::move(task));  // EnQueue handles was_stopped check
