@@ -103,12 +103,31 @@ struct ProxyRetryConfig {
 };
 
 struct ProxyConfig {
+    // Response relay mode:
+    //   auto   = choose at runtime from framing / content type / size
+    //   always = keep buffered HttpResponse completion
+    //   never  = prefer streaming whenever the downstream protocol allows it
     std::string buffering = "auto";
+    // High-water mark, in bytes, for protocol-native downstream streaming
+    // buffers. Crossing this limit pauses upstream reads until the downstream
+    // side drains back to low-water.
     uint32_t relay_buffer_limit_bytes = 1048576;
+    // In buffering=auto mode, fixed-length responses above this size stream
+    // instead of buffering. Units: bytes. Must be <= relay_buffer_limit_bytes.
     uint32_t auto_stream_content_length_threshold_bytes = 262144;
+    // Body-phase idle timeout after upstream headers have been received.
+    // Units: seconds. 0 disables. Ignored for SSE (`text/event-stream`).
     uint32_t stream_idle_timeout_sec = 30;
+    // Absolute body-phase streaming budget after headers have been received.
+    // Units: seconds. 0 disables.
     uint32_t stream_max_duration_sec = 0;
+    // HTTP/1.0 fallback when runtime relay mode selects streaming:
+    //   close  = stream with EOF framing and close the connection
+    //   buffer = force buffered completion instead
     std::string h10_streaming = "close";
+    // Forward upstream trailers to the downstream protocol when supported.
+    // HTTP/1.1 chunked streaming can emit them; HTTP/2 currently warns and
+    // drops them because trailer submission is not wired yet.
     bool forward_trailers = false;
 
     // Response timeout: max time to wait for upstream response headers

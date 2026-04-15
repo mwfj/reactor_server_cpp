@@ -26,6 +26,10 @@ static ssize_t DataSourceReadCallback(
     uint8_t* buf, size_t length, uint32_t* data_flags,
     nghttp2_data_source* source, void* /*user_data*/) {
 
+    if (!source || !source->ptr) {
+        logging::Get()->error("H2 data source callback invoked with null source");
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
     auto* src = static_cast<ResponseDataSource*>(source->ptr);
     return src->ReadChunk(buf, length, data_flags);
 }
@@ -1021,8 +1025,14 @@ int Http2Session::SubmitStreamingResponse(
             "HTTP/2 stream {} SubmitStreamingResponse called with {} "
             "(1xx not supported as app response)",
             stream_id, status_code);
-        nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
-                                  stream_id, NGHTTP2_INTERNAL_ERROR);
+        int rv_rst = nghttp2_submit_rst_stream(
+            impl_->session, NGHTTP2_FLAG_NONE,
+            stream_id, NGHTTP2_INTERNAL_ERROR);
+        if (rv_rst != 0) {
+            logging::Get()->warn(
+                "nghttp2_submit_rst_stream failed stream={} rv={} ({})",
+                stream_id, rv_rst, nghttp2_strerror(rv_rst));
+        }
         return -1;
     }
 
@@ -1466,13 +1476,24 @@ void Http2Session::SendGoaway(uint32_t error_code) {
 }
 
 void Http2Session::ResetStream(int32_t stream_id, uint32_t error_code) {
-    nghttp2_submit_rst_stream(impl_->session, NGHTTP2_FLAG_NONE,
-                              stream_id, error_code);
+    int rv = nghttp2_submit_rst_stream(
+        impl_->session, NGHTTP2_FLAG_NONE, stream_id, error_code);
+    if (rv != 0) {
+        logging::Get()->warn(
+            "nghttp2_submit_rst_stream failed stream={} rv={} ({})",
+            stream_id, rv, nghttp2_strerror(rv));
+    }
     SendPendingFrames();
 }
 
 int Http2Session::ResumeStreamData(int32_t stream_id) {
-    return nghttp2_session_resume_data(impl_->session, stream_id);
+    int rv = nghttp2_session_resume_data(impl_->session, stream_id);
+    if (rv != 0) {
+        logging::Get()->warn(
+            "nghttp2_session_resume_data failed stream={} rv={} ({})",
+            stream_id, rv, nghttp2_strerror(rv));
+    }
+    return rv;
 }
 
 // --- Stream management ---

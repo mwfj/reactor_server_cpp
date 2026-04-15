@@ -15,6 +15,16 @@
 
 using json = nlohmann::json;
 
+namespace {
+
+constexpr uint32_t kMinRelayBufferLimitBytes = 16 * 1024;
+constexpr uint32_t kMaxRelayBufferLimitBytes = 64 * 1024 * 1024;
+constexpr uint32_t kMaxStreamIdleTimeoutSec = 3600;
+constexpr uint32_t kMaxStreamDurationSec = 86400;
+constexpr int kMaxProxyRetryCount = 10;
+
+}  // namespace
+
 ServerConfig ConfigLoader::LoadFromFile(const std::string& path) {
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -995,11 +1005,13 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     idx + " ('" + u.name +
                     "'): proxy.h10_streaming must be one of close|buffer");
             }
-            if (u.proxy.relay_buffer_limit_bytes < 16384 ||
-                u.proxy.relay_buffer_limit_bytes > 67108864) {
+            if (u.proxy.relay_buffer_limit_bytes < kMinRelayBufferLimitBytes ||
+                u.proxy.relay_buffer_limit_bytes > kMaxRelayBufferLimitBytes) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name +
-                    "'): proxy.relay_buffer_limit_bytes must be in [16384, 67108864]");
+                    "'): proxy.relay_buffer_limit_bytes must be in [" +
+                    std::to_string(kMinRelayBufferLimitBytes) + ", " +
+                    std::to_string(kMaxRelayBufferLimitBytes) + "]");
             }
             if (u.proxy.auto_stream_content_length_threshold_bytes >
                 u.proxy.relay_buffer_limit_bytes) {
@@ -1008,15 +1020,17 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     "'): proxy.auto_stream_content_length_threshold_bytes must be <= "
                     "proxy.relay_buffer_limit_bytes");
             }
-            if (u.proxy.stream_idle_timeout_sec > 3600) {
+            if (u.proxy.stream_idle_timeout_sec > kMaxStreamIdleTimeoutSec) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name +
-                    "'): proxy.stream_idle_timeout_sec must be <= 3600");
+                    "'): proxy.stream_idle_timeout_sec must be <= " +
+                    std::to_string(kMaxStreamIdleTimeoutSec));
             }
-            if (u.proxy.stream_max_duration_sec > 86400) {
+            if (u.proxy.stream_max_duration_sec > kMaxStreamDurationSec) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name +
-                    "'): proxy.stream_max_duration_sec must be <= 86400");
+                    "'): proxy.stream_max_duration_sec must be <= " +
+                    std::to_string(kMaxStreamDurationSec));
             }
             if (u.proxy.stream_max_duration_sec > 0 &&
                 u.proxy.stream_idle_timeout_sec >
@@ -1027,10 +1041,12 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     idx, u.name, u.proxy.stream_idle_timeout_sec,
                     u.proxy.stream_max_duration_sec);
             }
-            if (u.proxy.retry.max_retries < 0 || u.proxy.retry.max_retries > 10) {
+            if (u.proxy.retry.max_retries < 0 ||
+                u.proxy.retry.max_retries > kMaxProxyRetryCount) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name +
-                    "'): proxy.retry.max_retries must be >= 0 and <= 10");
+                    "'): proxy.retry.max_retries must be >= 0 and <= " +
+                    std::to_string(kMaxProxyRetryCount));
             }
 
             // Circuit breaker validation.

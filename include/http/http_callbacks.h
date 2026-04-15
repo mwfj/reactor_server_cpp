@@ -101,6 +101,25 @@ namespace HTTP_CALLBACKS_NAMESPACE {
         const HttpResponse& response
     )>;
 
+    // Streaming final-response sender for async handlers.
+    //
+    // Contract:
+    //   - `SendHeaders()` claims the final response and commits the
+    //     downstream stream. After a successful call, the handler MUST
+    //     finish with exactly one of `End()` or `Abort()`.
+    //   - `SendData()` is always-accept: callers never hold rejected bytes.
+    //     The return value reports downstream occupancy AFTER the chunk is
+    //     consumed so the caller can apply backpressure upstream.
+    //   - `ACCEPTED_ABOVE_HIGH_WATER` means the chunk was accepted AND the
+    //     downstream buffer crossed the configured high-water mark. The caller
+    //     should pause upstream reads until the drain listener fires.
+    //   - `CLOSED` means the sender is no longer usable (client disconnect,
+    //     terminal End/Abort already fired, or contract violation such as
+    //     SendData/End before SendHeaders).
+    //   - `Abort()` is idempotent. `Abort()` before `SendHeaders()` is legal
+    //     and must not emit a successful final response.
+    //   - Streaming senders are dispatcher-thread primitives. Off-dispatcher
+    //     calls are rejected with `CLOSED` / `-1` and logged at error level.
     class StreamingResponseSender {
     public:
         enum class SendResult {
@@ -123,9 +142,11 @@ namespace HTTP_CALLBACKS_NAMESPACE {
         class Impl {
         public:
             virtual ~Impl() = default;
-            virtual int SendHeaders(const HttpResponse& headers_only_response) = 0;
-            virtual SendResult SendData(const char* data, size_t len) = 0;
-            virtual SendResult End(
+            [[nodiscard]] virtual int SendHeaders(
+                const HttpResponse& headers_only_response) = 0;
+            [[nodiscard]] virtual SendResult SendData(
+                const char* data, size_t len) = 0;
+            [[nodiscard]] virtual SendResult End(
                 const std::vector<std::pair<std::string, std::string>>& trailers) = 0;
             virtual void Abort(AbortReason reason) = 0;
             virtual void SetDrainListener(DrainListener listener) = 0;
@@ -139,13 +160,14 @@ namespace HTTP_CALLBACKS_NAMESPACE {
         explicit StreamingResponseSender(std::shared_ptr<Impl> impl)
             : impl_(std::move(impl)) {}
 
-        int SendHeaders(const HttpResponse& headers_only_response) const {
+        [[nodiscard]] int SendHeaders(
+            const HttpResponse& headers_only_response) const {
             return impl_ ? impl_->SendHeaders(headers_only_response) : -1;
         }
-        SendResult SendData(const char* data, size_t len) const {
+        [[nodiscard]] SendResult SendData(const char* data, size_t len) const {
             return impl_ ? impl_->SendData(data, len) : SendResult::CLOSED;
         }
-        SendResult End(
+        [[nodiscard]] SendResult End(
             const std::vector<std::pair<std::string, std::string>>& trailers = {}) const {
             return impl_ ? impl_->End(trailers) : SendResult::CLOSED;
         }
@@ -170,15 +192,22 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     // Async handler for HTTP requests. Used when the request handler needs to
     // dispatch async work (e.g. upstream proxy via UpstreamManager::CheckoutAsync)
     // and deliver the response later. The handler receives the request plus
-    // a completion callback and is responsible for invoking `complete(resp)`
-    // exactly once. The framework:
+    // an interim sender, an H2 push helper, a streaming final-response sender,
+    // and a completion callback. The handler either:
+    //   - invokes `complete(resp)` exactly once for buffered completion, or
+    //   - uses `stream_sender` (`SendHeaders` + `SendData*` + `End/Abort`)
+    //     for protocol-native streaming completion.
+    //
+    // The framework:
     //   - Runs middleware before invoking the async handler (auth, CORS, etc.)
     //   - Blocks the HTTP/1 parser from accepting new requests until the
-    //     completion fires, preserving response ordering on keep-alive
+    //     final response completes, preserving response ordering on keep-alive
     //   - Marks the connection as shutdown-exempt while the async work is
     //     pending so graceful shutdown waits for the reply
     //   - Applies Connection: close / keep-alive / HEAD body-stripping to
-    //     the completion response using the original request's metadata
+    //     buffered completions using the original request's metadata
+    //   - Binds protocol-specific streaming senders so the handler can use
+    //     one API across HTTP/1.1 and HTTP/2
     // Invoked by HttpServer (NOT HttpRouter — the router has no transport
     // context). See design §2.2 and §4.2.
     using AsyncHandler = std::function<void(

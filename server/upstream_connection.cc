@@ -45,20 +45,24 @@ void UpstreamConnection::IncrementRequestCount() {
 }
 
 void UpstreamConnection::IncReadDisable() {
-    ++read_disable_count_;
-    if (read_disable_count_ == 1 && conn_) {
+    int previous = read_disable_count_.fetch_add(1, std::memory_order_acq_rel);
+    if (previous == 0 && conn_) {
         conn_->DisableReadMode();
     }
 }
 
 void UpstreamConnection::DecReadDisable() {
-    if (read_disable_count_ <= 0) {
-        read_disable_count_ = 0;
-        return;
-    }
-    --read_disable_count_;
-    if (read_disable_count_ == 0 && conn_) {
-        conn_->EnableReadMode();
+    int current = read_disable_count_.load(std::memory_order_acquire);
+    while (current > 0) {
+        if (read_disable_count_.compare_exchange_weak(
+                current, current - 1,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            if (current == 1 && conn_) {
+                conn_->EnableReadMode();
+            }
+            return;
+        }
     }
 }
 

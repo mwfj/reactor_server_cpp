@@ -14,6 +14,7 @@
 #include "log/log_utils.h"
 #include <algorithm>
 #include <set>
+#include <unordered_set>
 
 // Definition of the per-thread sync push slot. See declaration in
 // include/http/http_server.h. Initial value is nullptr — the helper
@@ -254,6 +255,13 @@ static bool IsRepeatableResponseHeader(const std::string& name) {
            lower == "content-language";
 }
 
+static std::string LowerHeaderName(const std::string& name) {
+    std::string lower(name);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return lower;
+}
+
 static HttpResponse MergeAsyncResponseHeaders(
     const HttpResponse& final_resp,
     const std::vector<std::pair<std::string, std::string>>& mw_headers) {
@@ -265,21 +273,21 @@ static HttpResponse MergeAsyncResponseHeaders(
         merged.PreserveContentLength();
     }
 
-    std::set<std::string> final_non_repeatable;
+    std::unordered_set<std::string> final_non_repeatable;
+    std::vector<const std::pair<std::string, std::string>*> final_headers_to_append;
+    final_headers_to_append.reserve(final_resp.GetHeaders().size());
     for (const auto& fh : final_resp.GetHeaders()) {
-        if (!IsRepeatableResponseHeader(fh.first)) {
-            std::string lower = fh.first;
-            std::transform(
-                lower.begin(), lower.end(), lower.begin(),
-                [](unsigned char c) { return std::tolower(c); });
-            final_non_repeatable.insert(std::move(lower));
+        if (IsRepeatableResponseHeader(fh.first)) {
+            final_headers_to_append.push_back(&fh);
+            continue;
+        }
+        std::string lower = LowerHeaderName(fh.first);
+        if (final_non_repeatable.insert(std::move(lower)).second) {
+            final_headers_to_append.push_back(&fh);
         }
     }
     for (const auto& mh : mw_headers) {
-        std::string lower = mh.first;
-        std::transform(
-            lower.begin(), lower.end(), lower.begin(),
-            [](unsigned char c) { return std::tolower(c); });
+        std::string lower = LowerHeaderName(mh.first);
         if (!IsRepeatableResponseHeader(mh.first) &&
             final_non_repeatable.count(lower)) {
             continue;
@@ -287,18 +295,8 @@ static HttpResponse MergeAsyncResponseHeaders(
         merged.AppendHeader(mh.first, mh.second);
     }
 
-    std::set<std::string> seen_final_non_repeatable;
-    for (const auto& fh : final_resp.GetHeaders()) {
-        if (!IsRepeatableResponseHeader(fh.first)) {
-            std::string lower = fh.first;
-            std::transform(
-                lower.begin(), lower.end(), lower.begin(),
-                [](unsigned char c) { return std::tolower(c); });
-            if (!seen_final_non_repeatable.insert(lower).second) {
-                continue;
-            }
-        }
-        merged.AppendHeader(fh.first, fh.second);
+    for (const auto* fh : final_headers_to_append) {
+        merged.AppendHeader(fh->first, fh->second);
     }
     return merged;
 }
@@ -3519,8 +3517,15 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         true, std::memory_order_release);
                     return true;
                 };
+                auto release_streaming_claim =
+                    [response_claimed, streaming_started]() {
+                    response_claimed->store(false, std::memory_order_release);
+                    streaming_started->store(
+                        false, std::memory_order_release);
+                };
                 auto raw_stream_sender = self->CreateStreamingResponseSender(
-                    stream_id, claim_streaming, finalize_request);
+                    stream_id, claim_streaming, release_streaming_claim,
+                    finalize_request);
                 auto stream_sender = HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender(
                     std::make_shared<MiddlewareMergingStreamSenderImpl>(
                         std::move(raw_stream_sender), mw_headers));

@@ -73,6 +73,7 @@ public:
     HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender CreateStreamingResponseSender(
         int32_t stream_id,
         std::function<bool()> claim_response,
+        std::function<void()> release_response_claim,
         std::function<void()> finalize_request);
 
     // Submit a non-final 1xx informational response (e.g. 103 Early Hints)

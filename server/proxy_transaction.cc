@@ -52,6 +52,20 @@ bool HeaderValueStartsWith(
     return false;
 }
 
+bool ShouldPreserveKnownContentLength(
+    const std::string& method,
+    const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head,
+    bool include_body) {
+    if (method == "HEAD") {
+        return true;
+    }
+    return head.framing ==
+               UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::
+                   CONTENT_LENGTH &&
+           !include_body &&
+           head.expected_length >= 0;
+}
+
 }  // namespace
 
 ProxyTransaction::ProxyTransaction(
@@ -133,6 +147,7 @@ void ProxyTransaction::Start() {
     paused_parse_bytes_.clear();
     InvalidateStreamTimers();
     sse_stream_ = false;
+    ClearPendingRetryable5xxResponse();
 
     // Compute rewritten headers (strip hop-by-hop, add X-Forwarded-For, etc.)
     rewritten_headers_ = header_rewriter_.RewriteRequest(
@@ -260,6 +275,9 @@ void ProxyTransaction::AttemptCheckout() {
             // no-op for non-probe (CLOSED) admissions, matching the
             // general "local cause, no upstream signal" semantic.
             ReleaseBreakerAdmissionNeutral();
+            if (DeliverPendingRetryable5xxResponse("retry_budget_exhausted")) {
+                return;
+            }
             state_ = State::FAILED;
             DeliverResponse(MakeRetryBudgetResponse());
             return;
@@ -274,6 +292,10 @@ void ProxyTransaction::AttemptCheckout() {
     if (retry_budget_ && breaker_live_enabled) {
         inflight_guard_ = retry_budget_->TrackInFlight();
     }
+
+    // Breaker / budget gates for this attempt are complete. Any saved
+    // retryable 5xx fallback belongs only to the pre-upstream retry gate.
+    ClearPendingRetryable5xxResponse();
 
     auto self = shared_from_this();
 
@@ -659,11 +681,16 @@ bool ProxyTransaction::OnHeaders(
     if (head.status_code >= HttpStatus::INTERNAL_SERVER_ERROR &&
         head.status_code < 600) {
         ReportBreakerOutcome(-1000);
-        if (ShouldRetryResponse5xx()) {
+        if (ShouldRetryResponse5xx() && CanRetryResponse5xxNow()) {
             retry_from_headers_pending_ = true;
             poison_connection_ = true;
             codec_.PauseParsing();
             return true;
+        } else if (ShouldRetryResponse5xx()) {
+            logging::Get()->info(
+                "ProxyTransaction relaying current upstream 5xx client_fd={} "
+                "service={} status={} attempt={} because retry is unavailable",
+                client_fd_, service_name_, head.status_code, attempt_);
         }
     } else if (head.status_code >= HttpStatus::BAD_REQUEST) {
         ReleaseBreakerAdmissionNeutral();
@@ -709,6 +736,7 @@ bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
     auto result = stream_sender_.SendData(data, len);
     HandleStreamSendResult(result);
     if (result == HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+        poison_connection_ = true;
         stream_sender_.Abort(
             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::CLIENT_DISCONNECT);
         state_ = State::FAILED;
@@ -794,7 +822,7 @@ void ProxyTransaction::OnResponseComplete() {
         auto result = stream_sender_.End(response_trailers_);
         if (result == HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
             stream_sender_.Abort(
-                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::CLIENT_DISCONNECT);
         }
         complete_cb_invoked_ = true;
         complete_cb_ = nullptr;
@@ -852,6 +880,12 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
     // disconnected client.
     if (cancelled_) return;
     if (retry_policy_.ShouldRetry(attempt_, method_, condition, response_committed_)) {
+        if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX) {
+            pending_retryable_5xx_response_ = true;
+            pending_retryable_5xx_head_ = response_head_;
+        } else {
+            ClearPendingRetryable5xxResponse();
+        }
         attempt_++;
 
         logging::Get()->info("ProxyTransaction retrying client_fd={} "
@@ -923,10 +957,20 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                 // Dispatcher stopped — task was silently dropped.
                 // Deliver an error so the transaction doesn't die
                 // without invoking complete_cb_.
+                if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX &&
+                    DeliverPendingRetryable5xxResponse(
+                        "retry_backoff_dispatcher_stopped")) {
+                    return;
+                }
                 OnError(RESULT_CHECKOUT_FAILED,
                         "Dispatcher stopped during retry backoff");
             }
         } else if (delay.count() > 0) {
+            if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX &&
+                DeliverPendingRetryable5xxResponse(
+                    "retry_backoff_dispatcher_unavailable")) {
+                return;
+            }
             OnError(RESULT_CHECKOUT_FAILED,
                     "Dispatcher unavailable for retry backoff");
         } else {
@@ -957,6 +1001,7 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             // On 5xx with no retry, deliver the actual upstream response
             // (which may contain useful error details for the client).
             {
+                ClearPendingRetryable5xxResponse();
                 auto duration = std::chrono::duration_cast<
                     std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - start_time_);
@@ -985,6 +1030,7 @@ void ProxyTransaction::DeliverResponse(HttpResponse response) {
         return;
     }
     complete_cb_invoked_ = true;
+    ClearPendingRetryable5xxResponse();
 
     // Cleanup BEFORE invoking the completion callback to ensure transport
     // callbacks are cleared and lease is released.
@@ -1044,6 +1090,7 @@ void ProxyTransaction::Cancel() {
         poison_connection_ = true;
     }
     InvalidateStreamTimers();
+    ClearPendingRetryable5xxResponse();
     // Release any held breaker admission neutrally. Cancel() is always
     // a LOCAL termination — client disconnect, framework-level abort,
     // H2 stream reset, etc. Even when we poisoned a pooled connection
@@ -1062,6 +1109,11 @@ void ProxyTransaction::Cancel() {
     // or fail still close / re-trip the cycle normally, and a broken
     // upstream under cancel-spam will still fail those real probes.
     ReleaseBreakerAdmissionNeutral();
+    if (response_committed_ && relay_mode_ == RelayMode::STREAMING) {
+        stream_sender_.Abort(
+            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::
+                CLIENT_DISCONNECT);
+    }
     // Release the upstream lease back to the pool (or destroy it if
     // poisoned) and clear transport callbacks so any in-flight upstream
     // bytes land harmlessly.
@@ -1124,43 +1176,65 @@ void ProxyTransaction::Cleanup() {
     // DeliverResponse() itself moves + nulls complete_cb_ after invocation.
 }
 
-HttpResponse ProxyTransaction::BuildClientResponse() {
-    HttpResponse response = BuildResponseFromHead(true);
-    if (!response_body_.empty()) {
-        response.Body(std::move(response_body_));
-    }
-    return response;
+void ProxyTransaction::ClearPendingRetryable5xxResponse() {
+    pending_retryable_5xx_response_ = false;
+    pending_retryable_5xx_head_ = {};
 }
 
-HttpResponse ProxyTransaction::BuildResponseFromHead(bool include_body) const {
-    HttpResponse response;
-    response.Status(response_head_.status_code, response_head_.status_reason);
+bool ProxyTransaction::DeliverPendingRetryable5xxResponse(
+    const char* reject_source) {
+    if (!pending_retryable_5xx_response_) {
+        return false;
+    }
 
-    auto rewritten = header_rewriter_.RewriteResponse(response_head_.headers);
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_time_);
+    logging::Get()->warn(
+        "ProxyTransaction relaying stored upstream 5xx client_fd={} service={} "
+        "status={} attempt={} duration={}ms reject_source={}",
+        client_fd_, service_name_, pending_retryable_5xx_head_.status_code,
+        attempt_, duration.count(), reject_source);
+
+    state_ = State::COMPLETE;
+    HttpResponse response = BuildResponseFromHead(
+        pending_retryable_5xx_head_, false, nullptr);
+    DeliverResponse(std::move(response));
+    return true;
+}
+
+HttpResponse ProxyTransaction::BuildClientResponse() {
+    return BuildResponseFromHead(response_head_, true, &response_body_);
+}
+
+HttpResponse ProxyTransaction::BuildResponseFromHead(
+    const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head,
+    bool include_body,
+    std::string* body) const {
+    HttpResponse response;
+    response.Status(head.status_code, head.status_reason);
+
+    auto rewritten = header_rewriter_.RewriteResponse(head.headers);
     for (const auto& [name, value] : rewritten) {
         response.AppendHeader(name, value);
     }
 
-    if (method_ == "HEAD" ||
-        (response_head_.framing ==
-             UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH &&
-         !include_body && response_head_.expected_length >= 0)) {
+    if (ShouldPreserveKnownContentLength(method_, head, include_body)) {
         response.PreserveContentLength();
-        if (response_head_.expected_length >= 0 &&
+        if (head.expected_length >= 0 &&
             !FirstHeaderValue(response.GetHeaders(), "content-length")) {
             response.AppendHeader("Content-Length",
-                                  std::to_string(response_head_.expected_length));
+                                  std::to_string(head.expected_length));
         }
     }
 
-    if (include_body && !response_body_.empty()) {
-        response.Body(response_body_);
+    if (include_body && body && !body->empty()) {
+        response.Body(std::move(*body));
     }
     return response;
 }
 
 HttpResponse ProxyTransaction::BuildStreamingHeadersResponse() const {
-    return BuildResponseFromHead(false);
+    return BuildResponseFromHead(response_head_, false, nullptr);
 }
 
 bool ProxyTransaction::CommitStreamingResponse() {
@@ -1224,6 +1298,38 @@ bool ProxyTransaction::ShouldRetryResponse5xx() const {
         attempt_, method_, RetryPolicy::RetryCondition::RESPONSE_5XX, false);
 }
 
+bool ProxyTransaction::CanRetryResponse5xxNow() const {
+    bool breaker_live_enabled = slice_ && slice_->config().enabled;
+    if (!breaker_live_enabled) {
+        return true;
+    }
+    if (!slice_->config().dry_run &&
+        slice_->CurrentState() == CIRCUIT_BREAKER_NAMESPACE::State::OPEN) {
+        return false;
+    }
+    if (!retry_budget_ || slice_->config().dry_run) {
+        return true;
+    }
+
+    int64_t in_flight_after = retry_budget_->InFlight();
+    if (in_flight_after > 0) {
+        --in_flight_after;
+    }
+    int64_t retries_after = retry_budget_->RetriesInFlight();
+    if (retry_token_held_ && retries_after > 0) {
+        --retries_after;
+    }
+    int64_t non_retry_after = in_flight_after - retries_after;
+    if (non_retry_after < 0) {
+        non_retry_after = 0;
+    }
+    int64_t pct_cap =
+        (non_retry_after * retry_budget_->percent()) / 100;
+    int64_t cap = std::max<int64_t>(
+        retry_budget_->min_concurrency(), pct_cap);
+    return retries_after < cap;
+}
+
 bool ProxyTransaction::IsSseStream(
     const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) const {
     return HeaderValueStartsWith(
@@ -1246,7 +1352,13 @@ void ProxyTransaction::ResumePausedParsing() {
     auto transport = upstream_conn ? upstream_conn->GetTransport() : nullptr;
     if (transport) {
         OnUpstreamData(transport, pending);
+        return;
     }
+    paused_parse_bytes_ = std::move(pending);
+    logging::Get()->debug(
+        "ProxyTransaction deferred paused parse replay; upstream transport unavailable "
+        "client_fd={} service={} buffered_bytes={}",
+        client_fd_, service_name_, paused_parse_bytes_.size());
 }
 
 void ProxyTransaction::HandleStreamSendResult(
@@ -1276,23 +1388,37 @@ void ProxyTransaction::HandleStreamSendResult(
 }
 
 void ProxyTransaction::RefreshStreamIdleTimer() {
-    ++stream_idle_timer_generation_;
     if (!dispatcher_ || !response_headers_seen_ || body_complete_ ||
         cancelled_ || sse_stream_ ||
         config_.stream_idle_timeout_sec == 0) {
         return;
     }
+    if (stream_idle_timer_armed_) {
+        return;
+    }
 
+    stream_idle_timer_armed_ = true;
     const uint64_t generation = stream_idle_timer_generation_;
+    ScheduleStreamIdleCheck(
+        generation,
+        std::chrono::milliseconds(
+            static_cast<int64_t>(config_.stream_idle_timeout_sec) * 1000));
+}
+
+void ProxyTransaction::ScheduleStreamIdleCheck(
+    uint64_t generation,
+    std::chrono::milliseconds delay) {
     std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
-    dispatcher_->EnQueueDelayed(
+    bool enqueued = dispatcher_->EnQueueDelayed(
         [weak_self, generation]() {
             if (auto self = weak_self.lock()) {
                 self->OnStreamIdleTimeout(generation);
             }
         },
-        std::chrono::milliseconds(
-            static_cast<int64_t>(config_.stream_idle_timeout_sec) * 1000));
+        delay);
+    if (!enqueued) {
+        stream_idle_timer_armed_ = false;
+    }
 }
 
 void ProxyTransaction::ArmStreamBudgetTimer() {
@@ -1317,14 +1443,32 @@ void ProxyTransaction::ArmStreamBudgetTimer() {
 void ProxyTransaction::InvalidateStreamTimers() {
     ++stream_idle_timer_generation_;
     ++stream_budget_timer_generation_;
+    stream_idle_timer_armed_ = false;
 }
 
 void ProxyTransaction::OnStreamIdleTimeout(uint64_t generation) {
     if (generation != stream_idle_timer_generation_ || cancelled_ ||
         body_complete_ || !response_headers_seen_ ||
         state_ == State::COMPLETE || state_ == State::FAILED) {
+        if (generation == stream_idle_timer_generation_) {
+            stream_idle_timer_armed_ = false;
+        }
         return;
     }
+    auto timeout = std::chrono::milliseconds(
+        static_cast<int64_t>(config_.stream_idle_timeout_sec) * 1000);
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - last_body_progress_at_);
+    if (elapsed < timeout) {
+        auto remaining = timeout - elapsed;
+        if (remaining <= std::chrono::milliseconds(0)) {
+            remaining = std::chrono::milliseconds(1);
+        }
+        ScheduleStreamIdleCheck(generation, remaining);
+        return;
+    }
+    stream_idle_timer_armed_ = false;
     logging::Get()->warn(
         "proxy: stream_idle_timeout svc={} idle_sec={} client_fd={} attempt={}",
         service_name_, config_.stream_idle_timeout_sec, client_fd_, attempt_);
@@ -1576,6 +1720,10 @@ bool ProxyTransaction::ConsultBreaker() {
         // touch the upstream. Emit §12.1 response and DO NOT Report
         // back (would create a feedback loop — our own reject counting
         // as a failure against the already-OPEN slice).
+        if (DeliverPendingRetryable5xxResponse("circuit_open")) {
+            admission_generation_ = 0;
+            return false;
+        }
         state_ = State::FAILED;
         logging::Get()->info(
             "ProxyTransaction circuit-open reject client_fd={} service={} "

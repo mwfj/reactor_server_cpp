@@ -229,7 +229,11 @@ private:
     std::chrono::steady_clock::time_point last_body_progress_at_{};
     uint64_t stream_idle_timer_generation_ = 0;
     uint64_t stream_budget_timer_generation_ = 0;
+    bool stream_idle_timer_armed_ = false;
     bool sse_stream_ = false;
+    bool pending_retryable_5xx_response_ = false;
+    UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead
+        pending_retryable_5xx_head_;
 
     // Internal methods
     void AttemptCheckout();
@@ -242,10 +246,15 @@ private:
     void MaybeRetry(RetryPolicy::RetryCondition condition);
     void DeliverResponse(HttpResponse response);
     void Cleanup();
+    void ClearPendingRetryable5xxResponse();
+    bool DeliverPendingRetryable5xxResponse(const char* reject_source);
 
     // Build the final client-facing HttpResponse from the parsed upstream response
     HttpResponse BuildClientResponse();
-    HttpResponse BuildResponseFromHead(bool include_body) const;
+    HttpResponse BuildResponseFromHead(
+        const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head,
+        bool include_body,
+        std::string* body) const;
     HttpResponse BuildStreamingHeadersResponse() const;
     bool CommitStreamingResponse();
     RelayMode DecideRelayMode(
@@ -253,6 +262,7 @@ private:
     bool IsNoBodyResponse(
         const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) const;
     bool ShouldRetryResponse5xx() const;
+    bool CanRetryResponse5xxNow() const;
     void ProcessHeadersRetryDecision();
     void ResumePausedParsing();
     void HandleStreamSendResult(
@@ -260,6 +270,8 @@ private:
     bool IsSseStream(
         const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) const;
     void RefreshStreamIdleTimer();
+    void ScheduleStreamIdleCheck(uint64_t generation,
+                                 std::chrono::milliseconds delay);
     void ArmStreamBudgetTimer();
     void InvalidateStreamTimers();
     void OnStreamIdleTimeout(uint64_t generation);

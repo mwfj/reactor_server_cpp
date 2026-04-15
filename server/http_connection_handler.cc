@@ -2,9 +2,14 @@
 #include "http/http_status.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
+#include <cstdio>
 #include <sstream>
 
 namespace {
+static constexpr size_t DEFAULT_STREAM_HIGH_WATER_BYTES = 1024 * 1024;
+static constexpr size_t DEFAULT_STREAM_LOW_WATER_BYTES =
+    DEFAULT_STREAM_HIGH_WATER_BYTES / 2;
+
 // Overhead budget above max_body_size_ + max_header_size_ for any extra
 // request-line, headers, and framing bytes that may accumulate while an
 // async response is pending on a pipelined keep-alive connection.
@@ -87,12 +92,19 @@ std::string SerializeStreamingHead(const HttpResponse& response,
     return oss.str();
 }
 
-std::string EncodeChunk(const char* data, size_t len) {
-    std::ostringstream oss;
-    oss << std::hex << len << "\r\n";
-    oss.write(data, static_cast<std::streamsize>(len));
-    oss << "\r\n";
-    return oss.str();
+const char* AbortReasonToString(
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason reason) {
+    using AbortReason =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason;
+    switch (reason) {
+        case AbortReason::UPSTREAM_TRUNCATED: return "upstream_truncated";
+        case AbortReason::UPSTREAM_TIMEOUT: return "upstream_timeout";
+        case AbortReason::UPSTREAM_ERROR: return "upstream_error";
+        case AbortReason::CLIENT_DISCONNECT: return "client_disconnect";
+        case AbortReason::TIMER_EXPIRED: return "timer_expired";
+        case AbortReason::SERVER_SHUTDOWN: return "server_shutdown";
+    }
+    return "unknown";
 }
 
 std::string EncodeChunkTerminator(
@@ -151,19 +163,18 @@ public:
         if (terminal_ || programmer_error_ || headers_sent_) {
             return -1;
         }
+        auto prepared = prepare_head_ ? prepare_head_(headers_only_response)
+                                      : std::nullopt;
+        if (!prepared) {
+            terminal_ = true;
+            return -1;
+        }
         if (!claimed_response_) {
             if (!claim_response_ || !claim_response_()) {
                 terminal_ = true;
                 return -1;
             }
             claimed_response_ = true;
-        }
-
-        auto prepared = prepare_head_ ? prepare_head_(headers_only_response)
-                                      : std::nullopt;
-        if (!prepared) {
-            terminal_ = true;
-            return -1;
         }
 
         use_chunked_ = prepared->use_chunked;
@@ -178,28 +189,67 @@ public:
     }
 
     SendResult SendData(const char* data, size_t len) override {
+        if (!conn_ || conn_->IsClosing()) {
+            return SendResult::CLOSED;
+        }
+        if (!conn_->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H1 streaming SendData called off dispatcher fd={}",
+                conn_->fd());
+            return SendResult::CLOSED;
+        }
         if (!headers_sent_) {
             return HandleProgrammerError("SendData");
         }
-        if (terminal_ || programmer_error_ || !conn_ || conn_->IsClosing()) {
+        if (terminal_ || programmer_error_) {
             return SendResult::CLOSED;
         }
         if (body_suppressed_) {
             return SendResult::ACCEPTED_BELOW_WATER;
         }
-        std::string wire = use_chunked_ ? EncodeChunk(data, len)
-                                        : std::string(data, len);
-        conn_->SendRaw(wire.data(), wire.size());
+        if (use_chunked_) {
+            if (len == 0) {
+                return EvaluateOccupancy();
+            }
+            static constexpr size_t CHUNK_HEADER_BUF_SIZE = 32;
+            char header[CHUNK_HEADER_BUF_SIZE];
+            int header_len = std::snprintf(header, sizeof(header),
+                                           "%zx\r\n", len);
+            if (header_len <= 0 ||
+                static_cast<size_t>(header_len) >= sizeof(header)) {
+                logging::Get()->error(
+                    "H1 streaming chunk header encode failed fd={} len={}",
+                    conn_->fd(), len);
+                AbortInternal(
+                    true,
+                    AbortReason::UPSTREAM_ERROR);
+                return SendResult::CLOSED;
+            }
+            conn_->SendRaw(header, static_cast<size_t>(header_len));
+            conn_->SendRaw(data, len);
+            conn_->SendRaw("\r\n", 2);
+        } else {
+            conn_->SendRaw(data, len);
+        }
         return EvaluateOccupancy();
     }
 
     SendResult End(
         const std::vector<std::pair<std::string, std::string>>& trailers) override {
+        if (!conn_ || conn_->IsClosing()) {
+            return SendResult::CLOSED;
+        }
+        if (!conn_->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H1 streaming End called off dispatcher fd={}",
+                conn_->fd());
+            return SendResult::CLOSED;
+        }
         if (!headers_sent_) {
             HandleProgrammerError("End");
             return SendResult::CLOSED;
         }
-        if (terminal_ || programmer_error_ || !conn_ || conn_->IsClosing()) {
+        if (terminal_ || programmer_error_) {
             return SendResult::CLOSED;
         }
         terminal_ = true;
@@ -217,8 +267,7 @@ public:
     }
 
     void Abort(AbortReason reason) override {
-        (void)reason;
-        AbortInternal(false);
+        AbortInternal(false, reason);
     }
 
     void SetDrainListener(DrainListener listener) override {
@@ -254,12 +303,12 @@ private:
                 "H1 streaming {} called before SendHeaders — programmer error fd={}",
                 op, conn_ ? conn_->fd() : -1);
             programmer_error_ = true;
-            AbortInternal(true);
+            AbortInternal(true, AbortReason::UPSTREAM_ERROR);
         }
         return SendResult::CLOSED;
     }
 
-    void AbortInternal(bool from_programmer_error) {
+    void AbortInternal(bool from_programmer_error, AbortReason reason) {
         if (terminal_ && !from_programmer_error) return;
         terminal_ = true;
         if (!claimed_response_) {
@@ -271,6 +320,11 @@ private:
         if (mark_response_committed_) {
             mark_response_committed_();
         }
+        logging::Get()->debug(
+            "H1 streaming abort fd={} reason={} programmer_error={}",
+            conn_ ? conn_->fd() : -1,
+            AbortReasonToString(reason),
+            from_programmer_error);
         if (abort_response_) {
             abort_response_();
         }
@@ -328,8 +382,8 @@ private:
     bool body_suppressed_ = false;
     bool above_high_water_ = false;
     bool drain_listener_scheduled_ = false;
-    size_t high_water_ = 1024 * 1024;
-    size_t low_water_ = 512 * 1024;
+    size_t high_water_ = DEFAULT_STREAM_HIGH_WATER_BYTES;
+    size_t low_water_ = DEFAULT_STREAM_LOW_WATER_BYTES;
 };
 
 }  // namespace

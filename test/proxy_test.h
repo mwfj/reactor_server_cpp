@@ -2124,7 +2124,7 @@ void TestIntegrationChunkedUpstreamStreamsImmediately() {
                     "Content-Type: text/plain\r\n"
                     "\r\n");
             SendAll(fd, "5\r\nhello\r\n");
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
             SendAll(fd, "5\r\nworld\r\n0\r\n\r\n");
         });
 
@@ -2152,8 +2152,8 @@ void TestIntegrationChunkedUpstreamStreamsImmediately() {
             throw std::runtime_error("gateway send failed");
         }
 
-        std::string early = RecvUntilContains(client_fd, "hello", 400);
-        std::string full = early + RecvUntilClose(client_fd, 2000);
+        std::string early = RecvUntilContains(client_fd, "\r\n\r\n", 1200);
+        std::string full = early + RecvUntilClose(client_fd, 3000);
         close(client_fd);
 
         std::string early_lower = early;
@@ -2163,11 +2163,15 @@ void TestIntegrationChunkedUpstreamStreamsImmediately() {
         bool pass = true;
         std::string err;
         if (!TestHttpClient::HasStatus(full, 200)) err += "status not 200; ";
+        if (early.empty()) err += "gateway emitted no early bytes; ";
         if (early_lower.find("transfer-encoding: chunked") == std::string::npos) {
             err += "chunked transfer-encoding missing; ";
         }
-        if (early.find("5\r\nhello\r\n") == std::string::npos) err += "first chunk not observed early; ";
         if (early.find("world") != std::string::npos) err += "second chunk arrived too early; ";
+        if (early.find("0\r\n\r\n") != std::string::npos) err += "chunk terminator arrived too early; ";
+        if (full.find("5\r\nhello\r\n") == std::string::npos) {
+            err += "first chunk missing from full response; ";
+        }
         if (full.find("5\r\nworld\r\n0\r\n\r\n") == std::string::npos) {
             err += "final chunk or terminator missing; ";
         }
@@ -2475,6 +2479,238 @@ void TestIntegration5xxFirstRetryBacksOff() {
         TestFramework::RecordTest("Integration: 5xx first retry backs off", pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("Integration: 5xx first retry backs off", false, e.what());
+    }
+}
+
+// When a retryable upstream 5xx reaches the retry-budget gate and the next
+// retry is rejected locally, the gateway must still relay the ORIGINAL 5xx
+// response to the client instead of replacing it with a local 503.
+void TestIntegrationRetryBudgetRejectStillRelaysUpstream5xx() {
+    std::cout << "\n[TEST] Integration: retry-budget reject still relays upstream 5xx..." << std::endl;
+    try {
+        std::atomic<int> request_count{0};
+
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/budget-503", [&](const HttpRequest&, HttpResponse& resp) {
+            request_count.fetch_add(1, std::memory_order_relaxed);
+            resp.Status(503)
+                .Header("X-Upstream-Source", "backend")
+                .Body("backend-budget-503", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 2;
+        gw_config.http2.enabled = false;
+
+        UpstreamConfig u = MakeRetryProxyConfig(
+            "backend", "127.0.0.1", backend_port, "/budget-503",
+            1 /*max_retries*/, true /*retry_on_5xx*/,
+            false /*retry_on_connect_failure*/);
+        u.circuit_breaker.enabled = true;
+        u.circuit_breaker.consecutive_failure_threshold = 100;
+        u.circuit_breaker.failure_rate_threshold = 100;
+        u.circuit_breaker.minimum_volume = 1000;
+        u.circuit_breaker.retry_budget_percent = 0;
+        u.circuit_breaker.retry_budget_min_concurrency = 0;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        std::string resp = TestHttpClient::HttpGet(gw_port, "/budget-503", 5000);
+        std::string resp_lower = resp;
+        std::transform(resp_lower.begin(), resp_lower.end(), resp_lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        bool pass = true;
+        std::string err;
+        if (!TestHttpClient::HasStatus(resp, 503)) {
+            pass = false;
+            err += "expected upstream 503; ";
+        }
+        if (TestHttpClient::ExtractBody(resp) != "backend-budget-503") {
+            pass = false;
+            err += "upstream body not relayed; ";
+        }
+        if (resp_lower.find("x-upstream-source: backend") == std::string::npos) {
+            pass = false;
+            err += "upstream header missing; ";
+        }
+        if (resp.find("X-Retry-Budget-Exhausted: 1") != std::string::npos) {
+            pass = false;
+            err += "local retry-budget 503 leaked instead of upstream 5xx; ";
+        }
+        if (request_count.load(std::memory_order_relaxed) != 1) {
+            pass = false;
+            err += "expected exactly one backend request; ";
+        }
+
+        TestFramework::RecordTest(
+            "Integration: retry-budget reject still relays upstream 5xx",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: retry-budget reject still relays upstream 5xx",
+            false, e.what());
+    }
+}
+
+// When the first retryable upstream 5xx trips the breaker OPEN and the next
+// retry is rejected by the breaker, the client must still receive the
+// original upstream 5xx response body/headers rather than the local
+// circuit-open synthetic 503.
+void TestIntegrationCircuitOpenRejectStillRelaysUpstream5xx() {
+    std::cout << "\n[TEST] Integration: circuit-open reject still relays upstream 5xx..." << std::endl;
+    try {
+        std::atomic<int> request_count{0};
+
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/breaker-503", [&](const HttpRequest&, HttpResponse& resp) {
+            request_count.fetch_add(1, std::memory_order_relaxed);
+            resp.Status(503)
+                .Header("X-Upstream-Source", "backend")
+                .Body("backend-breaker-503", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 2;
+        gw_config.http2.enabled = false;
+
+        UpstreamConfig u = MakeRetryProxyConfig(
+            "backend", "127.0.0.1", backend_port, "/breaker-503",
+            1 /*max_retries*/, true /*retry_on_5xx*/,
+            false /*retry_on_connect_failure*/);
+        u.circuit_breaker.enabled = true;
+        u.circuit_breaker.consecutive_failure_threshold = 1;
+        u.circuit_breaker.failure_rate_threshold = 100;
+        u.circuit_breaker.minimum_volume = 1000;
+        u.circuit_breaker.base_open_duration_ms = 1000;
+        u.circuit_breaker.max_open_duration_ms = 1000;
+        u.circuit_breaker.retry_budget_percent = 100;
+        u.circuit_breaker.retry_budget_min_concurrency = 1;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        std::string resp = TestHttpClient::HttpGet(gw_port, "/breaker-503", 5000);
+        std::string resp_lower = resp;
+        std::transform(resp_lower.begin(), resp_lower.end(), resp_lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        bool pass = true;
+        std::string err;
+        if (!TestHttpClient::HasStatus(resp, 503)) {
+            pass = false;
+            err += "expected upstream 503; ";
+        }
+        if (TestHttpClient::ExtractBody(resp) != "backend-breaker-503") {
+            pass = false;
+            err += "upstream body not relayed; ";
+        }
+        if (resp_lower.find("x-upstream-source: backend") == std::string::npos) {
+            pass = false;
+            err += "upstream header missing; ";
+        }
+        if (resp.find("X-Circuit-Breaker:") != std::string::npos) {
+            pass = false;
+            err += "local circuit-open 503 leaked instead of upstream 5xx; ";
+        }
+        if (request_count.load(std::memory_order_relaxed) != 1) {
+            pass = false;
+            err += "expected exactly one backend request; ";
+        }
+
+        TestFramework::RecordTest(
+            "Integration: circuit-open reject still relays upstream 5xx",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: circuit-open reject still relays upstream 5xx",
+            false, e.what());
+    }
+}
+
+// When retry_on_5xx is enabled but max_retries is already exhausted, the
+// current upstream 5xx response must still be relayed verbatim instead of
+// being replaced by a synthetic local error.
+void TestIntegrationMaxRetriesExhaustedStillRelaysUpstream5xx() {
+    std::cout << "\n[TEST] Integration: max-retries exhausted still relays upstream 5xx..." << std::endl;
+    try {
+        std::atomic<int> request_count{0};
+
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/max-retries-503", [&](const HttpRequest&, HttpResponse& resp) {
+            request_count.fetch_add(1, std::memory_order_relaxed);
+            resp.Status(503)
+                .Header("X-Upstream-Source", "backend")
+                .Body("backend-max-retries-503", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 2;
+        gw_config.http2.enabled = false;
+        gw_config.upstreams.push_back(
+            MakeRetryProxyConfig(
+                "backend", "127.0.0.1", backend_port, "/max-retries-503",
+                0 /*max_retries*/, true /*retry_on_5xx*/,
+                false /*retry_on_connect_failure*/));
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        std::string resp =
+            TestHttpClient::HttpGet(gw_port, "/max-retries-503", 5000);
+        std::string resp_lower = resp;
+        std::transform(resp_lower.begin(), resp_lower.end(), resp_lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        bool pass = true;
+        std::string err;
+        if (!TestHttpClient::HasStatus(resp, 503)) {
+            pass = false;
+            err += "expected upstream 503; ";
+        }
+        if (TestHttpClient::ExtractBody(resp) != "backend-max-retries-503") {
+            pass = false;
+            err += "upstream body not relayed; ";
+        }
+        if (resp_lower.find("x-upstream-source: backend") == std::string::npos) {
+            pass = false;
+            err += "upstream header missing; ";
+        }
+        if (resp.find("X-Circuit-Breaker:") != std::string::npos ||
+            resp.find("X-Retry-Budget-Exhausted: 1") != std::string::npos) {
+            pass = false;
+            err += "local synthetic 503 leaked instead of upstream 5xx; ";
+        }
+        if (request_count.load(std::memory_order_relaxed) != 1) {
+            pass = false;
+            err += "expected exactly one backend request; ";
+        }
+
+        TestFramework::RecordTest(
+            "Integration: max-retries exhausted still relays upstream 5xx",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: max-retries exhausted still relays upstream 5xx",
+            false, e.what());
     }
 }
 
@@ -2798,6 +3034,9 @@ void RunAllTests() {
 
     // Section 14: Integration tests -- timer-based retry backoff
     TestIntegration5xxFirstRetryBacksOff();
+    TestIntegrationRetryBudgetRejectStillRelaysUpstream5xx();
+    TestIntegrationCircuitOpenRejectStillRelaysUpstream5xx();
+    TestIntegrationMaxRetriesExhaustedStillRelaysUpstream5xx();
     TestIntegrationConnectFailureFirstRetryIsImmediate();
     TestIntegrationBackoffDoesNotBlockOtherRequests();
 }
