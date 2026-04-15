@@ -3545,8 +3545,16 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         //      field changes (timeouts, limits, log level).
         validation_copy.http2.enabled =
             http2_enabled_ && new_config.http2.enabled;
-        // Upstream configs are restart-only — clear them so staged edits
-        // in the config file don't block live-safe field reloads.
+        // Upstream configs are RESTART-ONLY for topology fields, but the
+        // per-upstream `circuit_breaker` block is HOT-RELOADABLE — clearing
+        // upstreams entirely from validation_copy would skip CB-field
+        // validation here. Instead: clear the topology-restart-only
+        // path (the full Validate would reject those) and run a separate
+        // ValidateHotReloadable on the original new_config so live-
+        // reloadable CB rules (range checks, duplicate names) are
+        // enforced symmetrically with the SIGHUP path in main.cc.
+        // Without this, in-process callers using HttpServer::Reload
+        // directly would bypass the gate that the CLI path enforces.
         validation_copy.upstreams.clear();
         // Rate limit config IS live-reloadable and MUST be validated.
         // Unlike upstreams (restart-only), rate_limit changes are applied
@@ -3557,6 +3565,16 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
             ConfigLoader::Validate(validation_copy);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Reload() rejected invalid config: {}", e.what());
+            return false;
+        }
+        // Strict gate for hot-reloadable CB fields + duplicate names.
+        // Mirrors main.cc::ReloadConfig — both entry points must reject
+        // invalid CB tuning before it reaches live slices.
+        try {
+            ConfigLoader::ValidateHotReloadable(new_config);
+        } catch (const std::invalid_argument& e) {
+            logging::Get()->error("Reload() rejected invalid config: {}",
+                                  e.what());
             return false;
         }
     }

@@ -568,6 +568,28 @@ void ConfigLoader::ValidateHotReloadable(const ServerConfig& config) {
     // reload path would silently accept values the startup path
     // rejects (which is exactly the regression this helper exists
     // to prevent).
+
+    // Reject duplicate upstream service names BEFORE the per-upstream
+    // CB validation. CircuitBreakerManager::Reload iterates the new
+    // upstream list and applies each entry's `circuit_breaker` block
+    // to GetHost(name). With duplicates, the first entry's CB values
+    // are applied, then the second entry's overwrite them — last
+    // write silently wins. Startup's full Validate() rejects the
+    // file outright; the hot-reload path must match.
+    {
+        std::unordered_set<std::string> seen;
+        seen.reserve(config.upstreams.size());
+        for (size_t i = 0; i < config.upstreams.size(); ++i) {
+            const auto& name = config.upstreams[i].name;
+            if (!seen.insert(name).second) {
+                throw std::invalid_argument(
+                    "upstreams[" + std::to_string(i) +
+                    "] duplicate service name '" + name +
+                    "' (upstream service names must be unique)");
+            }
+        }
+    }
+
     for (size_t i = 0; i < config.upstreams.size(); ++i) {
         const auto& u = config.upstreams[i];
         const std::string idx = "upstreams[" + std::to_string(i) + "]";

@@ -946,6 +946,16 @@ void ProxyTransaction::Cleanup() {
     // via the retry_token_held_ flag.
     ReleaseRetryToken();
 
+    // Release the in-flight guard from the just-ended attempt. If
+    // MaybeRetry schedules a delayed backoff, the gap between Cleanup
+    // and the eventual AttemptCheckout (which would move-assign a
+    // fresh guard) holds the old slot in `retry_budget_->in_flight_`
+    // for the entire backoff sleep. That inflates the effective
+    // denominator of the percent-cap formula, weakening the budget
+    // exactly during retry storms. Move-assign from a default
+    // (empty) guard decrements the old counter immediately.
+    inflight_guard_ = circuit_breaker::RetryBudget::InFlightGuard{};
+
     if (lease_) {
         auto* conn = lease_.Get();
         if (conn) {
