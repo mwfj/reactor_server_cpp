@@ -25,7 +25,7 @@ ifeq ($(UNAME_S),Darwin)
     endif
 endif
 
-CXXFLAGS = -std=c++17 -g -Wall -Iinclude -Ithread_pool/include -Iutil -Itest -Ithird_party -Ithird_party/nghttp2 $(OPENSSL_CFLAGS)
+CXXFLAGS = -std=c++17 -g -Wall -Iinclude -Ithread_pool/include -Iutil -Itest -Ithird_party -Ithird_party/nghttp2 -Ithird_party/jwt-cpp/include -DJWT_DISABLE_PICOJSON $(OPENSSL_CFLAGS)
 CFLAGS = -g -Wall -Ithird_party/llhttp
 NGHTTP2_CFLAGS = -std=c99 -g -Wall -DHAVE_CONFIG_H -Ithird_party/nghttp2
 LDFLAGS = $(OPENSSL_LDFLAGS) -lpthread -lssl -lcrypto
@@ -80,7 +80,10 @@ RATE_LIMIT_SRCS = $(SERVER_DIR)/token_bucket.cc $(SERVER_DIR)/rate_limit_zone.cc
 CIRCUIT_BREAKER_SRCS = $(SERVER_DIR)/circuit_breaker_window.cc $(SERVER_DIR)/circuit_breaker_slice.cc $(SERVER_DIR)/retry_budget.cc $(SERVER_DIR)/circuit_breaker_host.cc $(SERVER_DIR)/circuit_breaker_manager.cc
 
 # Auth layer sources (OAuth 2.0 token validation — Layer 7 middleware)
-AUTH_SRCS = $(SERVER_DIR)/token_hasher.cc $(SERVER_DIR)/jwt_decode.cc $(SERVER_DIR)/auth_policy_matcher.cc $(SERVER_DIR)/auth_claims.cc
+# Note: JWT decode + signature verification is delegated to vendored jwt-cpp
+# (third_party/jwt-cpp/, header-only). See design spec §12.1 and r4/r5 revision
+# history for the library-adoption rationale.
+AUTH_SRCS = $(SERVER_DIR)/token_hasher.cc $(SERVER_DIR)/auth_policy_matcher.cc $(SERVER_DIR)/auth_claims.cc
 
 # CLI layer sources
 CLI_SRCS = $(SERVER_DIR)/cli_parser.cc $(SERVER_DIR)/signal_handler.cc $(SERVER_DIR)/pid_file.cc $(SERVER_DIR)/daemonizer.cc
@@ -149,9 +152,12 @@ TLS_HEADERS = $(LIB_DIR)/tls/tls_context.h $(LIB_DIR)/tls/tls_connection.h $(LIB
 UPSTREAM_HEADERS = $(LIB_DIR)/upstream/upstream_manager.h $(LIB_DIR)/upstream/upstream_host_pool.h $(LIB_DIR)/upstream/pool_partition.h $(LIB_DIR)/upstream/upstream_connection.h $(LIB_DIR)/upstream/upstream_lease.h $(LIB_DIR)/upstream/upstream_http_codec.h $(LIB_DIR)/upstream/http_request_serializer.h $(LIB_DIR)/upstream/header_rewriter.h $(LIB_DIR)/upstream/retry_policy.h $(LIB_DIR)/upstream/proxy_transaction.h $(LIB_DIR)/upstream/proxy_handler.h $(LIB_DIR)/upstream/upstream_response.h $(LIB_DIR)/upstream/upstream_callbacks.h
 RATE_LIMIT_HEADERS = $(LIB_DIR)/rate_limit/token_bucket.h $(LIB_DIR)/rate_limit/rate_limit_zone.h $(LIB_DIR)/rate_limit/rate_limiter.h
 CIRCUIT_BREAKER_HEADERS = $(LIB_DIR)/circuit_breaker/circuit_breaker_state.h $(LIB_DIR)/circuit_breaker/circuit_breaker_window.h $(LIB_DIR)/circuit_breaker/circuit_breaker_slice.h $(LIB_DIR)/circuit_breaker/retry_budget.h $(LIB_DIR)/circuit_breaker/circuit_breaker_host.h $(LIB_DIR)/circuit_breaker/circuit_breaker_manager.h
-AUTH_HEADERS = $(LIB_DIR)/auth/auth_context.h $(LIB_DIR)/auth/auth_config.h $(LIB_DIR)/auth/token_hasher.h $(LIB_DIR)/auth/jwt_decode.h $(LIB_DIR)/auth/auth_policy_matcher.h $(LIB_DIR)/auth/auth_claims.h
+# Auth headers. The vendored jwt-cpp headers are pulled into the dependency
+# graph so a bump-jwt-cpp PR correctly invalidates the whole build.
+JWT_CPP_DIR = $(THIRD_PARTY_DIR)/jwt-cpp/include/jwt-cpp
+AUTH_HEADERS = $(LIB_DIR)/auth/auth_context.h $(LIB_DIR)/auth/auth_config.h $(LIB_DIR)/auth/token_hasher.h $(LIB_DIR)/auth/auth_policy_matcher.h $(LIB_DIR)/auth/auth_claims.h $(JWT_CPP_DIR)/jwt.h $(JWT_CPP_DIR)/base.h $(JWT_CPP_DIR)/traits/nlohmann-json/defaults.h $(JWT_CPP_DIR)/traits/nlohmann-json/traits.h
 CLI_HEADERS = $(LIB_DIR)/cli/cli_parser.h $(LIB_DIR)/cli/signal_handler.h $(LIB_DIR)/cli/pid_file.h $(LIB_DIR)/cli/version.h $(LIB_DIR)/cli/daemonizer.h
-TEST_HEADERS = $(TEST_DIR)/test_framework.h $(TEST_DIR)/http_test_client.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h $(TEST_DIR)/route_test.h $(TEST_DIR)/upstream_pool_test.h $(TEST_DIR)/proxy_test.h $(TEST_DIR)/rate_limit_test.h $(TEST_DIR)/kqueue_test.h $(TEST_DIR)/circuit_breaker_test.h $(TEST_DIR)/circuit_breaker_components_test.h $(TEST_DIR)/circuit_breaker_integration_test.h $(TEST_DIR)/circuit_breaker_retry_budget_test.h $(TEST_DIR)/circuit_breaker_wait_queue_drain_test.h $(TEST_DIR)/circuit_breaker_observability_test.h $(TEST_DIR)/circuit_breaker_reload_test.h
+TEST_HEADERS = $(TEST_DIR)/test_framework.h $(TEST_DIR)/http_test_client.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h $(TEST_DIR)/route_test.h $(TEST_DIR)/upstream_pool_test.h $(TEST_DIR)/proxy_test.h $(TEST_DIR)/rate_limit_test.h $(TEST_DIR)/kqueue_test.h $(TEST_DIR)/circuit_breaker_test.h $(TEST_DIR)/circuit_breaker_components_test.h $(TEST_DIR)/circuit_breaker_integration_test.h $(TEST_DIR)/circuit_breaker_retry_budget_test.h $(TEST_DIR)/circuit_breaker_wait_queue_drain_test.h $(TEST_DIR)/circuit_breaker_observability_test.h $(TEST_DIR)/circuit_breaker_reload_test.h $(TEST_DIR)/auth_foundation_test.h
 
 # All headers combined
 HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(FOUNDATION_HEADERS) $(HTTP_HEADERS) $(HTTP2_HEADERS) $(WS_HEADERS) $(TLS_HEADERS) $(UPSTREAM_HEADERS) $(RATE_LIMIT_HEADERS) $(CIRCUIT_BREAKER_HEADERS) $(AUTH_HEADERS) $(CLI_HEADERS) $(TEST_HEADERS)

@@ -30,6 +30,19 @@ using AppliedPolicyList = std::vector<AppliedPolicy>;
 //   any longer matching prefix (longest-prefix wins).
 // - Matching is case-sensitive. HTTP path components are case-sensitive per
 //   RFC 3986 §6.2.2.1 (schemes and hosts are the case-insensitive parts).
+//
+// IMPORTANT — PLAIN (byte-level) prefix, NOT segment-safe:
+// - A policy `/admin` matches `/administrator/foo` because `/admin` is a
+//   byte prefix of `/administrator/foo`. This is deliberate — it mirrors
+//   `RateLimitZone::ZonePolicy::applies_to` semantics and matches the design
+//   spec §3.2. Operators who want segment-safe matching ("only the /admin
+//   subtree") must express that with a trailing slash: `/admin/` only
+//   matches `/admin/...` and NOT `/administrator`.
+// - Not a security hole: plain-prefix over-protects (additional paths get
+//   auth enforcement), it does NOT under-protect. Still, operators should
+//   prefer trailing-slash prefixes for narrow subtree protection.
+// - A future `match_mode: "segment"` knob is tracked in the design spec's
+//   §15 (Future work) and is out of scope for v1.
 const AppliedPolicy* FindPolicyForPath(const AppliedPolicyList& policies,
                                        const std::string& path);
 

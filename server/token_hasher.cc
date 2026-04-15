@@ -1,6 +1,7 @@
 #include "auth/token_hasher.h"
 
 #include "log/logger.h"
+#include "jwt-cpp/base.h"
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -39,7 +40,7 @@ TokenHasher::TokenHasher(const std::string& key) : key_(key) {
     }
 }
 
-std::string TokenHasher::Hash(const std::string& token) const {
+std::optional<std::string> TokenHasher::Hash(const std::string& token) const {
     unsigned char out[EVP_MAX_MD_SIZE];
     unsigned int out_len = 0;
     auto* md = EVP_sha256();
@@ -52,12 +53,12 @@ std::string TokenHasher::Hash(const std::string& token) const {
     if (!HMAC(md, key_bytes, static_cast<int>(key_.size()),
               msg_bytes, token.size(), out, &out_len)) {
         logging::Get()->error("TokenHasher::Hash: HMAC failed");
-        return {};
+        return std::nullopt;
     }
     if (out_len < TRUNCATED_BYTES) {
         logging::Get()->error("TokenHasher::Hash: HMAC produced only {} bytes, "
                               "expected >= {}", out_len, TRUNCATED_BYTES);
-        return {};
+        return std::nullopt;
     }
     return HexEncode(out, TRUNCATED_BYTES);
 }
@@ -76,7 +77,39 @@ std::string LoadHmacKeyFromEnv(const std::string& env_var_name) {
     if (env_var_name.empty()) return {};
     const char* val = std::getenv(env_var_name.c_str());
     if (!val) return {};
-    return std::string(val);
+    std::string raw(val);
+    if (raw.empty()) return {};
+
+    // Auto-detect base64url: operators typically store base64url-encoded keys
+    // because raw 32-byte binaries mangle through `.env` transport. A valid
+    // base64url-encoded 32-byte key is exactly 43 chars (no-padding form) or
+    // 44 with '=' padding. Accept either by trying the base64url decoder
+    // first and using the result only when it yields EXACTLY 32 bytes — any
+    // other length means the env value wasn't a base64url 32-byte key and we
+    // fall back to treating it as raw.
+    //
+    // Strip a trailing '=' padding char so 44-char padded forms also work.
+    //
+    // Exception containment (design spec §9 item 16): jwt::base::decode
+    // throws std::runtime_error on invalid input (illegal chars, bad length).
+    // Catch at this boundary and fall through to the raw-bytes interpretation
+    // — a malformed env value must not propagate as an exception into
+    // AuthManager::Start(), which would abort startup.
+    std::string candidate = raw;
+    while (!candidate.empty() && candidate.back() == '=') candidate.pop_back();
+    try {
+        std::string decoded =
+            jwt::base::decode<jwt::alphabet::base64url>(candidate);
+        if (decoded.size() == 32) {
+            return decoded;
+        }
+    } catch (const std::exception& e) {
+        logging::Get()->debug("LoadHmacKeyFromEnv: base64url decode failed "
+                              "for env var '{}' ({}); falling back to raw "
+                              "bytes interpretation",
+                              env_var_name, e.what());
+    }
+    return raw;
 }
 
 }  // namespace auth

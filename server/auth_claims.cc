@@ -7,12 +7,13 @@ namespace auth {
 namespace {
 
 std::vector<std::string> SplitWhitespace(const std::string& s) {
+    // operator>>(istream&, string&) skips leading whitespace and reads a
+    // non-empty run of non-whitespace characters — it cannot produce an
+    // empty `tok` on success, so no inner empty-check is needed here.
     std::vector<std::string> out;
     std::istringstream iss(s);
     std::string tok;
-    while (iss >> tok) {
-        if (!tok.empty()) out.push_back(std::move(tok));
-    }
+    while (iss >> tok) out.push_back(std::move(tok));
     return out;
 }
 
@@ -60,6 +61,21 @@ bool PopulateFromPayload(const nlohmann::json& payload,
 
     // Copy only operator-requested claims into ctx.claims, to keep the
     // context object small and to limit the data that flows into logs.
+    //
+    // Only scalar claims are flattened into the string-valued map. Array /
+    // object claims are SILENTLY SKIPPED — a common operator ask like
+    // "forward the `groups` array to X-Auth-Groups" will produce no header
+    // with the current Phase 1-2 model. That is intentional for this layer:
+    // array-to-header flattening (typically comma-separated, or multi-valued
+    // headers) is a HeaderRewriter / middleware concern because the
+    // serialization choice depends on what the upstream expects. Phase 3
+    // wiring should add that flattening at the overlay layer, not here.
+    //
+    // Numeric truncation caveat: uint64_t claims that exceed INT64_MAX are
+    // currently read via is_number_integer() + get<int64_t>(), which nlohmann
+    // clamps to the signed range. Tolerable for human-readable claim types
+    // (email, sub, username) but callers that need big-unsigned claim
+    // fidelity should extract them directly from the payload JSON.
     for (const auto& key : claims_keys) {
         if (!payload.contains(key)) continue;
         const auto& v = payload[key];
@@ -72,7 +88,8 @@ bool PopulateFromPayload(const nlohmann::json& payload,
         } else if (v.is_boolean()) {
             ctx.claims[key] = v.get<bool>() ? "true" : "false";
         }
-        // Arrays/objects: skip (operator should pick a more specific key).
+        // Arrays/objects: skip (see comment above — flattening is a Phase 3
+        // HeaderRewriter concern, not a claim-extraction concern).
     }
     return true;
 }

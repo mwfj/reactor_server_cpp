@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include <optional>
 // <string>, <cstdint> via common.h
 
 namespace auth {
@@ -28,10 +29,17 @@ public:
     // when key is empty.
     explicit TokenHasher(const std::string& key);
 
-    // Compute the cache-key hex string for a token. Returns 32 hex chars
-    // (128-bit truncation of HMAC-SHA256). Thread-safe — OpenSSL's HMAC
-    // via EVP is reentrant given an independent per-call context.
-    std::string Hash(const std::string& token) const;
+    // Compute the cache-key hex string for a token. On success returns
+    // 32 hex chars (128-bit truncation of HMAC-SHA256). Returns std::nullopt
+    // on HMAC failure — callers MUST treat nullopt as "uncacheable" and
+    // fall through to live introspection. Never fall back to a fixed
+    // sentinel value: two distinct tokens that both hit an HMAC failure
+    // would collide on the same cache key, which is a confidentiality bug
+    // (a leaked-claims cache hit for one token served to another).
+    //
+    // Thread-safe: uses OpenSSL's one-shot HMAC() API, which allocates its
+    // own EVP context per call and is reentrant.
+    std::optional<std::string> Hash(const std::string& token) const;
 
     // Return true when the hasher is initialized with a non-empty key.
     bool ready() const { return !key_.empty(); }
@@ -45,8 +53,14 @@ private:
 std::string GenerateHmacKey();
 
 // Load key material from an environment variable by name. The env value is
-// interpreted as raw bytes (NOT base64). Returns an empty string when the
-// env var is unset or empty.
+// interpreted using auto-detect:
+//   1. If the value is valid base64url (no padding) AND decodes to exactly
+//      32 bytes, the decoded bytes are used. This is the safer shell-transport
+//      form recommended by the design spec (§5.1) because raw 32-byte keys
+//      often contain non-printable bytes that mangle through `.env` files.
+//   2. Otherwise, the value is used as raw bytes.
+//
+// Returns an empty string when the env var is unset or empty.
 std::string LoadHmacKeyFromEnv(const std::string& env_var_name);
 
 }  // namespace auth

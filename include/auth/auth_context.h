@@ -16,7 +16,16 @@ struct AuthContext {
     std::vector<std::string> scopes;                      // From `scope` (space-sep) or `scp` (array)
     std::map<std::string, std::string> claims;            // Operator-selected claims (claims_to_headers source)
     std::string policy_name;                              // Matched policy's name (observability)
-    std::string raw_token;                                // Raw bearer token (for raw_jwt_header injection, if enabled)
+
+    // SENSITIVE — raw bearer token. NEVER log this field. Never include it
+    // in error messages, debug dumps, or diagnostic responses. Per
+    // LOGGING_STANDARDS.md, logs must reference `subject` (post-validation)
+    // only; the raw token must never appear. The middleware should populate
+    // this field ONLY when `AuthForwardConfig::raw_jwt_header` is non-empty
+    // (operator explicitly opted in to re-forwarding under a separate
+    // header name) — otherwise leave it empty to minimize the blast radius
+    // if a future request-dump helper accidentally serializes AuthContext.
+    std::string raw_token;
     bool undetermined = false;                            // True when on_undetermined="allow" path forwarded
 
     void Clear() {
