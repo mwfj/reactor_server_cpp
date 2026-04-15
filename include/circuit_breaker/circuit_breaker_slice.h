@@ -246,7 +246,14 @@ private:
     StateTransitionCallback transition_cb_;
 
     // Internal transitions (dispatcher-thread).
-    void TripClosedToOpen(const char* trigger);
+    // `now` is threaded through from ReportFailure so the window_total /
+    // window_fail_rate fields in the trip log reflect the SAME sliding-window
+    // view that ShouldTripClosed just saw — a fresh Now() here can cross a
+    // bucket boundary (especially with window_seconds=1 or under a dispatcher
+    // stall) and trigger Window::Advance's full-reset, zeroing the bucket that
+    // holds the failure which actually tripped the breaker.
+    void TripClosedToOpen(const char* trigger,
+                          std::chrono::steady_clock::time_point now);
     void TransitionOpenToHalfOpen();
     void TransitionHalfOpenToClosed();
     void TripHalfOpenToOpen(const char* trigger);
