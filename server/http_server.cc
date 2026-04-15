@@ -471,48 +471,57 @@ void HttpServer::MarkServerReady() {
                         [um, service, i, slice_ptr](
                                 circuit_breaker::State old_s,
                                 circuit_breaker::State new_s,
-                                const char* /*trigger*/) {
-                            // Drain the partition's wait queue whenever
-                            // the slice enters OPEN — from CLOSED (fresh
-                            // trip) OR from HALF_OPEN (probe cycle re-
-                            // tripped).
-                            //
-                            // CLOSED→OPEN is the classic case: queued
-                            // non-probe waiters need to fail fast with
-                            // CHECKOUT_CIRCUIT_OPEN rather than wait for
-                            // the full open duration.
-                            //
-                            // HALF_OPEN→OPEN (probe_fail) matters
-                            // because probe admissions pass
-                            // ConsultBreaker() BEFORE CheckoutAsync() —
-                            // if the pool was saturated during the
-                            // probe cycle, those admitted probes may
-                            // still be queued when the cycle re-trips.
-                            // Without draining, a saw_failure probe
-                            // cycle can leave the pool with queued
-                            // waiters that still eventually dispatch to
-                            // a known-bad upstream. Draining also
-                            // sweeps any non-probe waiters that
-                            // somehow queued during HALF_OPEN (defense
-                            // in depth — TryAcquire normally rejects
-                            // non-probes before they reach the pool).
-                            if (new_s != circuit_breaker::State::OPEN ||
-                                (old_s != circuit_breaker::State::CLOSED &&
-                                 old_s != circuit_breaker::State::HALF_OPEN)) {
+                                const char* trigger) {
+                            // Three drain triggers, all entering OPEN:
+                            //   CLOSED→OPEN  : fresh trip; queued non-
+                            //     probe waiters need CHECKOUT_CIRCUIT_OPEN
+                            //     instead of waiting out the full open
+                            //     window.
+                            //   HALF_OPEN→OPEN : probe cycle re-tripped;
+                            //     probe admissions passed ConsultBreaker
+                            //     before CheckoutAsync, so saturated
+                            //     pools can leave them queued. Without
+                            //     draining they eventually dispatch to a
+                            //     known-bad upstream.
+                            //   OPEN→OPEN with trigger="dry_run_disabled"
+                            //     : synthetic signal from
+                            //     CircuitBreakerSlice::Reload when
+                            //     dry_run flips true→false on a slice
+                            //     that's still OPEN. The earlier trip
+                            //     skipped the drain (shadow mode); now
+                            //     enforcement is back on, queued
+                            //     waiters from that period must be
+                            //     flushed before the pool services
+                            //     them. Real transitions never use this
+                            //     trigger string with old==new==OPEN,
+                            //     so there's no overlap with normal
+                            //     state-machine signals.
+                            const bool normal_trip =
+                                new_s == circuit_breaker::State::OPEN &&
+                                (old_s == circuit_breaker::State::CLOSED ||
+                                 old_s == circuit_breaker::State::HALF_OPEN);
+                            const bool dry_run_disable_drain =
+                                old_s == circuit_breaker::State::OPEN &&
+                                new_s == circuit_breaker::State::OPEN &&
+                                trigger != nullptr &&
+                                std::strcmp(trigger,
+                                            "dry_run_disabled") == 0;
+                            if (!normal_trip && !dry_run_disable_drain) {
                                 return;
                             }
-                            // Dry-run honors the shadow-mode contract:
-                            // the slice already log-but-admits
-                            // would-reject decisions, so the wait-queue
-                            // drain — which would deliver hard 503s
-                            // (CHECKOUT_CIRCUIT_OPEN → RESULT_CIRCUIT_OPEN)
-                            // to queued waiters — must also be a no-op.
-                            // Otherwise shadow-mode rollouts can still
-                            // drop queued requests under backpressure,
-                            // defeating the safety of enabling dry_run
-                            // on a live service. Logged at info so
-                            // operators see the trip event without
-                            // the side effect.
+                            // Dry-run shadow-mode contract: the slice
+                            // log-but-admits would-reject decisions, so
+                            // the wait-queue drain — which would
+                            // deliver hard 503s (CHECKOUT_CIRCUIT_OPEN
+                            // → RESULT_CIRCUIT_OPEN) to queued
+                            // waiters — must also be a no-op while
+                            // dry_run is true. Note: when this fires
+                            // via the dry_run_disabled trigger, the
+                            // slice's config_.dry_run was already
+                            // updated to false in Reload BEFORE the
+                            // synthetic callback, so this guard
+                            // correctly does NOT skip the drain in
+                            // that case.
                             if (slice_ptr && slice_ptr->config().dry_run) {
                                 logging::Get()->info(
                                     "[dry-run] circuit breaker would drain "
