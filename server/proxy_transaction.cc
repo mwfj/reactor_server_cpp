@@ -354,20 +354,33 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
     static constexpr int CIRCUIT_OPEN    = -6;
 
     if (error_code == CIRCUIT_OPEN) {
-        // Drain path: breaker tripped while this transaction was queued
-        // Do NOT Report to the slice —
-        // our own reject must not feed back into the failure math. Emit
-        // the §12.1 circuit-open response directly.
+        // Drain path: breaker tripped while this transaction was queued.
+        // Do NOT Report success/failure to the slice — our own reject
+        // must not feed back into the failure math. Emit the §12.1
+        // circuit-open response directly.
         logging::Get()->info(
             "ProxyTransaction checkout drained by circuit breaker "
             "client_fd={} service={}",
             client_fd_, service_name_);
+        // Neutral-release the slice admission instead of just clearing
+        // admission_generation_. Three drain paths reach here:
+        //   CLOSED→OPEN  : closed_gen_ was bumped by the trip; our
+        //                  generation is now stale → ReportNeutral
+        //                  drops as stale-gen. No state mutation. Safe.
+        //   HALF_OPEN→OPEN : halfopen_gen_ was bumped by the trip AND
+        //                  half_open_inflight_/admitted_ reset to 0 by
+        //                  TransitionOpenToHalfOpen's sibling path →
+        //                  ReportNeutral drops as stale-gen. Safe.
+        //   (Any future same-cycle drain without a generation bump):
+        //                  admission_generation_ is still current →
+        //                  ReportNeutral correctly returns the slot,
+        //                  preventing half_open_inflight_/admitted_
+        //                  from leaking and wedging the slice in
+        //                  half_open_full until the next reset.
+        // ReleaseBreakerAdmissionNeutral clears admission_generation_
+        // internally, so Cleanup/destructor won't double-report.
+        ReleaseBreakerAdmissionNeutral();
         DeliverResponse(MakeCircuitOpenResponse());
-        // Clear admission_generation_ so Cleanup / destructor doesn't
-        // double-report. The admission was already fire-and-forget —
-        // slice-side bookkeeping is intact (the drain itself doesn't
-        // touch inflight counters because the breaker didn't admit).
-        admission_generation_ = 0;
         return;
     }
 

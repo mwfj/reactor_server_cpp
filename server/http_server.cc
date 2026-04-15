@@ -483,29 +483,30 @@ void HttpServer::MarkServerReady() {
                             //     pools can leave them queued. Without
                             //     draining they eventually dispatch to a
                             //     known-bad upstream.
-                            //   OPEN→OPEN or HALF_OPEN→HALF_OPEN with
-                            //     trigger="dry_run_disabled" :
-                            //     synthetic signal from
+                            //   OPEN→OPEN with trigger="dry_run_disabled"
+                            //     : synthetic signal from
                             //     CircuitBreakerSlice::Reload when
                             //     dry_run flips true→false on a slice
-                            //     that's still rejecting traffic. The
-                            //     earlier trip / HALF_OPEN rejects
-                            //     skipped enforcement (shadow mode);
-                            //     now enforcement is back on, queued
+                            //     that's still OPEN. The earlier trip
+                            //     skipped the drain (shadow mode); now
+                            //     enforcement is back on, queued
                             //     waiters from that period must be
                             //     flushed before the pool services
-                            //     them. Real transitions never use
-                            //     this trigger string with old==new,
+                            //     them. Real transitions never use this
+                            //     trigger string with old==new==OPEN,
                             //     so there's no overlap with normal
                             //     state-machine signals.
+                            //     (The slice intentionally does NOT
+                            //     fire this signal in HALF_OPEN — see
+                            //     CircuitBreakerSlice::Reload for why
+                            //     valid probes must not be flushed.)
                             const bool normal_trip =
                                 new_s == circuit_breaker::State::OPEN &&
                                 (old_s == circuit_breaker::State::CLOSED ||
                                  old_s == circuit_breaker::State::HALF_OPEN);
                             const bool dry_run_disable_drain =
-                                old_s == new_s &&
-                                (old_s == circuit_breaker::State::OPEN ||
-                                 old_s == circuit_breaker::State::HALF_OPEN) &&
+                                old_s == circuit_breaker::State::OPEN &&
+                                new_s == circuit_breaker::State::OPEN &&
                                 trigger != nullptr &&
                                 std::strcmp(trigger,
                                             "dry_run_disabled") == 0;

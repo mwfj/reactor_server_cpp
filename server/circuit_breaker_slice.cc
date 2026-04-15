@@ -624,41 +624,47 @@ void CircuitBreakerSlice::Reload(const CircuitBreakerConfig& new_config) {
         new_config.consecutive_failure_threshold,
         enabled_changed ? " (enabled toggled — state reset to CLOSED)" : "");
 
-    // dry_run true→false on a slice that's still rejecting traffic
-    // (OPEN or HALF_OPEN): enforcement is back on, but the same-state
-    // intra-config edit doesn't fire any natural transition callback.
-    // The pool partition may have queued waiters from the shadow-mode
-    // period — drain reasons per state:
-    //   OPEN: the original CLOSED→OPEN drain was skipped because
-    //     dry_run was true at trip time, so every request that arrived
-    //     during the open window was admitted and may be queued.
-    //   HALF_OPEN: under dry_run the slice log-but-admits both probe-
-    //     budget-exhausted (half_open_full) and saw-failure short-
-    //     circuits (half_open_recovery_failing). Those requests sit in
-    //     the pool wait queue even though enforcement would reject
-    //     them. Without a drain they reach the unhealthy upstream once
-    //     a pool slot frees, defeating re-enabled enforcement.
+    // dry_run true→false on a slice that's STILL OPEN: enforcement is
+    // back on, but the OPEN→OPEN intra-state config edit doesn't fire
+    // any natural transition callback. The pool partition may have
+    // queued waiters from the shadow-mode period (the original
+    // CLOSED→OPEN drain was skipped because dry_run was true at the
+    // time). Without flushing them now, those queued requests will
+    // eventually dispatch to the unhealthy upstream once a pool slot
+    // frees, defeating the just-re-enabled enforcement.
     //
-    // Signal the host via a synthetic same-state transition callback
+    // Signal the host via a synthetic OPEN→OPEN transition callback
     // with trigger="dry_run_disabled". The HttpServer-installed
-    // callback recognizes this trigger and drains the partition
-    // queue. Real state transitions never reuse old==new with this
-    // trigger string, so there's no overlap with normal signals.
+    // callback recognizes this special trigger and drains the
+    // partition queue. Real state transitions never reuse the same
+    // old/new state with this trigger string, so there's no overlap.
     //
-    // Only fire when we KNOW the state is still rejecting — the
-    // enabled-toggle branch above resets to CLOSED, in which case the
-    // drain is unnecessary (no enforcement to re-engage). State is
-    // dispatcher-thread-only here; a plain load is sufficient.
-    if (old_dry_run && !new_config.dry_run && transition_cb_) {
-        State s = state_.load(std::memory_order_acquire);
-        if (s == State::OPEN || s == State::HALF_OPEN) {
-            const char* state_label =
-                (s == State::OPEN) ? "OPEN" : "HALF_OPEN";
-            logging::Get()->info(
-                "circuit breaker dry_run disabled while {} {} — "
-                "flushing wait queue", state_label, host_label_);
-            transition_cb_(s, s, "dry_run_disabled");
-        }
+    // IMPORTANT — why this does NOT fire in HALF_OPEN: HALF_OPEN
+    // queues can mix two admission kinds that share a partition wait
+    // slot but differ on slice bookkeeping:
+    //   (a) Valid probes admitted within permitted_half_open_calls —
+    //       admission_generation_ = current halfopen_gen_, holding a
+    //       real half_open_inflight_/admitted_ slot. These drive
+    //       recovery on a healthy upstream and must NOT be disrupted
+    //       by an operator config flip.
+    //   (b) Dry-run-admitted shadow requests (half_open_full /
+    //       half_open_recovery_failing paths) — admission_generation_
+    //       = 0 (RejectWithLog sentinel). Their outcomes drop as
+    //       stale-gen on report, so they never influence the slice's
+    //       state machine and are bounded by pool queue size.
+    // DrainWaitQueueOnTrip is partition-wide and can't tell (a) from
+    // (b); draining would 503 valid probes (delaying/preventing
+    // recovery) to also drop the harmless (b). We accept the small
+    // bounded leak of (b) as the lesser evil.
+    //
+    // State is dispatcher-thread-only here; a plain load is sufficient.
+    if (old_dry_run && !new_config.dry_run &&
+        state_.load(std::memory_order_acquire) == State::OPEN &&
+        transition_cb_) {
+        logging::Get()->info(
+            "circuit breaker dry_run disabled while OPEN {} — "
+            "flushing wait queue", host_label_);
+        transition_cb_(State::OPEN, State::OPEN, "dry_run_disabled");
     }
 }
 
