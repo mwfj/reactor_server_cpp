@@ -933,8 +933,7 @@ void ProxyTransaction::Cancel() {
     // mid-request, counting that as an upstream-health failure would
     // trip the breaker against a backend that may be perfectly healthy
     // (browser cancels, user-initiated timeouts, etc. are all common
-    // causes). The reviewer guidance is explicit: client-initiated
-    // aborts must be neutral from the breaker's perspective.
+    // causes). Client-initiated aborts must be neutral from the breaker's perspective.
     //
     // Trade-off: in HALF_OPEN, ReportNeutral on a probe decrements
     // both inflight and admitted, so a cancelled probe makes the slot

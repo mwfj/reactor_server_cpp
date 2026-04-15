@@ -579,7 +579,7 @@ void TestSuccessClearsConsecutive() {
 }
 
 // ============================================================================
-// Regression tests — critical bugs caught in code review
+// Regression tests
 // ============================================================================
 
 // BUG: late non-probe failure after trip re-entered TripClosedToOpen, inflating
@@ -775,7 +775,7 @@ void TestHalfOpenFullCounterSeparate() {
     }
 }
 
-// BUG (review round 2, P2): Reload preserved stale state across enabled
+// Reload preserved stale state across enabled
 // toggles. Disabling while OPEN and re-enabling later resumed the OPEN state,
 // rejecting requests despite an explicit operator off→on cycle. Disabling
 // after accumulated consecutive failures would re-trip on the very next
@@ -830,8 +830,7 @@ void TestReloadResetsStateOnEnabledToggleWhileOpen() {
     }
 }
 
-// BUG (review round 2, P2, variant): if disable happens while
-// consecutive_failures_ has accumulated but not yet tripped, re-enable would
+// If disable happens while consecutive_failures_ has accumulated but not yet tripped, re-enable would
 // inherit that count and trip early on the next failure.
 void TestReloadResetsConsecutiveFailuresOnEnabledToggle() {
     std::cout << "\n[TEST] CB: reload clears consecutive_failures on enable toggle..."
@@ -909,7 +908,7 @@ void TestReloadThresholdChangePreservesState() {
     }
 }
 
-// BUG (review round 2, P3): saw_failure short-circuit incorrectly bumped the
+// saw_failure short-circuit incorrectly bumped the
 // HALF_OPEN_FULL counter, polluting dashboards that need to distinguish
 // "probing, no capacity left" from "recovery attempt is failing".
 void TestSawFailureDoesNotBumpHalfOpenFullCounter() {
@@ -956,7 +955,7 @@ void TestSawFailureDoesNotBumpHalfOpenFullCounter() {
     }
 }
 
-// BUG (review round 3, P2): TransitionOpenToHalfOpen deliberately left
+// TransitionOpenToHalfOpen deliberately left
 // `open_until_steady_ns_` populated, violating the documented OpenUntil()
 // contract ("zero when not OPEN"). A consumer computing Retry-After
 // from a HALF_OPEN slice would compute (stale_deadline - now), which is
@@ -1002,7 +1001,7 @@ void TestOpenUntilZeroWhenHalfOpen() {
     }
 }
 
-// BUG (review round 3, P1): Reload reset the state on enabled toggle but
+// Reload reset the state on enabled toggle but
 // gave Report* no way to distinguish pre-toggle admissions from post-toggle
 // ones. Stale completions then polluted the fresh CLOSED cycle. Fixed with
 // a generation token captured at admission and checked at report.
@@ -1122,7 +1121,7 @@ void TestStaleGenerationReportsDroppedAcrossStateTransitions() {
     }
 }
 
-// BUG (review round 4, P2): Reload that resizes the rolling window without
+// Reload that resizes the rolling window without
 // toggling enabled cleared the window buckets but left generation_ unchanged.
 // Late reports from pre-reload admissions would carry the still-current
 // generation, pass the guard, and re-populate the freshly empty window —
@@ -1239,7 +1238,7 @@ void TestThresholdOnlyReloadDoesNotAdvanceGeneration() {
     }
 }
 
-// BUG (review round 5, P1): Reload with window_seconds change while the
+// Reload with window_seconds change while the
 // slice is HALF_OPEN used to bump the single `generation_`, invalidating
 // every in-flight probe. Those probes' late Report* calls then dropped
 // WITHOUT decrementing half_open_inflight_, wedging the slice in HALF_OPEN
@@ -1377,7 +1376,7 @@ void TestWindowResizeStillInvalidatesClosedAdmissions() {
     }
 }
 
-// BUG (review round 7, P2): Reload() lowering permitted_half_open_calls
+// Reload() lowering permitted_half_open_calls
 // while a HALF_OPEN cycle is active could close the breaker early and
 // discard failures from already-admitted probes.
 //
@@ -1463,7 +1462,7 @@ void TestHalfOpenBudgetFrozenAcrossReload() {
     }
 }
 
-// BUG (review round 6, P2): Reload with window_seconds change preserved
+// Reload with window_seconds change preserved
 // consecutive_failures_ while bumping closed_gen_. Pre-reload CLOSED
 // reports are correctly blocked (stale gen), but they can no longer
 // clear or advance consecutive_failures_ either. The counter becomes an
@@ -1538,7 +1537,7 @@ void TestWindowResizeResetConsecutiveFailures() {
     }
 }
 
-// BUG (review round 9, P2-1): ReportFailure captured Now() separately in
+// ReportFailure captured Now() separately in
 // AddFailure() and ShouldTripClosed()'s internal TotalCount/FailureCount
 // calls. If a second boundary elapsed between the two calls, Advance() could
 // wipe the just-recorded failure — with window_seconds=1, the 1-second delta
@@ -1602,7 +1601,7 @@ void TestReportFailureUsesOneTimestampAcrossTripEval() {
     }
 }
 
-// BUG (review round 8, P2): CircuitBreakerWindow's constructor allocated
+// CircuitBreakerWindow's constructor allocated
 // `max(1, window_seconds)` buckets but stored the RAW window_seconds_ value.
 // Programmatic callers bypassing ConfigLoader::Validate() (tests, future
 // direct users) that passed window_seconds <= 0 would trigger BucketIndex's
@@ -1639,7 +1638,7 @@ void TestWindowNonPositiveWindowSizeClamp() {
     }
 }
 
-// BUG (review round 9, P3): CircuitBreakerSlice copied permitted_half_open_calls
+// CircuitBreakerSlice copied permitted_half_open_calls
 // into the HALF_OPEN snapshot verbatim. For programmatic callers bypassing
 // ConfigLoader::Validate() (same class as the window ctor clamp), a zero or
 // negative budget would permanently wedge the breaker in HALF_OPEN:
@@ -1703,7 +1702,7 @@ void TestHalfOpenClampsNonPositiveProbeBudget() {
     }
 }
 
-// BUG (review round 10, P1): TryAcquire gated HALF_OPEN admission on
+// TryAcquire gated HALF_OPEN admission on
 // half_open_inflight_, so a probe slot was reused once an earlier probe
 // completed. With permitted_half_open_calls=2:
 //
@@ -1788,7 +1787,7 @@ void TestHalfOpenDoesNotReuseProbeSlots() {
     }
 }
 
-// BUG (review round 11, P1): Admission contract has ReportSuccess and
+// Admission contract has ReportSuccess and
 // ReportFailure but no path for probes that complete without touching the
 // upstream (POOL_EXHAUSTED after probe admission, shutdown, client
 // disconnect, PARSE_ERROR). Following the §7 "don't report these as
@@ -1921,7 +1920,7 @@ void TestReportNeutralLastProbeAfterFailureReTrips() {
     }
 }
 
-// BUG (review round 12, P2): ComputeOpenDuration read base/max durations
+// ComputeOpenDuration read base/max durations
 // straight from config_, so a programmatic caller bypassing
 // ConfigLoader::Validate() with base_open_duration_ms <= 0 or max < base
 // would compute scaled_ms <= 0. open_until = now + 0 → next TryAcquire

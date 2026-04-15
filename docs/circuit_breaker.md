@@ -145,5 +145,3 @@ Topology edits (`host`, `port`, `pool.*`, `proxy.*`, `tls.*`) still require a re
 - **Generation tokens.** Every admission is stamped with a per-domain generation counter (`closed_gen_` or `halfopen_gen_`, depending on state). `Report*` drops stale-generation completions so pre-transition requests can't pollute a fresh cycle. Window resizes bump only `closed_gen_` so in-flight probes aren't stranded.
 - **Retry budget CAS.** `TryConsumeRetry` uses `compare_exchange_weak` to serialize concurrent retry admissions. A plain load-check-add would let N callers all observe `current < cap` and all increment past the cap.
 - **Non-retry denominator.** The budget base is `in_flight - retries_in_flight`, not raw `in_flight`. Retries count in both terms but subtract out here so admitting a retry doesn't inflate its own cap.
-
-For the full design document (motivations, trade-offs, failure modes, revision history, test strategy), see [.claude/documents/design/CIRCUIT_BREAKER_DESIGN.md](../.claude/documents/design/CIRCUIT_BREAKER_DESIGN.md).

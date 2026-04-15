@@ -126,7 +126,7 @@ HttpServer
 - **Synchronous LRU eviction on insert** — `FindOrCreate` evicts LRU tail before creating a new entry if the shard is at capacity, guaranteeing `max_entries` is honored even under high-cardinality bursts
 - **Disable-first / enable-last reload ordering** — ensures no request can observe `enabled=true` with the previous (stale) zone list during a `(false,[])→(true,[Z])` transition
 
-See `docs/configuration.md` for the full config reference and `.claude/documents/features/RATE_LIMITING.md` for implementation internals.
+See `docs/configuration.md` for the full config reference.
 
 ## Memory Management
 
