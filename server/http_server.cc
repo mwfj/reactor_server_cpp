@@ -458,10 +458,20 @@ void HttpServer::MarkServerReady() {
                 for (size_t i = 0; i < host->partition_count(); ++i) {
                     auto* slice = host->GetSlice(i);
                     if (!slice) continue;
+                    // Capture the slice pointer so the callback can read
+                    // the LIVE `dry_run` flag on every fire — operators
+                    // can toggle dry_run via SIGHUP, and the drain
+                    // decision must reflect the current setting, not a
+                    // snapshot from server startup. Slice lifetime is
+                    // tied to the manager (declared after upstream
+                    // manager → destructs first), so the raw pointer
+                    // outlives every possible callback invocation.
+                    auto* slice_ptr = slice;
                     slice->SetTransitionCallback(
-                        [um, service, i](circuit_breaker::State old_s,
-                                         circuit_breaker::State new_s,
-                                         const char* /*trigger*/) {
+                        [um, service, i, slice_ptr](
+                                circuit_breaker::State old_s,
+                                circuit_breaker::State new_s,
+                                const char* /*trigger*/) {
                             // Drain the partition's wait queue whenever
                             // the slice enters OPEN — from CLOSED (fresh
                             // trip) OR from HALF_OPEN (probe cycle re-
@@ -486,13 +496,34 @@ void HttpServer::MarkServerReady() {
                             // somehow queued during HALF_OPEN (defense
                             // in depth — TryAcquire normally rejects
                             // non-probes before they reach the pool).
-                            if (new_s == circuit_breaker::State::OPEN &&
-                                (old_s == circuit_breaker::State::CLOSED ||
-                                 old_s == circuit_breaker::State::HALF_OPEN)) {
-                                if (auto* part = um->GetPoolPartition(
-                                        service, i)) {
-                                    part->DrainWaitQueueOnTrip();
-                                }
+                            if (new_s != circuit_breaker::State::OPEN ||
+                                (old_s != circuit_breaker::State::CLOSED &&
+                                 old_s != circuit_breaker::State::HALF_OPEN)) {
+                                return;
+                            }
+                            // Dry-run honors the shadow-mode contract:
+                            // the slice already log-but-admits
+                            // would-reject decisions, so the wait-queue
+                            // drain — which would deliver hard 503s
+                            // (CHECKOUT_CIRCUIT_OPEN → RESULT_CIRCUIT_OPEN)
+                            // to queued waiters — must also be a no-op.
+                            // Otherwise shadow-mode rollouts can still
+                            // drop queued requests under backpressure,
+                            // defeating the safety of enabling dry_run
+                            // on a live service. Logged at info so
+                            // operators see the trip event without
+                            // the side effect.
+                            if (slice_ptr && slice_ptr->config().dry_run) {
+                                logging::Get()->info(
+                                    "[dry-run] circuit breaker would drain "
+                                    "wait queue on trip — skipping (shadow "
+                                    "mode) service={} partition={}",
+                                    service, i);
+                                return;
+                            }
+                            if (auto* part = um->GetPoolPartition(
+                                    service, i)) {
+                                part->DrainWaitQueueOnTrip();
                             }
                         });
                 }
