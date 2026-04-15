@@ -2,6 +2,8 @@
 #include "dispatcher.h"
 #include "log/logger.h"
 
+#include <future>
+
 namespace circuit_breaker {
 
 CircuitBreakerHost::CircuitBreakerHost(std::string service_name,
@@ -104,11 +106,23 @@ void CircuitBreakerHost::Reload(
     retry_budget_->Reload(new_config.retry_budget_percent,
                           new_config.retry_budget_min_concurrency);
 
-    // Enqueue per-slice Reload on each owning dispatcher. The slice is
+    // Apply per-slice Reload on each owning dispatcher. The slice is
     // dispatcher-thread-local for mutation, so the config swap must
     // happen there. Passing slice as raw pointer is safe: slices_ is
     // owned by `this` (the host), which outlives the manager's reload
     // (enforced by CircuitBreakerManager's lifetime).
+    //
+    // Synchronize: wait for every enqueued slice Reload to actually run
+    // before returning. Without this, HttpServer::Reload could return
+    // "success" while requests already queued on a dispatcher still run
+    // with the OLD enabled/dry_run/thresholds — a SIGHUP flipping a
+    // tripped breaker to disabled (or to dry_run) could still emit hard
+    // 503s or enforce the old retry budget for a brief window after the
+    // operator sees reload-ok. Dispatcher-local inline on the current
+    // thread avoids self-deadlock if Reload is ever called from a
+    // dispatcher thread.
+    std::vector<std::future<void>> pending;
+    pending.reserve(slices_.size());
     for (size_t i = 0; i < slices_.size(); ++i) {
         CircuitBreakerSlice* slice = slices_[i].get();
         auto& dispatcher = dispatchers[i];
@@ -118,9 +132,40 @@ void CircuitBreakerHost::Reload(
                 service_name_, host_, i);
             continue;
         }
-        dispatcher->EnQueue([slice, new_config]() {
+        if (dispatcher->is_on_loop_thread()) {
+            // Caller IS this dispatcher — apply inline to preserve
+            // dispatcher-thread-local invariant without self-enqueueing
+            // (which would only run after this frame returns, defeating
+            // the sync contract). No future to wait on for this slice.
             slice->Reload(new_config);
+            continue;
+        }
+        auto promise = std::make_shared<std::promise<void>>();
+        pending.push_back(promise->get_future());
+        dispatcher->EnQueue([slice, new_config, promise]() {
+            slice->Reload(new_config);
+            promise->set_value();
         });
+    }
+
+    // Bounded wait: slice Reload is trivial (config copy + optional
+    // synthetic transition callback), so each dispatcher only needs one
+    // event-loop iteration to drain. A 2s ceiling protects callers from
+    // a stalled / stopping dispatcher — if the wait times out we log and
+    // proceed; the remaining slice(s) will pick up the new config when
+    // the queued task eventually runs (via the shared_ptr-captured
+    // new_config copy), so we never lose an edit — just delay its visibility.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (auto& fut : pending) {
+        if (fut.wait_until(deadline) != std::future_status::ready) {
+            logging::Get()->warn(
+                "CircuitBreakerHost::Reload({}:{}) timed out waiting for "
+                "slice apply — new config will be applied when the "
+                "dispatcher drains", service_name_, host_);
+            break;  // No benefit to waiting out the remaining futures
+                    // after the first timeout — they share the deadline.
+        }
     }
 
     // Save the new config for future Snapshot() / construction-like

@@ -3853,7 +3853,36 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     // When topology MATCHES (the common case, including CB-only
     // edits), adopt the new snapshot as the fresh baseline so CB-
     // field edits persist for later reload diffs.
-    if (new_config.upstreams != upstream_configs_) {
+    //
+    // Compare as name-keyed maps rather than vectors: live pools and
+    // CircuitBreakerManager are both keyed by upstream name, so a pure
+    // reorder of otherwise-identical entries is NOT a topology change.
+    // Vector equality would fire a spurious "restart required" warning
+    // and skip the upstream_configs_ update, leaving every subsequent
+    // breaker-only reload on that reordered file forever looking like a
+    // topology change. UpstreamConfig::operator== already excludes the
+    // live-reloadable `circuit_breaker` field, so map equality reflects
+    // the true restart-vs-live partition. Duplicate names were rejected
+    // upstream by ValidateHotReloadable, so the map conversion is
+    // lossless here.
+    auto by_name = [](const std::vector<UpstreamConfig>& v) {
+        std::map<std::string, const UpstreamConfig*> m;
+        for (const auto& u : v) m[u.name] = &u;
+        return m;
+    };
+    const auto old_map = by_name(upstream_configs_);
+    const auto new_map = by_name(new_config.upstreams);
+    bool topology_match = old_map.size() == new_map.size();
+    if (topology_match) {
+        for (const auto& entry : old_map) {
+            auto it = new_map.find(entry.first);
+            if (it == new_map.end() || *entry.second != *it->second) {
+                topology_match = false;
+                break;
+            }
+        }
+    }
+    if (!topology_match) {
         logging::Get()->warn("Reload: upstream topology changes require a "
                              "restart to take effect (circuit-breaker "
                              "field edits, if any, were applied live)");
