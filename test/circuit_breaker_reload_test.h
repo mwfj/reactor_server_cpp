@@ -359,6 +359,224 @@ void TestReloadDisableThenEnable() {
     }
 }
 
+// Regression: a SIGHUP carrying an invalid CB threshold (e.g.
+// `consecutive_failure_threshold = 0`) on an EXISTING upstream must
+// be hard-rejected. The downgrade-to-warn behavior of the wider
+// `Validate()` call would otherwise push the bad value into live
+// slices even though startup rejects the same file.
+void TestReloadRejectsInvalidCbField() {
+    std::cout << "\n[TEST] CB Reload: invalid CB tuning is hard-rejected..."
+              << std::endl;
+    try {
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/fail", [](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(502).Body("err", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw;
+        gw.bind_host = "127.0.0.1";
+        gw.bind_port = 0;
+        gw.worker_threads = 1;
+        gw.http2.enabled = false;
+        gw.upstreams.push_back(
+            MakeReloadUpstream("svc", "127.0.0.1", backend_port));
+
+        HttpServer gateway(gw);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+
+        // Build an invalid reload — threshold below the [1, 10000] range.
+        ServerConfig invalid = gw;
+        invalid.upstreams[0].circuit_breaker.consecutive_failure_threshold = 0;
+
+        bool reload_returned = gateway.Reload(invalid);
+        // The slice's threshold must NOT have been pushed live.
+        auto* cbm = gateway.GetUpstreamManager()->GetCircuitBreakerManager();
+        auto* slice = cbm->GetHost("svc")->GetSlice(0);
+        int live_threshold = slice->config().consecutive_failure_threshold;
+
+        bool pass = reload_returned == false && live_threshold == 3;
+        TestFramework::RecordTest(
+            "CB Reload: invalid CB tuning is hard-rejected", pass,
+            pass ? "" :
+            "reload_returned=" + std::to_string(reload_returned) +
+            " live_threshold=" + std::to_string(live_threshold) +
+            " (expected reload=false, threshold=3 unchanged)");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB Reload: invalid CB tuning is hard-rejected", false, e.what());
+    }
+}
+
+// Regression: with `dry_run=true`, the CLOSED→OPEN transition callback
+// must NOT drain the partition wait queue (shadow-mode contract: log
+// would-reject decisions, admit traffic). The breaker's dry_run check
+// inside the transition callback covers this; the regression we lock
+// in is the log-emitted breadcrumb plus the absence of CHECKOUT_CIRCUIT_OPEN
+// to queued waiters.
+void TestDryRunDoesNotDrainOnTrip() {
+    std::cout << "\n[TEST] CB Reload: dry-run skips wait-queue drain on trip..."
+              << std::endl;
+    try {
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/fail", [](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(502).Body("err", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw;
+        gw.bind_host = "127.0.0.1";
+        gw.bind_port = 0;
+        gw.worker_threads = 1;
+        gw.http2.enabled = false;
+        UpstreamConfig u = MakeReloadUpstream("svc", "127.0.0.1", backend_port);
+        u.circuit_breaker.dry_run = true;
+        u.circuit_breaker.consecutive_failure_threshold = 2;
+        gw.upstreams.push_back(u);
+
+        HttpServer gateway(gw);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+
+        auto ring = std::make_shared<
+            spdlog::sinks::ringbuffer_sink_mt>(1024);
+        auto logger = logging::Get();
+        auto prev_level = logger->level();
+        logger->set_level(spdlog::level::debug);
+        logger->sinks().push_back(ring);
+        struct SinkGuard {
+            std::shared_ptr<spdlog::logger> logger;
+            std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> ring;
+            spdlog::level::level_enum prev_level;
+            ~SinkGuard() {
+                auto& sinks = logger->sinks();
+                sinks.erase(std::remove(sinks.begin(), sinks.end(),
+                            std::shared_ptr<spdlog::sinks::sink>(ring)),
+                            sinks.end());
+                logger->set_level(prev_level);
+            }
+        } guard{logger, ring, prev_level};
+
+        int gw_port = gw_runner.GetPort();
+        // Trip the breaker via 2 failures.
+        for (int i = 0; i < 2; ++i) {
+            TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        bool saw_dryrun_drain_skip = false;
+        for (const auto& msg : ring->last_formatted()) {
+            if (msg.find("[dry-run] circuit breaker would drain wait queue") !=
+                std::string::npos) {
+                saw_dryrun_drain_skip = true;
+                break;
+            }
+        }
+
+        TestFramework::RecordTest(
+            "CB Reload: dry-run skips wait-queue drain on trip",
+            saw_dryrun_drain_skip,
+            saw_dryrun_drain_skip ? "" :
+            "expected '[dry-run] circuit breaker would drain wait queue' log line");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB Reload: dry-run skips wait-queue drain on trip", false, e.what());
+    }
+}
+
+// Regression: when `dry_run` flips true→false on a slice that's
+// currently OPEN, `Slice::Reload` fires a synthetic OPEN→OPEN
+// transition with trigger="dry_run_disabled". The HttpServer-installed
+// callback recognizes it and drains the partition queue so shadow-mode
+// waiters don't leak through to the upstream once enforcement is back on.
+void TestDryRunDisableOnOpenTriggersDrainSignal() {
+    std::cout << "\n[TEST] CB Reload: dry_run disable on OPEN triggers drain..."
+              << std::endl;
+    try {
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/fail", [](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(502).Body("err", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw;
+        gw.bind_host = "127.0.0.1";
+        gw.bind_port = 0;
+        gw.worker_threads = 1;
+        gw.http2.enabled = false;
+        UpstreamConfig u = MakeReloadUpstream("svc", "127.0.0.1", backend_port);
+        u.circuit_breaker.dry_run = true;
+        u.circuit_breaker.consecutive_failure_threshold = 2;
+        u.circuit_breaker.base_open_duration_ms = 60000;  // long open window
+        gw.upstreams.push_back(u);
+
+        HttpServer gateway(gw);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        // Trip the breaker (dry-run still records the trip; state goes OPEN).
+        for (int i = 0; i < 2; ++i) {
+            TestHttpClient::HttpGet(gw_port, "/fail", 3000);
+        }
+
+        auto* cbm = gateway.GetUpstreamManager()->GetCircuitBreakerManager();
+        auto* slice = cbm->GetHost("svc")->GetSlice(0);
+        bool was_open = slice->CurrentState() == circuit_breaker::State::OPEN;
+
+        auto ring = std::make_shared<
+            spdlog::sinks::ringbuffer_sink_mt>(1024);
+        auto logger = logging::Get();
+        auto prev_level = logger->level();
+        logger->set_level(spdlog::level::debug);
+        logger->sinks().push_back(ring);
+        struct SinkGuard {
+            std::shared_ptr<spdlog::logger> logger;
+            std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> ring;
+            spdlog::level::level_enum prev_level;
+            ~SinkGuard() {
+                auto& sinks = logger->sinks();
+                sinks.erase(std::remove(sinks.begin(), sinks.end(),
+                            std::shared_ptr<spdlog::sinks::sink>(ring)),
+                            sinks.end());
+                logger->set_level(prev_level);
+            }
+        } guard{logger, ring, prev_level};
+
+        // Reload with dry_run=false, everything else same.
+        ServerConfig disable_dry = gw;
+        disable_dry.upstreams[0].circuit_breaker.dry_run = false;
+        gateway.Reload(disable_dry);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        // The synthetic-callback fire path emits a slice-side log line.
+        bool saw_flush_log = false;
+        for (const auto& msg : ring->last_formatted()) {
+            if (msg.find("dry_run disabled while OPEN") != std::string::npos &&
+                msg.find("flushing wait queue") != std::string::npos) {
+                saw_flush_log = true;
+                break;
+            }
+        }
+        bool live_dry_run = slice->config().dry_run;
+        bool still_open = slice->CurrentState() == circuit_breaker::State::OPEN;
+
+        bool pass = was_open && !live_dry_run && saw_flush_log && still_open;
+        TestFramework::RecordTest(
+            "CB Reload: dry_run disable on OPEN triggers drain", pass,
+            pass ? "" :
+            "was_open=" + std::to_string(was_open) +
+            " live_dry_run=" + std::to_string(live_dry_run) +
+            " saw_flush_log=" + std::to_string(saw_flush_log) +
+            " still_open=" + std::to_string(still_open));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CB Reload: dry_run disable on OPEN triggers drain", false,
+            e.what());
+    }
+}
+
 void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "CIRCUIT BREAKER - HOT-RELOAD TESTS" << std::endl;
@@ -368,6 +586,9 @@ void RunAllTests() {
     TestCbOnlyReloadNoRestartWarn();
     TestTopologyChangeStillEmitsRestartWarn();
     TestReloadDisableThenEnable();
+    TestReloadRejectsInvalidCbField();
+    TestDryRunDoesNotDrainOnTrip();
+    TestDryRunDisableOnOpenTriggersDrainSignal();
 }
 
 }  // namespace CircuitBreakerReloadTests
