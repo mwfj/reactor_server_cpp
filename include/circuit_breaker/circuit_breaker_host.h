@@ -8,7 +8,7 @@
 
 class Dispatcher;
 
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 
 // Observability snapshot of a single host, aggregated across all its
 // partition slices. Safe to call from any thread (relaxed reads of
@@ -115,4 +115,4 @@ private:
     std::unique_ptr<RetryBudget> retry_budget_;
 };
 
-}  // namespace circuit_breaker
+}  // namespace CIRCUIT_BREAKER_NAMESPACE

@@ -1,6 +1,6 @@
 #include "circuit_breaker/retry_budget.h"
 
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 
 namespace {
 
@@ -94,4 +94,4 @@ void RetryBudget::Reload(int percent, int min_concurrency) {
                            std::memory_order_relaxed);
 }
 
-}  // namespace circuit_breaker
+}  // namespace CIRCUIT_BREAKER_NAMESPACE

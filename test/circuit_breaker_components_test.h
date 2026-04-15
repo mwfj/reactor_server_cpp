@@ -25,13 +25,13 @@
 // calls.
 namespace CircuitBreakerComponentsTests {
 
-using circuit_breaker::CircuitBreakerHost;
-using circuit_breaker::CircuitBreakerHostSnapshot;
-using circuit_breaker::CircuitBreakerManager;
-using circuit_breaker::Decision;
-using circuit_breaker::FailureKind;
-using circuit_breaker::RetryBudget;
-using circuit_breaker::State;
+using CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerHost;
+using CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerHostSnapshot;
+using CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerManager;
+using CIRCUIT_BREAKER_NAMESPACE::Decision;
+using CIRCUIT_BREAKER_NAMESPACE::FailureKind;
+using CIRCUIT_BREAKER_NAMESPACE::RetryBudget;
+using CIRCUIT_BREAKER_NAMESPACE::State;
 
 static CircuitBreakerConfig DefaultCbConfig() {
     CircuitBreakerConfig cb;

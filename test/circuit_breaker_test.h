@@ -12,11 +12,11 @@
 
 namespace CircuitBreakerTests {
 
-using circuit_breaker::CircuitBreakerSlice;
-using circuit_breaker::CircuitBreakerWindow;
-using circuit_breaker::Decision;
-using circuit_breaker::FailureKind;
-using circuit_breaker::State;
+using CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerSlice;
+using CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerWindow;
+using CIRCUIT_BREAKER_NAMESPACE::Decision;
+using CIRCUIT_BREAKER_NAMESPACE::FailureKind;
+using CIRCUIT_BREAKER_NAMESPACE::State;
 
 // A simple mock clock that advances only when the test tells it to.
 class MockClock {
@@ -867,7 +867,7 @@ void TestReloadResetsConsecutiveFailuresOnEnabledToggle() {
             "CB: reload clears consecutive_failures on enable toggle",
             pass,
             pass ? "" : "expected CLOSED after 1 post-reenable failure, got " +
-                        std::string(circuit_breaker::StateName(slice.CurrentState())),
+                        std::string(CIRCUIT_BREAKER_NAMESPACE::StateName(slice.CurrentState())),
             TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
@@ -899,7 +899,7 @@ void TestReloadThresholdChangePreservesState() {
         TestFramework::RecordTest(
             "CB: reload preserves state on threshold-only change",
             pass, pass ? "" : "expected OPEN, got " +
-                              std::string(circuit_breaker::StateName(slice.CurrentState())),
+                              std::string(CIRCUIT_BREAKER_NAMESPACE::StateName(slice.CurrentState())),
             TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(

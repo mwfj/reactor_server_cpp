@@ -9,7 +9,7 @@
 
 class TlsClientContext;
 
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerManager;
 }
 
@@ -79,14 +79,14 @@ public:
     // is declared AFTER upstream_manager_ on HttpServer, so it destructs
     // FIRST — UpstreamManager never reads through a dangling pointer on
     // shutdown. Passing nullptr is allowed (detaches).
-    void AttachCircuitBreakerManager(circuit_breaker::CircuitBreakerManager* mgr) {
+    void AttachCircuitBreakerManager(CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerManager* mgr) {
         breaker_manager_.store(mgr, std::memory_order_release);
     }
 
     // Returns the attached breaker manager, or nullptr if no manager is
     // attached. Safe from any thread (atomic load, acquire so any
     // Attach-time publication is visible).
-    circuit_breaker::CircuitBreakerManager* GetCircuitBreakerManager() const {
+    CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerManager* GetCircuitBreakerManager() const {
         return breaker_manager_.load(std::memory_order_acquire);
     }
 
@@ -110,7 +110,7 @@ private:
     // coherent pointer or nullptr (never torn). Owned by HttpServer;
     // lifetime outlives UpstreamManager (breaker destructs first —
     // §3.1 ownership). Default nullptr — breaker is an opt-in layer.
-    std::atomic<circuit_breaker::CircuitBreakerManager*> breaker_manager_{nullptr};
+    std::atomic<CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerManager*> breaker_manager_{nullptr};
 
     // Manager-owned atomic counter: total outstanding connections
     std::atomic<int64_t> outstanding_conns_{0};

@@ -425,14 +425,14 @@ void HttpServer::MarkServerReady() {
         // in UpstreamManager::breaker_manager_.
         try {
             circuit_breaker_manager_ =
-                std::make_unique<circuit_breaker::CircuitBreakerManager>(
+                std::make_unique<CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerManager>(
                     upstream_configs_, dispatchers.size(), dispatchers);
             upstream_manager_->AttachCircuitBreakerManager(
                 circuit_breaker_manager_.get());
 
             // Wire CLOSED→OPEN transition callbacks for every slice of every
-            // host — regardless of `enabled=false`, per design §3.1 R3-1. A
-            // disabled slice never fires transitions (TryAcquire short-
+            // host — regardless of `enabled=false`. 
+            // A disabled slice never fires transitions (TryAcquire short-
             // circuits to ADMITTED); wiring the callback costs nothing but
             // lets a live reload flip enable=false→true without re-wiring.
             //
@@ -446,9 +446,8 @@ void HttpServer::MarkServerReady() {
             // lookups.
             //
             // Safe to capture raw `UpstreamManager*`: CircuitBreakerManager
-            // destructs BEFORE UpstreamManager (§3.1 ownership), and slice
-            // callbacks only fire on dispatcher threads which are stopped
-            // before either manager is destroyed. So any live callback
+            // destructs BEFORE UpstreamManager, and slice callbacks only fire on dispatcher threads 
+            // which are stopped before either manager is destroyed. So any live callback
             // invocation sees a valid UpstreamManager.
             UpstreamManager* um = upstream_manager_.get();
             for (const auto& u : upstream_configs_) {
@@ -469,8 +468,8 @@ void HttpServer::MarkServerReady() {
                     auto* slice_ptr = slice;
                     slice->SetTransitionCallback(
                         [um, service, i, slice_ptr](
-                                circuit_breaker::State old_s,
-                                circuit_breaker::State new_s,
+                                CIRCUIT_BREAKER_NAMESPACE::State old_s,
+                                CIRCUIT_BREAKER_NAMESPACE::State new_s,
                                 const char* trigger) {
                             // Three drain triggers, all entering OPEN:
                             //   CLOSED→OPEN  : fresh trip; queued non-
@@ -501,12 +500,12 @@ void HttpServer::MarkServerReady() {
                             //     CircuitBreakerSlice::Reload for why
                             //     valid probes must not be flushed.)
                             const bool normal_trip =
-                                new_s == circuit_breaker::State::OPEN &&
-                                (old_s == circuit_breaker::State::CLOSED ||
-                                 old_s == circuit_breaker::State::HALF_OPEN);
+                                new_s == CIRCUIT_BREAKER_NAMESPACE::State::OPEN &&
+                                (old_s == CIRCUIT_BREAKER_NAMESPACE::State::CLOSED ||
+                                 old_s == CIRCUIT_BREAKER_NAMESPACE::State::HALF_OPEN);
                             const bool dry_run_disable_drain =
-                                old_s == circuit_breaker::State::OPEN &&
-                                new_s == circuit_breaker::State::OPEN &&
+                                old_s == CIRCUIT_BREAKER_NAMESPACE::State::OPEN &&
+                                new_s == CIRCUIT_BREAKER_NAMESPACE::State::OPEN &&
                                 trigger != nullptr &&
                                 std::strcmp(trigger,
                                             "dry_run_disabled") == 0;

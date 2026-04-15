@@ -3,7 +3,7 @@
 #include "common.h"
 // <vector>, <chrono> provided by common.h
 
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 
 // Time-bucketed sliding window. One bucket per second; ring indexed by
 // `epoch_sec % window_seconds`. Advances lazily on every Add* call:
@@ -56,4 +56,4 @@ private:
     static int64_t ToEpochSec(std::chrono::steady_clock::time_point now);
 };
 
-}  // namespace circuit_breaker
+}  // namespace CIRCUIT_BREAKER_NAMESPACE

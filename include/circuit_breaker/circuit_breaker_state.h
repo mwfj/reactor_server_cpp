@@ -15,7 +15,7 @@
 //                                                       failure
 //                                                       ▼
 //                                                      OPEN
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 
 enum class State : uint8_t {
     CLOSED    = 0,
@@ -67,4 +67,4 @@ inline const char* StateName(State s) {
     return "unknown";
 }
 
-}  // namespace circuit_breaker
+}  // namespace CIRCUIT_BREAKER_NAMESPACE

@@ -6,7 +6,7 @@
 
 class Dispatcher;
 
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 
 // Top-level circuit-breaker orchestrator. Mirrors the shape of
 // RateLimitManager: one instance lives on HttpServer, built once at
@@ -77,4 +77,4 @@ private:
     mutable std::mutex reload_mtx_;
 };
 
-}  // namespace circuit_breaker
+}  // namespace CIRCUIT_BREAKER_NAMESPACE

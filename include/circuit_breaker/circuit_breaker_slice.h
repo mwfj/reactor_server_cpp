@@ -6,7 +6,7 @@
 #include "circuit_breaker/circuit_breaker_window.h"
 // <chrono>, <atomic>, <string> provided by common.h
 
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 
 // One per-dispatcher slice of the breaker state for a given upstream host.
 // Dispatcher-thread-local for hot-path correctness: TryAcquire, ReportSuccess,
@@ -278,4 +278,4 @@ private:
     std::chrono::steady_clock::time_point Now() const;
 };
 
-}  // namespace circuit_breaker
+}  // namespace CIRCUIT_BREAKER_NAMESPACE

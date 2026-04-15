@@ -40,7 +40,7 @@
 
 namespace CircuitBreakerObservabilityTests {
 
-using circuit_breaker::State;
+using CIRCUIT_BREAKER_NAMESPACE::State;
 
 static UpstreamConfig MakeObservUpstream(const std::string& name,
                                           const std::string& host,

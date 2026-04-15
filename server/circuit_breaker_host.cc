@@ -4,7 +4,7 @@
 
 #include <future>
 
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 
 CircuitBreakerHost::CircuitBreakerHost(std::string service_name,
                                         std::string host,
@@ -184,4 +184,4 @@ void CircuitBreakerHost::SetTransitionCallbackOnAllSlices(
     }
 }
 
-}  // namespace circuit_breaker
+}  // namespace CIRCUIT_BREAKER_NAMESPACE

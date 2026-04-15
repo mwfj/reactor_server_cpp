@@ -2,7 +2,7 @@
 #include "log/logger.h"
 #include <unordered_set>
 
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 
 CircuitBreakerManager::CircuitBreakerManager(
         const std::vector<UpstreamConfig>& upstreams,
@@ -121,4 +121,4 @@ CircuitBreakerManager::SnapshotAll() const {
     return snapshots;
 }
 
-}  // namespace circuit_breaker
+}  // namespace CIRCUIT_BREAKER_NAMESPACE

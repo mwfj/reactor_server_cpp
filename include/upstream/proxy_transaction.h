@@ -16,7 +16,7 @@ class UpstreamManager;
 class ConnectionHandler;
 class Dispatcher;
 
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerSlice;
 }  // RetryBudget already defined via retry_budget.h
 
@@ -164,7 +164,7 @@ private:
     // breaker is being built lazily) — the breaker is simply skipped in
     // that case. Lifetime: the slice is owned by CircuitBreakerHost in
     // CircuitBreakerManager on HttpServer, which outlives this transaction.
-    circuit_breaker::CircuitBreakerSlice* slice_ = nullptr;
+    CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerSlice* slice_ = nullptr;
 
     // Per-host retry budget, resolved alongside `slice_` in Start() from
     // the same CircuitBreakerHost. Null when there's no breaker attached
@@ -172,7 +172,7 @@ private:
     // tracking entirely. Lifetime: the budget is owned by the host,
     // which outlives this transaction (destruction order guaranteed by
     // HttpServer member declaration).
-    circuit_breaker::RetryBudget* retry_budget_ = nullptr;
+    CIRCUIT_BREAKER_NAMESPACE::RetryBudget* retry_budget_ = nullptr;
 
     // Per-attempt in-flight tracker. Held for the duration of each
     // attempt (first try and retries alike). Replaced on every
@@ -181,7 +181,7 @@ private:
     // transaction stays at a single in_flight unit. Default-constructed
     // guard is empty (counter_ = nullptr): used when retry_budget_ is
     // null or before the first ConsultBreaker admission.
-    circuit_breaker::RetryBudget::InFlightGuard inflight_guard_;
+    CIRCUIT_BREAKER_NAMESPACE::RetryBudget::InFlightGuard inflight_guard_;
 
     // Per-ATTEMPT admission state. Reset on each call to ConsultBreaker();
     // paired Report*() calls thread the `generation` back so the slice

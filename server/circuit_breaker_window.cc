@@ -1,6 +1,6 @@
 #include "circuit_breaker/circuit_breaker_window.h"
 
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 
 // Map an epoch-second value into a non-negative bucket index. C++ built-in `%`
 // can return a negative result when the dividend is negative — and while
@@ -96,4 +96,4 @@ void CircuitBreakerWindow::Resize(int new_window_seconds) {
     head_epoch_sec_ = -1;
 }
 
-}  // namespace circuit_breaker
+}  // namespace CIRCUIT_BREAKER_NAMESPACE

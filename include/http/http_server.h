@@ -22,7 +22,7 @@
 class UpstreamManager;
 class ProxyHandler;
 
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerManager;
 }
 
@@ -348,7 +348,7 @@ private:
     // breaker_manager_ pointer is checked against null on every lookup.
     // Destroying the pool first would leave breaker slices holding
     // dangling references.
-    std::unique_ptr<circuit_breaker::CircuitBreakerManager> circuit_breaker_manager_;
+    std::unique_ptr<CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerManager> circuit_breaker_manager_;
 
     // Rate limiting
     RateLimitConfig rate_limit_config_;

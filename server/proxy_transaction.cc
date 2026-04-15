@@ -966,7 +966,7 @@ void ProxyTransaction::Cleanup() {
     // denominator of the percent-cap formula, weakening the budget
     // exactly during retry storms. Move-assign from a default
     // (empty) guard decrements the old counter immediately.
-    inflight_guard_ = circuit_breaker::RetryBudget::InFlightGuard{};
+    inflight_guard_ = CIRCUIT_BREAKER_NAMESPACE::RetryBudget::InFlightGuard{};
 
     if (lease_) {
         auto* conn = lease_.Get();
@@ -1196,7 +1196,7 @@ HttpResponse ProxyTransaction::MakeCircuitOpenResponse() const {
             retry_after_secs = static_cast<int>(diff);
             breaker_label = "open";
         } else if (slice_->CurrentState() ==
-                   circuit_breaker::State::HALF_OPEN) {
+                   CIRCUIT_BREAKER_NAMESPACE::State::HALF_OPEN) {
             // HALF_OPEN reject — no deadline to read. Hint with the
             // NEXT expected open duration (base << consecutive_trips_,
             // clamped by max_open_duration_ms) rather than base alone:
@@ -1256,9 +1256,9 @@ bool ProxyTransaction::ConsultBreaker() {
     // sentinel) — it's harmless and keeps the branches simpler.
     admission_generation_ = admission.generation;
     is_probe_ = (admission.decision ==
-                 circuit_breaker::Decision::ADMITTED_PROBE);
+                 CIRCUIT_BREAKER_NAMESPACE::Decision::ADMITTED_PROBE);
 
-    if (admission.decision == circuit_breaker::Decision::REJECTED_OPEN) {
+    if (admission.decision == CIRCUIT_BREAKER_NAMESPACE::Decision::REJECTED_OPEN) {
         // Hard reject — slice counted it, logged it, and we must not
         // touch the upstream. Emit §12.1 response and DO NOT Report
         // back (would create a feedback loop — our own reject counting
@@ -1317,7 +1317,7 @@ void ProxyTransaction::ReportBreakerOutcome(int result_code) {
     bool probe = is_probe_;
     is_probe_ = false;
 
-    using circuit_breaker::FailureKind;
+    using CIRCUIT_BREAKER_NAMESPACE::FailureKind;
 
     // Synthetic sentinel for the OnResponseComplete 5xx path — maps to
     // RESPONSE_5XX without needing a new public result code. Callers

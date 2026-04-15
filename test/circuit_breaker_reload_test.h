@@ -523,7 +523,7 @@ void TestDryRunDisableOnOpenTriggersDrainSignal() {
 
         auto* cbm = gateway.GetUpstreamManager()->GetCircuitBreakerManager();
         auto* slice = cbm->GetHost("svc")->GetSlice(0);
-        bool was_open = slice->CurrentState() == circuit_breaker::State::OPEN;
+        bool was_open = slice->CurrentState() == CIRCUIT_BREAKER_NAMESPACE::State::OPEN;
 
         auto ring = std::make_shared<
             spdlog::sinks::ringbuffer_sink_mt>(1024);
@@ -560,7 +560,7 @@ void TestDryRunDisableOnOpenTriggersDrainSignal() {
             }
         }
         bool live_dry_run = slice->config().dry_run;
-        bool still_open = slice->CurrentState() == circuit_breaker::State::OPEN;
+        bool still_open = slice->CurrentState() == CIRCUIT_BREAKER_NAMESPACE::State::OPEN;
 
         bool pass = was_open && !live_dry_run && saw_flush_log && still_open;
         TestFramework::RecordTest(

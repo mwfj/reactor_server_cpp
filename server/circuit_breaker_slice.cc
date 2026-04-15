@@ -1,7 +1,7 @@
 #include "circuit_breaker/circuit_breaker_slice.h"
 #include "log/logger.h"
 
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 
 CircuitBreakerSlice::CircuitBreakerSlice(std::string host_label,
                                          size_t dispatcher_index,
@@ -672,4 +672,4 @@ void CircuitBreakerSlice::SetTransitionCallback(StateTransitionCallback cb) {
     transition_cb_ = std::move(cb);
 }
 
-}  // namespace circuit_breaker
+}  // namespace CIRCUIT_BREAKER_NAMESPACE

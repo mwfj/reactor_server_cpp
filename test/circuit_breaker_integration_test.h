@@ -24,7 +24,7 @@
 
 namespace CircuitBreakerIntegrationTests {
 
-using circuit_breaker::State;
+using CIRCUIT_BREAKER_NAMESPACE::State;
 
 // Shared helper: build an upstream config that proxies /echo → backend and
 // has a breaker configured with low thresholds for fast trip.

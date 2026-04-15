@@ -3,7 +3,7 @@
 #include "common.h"
 // <atomic>, <cstdint> provided by common.h
 
-namespace circuit_breaker {
+namespace CIRCUIT_BREAKER_NAMESPACE {
 
 // Retry budget — orthogonal to the breaker state machine.
 //
@@ -148,4 +148,4 @@ private:
     std::atomic<int64_t> retries_rejected_{0};
 };
 
-}  // namespace circuit_breaker
+}  // namespace CIRCUIT_BREAKER_NAMESPACE
