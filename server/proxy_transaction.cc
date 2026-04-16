@@ -746,10 +746,6 @@ bool ProxyTransaction::OnHeaders(
                 "service={} status={} attempt={} because retry is unavailable",
                 client_fd_, service_name_, head.status_code, attempt_);
         }
-    } else if (head.status_code >= HttpStatus::BAD_REQUEST) {
-        ReleaseBreakerAdmissionNeutral();
-    } else {
-        ReportBreakerOutcome(RESULT_SUCCESS);
     }
 
     if (!IsNoBodyResponse(head)) {
@@ -857,6 +853,16 @@ void ProxyTransaction::OnUpstreamWriteComplete(
 void ProxyTransaction::OnResponseComplete() {
     ClearResponseTimeout();
     InvalidateStreamTimers();
+
+    if (response_head_.status_code >= HttpStatus::INTERNAL_SERVER_ERROR &&
+        response_head_.status_code < 600) {
+        // 5xx outcomes are reported at headers so retry/breaker gates see the
+        // failure before deciding whether another attempt is allowed.
+    } else if (response_head_.status_code >= HttpStatus::BAD_REQUEST) {
+        ReleaseBreakerAdmissionNeutral();
+    } else {
+        ReportBreakerOutcome(RESULT_SUCCESS);
+    }
 
     state_ = State::COMPLETE;
 
@@ -1293,7 +1299,15 @@ HttpResponse ProxyTransaction::BuildResponseFromHead(
 }
 
 HttpResponse ProxyTransaction::BuildStreamingHeadersResponse() const {
-    return BuildResponseFromHead(response_head_, false, nullptr);
+    HttpResponse response = BuildResponseFromHead(response_head_, false, nullptr);
+    if (config_.forward_trailers &&
+        client_http_major_ == 1 && client_http_minor_ == 1) {
+        auto trailer = FirstHeaderValue(response_head_.headers, "trailer");
+        if (trailer && !FirstHeaderValue(response.GetHeaders(), "trailer")) {
+            response.AppendHeader("Trailer", *trailer);
+        }
+    }
+    return response;
 }
 
 bool ProxyTransaction::CommitStreamingResponse() {

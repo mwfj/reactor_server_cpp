@@ -2539,6 +2539,199 @@ void TestRetryFullJitterCapAtMax() {
     }
 }
 
+void TestIntegrationPartialResponseFailureTripsCircuitBreaker() {
+    std::cout << "\n[TEST] Integration: partial upstream response trips circuit breaker..." << std::endl;
+    try {
+        std::atomic<int> request_count{0};
+
+        HttpServer backend("127.0.0.1", 0);
+        backend.GetAsync(
+            "/partial-breaker",
+            [&request_count](
+                const HttpRequest&,
+                HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
+                HTTP_CALLBACKS_NAMESPACE::ResourcePusher /*push_resource*/,
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender,
+                HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback /*complete*/) {
+                request_count.fetch_add(1, std::memory_order_relaxed);
+                HttpResponse head;
+                head.Status(200).Header("Content-Type", "text/plain");
+                if (stream_sender.SendHeaders(head) < 0) {
+                    return;
+                }
+                static constexpr char kPartialBody[] = "partial-body";
+                auto result = stream_sender.SendData(
+                    kPartialBody, sizeof(kPartialBody) - 1);
+                (void)result;
+                stream_sender.Abort(
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::
+                        UPSTREAM_ERROR);
+            });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+
+        UpstreamConfig u = MakeProxyUpstreamConfig(
+            "backend", "127.0.0.1", backend_port, "/partial-breaker");
+        u.proxy.buffering = "always";
+        u.proxy.retry.max_retries = 0;
+        u.proxy.retry.retry_on_5xx = false;
+        u.proxy.retry.retry_on_disconnect = false;
+        u.proxy.retry.retry_on_connect_failure = false;
+        u.circuit_breaker.enabled = true;
+        u.circuit_breaker.consecutive_failure_threshold = 1;
+        u.circuit_breaker.failure_rate_threshold = 100;
+        u.circuit_breaker.minimum_volume = 1;
+        u.circuit_breaker.base_open_duration_ms = 5000;
+        u.circuit_breaker.max_open_duration_ms = 5000;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        std::string first = TestHttpClient::HttpGet(
+            gw_port, "/partial-breaker", 5000);
+        (void)first;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::string second = TestHttpClient::HttpGet(
+            gw_port, "/partial-breaker", 5000);
+        std::string second_lower = second;
+        std::transform(second_lower.begin(), second_lower.end(),
+                       second_lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        bool pass = true;
+        std::string err;
+        if (!TestHttpClient::HasStatus(second, 503)) {
+            pass = false;
+            err += "second response should be 503 from open circuit breaker; ";
+        }
+        if (second_lower.find("x-circuit-breaker: open") == std::string::npos) {
+            pass = false;
+            err += "circuit-open header missing on second response; ";
+        }
+        if (request_count.load(std::memory_order_relaxed) > 1) {
+            pass = false;
+            err += "breaker should reject the follow-up request before reaching backend; ";
+        }
+
+        TestFramework::RecordTest(
+            "Integration: partial upstream response trips circuit breaker",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: partial upstream response trips circuit breaker",
+            false, e.what());
+    }
+}
+
+void TestIntegrationForwardTrailersRelaysChunkedTrailerBlock() {
+    std::cout << "\n[TEST] Integration: forward_trailers relays chunked trailer block..." << std::endl;
+    try {
+        HttpServer backend("127.0.0.1", 0);
+        backend.GetAsync(
+            "/trailers",
+            [](const HttpRequest&,
+               HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
+               HTTP_CALLBACKS_NAMESPACE::ResourcePusher /*push_resource*/,
+               HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender,
+               HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback /*complete*/) {
+                HttpResponse head;
+                head.Status(200)
+                    .Header("Content-Type", "text/plain")
+                    .Header("Trailer", "X-Checksum");
+                if (stream_sender.SendHeaders(head) < 0) {
+                    return;
+                }
+                static constexpr char kBody[] = "hello";
+                if (stream_sender.SendData(kBody, sizeof(kBody) - 1) ==
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                    return;
+                }
+                auto end_result = stream_sender.End({{"X-Checksum", "abc123"}});
+                (void)end_result;
+            });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+
+        UpstreamConfig u = MakeProxyUpstreamConfig(
+            "backend", "127.0.0.1", backend_port, "/trailers");
+        u.proxy.buffering = "never";
+        u.proxy.forward_trailers = true;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        int client_fd = TestHttpClient::ConnectRawSocket(gw_port);
+        if (client_fd < 0) throw std::runtime_error("gateway connect failed");
+
+        if (!SendAll(client_fd,
+                     "GET /trailers HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Connection: close\r\n"
+                     "\r\n")) {
+            close(client_fd);
+            throw std::runtime_error("gateway send failed");
+        }
+
+        std::string full = RecvUntilClose(client_fd, 3000);
+        close(client_fd);
+
+        std::string full_lower = full;
+        std::transform(full_lower.begin(), full_lower.end(), full_lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        bool pass = true;
+        std::string err;
+        if (!TestHttpClient::HasStatus(full, 200)) err += "status not 200; ";
+        if (full_lower.find("transfer-encoding: chunked") == std::string::npos) {
+            err += "chunked transfer-encoding missing; ";
+        }
+        if (full_lower.find("trailer: x-checksum") == std::string::npos) {
+            err += "trailer declaration header missing; ";
+        }
+        if (full.find("5\r\nhello\r\n") == std::string::npos) {
+            err += "chunked body missing; ";
+        }
+        auto header_end = full_lower.find("\r\n\r\n");
+        std::string body_and_trailers =
+            (header_end == std::string::npos) ? std::string() :
+            full_lower.substr(header_end + 4);
+        auto zero_chunk = body_and_trailers.find("0\r\n");
+        auto trailer_value = body_and_trailers.find("x-checksum: abc123");
+        if (zero_chunk == std::string::npos) {
+            err += "final zero chunk missing; ";
+        }
+        if (trailer_value == std::string::npos ||
+            (zero_chunk != std::string::npos && trailer_value < zero_chunk)) {
+            err += "final trailer block missing; ";
+        }
+        pass = err.empty();
+
+        TestFramework::RecordTest(
+            "Integration: forward_trailers relays chunked trailer block",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: forward_trailers relays chunked trailer block",
+            false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Section 13: Integration tests -- timer-based retry backoff
 // ---------------------------------------------------------------------------
@@ -3196,6 +3389,8 @@ void RunAllTests() {
     TestIntegrationParameterizedSseAutoStreams();
     TestIntegrationStreamIdleTimeoutAbortsRelay();
     TestIntegrationDownstreamBackpressureSuspendsIdleTimeout();
+    TestIntegrationPartialResponseFailureTripsCircuitBreaker();
+    TestIntegrationForwardTrailersRelaysChunkedTrailerBlock();
 
     // Section 13: RetryPolicy unit tests -- full jitter backoff
     TestRetryFullJitterRange();

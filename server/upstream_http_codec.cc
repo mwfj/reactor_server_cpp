@@ -9,11 +9,27 @@
 // These are declared before UpstreamHttpCodec methods so they can be
 // referenced in the constructor.
 
+static void FlushPendingHeader(UpstreamHttpCodec* self) {
+    if (self->current_header_field_.empty()) {
+        return;
+    }
+    std::string key = self->current_header_field_;
+    std::transform(key.begin(), key.end(), key.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    auto& target =
+        self->response_.headers_complete ? self->trailers_ : self->response_.headers;
+    target.emplace_back(std::move(key), std::move(self->current_header_value_));
+    self->current_header_field_.clear();
+    self->current_header_value_.clear();
+    self->parsing_header_value_ = false;
+}
+
 static int on_message_begin(llhttp_t* parser) {
     auto* self = static_cast<UpstreamHttpCodec*>(parser->data);
     self->response_.Reset();
     self->current_header_field_.clear();
     self->current_header_value_.clear();
+    self->trailers_.clear();
     self->parsing_header_value_ = false;
     self->in_header_field_ = false;
     // Reset all error state defensively (for connection reuse without external Reset())
@@ -35,21 +51,9 @@ static int on_status(llhttp_t* parser, const char* at, size_t length) {
 static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<UpstreamHttpCodec*>(parser->data);
 
-    // If we were reading a value, flush the previous header — but only
-    // if we're still in the header phase. After headers_complete, llhttp
-    // reuses these callbacks for trailers; we drop trailers to avoid
-    // promoting trailer-only fields (e.g., Digest) into the normal header
-    // block that BuildClientResponse() serializes to clients.
-    if (self->parsing_header_value_) {
-        if (!self->response_.headers_complete) {
-            std::string key = self->current_header_field_;
-            std::transform(key.begin(), key.end(), key.begin(),
-                           [](unsigned char c){ return std::tolower(c); });
-            self->response_.headers.emplace_back(std::move(key),
-                                                 std::move(self->current_header_value_));
-        }
-        self->current_header_field_.clear();
-        self->current_header_value_.clear();
+    if (self->parsing_header_value_ ||
+        (!self->in_header_field_ && !self->current_header_field_.empty())) {
+        FlushPendingHeader(self);
     }
 
     self->current_header_field_.append(at, length);
@@ -69,17 +73,12 @@ static int on_header_value(llhttp_t* parser, const char* at, size_t length) {
 static int on_headers_complete(llhttp_t* parser) {
     auto* self = static_cast<UpstreamHttpCodec*>(parser->data);
 
-    // llhttp fires on_headers_complete TWICE for chunked responses
-    // that carry trailers: once after the initial header block, and
-    // again after the trailer block. Only the first invocation should
-    // flush the last field/value pair into response_.headers and
-    // capture the status line. On the second invocation (trailers) we
-    // discard any buffered trailer pair — trailers are deliberately
-    // dropped to avoid promoting trailer-only fields (Digest, etc.)
-    // into the normal header block that BuildClientResponse forwards
-    // to clients. Without this guard, the final trailer leaks through
-    // as a regular response header.
     if (self->response_.headers_complete) {
+        FlushPendingHeader(self);
+        if (self->sink_ && self->response_.status_code >= HttpStatus::OK) {
+            self->sink_->OnTrailers(self->trailers_);
+        }
+        self->trailers_.clear();
         self->current_header_field_.clear();
         self->current_header_value_.clear();
         self->parsing_header_value_ = false;
@@ -87,16 +86,7 @@ static int on_headers_complete(llhttp_t* parser) {
         return 0;
     }
 
-    // Flush last header
-    if (!self->current_header_field_.empty()) {
-        std::string key = self->current_header_field_;
-        std::transform(key.begin(), key.end(), key.begin(),
-                       [](unsigned char c){ return std::tolower(c); });
-        self->response_.headers.emplace_back(std::move(key),
-                                             std::move(self->current_header_value_));
-        self->current_header_field_.clear();
-        self->current_header_value_.clear();
-    }
+    FlushPendingHeader(self);
 
     // Extract status code
     self->response_.status_code = llhttp_get_status_code(parser);
@@ -184,12 +174,13 @@ static int on_body(llhttp_t* parser, const char* at, size_t length) {
 static int on_message_complete(llhttp_t* parser) {
     auto* self = static_cast<UpstreamHttpCodec*>(parser->data);
 
-    // Discard any remaining trailer header field — trailers are not merged
-    // into response_.headers (see on_header_field's trailer guard above).
-    if (self->parsing_header_value_ && !self->current_header_field_.empty()) {
-        self->current_header_field_.clear();
-        self->current_header_value_.clear();
+    FlushPendingHeader(self);
+    if (self->sink_ &&
+        self->response_.status_code >= HttpStatus::OK &&
+        !self->trailers_.empty()) {
+        self->sink_->OnTrailers(self->trailers_);
     }
+    self->trailers_.clear();
 
     self->response_.complete = true;
     if (self->sink_ && self->response_.status_code >= HttpStatus::OK) {
@@ -264,6 +255,7 @@ size_t UpstreamHttpCodec::Parse(const char* data, size_t len) {
                 has_error_ = false;
                 current_header_field_.clear();
                 current_header_value_.clear();
+                trailers_.clear();
                 parsing_header_value_ = false;
                 in_header_field_ = false;
                 framing_hint_ =
@@ -296,6 +288,7 @@ void UpstreamHttpCodec::Reset() {
     error_type_ = ParseError::NONE;
     current_header_field_.clear();
     current_header_value_.clear();
+    trailers_.clear();
     parsing_header_value_ = false;
     in_header_field_ = false;
     framing_hint_ =

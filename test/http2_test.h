@@ -4111,6 +4111,61 @@ void TestH2_Async_HandlerThrowFiresCancelSlot() {
     }
 }
 
+void TestH2_StreamingAbortBeforeHeadersResetsStream() {
+    std::cout << "\n[TEST] H2 streaming: Abort before SendHeaders resets stream..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync(
+            "/abort-before-headers",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher /*push_resource*/,
+               HttpRouter::StreamingResponseSender stream_sender,
+               HttpRouter::AsyncCompletionCallback complete) {
+                stream_sender.Abort(
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::
+                        UPSTREAM_ERROR);
+                HttpResponse late;
+                late.Status(200).Text("late");
+                complete(std::move(late));
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/abort-before-headers");
+            if (!resp.rst) {
+                pass = false;
+                err += "expected RST_STREAM for pre-header abort; ";
+            }
+            if (resp.status == 200) {
+                pass = false;
+                err += "late buffered response was still submitted; ";
+            }
+            if (!resp.body.empty()) {
+                pass = false;
+                err += "body should be empty after pre-header abort; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: Abort before SendHeaders resets stream",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: Abort before SendHeaders resets stream",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression for PR #18 round-5 comment 2: H2 async handler that
 // calls complete() and then send_interim() inline on the dispatcher
 // thread (before returning from the handler body) must NOT land the
@@ -4578,6 +4633,7 @@ void RunAllTests() {
     TestH2_EarlyHints_OffDispatcherThread();
     TestH2_EarlyHints_DroppedAfterCompleteSameThread();
     TestH2_Async_HandlerThrowFiresCancelSlot();
+    TestH2_StreamingAbortBeforeHeadersResetsStream();
     TestH2_ProxyStreamingLargeContentLength();
 
     // --- Category 9: SETTINGS_ENABLE_PUSH wire format ---

@@ -407,6 +407,13 @@ private:
         if (terminal_ && !from_programmer_error) return;
         terminal_ = true;
 
+        if (!claimed_response_) {
+            if (!claim_response_ || !claim_response_()) {
+                return;
+            }
+            claimed_response_ = true;
+        }
+
         auto self = handler_.lock();
         auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
         if (data_source_) {
@@ -421,7 +428,7 @@ private:
             stream_id_,
             AbortReasonToString(reason),
             from_programmer_error);
-        if (headers_sent_ && session) {
+        if (session) {
             session->ResetStream(
                 stream_id_, HTTP2_CONSTANTS::ERROR_INTERNAL_ERROR);
         }

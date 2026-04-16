@@ -62,6 +62,7 @@ public:
     ParseError error_type_ = ParseError::NONE;
     std::string current_header_field_;
     std::string current_header_value_;
+    std::vector<std::pair<std::string, std::string>> trailers_;
     bool parsing_header_value_ = false;
     bool in_header_field_ = false;  // true while accumulating same header field across fragments
     UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink_ = nullptr;
