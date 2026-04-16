@@ -41,19 +41,11 @@ public:
         if (buffer_.empty()) {
             return;
         }
-        if (buffer_.size() == high_water_) {
+        size_t target = std::max(size_, high_water_);
+        if (buffer_.size() == target) {
             return;
         }
-        if (size_ > high_water_) {
-            logging::Get()->warn(
-                "H2 streaming watermarks shrink below buffered bytes size={} "
-                "high_water={} stream buffer kept",
-                size_, high_water_);
-            high_water_ = size_;
-            low_water_ = high_water_ / 2;
-            return;
-        }
-        if (!RebuildBuffer(high_water_)) {
+        if (!RebuildBuffer(target)) {
             Abort();
         }
     }
@@ -80,13 +72,11 @@ public:
                 return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
             }
         } else if (required > buffer_.size()) {
-            if (size_ >= high_water_) {
-                logging::Get()->error(
-                    "H2 streaming relay buffer overflow size={} append={} high_water={} capacity={}",
-                    size_, len, high_water_, buffer_.size());
-                Abort();
-                return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
-            }
+            // `high_water_` is a backpressure threshold, not a hard append cap:
+            // SendData must keep accepting bytes and report ABOVE_HIGH_WATER so
+            // the caller can pause upstream reads, matching the H1 sender
+            // contract. Grow only to the exact required size to avoid
+            // overshooting more than the already-buffered payload demands.
             if (!RebuildBuffer(required)) {
                 Abort();
                 return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
@@ -272,15 +262,6 @@ public:
         if (!headers_sent_) {
             return HandleProgrammerError("SendData");
         }
-        if (body_suppressed_) {
-            if (!programmer_error_) {
-                logging::Get()->error(
-                    "H2 streaming SendData called for bodyless response stream={}",
-                    stream_id_);
-                programmer_error_ = true;
-            }
-            return SendResult::CLOSED;
-        }
         if (terminal_ || programmer_error_ || !data_source_) {
             return SendResult::CLOSED;
         }
@@ -295,6 +276,9 @@ public:
                 "H2 streaming SendData called off dispatcher stream={}",
                 stream_id_);
             return SendResult::CLOSED;
+        }
+        if (body_suppressed_) {
+            return SendResult::ACCEPTED_BELOW_WATER;
         }
         if (data_source_->Append(data, len) == SendResult::CLOSED) {
             return SendResult::CLOSED;

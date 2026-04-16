@@ -4247,6 +4247,99 @@ void TestH2_StreamingNoBodyEndDoesNotResetStream() {
     }
 }
 
+void TestH2_StreamingBodylessSendDataDropsAndFinalizes() {
+    std::cout << "\n[TEST] H2 streaming: bodyless SendData drops and finalizes..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        auto send_result =
+            std::make_shared<std::atomic<int>>(static_cast<int>(
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED));
+        server.GetAsync(
+            "/stream-head-senddata",
+            [send_result](const HttpRequest&,
+                          HttpRouter::InterimResponseSender /*send_interim*/,
+                          HttpRouter::ResourcePusher /*push_resource*/,
+                          HttpRouter::StreamingResponseSender stream_sender,
+                          HttpRouter::AsyncCompletionCallback /*complete*/) {
+                HttpResponse head;
+                head.Status(200).Header("Content-Type", "text/plain");
+                if (stream_sender.SendHeaders(head) < 0) {
+                    return;
+                }
+                auto result = stream_sender.SendData("hello", 5);
+                send_result->store(static_cast<int>(result),
+                                   std::memory_order_release);
+                if (result ==
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                    return;
+                }
+                (void)stream_sender.End();
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+        int64_t before = server.GetStats().active_requests;
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.SendRequest("HEAD", "/stream-head-senddata", "");
+            if (resp.error) {
+                pass = false;
+                err += "client error; ";
+            }
+            if (resp.rst) {
+                pass = false;
+                err += "unexpected RST_STREAM; ";
+            }
+            if (resp.status != 200) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) + "; ";
+            }
+            if (!resp.body.empty()) {
+                pass = false;
+                err += "HEAD response leaked body; ";
+            }
+        }
+        client.Disconnect();
+
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(2);
+        int64_t after = server.GetStats().active_requests;
+        while (after != before &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            after = server.GetStats().active_requests;
+        }
+        if (after != before) {
+            pass = false;
+            err += "active_requests leaked from " +
+                   std::to_string(before) + " to " +
+                   std::to_string(after) + "; ";
+        }
+        if (send_result->load(std::memory_order_acquire) !=
+            static_cast<int>(
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::
+                    ACCEPTED_BELOW_WATER)) {
+            pass = false;
+            err += "bodyless SendData should be accepted/dropped; ";
+        }
+
+        TestFramework::RecordTest(
+            "H2 streaming: bodyless SendData drops and finalizes",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: bodyless SendData drops and finalizes",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestH2_StreamingUnknownLengthOmitsContentLength() {
     std::cout << "\n[TEST] H2 streaming: unknown-length response omits content-length..."
               << std::endl;
@@ -4310,6 +4403,98 @@ void TestH2_StreamingUnknownLengthOmitsContentLength() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "H2 streaming: unknown-length response omits content-length",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestH2_StreamingBatchedWritesPastHighWaterStayAccepted() {
+    std::cout << "\n[TEST] H2 streaming: batched writes past high-water stay accepted..."
+              << std::endl;
+    try {
+        auto first_result =
+            std::make_shared<std::atomic<int>>(static_cast<int>(
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED));
+        auto second_result =
+            std::make_shared<std::atomic<int>>(static_cast<int>(
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED));
+
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync(
+            "/stream-high-water-batch",
+            [first_result, second_result](
+                const HttpRequest&,
+                HttpRouter::InterimResponseSender /*send_interim*/,
+                HttpRouter::ResourcePusher /*push_resource*/,
+                HttpRouter::StreamingResponseSender stream_sender,
+                HttpRouter::AsyncCompletionCallback /*complete*/) {
+                static constexpr size_t HIGH_WATER_BYTES = 8;
+                HttpResponse head;
+                head.Status(200).Header("Content-Type", "text/plain");
+                stream_sender.ConfigureWatermarks(HIGH_WATER_BYTES);
+                if (stream_sender.SendHeaders(head) < 0) {
+                    return;
+                }
+                auto first = stream_sender.SendData("abcdefgh", 8);
+                first_result->store(static_cast<int>(first),
+                                    std::memory_order_release);
+                auto second = stream_sender.SendData("ijklmnop", 8);
+                second_result->store(static_cast<int>(second),
+                                     std::memory_order_release);
+                if (second ==
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                    return;
+                }
+                (void)stream_sender.End();
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/stream-high-water-batch");
+            if (resp.error) {
+                pass = false;
+                err += "client error; ";
+            }
+            if (resp.rst) {
+                pass = false;
+                err += "unexpected RST_STREAM; ";
+            }
+            if (resp.status != 200) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) + "; ";
+            }
+            if (resp.body != "abcdefghijklmnop") {
+                pass = false;
+                err += "body mismatch; ";
+            }
+        }
+        client.Disconnect();
+
+        auto above_water = static_cast<int>(
+            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::
+                ACCEPTED_ABOVE_HIGH_WATER);
+        if (first_result->load(std::memory_order_acquire) != above_water) {
+            pass = false;
+            err += "first write should report above-water; ";
+        }
+        if (second_result->load(std::memory_order_acquire) != above_water) {
+            pass = false;
+            err += "second write should stay accepted above-water; ";
+        }
+
+        TestFramework::RecordTest(
+            "H2 streaming: batched writes past high-water stay accepted",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: batched writes past high-water stay accepted",
             false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
@@ -4913,7 +5098,9 @@ void RunAllTests() {
     TestH2_Async_HandlerThrowFiresCancelSlot();
     TestH2_StreamingAbortBeforeHeadersResetsStream();
     TestH2_StreamingNoBodyEndDoesNotResetStream();
+    TestH2_StreamingBodylessSendDataDropsAndFinalizes();
     TestH2_StreamingUnknownLengthOmitsContentLength();
+    TestH2_StreamingBatchedWritesPastHighWaterStayAccepted();
     TestH2_StreamingEmptyEndInlineDoesNotResetStream();
     TestH2_ProxyStreamingLargeContentLength();
     TestH2_ProxyTransientHighWaterFlushDoesNotStall();
