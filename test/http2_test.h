@@ -3933,31 +3933,30 @@ void TestH2_Push_AsyncViaRunOnDispatcher() {
     }
 }
 
-// T9.13c: H2 push_resource called from a worker thread must auto-hop
-// to the dispatcher and still land a PUSH_PROMISE + response. Before
-// auto-hop, off-thread callers were silently dropped with a warn log,
-// which made the API unusable for real async handlers that resume on
-// a worker thread after an upstream completion.
-void TestH2_Push_OffDispatcherThreadHops() {
-    std::cout << "\n[TEST] H2 Push: off-dispatcher-thread hops to dispatcher..."
+// T9.13c: A ResourcePusher call that returns -1 must not also queue a
+// hidden push. Off-dispatcher calls therefore fail cleanly with no
+// PUSH_PROMISE side effect.
+void TestH2_Push_OffDispatcherThreadReturnsFailureWithoutSideEffect() {
+    std::cout << "\n[TEST] H2 Push: off-dispatcher-thread returns failure without side effect..."
               << std::endl;
     try {
         ServerConfig cfg = MakeH2Config(0);
         cfg.http2.enable_push = true;
         HttpServer server(cfg);
+        auto push_result = std::make_shared<std::promise<int32_t>>();
+        auto push_result_future = push_result->get_future();
         server.GetAsync("/",
-            [](const HttpRequest&,
-               HttpRouter::InterimResponseSender /*send_interim*/,
-               HttpRouter::ResourcePusher push_resource,
-               HttpRouter::StreamingResponseSender /*stream_sender*/,
-               HttpRouter::AsyncCompletionCallback complete) {
-                // Worker thread issues the push. Must auto-hop and
-                // the pushed stream must appear alongside the parent.
-                std::thread t([push_resource]() {
+            [push_result](const HttpRequest&,
+                          HttpRouter::InterimResponseSender /*send_interim*/,
+                          HttpRouter::ResourcePusher push_resource,
+                          HttpRouter::StreamingResponseSender /*stream_sender*/,
+                          HttpRouter::AsyncCompletionCallback complete) {
+                std::thread t([push_resource, push_result]() {
                     HttpResponse pushed;
                     pushed.Status(200).Body(kPushedBody, "text/css");
-                    push_resource("GET", "http", "localhost",
-                                  "/style.css", pushed);
+                    push_result->set_value(
+                        push_resource("GET", "http", "localhost",
+                                      "/style.css", pushed));
                 });
                 t.join();
                 HttpResponse main;
@@ -3974,30 +3973,28 @@ void TestH2_Push_OffDispatcherThreadHops() {
             pass = false; err += "connect failed; ";
         } else {
             auto resp = client.Get("/");
-            // Regression guard: a future break where off-thread push
-            // corrupts the main response must fail this test, not
-            // silently pass on the pushed-stream assertion alone.
             if (resp.status != 200) {
                 pass = false;
                 err += "parent status != 200 (got " +
                        std::to_string(resp.status) + "); ";
             }
-            if (resp.pushed.size() != 1) {
+            if (push_result_future.get() != -1) {
                 pass = false;
-                err += "expected 1 pushed stream after off-thread push, got " +
-                       std::to_string(resp.pushed.size()) + "; ";
-            } else if (resp.pushed[0].body != kPushedBody) {
-                pass = false; err += "pushed body mismatch; ";
+                err += "off-thread push should return -1; ";
+            }
+            if (!resp.pushed.empty()) {
+                pass = false;
+                err += "off-thread failure must not queue a pushed stream; ";
             }
         }
         client.Disconnect();
         TestFramework::RecordTest(
-            "H2 Push: off-dispatcher-thread hops to dispatcher", pass, err,
-            TestFramework::TestCategory::OTHER);
+            "H2 Push: off-dispatcher-thread returns failure without side effect",
+            pass, err, TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "H2 Push: off-dispatcher-thread hops to dispatcher", false, e.what(),
-            TestFramework::TestCategory::OTHER);
+            "H2 Push: off-dispatcher-thread returns failure without side effect",
+            false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
 
@@ -5193,7 +5190,7 @@ void RunAllTests() {
     TestH2_Push_SyncHandlerViaThreadLocal();
     TestH2_Push_OnHttp1Connection();
     TestH2_Push_AsyncViaRunOnDispatcher();
-    TestH2_Push_OffDispatcherThreadHops();
+    TestH2_Push_OffDispatcherThreadReturnsFailureWithoutSideEffect();
     TestH2_Push_RejectedAfterFinalResponseSubmitted();
     TestH2_Push_DroppedAfterCompleteSameThread();
     TestH2_Push_ActiveH2StreamsBalanced();

@@ -47,7 +47,7 @@ void UpstreamConnection::IncrementRequestCount() {
 void UpstreamConnection::IncReadDisable() {
     int previous = read_disable_count_.fetch_add(1, std::memory_order_acq_rel);
     if (previous == 0 && conn_) {
-        conn_->DisableReadMode();
+        conn_->PauseReadPump();
     }
 }
 
@@ -65,7 +65,7 @@ void UpstreamConnection::DecReadDisable() {
                 std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
             if (current == 1 && conn_) {
-                conn_->EnableReadMode();
+                conn_->ResumeReadPump();
             }
             return;
         }

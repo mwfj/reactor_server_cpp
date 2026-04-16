@@ -95,8 +95,8 @@ public:
     // `parent_stream_id` and the associated response on the freshly
     // promised stream, then flushes nghttp2 output.
     //
-    // Thread-safe: off-dispatcher callers are internally hopped to the
-    // dispatcher. Return value semantics (consistent with the
+    // Thread-safe: off-dispatcher callers are rejected safely with no
+    // side effects. Return value semantics (consistent with the
     // ResourcePusher public contract: >0 = promised id, -1 = failure):
     //   - On dispatcher: the promised stream_id (>0) on success, -1
     //     on validation / state failure (shutdown requested, push
@@ -104,15 +104,11 @@ public:
     //     already submitted, invalid method/scheme/path/authority,
     //     nghttp2 failure — see Http2Session::SubmitPushPromise for
     //     the full validation list).
-    //   - Off dispatcher: returns -1 (the call was queued, but the
-    //     off-thread caller cannot synchronously observe the submit
-    //     outcome, so we return the failure sentinel — callers that
-    //     use the return value to decide on a Link-header fallback
-    //     see "no id available" and fall back correctly). The push
-    //     still proceeds on the dispatcher on a best-effort basis.
-    //     Handlers that need the promised id MUST call from the
-    //     dispatcher thread (sync handler or inside a RunOnDispatcher
-    //     lambda before enqueuing complete()).
+    //   - Off dispatcher: returns -1 and does NOT queue a push. A
+    //     failure sentinel must not have a hidden side effect because
+    //     callers may use -1 to trigger a Link-header fallback.
+    //     Handlers that need push semantics MUST call from the
+    //     dispatcher thread.
     //
     // Application code should use the bound ResourcePusher closure
     // (async routes) or HTTP2_PUSH_NAMESPACE::PushResource (sync

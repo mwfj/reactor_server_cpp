@@ -671,6 +671,74 @@ void TestUpstreamConnectionRequestCount() {
     }
 }
 
+// Pausing an upstream read pump must not depend on a fresh ET read edge.
+// Bytes that arrived while paused should still be delivered after resume
+// via the synthetic OnMessage() drain.
+void TestUpstreamConnectionReadPauseResumesBufferedData() {
+    std::cout << "\n[TEST] UpstreamPool UpstreamConnection: read pause resumes buffered data..." << std::endl;
+    try {
+        int sv[2];
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+            throw std::runtime_error("socketpair failed");
+        }
+        for (int fd : sv) {
+            int flags = fcntl(fd, F_GETFL, 0);
+            if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+                ::close(sv[0]);
+                ::close(sv[1]);
+                throw std::runtime_error("failed to set non-blocking");
+            }
+        }
+
+        auto dispatcher = std::make_shared<Dispatcher>();
+        auto sock = std::make_unique<SocketHandler>(sv[0], "127.0.0.1", 9999);
+        auto conn = std::shared_ptr<ConnectionHandler>(
+            new ConnectionHandler(dispatcher, std::move(sock)));
+        UpstreamConnection uc(conn, "127.0.0.1", 9999);
+
+        std::string delivered;
+        conn->SetOnMessageCb(
+            [&delivered](std::shared_ptr<ConnectionHandler>, std::string& message) {
+                delivered = message;
+            });
+
+        uc.IncReadDisable();
+        static constexpr char PAYLOAD[] = "hello";
+        if (::send(sv[1], PAYLOAD, sizeof(PAYLOAD) - 1, 0) !=
+            static_cast<ssize_t>(sizeof(PAYLOAD) - 1)) {
+            ::close(sv[1]);
+            throw std::runtime_error("send failed");
+        }
+
+        // Simulate the readable edge that fired while the pump was paused.
+        conn->OnMessage();
+
+        bool pass = true;
+        std::string err;
+        if (!delivered.empty()) {
+            pass = false;
+            err += "paused read pump should not deliver data; ";
+        }
+
+        uc.DecReadDisable();
+        dispatcher->ProcessPendingTasks();
+
+        if (delivered != PAYLOAD) {
+            pass = false;
+            err += "resume did not drain buffered kernel data; ";
+        }
+
+        ::close(sv[1]);
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamConnection: read pause resumes buffered data",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamConnection: read pause resumes buffered data",
+            false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Section 4: UpstreamLease RAII tests
 //
@@ -1854,6 +1922,7 @@ void RunAllTests() {
     TestUpstreamConnectionIsAlive();
     TestUpstreamConnectionNullFd();
     TestUpstreamConnectionRequestCount();
+    TestUpstreamConnectionReadPauseResumesBufferedData();
 
     // Section 4: UpstreamLease RAII
     TestUpstreamLeaseEmptyDefault();

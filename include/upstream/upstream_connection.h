@@ -59,8 +59,8 @@ public:
     void IncrementRequestCount();
     // Ref-counted upstream read suppression used by the proxy relay's
     // downstream backpressure path. Thread-safe: the count itself is atomic,
-    // and the transition edges call ConnectionHandler::{Disable,Enable}ReadMode,
-    // which already hop off-dispatcher callers safely.
+    // and the transition edges pause/resume the transport's logical read
+    // pump without depending on ET read-interest re-registration.
     void IncReadDisable();
     void DecReadDisable();
     bool IsReadDisabled() const {

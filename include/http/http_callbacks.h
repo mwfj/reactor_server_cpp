@@ -83,15 +83,11 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     // sent, parent stream closed OR its final response already
     // submitted, nghttp2 submit failure.
     //
-    // Thread-safe: off-dispatcher callers are auto-hopped internally.
-    // Off-thread callers cannot synchronously observe the submit
-    // outcome, so they receive -1 (the failure sentinel) — a
-    // "caller-friendly" choice that lets `if (id > 0)` and
-    // `if (id != -1)` correctly branch into the Link-header / preload
-    // fallback path. The push itself still proceeds on the dispatcher
-    // on a best-effort basis. Application code that needs the promised
-    // id MUST call from the dispatcher thread (sync handler, inside a
-    // RunOnDispatcher lambda, or before enqueuing complete()).
+    // Thread-safe: off-dispatcher callers are rejected safely with -1
+    // and no side effects. Application code that needs a real push
+    // MUST call from the dispatcher thread (sync handler or inline
+    // during the async handler's dispatcher invocation, before
+    // enqueuing complete()).
     // See design spec §2.2.
     using ResourcePusher = std::function<int32_t(
         const std::string& method,

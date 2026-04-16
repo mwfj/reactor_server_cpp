@@ -1547,6 +1547,9 @@ HttpResponse ProxyTransaction::BuildResponseFromHead(
 
 HttpResponse ProxyTransaction::BuildStreamingHeadersResponse() const {
     HttpResponse response = BuildResponseFromHead(response_head_, false, nullptr);
+    // BuildResponseFromHead/HeaderRewriter strips upstream Trailer as a
+    // hop-by-hop field. Re-add it only for the one downstream path that will
+    // actually serialize a trailer block: HTTP/1.1 with forward_trailers=true.
     if (config_.forward_trailers &&
         client_http_major_ == 1 && client_http_minor_ == 1) {
         response.RemoveHeader("Trailer");

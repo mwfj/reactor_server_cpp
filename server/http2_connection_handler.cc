@@ -1058,32 +1058,11 @@ int32_t Http2ConnectionHandler::PushResource(
     const std::string& authority, const std::string& path,
     const HttpResponse& response) {
     if (!conn_) return -1;
-    // Off-dispatcher callers auto-hop so the API is usable from async
-    // handlers. Because we can't synchronously observe the submit
-    // outcome from the worker thread, we return -1 — the same sentinel
-    // used for any other failure — rather than inventing a third state
-    // (the previous 0 return broke the ResourcePusher contract, which
-    // the async caller may test with `if (id > 0)` or `if (id != -1)`
-    // to decide on a Link-header fallback; 0 would misclassify queued
-    // calls whose dispatcher-side submit later fails for real reasons
-    // like shutdown / peer refused / GOAWAY sent).
-    //
-    // Handlers that need the promised id MUST call from the dispatcher
-    // (sync handler, inside a RunOnDispatcher lambda, or inside the
-    // complete-callback before enqueuing complete()). Off-thread calls
-    // are "best effort": the push still goes through on the dispatcher,
-    // but caller treats the return as failure for decision purposes.
     if (!conn_->IsOnDispatcherThread()) {
-        std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
-        conn_->RunOnDispatcher(
-            [weak_self, parent_stream_id, method, scheme,
-             authority, path, response]() {
-            if (auto self = weak_self.lock()) {
-                self->PushResource(parent_stream_id, method, scheme,
-                                    authority, path, response);
-            }
-        });
-        return -1;  // queued; caller treats as "id not available" → fallback
+        logging::Get()->debug(
+            "PushResource called off dispatcher parent={}; drop",
+            parent_stream_id);
+        return -1;
     }
     if (!session_) {
         logging::Get()->debug(

@@ -73,6 +73,10 @@ private:
     // to EAGAIN (required for ET mode) but discards bytes past this limit.
     // 0 = unlimited (default). HttpServer sets this via ComputeInputCap().
     size_t max_input_size_ = 0;
+    // Logical read-pump pause used by the upstream proxy relay. Unlike
+    // toggling channel read interest, this keeps ET registration intact and
+    // resumes by scheduling a synthetic OnMessage() drain when unpaused.
+    std::atomic<bool> read_pump_paused_{false};
 public:
     ConnectionHandler() = delete;
     ConnectionHandler(std::shared_ptr<Dispatcher>, std::unique_ptr<SocketHandler>);
@@ -137,6 +141,11 @@ public:
     void EnableReadMode();
     void DisableReadMode();
     bool IsReadModeEnabled() const;
+    void PauseReadPump();
+    void ResumeReadPump();
+    bool IsReadPumpPaused() const {
+        return read_pump_paused_.load(std::memory_order_acquire);
+    }
 
     // Returns true if this connection has TLS (any state: handshake or ready).
     bool HasTls() const { return tls_state_ != TlsState::NONE; }
