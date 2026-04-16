@@ -1610,6 +1610,149 @@ namespace HttpTests {
         }
     }
 
+    void TestH1_Streaming205CanonicalizesContentLength() {
+        std::cout << "\n[TEST] H1 streaming: 205 canonicalizes Content-Length..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-205",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(205)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Content-Length", "9");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    (void)stream_sender.SendData("ignored", 7);
+                    (void)stream_sender.End();
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-205 HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("http/1.1 205 reset content") == std::string::npos) {
+                pass = false; err += "missing 205 response; ";
+            }
+            size_t cl_count = 0;
+            size_t pos = 0;
+            while ((pos = lower.find("content-length:", pos)) != std::string::npos) {
+                ++cl_count;
+                pos += std::string("content-length:").size();
+            }
+            if (cl_count != 1) {
+                pass = false; err += "expected exactly one content-length; ";
+            }
+            if (lower.find("content-length: 0") == std::string::npos) {
+                pass = false; err += "content-length not canonicalized to 0; ";
+            }
+            if (lower.find("content-length: 9") != std::string::npos) {
+                pass = false; err += "stale content-length leaked; ";
+            }
+            if (!TestHttpClient::ExtractBody(resp).empty()) {
+                pass = false; err += "205 response leaked body; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: 205 canonicalizes Content-Length",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: 205 canonicalizes Content-Length",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingDeduplicatesContentLength() {
+        std::cout << "\n[TEST] H1 streaming: duplicate Content-Length canonicalized..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-dup-cl",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .PreserveContentLength()
+                        .AppendHeader("Content-Length", "10")
+                        .AppendHeader("Content-Length", "10");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    (void)stream_sender.SendData("hello", 5);
+                    (void)stream_sender.SendData("world", 5);
+                    (void)stream_sender.End();
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-dup-cl HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("http/1.1 200 ok") == std::string::npos) {
+                pass = false; err += "missing 200 response; ";
+            }
+            size_t cl_count = 0;
+            size_t pos = 0;
+            while ((pos = lower.find("content-length:", pos)) != std::string::npos) {
+                ++cl_count;
+                pos += std::string("content-length:").size();
+            }
+            if (cl_count != 1) {
+                pass = false; err += "expected exactly one content-length; ";
+            }
+            if (lower.find("content-length: 10") == std::string::npos) {
+                pass = false; err += "canonical content-length missing; ";
+            }
+            if (lower.find("transfer-encoding: chunked") != std::string::npos) {
+                pass = false; err += "unexpected chunked transfer-encoding; ";
+            }
+            if (TestHttpClient::ExtractBody(resp) != "helloworld") {
+                pass = false; err += "body mismatch; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: duplicate Content-Length canonicalized",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: duplicate Content-Length canonicalized",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // T8: Worker-thread interleave — a handler that calls complete() from
     // a worker thread followed by send_interim() from the same worker
     // must not be able to queue a 103 AFTER the 200 on the wire.
@@ -1936,6 +2079,8 @@ namespace HttpTests {
         TestH1_EarlyHints_100ContinueThen103();
         TestH1_EarlyHints_CRLFSanitized();
         TestH1_StreamingTrailers_CRLFSanitized();
+        TestH1_Streaming205CanonicalizesContentLength();
+        TestH1_StreamingDeduplicatesContentLength();
         TestH1_EarlyHints_WorkerThreadOrderingSafe();
         TestH1_EarlyHints_PipelinedKeepAliveNoStale();
         TestH1_Async_HandlerThrowFiresCancelSlot();

@@ -73,9 +73,11 @@ struct PreparedStreamingHead {
 
 std::string SerializeStreamingHead(const HttpResponse& response,
                                    int http_minor,
-                                   bool use_chunked,
-                                   bool strip_content_length) {
+                                   bool use_chunked) {
     std::ostringstream oss;
+    auto effective_cl = use_chunked
+        ? std::optional<std::string>()
+        : response.ComputeWireContentLength(response.GetStatusCode());
 
     oss << "HTTP/1." << http_minor << " " << response.GetStatusCode()
         << " " << response.GetStatusReason() << "\r\n";
@@ -84,8 +86,11 @@ std::string SerializeStreamingHead(const HttpResponse& response,
         std::transform(lower.begin(), lower.end(), lower.begin(),
                        [](unsigned char c) { return std::tolower(c); });
         if (lower == "transfer-encoding") continue;
-        if (strip_content_length && lower == "content-length") continue;
+        if (lower == "content-length") continue;
         oss << key << ": " << value << "\r\n";
+    }
+    if (effective_cl) {
+        oss << "Content-Length: " << *effective_cl << "\r\n";
     }
     if (use_chunked) {
         oss << "Transfer-Encoding: chunked\r\n";
@@ -466,15 +471,8 @@ HttpConnectionHandler::CreateStreamingResponseSender(
             }
         }
 
-        const bool strip_content_length =
-            use_chunked ||
-            status_code < HttpStatus::OK ||
-            status_code == HttpStatus::SWITCHING_PROTOCOLS ||
-            status_code == HttpStatus::NO_CONTENT;
-
         return PreparedStreamingHead{
-            SerializeStreamingHead(response, http_minor, use_chunked,
-                                   strip_content_length),
+            SerializeStreamingHead(response, http_minor, use_chunked),
             use_chunked,
             should_close,
             body_suppressed};

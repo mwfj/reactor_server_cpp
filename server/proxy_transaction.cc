@@ -465,6 +465,12 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
                           client_fd_, service_name_, transport->fd(),
                           attempt_);
 
+    // Bound how much raw upstream data can accumulate in the transport's
+    // ET read loop before the codec/backpressure path gets a chance to run.
+    // This cap is per checked-out transaction and is cleared before the
+    // connection returns to the pool.
+    transport->SetMaxInputSize(config_.relay_buffer_limit_bytes);
+
     // Wire transport callbacks (do NOT overwrite close/error -- pool owns those).
     // Use shared_ptr capture to keep the transaction alive while the upstream
     // connection is in-flight.  The reference cycle (transaction -> lease ->
@@ -1301,6 +1307,7 @@ void ProxyTransaction::Cleanup() {
                 // any window where the callback can still fire on a
                 // transaction that's being torn down.
                 transport->SetWriteProgressCb(nullptr);
+                transport->SetMaxInputSize(0);
                 ClearResponseTimeout();
             }
             // Poison the connection if an early response was received while
@@ -1343,6 +1350,7 @@ void ProxyTransaction::ReleaseHeldRetryable5xxTransport() {
             transport->SetOnMessageCb(nullptr);
             transport->SetCompletionCb(nullptr);
             transport->SetWriteProgressCb(nullptr);
+            transport->SetMaxInputSize(0);
             ClearResponseTimeout();
         }
         if (poison_connection_) {
