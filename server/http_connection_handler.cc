@@ -121,9 +121,16 @@ std::string SerializeStreamingHead(const HttpResponse& response,
                                    int http_minor,
                                    bool use_chunked) {
     std::ostringstream oss;
-    auto effective_cl = use_chunked
-        ? std::optional<std::string>()
-        : response.ComputeWireContentLength(response.GetStatusCode());
+    // Streaming headers are emitted before the final body length is known. Only
+    // preserve an explicit known length (or status-defined wire values like
+    // 205/304); never auto-compute from the empty headers-only body.
+    std::optional<std::string> effective_cl;
+    if (!use_chunked &&
+        (response.IsContentLengthPreserved() ||
+         response.GetStatusCode() == HttpStatus::RESET_CONTENT ||
+         response.GetStatusCode() == HttpStatus::NOT_MODIFIED)) {
+        effective_cl = response.ComputeWireContentLength(response.GetStatusCode());
+    }
     auto merged_trailer = MergeAllowedTrailerDeclarations(response.GetHeaders());
 
     oss << "HTTP/1." << http_minor << " " << response.GetStatusCode()

@@ -1464,6 +1464,16 @@ bool ProxyTransaction::ResumeHeldRetryable5xxResponse(
     if (state_ == State::COMPLETE || state_ == State::FAILED) {
         return true;
     }
+    if (!body_complete_ &&
+        response_head_.framing ==
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH &&
+        response_head_.expected_length == 0 &&
+        paused_parse_bytes_.empty()) {
+        // We paused llhttp at headers, before on_message_complete could mark
+        // a zero-length body finished. When retry is abandoned later, there may
+        // be no buffered bytes or EOF edge left to drive completion.
+        body_complete_ = true;
+    }
     if (body_complete_) {
         OnResponseComplete();
         return true;

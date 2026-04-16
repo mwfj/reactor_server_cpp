@@ -836,6 +836,7 @@ int Http2Session::SubmitResponse(int32_t stream_id, const HttpResponse& response
             key == "transfer-encoding" || key == "upgrade") {
             continue;
         }
+        if (key == "trailer") continue;
         // Always strip caller-set content-length — we compute the
         // authoritative value below via HttpResponse::ComputeWireContentLength
         // (which mirrors the HTTP/1 Serialize() rules: 304 metadata
@@ -1064,6 +1065,7 @@ int Http2Session::SubmitStreamingResponse(
             key == "transfer-encoding" || key == "upgrade") {
             continue;
         }
+        if (key == "trailer") continue;
         if (key == "content-length") continue;
         lowered_names.push_back(std::move(key));
         nva.push_back({

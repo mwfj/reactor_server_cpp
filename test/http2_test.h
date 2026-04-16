@@ -4407,6 +4407,75 @@ void TestH2_StreamingUnknownLengthOmitsContentLength() {
     }
 }
 
+void TestH2_StreamingSuppressesTrailerDeclarationUntilTrailersSupported() {
+    std::cout << "\n[TEST] H2 streaming: Trailer declaration suppressed until trailing HEADERS are supported..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync(
+            "/stream-trailer-declared",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher /*push_resource*/,
+               HttpRouter::StreamingResponseSender stream_sender,
+               HttpRouter::AsyncCompletionCallback /*complete*/) {
+                HttpResponse head;
+                head.Status(200)
+                    .Header("Content-Type", "text/plain")
+                    .Header("Trailer", "X-Checksum");
+                if (stream_sender.SendHeaders(head) < 0) {
+                    return;
+                }
+                if (stream_sender.SendData("hello", 5) ==
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                    return;
+                }
+                (void)stream_sender.End({{"X-Checksum", "abc123"}});
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/stream-trailer-declared");
+            if (resp.error) {
+                pass = false;
+                err += "client error; ";
+            }
+            if (resp.rst) {
+                pass = false;
+                err += "unexpected RST_STREAM; ";
+            }
+            if (resp.status != 200) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) + "; ";
+            }
+            if (resp.body != "hello") {
+                pass = false;
+                err += "body mismatch; ";
+            }
+            if (FindHeaderValueCI(resp.headers, "trailer")) {
+                pass = false;
+                err += "Trailer header should be suppressed on H2 streaming path; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: Trailer declaration suppressed until trailing HEADERS are supported",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: Trailer declaration suppressed until trailing HEADERS are supported",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestH2_StreamingBatchedWritesPastHighWaterStayAccepted() {
     std::cout << "\n[TEST] H2 streaming: batched writes past high-water stay accepted..."
               << std::endl;
@@ -5100,6 +5169,7 @@ void RunAllTests() {
     TestH2_StreamingNoBodyEndDoesNotResetStream();
     TestH2_StreamingBodylessSendDataDropsAndFinalizes();
     TestH2_StreamingUnknownLengthOmitsContentLength();
+    TestH2_StreamingSuppressesTrailerDeclarationUntilTrailersSupported();
     TestH2_StreamingBatchedWritesPastHighWaterStayAccepted();
     TestH2_StreamingEmptyEndInlineDoesNotResetStream();
     TestH2_ProxyStreamingLargeContentLength();

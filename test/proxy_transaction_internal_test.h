@@ -58,10 +58,14 @@ void TestHeldRetryable5xxResumeCompletesBodylessResponse() {
         tx->state_ = ProxyTransaction::State::RECEIVING_BODY;
         tx->relay_mode_ = ProxyTransaction::RelayMode::BUFFERED;
         tx->response_headers_seen_ = true;
-        tx->body_complete_ = true;
+        tx->body_complete_ = false;
         tx->holding_retryable_5xx_response_ = true;
         tx->response_head_.status_code = HttpStatus::SERVICE_UNAVAILABLE;
         tx->response_head_.status_reason = "Service Unavailable";
+        tx->response_head_.framing =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH;
+        tx->response_head_.expected_length = 0;
+        tx->codec_.PauseParsing();
 
         bool resumed = tx->ResumeHeldRetryable5xxResponse("unit_test");
 

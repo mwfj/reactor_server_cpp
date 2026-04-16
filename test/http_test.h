@@ -1857,6 +1857,71 @@ namespace HttpTests {
         }
     }
 
+    void TestH1_StreamingHttp10UnknownLengthOmitsContentLength() {
+        std::cout << "\n[TEST] H1 streaming: HTTP/1.0 unknown-length response omits Content-Length..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-http10-unknown",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200).Header("Content-Type", "text/plain");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    if (stream_sender.SendData("hello", 5) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                        return;
+                    }
+                    if (stream_sender.SendData("world", 5) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End();
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-http10-unknown HTTP/1.0\r\n"
+                "Host: x\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("http/1.0 200 ok") == std::string::npos) {
+                pass = false; err += "missing HTTP/1.0 200 response; ";
+            }
+            if (lower.find("content-length:") != std::string::npos) {
+                pass = false; err += "content-length should be omitted; ";
+            }
+            if (lower.find("transfer-encoding:") != std::string::npos) {
+                pass = false; err += "transfer-encoding should be omitted; ";
+            }
+            if (TestHttpClient::ExtractBody(resp) != "helloworld") {
+                pass = false; err += "body mismatch; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: HTTP/1.0 unknown-length response omits Content-Length",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: HTTP/1.0 unknown-length response omits Content-Length",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // T8: Worker-thread interleave — a handler that calls complete() from
     // a worker thread followed by send_interim() from the same worker
     // must not be able to queue a 103 AFTER the 200 on the wire.
@@ -2186,6 +2251,7 @@ namespace HttpTests {
         TestH1_StreamingTrailers_DeclarationFiltersForbiddenNames();
         TestH1_Streaming205CanonicalizesContentLength();
         TestH1_StreamingDeduplicatesContentLength();
+        TestH1_StreamingHttp10UnknownLengthOmitsContentLength();
         TestH1_EarlyHints_WorkerThreadOrderingSafe();
         TestH1_EarlyHints_PipelinedKeepAliveNoStale();
         TestH1_Async_HandlerThrowFiresCancelSlot();
