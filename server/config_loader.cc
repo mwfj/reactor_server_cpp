@@ -1,4 +1,5 @@
 #include "config/config_loader.h"
+#include "auth/auth_config.h"
 #include "http2/http2_constants.h"
 #include "http/route_trie.h"         // ParsePattern, ValidatePattern for proxy route_prefix
 #include "log/logger.h"
@@ -14,6 +15,234 @@
 #include <unordered_set>
 
 using json = nlohmann::json;
+
+// Serialize a single AuthPolicy to JSON (mirror of ParseAuthPolicy for
+// ToJson round-trip). Omits defaulted fields only when they would collapse
+// noisily; defaulted simple fields are always emitted to keep the output
+// shape stable across round-trips.
+static nlohmann::json SerializeAuthPolicy(const auth::AuthPolicy& p) {
+    nlohmann::json out;
+    if (!p.name.empty()) out["name"] = p.name;
+    out["enabled"] = p.enabled;
+    if (!p.applies_to.empty()) out["applies_to"] = p.applies_to;
+    if (!p.issuers.empty()) out["issuers"] = p.issuers;
+    if (!p.required_scopes.empty()) out["required_scopes"] = p.required_scopes;
+    if (!p.required_audience.empty()) out["required_audience"] = p.required_audience;
+    out["on_undetermined"] = p.on_undetermined;
+    out["realm"] = p.realm;
+    return out;
+}
+
+// Parse a single AuthPolicy JSON object. Used both for inline
+// `upstreams[i].proxy.auth` and for top-level `auth.policies[]` entries.
+// `context` is embedded in error messages so operators can locate the
+// offending block.
+static void ParseAuthPolicy(const nlohmann::json& j, auth::AuthPolicy& out,
+                            const std::string& context) {
+    if (!j.is_object()) {
+        throw std::invalid_argument(context + " must be a JSON object");
+    }
+    out.name = j.value("name", std::string{});
+    out.enabled = j.value("enabled", false);
+    if (j.contains("applies_to")) {
+        if (!j["applies_to"].is_array()) {
+            throw std::invalid_argument(
+                context + ".applies_to must be an array of strings");
+        }
+        for (const auto& p : j["applies_to"]) {
+            if (!p.is_string()) {
+                throw std::invalid_argument(
+                    context + ".applies_to entries must be strings");
+            }
+            out.applies_to.push_back(p.get<std::string>());
+        }
+    }
+    if (j.contains("issuers")) {
+        if (!j["issuers"].is_array()) {
+            throw std::invalid_argument(
+                context + ".issuers must be an array of strings");
+        }
+        for (const auto& p : j["issuers"]) {
+            if (!p.is_string()) {
+                throw std::invalid_argument(
+                    context + ".issuers entries must be strings");
+            }
+            out.issuers.push_back(p.get<std::string>());
+        }
+    }
+    if (j.contains("required_scopes")) {
+        if (!j["required_scopes"].is_array()) {
+            throw std::invalid_argument(
+                context + ".required_scopes must be an array of strings");
+        }
+        for (const auto& p : j["required_scopes"]) {
+            if (!p.is_string()) {
+                throw std::invalid_argument(
+                    context + ".required_scopes entries must be strings");
+            }
+            out.required_scopes.push_back(p.get<std::string>());
+        }
+    }
+    out.required_audience = j.value("required_audience", std::string{});
+    out.on_undetermined = j.value("on_undetermined", std::string("deny"));
+    out.realm = j.value("realm", std::string("api"));
+}
+
+// Parse a single IssuerConfig JSON object for the top-level
+// `auth.issuers[name]` map.
+static void ParseIssuerConfig(const std::string& name, const nlohmann::json& j,
+                              auth::IssuerConfig& out) {
+    const std::string ctx = "auth.issuers." + name;
+    if (!j.is_object()) {
+        throw std::invalid_argument(ctx + " must be a JSON object");
+    }
+    out.name = name;
+    out.issuer_url = j.value("issuer_url", std::string{});
+    out.discovery = j.value("discovery", true);
+    out.jwks_uri = j.value("jwks_uri", std::string{});
+    out.upstream = j.value("upstream", std::string{});
+    out.mode = j.value("mode", std::string("jwt"));
+    out.leeway_sec = j.value("leeway_sec", 30);
+    out.jwks_cache_sec = j.value("jwks_cache_sec", 300);
+    out.jwks_refresh_timeout_sec = j.value("jwks_refresh_timeout_sec", 5);
+    out.discovery_retry_sec = j.value("discovery_retry_sec", 30);
+
+    if (j.contains("audiences")) {
+        if (!j["audiences"].is_array()) {
+            throw std::invalid_argument(ctx + ".audiences must be an array");
+        }
+        out.audiences.clear();
+        for (const auto& v : j["audiences"]) {
+            if (!v.is_string()) {
+                throw std::invalid_argument(
+                    ctx + ".audiences entries must be strings");
+            }
+            out.audiences.push_back(v.get<std::string>());
+        }
+    }
+    if (j.contains("algorithms")) {
+        if (!j["algorithms"].is_array()) {
+            throw std::invalid_argument(ctx + ".algorithms must be an array");
+        }
+        out.algorithms.clear();
+        for (const auto& v : j["algorithms"]) {
+            if (!v.is_string()) {
+                throw std::invalid_argument(
+                    ctx + ".algorithms entries must be strings");
+            }
+            out.algorithms.push_back(v.get<std::string>());
+        }
+    }
+    if (j.contains("required_claims")) {
+        if (!j["required_claims"].is_array()) {
+            throw std::invalid_argument(
+                ctx + ".required_claims must be an array");
+        }
+        for (const auto& v : j["required_claims"]) {
+            if (!v.is_string()) {
+                throw std::invalid_argument(
+                    ctx + ".required_claims entries must be strings");
+            }
+            out.required_claims.push_back(v.get<std::string>());
+        }
+    }
+    if (j.contains("introspection")) {
+        if (!j["introspection"].is_object()) {
+            throw std::invalid_argument(
+                ctx + ".introspection must be an object");
+        }
+        const auto& i = j["introspection"];
+        // Reject inline client_secret — only env-var sourcing is allowed
+        // (design spec §9 item 8, §5.3).
+        if (i.contains("client_secret")) {
+            throw std::invalid_argument(
+                ctx + ".introspection.client_secret must NOT be set inline; "
+                "use client_secret_env instead");
+        }
+        out.introspection.endpoint = i.value("endpoint", std::string{});
+        out.introspection.client_id = i.value("client_id", std::string{});
+        out.introspection.client_secret_env =
+            i.value("client_secret_env", std::string{});
+        out.introspection.auth_style =
+            i.value("auth_style", std::string("basic"));
+        out.introspection.timeout_sec = i.value("timeout_sec", 3);
+        out.introspection.cache_sec = i.value("cache_sec", 60);
+        out.introspection.negative_cache_sec =
+            i.value("negative_cache_sec", 10);
+        out.introspection.stale_grace_sec = i.value("stale_grace_sec", 30);
+        out.introspection.max_entries = i.value("max_entries", 100000);
+        out.introspection.shards = i.value("shards", 16);
+    }
+}
+
+// Parse the top-level `auth` block into ServerConfig::auth.
+static void ParseAuthConfig(const nlohmann::json& j, auth::AuthConfig& out) {
+    if (!j.is_object()) {
+        throw std::invalid_argument("auth must be a JSON object");
+    }
+    out.enabled = j.value("enabled", false);
+    out.hmac_cache_key_env = j.value("hmac_cache_key_env", std::string{});
+
+    if (j.contains("issuers")) {
+        if (!j["issuers"].is_object()) {
+            throw std::invalid_argument(
+                "auth.issuers must be an object mapping name -> IssuerConfig");
+        }
+        for (auto it = j["issuers"].begin(); it != j["issuers"].end(); ++it) {
+            auth::IssuerConfig ic;
+            ParseIssuerConfig(it.key(), it.value(), ic);
+            out.issuers.emplace(it.key(), std::move(ic));
+        }
+    }
+
+    if (j.contains("policies")) {
+        if (!j["policies"].is_array()) {
+            throw std::invalid_argument(
+                "auth.policies must be an array of AuthPolicy objects");
+        }
+        for (size_t i = 0; i < j["policies"].size(); ++i) {
+            auth::AuthPolicy p;
+            ParseAuthPolicy(j["policies"][i], p,
+                            "auth.policies[" + std::to_string(i) + "]");
+            out.policies.push_back(std::move(p));
+        }
+    }
+
+    if (j.contains("forward")) {
+        if (!j["forward"].is_object()) {
+            throw std::invalid_argument("auth.forward must be an object");
+        }
+        const auto& f = j["forward"];
+        out.forward.subject_header =
+            f.value("subject_header", std::string("X-Auth-Subject"));
+        out.forward.issuer_header =
+            f.value("issuer_header", std::string("X-Auth-Issuer"));
+        out.forward.scopes_header =
+            f.value("scopes_header", std::string("X-Auth-Scopes"));
+        out.forward.raw_jwt_header =
+            f.value("raw_jwt_header", std::string{});
+        out.forward.strip_inbound_identity_headers =
+            f.value("strip_inbound_identity_headers", true);
+        out.forward.preserve_authorization =
+            f.value("preserve_authorization", true);
+        if (f.contains("claims_to_headers")) {
+            if (!f["claims_to_headers"].is_object()) {
+                throw std::invalid_argument(
+                    "auth.forward.claims_to_headers must be an object "
+                    "mapping claim-name -> header-name");
+            }
+            for (auto it = f["claims_to_headers"].begin();
+                 it != f["claims_to_headers"].end(); ++it) {
+                if (!it.value().is_string()) {
+                    throw std::invalid_argument(
+                        "auth.forward.claims_to_headers values must be strings");
+                }
+                out.forward.claims_to_headers.emplace(
+                    it.key(), it.value().get<std::string>());
+            }
+        }
+    }
+}
 
 ServerConfig ConfigLoader::LoadFromFile(const std::string& path) {
     std::ifstream file(path);
@@ -265,6 +494,17 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     upstream.proxy.retry.retry_on_disconnect = r.value("retry_on_disconnect", true);
                     upstream.proxy.retry.retry_non_idempotent = r.value("retry_non_idempotent", false);
                 }
+
+                // Inline per-proxy auth policy. `applies_to` is derived from
+                // `route_prefix` at AuthManager::RegisterPolicy time — the
+                // inline stanza never declares its own `applies_to`. See
+                // design spec §3.2 / §5.2.
+                if (proxy.contains("auth")) {
+                    ParseAuthPolicy(
+                        proxy["auth"],
+                        upstream.proxy.auth,
+                        "upstreams[" + upstream.name + "].proxy.auth");
+                }
             }
 
             if (item.contains("circuit_breaker")) {
@@ -389,6 +629,17 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 config.rate_limit.zones.push_back(std::move(zone));
             }
         }
+    }
+
+    // Top-level auth config section (OAuth 2.0 token validation — §5.1).
+    // Parsed into config.auth; actually consumed by AuthManager at startup
+    // and by HttpServer::Reload() via AuthManager::Reload(). Per-proxy
+    // auth stanzas are handled inline in the upstreams loop above; the
+    // top-level section here owns the named issuers registry, the
+    // top-level `auth.policies[]` with explicit applies_to, the forward
+    // overlay config, and the HMAC cache-key env-var name.
+    if (j.contains("auth")) {
+        ParseAuthConfig(j["auth"], config.auth);
     }
 
     return config;
@@ -1219,6 +1470,180 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             }
         }
     }
+
+    // -------------------------------------------------------------------
+    // Auth validation (design spec §5.3).
+    //
+    // Scope: defensive input validation on the parsed auth config. Hard-
+    // reject conditions that cannot safely be live-applied later by
+    // AuthManager — e.g. HS256 which has no symmetric-secret provisioning
+    // surface in v1, or alg `none` which would constitute an
+    // authentication bypass if silently accepted. Validator runs once at
+    // startup (via ConfigLoader::Validate) and whenever reload wiring
+    // gets added — the runtime code downstream can then trust the parsed
+    // shape.
+    // -------------------------------------------------------------------
+    {
+        // Supported asymmetric algorithm allowlist — v1.
+        const std::unordered_set<std::string> kAllowedAlgs = {
+            "RS256", "RS384", "RS512", "ES256", "ES384"
+        };
+        // Collect upstream names to validate `issuer.upstream` references.
+        std::unordered_set<std::string> upstream_names;
+        for (const auto& u : config.upstreams) upstream_names.insert(u.name);
+
+        // Issuer validation.
+        for (const auto& [name, ic] : config.auth.issuers) {
+            const std::string ctx = "auth.issuers." + name;
+            if (name.empty()) {
+                throw std::invalid_argument(
+                    "auth.issuers key must be a non-empty string");
+            }
+            if (ic.issuer_url.empty()) {
+                throw std::invalid_argument(ctx + ".issuer_url is required");
+            }
+            // TLS-mandatory to IdP (design spec §9 item 4). Plaintext rejected.
+            if (ic.issuer_url.rfind("https://", 0) != 0) {
+                throw std::invalid_argument(
+                    ctx + ".issuer_url must start with https:// (plaintext "
+                    "IdP traffic is rejected for security)");
+            }
+            // Mode whitelist; `auto` is deferred per spec §15.
+            if (ic.mode != "jwt" && ic.mode != "introspection") {
+                throw std::invalid_argument(
+                    ctx + ".mode must be one of: \"jwt\", \"introspection\"");
+            }
+            // Algorithm allowlist — reject HS*/none/PS*/unknown. Phase 1 is
+            // asymmetric-only; HS* needs symmetric-secret provisioning
+            // (deferred, spec §15).
+            for (const auto& a : ic.algorithms) {
+                if (kAllowedAlgs.count(a) == 0) {
+                    throw std::invalid_argument(
+                        ctx + ".algorithms contains unsupported value '" + a +
+                        "' (v1 supports only RS256/RS384/RS512/ES256/ES384; "
+                        "HS*/none/PS*/auto are deferred per design spec §15)");
+                }
+            }
+            // Referenced upstream must exist (for outbound IdP calls).
+            if (!ic.upstream.empty() && upstream_names.count(ic.upstream) == 0) {
+                throw std::invalid_argument(
+                    ctx + ".upstream references unknown upstream '" +
+                    ic.upstream + "' — define it under `upstreams[]` first");
+            }
+            // Basic range checks.
+            if (ic.leeway_sec < 0) {
+                throw std::invalid_argument(ctx + ".leeway_sec must be >= 0");
+            }
+            if (ic.jwks_cache_sec <= 0) {
+                throw std::invalid_argument(ctx + ".jwks_cache_sec must be > 0");
+            }
+        }
+
+        // Top-level policy validation.
+        for (size_t i = 0; i < config.auth.policies.size(); ++i) {
+            const auto& p = config.auth.policies[i];
+            const std::string ctx =
+                "auth.policies[" + std::to_string(i) + "]";
+            if (p.on_undetermined != "deny" && p.on_undetermined != "allow") {
+                throw std::invalid_argument(
+                    ctx + ".on_undetermined must be \"deny\" or \"allow\"");
+            }
+            for (const auto& issuer_name : p.issuers) {
+                if (config.auth.issuers.count(issuer_name) == 0) {
+                    throw std::invalid_argument(
+                        ctx + ".issuers references unknown issuer '" +
+                        issuer_name + "'");
+                }
+            }
+        }
+
+        // Inline proxy.auth validation + exact-prefix collision detection.
+        // Per spec §3.2 / §5.2: a prefix that appears in both an inline
+        // proxy.auth and a top-level auth.policies[].applies_to is a
+        // hard-reject config error (ambiguity, not resolved at runtime).
+        // Also catch duplicate `route_prefix` across proxies when both
+        // have inline auth.
+        std::unordered_map<std::string, std::string> inline_prefixes;  // prefix -> owner
+        for (const auto& u : config.upstreams) {
+            if (u.proxy.auth == auth::AuthPolicy{}) continue;
+            const auto& p = u.proxy.auth;
+            const std::string ctx = "upstreams['" + u.name + "'].proxy.auth";
+            if (p.on_undetermined != "deny" && p.on_undetermined != "allow") {
+                throw std::invalid_argument(
+                    ctx + ".on_undetermined must be \"deny\" or \"allow\"");
+            }
+            for (const auto& issuer_name : p.issuers) {
+                if (config.auth.issuers.count(issuer_name) == 0) {
+                    throw std::invalid_argument(
+                        ctx + ".issuers references unknown issuer '" +
+                        issuer_name + "'");
+                }
+            }
+            // Inline proxy.auth derives its applies_to from the proxy's
+            // route_prefix. An empty route_prefix is a config bug — the
+            // policy would apply to everything, shadowing any top-level
+            // catch-all.
+            if (u.proxy.route_prefix.empty()) {
+                throw std::invalid_argument(
+                    ctx + " has no route_prefix — inline auth requires a "
+                    "non-empty proxy.route_prefix to derive applies_to");
+            }
+            auto ins = inline_prefixes.emplace(u.proxy.route_prefix, u.name);
+            if (!ins.second) {
+                throw std::invalid_argument(
+                    "prefix '" + u.proxy.route_prefix + "' appears in two "
+                    "proxies with inline auth (upstreams '" + ins.first->second +
+                    "' and '" + u.name + "') — exact-prefix collisions must be "
+                    "resolved at config time (design spec §3.2)");
+            }
+        }
+        // Top-level policies vs inline: a prefix that appears inline MUST
+        // NOT also appear in any top-level `auth.policies[].applies_to`.
+        for (size_t i = 0; i < config.auth.policies.size(); ++i) {
+            const auto& p = config.auth.policies[i];
+            for (const auto& pref : p.applies_to) {
+                auto it = inline_prefixes.find(pref);
+                if (it != inline_prefixes.end()) {
+                    throw std::invalid_argument(
+                        "auth.policies[" + std::to_string(i) + "] applies_to "
+                        "contains prefix '" + pref + "' which is already "
+                        "declared by inline proxy.auth on upstream '" +
+                        it->second + "' — resolve the collision at config "
+                        "time (design spec §3.2)");
+                }
+            }
+        }
+
+        // Forward config: reject header-name collisions among the fixed
+        // output slots and the claims_to_headers map. Design §5.3.
+        if (config.auth.forward != auth::AuthForwardConfig{}) {
+            std::unordered_set<std::string> output_headers;
+            auto add_header = [&output_headers](const std::string& name,
+                                                const std::string& which) {
+                if (name.empty()) return;
+                std::string lower;
+                lower.reserve(name.size());
+                for (char c : name) {
+                    lower.push_back(static_cast<char>(
+                        std::tolower(static_cast<unsigned char>(c))));
+                }
+                if (!output_headers.insert(lower).second) {
+                    throw std::invalid_argument(
+                        "auth.forward." + which + " '" + name +
+                        "' collides with another output header name "
+                        "(case-insensitive)");
+                }
+            };
+            add_header(config.auth.forward.subject_header, "subject_header");
+            add_header(config.auth.forward.issuer_header, "issuer_header");
+            add_header(config.auth.forward.scopes_header, "scopes_header");
+            add_header(config.auth.forward.raw_jwt_header, "raw_jwt_header");
+            for (const auto& [claim, header] :
+                 config.auth.forward.claims_to_headers) {
+                add_header(header, "claims_to_headers[" + claim + "]");
+            }
+        }
+    }
 }
 
 ServerConfig ConfigLoader::Default() {
@@ -1297,6 +1722,14 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             rj["retry_non_idempotent"] = u.proxy.retry.retry_non_idempotent;
             pj["retry"] = rj;
 
+            // Inline per-proxy auth policy. Only emitted when differs from
+            // default — same shape as the circuit_breaker block below —
+            // because an empty/disabled stanza is the common case and
+            // serializing it adds noise to every config dump.
+            if (u.proxy.auth != auth::AuthPolicy{}) {
+                pj["auth"] = SerializeAuthPolicy(u.proxy.auth);
+            }
+
             uj["proxy"] = pj;
         }
         // Always serialize circuit_breaker — same rationale as proxy block.
@@ -1346,6 +1779,79 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             rlj["zones"].push_back(zj);
         }
         j["rate_limit"] = rlj;
+    }
+
+    // Auth top-level block serialization. Emitted whenever it differs
+    // from defaults so a round-trip preserves operator intent.
+    if (config.auth != auth::AuthConfig{}) {
+        nlohmann::json aj;
+        aj["enabled"] = config.auth.enabled;
+        if (!config.auth.hmac_cache_key_env.empty()) {
+            aj["hmac_cache_key_env"] = config.auth.hmac_cache_key_env;
+        }
+        if (!config.auth.issuers.empty()) {
+            nlohmann::json ij = nlohmann::json::object();
+            for (const auto& [name, ic] : config.auth.issuers) {
+                nlohmann::json ijv;
+                ijv["issuer_url"] = ic.issuer_url;
+                ijv["discovery"] = ic.discovery;
+                if (!ic.jwks_uri.empty()) ijv["jwks_uri"] = ic.jwks_uri;
+                ijv["upstream"] = ic.upstream;
+                ijv["mode"] = ic.mode;
+                if (!ic.audiences.empty()) ijv["audiences"] = ic.audiences;
+                ijv["algorithms"] = ic.algorithms;
+                ijv["leeway_sec"] = ic.leeway_sec;
+                ijv["jwks_cache_sec"] = ic.jwks_cache_sec;
+                ijv["jwks_refresh_timeout_sec"] = ic.jwks_refresh_timeout_sec;
+                ijv["discovery_retry_sec"] = ic.discovery_retry_sec;
+                if (!ic.required_claims.empty()) {
+                    ijv["required_claims"] = ic.required_claims;
+                }
+                if (ic.introspection != auth::IntrospectionConfig{}) {
+                    nlohmann::json inj;
+                    inj["endpoint"] = ic.introspection.endpoint;
+                    inj["client_id"] = ic.introspection.client_id;
+                    inj["client_secret_env"] =
+                        ic.introspection.client_secret_env;
+                    inj["auth_style"] = ic.introspection.auth_style;
+                    inj["timeout_sec"] = ic.introspection.timeout_sec;
+                    inj["cache_sec"] = ic.introspection.cache_sec;
+                    inj["negative_cache_sec"] =
+                        ic.introspection.negative_cache_sec;
+                    inj["stale_grace_sec"] =
+                        ic.introspection.stale_grace_sec;
+                    inj["max_entries"] = ic.introspection.max_entries;
+                    inj["shards"] = ic.introspection.shards;
+                    ijv["introspection"] = inj;
+                }
+                ij[name] = ijv;
+            }
+            aj["issuers"] = ij;
+        }
+        if (!config.auth.policies.empty()) {
+            nlohmann::json pj = nlohmann::json::array();
+            for (const auto& p : config.auth.policies) {
+                pj.push_back(SerializeAuthPolicy(p));
+            }
+            aj["policies"] = pj;
+        }
+        if (config.auth.forward != auth::AuthForwardConfig{}) {
+            nlohmann::json fj;
+            fj["subject_header"] = config.auth.forward.subject_header;
+            fj["issuer_header"] = config.auth.forward.issuer_header;
+            fj["scopes_header"] = config.auth.forward.scopes_header;
+            fj["raw_jwt_header"] = config.auth.forward.raw_jwt_header;
+            fj["strip_inbound_identity_headers"] =
+                config.auth.forward.strip_inbound_identity_headers;
+            fj["preserve_authorization"] =
+                config.auth.forward.preserve_authorization;
+            if (!config.auth.forward.claims_to_headers.empty()) {
+                fj["claims_to_headers"] =
+                    config.auth.forward.claims_to_headers;
+            }
+            aj["forward"] = fj;
+        }
+        j["auth"] = aj;
     }
 
     return j.dump(4);

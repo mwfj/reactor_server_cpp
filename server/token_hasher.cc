@@ -81,14 +81,25 @@ std::string LoadHmacKeyFromEnv(const std::string& env_var_name) {
     if (raw.empty()) return {};
 
     // Auto-detect base64url: operators typically store base64url-encoded keys
-    // because raw 32-byte binaries mangle through `.env` transport. A valid
-    // base64url-encoded 32-byte key is exactly 43 chars (no-padding form) or
-    // 44 with '=' padding. Accept either by trying the base64url decoder
-    // first and using the result only when it yields EXACTLY 32 bytes — any
-    // other length means the env value wasn't a base64url 32-byte key and we
-    // fall back to treating it as raw.
+    // because raw 32-byte binaries mangle through `.env` transport.
     //
-    // Strip a trailing '=' padding char so 44-char padded forms also work.
+    // Accept THREE equivalent base64url forms for a 32-byte key:
+    //   1. RFC 7515 §2 standard: 43 chars, NO padding  (e.g. "QUFB...QUE")
+    //   2. jwt-cpp native:       46 chars, "%3d" padding (percent-encoded '=')
+    //   3. Legacy base64:        44 chars, "=" padding
+    // All three decode to the same 32 bytes.
+    //
+    // The trick: jwt-cpp's `decode<base64url>` expects form (2) — the
+    // alphabet's fill() returns "%3d", not "=". Form (1) throws because
+    // `(size + 0) % 4 != 0`. Form (3) throws because "=" is not in the
+    // base64url alphabet. We normalize by stripping BOTH padding forms,
+    // then re-padding with the form jwt-cpp wants. This matches how
+    // jwt-cpp itself handles JWT segments (see jwt.h:682, 1055, 2985 —
+    // `decode<base64url>(pad<base64url>(token))`).
+    //
+    // Result is accepted ONLY when it yields EXACTLY 32 bytes, per §5.1
+    // contract. Any other decoded length means the env value wasn't a
+    // base64url 32-byte key and we fall back to raw.
     //
     // Exception containment (design spec §9 item 16): jwt::base::decode
     // throws std::runtime_error on invalid input (illegal chars, bad length).
@@ -96,11 +107,31 @@ std::string LoadHmacKeyFromEnv(const std::string& env_var_name) {
     // — a malformed env value must not propagate as an exception into
     // AuthManager::Start(), which would abort startup.
     std::string candidate = raw;
+    // Step 1: strip standard '=' padding (if operator encoded with the
+    // legacy base64 form).
     while (!candidate.empty() && candidate.back() == '=') candidate.pop_back();
+    // Step 2: strip jwt-cpp "%3d" padding too — trim() returns the substring
+    // before the first occurrence of the fill string.
+    candidate = jwt::base::trim<jwt::alphabet::base64url>(candidate);
     try {
-        std::string decoded =
-            jwt::base::decode<jwt::alphabet::base64url>(candidate);
+        std::string decoded = jwt::base::decode<jwt::alphabet::base64url>(
+            jwt::base::pad<jwt::alphabet::base64url>(candidate));
         if (decoded.size() == 32) {
+            // Silent-swap corner case (review round N+1, finding #4): an
+            // operator's raw 43-char key composed entirely of base64url
+            // alphabet chars [A-Za-z0-9_-] will be interpreted as encoded
+            // rather than raw. HMAC security is preserved either way (both
+            // forms give 32 bytes of key material), but the derived key
+            // differs between interpretations. Log at info so operators
+            // see the decision in their startup logs and can disambiguate
+            // if they intended a 43-char raw key (recommend: change length
+            // or base64url-encode explicitly).
+            logging::Get()->info(
+                "LoadHmacKeyFromEnv: env var '{}' interpreted as "
+                "base64url-encoded 32-byte key (decoded). If you intended "
+                "a raw 43-char key, either base64url-encode it explicitly "
+                "or pick a length other than 43/44 chars.",
+                env_var_name);
             return decoded;
         }
     } catch (const std::exception& e) {

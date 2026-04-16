@@ -24,14 +24,23 @@ std::vector<std::string> ExtractScopes(const nlohmann::json& payload) {
     if (payload.contains("scope") && payload["scope"].is_string()) {
         return SplitWhitespace(payload["scope"].get<std::string>());
     }
-    // Then `scp` (RFC 8693 / common IdP convention — array of strings).
-    if (payload.contains("scp") && payload["scp"].is_array()) {
-        std::vector<std::string> out;
-        out.reserve(payload["scp"].size());
-        for (const auto& v : payload["scp"]) {
-            if (v.is_string()) out.push_back(v.get<std::string>());
+    // Then `scp`. Two common forms in the wild:
+    //   - RFC 8693 / Keycloak / Ory: array of strings
+    //   - Azure AD / Entra delegated flows: space-delimited string
+    // Accept both; fall back to empty list for any other shape (e.g. object).
+    if (payload.contains("scp")) {
+        const auto& v = payload["scp"];
+        if (v.is_array()) {
+            std::vector<std::string> out;
+            out.reserve(v.size());
+            for (const auto& s : v) {
+                if (s.is_string()) out.push_back(s.get<std::string>());
+            }
+            return out;
         }
-        return out;
+        if (v.is_string()) {
+            return SplitWhitespace(v.get<std::string>());
+        }
     }
     // Azure AD and friends.
     if (payload.contains("scopes") && payload["scopes"].is_array()) {

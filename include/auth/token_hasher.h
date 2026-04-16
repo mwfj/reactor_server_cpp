@@ -54,13 +54,26 @@ std::string GenerateHmacKey();
 
 // Load key material from an environment variable by name. The env value is
 // interpreted using auto-detect:
-//   1. If the value is valid base64url (no padding) AND decodes to exactly
-//      32 bytes, the decoded bytes are used. This is the safer shell-transport
-//      form recommended by the design spec (§5.1) because raw 32-byte keys
-//      often contain non-printable bytes that mangle through `.env` files.
+//   1. If the value is a valid base64url encoding AND decodes to exactly
+//      32 bytes, the decoded bytes are used. The three accepted forms are:
+//        - RFC 7515 §2 standard unpadded (43 chars for a 32-byte key)
+//        - jwt-cpp "%3d"-padded (46 chars)
+//        - Legacy base64 "="-padded (44 chars)
+//      These are the safer shell-transport forms recommended by the
+//      design spec (§5.1) because raw 32-byte keys often contain
+//      non-printable bytes that mangle through `.env` files.
 //   2. Otherwise, the value is used as raw bytes.
 //
 // Returns an empty string when the env var is unset or empty.
+//
+// CORNER CASE: a raw 43-char key composed entirely of base64url-alphabet
+// characters ([A-Za-z0-9_-], which includes UUID-like strings since `-` is
+// in the alphabet) is silently interpreted as base64url rather than raw.
+// HMAC security is preserved either way (both give 32 bytes of key material),
+// but the derived HMAC key differs between interpretations. An `info` log
+// line fires when this branch is taken so operators can disambiguate. To
+// force raw-bytes interpretation for such keys, either (a) base64url-encode
+// the raw bytes explicitly, or (b) use a key length other than 43/44 chars.
 std::string LoadHmacKeyFromEnv(const std::string& env_var_name);
 
 }  // namespace auth

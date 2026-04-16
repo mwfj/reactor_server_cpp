@@ -131,8 +131,10 @@ void PrintUsage(const char* program_name) {
     std::cout << "  upstream, -U    Run upstream connection pool tests only" << std::endl;
     std::cout << "  proxy,    -P    Run proxy engine tests only" << std::endl;
     std::cout << "  rate_limit, -L  Run rate limit tests only" << std::endl;
+    std::cout << "  circuit_breaker, -B  Run circuit-breaker tests only" << std::endl;
+    std::cout << "  auth,     -A    Run auth foundation tests only" << std::endl;
     std::cout << "  help,     -h    Show this help message" << std::endl;
-    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route + kqueue + upstream + proxy + rate_limit)" << std::endl;
+    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route + kqueue + upstream + proxy + rate_limit + circuit_breaker + auth)" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -191,6 +193,9 @@ int main(int argc, char* argv[]) {
         // Run circuit-breaker tests (unit + components + integration + retry-budget + drain + observability + reload)
         }else if(mode == "circuit_breaker" || mode == "-B"){
             CircuitBreakerTests::RunAllTests();
+        // Run auth foundation tests (token_hasher + base64url env auto-detect + scope extractors)
+        }else if(mode == "auth" || mode == "-A"){
+            AuthFoundationTests::RunAllTests();
             CircuitBreakerComponentsTests::RunAllTests();
             CircuitBreakerIntegrationTests::RunAllTests();
             CircuitBreakerRetryBudgetTests::RunAllTests();
