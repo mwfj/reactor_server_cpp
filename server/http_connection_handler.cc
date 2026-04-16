@@ -1,5 +1,7 @@
 #include "http/http_connection_handler.h"
 #include "http/http_status.h"
+#include "http/trailer_policy.h"
+#include "http/streaming_response_sender_utils.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
 #include <cstdio>
@@ -38,19 +40,6 @@ bool IsForbiddenInterimHeader(const std::string& lower_name) {
         return true;
     }
     return false;
-}
-
-bool IsForbiddenTrailerHeader(const std::string& lower_name) {
-    if (lower_name.empty()) return true;
-    if (lower_name[0] == ':') return true;
-    return lower_name == "connection" || lower_name == "keep-alive" ||
-           lower_name == "proxy-connection" ||
-           lower_name == "transfer-encoding" || lower_name == "upgrade" ||
-           lower_name == "te" || lower_name == "content-length" ||
-           lower_name == "host" || lower_name == "authorization" ||
-           lower_name == "content-type" ||
-           lower_name == "content-encoding" ||
-           lower_name == "content-range";
 }
 
 // Returns the standard reason phrase for 1xx status codes.
@@ -105,21 +94,6 @@ std::string SerializeStreamingHead(const HttpResponse& response,
     return oss.str();
 }
 
-const char* AbortReasonToString(
-    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason reason) {
-    using AbortReason =
-        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason;
-    switch (reason) {
-        case AbortReason::UPSTREAM_TRUNCATED: return "upstream_truncated";
-        case AbortReason::UPSTREAM_TIMEOUT: return "upstream_timeout";
-        case AbortReason::UPSTREAM_ERROR: return "upstream_error";
-        case AbortReason::CLIENT_DISCONNECT: return "client_disconnect";
-        case AbortReason::TIMER_EXPIRED: return "timer_expired";
-        case AbortReason::SERVER_SHUTDOWN: return "server_shutdown";
-    }
-    return "unknown";
-}
-
 std::string EncodeChunkTerminator(
     const std::vector<std::pair<std::string, std::string>>& trailers) {
     std::string out = "0\r\n";
@@ -127,7 +101,7 @@ std::string EncodeChunkTerminator(
         std::string lower = key;
         std::transform(lower.begin(), lower.end(), lower.begin(),
                        [](unsigned char c) { return std::tolower(c); });
-        if (IsForbiddenTrailerHeader(lower)) {
+        if (IsForbiddenTrailerFieldName(lower)) {
             logging::Get()->warn(
                 "H1 streaming dropped forbidden trailer field '{}'",
                 key);
@@ -349,7 +323,7 @@ private:
         logging::Get()->debug(
             "H1 streaming abort fd={} reason={} programmer_error={}",
             conn_ ? conn_->fd() : -1,
-            AbortReasonToString(reason),
+            StreamingAbortReasonToString(reason),
             from_programmer_error);
         if (abort_response_) {
             abort_response_();

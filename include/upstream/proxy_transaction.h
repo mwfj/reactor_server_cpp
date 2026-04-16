@@ -32,6 +32,7 @@ public:
     static constexpr int RESULT_RESPONSE_TIMEOUT    = -4;
     static constexpr int RESULT_UPSTREAM_DISCONNECT = -5;
     static constexpr int RESULT_POOL_EXHAUSTED      = -6;  // Local capacity → 503
+    static constexpr int RESULT_RESPONSE_TOO_LARGE  = -9;  // Local buffering cap → 502
     // Circuit breaker rejected this attempt before it touched the upstream.
     // Carries Retry-After + X-Circuit-Breaker headers (§12.1).
     // Terminal — retry loop MUST NOT retry this outcome (§8).
@@ -235,9 +236,15 @@ private:
     UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead
         pending_retryable_5xx_head_;
     std::string pending_retryable_5xx_body_;
+    bool holding_retryable_5xx_response_ = false;
+    bool held_retryable_5xx_saw_eof_ = false;
 
     // Internal methods
     void AttemptCheckout();
+    bool PrepareAttemptAdmission();
+    void ActivateAttemptTracking();
+    void EnsureCheckoutCancelToken();
+    void StartCheckoutAsync();
     void OnCheckoutReady(UpstreamLease lease);
     void OnCheckoutError(int error_code);
     void SendUpstreamRequest();
@@ -247,8 +254,13 @@ private:
     void MaybeRetry(RetryPolicy::RetryCondition condition);
     void DeliverResponse(HttpResponse response);
     void Cleanup();
+    void ReleaseAttemptAccounting();
+    void ReleaseHeldRetryable5xxTransport();
+    void ResetForRetryAttempt();
+    void BeginRetryAttemptFromHeld5xx();
     void ClearPendingRetryable5xxResponse();
     bool DeliverPendingRetryable5xxResponse(const char* reject_source);
+    bool ResumeHeldRetryable5xxResponse(const char* reject_source);
 
     // Build the final client-facing HttpResponse from the parsed upstream response
     HttpResponse BuildClientResponse();

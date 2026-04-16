@@ -1,5 +1,7 @@
 #include "http2/http2_connection_handler.h"
 #include "http/http_response.h"
+#include "http/http_status.h"
+#include "http/streaming_response_sender_utils.h"
 #include "log/logger.h"
 #include <nghttp2/nghttp2.h>
 #include <new>
@@ -10,19 +12,20 @@ static constexpr size_t DEFAULT_STREAM_HIGH_WATER_BYTES = 1024 * 1024;
 static constexpr size_t DEFAULT_STREAM_LOW_WATER_BYTES =
     DEFAULT_STREAM_HIGH_WATER_BYTES / 2;
 
-const char* AbortReasonToString(
-    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason reason) {
-    using AbortReason =
-        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason;
-    switch (reason) {
-        case AbortReason::UPSTREAM_TRUNCATED: return "upstream_truncated";
-        case AbortReason::UPSTREAM_TIMEOUT: return "upstream_timeout";
-        case AbortReason::UPSTREAM_ERROR: return "upstream_error";
-        case AbortReason::CLIENT_DISCONNECT: return "client_disconnect";
-        case AbortReason::TIMER_EXPIRED: return "timer_expired";
-        case AbortReason::SERVER_SHUTDOWN: return "server_shutdown";
+bool IsBodySuppressedStreamingResponse(
+    Http2Session* session,
+    int32_t stream_id,
+    const HttpResponse& response) {
+    auto* stream = session ? session->FindStream(stream_id) : nullptr;
+    if (!stream) {
+        return false;
     }
-    return "unknown";
+    int status_code = response.GetStatusCode();
+    const HttpRequest& req = stream->GetRequest();
+    return req.method == "HEAD" ||
+           status_code == HttpStatus::NO_CONTENT ||
+           status_code == HttpStatus::RESET_CONTENT ||
+           status_code == HttpStatus::NOT_MODIFIED;
 }
 
 class StreamingH2DataSource final : public ResponseDataSource,
@@ -276,9 +279,12 @@ public:
                     std::move(pending_drain_listener_));
             }
         }
+        body_suppressed_ = IsBodySuppressedStreamingResponse(
+            session, stream_id_, headers_only_response);
         if (session->SubmitStreamingResponse(
                 stream_id_, headers_only_response, data_source_) != 0) {
             terminal_ = true;
+            body_suppressed_ = false;
             if (data_source_) {
                 data_source_->Abort();
                 data_source_.reset();
@@ -300,6 +306,15 @@ public:
     SendResult SendData(const char* data, size_t len) override {
         if (!headers_sent_) {
             return HandleProgrammerError("SendData");
+        }
+        if (body_suppressed_) {
+            if (!programmer_error_) {
+                logging::Get()->error(
+                    "H2 streaming SendData called for bodyless response stream={}",
+                    stream_id_);
+                programmer_error_ = true;
+            }
+            return SendResult::CLOSED;
         }
         if (terminal_ || programmer_error_ || !data_source_) {
             return SendResult::CLOSED;
@@ -358,6 +373,13 @@ public:
             return SendResult::CLOSED;
         }
         terminal_ = true;
+        if (body_suppressed_) {
+            data_source_.reset();
+            if (finalize_request_) {
+                finalize_request_();
+            }
+            return SendResult::ACCEPTED_BELOW_WATER;
+        }
         data_source_->Finish();
         int rv = session->ResumeStreamData(stream_id_);
         if (rv != 0) {
@@ -433,7 +455,7 @@ private:
         logging::Get()->debug(
             "H2 streaming abort stream={} reason={} programmer_error={}",
             stream_id_,
-            AbortReasonToString(reason),
+            StreamingAbortReasonToString(reason),
             from_programmer_error);
         if (session) {
             session->ResetStream(
@@ -455,6 +477,7 @@ private:
     bool headers_sent_ = false;
     bool terminal_ = false;
     bool programmer_error_ = false;
+    bool body_suppressed_ = false;
     size_t high_water_ = DEFAULT_STREAM_HIGH_WATER_BYTES;
 };
 

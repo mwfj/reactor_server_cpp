@@ -4166,6 +4166,66 @@ void TestH2_StreamingAbortBeforeHeadersResetsStream() {
     }
 }
 
+void TestH2_StreamingNoBodyEndDoesNotResetStream() {
+    std::cout << "\n[TEST] H2 streaming: bodyless End does not reset stream..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync(
+            "/stream-204",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher /*push_resource*/,
+               HttpRouter::StreamingResponseSender stream_sender,
+               HttpRouter::AsyncCompletionCallback /*complete*/) {
+                HttpResponse head;
+                head.Status(204).Header("X-Stream", "yes");
+                if (stream_sender.SendHeaders(head) < 0) {
+                    return;
+                }
+                auto end_result = stream_sender.End();
+                (void)end_result;
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/stream-204");
+            if (resp.error) {
+                pass = false;
+                err += "client error; ";
+            }
+            if (resp.rst) {
+                pass = false;
+                err += "unexpected RST_STREAM; ";
+            }
+            if (resp.status != 204) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) + "; ";
+            }
+            if (!resp.body.empty()) {
+                pass = false;
+                err += "body should be empty for 204; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: bodyless End does not reset stream",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: bodyless End does not reset stream",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression for PR #18 round-5 comment 2: H2 async handler that
 // calls complete() and then send_interim() inline on the dispatcher
 // thread (before returning from the handler body) must NOT land the
@@ -4699,6 +4759,7 @@ void RunAllTests() {
     TestH2_EarlyHints_DroppedAfterCompleteSameThread();
     TestH2_Async_HandlerThrowFiresCancelSlot();
     TestH2_StreamingAbortBeforeHeadersResetsStream();
+    TestH2_StreamingNoBodyEndDoesNotResetStream();
     TestH2_ProxyStreamingLargeContentLength();
     TestH2_ProxyTransientHighWaterFlushDoesNotStall();
 
