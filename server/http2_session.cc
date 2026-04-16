@@ -1076,17 +1076,29 @@ int Http2Session::SubmitStreamingResponse(
         });
     }
 
+    // Streaming responses submit headers before body bytes exist. Auto-
+    // computing Content-Length from a headers-only response body would inject
+    // CL=0 on unknown-length streams that will later send DATA frames.
+    // Preserve CL only when the caller explicitly marked a known length, or
+    // when the status code itself defines the wire value (205 / 304).
     std::string content_length_str;
-    if (auto effective_cl = response.ComputeWireContentLength(status_code)) {
-        content_length_str = std::move(*effective_cl);
-        nva.push_back({
-            const_cast<uint8_t*>(
-                reinterpret_cast<const uint8_t*>("content-length")),
-            const_cast<uint8_t*>(
-                reinterpret_cast<const uint8_t*>(content_length_str.c_str())),
-            14, content_length_str.size(),
-            NGHTTP2_NV_FLAG_NONE
-        });
+    bool emit_known_length =
+        response.IsContentLengthPreserved() ||
+        status_code == HttpStatus::RESET_CONTENT ||
+        status_code == HttpStatus::NOT_MODIFIED;
+    if (emit_known_length) {
+        auto effective_cl = response.ComputeWireContentLength(status_code);
+        if (effective_cl) {
+            content_length_str = std::move(*effective_cl);
+            nva.push_back({
+                const_cast<uint8_t*>(
+                    reinterpret_cast<const uint8_t*>("content-length")),
+                const_cast<uint8_t*>(
+                    reinterpret_cast<const uint8_t*>(content_length_str.c_str())),
+                14, content_length_str.size(),
+                NGHTTP2_NV_FLAG_NONE
+            });
+        }
     }
 
     int rv;

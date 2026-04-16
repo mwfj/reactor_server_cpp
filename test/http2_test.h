@@ -65,6 +65,7 @@ public:
         std::string body;
         bool        rst     = false;   // stream was RST'd
         bool        error   = false;   // transport or session error
+        std::vector<std::pair<std::string, std::string>> headers;
         // Interim 1xx response blocks observed BEFORE the final status,
         // in arrival order. interim_headers[i] are the headers carried by
         // interim_statuses[i]. Used by 103 Early Hints and 100 Continue tests.
@@ -90,6 +91,7 @@ public:
         std::string  body;
         bool         rst    = false;
         bool         done   = false;
+        std::vector<std::pair<std::string, std::string>> headers;
     };
 
     Http2TestClient() = default;
@@ -344,6 +346,7 @@ private:
         std::string body;
         bool        done   = false;
         bool        rst    = false;
+        std::vector<std::pair<std::string, std::string>> response_headers;
         // Interim 1xx tracking. A new entry is appended to interim_statuses
         // when ":status" with a code in [100, 200) is observed; subsequent
         // header callbacks for the same HEADERS frame are appended to
@@ -384,6 +387,7 @@ private:
         resp.status           = it->second.status;
         resp.body             = it->second.body;
         resp.rst              = it->second.rst;
+        resp.headers          = std::move(it->second.response_headers);
         resp.interim_statuses = std::move(it->second.interim_statuses);
         resp.interim_headers  = std::move(it->second.interim_headers);
         for (auto sit = streams_.begin(); sit != streams_.end();) {
@@ -398,6 +402,7 @@ private:
                 ps.body      = std::move(sit->second.body);
                 ps.rst       = sit->second.rst;
                 ps.done      = sit->second.done;
+                ps.headers   = std::move(sit->second.response_headers);
                 resp.pushed.push_back(std::move(ps));
                 sit = streams_.erase(sit);
             } else {
@@ -547,6 +552,8 @@ private:
             }
         } else if (s.current_block_interim && !s.interim_headers.empty()) {
             s.interim_headers.back().emplace_back(std::move(n), std::move(v));
+        } else {
+            s.response_headers.emplace_back(std::move(n), std::move(v));
         }
         return 0;
     }
@@ -600,6 +607,20 @@ private:
         return static_cast<ssize_t>(to_copy);
     }
 };
+
+std::optional<std::string> FindHeaderValueCI(
+    const std::vector<std::pair<std::string, std::string>>& headers,
+    const std::string& lower_name) {
+    for (const auto& [name, value] : headers) {
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lower == lower_name) {
+            return value;
+        }
+    }
+    return std::nullopt;
+}
 
 // ============================================================
 // ============================================================
@@ -4226,6 +4247,73 @@ void TestH2_StreamingNoBodyEndDoesNotResetStream() {
     }
 }
 
+void TestH2_StreamingUnknownLengthOmitsContentLength() {
+    std::cout << "\n[TEST] H2 streaming: unknown-length response omits content-length..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync(
+            "/stream-unknown-length",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher /*push_resource*/,
+               HttpRouter::StreamingResponseSender stream_sender,
+               HttpRouter::AsyncCompletionCallback /*complete*/) {
+                HttpResponse head;
+                head.Status(200).Header("Content-Type", "text/plain");
+                if (stream_sender.SendHeaders(head) < 0) {
+                    return;
+                }
+                if (stream_sender.SendData("hello", 5) ==
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                    return;
+                }
+                (void)stream_sender.End();
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/stream-unknown-length");
+            if (resp.error) {
+                pass = false;
+                err += "client error; ";
+            }
+            if (resp.rst) {
+                pass = false;
+                err += "unexpected RST_STREAM; ";
+            }
+            if (resp.status != 200) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) + "; ";
+            }
+            if (resp.body != "hello") {
+                pass = false;
+                err += "body mismatch; ";
+            }
+            if (FindHeaderValueCI(resp.headers, "content-length")) {
+                pass = false;
+                err += "content-length should be omitted for unknown-length stream; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: unknown-length response omits content-length",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: unknown-length response omits content-length",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression for PR #18 round-5 comment 2: H2 async handler that
 // calls complete() and then send_interim() inline on the dispatcher
 // thread (before returning from the handler body) must NOT land the
@@ -4599,6 +4687,12 @@ void TestH2_ProxyStreamingLargeContentLength() {
                 pass = false;
                 err += "body mismatch len=" + std::to_string(resp.body.size()) + "; ";
             }
+            auto content_length = FindHeaderValueCI(resp.headers, "content-length");
+            if (!content_length ||
+                *content_length != std::to_string(body.size())) {
+                pass = false;
+                err += "known content-length not preserved; ";
+            }
         }
 
         TestFramework::RecordTest(
@@ -4760,6 +4854,7 @@ void RunAllTests() {
     TestH2_Async_HandlerThrowFiresCancelSlot();
     TestH2_StreamingAbortBeforeHeadersResetsStream();
     TestH2_StreamingNoBodyEndDoesNotResetStream();
+    TestH2_StreamingUnknownLengthOmitsContentLength();
     TestH2_ProxyStreamingLargeContentLength();
     TestH2_ProxyTransientHighWaterFlushDoesNotStall();
 

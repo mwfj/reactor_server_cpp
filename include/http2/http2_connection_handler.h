@@ -190,6 +190,18 @@ public:
     }
 
 private:
+    // Dispatcher-thread-only weak refs to active per-stream streaming senders.
+    // Used to forward transport write-progress events so H2 backpressure can
+    // account for bytes already drained out of nghttp2's per-stream ring and
+    // now buffered on the shared connection output buffer.
+    std::unordered_map<
+        int32_t,
+        std::weak_ptr<HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::Impl>>
+        active_stream_sender_impls_;
+
+    void NotifyActiveStreamSendersWriteProgress(size_t remaining_bytes);
+    void NotifyActiveStreamSendersWriteComplete();
+
     std::shared_ptr<ConnectionHandler> conn_;
     std::unique_ptr<Http2Session> session_;
     Http2Session::Settings settings_;

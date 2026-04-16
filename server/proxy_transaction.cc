@@ -1430,6 +1430,11 @@ bool ProxyTransaction::ResumeHeldRetryable5xxResponse(
         }
     }
 
+    if (!IsNoBodyResponse(response_head_)) {
+        RefreshStreamIdleTimer();
+        ArmStreamBudgetTimer();
+    }
+
     ResumePausedParsing();
     if (saw_eof && state_ != State::COMPLETE && state_ != State::FAILED) {
         auto* upstream_conn = lease_.Get();
