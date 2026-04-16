@@ -42,24 +42,29 @@ bool HeaderValueStartsWith(
     return false;
 }
 
-std::optional<std::string> FilterTrailerDeclaration(
-    const std::string& trailer_value) {
+std::optional<std::string> MergeTrailerDeclarations(
+    const std::vector<std::pair<std::string, std::string>>& headers) {
     std::vector<std::string> allowed;
-    size_t start = 0;
-    while (start <= trailer_value.size()) {
-        size_t comma = trailer_value.find(',', start);
-        std::string token = TrimOptionalWhitespace(
-            trailer_value.substr(start, comma == std::string::npos
-                                            ? std::string::npos
-                                            : comma - start));
-        if (!token.empty() &&
-            !IsForbiddenTrailerFieldName(LowerCopy(token))) {
-            allowed.push_back(std::move(token));
+    for (const auto& [key, value] : headers) {
+        if (LowerCopy(key) != "trailer") {
+            continue;
         }
-        if (comma == std::string::npos) {
-            break;
+        size_t start = 0;
+        while (start <= value.size()) {
+            size_t comma = value.find(',', start);
+            std::string token = TrimOptionalWhitespace(
+                value.substr(start, comma == std::string::npos
+                                        ? std::string::npos
+                                        : comma - start));
+            if (!token.empty() &&
+                !IsForbiddenTrailerFieldName(LowerCopy(token))) {
+                allowed.push_back(std::move(token));
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            start = comma + 1;
         }
-        start = comma + 1;
     }
     if (allowed.empty()) {
         return std::nullopt;
@@ -1525,11 +1530,10 @@ HttpResponse ProxyTransaction::BuildStreamingHeadersResponse() const {
     HttpResponse response = BuildResponseFromHead(response_head_, false, nullptr);
     if (config_.forward_trailers &&
         client_http_major_ == 1 && client_http_minor_ == 1) {
-        auto trailer = FirstHeaderValue(response_head_.headers, "trailer");
+        response.RemoveHeader("Trailer");
         auto filtered_trailer =
-            trailer ? FilterTrailerDeclaration(*trailer) : std::nullopt;
-        if (filtered_trailer &&
-            !FirstHeaderValue(response.GetHeaders(), "trailer")) {
+            MergeTrailerDeclarations(response_head_.headers);
+        if (filtered_trailer) {
             response.AppendHeader("Trailer", *filtered_trailer);
         }
     }

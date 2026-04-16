@@ -190,6 +190,8 @@ public:
     }
 
 private:
+    StreamCloseCallback WrapStreamCloseCallback(StreamCloseCallback callback);
+
     // Dispatcher-thread-only weak refs to active per-stream streaming senders.
     // Used to forward transport write-progress events so H2 backpressure can
     // account for bytes already drained out of nghttp2's per-stream ring and

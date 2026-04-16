@@ -507,6 +507,21 @@ Http2ConnectionHandler::Http2ConnectionHandler(
 
 Http2ConnectionHandler::~Http2ConnectionHandler() = default;
 
+Http2ConnectionHandler::StreamCloseCallback
+Http2ConnectionHandler::WrapStreamCloseCallback(StreamCloseCallback callback) {
+    return [callback = std::move(callback)](
+               std::shared_ptr<Http2ConnectionHandler> self,
+               int32_t stream_id,
+               uint32_t error_code) mutable {
+        if (self) {
+            self->active_stream_sender_impls_.erase(stream_id);
+        }
+        if (callback) {
+            callback(std::move(self), stream_id, error_code);
+        }
+    };
+}
+
 void Http2ConnectionHandler::SetRequestCallback(RequestCallback callback) {
     pending_request_cb_ = callback;  // Store for Initialize()
     if (session_) {
@@ -515,9 +530,10 @@ void Http2ConnectionHandler::SetRequestCallback(RequestCallback callback) {
 }
 
 void Http2ConnectionHandler::SetStreamCloseCallback(StreamCloseCallback callback) {
-    pending_stream_close_cb_ = callback;  // Store for Initialize()
+    auto wrapped = WrapStreamCloseCallback(std::move(callback));
+    pending_stream_close_cb_ = wrapped;  // Store for Initialize()
     if (session_) {
-        session_->SetStreamCloseCallback(std::move(callback));
+        session_->SetStreamCloseCallback(std::move(wrapped));
     }
 }
 

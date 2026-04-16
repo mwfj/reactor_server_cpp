@@ -78,6 +78,7 @@ std::string SerializeStreamingHead(const HttpResponse& response,
     auto effective_cl = use_chunked
         ? std::optional<std::string>()
         : response.ComputeWireContentLength(response.GetStatusCode());
+    std::string merged_trailer;
 
     oss << "HTTP/1." << http_minor << " " << response.GetStatusCode()
         << " " << response.GetStatusReason() << "\r\n";
@@ -87,7 +88,20 @@ std::string SerializeStreamingHead(const HttpResponse& response,
                        [](unsigned char c) { return std::tolower(c); });
         if (lower == "transfer-encoding") continue;
         if (lower == "content-length") continue;
+        if (lower == "trailer") {
+            std::string trimmed = TrimOptionalWhitespace(value);
+            if (!trimmed.empty()) {
+                if (!merged_trailer.empty()) {
+                    merged_trailer += ", ";
+                }
+                merged_trailer += trimmed;
+            }
+            continue;
+        }
         oss << key << ": " << value << "\r\n";
+    }
+    if (!merged_trailer.empty()) {
+        oss << "Trailer: " << merged_trailer << "\r\n";
     }
     if (effective_cl) {
         oss << "Content-Length: " << *effective_cl << "\r\n";
