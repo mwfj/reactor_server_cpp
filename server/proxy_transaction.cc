@@ -797,6 +797,13 @@ bool ProxyTransaction::OnHeaders(
             retry_from_headers_pending_ = true;
             poison_connection_ = true;
             codec_.PauseParsing();
+            if (auto* upstream_conn = lease_.Get()) {
+                // Hold the upstream body at the transport edge while the retry
+                // timer/local gates decide whether we will actually abandon
+                // this response. Pausing llhttp alone would keep appending raw
+                // bytes into paused_parse_bytes_ without the relay cap.
+                upstream_conn->IncReadDisable();
+            }
             return true;
         } else if (ShouldRetryResponse5xx()) {
             logging::Get()->info(
@@ -1435,7 +1442,19 @@ bool ProxyTransaction::ResumeHeldRetryable5xxResponse(
         ArmStreamBudgetTimer();
     }
 
+    if ((!body_complete_ || !paused_parse_bytes_.empty() || saw_eof) &&
+        lease_ && lease_.Get() && lease_.Get()->IsReadDisabled()) {
+        lease_.Get()->DecReadDisable();
+    }
+
     ResumePausedParsing();
+    if (state_ == State::COMPLETE || state_ == State::FAILED) {
+        return true;
+    }
+    if (body_complete_) {
+        OnResponseComplete();
+        return true;
+    }
     if (saw_eof && state_ != State::COMPLETE && state_ != State::FAILED) {
         auto* upstream_conn = lease_.Get();
         auto transport = upstream_conn ? upstream_conn->GetTransport() : nullptr;

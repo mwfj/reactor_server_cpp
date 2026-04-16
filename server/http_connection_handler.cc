@@ -96,9 +96,17 @@ std::string SerializeStreamingHead(const HttpResponse& response,
 
 std::string EncodeChunkTerminator(
     const std::vector<std::pair<std::string, std::string>>& trailers) {
+    auto strip_crlf = [](std::string s) -> std::string {
+        s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());
+        s.erase(std::remove(s.begin(), s.end(), '\n'), s.end());
+        return s;
+    };
+
     std::string out = "0\r\n";
     for (const auto& [key, value] : trailers) {
-        std::string lower = key;
+        std::string sanitized_key = strip_crlf(key);
+        std::string sanitized_value = strip_crlf(value);
+        std::string lower = sanitized_key;
         std::transform(lower.begin(), lower.end(), lower.begin(),
                        [](unsigned char c) { return std::tolower(c); });
         if (IsForbiddenTrailerFieldName(lower)) {
@@ -107,9 +115,9 @@ std::string EncodeChunkTerminator(
                 key);
             continue;
         }
-        out += key;
+        out += sanitized_key;
         out += ": ";
-        out += value;
+        out += sanitized_value;
         out += "\r\n";
     }
     out += "\r\n";

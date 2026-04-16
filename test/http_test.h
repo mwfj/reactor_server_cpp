@@ -1529,6 +1529,87 @@ namespace HttpTests {
         }
     }
 
+    void TestH1_StreamingTrailers_CRLFSanitized() {
+        std::cout << "\n[TEST] H1 streaming trailers: CR/LF sanitized..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-trailer-inject",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Trailer", "X-Key, X-Value");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    static constexpr char kBody[] = "hello";
+                    if (stream_sender.SendData(kBody, sizeof(kBody) - 1) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End({
+                        {"X-Key\r\nInjected-Name", "abc"},
+                        {"X-Value", "line1\r\nInjected-Value: leaked"},
+                    });
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-trailer-inject HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            if (resp.find("HTTP/1.1 200") == std::string::npos) {
+                pass = false; err += "missing 200; ";
+            }
+            if (resp.find("5\r\nhello\r\n") == std::string::npos) {
+                pass = false; err += "chunked body missing; ";
+            }
+            auto header_end = resp.find("\r\n\r\n");
+            std::string body_and_trailers =
+                (header_end == std::string::npos) ? std::string() :
+                resp.substr(header_end + 4);
+            if (body_and_trailers.find("0\r\n") == std::string::npos) {
+                pass = false; err += "final zero chunk missing; ";
+            }
+            if (body_and_trailers.find("\r\nInjected-Name:") != std::string::npos) {
+                pass = false; err += "trailer name injection observed; ";
+            }
+            if (body_and_trailers.find("\r\nInjected-Value:") != std::string::npos) {
+                pass = false; err += "trailer value injection observed; ";
+            }
+            std::string lower = body_and_trailers;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("x-keyinjected-name: abc") == std::string::npos) {
+                pass = false; err += "sanitized trailer name missing; ";
+            }
+            if (lower.find("x-value: line1injected-value: leaked") == std::string::npos) {
+                pass = false; err += "sanitized trailer value missing; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming trailers: CR/LF sanitized",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming trailers: CR/LF sanitized",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // T8: Worker-thread interleave — a handler that calls complete() from
     // a worker thread followed by send_interim() from the same worker
     // must not be able to queue a 103 AFTER the 200 on the wire.
@@ -1854,6 +1935,7 @@ namespace HttpTests {
         TestH1_EarlyHints_DroppedAfterFinal();
         TestH1_EarlyHints_100ContinueThen103();
         TestH1_EarlyHints_CRLFSanitized();
+        TestH1_StreamingTrailers_CRLFSanitized();
         TestH1_EarlyHints_WorkerThreadOrderingSafe();
         TestH1_EarlyHints_PipelinedKeepAliveNoStale();
         TestH1_Async_HandlerThrowFiresCancelSlot();

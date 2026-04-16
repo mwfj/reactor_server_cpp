@@ -1,3 +1,4 @@
+#include "proxy_transaction_internal_test.h"
 #include "stress_test.h"
 #include "basic_test.h"
 #include "race_condition_test.h"
@@ -53,6 +54,9 @@ void RunAllTest(){
 
     // Run config tests
     ConfigTests::RunAllTests();
+
+    // Run focused internal proxy transaction regressions
+    ProxyTransactionInternalTests::RunAllTests();
 
     // Run HTTP tests
     HttpTests::RunAllTests();
