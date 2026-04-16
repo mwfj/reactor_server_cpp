@@ -353,9 +353,10 @@ public:
 
     void SetDrainListener(DrainListener listener) override {
         drain_listener_ = std::move(listener);
+        ++drain_listener_generation_;
+        drain_listener_scheduled_ = false;
         if (!drain_listener_) {
             above_high_water_ = false;
-            drain_listener_scheduled_ = false;
             return;
         }
         MaybeScheduleDrain();
@@ -398,6 +399,7 @@ private:
         if (terminal_ && !from_programmer_error) return;
         terminal_ = true;
         drain_listener_ = nullptr;
+        ++drain_listener_generation_;
         above_high_water_ = false;
         drain_listener_scheduled_ = false;
 
@@ -463,6 +465,7 @@ private:
         above_high_water_ = false;
         drain_listener_scheduled_ = true;
         auto listener = drain_listener_;
+        const uint64_t generation = drain_listener_generation_;
         auto self = handler_.lock();
         auto conn = self ? self->GetConnection() : nullptr;
         if (!conn) {
@@ -472,8 +475,11 @@ private:
         std::weak_ptr<H2StreamingResponseSenderImpl> weak_self =
             shared_from_this();
         conn->RunOnDispatcher(
-            [weak_self, listener = std::move(listener)]() mutable {
+            [weak_self, listener = std::move(listener), generation]() mutable {
                 if (auto self = weak_self.lock()) {
+                    if (self->drain_listener_generation_ != generation) {
+                        return;
+                    }
                     self->drain_listener_scheduled_ = false;
                     if (listener) listener();
                 }
@@ -494,6 +500,7 @@ private:
     bool body_suppressed_ = false;
     bool above_high_water_ = false;
     bool drain_listener_scheduled_ = false;
+    uint64_t drain_listener_generation_ = 0;
     size_t high_water_ = DEFAULT_STREAM_HIGH_WATER_BYTES;
 };
 

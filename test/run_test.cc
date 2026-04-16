@@ -1,4 +1,5 @@
 #include "proxy_transaction_internal_test.h"
+#include "http_internal_test.h"
 #include "http2_internal_test.h"
 #include "stress_test.h"
 #include "basic_test.h"
@@ -58,6 +59,9 @@ void RunAllTest(){
 
     // Run focused internal proxy transaction regressions
     ProxyTransactionInternalTests::RunAllTests();
+
+    // Run focused internal HTTP/1 streaming regressions
+    HttpInternalTests::RunAllTests();
 
     // Run HTTP tests
     HttpTests::RunAllTests();
@@ -164,6 +168,7 @@ int main(int argc, char* argv[]) {
             ConfigTests::RunAllTests();
         // Run HTTP tests
         }else if(mode == "http" || mode == "-H"){
+            HttpInternalTests::RunAllTests();
             HttpTests::RunAllTests();
         // Run WebSocket tests
         }else if(mode == "ws" || mode == "-w"){

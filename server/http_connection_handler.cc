@@ -223,6 +223,14 @@ public:
         if (terminal_ || programmer_error_ || headers_sent_) {
             return -1;
         }
+        if (headers_only_response.GetStatusCode() < HttpStatus::OK) {
+            logging::Get()->error(
+                "H1 streaming SendHeaders called with {} "
+                "(1xx not supported as app final response) fd={}",
+                headers_only_response.GetStatusCode(),
+                conn_->fd());
+            return -1;
+        }
         auto prepared = prepare_head_ ? prepare_head_(headers_only_response)
                                       : std::nullopt;
         if (!prepared) {
@@ -336,9 +344,10 @@ public:
 
     void SetDrainListener(DrainListener listener) override {
         drain_listener_ = std::move(listener);
+        ++drain_listener_generation_;
+        drain_listener_scheduled_ = false;
         if (!drain_listener_) {
             above_high_water_ = false;
-            drain_listener_scheduled_ = false;
         }
     }
 
@@ -375,6 +384,10 @@ private:
     void AbortInternal(bool from_programmer_error, AbortReason reason) {
         if (terminal_ && !from_programmer_error) return;
         terminal_ = true;
+        drain_listener_ = nullptr;
+        ++drain_listener_generation_;
+        above_high_water_ = false;
+        drain_listener_scheduled_ = false;
         if (!claimed_response_) {
             if (!claim_response_ || !claim_response_()) {
                 return;
@@ -418,15 +431,19 @@ private:
         above_high_water_ = false;
         drain_listener_scheduled_ = true;
         auto listener = drain_listener_;
+        const uint64_t generation = drain_listener_generation_;
         std::weak_ptr<H1StreamingResponseSenderImpl> weak_self =
             shared_from_this();
         conn_->RunOnDispatcher(
-            [weak_self, listener = std::move(listener)]() mutable {
-            if (auto self = weak_self.lock()) {
-                self->drain_listener_scheduled_ = false;
-                if (listener) listener();
-            }
-        });
+            [weak_self, listener = std::move(listener), generation]() mutable {
+                if (auto self = weak_self.lock()) {
+                    if (self->drain_listener_generation_ != generation) {
+                        return;
+                    }
+                    self->drain_listener_scheduled_ = false;
+                    if (listener) listener();
+                }
+            });
     }
 
     std::shared_ptr<ConnectionHandler> conn_;
@@ -446,6 +463,7 @@ private:
     bool body_suppressed_ = false;
     bool above_high_water_ = false;
     bool drain_listener_scheduled_ = false;
+    uint64_t drain_listener_generation_ = 0;
     size_t high_water_ = DEFAULT_STREAM_HIGH_WATER_BYTES;
     size_t low_water_ = DEFAULT_STREAM_LOW_WATER_BYTES;
 };
