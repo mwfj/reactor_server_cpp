@@ -794,6 +794,11 @@ bool ProxyTransaction::OnHeaders(
         poison_connection_ = true;
     }
     if (state_ == State::SENDING_REQUEST) {
+        // Early response: the request write is no longer the active phase. If
+        // the upstream later finishes flushing the request bytes, that callback
+        // must not re-arm the response-header timer or move us back into the
+        // pre-headers state machine.
+        state_ = State::AWAITING_RESPONSE;
         poison_connection_ = true;
     }
 
@@ -859,6 +864,7 @@ bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
     if (relay_mode_ == RelayMode::BUFFERED) {
         if (response_body_.size() >= UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE ||
             len > UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE - response_body_.size()) {
+            poison_connection_ = true;
             OnError(RESULT_RESPONSE_TOO_LARGE,
                     "Upstream response body exceeds maximum buffered size");
             return false;
@@ -1465,13 +1471,16 @@ bool ProxyTransaction::ResumeHeldRetryable5xxResponse(
         return true;
     }
     if (!body_complete_ &&
-        response_head_.framing ==
-            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH &&
-        response_head_.expected_length == 0 &&
+        ((response_head_.framing ==
+              UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH &&
+          response_head_.expected_length == 0) ||
+         response_head_.framing ==
+             UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::NO_BODY) &&
         paused_parse_bytes_.empty()) {
         // We paused llhttp at headers, before on_message_complete could mark
-        // a zero-length body finished. When retry is abandoned later, there may
-        // be no buffered bytes or EOF edge left to drive completion.
+        // a zero-length / no-body response finished. When retry is abandoned
+        // later, there may be no buffered bytes or EOF edge left to drive
+        // completion.
         body_complete_ = true;
     }
     if (body_complete_) {
