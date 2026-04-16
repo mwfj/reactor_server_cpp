@@ -263,7 +263,7 @@ private:
     bool IsNoBodyResponse(
         const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) const;
     bool ShouldRetryResponse5xx() const;
-    bool CanRetryResponse5xxNow() const;
+    bool CanRetryResponse5xxNow();
     void ProcessHeadersRetryDecision();
     void ResumePausedParsing();
     void HandleStreamSendResult(

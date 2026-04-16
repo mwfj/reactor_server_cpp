@@ -11,6 +11,7 @@
 #include "http/http_request.h"
 #include "http/http_status.h"
 #include "log/logger.h"
+#include <cctype>
 
 namespace {
 
@@ -39,6 +40,63 @@ bool HeaderValueStartsWith(
         return lower_value.rfind(prefix_lower, 0) == 0;
     }
     return false;
+}
+
+std::string TrimAscii(std::string value) {
+    size_t begin = 0;
+    while (begin < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[begin]))) {
+        ++begin;
+    }
+    size_t end = value.size();
+    while (end > begin &&
+           std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        --end;
+    }
+    return value.substr(begin, end - begin);
+}
+
+bool IsForbiddenTrailerFieldName(const std::string& lower_name) {
+    if (lower_name.empty()) return true;
+    if (lower_name[0] == ':') return true;
+    return lower_name == "connection" || lower_name == "keep-alive" ||
+           lower_name == "proxy-connection" ||
+           lower_name == "transfer-encoding" || lower_name == "upgrade" ||
+           lower_name == "te" || lower_name == "content-length" ||
+           lower_name == "host" || lower_name == "authorization" ||
+           lower_name == "content-type" ||
+           lower_name == "content-encoding" ||
+           lower_name == "content-range";
+}
+
+std::optional<std::string> FilterTrailerDeclaration(
+    const std::string& trailer_value) {
+    std::vector<std::string> allowed;
+    size_t start = 0;
+    while (start <= trailer_value.size()) {
+        size_t comma = trailer_value.find(',', start);
+        std::string token = TrimAscii(
+            trailer_value.substr(start, comma == std::string::npos
+                                            ? std::string::npos
+                                            : comma - start));
+        if (!token.empty() &&
+            !IsForbiddenTrailerFieldName(LowerCopy(token))) {
+            allowed.push_back(std::move(token));
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    if (allowed.empty()) {
+        return std::nullopt;
+    }
+    std::string joined = allowed.front();
+    for (size_t i = 1; i < allowed.size(); ++i) {
+        joined += ", ";
+        joined += allowed[i];
+    }
+    return joined;
 }
 
 bool ShouldPreserveKnownContentLength(
@@ -755,8 +813,16 @@ bool ProxyTransaction::OnHeaders(
 
     if (relay_mode_ == RelayMode::STREAMING) {
         if (!CommitStreamingResponse()) {
-            OnError(RESULT_SEND_FAILED,
-                    "downstream stream sender rejected response headers");
+            logging::Get()->debug(
+                "ProxyTransaction streaming header commit aborted locally "
+                "client_fd={} service={} status={} attempt={}",
+                client_fd_, service_name_, head.status_code, attempt_);
+            ReleaseBreakerAdmissionNeutral();
+            poison_connection_ = true;
+            state_ = State::FAILED;
+            complete_cb_invoked_ = true;
+            complete_cb_ = nullptr;
+            Cleanup();
             return false;
         }
     }
@@ -787,6 +853,7 @@ bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
     HandleStreamSendResult(result);
     if (result == HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
         poison_connection_ = true;
+        ReleaseBreakerAdmissionNeutral();
         stream_sender_.Abort(
             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::CLIENT_DISCONNECT);
         state_ = State::FAILED;
@@ -1303,8 +1370,11 @@ HttpResponse ProxyTransaction::BuildStreamingHeadersResponse() const {
     if (config_.forward_trailers &&
         client_http_major_ == 1 && client_http_minor_ == 1) {
         auto trailer = FirstHeaderValue(response_head_.headers, "trailer");
-        if (trailer && !FirstHeaderValue(response.GetHeaders(), "trailer")) {
-            response.AppendHeader("Trailer", *trailer);
+        auto filtered_trailer =
+            trailer ? FilterTrailerDeclaration(*trailer) : std::nullopt;
+        if (filtered_trailer &&
+            !FirstHeaderValue(response.GetHeaders(), "trailer")) {
+            response.AppendHeader("Trailer", *filtered_trailer);
         }
     }
     return response;
@@ -1371,7 +1441,7 @@ bool ProxyTransaction::ShouldRetryResponse5xx() const {
         attempt_, method_, RetryPolicy::RetryCondition::RESPONSE_5XX, false);
 }
 
-bool ProxyTransaction::CanRetryResponse5xxNow() const {
+bool ProxyTransaction::CanRetryResponse5xxNow() {
     bool breaker_live_enabled = slice_ && slice_->config().enabled;
     if (!breaker_live_enabled) {
         return true;
@@ -1384,6 +1454,11 @@ bool ProxyTransaction::CanRetryResponse5xxNow() const {
         return true;
     }
 
+    // Optimistic look-ahead only. The retry budget is ultimately enforced by
+    // TryConsumeRetry()'s CAS loop when a retry actually executes. These
+    // separate atomic loads can race with other traffic, so this helper is
+    // intentionally advisory: it only short-circuits obviously-impossible
+    // retries before we tear down a retryable upstream 5xx.
     int64_t in_flight_after = retry_budget_->InFlight();
     if (in_flight_after > 0) {
         --in_flight_after;
@@ -1400,7 +1475,21 @@ bool ProxyTransaction::CanRetryResponse5xxNow() const {
         (non_retry_after * retry_budget_->percent()) / 100;
     int64_t cap = std::max<int64_t>(
         retry_budget_->min_concurrency(), pct_cap);
-    return retries_after < cap;
+    if (retries_after < cap) {
+        return true;
+    }
+
+    retry_budget_->RecordSkippedRetry();
+    logging::Get()->warn(
+        "retry budget exhausted service={} in_flight={} "
+        "retries_in_flight={} cap={} client_fd={} attempt={}",
+        service_name_,
+        in_flight_after,
+        retries_after,
+        cap,
+        client_fd_,
+        attempt_ + 1);
+    return false;
 }
 
 bool ProxyTransaction::IsSseStream(

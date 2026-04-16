@@ -97,6 +97,10 @@ public:
     // prior successful TryConsumeRetry.
     void ReleaseRetry();
 
+    // Record a retry rejection that was detected by a read-only preflight
+    // look-ahead instead of TryConsumeRetry(). No retry slot is consumed.
+    void RecordSkippedRetry();
+
     // Apply new tuning. Thread-safe (atomics). Preserves in-flight counters
     // — only the admission formula changes.
     void Reload(int percent, int min_concurrency);

@@ -40,6 +40,19 @@ bool IsForbiddenInterimHeader(const std::string& lower_name) {
     return false;
 }
 
+bool IsForbiddenTrailerHeader(const std::string& lower_name) {
+    if (lower_name.empty()) return true;
+    if (lower_name[0] == ':') return true;
+    return lower_name == "connection" || lower_name == "keep-alive" ||
+           lower_name == "proxy-connection" ||
+           lower_name == "transfer-encoding" || lower_name == "upgrade" ||
+           lower_name == "te" || lower_name == "content-length" ||
+           lower_name == "host" || lower_name == "authorization" ||
+           lower_name == "content-type" ||
+           lower_name == "content-encoding" ||
+           lower_name == "content-range";
+}
+
 // Returns the standard reason phrase for 1xx status codes.
 const char* InterimReasonPhrase(int code) {
     switch (code) {
@@ -111,6 +124,15 @@ std::string EncodeChunkTerminator(
     const std::vector<std::pair<std::string, std::string>>& trailers) {
     std::string out = "0\r\n";
     for (const auto& [key, value] : trailers) {
+        std::string lower = key;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (IsForbiddenTrailerHeader(lower)) {
+            logging::Get()->warn(
+                "H1 streaming dropped forbidden trailer field '{}'",
+                key);
+            continue;
+        }
         out += key;
         out += ": ";
         out += value;

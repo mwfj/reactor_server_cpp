@@ -51,6 +51,10 @@ static int on_status(llhttp_t* parser, const char* at, size_t length) {
 static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<UpstreamHttpCodec*>(parser->data);
 
+    // Empty-value headers (`Foo:\r\n`) may finish a field without ever
+    // entering on_header_value(). When the next field starts, flush the
+    // previous key/value pair before appending the new field name or the two
+    // names would be concatenated.
     if (self->parsing_header_value_ ||
         (!self->in_header_field_ && !self->current_header_field_.empty())) {
         FlushPendingHeader(self);
@@ -75,7 +79,8 @@ static int on_headers_complete(llhttp_t* parser) {
 
     if (self->response_.headers_complete) {
         FlushPendingHeader(self);
-        if (self->sink_ && self->response_.status_code >= HttpStatus::OK) {
+        if (self->sink_ && self->response_.status_code >= HttpStatus::OK &&
+            !self->trailers_.empty()) {
             self->sink_->OnTrailers(self->trailers_);
         }
         self->trailers_.clear();

@@ -4551,6 +4551,71 @@ void TestH2_ProxyStreamingLargeContentLength() {
     }
 }
 
+void TestH2_ProxyTransientHighWaterFlushDoesNotStall() {
+    std::cout << "\n[TEST] H2 proxy: transient high-water flush does not stall..."
+              << std::endl;
+    try {
+        static constexpr size_t RELAY_BUFFER_LIMIT_BYTES = 16 * 1024;
+        const std::string body(20 * 1024, 'y');
+
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/burst", [body](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(200).Body(body, "application/octet-stream");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig cfg = MakeH2Config(0);
+        UpstreamConfig upstream;
+        upstream.name = "backend";
+        upstream.host = "127.0.0.1";
+        upstream.port = backend_port;
+        upstream.proxy.route_prefix = "/relay";
+        upstream.proxy.strip_prefix = true;
+        upstream.proxy.auto_stream_content_length_threshold_bytes = 1;
+        upstream.proxy.relay_buffer_limit_bytes = RELAY_BUFFER_LIMIT_BYTES;
+        cfg.upstreams.push_back(upstream);
+
+        HttpServer gateway(cfg);
+        TestServerRunner<HttpServer> gateway_runner(gateway);
+        int gateway_port = gateway_runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", gateway_port)) {
+            pass = false;
+            err = "connect failed";
+        } else {
+            auto resp = client.Get("/relay/burst");
+            if (resp.error) {
+                pass = false;
+                err += "client error; ";
+            }
+            if (resp.rst) {
+                pass = false;
+                err += "stream reset; ";
+            }
+            if (resp.status != 200) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) + "; ";
+            }
+            if (resp.body != body) {
+                pass = false;
+                err += "body mismatch len=" + std::to_string(resp.body.size()) + "; ";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "H2 proxy: transient high-water flush does not stall",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 proxy: transient high-water flush does not stall",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ============================================================
 // Entry point
 // ============================================================
@@ -4635,6 +4700,7 @@ void RunAllTests() {
     TestH2_Async_HandlerThrowFiresCancelSlot();
     TestH2_StreamingAbortBeforeHeadersResetsStream();
     TestH2_ProxyStreamingLargeContentLength();
+    TestH2_ProxyTransientHighWaterFlushDoesNotStall();
 
     // --- Category 9: SETTINGS_ENABLE_PUSH wire format ---
     TestH2_SettingsEnablePushWire_Disabled();

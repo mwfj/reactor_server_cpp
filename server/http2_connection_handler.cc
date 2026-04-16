@@ -61,11 +61,7 @@ public:
             return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
         }
         if (len == 0) {
-            return size_ >= high_water_
-                ? HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::
-                      ACCEPTED_ABOVE_HIGH_WATER
-                : HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::
-                      ACCEPTED_BELOW_WATER;
+            return EvaluateOccupancy();
         }
         if (len > SIZE_MAX - size_) {
             logging::Get()->error(
@@ -104,13 +100,7 @@ public:
         }
         write_off_ = (write_off_ + len) % buffer_.size();
         size_ += len;
-        if (size_ >= high_water_) {
-            above_high_water_ = true;
-            return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::
-                ACCEPTED_ABOVE_HIGH_WATER;
-        }
-        return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::
-            ACCEPTED_BELOW_WATER;
+        return EvaluateOccupancy();
     }
 
     void Finish() {
@@ -132,7 +122,9 @@ public:
         if (!drain_listener_) {
             above_high_water_ = false;
             drain_listener_scheduled_ = false;
+            return;
         }
+        MaybeScheduleDrain();
     }
 
     ssize_t ReadChunk(uint8_t* buf, size_t length,
@@ -159,6 +151,21 @@ public:
         }
         MaybeScheduleDrain();
         return static_cast<ssize_t>(to_copy);
+    }
+
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult
+    EvaluateOccupancy() {
+        using SendResult =
+            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult;
+        if (aborted_) {
+            return SendResult::CLOSED;
+        }
+        if (size_ >= high_water_) {
+            above_high_water_ = true;
+            return SendResult::ACCEPTED_ABOVE_HIGH_WATER;
+        }
+        above_high_water_ = false;
+        return SendResult::ACCEPTED_BELOW_WATER;
     }
 
 private:
@@ -321,7 +328,7 @@ public:
         if (!session->InReceiveData()) {
             session->SendPendingFrames();
         }
-        return result;
+        return data_source_->EvaluateOccupancy();
     }
 
     SendResult End(

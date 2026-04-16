@@ -2610,15 +2610,21 @@ void TestIntegrationPartialResponseFailureTripsCircuitBreaker() {
         std::string err;
         if (!TestHttpClient::HasStatus(second, 503)) {
             pass = false;
-            err += "second response should be 503 from open circuit breaker; ";
+            auto status_end = second.find("\r\n");
+            std::string status_line =
+                status_end == std::string::npos ? second : second.substr(0, status_end);
+            err += "second response should be 503 from open circuit breaker (got '" +
+                   status_line + "'); ";
         }
         if (second_lower.find("x-circuit-breaker: open") == std::string::npos) {
             pass = false;
             err += "circuit-open header missing on second response; ";
         }
-        if (request_count.load(std::memory_order_relaxed) > 1) {
+        int observed_requests = request_count.load(std::memory_order_relaxed);
+        if (observed_requests > 1) {
             pass = false;
-            err += "breaker should reject the follow-up request before reaching backend; ";
+            err += "breaker should reject the follow-up request before reaching backend "
+                   "(request_count=" + std::to_string(observed_requests) + "); ";
         }
 
         TestFramework::RecordTest(
@@ -2728,6 +2734,121 @@ void TestIntegrationForwardTrailersRelaysChunkedTrailerBlock() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "Integration: forward_trailers relays chunked trailer block",
+            false, e.what());
+    }
+}
+
+void TestIntegrationForwardTrailersStripForbiddenTrailerFields() {
+    std::cout << "\n[TEST] Integration: forward_trailers strips forbidden trailer fields..." << std::endl;
+    try {
+        HttpServer backend("127.0.0.1", 0);
+        backend.GetAsync(
+            "/trailers-filter",
+            [](const HttpRequest&,
+               HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
+               HTTP_CALLBACKS_NAMESPACE::ResourcePusher /*push_resource*/,
+               HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender,
+               HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback /*complete*/) {
+                HttpResponse head;
+                head.Status(200)
+                    .Header("Content-Type", "text/plain")
+                    .Header("Trailer", "X-Checksum, Content-Length, Host");
+                if (stream_sender.SendHeaders(head) < 0) {
+                    return;
+                }
+                static constexpr char kBody[] = "hello";
+                if (stream_sender.SendData(kBody, sizeof(kBody) - 1) ==
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                    return;
+                }
+                auto end_result = stream_sender.End({
+                    {"X-Checksum", "abc123"},
+                    {"Content-Length", "999"},
+                    {"Host", "backend.local"},
+                });
+                (void)end_result;
+            });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+
+        UpstreamConfig u = MakeProxyUpstreamConfig(
+            "backend", "127.0.0.1", backend_port, "/trailers-filter");
+        u.proxy.buffering = "never";
+        u.proxy.forward_trailers = true;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        int client_fd = TestHttpClient::ConnectRawSocket(gw_port);
+        if (client_fd < 0) throw std::runtime_error("gateway connect failed");
+
+        if (!SendAll(client_fd,
+                     "GET /trailers-filter HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Connection: close\r\n"
+                     "\r\n")) {
+            close(client_fd);
+            throw std::runtime_error("gateway send failed");
+        }
+
+        std::string full = RecvUntilClose(client_fd, 3000);
+        close(client_fd);
+
+        std::string full_lower = full;
+        std::transform(full_lower.begin(), full_lower.end(), full_lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        auto header_end = full_lower.find("\r\n\r\n");
+        std::string header_block =
+            (header_end == std::string::npos) ? std::string() :
+            full_lower.substr(0, header_end);
+        std::string body_and_trailers =
+            (header_end == std::string::npos) ? std::string() :
+            full_lower.substr(header_end + 4);
+
+        bool pass = true;
+        std::string err;
+        if (!TestHttpClient::HasStatus(full, 200)) err += "status not 200; ";
+        if (header_block.find("trailer: x-checksum") == std::string::npos) {
+            err += "sanitized trailer declaration missing; ";
+        }
+        if (header_block.find("content-length") != std::string::npos) {
+            err += "forbidden content-length leaked into headers; ";
+        }
+        if (header_block.find("host:") != std::string::npos) {
+            err += "forbidden host leaked into headers; ";
+        }
+        auto zero_chunk = body_and_trailers.find("0\r\n");
+        auto allowed_trailer = body_and_trailers.find("x-checksum: abc123");
+        if (zero_chunk == std::string::npos) {
+            err += "final zero chunk missing; ";
+        }
+        if (allowed_trailer == std::string::npos ||
+            (zero_chunk != std::string::npos && allowed_trailer < zero_chunk)) {
+            err += "allowed trailer missing; ";
+        }
+        if (body_and_trailers.find("content-length: 999") != std::string::npos) {
+            err += "forbidden content-length trailer leaked; ";
+        }
+        if (body_and_trailers.find("host: backend.local") != std::string::npos) {
+            err += "forbidden host trailer leaked; ";
+        }
+        pass = err.empty();
+
+        TestFramework::RecordTest(
+            "Integration: forward_trailers strips forbidden trailer fields",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: forward_trailers strips forbidden trailer fields",
             false, e.what());
     }
 }
@@ -3391,6 +3512,7 @@ void RunAllTests() {
     TestIntegrationDownstreamBackpressureSuspendsIdleTimeout();
     TestIntegrationPartialResponseFailureTripsCircuitBreaker();
     TestIntegrationForwardTrailersRelaysChunkedTrailerBlock();
+    TestIntegrationForwardTrailersStripForbiddenTrailerFields();
 
     // Section 13: RetryPolicy unit tests -- full jitter backoff
     TestRetryFullJitterRange();

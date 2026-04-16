@@ -8,9 +8,10 @@
 // ProxyTransaction resolves
 // `retry_budget_` from the same CircuitBreakerHost as `slice_`, tracks
 // every attempt's in_flight via the RAII guard, and consults
-// `TryConsumeRetry` before each retry. Exhaustion emits the §12.2
-// response (503 + `X-Retry-Budget-Exhausted: 1`) and does NOT feed
-// back into the slice's failure math.
+// `TryConsumeRetry` before each retry. Retry-budget exhaustion is a
+// LOCAL signal: regular retry paths emit the §12.2 synthetic 503, while
+// pre-commit retryable 5xx paths relay the original upstream response
+// per R11. Neither path feeds back into the slice's failure math.
 //
 // Strategy: backends that always 502 with `retry_on_5xx=true` drive the
 // retry path. A near-zero retry-budget (`percent=0, min_concurrency=0`)
@@ -81,16 +82,14 @@ static bool HasRetryBudgetHeader(const std::string& response) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: A retry attempt rejected by the retry-budget gate delivers 503 +
-// X-Retry-Budget-Exhausted instead of the upstream's 5xx. Verifies that
-// `TryConsumeRetry` runs BEFORE the retry executes and that
-// `MakeRetryBudgetResponse` is emitted through the standard DeliverResponse
-// path.
+// Test 1: A retryable upstream 5xx that cannot be retried because the retry
+// budget is exhausted relays the ORIGINAL upstream 5xx verbatim (R11), rather
+// than a synthetic 503. The retry is still short-circuited locally, so the
+// backend is hit exactly once.
 //
 // retry_budget_percent=0 + retry_budget_min_concurrency=0 → cap = 0. Every
-// retry attempt's TryConsumeRetry returns false. First attempt is
-// unaffected (budget only gates retries), so the backend is hit exactly
-// once per client request; the retry is short-circuited locally.
+// would-be retry attempt is over budget. First attempt is unaffected (budget
+// only gates retries), so the backend is hit exactly once per client request.
 // ---------------------------------------------------------------------------
 void TestRetryBudgetRejectsRetry() {
     std::cout << "\n[TEST] CB Retry Budget: retry budget rejects retry..."
@@ -124,19 +123,23 @@ void TestRetryBudgetRejectsRetry() {
 
         std::string r = TestHttpClient::HttpGet(gw_port, "/fail", 5000);
 
-        bool is_503 = TestHttpClient::HasStatus(r, 503);
+        bool is_502 = TestHttpClient::HasStatus(r, 502);
         bool has_budget_hdr = HasRetryBudgetHeader(r);
+        bool relayed_upstream_body =
+            r.find("upstream-err") != std::string::npos;
         // Backend should have been hit exactly once (the first attempt);
         // every retry was short-circuited by the budget gate.
         int hits = backend_hits.load(std::memory_order_relaxed);
         bool single_backend_hit = (hits == 1);
 
-        bool pass = is_503 && has_budget_hdr && single_backend_hit;
+        bool pass = is_502 && !has_budget_hdr &&
+                    relayed_upstream_body && single_backend_hit;
         TestFramework::RecordTest(
             "CB Retry Budget: retry budget rejects retry", pass,
             pass ? "" :
-            "is_503=" + std::to_string(is_503) +
+            "is_502=" + std::to_string(is_502) +
             " budget_hdr=" + std::to_string(has_budget_hdr) +
+            " relayed_upstream_body=" + std::to_string(relayed_upstream_body) +
             " backend_hits=" + std::to_string(hits) +
             " body=" + r.substr(0, 256));
     } catch (const std::exception& e) {
