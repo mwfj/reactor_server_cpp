@@ -513,9 +513,14 @@ Http2ConnectionHandler::WrapStreamCloseCallback(StreamCloseCallback callback) {
                std::shared_ptr<Http2ConnectionHandler> self,
                int32_t stream_id,
                uint32_t error_code) mutable {
-        if (self) {
-            self->active_stream_sender_impls_.erase(stream_id);
+        // During session teardown nghttp2 can close any remaining live
+        // streams after Http2Session::Owner() has already expired. The
+        // server compensates that path separately, so never forward a null
+        // handler into callbacks that assume a live owner.
+        if (!self) {
+            return;
         }
+        self->active_stream_sender_impls_.erase(stream_id);
         if (callback) {
             callback(std::move(self), stream_id, error_code);
         }

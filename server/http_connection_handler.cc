@@ -71,6 +71,52 @@ struct PreparedStreamingHead {
     bool body_suppressed = false;
 };
 
+std::optional<std::string> MergeAllowedTrailerDeclarations(
+    const std::vector<std::pair<std::string, std::string>>& headers) {
+    std::vector<std::string> allowed;
+    for (const auto& [key, value] : headers) {
+        std::string lower = key;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lower != "trailer") {
+            continue;
+        }
+
+        size_t start = 0;
+        while (start <= value.size()) {
+            size_t comma = value.find(',', start);
+            std::string token = TrimOptionalWhitespace(
+                value.substr(start, comma == std::string::npos
+                                        ? std::string::npos
+                                        : comma - start));
+            if (!token.empty()) {
+                std::string lower_token = token;
+                std::transform(lower_token.begin(), lower_token.end(),
+                               lower_token.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                if (!IsForbiddenTrailerFieldName(lower_token)) {
+                    allowed.push_back(std::move(token));
+                }
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            start = comma + 1;
+        }
+    }
+
+    if (allowed.empty()) {
+        return std::nullopt;
+    }
+
+    std::string merged = allowed.front();
+    for (size_t i = 1; i < allowed.size(); ++i) {
+        merged += ", ";
+        merged += allowed[i];
+    }
+    return merged;
+}
+
 std::string SerializeStreamingHead(const HttpResponse& response,
                                    int http_minor,
                                    bool use_chunked) {
@@ -78,7 +124,7 @@ std::string SerializeStreamingHead(const HttpResponse& response,
     auto effective_cl = use_chunked
         ? std::optional<std::string>()
         : response.ComputeWireContentLength(response.GetStatusCode());
-    std::string merged_trailer;
+    auto merged_trailer = MergeAllowedTrailerDeclarations(response.GetHeaders());
 
     oss << "HTTP/1." << http_minor << " " << response.GetStatusCode()
         << " " << response.GetStatusReason() << "\r\n";
@@ -88,20 +134,11 @@ std::string SerializeStreamingHead(const HttpResponse& response,
                        [](unsigned char c) { return std::tolower(c); });
         if (lower == "transfer-encoding") continue;
         if (lower == "content-length") continue;
-        if (lower == "trailer") {
-            std::string trimmed = TrimOptionalWhitespace(value);
-            if (!trimmed.empty()) {
-                if (!merged_trailer.empty()) {
-                    merged_trailer += ", ";
-                }
-                merged_trailer += trimmed;
-            }
-            continue;
-        }
+        if (lower == "trailer") continue;
         oss << key << ": " << value << "\r\n";
     }
-    if (!merged_trailer.empty()) {
-        oss << "Trailer: " << merged_trailer << "\r\n";
+    if (merged_trailer) {
+        oss << "Trailer: " << *merged_trailer << "\r\n";
     }
     if (effective_cl) {
         oss << "Content-Length: " << *effective_cl << "\r\n";
