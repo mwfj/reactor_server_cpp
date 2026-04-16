@@ -16,6 +16,30 @@
 
 using json = nlohmann::json;
 
+// Strict integer parser for security-sensitive auth knobs.
+//
+// nlohmann/json's `j.value("key", default)` silently coerces non-integer
+// JSON values — `true` becomes 1, `1.9` becomes 1 — which would let invalid
+// configuration pass validation for fields like `leeway_sec`, `cache_sec`,
+// `timeout_sec`, etc. An operator typo that stores `"leeway_sec": true`
+// would result in a 1-second leeway instead of surfacing as a config error.
+//
+// This helper rejects non-integer JSON at parse time. `is_number_integer()`
+// is the right gate: it returns true for both signed and unsigned integers
+// and false for booleans, floats, null, strings, arrays, and objects.
+static int ParseStrictInt(const nlohmann::json& j, const std::string& key,
+                          int default_value, const std::string& context) {
+    if (!j.contains(key)) return default_value;
+    const auto& v = j[key];
+    if (v.is_null()) return default_value;
+    if (!v.is_number_integer()) {
+        throw std::invalid_argument(
+            context + "." + key + " must be an integer "
+            "(got " + std::string(v.type_name()) + ")");
+    }
+    return v.get<int>();
+}
+
 // Serialize a single AuthPolicy to JSON (mirror of ParseAuthPolicy for
 // ToJson round-trip). Omits defaulted fields only when they would collapse
 // noisily; defaulted simple fields are always emitted to keep the output
@@ -42,6 +66,14 @@ static void ParseAuthPolicy(const nlohmann::json& j, auth::AuthPolicy& out,
     if (!j.is_object()) {
         throw std::invalid_argument(context + " must be a JSON object");
     }
+    // Defensive reset: callers today pass fresh AuthPolicy locals, but the
+    // reload path (future Phase 3) can easily re-parse into an existing
+    // object, in which case the *_vec fields would otherwise accumulate
+    // entries across reloads. Clear up front — the only state preserved
+    // across ParseAuthPolicy is what this function explicitly rewrites.
+    out.applies_to.clear();
+    out.issuers.clear();
+    out.required_scopes.clear();
     out.name = j.value("name", std::string{});
     out.enabled = j.value("enabled", false);
     if (j.contains("applies_to")) {
@@ -102,10 +134,12 @@ static void ParseIssuerConfig(const std::string& name, const nlohmann::json& j,
     out.jwks_uri = j.value("jwks_uri", std::string{});
     out.upstream = j.value("upstream", std::string{});
     out.mode = j.value("mode", std::string("jwt"));
-    out.leeway_sec = j.value("leeway_sec", 30);
-    out.jwks_cache_sec = j.value("jwks_cache_sec", 300);
-    out.jwks_refresh_timeout_sec = j.value("jwks_refresh_timeout_sec", 5);
-    out.discovery_retry_sec = j.value("discovery_retry_sec", 30);
+    out.leeway_sec = ParseStrictInt(j, "leeway_sec", 30, ctx);
+    out.jwks_cache_sec = ParseStrictInt(j, "jwks_cache_sec", 300, ctx);
+    out.jwks_refresh_timeout_sec =
+        ParseStrictInt(j, "jwks_refresh_timeout_sec", 5, ctx);
+    out.discovery_retry_sec =
+        ParseStrictInt(j, "discovery_retry_sec", 30, ctx);
 
     if (j.contains("audiences")) {
         if (!j["audiences"].is_array()) {
@@ -138,6 +172,7 @@ static void ParseIssuerConfig(const std::string& name, const nlohmann::json& j,
             throw std::invalid_argument(
                 ctx + ".required_claims must be an array");
         }
+        out.required_claims.clear();
         for (const auto& v : j["required_claims"]) {
             if (!v.is_string()) {
                 throw std::invalid_argument(
@@ -165,13 +200,18 @@ static void ParseIssuerConfig(const std::string& name, const nlohmann::json& j,
             i.value("client_secret_env", std::string{});
         out.introspection.auth_style =
             i.value("auth_style", std::string("basic"));
-        out.introspection.timeout_sec = i.value("timeout_sec", 3);
-        out.introspection.cache_sec = i.value("cache_sec", 60);
+        const std::string ictx = ctx + ".introspection";
+        out.introspection.timeout_sec =
+            ParseStrictInt(i, "timeout_sec", 3, ictx);
+        out.introspection.cache_sec =
+            ParseStrictInt(i, "cache_sec", 60, ictx);
         out.introspection.negative_cache_sec =
-            i.value("negative_cache_sec", 10);
-        out.introspection.stale_grace_sec = i.value("stale_grace_sec", 30);
-        out.introspection.max_entries = i.value("max_entries", 100000);
-        out.introspection.shards = i.value("shards", 16);
+            ParseStrictInt(i, "negative_cache_sec", 10, ictx);
+        out.introspection.stale_grace_sec =
+            ParseStrictInt(i, "stale_grace_sec", 30, ictx);
+        out.introspection.max_entries =
+            ParseStrictInt(i, "max_entries", 100000, ictx);
+        out.introspection.shards = ParseStrictInt(i, "shards", 16, ictx);
     }
 }
 
@@ -1537,6 +1577,47 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             if (ic.jwks_cache_sec <= 0) {
                 throw std::invalid_argument(ctx + ".jwks_cache_sec must be > 0");
             }
+
+            // Mode-specific required fields (design spec §5.3).
+            // jwt mode requires at least one algorithm (the allowlist the
+            // Phase-2 verifier will build `allow_algorithm(key)` calls over)
+            // and a key source — either OIDC discovery OR a static jwks_uri.
+            // introspection mode requires the endpoint (the POST target).
+            if (ic.mode == "jwt") {
+                if (ic.algorithms.empty()) {
+                    throw std::invalid_argument(
+                        ctx + ".algorithms must contain at least one entry "
+                        "for mode=\"jwt\" (supported: RS256/RS384/RS512/"
+                        "ES256/ES384)");
+                }
+                if (!ic.discovery && ic.jwks_uri.empty()) {
+                    throw std::invalid_argument(
+                        ctx + ": mode=\"jwt\" with discovery=false requires "
+                        "a non-empty jwks_uri (static JWKS location)");
+                }
+            } else if (ic.mode == "introspection") {
+                if (ic.introspection.endpoint.empty()) {
+                    throw std::invalid_argument(
+                        ctx + ".introspection.endpoint is required for "
+                        "mode=\"introspection\"");
+                }
+            }
+
+            // Mode/endpoint mismatch — warn per design spec §5.3. Not a
+            // hard-reject because operators sometimes template both blocks
+            // and select mode dynamically; emitting a warn ensures the
+            // unused field is noticed without blocking deployment.
+            if (ic.mode == "jwt" &&
+                !ic.introspection.endpoint.empty()) {
+                logging::Get()->warn(
+                    "{}: mode=\"jwt\" but introspection.endpoint is set — "
+                    "introspection config will be ignored", ctx);
+            }
+            if (ic.mode == "introspection" && !ic.jwks_uri.empty()) {
+                logging::Get()->warn(
+                    "{}: mode=\"introspection\" but jwks_uri is set — "
+                    "JWKS config will be ignored", ctx);
+            }
         }
 
         // Top-level policy validation.
@@ -1561,11 +1642,21 @@ void ConfigLoader::Validate(const ServerConfig& config) {
         // Per spec §3.2 / §5.2: a prefix that appears in both an inline
         // proxy.auth and a top-level auth.policies[].applies_to is a
         // hard-reject config error (ambiguity, not resolved at runtime).
-        // Also catch duplicate `route_prefix` across proxies when both
-        // have inline auth.
-        std::unordered_map<std::string, std::string> inline_prefixes;  // prefix -> owner
+        // Same rule applies across ALL prefix sources: two inline proxies
+        // with the same route_prefix, one top-level policy with the same
+        // prefix declared twice in its applies_to, or two top-level
+        // policies sharing any prefix.
+        //
+        // Unified `all_prefixes` map catches every collision shape. Keyed
+        // by prefix string; value is a human-readable owner description.
+        std::unordered_map<std::string, std::string> all_prefixes;
+
         for (const auto& u : config.upstreams) {
-            if (u.proxy.auth == auth::AuthPolicy{}) continue;
+            // Detect "proxy has inline auth" via the master switch
+            // (u.proxy.auth.enabled). Earlier versions used a default-
+            // struct comparison which broke the moment a new field with a
+            // non-trivial default landed in AuthPolicy.
+            if (!u.proxy.auth.enabled) continue;
             const auto& p = u.proxy.auth;
             const std::string ctx = "upstreams['" + u.name + "'].proxy.auth";
             if (p.on_undetermined != "deny" && p.on_undetermined != "allow") {
@@ -1588,35 +1679,49 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     ctx + " has no route_prefix — inline auth requires a "
                     "non-empty proxy.route_prefix to derive applies_to");
             }
-            auto ins = inline_prefixes.emplace(u.proxy.route_prefix, u.name);
+            const std::string owner =
+                "inline proxy.auth on upstream '" + u.name + "'";
+            auto ins = all_prefixes.emplace(u.proxy.route_prefix, owner);
             if (!ins.second) {
                 throw std::invalid_argument(
-                    "prefix '" + u.proxy.route_prefix + "' appears in two "
-                    "proxies with inline auth (upstreams '" + ins.first->second +
-                    "' and '" + u.name + "') — exact-prefix collisions must be "
-                    "resolved at config time (design spec §3.2)");
+                    "auth policy prefix '" + u.proxy.route_prefix +
+                    "' declared by both " + ins.first->second + " and " +
+                    owner + " — exact-prefix collisions must be resolved at "
+                    "config time (design spec §3.2)");
             }
         }
-        // Top-level policies vs inline: a prefix that appears inline MUST
-        // NOT also appear in any top-level `auth.policies[].applies_to`.
+        // Top-level policies: catches (a) top-level vs inline, (b) two
+        // top-level policies sharing a prefix, (c) one top-level policy
+        // listing the same prefix twice in its applies_to. This is the
+        // guarantee the `auth_policy_matcher::ValidatePolicyList` helper
+        // was designed to enforce — ConfigLoader::Validate is the correct
+        // place to call it because collisions must be a load-time error,
+        // not a silent runtime first-wins.
         for (size_t i = 0; i < config.auth.policies.size(); ++i) {
             const auto& p = config.auth.policies[i];
+            const std::string policy_owner =
+                p.name.empty()
+                    ? ("auth.policies[" + std::to_string(i) + "]")
+                    : ("auth.policies['" + p.name + "']");
             for (const auto& pref : p.applies_to) {
-                auto it = inline_prefixes.find(pref);
-                if (it != inline_prefixes.end()) {
+                auto ins = all_prefixes.emplace(pref, policy_owner);
+                if (!ins.second) {
                     throw std::invalid_argument(
-                        "auth.policies[" + std::to_string(i) + "] applies_to "
-                        "contains prefix '" + pref + "' which is already "
-                        "declared by inline proxy.auth on upstream '" +
-                        it->second + "' — resolve the collision at config "
-                        "time (design spec §3.2)");
+                        "auth policy prefix '" + pref + "' declared by both " +
+                        ins.first->second + " and " + policy_owner +
+                        " — exact-prefix collisions must be resolved at "
+                        "config time (design spec §3.2)");
                 }
             }
         }
 
         // Forward config: reject header-name collisions among the fixed
         // output slots and the claims_to_headers map. Design §5.3.
-        if (config.auth.forward != auth::AuthForwardConfig{}) {
+        // Run unconditionally — the default AuthForwardConfig has three
+        // distinct non-empty header names that trivially pass the set
+        // insertion, and an operator who writes the defaults back
+        // explicitly in JSON gets the same (correct) treatment.
+        {
             std::unordered_set<std::string> output_headers;
             auto add_header = [&output_headers](const std::string& name,
                                                 const std::string& which) {

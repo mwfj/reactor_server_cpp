@@ -80,16 +80,22 @@ bool PopulateFromPayload(const nlohmann::json& payload,
     // serialization choice depends on what the upstream expects. Phase 3
     // wiring should add that flattening at the overlay layer, not here.
     //
-    // Numeric truncation caveat: uint64_t claims that exceed INT64_MAX are
-    // currently read via is_number_integer() + get<int64_t>(), which nlohmann
-    // clamps to the signed range. Tolerable for human-readable claim types
-    // (email, sub, username) but callers that need big-unsigned claim
-    // fidelity should extract them directly from the payload JSON.
+    // Numeric claims: check unsigned FIRST, then signed. This ordering
+    // preserves uint64 values > INT64_MAX — e.g. OAuth numeric IDs for user
+    // or tenant claims that operators may map via claims_to_headers.
+    // Without the unsigned branch, `is_number_integer()` + `get<int64_t>()`
+    // would silently wrap values like 18446744073709551615 to -1, which
+    // would then flow into X-Auth-* headers and downstream services would
+    // see the wrong principal data. nlohmann's `is_number_integer()`
+    // returns true for both signed and unsigned; `is_number_unsigned()`
+    // narrows to the specific unsigned shape.
     for (const auto& key : claims_keys) {
         if (!payload.contains(key)) continue;
         const auto& v = payload[key];
         if (v.is_string()) {
             ctx.claims[key] = v.get<std::string>();
+        } else if (v.is_number_unsigned()) {
+            ctx.claims[key] = std::to_string(v.get<uint64_t>());
         } else if (v.is_number_integer()) {
             ctx.claims[key] = std::to_string(v.get<int64_t>());
         } else if (v.is_number_float()) {

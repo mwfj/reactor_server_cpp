@@ -112,21 +112,23 @@ std::string LoadHmacKeyFromEnv(const std::string& env_var_name) {
     while (!candidate.empty() && candidate.back() == '=') candidate.pop_back();
     // Step 2: strip jwt-cpp "%3d" padding too — trim() returns the substring
     // before the first occurrence of the fill string.
-    candidate = jwt::base::trim<jwt::alphabet::base64url>(candidate);
+    std::string candidate_b64url =
+        jwt::base::trim<jwt::alphabet::base64url>(candidate);
     try {
         std::string decoded = jwt::base::decode<jwt::alphabet::base64url>(
-            jwt::base::pad<jwt::alphabet::base64url>(candidate));
+            jwt::base::pad<jwt::alphabet::base64url>(candidate_b64url));
         if (decoded.size() == 32) {
-            // Silent-swap corner case (review round N+1, finding #4): an
-            // operator's raw 43-char key composed entirely of base64url
-            // alphabet chars [A-Za-z0-9_-] will be interpreted as encoded
-            // rather than raw. HMAC security is preserved either way (both
-            // forms give 32 bytes of key material), but the derived key
-            // differs between interpretations. Log at info so operators
-            // see the decision in their startup logs and can disambiguate
-            // if they intended a 43-char raw key (recommend: change length
-            // or base64url-encode explicitly).
-            logging::Get()->info(
+            // Silent-swap corner case: an operator's raw 43-char key
+            // composed entirely of base64url alphabet chars [A-Za-z0-9_-]
+            // will be interpreted as encoded rather than raw. HMAC security
+            // is preserved either way (both forms give 32 bytes of key
+            // material), but the derived key differs between
+            // interpretations. Log at debug — the base64url path is the
+            // COMMON case (operators running `openssl rand -base64 32` and
+            // stripping '=' or using the url-safe variant), so info-level
+            // would spam every startup. Operators who suspect a raw/decoded
+            // mismatch can enable debug logging to disambiguate.
+            logging::Get()->debug(
                 "LoadHmacKeyFromEnv: env var '{}' interpreted as "
                 "base64url-encoded 32-byte key (decoded). If you intended "
                 "a raw 43-char key, either base64url-encode it explicitly "
@@ -136,8 +138,31 @@ std::string LoadHmacKeyFromEnv(const std::string& env_var_name) {
         }
     } catch (const std::exception& e) {
         logging::Get()->debug("LoadHmacKeyFromEnv: base64url decode failed "
-                              "for env var '{}' ({}); falling back to raw "
-                              "bytes interpretation",
+                              "for env var '{}' ({}); trying standard base64",
+                              env_var_name, e.what());
+    }
+
+    // Step 3: standard base64 fallback (for operators who ran
+    // `openssl rand -base64 32`, which emits the '+' / '/' alphabet — NOT
+    // base64url). base64url's alphabet excludes '+' and '/', so the first
+    // attempt above throws on those characters and we fall through here.
+    // The decoded bytes are identical as long as the key is 32 bytes.
+    try {
+        std::string trimmed_b64 =
+            jwt::base::trim<jwt::alphabet::base64>(candidate);
+        std::string decoded_b64 = jwt::base::decode<jwt::alphabet::base64>(
+            jwt::base::pad<jwt::alphabet::base64>(trimmed_b64));
+        if (decoded_b64.size() == 32) {
+            logging::Get()->debug(
+                "LoadHmacKeyFromEnv: env var '{}' interpreted as "
+                "standard-base64-encoded 32-byte key (decoded).",
+                env_var_name);
+            return decoded_b64;
+        }
+    } catch (const std::exception& e) {
+        logging::Get()->debug("LoadHmacKeyFromEnv: standard base64 decode "
+                              "also failed for env var '{}' ({}); falling "
+                              "back to raw bytes interpretation",
                               env_var_name, e.what());
     }
     return raw;

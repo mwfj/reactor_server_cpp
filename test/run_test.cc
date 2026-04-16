@@ -193,15 +193,15 @@ int main(int argc, char* argv[]) {
         // Run circuit-breaker tests (unit + components + integration + retry-budget + drain + observability + reload)
         }else if(mode == "circuit_breaker" || mode == "-B"){
             CircuitBreakerTests::RunAllTests();
-        // Run auth foundation tests (token_hasher + base64url env auto-detect + scope extractors)
-        }else if(mode == "auth" || mode == "-A"){
-            AuthFoundationTests::RunAllTests();
             CircuitBreakerComponentsTests::RunAllTests();
             CircuitBreakerIntegrationTests::RunAllTests();
             CircuitBreakerRetryBudgetTests::RunAllTests();
             CircuitBreakerWaitQueueDrainTests::RunAllTests();
             CircuitBreakerObservabilityTests::RunAllTests();
             CircuitBreakerReloadTests::RunAllTests();
+        // Run auth foundation tests (token_hasher + base64url env auto-detect + scope extractors)
+        }else if(mode == "auth" || mode == "-A"){
+            AuthFoundationTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);
