@@ -53,6 +53,12 @@ void UpstreamConnection::IncReadDisable() {
 
 void UpstreamConnection::DecReadDisable() {
     int current = read_disable_count_.load(std::memory_order_acquire);
+    if (current <= 0) {
+        logging::Get()->warn(
+            "UpstreamConnection read-disable underflow fd={} host={}:{} count={}",
+            fd(), upstream_host_, upstream_port_, current);
+        return;
+    }
     while (current > 0) {
         if (read_disable_count_.compare_exchange_weak(
                 current, current - 1,
@@ -64,6 +70,9 @@ void UpstreamConnection::DecReadDisable() {
             return;
         }
     }
+    logging::Get()->warn(
+        "UpstreamConnection read-disable underflow raced to zero fd={} host={}:{}",
+        fd(), upstream_host_, upstream_port_);
 }
 
 bool UpstreamConnection::IsAlive() const {

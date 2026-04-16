@@ -101,6 +101,21 @@ static bool SendAll(int fd, const std::string& data) {
     return true;
 }
 
+static std::string MakeChunk(const std::string& data) {
+    static constexpr size_t CHUNK_HEADER_BUF_SIZE = 32;
+    char header[CHUNK_HEADER_BUF_SIZE];
+    int header_len =
+        std::snprintf(header, sizeof(header), "%zx\r\n", data.size());
+    if (header_len <= 0 ||
+        static_cast<size_t>(header_len) >= sizeof(header)) {
+        return "";
+    }
+    std::string chunk(header, static_cast<size_t>(header_len));
+    chunk += data;
+    chunk += "\r\n";
+    return chunk;
+}
+
 static std::string RecvOnce(int fd, int timeout_ms) {
     struct pollfd pfd{fd, POLLIN, 0};
     int rv;
@@ -2185,6 +2200,81 @@ void TestIntegrationChunkedUpstreamStreamsImmediately() {
     }
 }
 
+void TestIntegrationParameterizedSseAutoStreams() {
+    std::cout << "\n[TEST] Integration: parameterized SSE auto-streams..." << std::endl;
+    try {
+        RawHttpBackendServer backend([](int fd, const std::string&) {
+            SendAll(fd,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "Content-Type: text/event-stream; charset=utf-8\r\n"
+                    "\r\n");
+            SendAll(fd, MakeChunk("data: first\n\n"));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+            SendAll(fd, MakeChunk("data: second\n\n"));
+            SendAll(fd, "0\r\n\r\n");
+        });
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+        gw_config.upstreams.push_back(
+            MakeProxyUpstreamConfig("backend", "127.0.0.1", backend.GetPort(), "/sse-auto"));
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        int client_fd = TestHttpClient::ConnectRawSocket(gw_port);
+        if (client_fd < 0) throw std::runtime_error("gateway connect failed");
+
+        if (!SendAll(client_fd,
+                     "GET /sse-auto HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Connection: close\r\n"
+                     "\r\n")) {
+            close(client_fd);
+            throw std::runtime_error("gateway send failed");
+        }
+
+        std::string early = RecvUntilContains(client_fd, "data: first\n\n", 1200);
+        std::string full = early + RecvUntilClose(client_fd, 3000);
+        close(client_fd);
+
+        std::string early_lower = early;
+        std::transform(early_lower.begin(), early_lower.end(), early_lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        bool pass = true;
+        std::string err;
+        if (!TestHttpClient::HasStatus(full, 200)) err += "status not 200; ";
+        if (early.find("data: first\n\n") == std::string::npos) {
+            err += "first SSE event was not streamed early; ";
+        }
+        if (early.find("data: second\n\n") != std::string::npos) {
+            err += "second SSE event arrived too early; ";
+        }
+        if (early_lower.find("transfer-encoding: chunked") == std::string::npos) {
+            err += "streaming chunked framing missing; ";
+        }
+        if (full.find("data: second\n\n") == std::string::npos) {
+            err += "second SSE event missing from final response; ";
+        }
+        if (full.find("0\r\n\r\n") == std::string::npos) {
+            err += "final chunk terminator missing; ";
+        }
+        pass = err.empty();
+
+        TestFramework::RecordTest(
+            "Integration: parameterized SSE auto-streams", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: parameterized SSE auto-streams", false, e.what());
+    }
+}
+
 void TestIntegrationStreamIdleTimeoutAbortsRelay() {
     std::cout << "\n[TEST] Integration: stream idle timeout aborts committed relay..." << std::endl;
     try {
@@ -2244,6 +2334,84 @@ void TestIntegrationStreamIdleTimeoutAbortsRelay() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "Integration: stream idle timeout aborts committed relay", false, e.what());
+    }
+}
+
+void TestIntegrationDownstreamBackpressureSuspendsIdleTimeout() {
+    std::cout << "\n[TEST] Integration: downstream backpressure suspends idle timeout..." << std::endl;
+    try {
+        std::string payload =
+            "BEGIN-" + std::string(512 * 1024, 'x') + "-END";
+
+        RawHttpBackendServer backend([payload](int fd, const std::string&) {
+            SendAll(fd,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "\r\n");
+            SendAll(fd, MakeChunk(payload));
+            SendAll(fd, "0\r\n\r\n");
+        });
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+        UpstreamConfig u = MakeProxyUpstreamConfig(
+            "backend", "127.0.0.1", backend.GetPort(), "/backpressure-idle");
+        u.proxy.buffering = "never";
+        u.proxy.response_timeout_ms = 0;
+        u.proxy.stream_idle_timeout_sec = 1;
+        u.proxy.relay_buffer_limit_bytes = 16 * 1024;
+        u.proxy.auto_stream_content_length_threshold_bytes = 16 * 1024;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        int client_fd = TestHttpClient::ConnectRawSocket(gw_port);
+        if (client_fd < 0) throw std::runtime_error("gateway connect failed");
+
+        int rcvbuf = 4096;
+        ::setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+        if (!SendAll(client_fd,
+                     "GET /backpressure-idle HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Connection: close\r\n"
+                     "\r\n")) {
+            close(client_fd);
+            throw std::runtime_error("gateway send failed");
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+        std::string full = RecvUntilClose(client_fd, 5000);
+        close(client_fd);
+
+        bool pass = true;
+        std::string err;
+        if (!TestHttpClient::HasStatus(full, 200)) err += "status not 200; ";
+        if (full.find("BEGIN-") == std::string::npos) {
+            err += "payload prefix missing; ";
+        }
+        if (full.find("-END") == std::string::npos) {
+            err += "payload suffix missing; ";
+        }
+        if (full.find("0\r\n\r\n") == std::string::npos) {
+            err += "final chunk terminator missing after downstream stall; ";
+        }
+        pass = err.empty();
+
+        TestFramework::RecordTest(
+            "Integration: downstream backpressure suspends idle timeout",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: downstream backpressure suspends idle timeout",
+            false, e.what());
     }
 }
 
@@ -3025,7 +3193,9 @@ void RunAllTests() {
     TestIntegrationSmallContentLengthStaysBuffered();
     TestIntegrationLargeContentLengthStreamsAndPreservesLength();
     TestIntegrationChunkedUpstreamStreamsImmediately();
+    TestIntegrationParameterizedSseAutoStreams();
     TestIntegrationStreamIdleTimeoutAbortsRelay();
+    TestIntegrationDownstreamBackpressureSuspendsIdleTimeout();
 
     // Section 13: RetryPolicy unit tests -- full jitter backoff
     TestRetryFullJitterRange();

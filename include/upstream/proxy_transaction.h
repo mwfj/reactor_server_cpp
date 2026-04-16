@@ -234,6 +234,7 @@ private:
     bool pending_retryable_5xx_response_ = false;
     UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead
         pending_retryable_5xx_head_;
+    std::string pending_retryable_5xx_body_;
 
     // Internal methods
     void AttemptCheckout();
@@ -269,6 +270,7 @@ private:
         HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult result);
     bool IsSseStream(
         const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) const;
+    void SuspendStreamIdleTimer();
     void RefreshStreamIdleTimer();
     void ScheduleStreamIdleCheck(uint64_t generation,
                                  std::chrono::milliseconds delay);

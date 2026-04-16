@@ -20,17 +20,6 @@ std::string LowerCopy(std::string value) {
     return value;
 }
 
-bool HeaderValueEquals(const std::vector<std::pair<std::string, std::string>>& headers,
-                       const std::string& name,
-                       const std::string& expected_lower) {
-    for (const auto& [key, value] : headers) {
-        if (LowerCopy(key) == name) {
-            return LowerCopy(value) == expected_lower;
-        }
-    }
-    return false;
-}
-
 std::optional<std::string> FirstHeaderValue(
     const std::vector<std::pair<std::string, std::string>>& headers,
     const std::string& name_lower) {
@@ -64,6 +53,64 @@ bool ShouldPreserveKnownContentLength(
                    CONTENT_LENGTH &&
            !include_body &&
            head.expected_length >= 0;
+}
+
+std::string SnapshotRetryable5xxBody(
+    const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head,
+    const std::string& decoded_body,
+    const std::string& paused_wire_body) {
+    std::string snapshot = decoded_body;
+    if (paused_wire_body.empty()) {
+        return snapshot;
+    }
+
+    using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
+    switch (head.framing) {
+        case Framing::CONTENT_LENGTH:
+            snapshot.append(paused_wire_body);
+            if (head.expected_length >= 0 &&
+                snapshot.size() > static_cast<size_t>(head.expected_length)) {
+                snapshot.resize(static_cast<size_t>(head.expected_length));
+            }
+            break;
+        case Framing::EOF_TERMINATED:
+            snapshot.append(paused_wire_body);
+            break;
+        case Framing::CHUNKED: {
+            size_t pos = 0;
+            while (pos < paused_wire_body.size()) {
+                size_t line_end = paused_wire_body.find("\r\n", pos);
+                if (line_end == std::string::npos) {
+                    break;
+                }
+
+                std::string size_line =
+                    paused_wire_body.substr(pos, line_end - pos);
+                size_t chunk_size = 0;
+                if (std::sscanf(size_line.c_str(), "%zx", &chunk_size) != 1) {
+                    break;
+                }
+
+                pos = line_end + 2;
+                if (chunk_size == 0) {
+                    break;
+                }
+                if (paused_wire_body.size() - pos < chunk_size + 2) {
+                    break;
+                }
+                snapshot.append(paused_wire_body.data() + pos, chunk_size);
+                pos += chunk_size;
+                if (paused_wire_body.compare(pos, 2, "\r\n") != 0) {
+                    break;
+                }
+                pos += 2;
+            }
+            break;
+        }
+        case Framing::NO_BODY:
+            break;
+    }
+    return snapshot;
 }
 
 }  // namespace
@@ -604,6 +651,13 @@ void ProxyTransaction::OnUpstreamData(
     // Parse upstream response data
     size_t consumed = codec_.Parse(parse_input.data(), parse_input.size());
 
+    // Body/header callbacks may have already completed or torn down the
+    // transaction (for example, downstream closed during streaming body
+    // relay). Ignore parser state after terminal callback-driven cleanup.
+    if (state_ == State::COMPLETE || state_ == State::FAILED) {
+        return;
+    }
+
     // Check for parse error — the HTTP stream is desynchronized and the
     // connection must not be returned to the idle pool.
     if (codec_.HasError()) {
@@ -743,6 +797,7 @@ bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
         complete_cb_invoked_ = true;
         complete_cb_ = nullptr;
         Cleanup();
+        return false;
     }
     return true;
 }
@@ -883,6 +938,8 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
         if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX) {
             pending_retryable_5xx_response_ = true;
             pending_retryable_5xx_head_ = response_head_;
+            pending_retryable_5xx_body_ = SnapshotRetryable5xxBody(
+                response_head_, response_body_, paused_parse_bytes_);
         } else {
             ClearPendingRetryable5xxResponse();
         }
@@ -1179,6 +1236,7 @@ void ProxyTransaction::Cleanup() {
 void ProxyTransaction::ClearPendingRetryable5xxResponse() {
     pending_retryable_5xx_response_ = false;
     pending_retryable_5xx_head_ = {};
+    pending_retryable_5xx_body_.clear();
 }
 
 bool ProxyTransaction::DeliverPendingRetryable5xxResponse(
@@ -1196,8 +1254,9 @@ bool ProxyTransaction::DeliverPendingRetryable5xxResponse(
         attempt_, duration.count(), reject_source);
 
     state_ = State::COMPLETE;
+    std::string body = pending_retryable_5xx_body_;
     HttpResponse response = BuildResponseFromHead(
-        pending_retryable_5xx_head_, false, nullptr);
+        pending_retryable_5xx_head_, !body.empty(), &body);
     DeliverResponse(std::move(response));
     return true;
 }
@@ -1263,7 +1322,7 @@ ProxyTransaction::RelayMode ProxyTransaction::DecideRelayMode(
     if (IsNoBodyResponse(head)) {
         return RelayMode::BUFFERED;
     }
-    if (HeaderValueEquals(head.headers, "content-type", "text/event-stream")) {
+    if (IsSseStream(head)) {
         return RelayMode::STREAMING;
     }
     if (head.framing ==
@@ -1373,6 +1432,7 @@ void ProxyTransaction::HandleStreamSendResult(
         return;
     }
 
+    SuspendStreamIdleTimer();
     upstream_conn->IncReadDisable();
     codec_.PauseParsing();
     std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
@@ -1383,8 +1443,15 @@ void ProxyTransaction::HandleStreamSendResult(
             conn->DecReadDisable();
         }
         self->stream_sender_.SetDrainListener(nullptr);
+        self->last_body_progress_at_ = std::chrono::steady_clock::now();
+        self->RefreshStreamIdleTimer();
         self->ResumePausedParsing();
     });
+}
+
+void ProxyTransaction::SuspendStreamIdleTimer() {
+    ++stream_idle_timer_generation_;
+    stream_idle_timer_armed_ = false;
 }
 
 void ProxyTransaction::RefreshStreamIdleTimer() {

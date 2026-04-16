@@ -166,6 +166,10 @@ public:
         auto prepared = prepare_head_ ? prepare_head_(headers_only_response)
                                       : std::nullopt;
         if (!prepared) {
+            logging::Get()->debug(
+                "H1 streaming SendHeaders prepare_head rejected fd={} closing={}",
+                conn_ ? conn_->fd() : -1,
+                conn_ ? conn_->IsClosing() : true);
             terminal_ = true;
             return -1;
         }

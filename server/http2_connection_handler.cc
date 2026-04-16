@@ -67,14 +67,33 @@ public:
                 : HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::
                       ACCEPTED_BELOW_WATER;
         }
-        if (len > high_water_ || size_ > high_water_ - len) {
+        if (len > SIZE_MAX - size_) {
             logging::Get()->error(
-                "H2 streaming relay buffer overflow size={} append={} high_water={}",
+                "H2 streaming relay size overflow size={} append={} high_water={}",
                 size_, len, high_water_);
             Abort();
             return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
         }
-        if (buffer_.empty() && !RebuildBuffer(high_water_)) {
+        size_t required = size_ + len;
+        if (buffer_.empty()) {
+            if (!RebuildBuffer(std::max(high_water_, required))) {
+                Abort();
+                return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
+            }
+        } else if (required > buffer_.size()) {
+            if (size_ >= high_water_) {
+                logging::Get()->error(
+                    "H2 streaming relay buffer overflow size={} append={} high_water={} capacity={}",
+                    size_, len, high_water_, buffer_.size());
+                Abort();
+                return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
+            }
+            if (!RebuildBuffer(required)) {
+                Abort();
+                return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
+            }
+        }
+        if (buffer_.empty()) {
             Abort();
             return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
         }
