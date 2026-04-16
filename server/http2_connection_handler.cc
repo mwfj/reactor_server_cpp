@@ -299,12 +299,16 @@ public:
         if (data_source_->Append(data, len) == SendResult::CLOSED) {
             return SendResult::CLOSED;
         }
-        int rv = session->ResumeStreamData(stream_id_);
-        if (rv != 0) {
-            AbortInternal(false, AbortReason::CLIENT_DISCONNECT);
-            return SendResult::CLOSED;
-        }
+        // While we're still inside nghttp2_session_mem_recv2, the stream has
+        // not yet had a chance to return NGHTTP2_ERR_DEFERRED from the data
+        // provider. Resuming before that point returns INVALID_ARGUMENT and
+        // would incorrectly reset a healthy inline-streamed response.
         if (!session->InReceiveData()) {
+            int rv = session->ResumeStreamData(stream_id_);
+            if (rv != 0) {
+                AbortInternal(false, AbortReason::CLIENT_DISCONNECT);
+                return SendResult::CLOSED;
+            }
             session->SendPendingFrames();
         }
         return EvaluateCombinedOccupancy();
@@ -345,12 +349,12 @@ public:
             return SendResult::ACCEPTED_BELOW_WATER;
         }
         data_source_->Finish();
-        int rv = session->ResumeStreamData(stream_id_);
-        if (rv != 0) {
-            AbortInternal(false, AbortReason::CLIENT_DISCONNECT);
-            return SendResult::CLOSED;
-        }
         if (!session->InReceiveData()) {
+            int rv = session->ResumeStreamData(stream_id_);
+            if (rv != 0) {
+                AbortInternal(false, AbortReason::CLIENT_DISCONNECT);
+                return SendResult::CLOSED;
+            }
             session->SendPendingFrames();
         }
         if (finalize_request_) {
