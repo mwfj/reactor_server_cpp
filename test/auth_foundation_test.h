@@ -513,14 +513,175 @@ void TestConfigLoaderAuthValidation() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// LoadHmacKeyFromEnv — standard base64 fallback (base64 alphabet uses +/=,
+// not base64url's -_). Operators running `openssl rand -base64 32` (the most
+// common JWT-key-generation command in tutorials) get 44-char output with
+// '+' or '/' characters that base64url rejects. This test pins the fallback
+// path that decodes via `jwt::alphabet::base64` after base64url fails —
+// added in the review round that introduced the Step-3 fallback in
+// server/token_hasher.cc.
+// -----------------------------------------------------------------------------
+void TestLoadHmacKeyFromEnvStandardBase64() {
+    std::cout << "\n[TEST] LoadHmacKeyFromEnv standard base64 fallback..." << std::endl;
+
+    const char* kVarName = "REACTOR_TEST_AUTH_STD_B64_KEY";
+    auto restore_env = [](const char* name, const char* prev, bool had) {
+        if (had) setenv(name, prev, 1);
+        else unsetenv(name);
+    };
+
+    // Hoist saved state above the try so the catch block sees the correct
+    // pre-test value (matches the pattern from the other tests — fixes the
+    // restore-corruption regression flagged in an earlier round).
+    const char* prev = std::getenv(kVarName);
+    std::string saved = prev ? prev : "";
+    bool had_original = (prev != nullptr);
+
+    try {
+        // Craft a 32-byte binary key whose STANDARD base64 encoding contains
+        // '+' or '/'. Byte pattern 0xFF 0xFB 0xFF 0xFB ... produces bit groups
+        // that base64-encode to chars including '/' (0x3F = 63) and '+' (0x3E
+        // = 62) — neither of which is in the base64url alphabet.
+        std::string raw_key;
+        raw_key.reserve(32);
+        for (int i = 0; i < 32; ++i) {
+            raw_key.push_back(
+                static_cast<char>(i % 2 == 0 ? 0xFF : 0xFB));
+        }
+        // Encode using STANDARD base64 (mirrors `openssl rand -base64 32`
+        // output, which uses '+' / '/' / '='). jwt-cpp's base64 alphabet
+        // emits '=' padding by default, producing the 44-char form.
+        std::string encoded =
+            jwt::base::encode<jwt::alphabet::base64>(raw_key);
+
+        // Fixture self-check: if the encoded string happens not to contain
+        // any base64-only character, this test wouldn't exercise the
+        // fallback — a base64url decode would succeed and we'd never hit
+        // Step 3. Fail loudly rather than silently pass a no-op test.
+        bool has_std_only_char =
+            encoded.find('+') != std::string::npos ||
+            encoded.find('/') != std::string::npos;
+        if (!has_std_only_char) {
+            TestFramework::RecordTest(
+                "AuthFoundation: LoadHmacKeyFromEnv standard base64 fallback",
+                false,
+                "fixture: chosen byte pattern didn't produce '+' or '/' in "
+                "base64 encoding — test would not exercise the Step-3 "
+                "fallback path",
+                TestFramework::TestCategory::OTHER);
+            return;
+        }
+
+        setenv(kVarName, encoded.c_str(), 1);
+        std::string decoded_key = auth::LoadHmacKeyFromEnv(kVarName);
+
+        restore_env(kVarName, saved.c_str(), had_original);
+
+        bool decoded_to_32 = decoded_key.size() == 32;
+        bool matches_raw = decoded_to_32 && decoded_key == raw_key;
+
+        bool pass = decoded_to_32 && matches_raw;
+        std::string err;
+        if (!decoded_to_32) {
+            err = "standard-base64 input (" + std::to_string(encoded.size()) +
+                  " chars containing '+' or '/') not decoded via Step-3 "
+                  "fallback; returned size=" +
+                  std::to_string(decoded_key.size());
+        } else if (!matches_raw) {
+            err = "standard-base64 decoded bytes differ from original raw key "
+                  "(HMAC key would silently change)";
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: LoadHmacKeyFromEnv standard base64 fallback",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        restore_env(kVarName, saved.c_str(), had_original);
+        TestFramework::RecordTest(
+            "AuthFoundation: LoadHmacKeyFromEnv standard base64 fallback",
+            false, std::string("unexpected exception: ") + e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — same-header collision in claims_to_headers.
+// Two distinct claim keys mapping to the same header NAME must be rejected
+// at config-load time. Without this rejection, the runtime HeaderRewriter
+// would get last-write-wins behavior and operators would see silently
+// wrong values in the selected claim header. The unified header-collision
+// set in Validate() already catches this — the test pins that guarantee
+// against a future refactor that might inadvertently narrow the check.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderClaimHeaderCollision() {
+    std::cout << "\n[TEST] ConfigLoader rejects claim->same-header collision..." << std::endl;
+    try {
+        const std::string bad_json = R"({
+            "bind_host": "127.0.0.1",
+            "bind_port": 8080,
+            "auth": {
+                "enabled": true,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://accounts.google.com",
+                        "upstream": "idp_google",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                },
+                "forward": {
+                    "claims_to_headers": {
+                        "email": "X-Shared-Header",
+                        "sub":   "X-Shared-Header"
+                    }
+                }
+            },
+            "upstreams": [{"name": "idp_google", "host": "127.0.0.1", "port": 443}]
+        })";
+        bool threw = false;
+        std::string err_msg;
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(bad_json);
+            ConfigLoader::Validate(cfg);
+        } catch (const std::invalid_argument& e) {
+            threw = true;
+            err_msg = e.what();
+        }
+        bool mentions_collision =
+            threw && err_msg.find("collides") != std::string::npos;
+
+        bool pass = threw && mentions_collision;
+        std::string err;
+        if (!threw) {
+            err = "expected Validate() to reject duplicate header names in "
+                  "claims_to_headers but it accepted the config";
+        } else if (!mentions_collision) {
+            err = "Validate() threw but error text didn't mention "
+                  "'collides'; got: " + err_msg;
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects claim->same-header collision",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects claim->same-header collision",
+            false, std::string("unexpected harness error: ") + e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
     TestLoadHmacKeyFromEnvDoesNotThrow();
     TestLoadHmacKeyFromEnvAutoDetect();
+    TestLoadHmacKeyFromEnvStandardBase64();
     TestExtractScopesScpAsString();
     TestConfigLoaderAuthRoundTrip();
     TestConfigLoaderAuthValidation();
+    TestConfigLoaderClaimHeaderCollision();
 }
 
 }  // namespace AuthFoundationTests
