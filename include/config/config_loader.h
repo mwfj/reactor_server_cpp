@@ -80,6 +80,44 @@ public:
         const ServerConfig& config,
         const std::unordered_set<std::string>& live_upstream_names);
 
+    // Validate inline per-proxy auth blocks (structural checks +
+    // enforcement-not-yet-wired gate). Runs the SAME per-upstream auth
+    // checks that ConfigLoader::Validate() applies inline, but exposed
+    // as a separate entry point so callers can run them on the REAL
+    // (non-stripped) `upstreams[]` list even when the full Validate is
+    // called on a reload-stripped copy.
+    //
+    // Motivation: HttpServer::Reload() strips `upstreams[]` from its
+    // validation copy to skip topology-restart-only checks
+    // (UpstreamTlsConfig/Pool ranges/etc.). That stripping also skips
+    // the per-upstream inline-auth loop, so an operator reload that
+    // sets `proxy.auth.enabled=true` or a bad inline issuer reference
+    // would slip through the strict reload gate. Reload calls this
+    // helper explicitly against the original `new_config` to restore
+    // those checks without reintroducing the topology-restart noise.
+    //
+    // Runs (against `config.upstreams`):
+    //   - on_undetermined value check
+    //   - issuer references resolve to `config.auth.issuers`
+    //   - populated-inline-auth requires non-empty `proxy.route_prefix`
+    //   - populated-inline-auth requires LITERAL byte-prefix
+    //     (rejects route_trie patterns because the auth matcher is
+    //     literal-only)
+    //   - enforcement-not-yet-wired gate: rejects `proxy.auth.enabled=true`
+    //     until request-time enforcement is wired (design spec §14 Phase 2)
+    //
+    // Does NOT run collision detection — that requires the cross-source
+    // view (inline + top-level applies_to) which the full Validate owns.
+    //
+    // Idempotent with the inline-auth branch inside Validate(): at
+    // startup the full Validate runs the same logic once; this helper
+    // is safe to call a second time with the same config (all checks
+    // are pure / side-effect-free / deterministic).
+    //
+    // Throws std::invalid_argument with an `upstreams['name'].proxy.auth...`
+    // message on failure.
+    static void ValidateProxyAuth(const ServerConfig& config);
+
     // Return a ServerConfig with all default values.
     static ServerConfig Default();
 

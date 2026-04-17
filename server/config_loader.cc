@@ -2239,6 +2239,90 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
     }
 }
 
+void ConfigLoader::ValidateProxyAuth(const ServerConfig& config) {
+    // Same per-upstream checks that Validate() runs inline, extracted so
+    // the reload path can invoke them against the REAL upstreams[] list
+    // even when Validate() is called on a stripped validation_copy.
+    // See config_loader.h docstring for the full motivation.
+    for (const auto& u : config.upstreams) {
+        const auto& p = u.proxy.auth;
+        const std::string ctx = "upstreams['" + u.name + "'].proxy.auth";
+
+        if (p.on_undetermined != "deny" && p.on_undetermined != "allow") {
+            throw std::invalid_argument(
+                ctx + ".on_undetermined must be \"deny\" or \"allow\" "
+                "(checked regardless of `enabled` so staged disabled "
+                "policies still get typo-rejection)");
+        }
+        for (const auto& issuer_name : p.issuers) {
+            if (config.auth.issuers.count(issuer_name) == 0) {
+                throw std::invalid_argument(
+                    ctx + ".issuers references unknown issuer '" +
+                    issuer_name + "' (checked regardless of `enabled` "
+                    "so staged disabled policies still get typo-rejection)");
+            }
+        }
+
+        // route_prefix non-empty is required ONLY when the operator has
+        // actually populated the inline auth block. See the parallel
+        // in-Validate comment for the rationale (programmatic-only
+        // proxies with no auth block skip this check).
+        const bool inline_auth_populated = (p != auth::AuthPolicy{});
+        if (inline_auth_populated && u.proxy.route_prefix.empty()) {
+            throw std::invalid_argument(
+                ctx + " has no route_prefix — inline auth requires a "
+                "non-empty proxy.route_prefix to derive applies_to");
+        }
+
+        // route_prefix must be a LITERAL byte prefix — patterns never
+        // match because route_trie patterns + auth matcher (literal)
+        // disagree. See the parallel in-Validate comment for full
+        // rationale and the alternative operator guidance.
+        if (inline_auth_populated && !u.proxy.route_prefix.empty()) {
+            std::vector<ROUTE_TRIE::Segment> segs;
+            try {
+                segs = ROUTE_TRIE::ParsePattern(u.proxy.route_prefix);
+            } catch (const std::exception& e) {
+                throw std::invalid_argument(
+                    ctx + ": route_prefix '" + u.proxy.route_prefix +
+                    "' failed to parse as a route pattern: " + e.what());
+            }
+            for (const auto& s : segs) {
+                if (s.type != ROUTE_TRIE::NodeType::STATIC) {
+                    throw std::invalid_argument(
+                        ctx + ": inline auth requires a LITERAL prefix "
+                        "in proxy.route_prefix (got '" +
+                        u.proxy.route_prefix + "' which contains a " +
+                        (s.type == ROUTE_TRIE::NodeType::PARAM
+                            ? "':" + s.param_name + "' param"
+                            : "'*" + s.param_name + "' catch-all") +
+                        " segment). The auth matcher does byte-prefix "
+                        "matching only (design spec §3.2). If you need "
+                        "to protect a patterned route, use top-level "
+                        "auth.policies[] with applies_to listing the "
+                        "literal prefix(es) the pattern expands through "
+                        "(e.g. ['/api/']).");
+                }
+            }
+        }
+
+        // Enforcement-not-yet-wired gate (the security-critical case
+        // the reviewer specifically flagged as bypassed by the reload
+        // strip). Same message as the in-Validate gate — operators
+        // should see the same wording regardless of which entry point
+        // (startup Validate / reload ValidateProxyAuth) surfaces it.
+        if (p.enabled) {
+            throw std::invalid_argument(
+                "upstreams['" + u.name +
+                "'].proxy.auth.enabled=true rejected: request-time "
+                "enforcement is not yet wired in this build (design spec "
+                "§14 Phase 2). Set proxy.auth.enabled=false for now; the "
+                "auth block (issuers reference, required_scopes, etc.) "
+                "may remain populated for upgrade.");
+        }
+    }
+}
+
 ServerConfig ConfigLoader::Default() {
     return ServerConfig{};
 }

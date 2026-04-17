@@ -2616,6 +2616,259 @@ void TestConfigLoaderAcceptsLiteralPatternCharsInAppliesTo() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// ConfigLoader::ValidateProxyAuth — reload-path gate for inline per-proxy
+// auth (review P1). HttpServer::Reload strips upstreams[] from its
+// validation copy to avoid topology-restart-only noise — that stripping
+// also skipped the in-Validate per-proxy auth loop entirely, leaving the
+// enforcement-not-yet-wired gate bypassable via reload.
+//
+// This test calls ValidateProxyAuth directly with a full upstreams[]
+// list (simulating what HttpServer::Reload now passes), covering:
+//   - proxy.auth.enabled=true must reject
+//   - bad inline issuer reference must reject (structural)
+//   - bad on_undetermined value must reject (structural)
+//   - patterned route_prefix with inline auth must reject
+//   - clean disabled inline auth must accept
+//   - proxy with no auth block at all must accept
+// -----------------------------------------------------------------------------
+void TestValidateProxyAuthReloadGate() {
+    std::cout << "\n[TEST] ConfigLoader::ValidateProxyAuth reload gate..." << std::endl;
+
+    auto validate_expect_failure = [](const std::string& json,
+                                       const std::string& expected_phrase)
+        -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::ValidateProxyAuth(cfg);
+            return "expected throw containing '" + expected_phrase +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
+                return "threw but message missing '" + expected_phrase +
+                       "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // Case 1: enforcement gate — proxy.auth.enabled=true. This is
+        // the primary security concern the reviewer flagged: a reload
+        // toggling auth on MUST be rejected even when the full Validate
+        // runs on a stripped copy.
+        std::string err = validate_expect_failure(R"({
+            "upstreams": [
+                {"name":"x","host":"127.0.0.1","port":80},
+                {
+                    "name": "api",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "proxy": {
+                        "route_prefix": "/api/v1/",
+                        "auth": {
+                            "enabled": true,
+                            "issuers": ["google"]
+                        }
+                    }
+                }
+            ],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })", "proxy.auth.enabled=true rejected");
+        if (!err.empty()) throw std::runtime_error("enforcement gate: " + err);
+
+        // Case 2: structural — unknown issuer reference. Staged
+        // disabled policy with a typo should fail the reload gate.
+        err = validate_expect_failure(R"({
+            "upstreams": [
+                {"name":"x","host":"127.0.0.1","port":80},
+                {
+                    "name": "api",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "proxy": {
+                        "route_prefix": "/api/v1/",
+                        "auth": {
+                            "enabled": false,
+                            "issuers": ["typo"]
+                        }
+                    }
+                }
+            ],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })", "references unknown issuer");
+        if (!err.empty()) throw std::runtime_error("unknown issuer: " + err);
+
+        // Case 3: structural — bad on_undetermined.
+        err = validate_expect_failure(R"({
+            "upstreams": [
+                {"name":"x","host":"127.0.0.1","port":80},
+                {
+                    "name": "api",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "proxy": {
+                        "route_prefix": "/api/v1/",
+                        "auth": {
+                            "enabled": false,
+                            "issuers": ["google"],
+                            "on_undetermined": "maybe"
+                        }
+                    }
+                }
+            ],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })", "on_undetermined must be");
+        if (!err.empty()) throw std::runtime_error("bad on_undetermined: " + err);
+
+        // Case 4: structural — patterned route_prefix with inline auth.
+        err = validate_expect_failure(R"({
+            "upstreams": [
+                {"name":"x","host":"127.0.0.1","port":80},
+                {
+                    "name": "api",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "proxy": {
+                        "route_prefix": "/api/:v/users",
+                        "auth": {
+                            "enabled": false,
+                            "issuers": ["google"]
+                        }
+                    }
+                }
+            ],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })", "LITERAL prefix");
+        if (!err.empty()) throw std::runtime_error("patterned prefix: " + err);
+
+        // Case 5: POSITIVE — clean disabled inline auth passes. Proves
+        // the helper doesn't over-reject.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [
+                    {"name":"x","host":"127.0.0.1","port":80},
+                    {
+                        "name": "api",
+                        "host": "127.0.0.1",
+                        "port": 8080,
+                        "proxy": {
+                            "route_prefix": "/api/v1/",
+                            "auth": {
+                                "enabled": false,
+                                "issuers": ["google"]
+                            }
+                        }
+                    }
+                ],
+                "auth": {
+                    "enabled": false,
+                    "issuers": {
+                        "google": {
+                            "issuer_url": "https://issuer.example",
+                            "upstream": "x",
+                            "mode": "jwt",
+                            "algorithms": ["RS256"]
+                        }
+                    }
+                }
+            })");
+            ConfigLoader::ValidateProxyAuth(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("clean disabled inline auth should be ACCEPTED ")
+                + "but ValidateProxyAuth threw: " + e.what());
+        }
+
+        // Case 6: POSITIVE — proxy with NO auth block at all must pass.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [
+                    {
+                        "name": "api",
+                        "host": "127.0.0.1",
+                        "port": 8080,
+                        "proxy": {"route_prefix": "/api/v1/"}
+                    }
+                ]
+            })");
+            ConfigLoader::ValidateProxyAuth(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("proxy without auth block should be ACCEPTED ")
+                + "but ValidateProxyAuth threw: " + e.what());
+        }
+
+        // Case 7: POSITIVE — empty upstreams list passes (no-op).
+        // Mirrors the reload-copy scenario where ValidateProxyAuth is
+        // also called separately by HttpServer::Reload on the REAL
+        // upstreams, but in the hypothetical case that it gets called
+        // on a stripped copy it should be a harmless no-op.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [],
+                "auth": {"enabled": false}
+            })");
+            ConfigLoader::ValidateProxyAuth(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("empty upstreams should be a no-op for ")
+                + "ValidateProxyAuth but threw: " + e.what());
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ValidateProxyAuth reload gate",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ValidateProxyAuth reload gate",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -2644,6 +2897,7 @@ inline void RunAllTests() {
     TestConfigLoaderRequiresIssuerUpstream();
     TestConfigLoaderValidatesHeaderNameTchar();
     TestConfigLoaderAcceptsLiteralPatternCharsInAppliesTo();
+    TestValidateProxyAuthReloadGate();
     TestConfigLoaderClaimHeaderCollision();
 }
 

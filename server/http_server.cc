@@ -3617,6 +3617,26 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
             logging::Get()->error("Reload() rejected invalid config: {}", e.what());
             return false;
         }
+
+        // Inline proxy.auth validation runs AGAINST the original
+        // new_config (full upstreams), not validation_copy. The strip
+        // above skips the in-Validate per-upstream auth loop entirely
+        // — which would let a reload that toggled
+        // `upstreams[i].proxy.auth.enabled=true` slip past the
+        // enforcement-not-yet-wired gate AND let bad inline issuer
+        // references slide through structural validation until the
+        // next restart. ValidateProxyAuth re-runs those checks on the
+        // real upstream list so the strict reload gate is
+        // enforcement-complete for inline auth too. (Collision
+        // detection stays in the main Validate — it requires the
+        // cross-source view that the full Validate owns.)
+        try {
+            ConfigLoader::ValidateProxyAuth(new_config);
+        } catch (const std::invalid_argument& e) {
+            logging::Get()->error("Reload() rejected invalid inline auth: {}",
+                                  e.what());
+            return false;
+        }
         // Strict gate for hot-reloadable CB fields + duplicate names.
         // Mirrors main.cc::ReloadConfig — both entry points must reject
         // invalid CB tuning before it reaches live slices.
