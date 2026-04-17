@@ -874,6 +874,10 @@ void ConnectionHandler::CallWriteCb(){
 
 void ConnectionHandler::SetOnMessageCb(CALLBACKS_NAMESPACE::ConnOnMsgCallback fn){
     callbacks_.on_message_callback = std::move(fn);
+    has_on_message_callback_.store(
+        static_cast<bool>(callbacks_.on_message_callback),
+        std::memory_order_release);
+    on_message_cb_epoch_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void ConnectionHandler::SetCompletionCb(CALLBACKS_NAMESPACE::ConnCompleteCallback fn){
@@ -944,10 +948,17 @@ void ConnectionHandler::ResumeReadPump() {
         return;
     }
 
-    auto fn = [weak_self = weak_from_this()]() {
+    uint64_t expected_epoch =
+        on_message_cb_epoch_.load(std::memory_order_acquire);
+    auto fn = [weak_self = weak_from_this(), expected_epoch]() {
         if (auto self = weak_self.lock()) {
             if (self->is_closing_.load(std::memory_order_acquire) ||
                 self->read_pump_paused_.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (!self->has_on_message_callback_.load(std::memory_order_acquire) ||
+                self->on_message_cb_epoch_.load(std::memory_order_acquire) !=
+                    expected_epoch) {
                 return;
             }
             self->OnMessage();

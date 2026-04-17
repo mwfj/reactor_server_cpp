@@ -1304,9 +1304,6 @@ void ProxyTransaction::Cleanup() {
     if (lease_) {
         auto* conn = lease_.Get();
         if (conn) {
-            if (conn->IsReadDisabled()) {
-                conn->DecReadDisable();
-            }
             auto transport = conn->GetTransport();
             if (transport) {
                 transport->SetOnMessageCb(nullptr);
@@ -1318,8 +1315,16 @@ void ProxyTransaction::Cleanup() {
                 // any window where the callback can still fire on a
                 // transaction that's being torn down.
                 transport->SetWriteProgressCb(nullptr);
-                transport->SetMaxInputSize(0);
+                // A returned keep-alive transport immediately falls back to the
+                // pool's idle on_message callback, which force-closes on any
+                // unexpected upstream bytes. Keep a small cap in place so an
+                // idle pooled socket cannot buffer an unbounded late response
+                // burst before that callback runs.
+                transport->SetMaxInputSize(MAX_BUFFER_SIZE);
                 ClearResponseTimeout();
+            }
+            if (conn->IsReadDisabled()) {
+                conn->DecReadDisable();
             }
             // Poison the connection if an early response was received while
             // the request write was still in progress. The transport's output
@@ -1353,16 +1358,16 @@ void ProxyTransaction::ReleaseHeldRetryable5xxTransport() {
 
     auto* conn = lease_.Get();
     if (conn) {
-        if (conn->IsReadDisabled()) {
-            conn->DecReadDisable();
-        }
         auto transport = conn->GetTransport();
         if (transport) {
             transport->SetOnMessageCb(nullptr);
             transport->SetCompletionCb(nullptr);
             transport->SetWriteProgressCb(nullptr);
-            transport->SetMaxInputSize(0);
+            transport->SetMaxInputSize(MAX_BUFFER_SIZE);
             ClearResponseTimeout();
+        }
+        if (conn->IsReadDisabled()) {
+            conn->DecReadDisable();
         }
         if (poison_connection_) {
             conn->MarkClosing();

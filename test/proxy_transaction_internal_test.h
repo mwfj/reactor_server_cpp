@@ -280,7 +280,7 @@ void TestBufferedOverflowPoisonsConnection() {
     }
 }
 
-void TestCheckoutCapsAndCleanupClearsUpstreamTransportInputBuffer() {
+void TestCheckoutCapsAndCleanupRestoresIdleUpstreamTransportInputCap() {
     std::cout << "\n[TEST] ProxyTransaction internal: checkout caps upstream transport input buffer..."
               << std::endl;
     try {
@@ -339,9 +339,9 @@ void TestCheckoutCapsAndCleanupClearsUpstreamTransportInputBuffer() {
         }
 
         tx->Cleanup();
-        if (transport->max_input_size_ != 0) {
+        if (transport->max_input_size_ != MAX_BUFFER_SIZE) {
             pass = false;
-            err += "transport cap not cleared on cleanup; ";
+            err += "idle transport cap not restored on cleanup; ";
         }
         tx->complete_cb_invoked_ = true;
         tx->complete_cb_ = nullptr;
@@ -365,7 +365,7 @@ void RunAllTests() {
     TestHeldRetryable5xxResumeCompletesNoBodyHeadResponse();
     TestEarlyResponseHeadersExitSendPhase();
     TestBufferedOverflowPoisonsConnection();
-    TestCheckoutCapsAndCleanupClearsUpstreamTransportInputBuffer();
+    TestCheckoutCapsAndCleanupRestoresIdleUpstreamTransportInputCap();
 }
 
 }  // namespace ProxyTransactionInternalTests

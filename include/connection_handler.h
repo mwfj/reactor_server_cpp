@@ -77,6 +77,12 @@ private:
     // toggling channel read interest, this keeps ET registration intact and
     // resumes by scheduling a synthetic OnMessage() drain when unpaused.
     std::atomic<bool> read_pump_paused_{false};
+    // Every SetOnMessageCb() bumps this epoch. Synthetic read-pump resumes
+    // capture it so a queued drain can tell whether ownership of the socket's
+    // read callback changed before it ran (cleanup / pool rebind / new
+    // borrower). That prevents stale reads from crossing request boundaries.
+    std::atomic<uint64_t> on_message_cb_epoch_{0};
+    std::atomic<bool> has_on_message_callback_{false};
 public:
     ConnectionHandler() = delete;
     ConnectionHandler(std::shared_ptr<Dispatcher>, std::unique_ptr<SocketHandler>);
@@ -135,6 +141,8 @@ public:
 
     void SetTlsConnection(std::unique_ptr<TlsConnection> tls);
     void SetMaxInputSize(size_t max) { max_input_size_ = max; }
+    // Dispatcher-thread-only for reuse validation.
+    size_t InputBufferSize() const { return input_bf_.Size(); }
     size_t OutputBufferSize() const { return output_bf_.Size(); }
     Dispatcher* GetDispatcher() const { return event_dispatcher_.get(); }
 
