@@ -1714,6 +1714,84 @@ namespace HttpTests {
         }
     }
 
+    void TestH1_StreamingTrailers_SuppressedWhenNotChunked() {
+        std::cout << "\n[TEST] H1 streaming trailers: declaration suppressed when framing is not chunked..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-trailer-fixed-length",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Content-Length", "5")
+                        .PreserveContentLength()
+                        .Header("Trailer", "X-Checksum");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    static constexpr char kBody[] = "hello";
+                    if (stream_sender.SendData(kBody, sizeof(kBody) - 1) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End({{"X-Checksum", "abc123"}});
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-trailer-fixed-length HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            auto header_end = lower.find("\r\n\r\n");
+            if (header_end == std::string::npos) {
+                pass = false; err += "missing header terminator; ";
+            } else {
+                std::string headers = lower.substr(0, header_end);
+                std::string body = lower.substr(header_end + 4);
+                if (headers.find("content-length: 5") == std::string::npos) {
+                    pass = false; err += "content-length missing; ";
+                }
+                if (headers.find("transfer-encoding: chunked") != std::string::npos) {
+                    pass = false; err += "unexpected chunked framing; ";
+                }
+                if (headers.find("trailer:") != std::string::npos) {
+                    pass = false; err += "Trailer declaration should be stripped; ";
+                }
+                if (body != "hello") {
+                    pass = false; err += "body mismatch; ";
+                }
+                if (body.find("x-checksum: abc123") != std::string::npos) {
+                    pass = false; err += "unexpected trailer block serialized; ";
+                }
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming trailers: declaration suppressed when framing is not chunked",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming trailers: declaration suppressed when framing is not chunked",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     void TestH1_Streaming205CanonicalizesContentLength() {
         std::cout << "\n[TEST] H1 streaming: 205 canonicalizes Content-Length..." << std::endl;
         try {
@@ -1869,7 +1947,9 @@ namespace HttpTests {
                    HttpRouter::StreamingResponseSender stream_sender,
                    HttpRouter::AsyncCompletionCallback /*complete*/) {
                     HttpResponse head;
-                    head.Status(200).Header("Content-Type", "text/plain");
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Trailer", "X-Checksum");
                     if (stream_sender.SendHeaders(head) < 0) {
                         return;
                     }
@@ -1881,7 +1961,7 @@ namespace HttpTests {
                         HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
                         return;
                     }
-                    (void)stream_sender.End();
+                    (void)stream_sender.End({{"X-Checksum", "abc123"}});
                 });
 
             TestServerRunner<HttpServer> runner(server);
@@ -1908,8 +1988,14 @@ namespace HttpTests {
             if (lower.find("transfer-encoding:") != std::string::npos) {
                 pass = false; err += "transfer-encoding should be omitted; ";
             }
+            if (lower.find("trailer:") != std::string::npos) {
+                pass = false; err += "trailer declaration should be omitted; ";
+            }
             if (TestHttpClient::ExtractBody(resp) != "helloworld") {
                 pass = false; err += "body mismatch; ";
+            }
+            if (lower.find("x-checksum: abc123") != std::string::npos) {
+                pass = false; err += "unexpected trailer block serialized; ";
             }
 
             TestFramework::RecordTest(
@@ -2498,6 +2584,7 @@ namespace HttpTests {
         TestH1_EarlyHints_CRLFSanitized();
         TestH1_StreamingTrailers_CRLFSanitized();
         TestH1_StreamingTrailers_DeclarationFiltersForbiddenNames();
+        TestH1_StreamingTrailers_SuppressedWhenNotChunked();
         TestH1_Streaming205CanonicalizesContentLength();
         TestH1_StreamingDeduplicatesContentLength();
         TestH1_StreamingHttp10UnknownLengthOmitsContentLength();

@@ -12,6 +12,7 @@
 #include "http/http_status.h"
 #include "http/trailer_policy.h"
 #include "log/logger.h"
+#include <unordered_set>
 
 namespace {
 
@@ -75,6 +76,33 @@ std::optional<std::string> MergeTrailerDeclarations(
         joined += allowed[i];
     }
     return joined;
+}
+
+std::unordered_set<std::string> CollectDeclaredTrailerNames(
+    const std::vector<std::pair<std::string, std::string>>& headers) {
+    std::unordered_set<std::string> allowed;
+    for (const auto& [key, value] : headers) {
+        if (LowerCopy(key) != "trailer") {
+            continue;
+        }
+        size_t start = 0;
+        while (start <= value.size()) {
+            size_t comma = value.find(',', start);
+            std::string token = TrimOptionalWhitespace(
+                value.substr(start, comma == std::string::npos
+                                        ? std::string::npos
+                                        : comma - start));
+            std::string lower = LowerCopy(token);
+            if (!lower.empty() && !IsForbiddenTrailerFieldName(lower)) {
+                allowed.insert(std::move(lower));
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            start = comma + 1;
+        }
+    }
+    return allowed;
 }
 
 bool ShouldPreserveKnownContentLength(
@@ -892,7 +920,18 @@ bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
 void ProxyTransaction::OnTrailers(
     const std::vector<std::pair<std::string, std::string>>& trailers) {
     if (config_.forward_trailers) {
-        response_trailers_ = trailers;
+        auto allowed = CollectDeclaredTrailerNames(response_head_.headers);
+        response_trailers_.clear();
+        if (allowed.empty()) {
+            return;
+        }
+        response_trailers_.reserve(trailers.size());
+        for (const auto& [key, value] : trailers) {
+            if (allowed.count(LowerCopy(key)) == 0) {
+                continue;
+            }
+            response_trailers_.emplace_back(key, value);
+        }
     }
 }
 

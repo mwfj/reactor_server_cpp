@@ -2959,6 +2959,102 @@ void TestIntegrationForwardTrailersMergesMultipleDeclarations() {
     }
 }
 
+void TestIntegrationForwardTrailersDropUndeclaredFields() {
+    std::cout << "\n[TEST] Integration: forward_trailers drops undeclared trailer fields..." << std::endl;
+    try {
+        RawHttpBackendServer backend([](int client_fd, const std::string&) {
+            std::string response =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain\r\n"
+                "Transfer-Encoding: chunked\r\n"
+                "Trailer: X-A\r\n"
+                "\r\n";
+            response += MakeChunk("hello");
+            response += "0\r\n";
+            response += "X-A: 1\r\n";
+            response += "X-B: 2\r\n";
+            response += "\r\n";
+            (void)SendAll(client_fd, response);
+        });
+        int backend_port = backend.GetPort();
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+
+        UpstreamConfig u = MakeProxyUpstreamConfig(
+            "backend", "127.0.0.1", backend_port, "/trailers-undeclared");
+        u.proxy.buffering = "never";
+        u.proxy.forward_trailers = true;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        int client_fd = TestHttpClient::ConnectRawSocket(gw_port);
+        if (client_fd < 0) throw std::runtime_error("gateway connect failed");
+
+        if (!SendAll(client_fd,
+                     "GET /trailers-undeclared HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Connection: close\r\n"
+                     "\r\n")) {
+            close(client_fd);
+            throw std::runtime_error("gateway send failed");
+        }
+
+        std::string full = RecvUntilClose(client_fd, 3000);
+        close(client_fd);
+
+        std::string lower = full;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        bool pass = true;
+        std::string err;
+        if (!TestHttpClient::HasStatus(full, 200)) err += "status not 200; ";
+        auto header_end = lower.find("\r\n\r\n");
+        if (header_end == std::string::npos) {
+            err += "missing header terminator; ";
+        } else {
+            std::string headers = lower.substr(0, header_end);
+            std::string body_and_trailers = lower.substr(header_end + 4);
+            if (headers.find("trailer: x-a") == std::string::npos) {
+                err += "declared trailer header missing; ";
+            }
+            if (headers.find("x-b") != std::string::npos) {
+                err += "undeclared trailer leaked into header declaration; ";
+            }
+            auto zero_chunk = body_and_trailers.find("0\r\n");
+            auto trailer_a = body_and_trailers.find("x-a: 1");
+            auto trailer_b = body_and_trailers.find("x-b: 2");
+            if (zero_chunk == std::string::npos) {
+                err += "final zero chunk missing; ";
+            }
+            if (trailer_a == std::string::npos ||
+                (zero_chunk != std::string::npos && trailer_a < zero_chunk)) {
+                err += "declared trailer missing; ";
+            }
+            if (trailer_b != std::string::npos &&
+                (zero_chunk == std::string::npos || trailer_b > zero_chunk)) {
+                err += "undeclared trailer leaked into downstream body; ";
+            }
+        }
+        pass = err.empty();
+
+        TestFramework::RecordTest(
+            "Integration: forward_trailers drops undeclared trailer fields",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Integration: forward_trailers drops undeclared trailer fields",
+            false, e.what());
+    }
+}
+
 void TestIntegrationDisabledForwardTrailersSuppressesTrailerDeclaration() {
     std::cout << "\n[TEST] Integration: forward_trailers disabled strips Trailer declaration..." << std::endl;
     try {
@@ -3710,6 +3806,7 @@ void RunAllTests() {
     TestIntegrationForwardTrailersRelaysChunkedTrailerBlock();
     TestIntegrationForwardTrailersStripForbiddenTrailerFields();
     TestIntegrationForwardTrailersMergesMultipleDeclarations();
+    TestIntegrationForwardTrailersDropUndeclaredFields();
     TestIntegrationDisabledForwardTrailersSuppressesTrailerDeclaration();
 
     // Section 13: RetryPolicy unit tests -- full jitter backoff

@@ -151,7 +151,7 @@ std::string SerializeStreamingHead(const HttpResponse& response,
         if (lower == "trailer") continue;
         oss << key << ": " << value << "\r\n";
     }
-    if (merged_trailer) {
+    if (use_chunked && merged_trailer) {
         oss << "Trailer: " << *merged_trailer << "\r\n";
     }
     if (effective_cl) {
@@ -380,7 +380,9 @@ public:
         drain_listener_scheduled_ = false;
         if (!drain_listener_) {
             above_high_water_ = false;
+            return;
         }
+        MaybeFireDrainListener(conn_->OutputBufferSize());
     }
 
     void ConfigureWatermarks(size_t high_water_bytes) override {
