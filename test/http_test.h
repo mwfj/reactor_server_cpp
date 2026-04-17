@@ -2160,6 +2160,102 @@ namespace HttpTests {
         }
     }
 
+    void TestH1_StreamingCommittedResponseBypassesAsyncCap() {
+        std::cout << "\n[TEST] H1 streaming: committed response bypasses async cap..."
+                  << std::endl;
+        try {
+            auto enqueue_ok =
+                std::make_shared<std::atomic<bool>>(false);
+            auto delayed_fired =
+                std::make_shared<std::atomic<bool>>(false);
+
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-committed-cap",
+                [enqueue_ok, delayed_fired](
+                    const HttpRequest& req,
+                    HttpRouter::InterimResponseSender /*send_interim*/,
+                    HttpRouter::ResourcePusher /*push_resource*/,
+                    HttpRouter::StreamingResponseSender stream_sender,
+                    HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    req.async_cap_sec_override = 1;
+
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Content-Length", "2")
+                        .PreserveContentLength();
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+
+                    Dispatcher* dispatcher = stream_sender.GetDispatcher();
+                    if (!dispatcher) {
+                        enqueue_ok->store(false, std::memory_order_release);
+                        stream_sender.Abort(
+                            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                                AbortReason::SERVER_SHUTDOWN);
+                        return;
+                    }
+
+                    bool enqueued = dispatcher->EnQueueDelayed(
+                        [stream_sender, delayed_fired]() mutable {
+                            delayed_fired->store(true, std::memory_order_release);
+                            if (stream_sender.SendData("ok", 2) ==
+                                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                                    SendResult::CLOSED) {
+                                return;
+                            }
+                            (void)stream_sender.End();
+                        },
+                        std::chrono::milliseconds(1500));
+                    enqueue_ok->store(enqueued, std::memory_order_release);
+                    if (!enqueued) {
+                        stream_sender.Abort(
+                            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                                AbortReason::SERVER_SHUTDOWN);
+                    }
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-committed-cap HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                5000);
+
+            bool pass = true;
+            std::string err;
+            if (!enqueue_ok->load(std::memory_order_acquire)) {
+                pass = false; err += "delayed body send was not enqueued; ";
+            }
+            if (!delayed_fired->load(std::memory_order_acquire)) {
+                pass = false; err += "delayed body send did not fire; ";
+            }
+            if (!TestHttpClient::HasStatus(resp, 200)) {
+                pass = false; err += "missing 200 response; ";
+            }
+            if (resp.find("504 Gateway Timeout") != std::string::npos) {
+                pass = false; err += "async cap still injected a 504; ";
+            }
+            if (TestHttpClient::ExtractBody(resp) != "ok") {
+                pass = false; err += "body mismatch; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: committed response bypasses async cap",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: committed response bypasses async cap",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     void TestH1_StreamingControlMethodsOffDispatcherThreadRejected() {
         std::cout << "\n[TEST] H1 streaming: off-dispatcher control methods are rejected..." << std::endl;
         try {
@@ -2590,6 +2686,7 @@ namespace HttpTests {
         TestH1_StreamingHttp10UnknownLengthOmitsContentLength();
         TestH1_StreamingAbortOffDispatcherThreadRejected();
         TestH1_StreamingRawContentLengthWithoutPreserveUsesChunkedFraming();
+        TestH1_StreamingCommittedResponseBypassesAsyncCap();
         TestH1_StreamingControlMethodsOffDispatcherThreadRejected();
         TestH1_EarlyHints_WorkerThreadOrderingSafe();
         TestH1_EarlyHints_PipelinedKeepAliveNoStale();

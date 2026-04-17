@@ -594,6 +594,7 @@ HttpConnectionHandler::CreateStreamingResponseSender(
         if (!self || !self->conn_) return;
 
         self->deferred_response_pending_ = false;
+        self->deferred_response_committed_ = false;
         self->deferred_was_head_ = false;
         self->deferred_keep_alive_ = true;
         self->deferred_start_ = std::chrono::steady_clock::time_point{};
@@ -627,6 +628,7 @@ HttpConnectionHandler::CreateStreamingResponseSender(
         if (!self || !self->conn_) return;
 
         self->deferred_response_pending_ = false;
+        self->deferred_response_committed_ = false;
         self->deferred_was_head_ = false;
         self->deferred_keep_alive_ = true;
         self->deferred_pending_buf_.clear();
@@ -643,6 +645,7 @@ HttpConnectionHandler::CreateStreamingResponseSender(
     auto mark_response_committed = [weak_self]() {
         if (auto self = weak_self.lock()) {
             self->final_response_sent_.store(true, std::memory_order_release);
+            self->deferred_response_committed_ = true;
         }
     };
 
@@ -785,6 +788,7 @@ void HttpConnectionHandler::StripResponseBodyForHead(std::string& wire) {
 
 void HttpConnectionHandler::BeginAsyncResponse(const HttpRequest& req) {
     deferred_response_pending_ = true;
+    deferred_response_committed_ = false;
     deferred_was_head_ = (req.method == "HEAD");
     deferred_keep_alive_ = req.keep_alive;
     // Reset so interim responses can be emitted before the final response
@@ -803,6 +807,7 @@ void HttpConnectionHandler::BeginAsyncResponse(const HttpRequest& req) {
 
 void HttpConnectionHandler::CancelAsyncResponse() {
     deferred_response_pending_ = false;
+    deferred_response_committed_ = false;
     deferred_was_head_ = false;
     deferred_keep_alive_ = true;
     deferred_pending_buf_.clear();
@@ -901,6 +906,7 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     // flags are false causes the drain loop to exit and stop the event
     // loop, truncating the response bytes we just queued with SendRaw.
     deferred_response_pending_ = false;
+    deferred_response_committed_ = false;
     deferred_was_head_ = false;
     deferred_keep_alive_ = true;
     deferred_start_ = std::chrono::steady_clock::time_point{};
@@ -1479,6 +1485,12 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                     // because CompleteAsyncResponse clears the deadline,
                     // but handle defensively).
                     return false;
+                }
+                if (self->deferred_response_committed_) {
+                    auto now_steady = std::chrono::steady_clock::now();
+                    self->conn_->SetDeadline(
+                        now_steady + std::chrono::seconds(heartbeat_sec));
+                    return true;
                 }
                 // Absolute safety cap: if configured AND exceeded,
                 // abort the deferred state and send 504. This catches

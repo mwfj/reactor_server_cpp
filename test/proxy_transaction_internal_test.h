@@ -18,7 +18,9 @@ namespace ProxyTransactionInternalTests {
 std::shared_ptr<ProxyTransaction> MakeInternalProxyTransaction(
     const HttpRequest& request,
     HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete_cb =
-        [](HttpResponse) {}) {
+        [](HttpResponse) {},
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender()) {
     ProxyConfig proxy_config;
     HeaderRewriter::Config rewriter_config;
     HeaderRewriter header_rewriter(rewriter_config);
@@ -28,7 +30,7 @@ std::shared_ptr<ProxyTransaction> MakeInternalProxyTransaction(
     return std::make_shared<ProxyTransaction>(
         "svc",
         request,
-        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender(),
+        std::move(stream_sender),
         std::move(complete_cb),
         nullptr,
         proxy_config,
@@ -41,6 +43,50 @@ std::shared_ptr<ProxyTransaction> MakeInternalProxyTransaction(
         "",
         "");
 }
+
+class AbortTrackingStreamSenderImpl final
+    : public HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::Impl {
+public:
+    using SendResult =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult;
+    using AbortReason =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason;
+    using DrainListener =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::DrainListener;
+
+    explicit AbortTrackingStreamSenderImpl(int send_headers_result)
+        : send_headers_result_(send_headers_result) {}
+
+    int SendHeaders(const HttpResponse&) override {
+        ++send_headers_calls_;
+        return send_headers_result_;
+    }
+
+    SendResult SendData(const char*, size_t) override {
+        return SendResult::ACCEPTED_BELOW_WATER;
+    }
+
+    SendResult End(
+        const std::vector<std::pair<std::string, std::string>>&) override {
+        return SendResult::ACCEPTED_BELOW_WATER;
+    }
+
+    void Abort(AbortReason reason) override {
+        ++abort_calls_;
+        last_abort_reason_ = reason;
+    }
+
+    void SetDrainListener(DrainListener) override {}
+    void ConfigureWatermarks(size_t) override {}
+    Dispatcher* GetDispatcher() override { return nullptr; }
+
+    int send_headers_calls_ = 0;
+    int abort_calls_ = 0;
+    AbortReason last_abort_reason_ = AbortReason::UPSTREAM_ERROR;
+
+private:
+    int send_headers_result_ = -1;
+};
 
 void TestHeldRetryable5xxResumeCompletesBodylessResponse() {
     std::cout << "\n[TEST] ProxyTransaction internal: held 5xx resume completes bodyless response..."
@@ -360,12 +406,121 @@ void TestCheckoutCapsAndCleanupRestoresIdleUpstreamTransportInputCap() {
     }
 }
 
+void TestStreamingCommitFailureAbortsSenderOnHeaders() {
+    std::cout << "\n[TEST] ProxyTransaction internal: streaming header commit failure aborts sender..."
+              << std::endl;
+    try {
+        HttpRequest request;
+        request.method = "GET";
+        request.url = "/stream-fail";
+        request.path = "/stream-fail";
+        request.headers["host"] = "example.test";
+        request.client_fd = 42;
+
+        auto impl = std::make_shared<AbortTrackingStreamSenderImpl>(-1);
+        auto tx = MakeInternalProxyTransaction(
+            request,
+            [](HttpResponse) {},
+            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender(impl));
+
+        tx->state_ = ProxyTransaction::State::AWAITING_RESPONSE;
+        tx->config_.buffering = "never";
+
+        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead head;
+        head.status_code = HttpStatus::OK;
+        head.status_reason = "OK";
+        head.keep_alive = true;
+        head.framing =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH;
+        head.expected_length = 2;
+        head.headers.push_back({"content-length", "2"});
+
+        bool accepted = tx->OnHeaders(head);
+
+        bool pass = !accepted &&
+                    impl->send_headers_calls_ == 1 &&
+                    impl->abort_calls_ == 1 &&
+                    impl->last_abort_reason_ ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            AbortReason::UPSTREAM_ERROR &&
+                    tx->state_ == ProxyTransaction::State::FAILED;
+        std::string err;
+        if (accepted) err += "headers should be rejected; ";
+        if (impl->send_headers_calls_ != 1) err += "SendHeaders not called exactly once; ";
+        if (impl->abort_calls_ != 1) err += "Abort not called exactly once; ";
+        if (tx->state_ != ProxyTransaction::State::FAILED) err += "state should be FAILED; ";
+
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: streaming header commit failure aborts sender",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: streaming header commit failure aborts sender",
+            false, e.what());
+    }
+}
+
+void TestHeldRetryable5xxCommitFailureAbortsSender() {
+    std::cout << "\n[TEST] ProxyTransaction internal: held 5xx commit failure aborts sender..."
+              << std::endl;
+    try {
+        HttpRequest request;
+        request.method = "GET";
+        request.url = "/held-stream-fail";
+        request.path = "/held-stream-fail";
+        request.headers["host"] = "example.test";
+        request.client_fd = 42;
+
+        auto impl = std::make_shared<AbortTrackingStreamSenderImpl>(-1);
+        auto tx = MakeInternalProxyTransaction(
+            request,
+            [](HttpResponse) {},
+            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender(impl));
+
+        tx->state_ = ProxyTransaction::State::RECEIVING_BODY;
+        tx->relay_mode_ = ProxyTransaction::RelayMode::STREAMING;
+        tx->response_headers_seen_ = true;
+        tx->holding_retryable_5xx_response_ = true;
+        tx->response_head_.status_code = HttpStatus::BAD_GATEWAY;
+        tx->response_head_.status_reason = "Bad Gateway";
+        tx->response_head_.framing =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH;
+        tx->response_head_.expected_length = 3;
+        tx->response_head_.headers.push_back({"content-length", "3"});
+
+        bool resumed = tx->ResumeHeldRetryable5xxResponse("unit_test_stream_fail");
+
+        bool pass = resumed &&
+                    impl->send_headers_calls_ == 1 &&
+                    impl->abort_calls_ == 1 &&
+                    impl->last_abort_reason_ ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            AbortReason::UPSTREAM_ERROR &&
+                    tx->state_ == ProxyTransaction::State::FAILED;
+        std::string err;
+        if (!resumed) err += "resume should return true; ";
+        if (impl->send_headers_calls_ != 1) err += "SendHeaders not called exactly once; ";
+        if (impl->abort_calls_ != 1) err += "Abort not called exactly once; ";
+        if (tx->state_ != ProxyTransaction::State::FAILED) err += "state should be FAILED; ";
+
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: held 5xx commit failure aborts sender",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: held 5xx commit failure aborts sender",
+            false, e.what());
+    }
+}
+
 void RunAllTests() {
     TestHeldRetryable5xxResumeCompletesBodylessResponse();
     TestHeldRetryable5xxResumeCompletesNoBodyHeadResponse();
     TestEarlyResponseHeadersExitSendPhase();
     TestBufferedOverflowPoisonsConnection();
     TestCheckoutCapsAndCleanupRestoresIdleUpstreamTransportInputCap();
+    TestStreamingCommitFailureAbortsSenderOnHeaders();
+    TestHeldRetryable5xxCommitFailureAbortsSender();
 }
 
 }  // namespace ProxyTransactionInternalTests

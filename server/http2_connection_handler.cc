@@ -254,6 +254,7 @@ public:
         headers_sent_ = true;
         if (!session->InReceiveData()) {
             session->SendPendingFrames();
+            self->RecheckShutdownDrainAfterFlush();
         }
         return 0;
     }
@@ -340,6 +341,7 @@ public:
                 return SendResult::CLOSED;
             }
             session->SendPendingFrames();
+            self->RecheckShutdownDrainAfterFlush();
         }
         if (finalize_request_) {
             finalize_request_();
@@ -966,17 +968,11 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
     // inbound frame, shutdown, or timeout happens to flush it — hanging
     // any async H2 route.
     session_->SendPendingFrames();
+    RecheckShutdownDrainAfterFlush();
+}
 
-    // Check if this async response was the last active stream during a
-    // graceful shutdown drain. The normal drain check in OnRawData runs
-    // after ReceiveData, but async completions arrive via RunOnDispatcher
-    // — no inbound data triggers OnRawData. OnSendComplete can also miss
-    // this: it fires when the output buffer empties, but the stream close
-    // callback inside nghttp2_session_send (called by SendPendingFrames)
-    // fires during the send, before FlushDeferredRemovals updates
-    // ActiveStreamCount. By the time SendPendingFrames returns, the count
-    // IS updated, but OnSendComplete already ran and saw a stale count.
-    // Without this check, the connection waits until the drain timeout.
+void Http2ConnectionHandler::RecheckShutdownDrainAfterFlush() {
+    if (!session_) return;
     if (shutdown_requested_.load(std::memory_order_acquire) &&
         session_->ActiveStreamCount() == 0 && !drain_notified_) {
         // Do NOT call UpdateDeadline() here. Clearing has_deadline_ during
@@ -1002,12 +998,13 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
             conn_->OutputBufferSize() == 0) {
             NotifyDrainComplete();
         }
-    } else {
-        // Normal operation or shutdown with active streams remaining:
-        // recompute deadline so it tracks the oldest incomplete stream,
-        // or clears it when no streams remain (idle keep-alive).
-        UpdateDeadline();
+        return;
     }
+
+    // Normal operation or shutdown with active streams remaining:
+    // recompute deadline so it tracks the oldest incomplete stream,
+    // or clears it when no streams remain (idle keep-alive).
+    UpdateDeadline();
 }
 
 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender

@@ -70,6 +70,11 @@ public:
     // Http2Session handles the missing-stream case internally.
     void SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
 
+    // Internal: after an explicit SendPendingFrames() flush, re-check whether
+    // graceful shutdown can now complete or whether the normal deadline
+    // tracking should be refreshed.
+    void RecheckShutdownDrainAfterFlush();
+
     HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender CreateStreamingResponseSender(
         int32_t stream_id,
         std::function<bool()> claim_response,

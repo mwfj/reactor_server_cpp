@@ -245,6 +245,10 @@ private:
     // across the deferred window (no new requests are parsed until the
     // completion runs), so it serves as the canonical version field.
     bool deferred_response_pending_ = false;
+    // True once a deferred async request has committed its final streaming
+    // headers. The request must still block pipelined parsing until End/Abort,
+    // but the generic async safety cap no longer applies after commitment.
+    bool deferred_response_committed_ = false;
     bool deferred_was_head_ = false;
     bool deferred_keep_alive_ = true;
     std::string deferred_pending_buf_;

@@ -871,6 +871,8 @@ bool ProxyTransaction::OnHeaders(
             ReleaseBreakerAdmissionNeutral();
             poison_connection_ = true;
             state_ = State::FAILED;
+            stream_sender_.Abort(
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
             complete_cb_invoked_ = true;
             complete_cb_ = nullptr;
             Cleanup();
@@ -1493,6 +1495,8 @@ bool ProxyTransaction::ResumeHeldRetryable5xxResponse(
                 client_fd_, service_name_, response_head_.status_code, attempt_);
             poison_connection_ = true;
             state_ = State::FAILED;
+            stream_sender_.Abort(
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
             complete_cb_invoked_ = true;
             complete_cb_ = nullptr;
             Cleanup();
