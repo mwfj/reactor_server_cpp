@@ -41,7 +41,11 @@ static int ParseStrictInt(const nlohmann::json& j, const std::string& key,
                           int default_value, const std::string& context) {
     if (!j.contains(key)) return default_value;
     const auto& v = j[key];
-    if (v.is_null()) return default_value;
+    // JSON null is NOT treated as "field absent" (earlier behavior). A
+    // templated config that renders `"key": null` — typically because a
+    // variable is missing or unrendered — should surface loudly, not
+    // silently fall back to the default. Strict-typing guarantee means
+    // null fails the same way `true` or `1.9` would.
     if (!v.is_number_integer()) {
         throw std::invalid_argument(
             context + "." + key + " must be an integer "
@@ -614,7 +618,19 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
             UpstreamConfig upstream;
             upstream.name = item.value("name", "");
             upstream.host = item.value("host", "");
-            upstream.port = item.value("port", 80);
+            // Integer fields use ParseStrictInt throughout the upstream
+            // block: nlohmann/json's json::value<int>() silently coerces
+            // booleans (true → 1), floats (1.9 → 1), and oversized
+            // unsigned values (4294967297 → 1). For security-sensitive
+            // routing knobs (ports, timeouts, retry counts), that
+            // quiet coercion would mean a malformed config silently
+            // retargets traffic or rewrites retry semantics instead of
+            // surfacing as an error. ParseStrictInt rejects non-integer
+            // JSON AND out-of-int-range values (review P2 hardening).
+            const std::string up_ctx = "upstreams['" +
+                (upstream.name.empty() ? std::string("?") : upstream.name) +
+                "']";
+            upstream.port = ParseStrictInt(item, "port", 80, up_ctx);
 
             if (item.contains("tls")) {
                 if (!item["tls"].is_object())
@@ -631,12 +647,19 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 if (!item["pool"].is_object())
                     throw std::runtime_error("upstream pool must be an object");
                 auto& pool = item["pool"];
-                upstream.pool.max_connections = pool.value("max_connections", 64);
-                upstream.pool.max_idle_connections = pool.value("max_idle_connections", 16);
-                upstream.pool.connect_timeout_ms = pool.value("connect_timeout_ms", 5000);
-                upstream.pool.idle_timeout_sec = pool.value("idle_timeout_sec", 90);
-                upstream.pool.max_lifetime_sec = pool.value("max_lifetime_sec", 3600);
-                upstream.pool.max_requests_per_conn = pool.value("max_requests_per_conn", 0);
+                const std::string pool_ctx = up_ctx + ".pool";
+                upstream.pool.max_connections =
+                    ParseStrictInt(pool, "max_connections", 64, pool_ctx);
+                upstream.pool.max_idle_connections =
+                    ParseStrictInt(pool, "max_idle_connections", 16, pool_ctx);
+                upstream.pool.connect_timeout_ms =
+                    ParseStrictInt(pool, "connect_timeout_ms", 5000, pool_ctx);
+                upstream.pool.idle_timeout_sec =
+                    ParseStrictInt(pool, "idle_timeout_sec", 90, pool_ctx);
+                upstream.pool.max_lifetime_sec =
+                    ParseStrictInt(pool, "max_lifetime_sec", 3600, pool_ctx);
+                upstream.pool.max_requests_per_conn =
+                    ParseStrictInt(pool, "max_requests_per_conn", 0, pool_ctx);
             }
 
             if (item.contains("proxy")) {
@@ -645,7 +668,8 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 auto& proxy = item["proxy"];
                 upstream.proxy.route_prefix = proxy.value("route_prefix", "");
                 upstream.proxy.strip_prefix = proxy.value("strip_prefix", false);
-                upstream.proxy.response_timeout_ms = proxy.value("response_timeout_ms", 30000);
+                upstream.proxy.response_timeout_ms = ParseStrictInt(
+                    proxy, "response_timeout_ms", 30000, up_ctx + ".proxy");
 
                 if (proxy.contains("methods")) {
                     if (!proxy["methods"].is_array())
@@ -671,7 +695,8 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     if (!proxy["retry"].is_object())
                         throw std::runtime_error("upstream proxy retry must be an object");
                     auto& r = proxy["retry"];
-                    upstream.proxy.retry.max_retries = r.value("max_retries", 0);
+                    upstream.proxy.retry.max_retries = ParseStrictInt(
+                        r, "max_retries", 0, up_ctx + ".proxy.retry");
                     upstream.proxy.retry.retry_on_connect_failure = r.value("retry_on_connect_failure", true);
                     upstream.proxy.retry.retry_on_5xx = r.value("retry_on_5xx", false);
                     upstream.proxy.retry.retry_on_timeout = r.value("retry_on_timeout", false);
@@ -1795,12 +1820,36 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                         ctx + ".introspection.endpoint is required for "
                         "mode=\"introspection\"");
                 }
+                // Credentials: both supported auth_style values ("basic",
+                // "body") require client_id + client secret to be part of
+                // the RFC 7662 request. Inline client_secret is already
+                // rejected (env-var sourcing is mandatory — see
+                // ParseIssuerConfig). Without these checks, an issuer
+                // staged with `mode="introspection"` + endpoint but no
+                // credentials would load successfully and fail every
+                // introspection call at request time. Reject at load
+                // instead, so the misconfig surfaces before enforcement
+                // lands in Phase 2.
+                const auto& is = ic.introspection;
+                if (is.client_id.empty()) {
+                    throw std::invalid_argument(
+                        ctx + ".introspection.client_id is required for "
+                        "mode=\"introspection\" (both 'basic' and 'body' "
+                        "auth_style values need it per RFC 7662)");
+                }
+                if (is.client_secret_env.empty()) {
+                    throw std::invalid_argument(
+                        ctx + ".introspection.client_secret_env is required "
+                        "for mode=\"introspection\" — the secret must be "
+                        "sourced from an environment variable (inline "
+                        "client_secret is rejected separately as a secret-"
+                        "in-config anti-pattern)");
+                }
                 // auth_style — RFC 7662 doesn't standardize the credential
                 // delivery channel; we support two: "basic" (Authorization
                 // header) and "body" (urlencoded form). Anything else
                 // would silently choose one at request time, which is
                 // worse than a load-time reject.
-                const auto& is = ic.introspection;
                 if (is.auth_style != "basic" && is.auth_style != "body") {
                     throw std::invalid_argument(
                         ctx + ".introspection.auth_style must be \"basic\" "

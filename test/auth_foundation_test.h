@@ -904,7 +904,9 @@ void TestConfigLoaderRejectsPlaintextIdpEndpoints() {
                         "upstream": "x",
                         "mode": "introspection",
                         "introspection": {
-                            "endpoint": "http://issuer.example/introspect"
+                            "endpoint": "http://issuer.example/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E"
                         }
                     }
                 }
@@ -1180,6 +1182,8 @@ void TestConfigLoaderRejectsOutOfRangeIntegers() {
                         "mode": "introspection",
                         "introspection": {
                             "endpoint": "https://issuer.example/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E",
                             "timeout_sec": 9999999999
                         }
                     }
@@ -2049,7 +2053,9 @@ void TestConfigLoaderValidatesIntrospectionKnobs() {
                         "upstream": "x",
                         "mode": "introspection",
                         "introspection": {
-                            "endpoint": "https://issuer.example/introspect")"
+                            "endpoint": "https://issuer.example/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E")"
             + fields + R"(
                         }
                     }
@@ -3139,6 +3145,296 @@ void TestLoadHmacKeyFromEnvPreservesMiddlePadding() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// ParseStrictInt — JSON null is rejected (review P3). Previously null was
+// treated as "field absent" and returned the default. A templated config
+// that renders `"key": null` (missing variable, unrendered) would silently
+// get default values for security-sensitive knobs. Strict typing means
+// null fails the same way `true` or `1.9` would.
+// -----------------------------------------------------------------------------
+void TestParseStrictIntRejectsNull() {
+    std::cout << "\n[TEST] ParseStrictInt rejects JSON null..." << std::endl;
+    try {
+        // Exercised indirectly via ConfigLoader::LoadFromString parsing
+        // an auth issuer with a null-valued integer field.
+        const std::string with_null = R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"],
+                        "leeway_sec": null
+                    }
+                }
+            }
+        })";
+        bool threw = false;
+        std::string err_msg;
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(with_null);
+        } catch (const std::invalid_argument& e) {
+            threw = true;
+            err_msg = e.what();
+        }
+        bool good = threw &&
+            err_msg.find("leeway_sec") != std::string::npos &&
+            err_msg.find("must be an integer") != std::string::npos;
+
+        bool pass = threw && good;
+        std::string err;
+        if (!threw) {
+            err = "expected null value to reject but LoadFromString accepted";
+        } else if (!good) {
+            err = "threw but message missing 'leeway_sec' or 'must be an "
+                  "integer'; got: " + err_msg;
+        }
+        TestFramework::RecordTest(
+            "AuthFoundation: ParseStrictInt rejects JSON null",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ParseStrictInt rejects JSON null",
+            false, std::string("unexpected exception: ") + e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — introspection issuers require client_id AND
+// client_secret_env (review P2 #2). RFC 7662 basic/body auth both need
+// these; without them introspection calls fail at runtime. Reject now.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderRequiresIntrospectionCredentials() {
+    std::cout << "\n[TEST] ConfigLoader requires introspection credentials..." << std::endl;
+    auto validate_expect_failure = [](const std::string& json,
+                                       const std::string& expected_phrase)
+        -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(cfg);
+            return "expected throw containing '" + expected_phrase +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
+                return "threw but message missing '" + expected_phrase +
+                       "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // Case 1: missing client_id.
+        std::string err = validate_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://issuer.example/introspect",
+                            "client_secret_env": "E"
+                        }
+                    }
+                }
+            }
+        })", "client_id is required");
+        if (!err.empty()) throw std::runtime_error("missing client_id: " + err);
+
+        // Case 2: missing client_secret_env.
+        err = validate_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://issuer.example/introspect",
+                            "client_id": "c"
+                        }
+                    }
+                }
+            }
+        })", "client_secret_env is required");
+        if (!err.empty()) throw std::runtime_error("missing client_secret_env: " + err);
+
+        // POSITIVE: with both credentials present, validation passes.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+                "auth": {
+                    "enabled": false,
+                    "issuers": {
+                        "ours": {
+                            "issuer_url": "https://issuer.example",
+                            "upstream": "x",
+                            "mode": "introspection",
+                            "introspection": {
+                                "endpoint": "https://issuer.example/introspect",
+                                "client_id": "c",
+                                "client_secret_env": "E"
+                            }
+                        }
+                    }
+                }
+            })");
+            ConfigLoader::Validate(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("introspection with credentials should pass but ")
+                + "threw: " + e.what());
+        }
+
+        // POSITIVE: jwt-mode issuer without credentials still valid.
+        // (credentials are REQUIRED only for mode="introspection")
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+                "auth": {
+                    "enabled": false,
+                    "issuers": {
+                        "ours": {
+                            "issuer_url": "https://issuer.example",
+                            "upstream": "x",
+                            "mode": "jwt",
+                            "algorithms": ["RS256"]
+                        }
+                    }
+                }
+            })");
+            ConfigLoader::Validate(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("jwt mode without introspection creds should ")
+                + "pass but threw: " + e.what());
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader requires introspection credentials",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader requires introspection credentials",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader::LoadFromString — upstream/pool/proxy integer fields parsed
+// strictly (review P2 #1). Pre-existing issue: nlohmann's json::value<int>()
+// silently coerces booleans, floats, and oversized unsigned values. For
+// routing-critical fields (port, timeouts, retry counts), that would let
+// a typo'd config silently retarget traffic or rewrite behavior.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderStrictUpstreamIntegers() {
+    std::cout << "\n[TEST] ConfigLoader strict upstream integer parsing..." << std::endl;
+    auto load_expect_failure = [](const std::string& json,
+                                   const std::string& expected_phrase)
+        -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            return "expected throw containing '" + expected_phrase +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
+                return "threw but message missing '" + expected_phrase +
+                       "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // Case 1: upstream.port as boolean (the reviewer's true→1 example).
+        std::string err = load_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":true}]
+        })", "must be an integer");
+        if (!err.empty()) throw std::runtime_error("port as bool: " + err);
+
+        // Case 2: upstream.port as float.
+        err = load_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80.5}]
+        })", "must be an integer");
+        if (!err.empty()) throw std::runtime_error("port as float: " + err);
+
+        // Case 3: pool.max_connections oversized (reviewer's 4294967297 → 1 example).
+        err = load_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80,
+                           "pool":{"max_connections":4294967297}}]
+        })", "out of int range");
+        if (!err.empty()) throw std::runtime_error("max_connections oversized: " + err);
+
+        // Case 4: proxy.response_timeout_ms as bool.
+        err = load_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80,
+                           "proxy":{"response_timeout_ms":true}}]
+        })", "must be an integer");
+        if (!err.empty()) throw std::runtime_error("response_timeout_ms as bool: " + err);
+
+        // Case 5: proxy.retry.max_retries as bool.
+        err = load_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80,
+                           "proxy":{"retry":{"max_retries":true}}}]
+        })", "must be an integer");
+        if (!err.empty()) throw std::runtime_error("max_retries as bool: " + err);
+
+        // POSITIVE: valid config with normal integers parses fine.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [{
+                    "name":"x",
+                    "host":"127.0.0.1",
+                    "port":8080,
+                    "pool":{"max_connections":128,"connect_timeout_ms":3000},
+                    "proxy":{"response_timeout_ms":10000,
+                             "retry":{"max_retries":2}}
+                }]
+            })");
+            bool all_set =
+                cfg.upstreams.size() == 1 &&
+                cfg.upstreams[0].port == 8080 &&
+                cfg.upstreams[0].pool.max_connections == 128 &&
+                cfg.upstreams[0].pool.connect_timeout_ms == 3000 &&
+                cfg.upstreams[0].proxy.response_timeout_ms == 10000 &&
+                cfg.upstreams[0].proxy.retry.max_retries == 2;
+            if (!all_set) {
+                throw std::runtime_error(
+                    "valid integers parsed but values didn't land in struct");
+            }
+        } catch (const std::runtime_error& e) {
+            throw;
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("valid integer config rejected by strict parser: ")
+                + e.what());
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader strict upstream integer parsing",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader strict upstream integer parsing",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -3171,6 +3467,9 @@ inline void RunAllTests() {
     TestExtractScopesScopesAsString();
     TestValidateProxyAuthIssuerUpstreamCrossRef();
     TestLoadHmacKeyFromEnvPreservesMiddlePadding();
+    TestParseStrictIntRejectsNull();
+    TestConfigLoaderRequiresIntrospectionCredentials();
+    TestConfigLoaderStrictUpstreamIntegers();
     TestConfigLoaderClaimHeaderCollision();
 }
 
