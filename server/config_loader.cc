@@ -1783,33 +1783,71 @@ void ConfigLoader::Validate(const ServerConfig& config) {
         std::unordered_map<std::string, std::string> all_prefixes;
 
         for (const auto& u : config.upstreams) {
-            // Detect "proxy has inline auth" via the master switch
-            // (u.proxy.auth.enabled). Earlier versions used a default-
-            // struct comparison which broke the moment a new field with a
-            // non-trivial default landed in AuthPolicy.
-            if (!u.proxy.auth.enabled) continue;
             const auto& p = u.proxy.auth;
             const std::string ctx = "upstreams['" + u.name + "'].proxy.auth";
+
+            // ---- Structural validation: runs regardless of `enabled` ----
+            //
+            // Per the rollout plan (design spec §14), operators are EXPECTED
+            // to pre-stage inline auth blocks with `enabled=false` while
+            // request-time enforcement is being wired in follow-up PRs.
+            // If we only validated when enabled=true, typos in the staged
+            // configs (unknown issuer names, invalid on_undetermined
+            // values) would silently slip through and only surface when
+            // the operator flips enabled to true at deployment. That's a
+            // bad operator experience and a hidden-correctness vector.
+            //
+            // The structural checks below have well-defined semantics for
+            // ANY populated AuthPolicy and so are safe to run on disabled
+            // blocks — they catch typos BEFORE deploy.
             if (p.on_undetermined != "deny" && p.on_undetermined != "allow") {
                 throw std::invalid_argument(
-                    ctx + ".on_undetermined must be \"deny\" or \"allow\"");
+                    ctx + ".on_undetermined must be \"deny\" or \"allow\" "
+                    "(checked regardless of `enabled` so staged disabled "
+                    "policies still get typo-rejection)");
             }
             for (const auto& issuer_name : p.issuers) {
                 if (config.auth.issuers.count(issuer_name) == 0) {
                     throw std::invalid_argument(
                         ctx + ".issuers references unknown issuer '" +
-                        issuer_name + "'");
+                        issuer_name + "' (checked regardless of `enabled` "
+                        "so staged disabled policies still get typo-rejection)");
                 }
             }
-            // Inline proxy.auth derives its applies_to from the proxy's
-            // route_prefix. An empty route_prefix is a config bug — the
-            // policy would apply to everything, shadowing any top-level
-            // catch-all.
-            if (u.proxy.route_prefix.empty()) {
+
+            // route_prefix non-empty is required ONLY when the operator
+            // has actually populated the inline auth block. A proxy with
+            // a fully-default auth block (the operator never wrote
+            // `proxy.auth: {...}`) shouldn't be required to have a
+            // route_prefix — it might be a programmatic-only proxy. So
+            // gate this specific check on whether ANY field of the block
+            // was touched by the operator. Detection: any field differs
+            // from the AuthPolicy default constructor.
+            //
+            // Includes p.enabled in the populated check because an
+            // operator who writes `"auth": {"enabled": true}` literally
+            // (even with no other fields) is signaling intent and should
+            // still be told their proxy lacks a route_prefix. Same for
+            // any other non-default field.
+            const bool inline_auth_populated = (p != auth::AuthPolicy{});
+            if (inline_auth_populated && u.proxy.route_prefix.empty()) {
                 throw std::invalid_argument(
                     ctx + " has no route_prefix — inline auth requires a "
                     "non-empty proxy.route_prefix to derive applies_to");
             }
+
+            // ---- Collision detection: ENABLED-only ----
+            //
+            // Per spec §3.2, only enabled inline policies participate in
+            // the runtime longest-prefix matcher. Disabled policies are
+            // inert at request time, so they shouldn't collide with each
+            // other or with top-level policies. (This matches the prior
+            // reviewer round's guidance that the "enable a disabled
+            // policy and discover a collision later" flow is a deliberate
+            // UX trade-off, not a bug — and confirms the gate is the
+            // right place to draw the structural-vs-collision line.)
+            if (!p.enabled) continue;
+
             const std::string owner =
                 "inline proxy.auth on upstream '" + u.name + "'";
             auto ins = all_prefixes.emplace(u.proxy.route_prefix, owner);
@@ -1994,7 +2032,18 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
         // route_prefix is empty (exposed via programmatic Proxy() API).
         // Skipping this block on empty route_prefix would silently reset
         // those settings on a ToJson() / LoadFromString() round-trip.
-        if (u.proxy != ProxyConfig{}) {
+        //
+        // The gate also explicitly checks for an auth-only difference:
+        // ProxyConfig::operator== INTENTIONALLY ignores the `auth` field
+        // (live-reloadable per same-PR `AuthManager::Reload` discipline,
+        // see DEVELOPMENT_RULES.md). Without the second clause, a proxy
+        // that only customizes inline auth — exactly the staged config
+        // shape operators are expected to write before request-time
+        // enforcement is wired — would compare equal to the default and
+        // get its entire proxy block (including `auth`) silently dropped
+        // by ToJson(). Round-trip would lose the staged policy. Treat
+        // any non-default auth as sufficient reason to serialize.
+        if (u.proxy != ProxyConfig{} || u.proxy.auth != auth::AuthPolicy{}) {
             nlohmann::json pj;
             pj["route_prefix"] = u.proxy.route_prefix;
             pj["strip_prefix"] = u.proxy.strip_prefix;

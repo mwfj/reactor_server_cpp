@@ -1256,6 +1256,350 @@ void TestConfigLoaderRejectsReservedForwardHeaders() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// PopulateFromPayload — clears stale fields on reuse (review P2 #1).
+// A second call with a payload missing iss/sub/claims must NOT inherit
+// the previous call's values. Principal-confusion bug if not cleared.
+// -----------------------------------------------------------------------------
+void TestPopulateFromPayloadClearsStaleFields() {
+    std::cout << "\n[TEST] PopulateFromPayload clears stale fields on reuse..." << std::endl;
+    try {
+        auth::AuthContext ctx;
+
+        // First call: populate ctx with iss/sub/email/groups (groups
+        // ignored — it's an array — but email is a scalar that lands
+        // in claims).
+        nlohmann::json first = nlohmann::json::parse(R"({
+            "iss": "https://issuer-A.example",
+            "sub": "alice",
+            "email": "alice@example.com",
+            "scope": "read:data"
+        })");
+        bool ok1 = auth::PopulateFromPayload(first, {"email"}, ctx);
+        bool first_pass = ok1 &&
+            ctx.issuer == "https://issuer-A.example" &&
+            ctx.subject == "alice" &&
+            ctx.claims.count("email") == 1 &&
+            ctx.scopes.size() == 1;
+        if (!first_pass) {
+            TestFramework::RecordTest(
+                "AuthFoundation: PopulateFromPayload clears stale fields",
+                false, "first call failed to populate baseline state",
+                TestFramework::TestCategory::OTHER);
+            return;
+        }
+
+        // Second call REUSING the same ctx: payload has NEITHER iss NOR
+        // sub, no email, and a different scope. After this call, ctx
+        // must reflect ONLY the second payload — no carryover.
+        nlohmann::json second = nlohmann::json::parse(R"({
+            "scope": "write:data"
+        })");
+        bool ok2 = auth::PopulateFromPayload(second, {"email"}, ctx);
+
+        bool second_pass = ok2 &&
+            ctx.issuer.empty() &&         // NOT "https://issuer-A.example"
+            ctx.subject.empty() &&        // NOT "alice"
+            ctx.claims.count("email") == 0 &&  // NOT alice@example.com
+            ctx.scopes.size() == 1 &&
+            ctx.scopes[0] == "write:data";
+
+        // Third case: structurally invalid payload also clears (caller
+        // who accidentally trusts ctx after a false return gets clean
+        // state, not stale carryover from the first successful call).
+        ctx.issuer = "leftover";
+        ctx.subject = "leftover";
+        ctx.claims["leftover"] = "leftover";
+        nlohmann::json bad = nlohmann::json::parse(R"("a string")");
+        bool ok3 = auth::PopulateFromPayload(bad, {}, ctx);
+        bool third_pass = !ok3 &&  // returns false on non-object
+            ctx.issuer.empty() &&
+            ctx.subject.empty() &&
+            ctx.claims.empty();
+
+        bool pass = second_pass && third_pass;
+        std::string err;
+        if (!second_pass) {
+            err = "stale-field carryover on reuse: ctx still holds prior "
+                  "values (iss='" + ctx.issuer + "', sub='" + ctx.subject +
+                  "', claims.size=" + std::to_string(ctx.claims.size()) + ")";
+        } else if (!third_pass) {
+            err = "non-object payload didn't clear ctx — fail-closed "
+                  "contract violated";
+        }
+        TestFramework::RecordTest(
+            "AuthFoundation: PopulateFromPayload clears stale fields",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: PopulateFromPayload clears stale fields",
+            false, std::string("unexpected exception: ") + e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — disabled inline proxy.auth still gets structural
+// validation (review P2 #2). Operators are expected to pre-stage disabled
+// auth blocks during the rollout; typos must surface NOW, not at the
+// deploy where they flip enabled=true.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderValidatesDisabledInlineAuth() {
+    std::cout << "\n[TEST] ConfigLoader validates disabled inline proxy.auth..." << std::endl;
+    auto validate_expect_failure = [](const std::string& json,
+                                       const std::string& expected_phrase)
+        -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(cfg);
+            return "expected throw containing '" + expected_phrase +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
+                return "threw with wrong message; expected '" +
+                       expected_phrase + "', got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // Case 1: DISABLED inline auth references unknown issuer — must reject.
+        std::string err = validate_expect_failure(R"({
+            "upstreams": [
+                {"name":"x","host":"127.0.0.1","port":80},
+                {
+                    "name": "internal-api",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "proxy": {
+                        "route_prefix": "/api/v1",
+                        "auth": {
+                            "enabled": false,
+                            "issuers": ["typo-not-a-real-issuer"]
+                        }
+                    }
+                }
+            ],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://accounts.google.com",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })", "references unknown issuer");
+        if (!err.empty()) throw std::runtime_error("disabled unknown issuer: " + err);
+
+        // Case 2: DISABLED inline auth with bad on_undetermined value.
+        err = validate_expect_failure(R"({
+            "upstreams": [
+                {"name":"x","host":"127.0.0.1","port":80},
+                {
+                    "name": "internal-api",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "proxy": {
+                        "route_prefix": "/api/v1",
+                        "auth": {
+                            "enabled": false,
+                            "issuers": ["google"],
+                            "on_undetermined": "maybe"
+                        }
+                    }
+                }
+            ],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://accounts.google.com",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })", "on_undetermined must be");
+        if (!err.empty()) throw std::runtime_error("disabled bad on_undetermined: " + err);
+
+        // Case 3: DISABLED inline auth populated but no route_prefix.
+        err = validate_expect_failure(R"({
+            "upstreams": [
+                {"name":"x","host":"127.0.0.1","port":80},
+                {
+                    "name": "internal-api",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "proxy": {
+                        "auth": {
+                            "enabled": false,
+                            "issuers": ["google"]
+                        }
+                    }
+                }
+            ],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://accounts.google.com",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })", "no route_prefix");
+        if (!err.empty()) throw std::runtime_error("disabled no route_prefix: " + err);
+
+        // Case 4: NEGATIVE — proxy with no auth block at all and no
+        // route_prefix (programmatic-only proxy). Must NOT trigger the
+        // route_prefix check (the populated-detection guards it).
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [
+                    {
+                        "name": "programmatic-only",
+                        "host": "127.0.0.1",
+                        "port": 8080
+                    }
+                ]
+            })");
+            ConfigLoader::Validate(cfg);
+            // Expected: no throw. If we got here, good.
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                "no-auth-block proxy without route_prefix should pass "
+                "validation, but threw: " + std::string(e.what()));
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader validates disabled inline proxy.auth",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader validates disabled inline proxy.auth",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader::ToJson — serializes proxy block when only auth differs
+// (review P2 #3). ProxyConfig::operator== ignores `auth` (correct, by
+// design — auth is live-reloadable). Without an explicit auth-difference
+// check in the serialization gate, a proxy customizing only the inline
+// auth stanza gets its entire block dropped on round-trip. That's exactly
+// the staged-config shape operators are expected to use during the
+// pre-Phase-2 rollout, so the round-trip loss is a config-data-loss bug.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderRoundTripsAuthOnlyProxy() {
+    std::cout << "\n[TEST] ConfigLoader round-trips auth-only proxy block..." << std::endl;
+    try {
+        // Proxy that ONLY customizes inline auth — every other proxy
+        // field is at its default (empty route_prefix would fail the
+        // populated-route-prefix structural check, so we set
+        // route_prefix to something non-empty; everything ELSE is at
+        // default). Notable: enabled=false on the auth (so the master
+        // gate doesn't fire) but issuers/realm are populated to make
+        // the auth block clearly non-default.
+        const std::string original = R"({
+            "bind_host": "127.0.0.1",
+            "bind_port": 8080,
+            "upstreams": [
+                {"name":"x","host":"127.0.0.1","port":80},
+                {
+                    "name": "internal-api",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "proxy": {
+                        "route_prefix": "/api/v1",
+                        "auth": {
+                            "enabled": false,
+                            "issuers": ["google"],
+                            "realm": "internal-api"
+                        }
+                    }
+                }
+            ],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://accounts.google.com",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })";
+
+        ServerConfig c1 = ConfigLoader::LoadFromString(original);
+        // Confirm the original fixture parsed the inline auth block.
+        bool parsed_inline = false;
+        for (const auto& u : c1.upstreams) {
+            if (u.name == "internal-api") {
+                parsed_inline =
+                    !u.proxy.auth.issuers.empty() &&
+                    u.proxy.auth.issuers[0] == "google" &&
+                    u.proxy.auth.realm == "internal-api";
+                break;
+            }
+        }
+        if (!parsed_inline) {
+            TestFramework::RecordTest(
+                "AuthFoundation: ConfigLoader round-trips auth-only proxy",
+                false, "fixture: parser failed to capture the inline auth "
+                       "block on the first parse — test cannot proceed",
+                TestFramework::TestCategory::OTHER);
+            return;
+        }
+
+        // Serialize and re-parse. THIS is the path that previously dropped
+        // the proxy block because operator== ignores auth and the gate
+        // used `u.proxy != ProxyConfig{}`.
+        std::string reserialized = ConfigLoader::ToJson(c1);
+        ServerConfig c2 = ConfigLoader::LoadFromString(reserialized);
+
+        // The round-trip must preserve the inline auth block.
+        bool round_trip_preserved = false;
+        for (const auto& u : c2.upstreams) {
+            if (u.name == "internal-api") {
+                round_trip_preserved =
+                    !u.proxy.auth.issuers.empty() &&
+                    u.proxy.auth.issuers[0] == "google" &&
+                    u.proxy.auth.realm == "internal-api";
+                break;
+            }
+        }
+
+        bool pass = round_trip_preserved;
+        std::string err;
+        if (!pass) {
+            err = "round-trip dropped the auth-only proxy block — "
+                  "ToJson() gate didn't recognize the auth-only "
+                  "difference. Reserialized JSON: " +
+                  reserialized.substr(0, 300) + "...";
+        }
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader round-trips auth-only proxy",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader round-trips auth-only proxy",
+            false, std::string("unexpected exception: ") + e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -1272,6 +1616,9 @@ inline void RunAllTests() {
     TestConfigLoaderUpstreamCrossRefReloadSafe();
     TestConfigLoaderRejectsOutOfRangeIntegers();
     TestConfigLoaderRejectsReservedForwardHeaders();
+    TestPopulateFromPayloadClearsStaleFields();
+    TestConfigLoaderValidatesDisabledInlineAuth();
+    TestConfigLoaderRoundTripsAuthOnlyProxy();
     TestConfigLoaderClaimHeaderCollision();
 }
 

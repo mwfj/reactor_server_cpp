@@ -57,6 +57,30 @@ std::vector<std::string> ExtractScopes(const nlohmann::json& payload) {
 bool PopulateFromPayload(const nlohmann::json& payload,
                          const std::vector<std::string>& claims_keys,
                          AuthContext& ctx) {
+    // Defensive reset of the fields THIS function manages. Without this,
+    // a non-fresh AuthContext (e.g. a verifier that reuses a stack object
+    // across requests, or a retry path that re-invokes Populate) would
+    // INHERIT the previous call's iss / sub / scopes / claims when the
+    // current payload doesn't supply them — a token could end up with
+    // the prior caller's principal, scopes, or forwarded-claim values.
+    // Principal-confusion bug. The cheap fix is "this function owns these
+    // fields; clear up front, populate from payload."
+    //
+    // Fields NOT cleared here (policy_name, raw_token, undetermined) are
+    // caller-managed; they're set by the middleware around the verifier
+    // call, not derived from the JWT payload. Clearing them would force
+    // the caller to re-set on every payload populate, which is the wrong
+    // contract.
+    //
+    // Cleared even when we return false below (non-object payload) — a
+    // caller who accidentally uses ctx after a false return gets clean
+    // empty fields, not stale ones from a previous successful call. This
+    // is the safer side of the fail-closed coin.
+    ctx.issuer.clear();
+    ctx.subject.clear();
+    ctx.scopes.clear();
+    ctx.claims.clear();
+
     if (!payload.is_object()) return false;
 
     // `iss` and `sub` are both OPTIONAL per RFC 7519 §4.1.1 / §4.1.2; the
