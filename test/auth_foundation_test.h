@@ -989,21 +989,24 @@ void TestPopulateFromPayloadOptionalIssSub() {
 
 // -----------------------------------------------------------------------------
 // ConfigLoader::Validate — issuer.upstream cross-reference is reload-safe
-// (review P2 #1). HttpServer::Reload() validates a copy with upstreams[]
-// stripped (server/http_server.cc:3601) so the topology-restart-only path
-// can be re-validated for live-reloadable bits without dragging restart
-// constraints. Before this fix, the issuer.upstream check would fire on
-// the empty upstream_names set and reject ANY reload of a config that has
-// auth.issuers populated — even an entirely auth-unrelated reload like a
-// rate-limit edit. This test pins the relaxation: with upstreams empty,
-// the cross-reference check is skipped (typo-catching value preserved at
-// startup where upstreams is always full).
+// via the EXPLICIT `reload_copy=true` flag (review P2). HttpServer::Reload()
+// validates a copy with upstreams[] stripped and now passes
+// `reload_copy=true` so topology cross-refs are skipped. Earlier iterations
+// used `upstream_names.empty()` as an implicit reload sentinel — that
+// overloaded "no upstreams" to mean "reload context", which incorrectly
+// skipped checks on legitimate startup configs with programmatic-only
+// routes. The explicit flag fixes that. This test pins three behaviors:
+//
+//   1. reload_copy=true + empty upstreams → cross-ref skipped (reload safe)
+//   2. reload_copy=false + full upstreams + missing target → reject
+//   3. reload_copy=false + empty upstreams + populated issuer → reject
+//      (regression catch — programmatic-only startup must still validate)
 // -----------------------------------------------------------------------------
 void TestConfigLoaderUpstreamCrossRefReloadSafe() {
     std::cout << "\n[TEST] ConfigLoader issuer.upstream cross-ref is reload-safe..." << std::endl;
     try {
-        // Simulate the reload-validation context: full auth schema, but
-        // upstreams[] cleared (mimics HttpServer::Reload's validation_copy).
+        // Reload-context shape: full auth schema, upstreams[] cleared.
+        // With reload_copy=true the cross-ref must be skipped.
         const std::string reload_shape = R"({
             "bind_host": "127.0.0.1",
             "bind_port": 8080,
@@ -1025,15 +1028,15 @@ void TestConfigLoaderUpstreamCrossRefReloadSafe() {
         std::string err_msg;
         try {
             ServerConfig cfg = ConfigLoader::LoadFromString(reload_shape);
-            ConfigLoader::Validate(cfg);
+            ConfigLoader::Validate(cfg, /*reload_copy=*/true);
         } catch (const std::exception& e) {
             threw = true;
             err_msg = e.what();
         }
 
-        // Regression check: at STARTUP (full upstreams, no idp_google), the
-        // check should still fire. This confirms we relaxed only the
-        // empty-upstreams branch, not the entire check.
+        // Regression #1: at STARTUP (full upstreams, missing target),
+        // the cross-ref must still fire. This confirms the flag default
+        // (false) preserves the typo-catching value of the check.
         const std::string startup_shape = R"({
             "bind_host": "127.0.0.1",
             "bind_port": 8080,
@@ -1054,27 +1057,54 @@ void TestConfigLoaderUpstreamCrossRefReloadSafe() {
         std::string startup_err;
         try {
             ServerConfig cfg2 = ConfigLoader::LoadFromString(startup_shape);
-            ConfigLoader::Validate(cfg2);
+            ConfigLoader::Validate(cfg2);  // default reload_copy=false
         } catch (const std::exception& e) {
             startup_threw = true;
             startup_err = e.what();
         }
 
+        // Regression #2 (the new behavior the explicit flag fixes):
+        // genuine startup config with empty upstreams[] (a programmatic-
+        // only deployment that uses top-level auth.policies[] to protect
+        // its handlers) MUST still reject an issuer.upstream pointing
+        // at a nonexistent pool. Before the flag, this slipped through
+        // because empty upstreams was the reload sentinel.
+        bool prog_only_startup_threw = false;
+        std::string prog_only_err;
+        try {
+            ServerConfig cfg3 = ConfigLoader::LoadFromString(reload_shape);
+            ConfigLoader::Validate(cfg3);  // default reload_copy=false
+        } catch (const std::exception& e) {
+            prog_only_startup_threw = true;
+            prog_only_err = e.what();
+        }
+
         bool reload_pass = !threw;
         bool startup_pass = startup_threw &&
             startup_err.find("references unknown upstream") != std::string::npos;
+        bool prog_only_pass = prog_only_startup_threw &&
+            prog_only_err.find("references unknown upstream") != std::string::npos;
 
-        bool pass = reload_pass && startup_pass;
+        bool pass = reload_pass && startup_pass && prog_only_pass;
         std::string err;
         if (!reload_pass) {
-            err = "reload-shape (empty upstreams) should NOT throw on "
-                  "issuer.upstream cross-ref but did: " + err_msg;
+            err = "reload-shape (reload_copy=true, empty upstreams) should "
+                  "NOT throw on issuer.upstream cross-ref but did: " + err_msg;
         } else if (!startup_pass) {
             err = startup_threw
                 ? "startup-shape threw but with wrong error (expected "
                   "'references unknown upstream'); got: " + startup_err
-                : "startup-shape (full upstreams, missing idp_google) "
-                  "should still reject the cross-ref but accepted";
+                : "startup-shape (reload_copy=false, full upstreams, missing "
+                  "idp_google) should still reject the cross-ref but accepted";
+        } else if (!prog_only_pass) {
+            err = prog_only_startup_threw
+                ? "programmatic-only startup threw but with wrong error "
+                  "(expected 'references unknown upstream'); got: " + prog_only_err
+                : "programmatic-only startup (reload_copy=false, empty "
+                  "upstreams, populated issuer.upstream) should reject the "
+                  "cross-ref — this is the gap the explicit reload_copy "
+                  "flag was added to fix. Test failure means the fix has "
+                  "regressed.";
         }
 
         TestFramework::RecordTest(
@@ -2342,10 +2372,9 @@ void TestConfigLoaderRequiresIssuerUpstream() {
         if (!err.empty()) throw std::runtime_error("unknown upstream at startup: " + err);
 
         // Case 4: regression — reload-safe path still skips cross-ref
-        // when upstreams is empty (avoids blocking unrelated hot reloads).
-        // Upstream IS set here; upstreams list is empty. Per the
-        // reload-safety contract, this is accepted (the structural check
-        // passed because upstream is non-empty; the cross-ref is skipped).
+        // when called with reload_copy=true (avoids blocking unrelated
+        // hot reloads). Upstream IS set here; upstreams list is empty;
+        // caller signals reload context explicitly via the flag.
         try {
             ServerConfig cfg = ConfigLoader::LoadFromString(R"({
                 "upstreams": [],
@@ -2361,10 +2390,10 @@ void TestConfigLoaderRequiresIssuerUpstream() {
                     }
                 }
             })");
-            ConfigLoader::Validate(cfg);
+            ConfigLoader::Validate(cfg, /*reload_copy=*/true);
         } catch (const std::exception& e) {
             throw std::runtime_error(
-                std::string("reload-shape (empty upstreams, upstream set) ")
+                std::string("reload-shape with reload_copy=true ")
                 + "should pass cross-ref check but threw: " + e.what());
         }
 
@@ -2486,6 +2515,107 @@ void TestConfigLoaderValidatesHeaderNameTchar() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — top-level auth.policies[].applies_to entries
+// are LITERAL byte prefixes and may contain any printable characters —
+// INCLUDING ':' and '*' that look like route-trie pattern syntax but are
+// actually literal path components. An earlier iteration parsed these
+// with ROUTE_TRIE::ParsePattern and rejected ':' / '*' segments; that
+// was over-strict and blocked legitimate literal URLs like "/docs/:faq"
+// or "/assets/*latest". The auth matcher has NO concept of route-trie
+// patterns — it just does byte-prefix comparison — so accepting these
+// strings is correct.
+//
+// This test pins the acceptance behavior (regression protection against
+// reintroducing the over-strict check). The inline `proxy.auth`
+// route_prefix check is SEPARATE and DOES still reject patterned
+// prefixes, because inline route_prefix is consumed by TWO matchers
+// (route_trie + auth) with different semantics — see
+// TestConfigLoaderRejectsPatternedInlineAuthPrefix.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderAcceptsLiteralPatternCharsInAppliesTo() {
+    std::cout << "\n[TEST] ConfigLoader accepts literal :/* chars in top-level applies_to..." << std::endl;
+
+    auto make_json = [](const std::string& applies_to_array,
+                         bool enabled) -> std::string {
+        return std::string(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                },
+                "policies": [{"name":"p","enabled":)") +
+               (enabled ? "true" : "false") + R"(,"applies_to":)" +
+               applies_to_array + R"(,"issuers":["google"]}]
+            }
+        })";
+    };
+
+    auto expect_accepted = [&make_json](const std::string& applies_to_array,
+                                         const std::string& label,
+                                         bool enabled) -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(
+                make_json(applies_to_array, enabled));
+            ConfigLoader::Validate(cfg);
+            return "";
+        } catch (const std::exception& e) {
+            return label + " rejected (should be accepted): " + e.what();
+        }
+    };
+
+    try {
+        // Case 1: literal ":faq" segment (e.g. docs/wiki system with
+        // literal ':' in URL path) — accepted.
+        std::string err = expect_accepted(
+            R"(["/docs/:faq"])", "/docs/:faq", /*enabled=*/true);
+        if (!err.empty()) throw std::runtime_error(err);
+
+        // Case 2: literal "*latest" segment (e.g. asset versioning URL) —
+        // accepted.
+        err = expect_accepted(
+            R"(["/assets/*latest"])", "/assets/*latest", /*enabled=*/true);
+        if (!err.empty()) throw std::runtime_error(err);
+
+        // Case 3: mixed — pure-literal and pattern-looking entries in
+        // same policy — all accepted.
+        err = expect_accepted(
+            R"(["/api/", "/api/:version/"])", "mixed", /*enabled=*/true);
+        if (!err.empty()) throw std::runtime_error(err);
+
+        // Case 4: disabled policy with pattern-looking entry also
+        // accepted (consistency — no reason to reject based on enable
+        // state when the entry itself is legal).
+        err = expect_accepted(
+            R"(["/api/:id"])", "disabled /api/:id", /*enabled=*/false);
+        if (!err.empty()) throw std::runtime_error(err);
+
+        // Case 5: pure literal entry (the common case) — accepted.
+        err = expect_accepted(
+            R"(["/api/v1/"])", "literal /api/v1/", /*enabled=*/true);
+        if (!err.empty()) throw std::runtime_error(err);
+
+        // Case 6: empty string (catch-all) — accepted per auth_policy_matcher.h.
+        err = expect_accepted(
+            R"([""])", "empty catch-all", /*enabled=*/true);
+        if (!err.empty()) throw std::runtime_error(err);
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader accepts literal :/* in top-level applies_to",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader accepts literal :/* in top-level applies_to",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -2513,6 +2643,7 @@ inline void RunAllTests() {
     TestConfigLoaderRejectsPatternedInlineAuthPrefix();
     TestConfigLoaderRequiresIssuerUpstream();
     TestConfigLoaderValidatesHeaderNameTchar();
+    TestConfigLoaderAcceptsLiteralPatternCharsInAppliesTo();
     TestConfigLoaderClaimHeaderCollision();
 }
 

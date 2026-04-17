@@ -1110,7 +1110,7 @@ void ConfigLoader::ValidateHotReloadable(
     }
 }
 
-void ConfigLoader::Validate(const ServerConfig& config) {
+void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
     // Validate bind_host is a strict dotted-quad IPv4 address.
     // Use inet_pton (not inet_addr) to reject legacy shorthand forms
     // like "1" (→ 0.0.0.1) or octal "0127.0.0.1" (→ 87.0.0.1).
@@ -1739,23 +1739,26 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             // (see server/http_server.cc:3601 —
             // `validation_copy.upstreams.clear()`) because upstream topology
             // is restart-only and the reload path intentionally re-validates
-            // only the live-reloadable bits. If we ran the cross-reference
-            // check unconditionally, ANY hot reload of a config that has
-            // populated auth.issuers — even an entirely auth-unrelated
-            // reload (e.g. a rate-limit edit) — would fail with "unknown
-            // issuer upstream" because the source map is empty. That would
-            // block the forward-compatible auth schema the final
-            // enforcement-not-yet-wired gate intentionally permits.
+            // only the live-reloadable bits. The caller signals that
+            // context explicitly via `reload_copy=true`; we skip the
+            // topology cross-ref in that context.
             //
-            // Skip the cross-ref when upstream_names is empty (i.e. we're
-            // running in a stripped reload context). The startup path
-            // always passes the full upstreams list, so the typo-catching
-            // value of this check is preserved there. (Note: the structural
-            // "upstream must be non-empty" check above still fires on
-            // reload paths — that catches configs that were outright
-            // missing the field; only the existence cross-check is
-            // context-sensitive.)
-            if (!upstream_names.empty() &&
+            // Startup path (`reload_copy=false`, the default) runs the
+            // check ALWAYS — including when upstreams[] is genuinely
+            // empty. An empty upstreams[] is a legitimate startup shape
+            // (programmatic-only deployment), and in that case an
+            // issuer.upstream reference still needs to fail loudly
+            // because no pool exists to host the IdP traffic. Earlier
+            // iterations of this check used `upstream_names.empty()` as
+            // an implicit reload sentinel, but that overload let genuine
+            // startup typos slip through for programmatic-only configs;
+            // the explicit flag fixes that without re-breaking reload.
+            //
+            // (The structural "upstream must be non-empty" check above
+            // still fires regardless of `reload_copy` — it catches
+            // configs that were outright missing the field, which is a
+            // schema error independent of topology context.)
+            if (!reload_copy &&
                 upstream_names.count(ic.upstream) == 0) {
                 throw std::invalid_argument(
                     ctx + ".upstream references unknown upstream '" +
@@ -1924,6 +1927,29 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     "one prefix to applies_to, or set enabled=false until "
                     "the prefix list is ready.");
             }
+
+            // applies_to entries are consumed ONLY by auth::FindPolicyForPath
+            // which does literal byte-prefix matching (design spec §3.2).
+            // No route_trie is involved in this path — the string is taken
+            // verbatim as the prefix to compare against each request's URL
+            // path bytes. So applies_to values can legitimately contain
+            // any printable characters, including ':' and '*' that would
+            // look like route-trie pattern syntax (e.g. a docs system with
+            // `/docs/:faq` as a LITERAL URL, or `/assets/*latest` where
+            // `*latest` is a literal filename prefix).
+            //
+            // We deliberately do NOT run ROUTE_TRIE::ParsePattern here:
+            // there's no second matcher that interprets the pattern, so
+            // there's no mismatch risk (unlike inline `proxy.auth`, where
+            // the trie AND the auth matcher both consume the same
+            // route_prefix and disagree on semantics — that case still
+            // rejects patterned prefixes).
+            //
+            // If an operator writes `/api/:version/` here EXPECTING trie
+            // semantics, they'll get literal matching only. That's an
+            // operator-education problem, not a validator problem; the
+            // matcher's behavior is unambiguous and trying to guess
+            // intent would incorrectly reject legitimate literal URLs.
         }
 
         // Inline proxy.auth validation + exact-prefix collision detection.

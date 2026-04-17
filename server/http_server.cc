@@ -3605,7 +3605,14 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // (rate<=0, invalid key_type, duplicate zone names) must be caught.
         validation_copy.rate_limit = new_config.rate_limit;
         try {
-            ConfigLoader::Validate(validation_copy);
+            // reload_copy=true — signals the validator that upstreams[]
+            // has been deliberately stripped above, so topology cross-
+            // reference checks (e.g. `auth.issuers.*.upstream` pointing
+            // at a pool name) should be skipped in this context.
+            // Startup validation passes false (the default), so genuine
+            // startup configs with no upstreams still get their cross-
+            // refs checked. See ConfigLoader::Validate docstring.
+            ConfigLoader::Validate(validation_copy, /*reload_copy=*/true);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Reload() rejected invalid config: {}", e.what());
             return false;

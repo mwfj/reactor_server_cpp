@@ -26,7 +26,23 @@ public:
 
     // Validate the configuration.
     // Throws std::invalid_argument if validation fails.
-    static void Validate(const ServerConfig& config);
+    //
+    // `reload_copy` — set to `true` ONLY by the SIGHUP reload path
+    // (HttpServer::Reload / main.cc::ReloadConfig), which passes a
+    // ServerConfig with `upstreams` deliberately cleared so that
+    // topology-restart-only checks don't run against a stripped copy.
+    // When `true`, checks that cross-reference into `upstreams[]` are
+    // skipped (the reload path revalidates topology separately via the
+    // existing `proxy == o.proxy` equality mechanism).
+    //
+    // At startup, `reload_copy=false` so ALL cross-reference checks
+    // fire — including on programmatic-only deployments (empty
+    // `upstreams[]` is a legitimate startup shape, and typos in
+    // `auth.issuers.*.upstream` must still surface loudly in that
+    // context rather than silently accepting references to pools that
+    // don't exist).
+    static void Validate(const ServerConfig& config,
+                         bool reload_copy = false);
 
     // Validate ONLY the fields that are live-reloadable without a
     // restart — today this is the per-upstream circuit_breaker block
