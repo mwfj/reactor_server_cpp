@@ -2074,6 +2074,103 @@ namespace HttpTests {
         }
     }
 
+    void TestH1_StreamingControlMethodsOffDispatcherThreadRejected() {
+        std::cout << "\n[TEST] H1 streaming: off-dispatcher control methods are rejected..." << std::endl;
+        try {
+            auto worker_called = std::make_shared<std::atomic<bool>>(false);
+            auto first_result =
+                std::make_shared<std::atomic<int>>(static_cast<int>(
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED));
+
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-control-offthread",
+                [worker_called, first_result](
+                    const HttpRequest&,
+                    HttpRouter::InterimResponseSender /*send_interim*/,
+                    HttpRouter::ResourcePusher /*push_resource*/,
+                    HttpRouter::StreamingResponseSender stream_sender,
+                    HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    std::thread t([stream_sender, worker_called]() mutable {
+                        worker_called->store(true, std::memory_order_release);
+                        stream_sender.ConfigureWatermarks(1);
+                        stream_sender.SetDrainListener([]() {});
+                    });
+                    t.join();
+
+                    HttpResponse head;
+                    head.Status(200).Header("Content-Type", "text/plain");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    auto first = stream_sender.SendData("a", 1);
+                    first_result->store(static_cast<int>(first),
+                                        std::memory_order_release);
+                    if (first ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+
+                    std::string body(4096, 'x');
+                    stream_sender.ConfigureWatermarks(1);
+                    auto second = stream_sender.SendData(body.data(), body.size());
+                    if (second ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End();
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-control-offthread HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("http/1.1 200 ok") == std::string::npos) {
+                pass = false; err += "missing 200 response; ";
+            }
+            if (lower.find("transfer-encoding: chunked") == std::string::npos) {
+                pass = false; err += "expected chunked framing; ";
+            }
+            if (lower.find("1\r\na\r\n1000\r\n") == std::string::npos) {
+                pass = false; err += "expected streamed chunk sequence missing; ";
+            }
+            if (!worker_called->load(std::memory_order_acquire)) {
+                pass = false; err += "worker thread did not call control methods; ";
+            }
+            auto expected_first = static_cast<int>(
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::
+                    ACCEPTED_BELOW_WATER);
+            if (first_result->load(std::memory_order_acquire) != expected_first) {
+                pass = false;
+                err += "off-thread ConfigureWatermarks should be ignored; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: off-dispatcher control methods are rejected",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: off-dispatcher control methods are rejected",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // T8: Worker-thread interleave — a handler that calls complete() from
     // a worker thread followed by send_interim() from the same worker
     // must not be able to queue a 103 AFTER the 200 on the wire.
@@ -2406,6 +2503,7 @@ namespace HttpTests {
         TestH1_StreamingHttp10UnknownLengthOmitsContentLength();
         TestH1_StreamingAbortOffDispatcherThreadRejected();
         TestH1_StreamingRawContentLengthWithoutPreserveUsesChunkedFraming();
+        TestH1_StreamingControlMethodsOffDispatcherThreadRejected();
         TestH1_EarlyHints_WorkerThreadOrderingSafe();
         TestH1_EarlyHints_PipelinedKeepAliveNoStale();
         TestH1_Async_HandlerThrowFiresCancelSlot();

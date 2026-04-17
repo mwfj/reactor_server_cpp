@@ -364,6 +364,17 @@ public:
     }
 
     void SetDrainListener(DrainListener listener) override {
+        auto self = handler_.lock();
+        auto conn = self ? self->GetConnection() : nullptr;
+        if (!self || !conn || conn->IsClosing()) {
+            return;
+        }
+        if (!conn->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H2 streaming SetDrainListener called off dispatcher stream={}",
+                stream_id_);
+            return;
+        }
         drain_listener_ = std::move(listener);
         ++drain_listener_generation_;
         drain_listener_scheduled_ = false;
@@ -375,6 +386,17 @@ public:
     }
 
     void ConfigureWatermarks(size_t high_water_bytes) override {
+        auto self = handler_.lock();
+        auto conn = self ? self->GetConnection() : nullptr;
+        if (!self || !conn || conn->IsClosing()) {
+            return;
+        }
+        if (!conn->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H2 streaming ConfigureWatermarks called off dispatcher stream={}",
+                stream_id_);
+            return;
+        }
         high_water_ = high_water_bytes;
         if (data_source_) {
             data_source_->ConfigureWatermarks(high_water_bytes);

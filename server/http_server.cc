@@ -3837,8 +3837,9 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
             for (auto& h2conn : snap.h2) {
                 auto conn = h2conn->GetConnection();
                 if (!conn) continue;
-                conn->RunOnDispatcher([h2conn, conn, body, final_cap]() {
+                conn->RunOnDispatcher([h2conn, conn, body, header, final_cap]() {
                     h2conn->SetMaxBodySize(body);
+                    h2conn->SetMaxHeaderSize(header);
                     conn->SetMaxInputSize(final_cap);
                 });
             }

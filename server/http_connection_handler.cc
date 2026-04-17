@@ -366,6 +366,15 @@ public:
     }
 
     void SetDrainListener(DrainListener listener) override {
+        if (!conn_ || conn_->IsClosing()) {
+            return;
+        }
+        if (!conn_->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H1 streaming SetDrainListener called off dispatcher fd={}",
+                conn_->fd());
+            return;
+        }
         drain_listener_ = std::move(listener);
         ++drain_listener_generation_;
         drain_listener_scheduled_ = false;
@@ -375,6 +384,15 @@ public:
     }
 
     void ConfigureWatermarks(size_t high_water_bytes) override {
+        if (!conn_ || conn_->IsClosing()) {
+            return;
+        }
+        if (!conn_->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H1 streaming ConfigureWatermarks called off dispatcher fd={}",
+                conn_->fd());
+            return;
+        }
         if (high_water_bytes == 0) return;
         high_water_ = high_water_bytes;
         low_water_ = high_water_ / 2;

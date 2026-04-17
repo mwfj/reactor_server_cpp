@@ -4702,6 +4702,130 @@ void TestH2_StreamingEmptyEndInlineDoesNotResetStream() {
     }
 }
 
+void TestH2_StreamingControlMethodsOffDispatcherThreadRejected() {
+    std::cout << "\n[TEST] H2 streaming: off-dispatcher control methods are rejected..."
+              << std::endl;
+    try {
+        auto worker_called = std::make_shared<std::atomic<bool>>(false);
+        auto drain_called = std::make_shared<std::atomic<bool>>(false);
+        auto first_result =
+            std::make_shared<std::atomic<int>>(static_cast<int>(
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED));
+        auto second_result =
+            std::make_shared<std::atomic<int>>(static_cast<int>(
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED));
+
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync(
+            "/stream-control-offthread",
+            [worker_called, drain_called, first_result, second_result](
+                const HttpRequest&,
+                HttpRouter::InterimResponseSender /*send_interim*/,
+                HttpRouter::ResourcePusher /*push_resource*/,
+                HttpRouter::StreamingResponseSender stream_sender,
+                HttpRouter::AsyncCompletionCallback /*complete*/) {
+                std::thread t([stream_sender, worker_called, drain_called]() mutable {
+                    worker_called->store(true, std::memory_order_release);
+                    stream_sender.ConfigureWatermarks(1);
+                    stream_sender.SetDrainListener([drain_called]() {
+                        drain_called->store(true, std::memory_order_release);
+                    });
+                });
+                t.join();
+
+                HttpResponse head;
+                head.Status(200).Header("Content-Type", "text/plain");
+                if (stream_sender.SendHeaders(head) < 0) {
+                    return;
+                }
+                auto first = stream_sender.SendData("a", 1);
+                first_result->store(static_cast<int>(first),
+                                    std::memory_order_release);
+                if (first ==
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                        SendResult::CLOSED) {
+                    return;
+                }
+
+                std::string body(4096, 'x');
+                stream_sender.ConfigureWatermarks(1);
+                auto second = stream_sender.SendData(body.data(), body.size());
+                second_result->store(static_cast<int>(second),
+                                     std::memory_order_release);
+                if (second ==
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                        SendResult::CLOSED) {
+                    return;
+                }
+                (void)stream_sender.End();
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/stream-control-offthread");
+            if (resp.error) {
+                pass = false;
+                err += "client error; ";
+            }
+            if (resp.rst) {
+                pass = false;
+                err += "unexpected RST_STREAM; ";
+            }
+            if (resp.status != 200) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) + "; ";
+            }
+            std::string expected_body = "a" + std::string(4096, 'x');
+            if (resp.body != expected_body) {
+                pass = false;
+                err += "body mismatch; ";
+            }
+        }
+        client.Disconnect();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        if (!worker_called->load(std::memory_order_acquire)) {
+            pass = false;
+            err += "worker thread did not call control methods; ";
+        }
+        auto expected_first = static_cast<int>(
+            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::
+                ACCEPTED_BELOW_WATER);
+        if (first_result->load(std::memory_order_acquire) != expected_first) {
+            pass = false;
+            err += "off-thread ConfigureWatermarks should be ignored; ";
+        }
+        auto expected_second = static_cast<int>(
+            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::
+                ACCEPTED_ABOVE_HIGH_WATER);
+        if (second_result->load(std::memory_order_acquire) != expected_second) {
+            pass = false;
+            err += "dispatcher ConfigureWatermarks did not drive above-water path; ";
+        }
+        if (drain_called->load(std::memory_order_acquire)) {
+            pass = false;
+            err += "off-thread SetDrainListener should be ignored; ";
+        }
+
+        TestFramework::RecordTest(
+            "H2 streaming: off-dispatcher control methods are rejected",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: off-dispatcher control methods are rejected",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression for PR #18 round-5 comment 2: H2 async handler that
 // calls complete() and then send_interim() inline on the dispatcher
 // thread (before returning from the handler body) must NOT land the
@@ -5022,6 +5146,65 @@ void TestH2_Push_ReloadTogglesEnablePush() {
     }
 }
 
+void TestH2_ReloadUpdatesLiveConnectionHeaderLimit() {
+    std::cout << "\n[TEST] H2 reload: live connections pick up new header limit..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.max_header_size = 4096;
+
+        HttpServer server(cfg);
+        server.Get("/", [](const HttpRequest&, HttpResponse& res) {
+            res.Status(200).Text("ok");
+        });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto before = client.Get("/");
+            if (before.error || before.rst || before.status != 200 ||
+                before.body != "ok") {
+                pass = false;
+                err += "pre-reload request failed; ";
+            }
+
+            ServerConfig reloaded = cfg;
+            reloaded.max_header_size = 256;
+            if (!server.Reload(reloaded)) {
+                pass = false;
+                err += "reload returned false; ";
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                auto after = client.Get(
+                    "/",
+                    {{"x-large", std::string(600, 'a')}});
+                bool handled = after.rst || after.error ||
+                               (after.status >= 400 && after.status < 600);
+                if (!handled) {
+                    pass = false;
+                    err += "existing connection kept stale header limit; ";
+                }
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 reload: live connections pick up new header limit",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 reload: live connections pick up new header limit",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Proxying a large Content-Length response over an H2 downstream connection
 // must exercise the streaming relay path without resetting the stream.
 void TestH2_ProxyStreamingLargeContentLength() {
@@ -5248,6 +5431,7 @@ void RunAllTests() {
     TestH2_StreamingSuppressesTrailerDeclarationUntilTrailersSupported();
     TestH2_StreamingBatchedWritesPastHighWaterStayAccepted();
     TestH2_StreamingEmptyEndInlineDoesNotResetStream();
+    TestH2_StreamingControlMethodsOffDispatcherThreadRejected();
     TestH2_ProxyStreamingLargeContentLength();
     TestH2_ProxyTransientHighWaterFlushDoesNotStall();
 
@@ -5274,6 +5458,7 @@ void RunAllTests() {
     TestH2_Push_DroppedAfterCompleteSameThread();
     TestH2_Push_ActiveH2StreamsBalanced();
     TestH2_Push_ReloadTogglesEnablePush();
+    TestH2_ReloadUpdatesLiveConnectionHeaderLimit();
 }
 
 }  // namespace Http2Tests
