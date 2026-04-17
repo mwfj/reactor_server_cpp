@@ -406,6 +406,175 @@ void TestCheckoutCapsAndCleanupRestoresIdleUpstreamTransportInputCap() {
     }
 }
 
+void TestRetryable5xxRetryReleasesLeaseBeforeBackoff() {
+    std::cout << "\n[TEST] ProxyTransaction internal: retryable 5xx releases lease before backoff..."
+              << std::endl;
+    try {
+        int fds[2] = {-1, -1};
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+            throw std::runtime_error("socketpair failed");
+        }
+
+        auto dispatcher = std::make_shared<Dispatcher>();
+        auto transport = std::shared_ptr<ConnectionHandler>(new ConnectionHandler(
+            dispatcher,
+            std::unique_ptr<SocketHandler>(
+                new SocketHandler(fds[0], "127.0.0.1", 8080))));
+        auto upstream_conn =
+            std::make_unique<UpstreamConnection>(transport, "127.0.0.1", 8080);
+
+        HttpRequest request;
+        request.method = "GET";
+        request.url = "/retry-5xx-release";
+        request.path = "/retry-5xx-release";
+        request.headers["host"] = "example.test";
+        request.client_fd = 42;
+
+        ProxyConfig proxy_config;
+        HeaderRewriter::Config rewriter_config;
+        HeaderRewriter header_rewriter(rewriter_config);
+        RetryPolicy::Config retry_config;
+        retry_config.max_retries = 1;
+        retry_config.retry_on_5xx = true;
+        retry_config.retry_on_connect_failure = false;
+        RetryPolicy retry_policy(retry_config);
+
+        auto tx = std::make_shared<ProxyTransaction>(
+            "svc",
+            request,
+            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender(),
+            [](HttpResponse) {},
+            nullptr,
+            proxy_config,
+            header_rewriter,
+            retry_policy,
+            false,
+            "127.0.0.1",
+            8080,
+            "",
+            "",
+            "");
+
+        tx->dispatcher_ = dispatcher.get();
+        tx->state_ = ProxyTransaction::State::RECEIVING_BODY;
+        tx->lease_ = UpstreamLease(upstream_conn.get(), nullptr, nullptr);
+        tx->poison_connection_ = true;
+        tx->response_headers_seen_ = true;
+        tx->response_head_.status_code = HttpStatus::SERVICE_UNAVAILABLE;
+        tx->response_head_.status_reason = "Service Unavailable";
+        tx->response_head_.framing =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH;
+        tx->response_head_.expected_length = 11;
+        tx->response_body_ = "backend-503";
+
+        tx->MaybeRetry(RetryPolicy::RetryCondition::RESPONSE_5XX);
+
+        bool pass = !tx->lease_ &&
+                    tx->attempt_ == 1 &&
+                    tx->pending_retryable_5xx_response_ &&
+                    tx->pending_retryable_5xx_body_ == "backend-503" &&
+                    !tx->holding_retryable_5xx_response_ &&
+                    upstream_conn->IsClosing();
+        std::string err;
+        if (tx->lease_) err += "lease should be released during backoff; ";
+        if (tx->attempt_ != 1) err += "attempt not incremented; ";
+        if (!tx->pending_retryable_5xx_response_) err += "stored 5xx missing; ";
+        if (tx->pending_retryable_5xx_body_ != "backend-503") {
+            err += "stored body mismatch; ";
+        }
+        if (tx->holding_retryable_5xx_response_) {
+            err += "transport should not remain held across backoff; ";
+        }
+        if (!upstream_conn->IsClosing()) {
+            err += "failed upstream connection should be poisoned; ";
+        }
+
+        tx->complete_cb_invoked_ = true;
+        tx->complete_cb_ = nullptr;
+        if (fds[1] >= 0) {
+            ::close(fds[1]);
+        }
+
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: retryable 5xx releases lease before backoff",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: retryable 5xx releases lease before backoff",
+            false, e.what());
+    }
+}
+
+void TestCheckoutLocalFailureRelaysStoredRetryable5xx() {
+    std::cout << "\n[TEST] ProxyTransaction internal: checkout local failure relays stored retryable 5xx..."
+              << std::endl;
+    try {
+        HttpRequest request;
+        request.method = "GET";
+        request.url = "/checkout-fallback";
+        request.path = "/checkout-fallback";
+        request.headers["host"] = "example.test";
+        request.client_fd = 42;
+
+        bool delivered = false;
+        int delivered_status = 0;
+        std::string delivered_body;
+        bool saw_upstream_header = false;
+        auto tx = MakeInternalProxyTransaction(
+            request,
+            [&delivered, &delivered_status, &delivered_body, &saw_upstream_header](
+                HttpResponse response) {
+                delivered = true;
+                delivered_status = response.GetStatusCode();
+                delivered_body = response.GetBody();
+                for (const auto& [key, value] : response.GetHeaders()) {
+                    if (key == "X-Upstream-Source" && value == "backend") {
+                        saw_upstream_header = true;
+                        break;
+                    }
+                }
+            });
+
+        tx->state_ = ProxyTransaction::State::CHECKOUT_PENDING;
+        tx->attempt_ = 1;
+        tx->pending_retryable_5xx_response_ = true;
+        tx->pending_retryable_5xx_head_.status_code = HttpStatus::SERVICE_UNAVAILABLE;
+        tx->pending_retryable_5xx_head_.status_reason = "Service Unavailable";
+        tx->pending_retryable_5xx_head_.framing =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH;
+        tx->pending_retryable_5xx_head_.expected_length = 11;
+        tx->pending_retryable_5xx_head_.headers.push_back(
+            {"X-Upstream-Source", "backend"});
+        tx->pending_retryable_5xx_body_ = "backend-503";
+
+        tx->OnCheckoutError(-1);
+
+        bool pass = delivered &&
+                    delivered_status == HttpStatus::SERVICE_UNAVAILABLE &&
+                    delivered_body == "backend-503" &&
+                    saw_upstream_header &&
+                    tx->state_ == ProxyTransaction::State::COMPLETE;
+        std::string err;
+        if (!delivered) err += "stored response not delivered; ";
+        if (delivered_status != HttpStatus::SERVICE_UNAVAILABLE) {
+            err += "status=" + std::to_string(delivered_status) + "; ";
+        }
+        if (delivered_body != "backend-503") err += "stored body not relayed; ";
+        if (!saw_upstream_header) err += "stored upstream headers missing; ";
+        if (tx->state_ != ProxyTransaction::State::COMPLETE) {
+            err += "state should be COMPLETE; ";
+        }
+
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: checkout local failure relays stored retryable 5xx",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: checkout local failure relays stored retryable 5xx",
+            false, e.what());
+    }
+}
+
 void TestStreamingCommitFailureAbortsSenderOnHeaders() {
     std::cout << "\n[TEST] ProxyTransaction internal: streaming header commit failure aborts sender..."
               << std::endl;
@@ -519,6 +688,8 @@ void RunAllTests() {
     TestEarlyResponseHeadersExitSendPhase();
     TestBufferedOverflowPoisonsConnection();
     TestCheckoutCapsAndCleanupRestoresIdleUpstreamTransportInputCap();
+    TestRetryable5xxRetryReleasesLeaseBeforeBackoff();
+    TestCheckoutLocalFailureRelaysStoredRetryable5xx();
     TestStreamingCommitFailureAbortsSenderOnHeaders();
     TestHeldRetryable5xxCommitFailureAbortsSender();
 }

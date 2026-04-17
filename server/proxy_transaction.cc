@@ -448,7 +448,6 @@ void ProxyTransaction::AttemptCheckout() {
         return;
     }
     ActivateAttemptTracking();
-    ClearPendingRetryable5xxResponse();
     EnsureCheckoutCancelToken();
     StartCheckoutAsync();
 }
@@ -481,6 +480,10 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
 
     auto* upstream_conn = lease_.Get();
     if (!upstream_conn) {
+        ReleaseBreakerAdmissionNeutral();
+        if (DeliverPendingRetryable5xxResponse("checkout_empty_lease")) {
+            return;
+        }
         OnError(RESULT_CHECKOUT_FAILED,
                 "Checkout returned empty lease");
         return;
@@ -488,6 +491,10 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
 
     auto transport = upstream_conn->GetTransport();
     if (!transport) {
+        ReleaseBreakerAdmissionNeutral();
+        if (DeliverPendingRetryable5xxResponse("checkout_missing_transport")) {
+            return;
+        }
         OnError(RESULT_CHECKOUT_FAILED,
                 "Upstream connection has no transport");
         return;
@@ -612,6 +619,9 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
         // Use RESULT_POOL_EXHAUSTED → 503 (not 502 which implies upstream failure).
         // Release the breaker slot neutrally — admission never reached upstream.
         ReportBreakerOutcome(RESULT_POOL_EXHAUSTED);
+        if (DeliverPendingRetryable5xxResponse("checkout_local_failure")) {
+            return;
+        }
         OnError(RESULT_POOL_EXHAUSTED,
                 "Pool checkout failed (local capacity, error=" +
                 std::to_string(error_code) + ")");
@@ -619,10 +629,12 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
 }
 
 void ProxyTransaction::SendUpstreamRequest() {
-    state_ = State::SENDING_REQUEST;
-
     auto* upstream_conn = lease_.Get();
     if (!upstream_conn) {
+        ReleaseBreakerAdmissionNeutral();
+        if (DeliverPendingRetryable5xxResponse("send_without_lease")) {
+            return;
+        }
         OnError(RESULT_SEND_FAILED, "Upstream connection lost before send");
         return;
     }
@@ -646,6 +658,15 @@ void ProxyTransaction::SendUpstreamRequest() {
         MaybeRetry(RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT);
         return;
     }
+
+    // The replacement attempt is now live: we have a checked-out transport and
+    // are about to put bytes on the wire. From this point onward, local
+    // checkout/backoff failures can no longer occur, so the saved retryable 5xx
+    // fallback is no longer needed.
+    ClearPendingRetryable5xxResponse();
+    holding_retryable_5xx_response_ = false;
+    held_retryable_5xx_saw_eof_ = false;
+    state_ = State::SENDING_REQUEST;
 
     logging::Get()->debug("ProxyTransaction sending request client_fd={} "
                           "service={} upstream_fd={} bytes={}",
@@ -1090,19 +1111,19 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                              client_fd_, service_name_, attempt_,
                              static_cast<int>(condition));
 
-        // Release the completed attempt's accounting immediately so
-        // any backoff wait does not keep it counted as active retry or
-        // in-flight traffic. For retryable 5xx responses we keep the
-        // original upstream connection paused until the next retry
-        // actually clears local gates; that lets a later local reject
-        // resume the original response instead of replaying only an
-        // early-body snapshot.
+        // Release the completed attempt immediately so backoff does not pin a
+        // checked-out upstream lease or keep retry/in-flight accounting active
+        // for work that is merely waiting to retry. For retryable 5xx
+        // responses we retain a replayable snapshot of the original upstream
+        // error until the replacement attempt is actually live.
         if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX) {
-            ReleaseAttemptAccounting();
+            holding_retryable_5xx_response_ = false;
+            held_retryable_5xx_saw_eof_ = false;
         } else {
-            Cleanup();
-            ResetForRetryAttempt();
+            ClearPendingRetryable5xxResponse();
         }
+        Cleanup();
+        ResetForRetryAttempt();
 
         // Condition-dependent first-retry policy:
         // Connection-level failures (stale keep-alive, connect refused)
@@ -1177,7 +1198,8 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                 "service={} attempt={} condition={}",
                 client_fd_, service_name_, attempt_,
                 static_cast<int>(condition));
-            if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX) {
+            if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX &&
+                holding_retryable_5xx_response_) {
                 BeginRetryAttemptFromHeld5xx();
             } else {
                 AttemptCheckout();
@@ -1552,7 +1574,6 @@ void ProxyTransaction::BeginRetryAttemptFromHeld5xx() {
         return;
     }
 
-    ClearPendingRetryable5xxResponse();
     holding_retryable_5xx_response_ = false;
     held_retryable_5xx_saw_eof_ = false;
     ReleaseHeldRetryable5xxTransport();
