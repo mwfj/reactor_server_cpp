@@ -2596,9 +2596,8 @@ void TestIntegrationPartialResponseFailureTripsCircuitBreaker() {
         int gw_port = gw_runner.GetPort();
 
         std::string first = TestHttpClient::HttpGet(
-            gw_port, "/partial-breaker", 5000);
-        (void)first;
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            gw_port, "/partial-breaker", 10000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         std::string second = TestHttpClient::HttpGet(
             gw_port, "/partial-breaker", 5000);
         std::string second_lower = second;
@@ -2608,6 +2607,14 @@ void TestIntegrationPartialResponseFailureTripsCircuitBreaker() {
 
         bool pass = true;
         std::string err;
+        if (!TestHttpClient::HasStatus(first, 502)) {
+            pass = false;
+            auto status_end = first.find("\r\n");
+            std::string status_line =
+                status_end == std::string::npos ? first : first.substr(0, status_end);
+            err += "first response should be 502 for the truncated upstream body (got '" +
+                   status_line + "'); ";
+        }
         if (!TestHttpClient::HasStatus(second, 503)) {
             pass = false;
             auto status_end = second.find("\r\n");

@@ -1922,6 +1922,158 @@ namespace HttpTests {
         }
     }
 
+    void TestH1_StreamingAbortOffDispatcherThreadRejected() {
+        std::cout << "\n[TEST] H1 streaming: off-dispatcher Abort is rejected..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            auto worker_called = std::make_shared<std::atomic<bool>>(false);
+            server.GetAsync(
+                "/stream-abort-offthread",
+                [worker_called](const HttpRequest&,
+                                HttpRouter::InterimResponseSender /*send_interim*/,
+                                HttpRouter::ResourcePusher /*push_resource*/,
+                                HttpRouter::StreamingResponseSender stream_sender,
+                                HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    std::thread t([stream_sender, worker_called]() mutable {
+                        worker_called->store(true, std::memory_order_release);
+                        stream_sender.Abort(
+                            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                                AbortReason::UPSTREAM_ERROR);
+                    });
+                    t.join();
+
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Content-Length", "2")
+                        .PreserveContentLength();
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    if (stream_sender.SendData("ok", 2) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End();
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendHttpRequest(
+                port,
+                "GET /stream-abort-offthread HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n");
+
+            bool pass = true;
+            std::string err;
+            if (!TestHttpClient::HasStatus(resp, 200)) {
+                pass = false; err += "missing 200 response; ";
+            }
+            if (TestHttpClient::ExtractBody(resp) != "ok") {
+                pass = false; err += "body mismatch; ";
+            }
+            if (!worker_called->load(std::memory_order_acquire)) {
+                pass = false; err += "worker thread did not call Abort; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: off-dispatcher Abort is rejected",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: off-dispatcher Abort is rejected",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingRawContentLengthWithoutPreserveUsesChunkedFraming() {
+        std::cout << "\n[TEST] H1 streaming: raw Content-Length without preserve uses chunked framing..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-natural-cl",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Content-Length", "10");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    if (stream_sender.SendData("hello", 5) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    if (stream_sender.SendData("world", 5) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End();
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-natural-cl HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            size_t first_header_end = resp.find("\r\n\r\n");
+            if (first_header_end == std::string::npos) {
+                pass = false; err += "first response headers missing; ";
+            } else {
+                std::string first_header = resp.substr(0, first_header_end);
+                std::string lower_first = first_header;
+                std::transform(lower_first.begin(), lower_first.end(),
+                               lower_first.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                if (lower_first.find("http/1.1 200 ok") == std::string::npos) {
+                    pass = false; err += "first response status missing; ";
+                }
+                if (lower_first.find("transfer-encoding: chunked") ==
+                    std::string::npos) {
+                    pass = false; err += "first response not chunked; ";
+                }
+                if (lower_first.find("content-length:") != std::string::npos) {
+                    pass = false; err += "unexpected content-length in streamed head; ";
+                }
+            }
+
+            std::string lower_resp = resp;
+            std::transform(lower_resp.begin(), lower_resp.end(), lower_resp.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower_resp.find("5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n") ==
+                std::string::npos) {
+                pass = false;
+                err += "chunked body or terminator missing; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: raw Content-Length without preserve uses chunked framing",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: raw Content-Length without preserve uses chunked framing",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // T8: Worker-thread interleave — a handler that calls complete() from
     // a worker thread followed by send_interim() from the same worker
     // must not be able to queue a 103 AFTER the 200 on the wire.
@@ -2252,6 +2404,8 @@ namespace HttpTests {
         TestH1_Streaming205CanonicalizesContentLength();
         TestH1_StreamingDeduplicatesContentLength();
         TestH1_StreamingHttp10UnknownLengthOmitsContentLength();
+        TestH1_StreamingAbortOffDispatcherThreadRejected();
+        TestH1_StreamingRawContentLengthWithoutPreserveUsesChunkedFraming();
         TestH1_EarlyHints_WorkerThreadOrderingSafe();
         TestH1_EarlyHints_PipelinedKeepAliveNoStale();
         TestH1_Async_HandlerThrowFiresCancelSlot();

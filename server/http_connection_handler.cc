@@ -117,6 +117,17 @@ std::optional<std::string> MergeAllowedTrailerDeclarations(
     return merged;
 }
 
+std::optional<std::string> ComputeEffectiveStreamingContentLength(
+    const HttpResponse& response) {
+    const int status_code = response.GetStatusCode();
+    if (response.IsContentLengthPreserved() ||
+        status_code == HttpStatus::RESET_CONTENT ||
+        status_code == HttpStatus::NOT_MODIFIED) {
+        return response.ComputeWireContentLength(status_code);
+    }
+    return std::nullopt;
+}
+
 std::string SerializeStreamingHead(const HttpResponse& response,
                                    int http_minor,
                                    bool use_chunked) {
@@ -124,13 +135,9 @@ std::string SerializeStreamingHead(const HttpResponse& response,
     // Streaming headers are emitted before the final body length is known. Only
     // preserve an explicit known length (or status-defined wire values like
     // 205/304); never auto-compute from the empty headers-only body.
-    std::optional<std::string> effective_cl;
-    if (!use_chunked &&
-        (response.IsContentLengthPreserved() ||
-         response.GetStatusCode() == HttpStatus::RESET_CONTENT ||
-         response.GetStatusCode() == HttpStatus::NOT_MODIFIED)) {
-        effective_cl = response.ComputeWireContentLength(response.GetStatusCode());
-    }
+    std::optional<std::string> effective_cl =
+        use_chunked ? std::nullopt
+                    : ComputeEffectiveStreamingContentLength(response);
     auto merged_trailer = MergeAllowedTrailerDeclarations(response.GetHeaders());
 
     oss << "HTTP/1." << http_minor << " " << response.GetStatusCode()
@@ -346,6 +353,15 @@ public:
     }
 
     void Abort(AbortReason reason) override {
+        if (!conn_ || conn_->IsClosing()) {
+            return;
+        }
+        if (!conn_->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H1 streaming Abort called off dispatcher fd={}",
+                conn_->fd());
+            return;
+        }
         AbortInternal(false, reason);
     }
 
@@ -534,11 +550,10 @@ HttpConnectionHandler::CreateStreamingResponseSender(
         bool should_close = self->NormalizeOutgoingResponse(
             response, effective_keep_alive, http_minor);
 
-        const bool has_content_length =
-            FirstHeaderValueCI(response.GetHeaders(), "content-length")
-                .has_value();
+        const bool has_effective_content_length =
+            ComputeEffectiveStreamingContentLength(response).has_value();
         bool use_chunked = false;
-        if (!body_suppressed && !has_content_length) {
+        if (!body_suppressed && !has_effective_content_length) {
             if (http_minor >= 1) {
                 use_chunked = true;
             } else {

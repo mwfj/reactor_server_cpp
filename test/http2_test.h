@@ -4404,6 +4404,84 @@ void TestH2_StreamingUnknownLengthOmitsContentLength() {
     }
 }
 
+void TestH2_StreamingAbortOffDispatcherThreadRejected() {
+    std::cout << "\n[TEST] H2 streaming: off-dispatcher Abort is rejected..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        auto worker_called = std::make_shared<std::atomic<bool>>(false);
+        server.GetAsync(
+            "/stream-abort-offthread",
+            [worker_called](const HttpRequest&,
+                            HttpRouter::InterimResponseSender /*send_interim*/,
+                            HttpRouter::ResourcePusher /*push_resource*/,
+                            HttpRouter::StreamingResponseSender stream_sender,
+                            HttpRouter::AsyncCompletionCallback /*complete*/) {
+                std::thread t([stream_sender, worker_called]() mutable {
+                    worker_called->store(true, std::memory_order_release);
+                    stream_sender.Abort(
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            AbortReason::UPSTREAM_ERROR);
+                });
+                t.join();
+
+                HttpResponse head;
+                head.Status(200).Header("Content-Type", "text/plain");
+                if (stream_sender.SendHeaders(head) < 0) {
+                    return;
+                }
+                if (stream_sender.SendData("ok", 2) ==
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                        SendResult::CLOSED) {
+                    return;
+                }
+                (void)stream_sender.End();
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/stream-abort-offthread");
+            if (resp.error) {
+                pass = false;
+                err += "client error; ";
+            }
+            if (resp.rst) {
+                pass = false;
+                err += "unexpected RST_STREAM; ";
+            }
+            if (resp.status != 200) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) + "; ";
+            }
+            if (resp.body != "ok") {
+                pass = false;
+                err += "body mismatch; ";
+            }
+        }
+        client.Disconnect();
+        if (!worker_called->load(std::memory_order_acquire)) {
+            pass = false;
+            err += "worker thread did not call Abort; ";
+        }
+
+        TestFramework::RecordTest(
+            "H2 streaming: off-dispatcher Abort is rejected",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: off-dispatcher Abort is rejected",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestH2_StreamingSuppressesTrailerDeclarationUntilTrailersSupported() {
     std::cout << "\n[TEST] H2 streaming: Trailer declaration suppressed until trailing HEADERS are supported..."
               << std::endl;
@@ -5166,6 +5244,7 @@ void RunAllTests() {
     TestH2_StreamingNoBodyEndDoesNotResetStream();
     TestH2_StreamingBodylessSendDataDropsAndFinalizes();
     TestH2_StreamingUnknownLengthOmitsContentLength();
+    TestH2_StreamingAbortOffDispatcherThreadRejected();
     TestH2_StreamingSuppressesTrailerDeclarationUntilTrailersSupported();
     TestH2_StreamingBatchedWritesPastHighWaterStayAccepted();
     TestH2_StreamingEmptyEndInlineDoesNotResetStream();

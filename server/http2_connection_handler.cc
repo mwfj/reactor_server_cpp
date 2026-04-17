@@ -348,6 +348,18 @@ public:
     }
 
     void Abort(AbortReason reason) override {
+        auto self = handler_.lock();
+        auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
+        auto conn = self ? self->GetConnection() : nullptr;
+        if (!self || !session || !conn || conn->IsClosing()) {
+            return;
+        }
+        if (!conn->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H2 streaming Abort called off dispatcher stream={}",
+                stream_id_);
+            return;
+        }
         AbortInternal(false, reason);
     }
 
