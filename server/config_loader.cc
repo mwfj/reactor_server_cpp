@@ -98,8 +98,48 @@ static int ParseStrictInt(const nlohmann::json& j, const std::string& key,
 //     receives a forged identity.
 //
 // Match is case-insensitive. Caller passes already-lowercased name.
+// RFC 7230 §3.2.6 field-name validator (the `token` production).
+//
+// HTTP header names are a strict subset of printable ASCII — the "tchar"
+// rule excludes whitespace, control chars, slashes, parens, angle
+// brackets, colons, at-signs, commas, quote chars, curly braces, and more.
+// HttpRequestSerializer writes the configured name verbatim into the
+// upstream request, so if we accept a malformed name here (e.g. "X Bad"
+// with a space, or "X/Bad" with a slash) every forwarded request becomes
+// malformed HTTP as soon as auth enforcement lands — a deployment-
+// stopping bug masquerading as a config typo.
+//
+// Valid tchar: A-Z, a-z, 0-9, and the punctuation set
+//   ! # $ % & ' * + - . ^ _ ` | ~
+// Everything else (including `:`, which is separately caught by the
+// pseudo-header reserved-name check, and space / slash / paren / etc.)
+// is rejected at config load.
+static bool IsValidHttpFieldName(const std::string& name) {
+    if (name.empty()) return false;
+    for (char c : name) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        // DIGIT / ALPHA
+        if ((uc >= '0' && uc <= '9') ||
+            (uc >= 'A' && uc <= 'Z') ||
+            (uc >= 'a' && uc <= 'z')) continue;
+        // tchar punctuation (RFC 7230 §3.2.6 exact list)
+        switch (uc) {
+            case '!': case '#': case '$': case '%': case '&':
+            case '\'': case '*': case '+': case '-': case '.':
+            case '^': case '_': case '`': case '|': case '~':
+                continue;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
 static bool IsReservedAuthForwardHeader(const std::string& lower) {
     if (!lower.empty() && lower[0] == ':') return true;  // HTTP/2 pseudo
+    // Validates RFC 7230 §3.2.6 token rules — applied separately and earlier
+    // in the add_header lambda (on the ORIGINAL case-preserved name). See
+    // IsValidHttpFieldName for details.
     static const std::unordered_set<std::string> kReserved = {
         // Hop-by-hop per RFC 7230 §6.1
         "connection", "keep-alive", "proxy-authenticate",
@@ -1673,30 +1713,49 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                         "HS*/none/PS*/auto are deferred per design spec §15)");
                 }
             }
-            // Referenced upstream must exist (for outbound IdP calls).
+            // Referenced upstream is mandatory. An issuer without a bound
+            // UpstreamHostPool has no way to talk to the IdP in Phase 2 —
+            // JWKS refresh, OIDC discovery, and RFC 7662 introspection all
+            // route through UpstreamManager. Reject at config load so the
+            // misconfig surfaces here instead of at first request.
             //
-            // Reload-safe: HttpServer::Reload calls ConfigLoader::Validate on
-            // a copy whose upstreams[] has been deliberately stripped (see
-            // server/http_server.cc:3601 — `validation_copy.upstreams.clear()`)
-            // because upstream topology is restart-only and the reload path
-            // intentionally re-validates only the live-reloadable bits. If we
-            // ran the cross-reference check unconditionally, ANY hot reload
-            // of a config that has populated auth.issuers — even an
-            // entirely auth-unrelated reload (e.g. a rate-limit edit) —
-            // would fail with "unknown issuer upstream" because the source
-            // map is empty. That would block the forward-compatible auth
-            // schema the final enforcement-not-yet-wired gate intentionally
-            // permits.
+            // This is a STRUCTURAL check (is the field set at all?) and so
+            // fires unconditionally — independent of the cross-reference
+            // check below.
+            if (ic.upstream.empty()) {
+                throw std::invalid_argument(
+                    ctx + ".upstream is required — each issuer must bind "
+                    "to an existing UpstreamHostPool so JWKS / discovery / "
+                    "introspection traffic has a configured outbound path "
+                    "(declare the IdP as an entry in `upstreams[]`, then "
+                    "set `auth.issuers." + name + ".upstream` to its name)");
+            }
+
+            // Cross-reference check: does the named upstream actually
+            // exist in this config?
+            //
+            // Reload-safe: HttpServer::Reload calls ConfigLoader::Validate
+            // on a copy whose upstreams[] has been deliberately stripped
+            // (see server/http_server.cc:3601 —
+            // `validation_copy.upstreams.clear()`) because upstream topology
+            // is restart-only and the reload path intentionally re-validates
+            // only the live-reloadable bits. If we ran the cross-reference
+            // check unconditionally, ANY hot reload of a config that has
+            // populated auth.issuers — even an entirely auth-unrelated
+            // reload (e.g. a rate-limit edit) — would fail with "unknown
+            // issuer upstream" because the source map is empty. That would
+            // block the forward-compatible auth schema the final
+            // enforcement-not-yet-wired gate intentionally permits.
             //
             // Skip the cross-ref when upstream_names is empty (i.e. we're
             // running in a stripped reload context). The startup path
             // always passes the full upstreams list, so the typo-catching
-            // value of this check is preserved there. When upstreams is
-            // truly empty at startup (a no-proxies gateway), the issuer's
-            // upstream reference is unverifiable here anyway — Phase 2's
-            // AuthManager::Start will surface it at first IdP outbound
-            // attempt, which is acceptable for that uncommon case.
-            if (!ic.upstream.empty() && !upstream_names.empty() &&
+            // value of this check is preserved there. (Note: the structural
+            // "upstream must be non-empty" check above still fires on
+            // reload paths — that catches configs that were outright
+            // missing the field; only the existence cross-check is
+            // context-sensitive.)
+            if (!upstream_names.empty() &&
                 upstream_names.count(ic.upstream) == 0) {
                 throw std::invalid_argument(
                     ctx + ".upstream references unknown upstream '" +
@@ -1934,6 +1993,55 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                     "non-empty proxy.route_prefix to derive applies_to");
             }
 
+            // route_prefix must be a LITERAL byte prefix when inline auth
+            // is populated. auth::FindPolicyForPath does literal-prefix
+            // matching (design spec §3.2) — it has no understanding of the
+            // route_trie's :param / *splat syntax. A proxy with
+            // `/api/:version/users/*path` routes real requests like
+            // `/api/v1/users/123` via the trie just fine, but the AUTH
+            // overlay would try to match the literal string
+            // `/api/:version/users/*path` as a prefix of `/api/v1/...` and
+            // never succeed. That would silently leave the proxy
+            // unprotected as soon as enforcement lands.
+            //
+            // Reject patterned route_prefixes here and point operators at
+            // the alternative: top-level auth.policies[] with applies_to
+            // listing the literal prefix(es) the pattern expands through.
+            // Reuse ParsePattern so the pattern-detection rules stay
+            // consistent with how the route_trie itself interprets them.
+            if (inline_auth_populated && !u.proxy.route_prefix.empty()) {
+                std::vector<ROUTE_TRIE::Segment> segs;
+                try {
+                    segs = ROUTE_TRIE::ParsePattern(u.proxy.route_prefix);
+                } catch (const std::exception& e) {
+                    // ParsePattern may throw on malformed input. The
+                    // proxy-routes pass already validates pattern syntax,
+                    // so by the time we get here the string should parse.
+                    // If it doesn't, surface it with auth context so the
+                    // operator knows the auth check was the one that tripped.
+                    throw std::invalid_argument(
+                        ctx + ": route_prefix '" + u.proxy.route_prefix +
+                        "' failed to parse as a route pattern: " + e.what());
+                }
+                for (const auto& s : segs) {
+                    if (s.type != ROUTE_TRIE::NodeType::STATIC) {
+                        throw std::invalid_argument(
+                            ctx + ": inline auth requires a LITERAL prefix "
+                            "in proxy.route_prefix (got '" +
+                            u.proxy.route_prefix + "' which contains a " +
+                            (s.type == ROUTE_TRIE::NodeType::PARAM
+                                ? "':" + s.param_name + "' param"
+                                : "'*" + s.param_name + "' catch-all") +
+                            " segment). The auth matcher does byte-prefix "
+                            "matching only (design spec §3.2). If you need "
+                            "to protect a patterned route, use top-level "
+                            "auth.policies[] with applies_to listing the "
+                            "literal prefix(es) the pattern expands through "
+                            "(e.g. ['/api/']).");
+                    }
+                }
+            }
+
             // ---- Collision detection: ENABLED-only ----
             //
             // Per spec §3.2, only enabled inline policies participate in
@@ -2006,6 +2114,21 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             auto add_header = [&output_headers](const std::string& name,
                                                 const std::string& which) {
                 if (name.empty()) return;
+                // Validate the ORIGINAL case-preserved name against RFC
+                // 7230 §3.2.6 tchar. An invalid name would pass through
+                // HttpRequestSerializer verbatim and produce malformed
+                // HTTP on every forwarded request. Check first — a
+                // malformed name CAN'T meaningfully be reserved or
+                // non-reserved, so field-name validity is more
+                // fundamental than the reserved/duplicate checks below.
+                if (!IsValidHttpFieldName(name)) {
+                    throw std::invalid_argument(
+                        "auth.forward." + which + " '" + name +
+                        "' contains characters not valid in an HTTP field "
+                        "name (RFC 7230 §3.2.6 `token`: A-Z a-z 0-9 and "
+                        "!#$%&'*+-.^_`|~). Spaces, slashes, colons, and "
+                        "other punctuation are forbidden.");
+                }
                 std::string lower;
                 lower.reserve(name.size());
                 for (char c : name) {

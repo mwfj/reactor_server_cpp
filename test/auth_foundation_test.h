@@ -1202,8 +1202,21 @@ void TestConfigLoaderRejectsReservedForwardHeaders() {
                    "' but accepted";
         } catch (const std::invalid_argument& e) {
             std::string msg = e.what();
-            if (msg.find("reserved") == std::string::npos) {
-                return "threw but message lacked 'reserved'; got: " + msg;
+            // Accept EITHER rejection path:
+            //   - "reserved" — the name is syntactically valid tchar but
+            //     in the reserved list (Connection, Host, etc.)
+            //   - "not valid in an HTTP field name" — the name contains
+            //     non-tchar characters (e.g. ':path' has a colon)
+            // Both are valid reasons to reject; pseudo-headers like :path
+            // are syntactically invalid AND reserved. The tchar check now
+            // fires first for pseudo-headers — either message is fine for
+            // this test as long as the offending name appears.
+            bool has_rejection_phrase =
+                msg.find("reserved") != std::string::npos ||
+                msg.find("not valid in an HTTP field name") != std::string::npos;
+            if (!has_rejection_phrase) {
+                return "threw but message lacked both 'reserved' and "
+                       "'not valid in an HTTP field name'; got: " + msg;
             }
             if (msg.find(bad_header_name) == std::string::npos) {
                 return "threw but message lacked offending name '" +
@@ -1222,6 +1235,10 @@ void TestConfigLoaderRejectsReservedForwardHeaders() {
         if (!err.empty()) throw std::runtime_error("Connection: " + err);
 
         // Case 2: HTTP/2 pseudo-header in raw_jwt_header.
+        // Note: `:path` fails the tchar check first (colon isn't a valid
+        // tchar char) — the reserved check is secondary. Either rejection
+        // path is accepted by the helper above; the test still pins the
+        // "pseudo-headers cannot appear in auth.forward outputs" intent.
         err = validate_expect_reserved(
             R"("raw_jwt_header": ":path")", ":path");
         if (!err.empty()) throw std::runtime_error(":path: " + err);
@@ -2123,6 +2140,352 @@ void TestConfigLoaderValidatesIntrospectionKnobs() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — inline auth rejects patterned route_prefix
+// (review P1). auth::FindPolicyForPath does byte-prefix matching; a proxy
+// with /api/:v/users/*path cannot be matched via the auth overlay because
+// the literal string never appears in real request paths. Reject at load.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderRejectsPatternedInlineAuthPrefix() {
+    std::cout << "\n[TEST] ConfigLoader rejects patterned route_prefix in inline auth..." << std::endl;
+    auto validate_expect_failure = [](const std::string& json,
+                                       const std::string& expected_phrase)
+        -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(cfg);
+            return "expected throw containing '" + expected_phrase +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
+                return "threw but message missing '" + expected_phrase +
+                       "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    auto make_json = [](const std::string& route_prefix) -> std::string {
+        return R"({
+            "upstreams": [
+                {"name":"x","host":"127.0.0.1","port":80},
+                {
+                    "name": "api",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "proxy": {
+                        "route_prefix": ")" + route_prefix + R"(",
+                        "auth": {
+                            "enabled": false,
+                            "issuers": ["google"]
+                        }
+                    }
+                }
+            ],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })";
+    };
+
+    try {
+        // Case 1: :param segment.
+        std::string err = validate_expect_failure(
+            make_json("/api/:version/users"), "LITERAL prefix");
+        if (!err.empty()) throw std::runtime_error(":version case: " + err);
+
+        // Case 2: *splat segment.
+        err = validate_expect_failure(
+            make_json("/api/*rest"), "LITERAL prefix");
+        if (!err.empty()) throw std::runtime_error("*rest case: " + err);
+
+        // Case 3: mixed — both :param and *splat.
+        err = validate_expect_failure(
+            make_json("/api/:version/users/*path"), "LITERAL prefix");
+        if (!err.empty()) throw std::runtime_error("mixed case: " + err);
+
+        // POSITIVE: pure literal prefix accepted.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(
+                make_json("/api/v1/"));
+            ConfigLoader::Validate(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("pure literal prefix should be ACCEPTED but ")
+                + "rejected: " + e.what());
+        }
+
+        // POSITIVE: proxy with :param prefix but NO auth block at all —
+        // should still be accepted (route_trie handles the pattern; auth
+        // overlay isn't involved).
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [
+                    {
+                        "name": "api",
+                        "host": "127.0.0.1",
+                        "port": 8080,
+                        "proxy": {"route_prefix": "/api/:v/users"}
+                    }
+                ]
+            })");
+            ConfigLoader::Validate(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("patterned route WITHOUT inline auth should be ")
+                + "ACCEPTED (auth overlay not involved) but rejected: " + e.what());
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects patterned route_prefix in inline auth",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects patterned route_prefix in inline auth",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — issuer.upstream is structurally required
+// (review P2 #1). Separate the "field present" check (fires always) from
+// the "cross-ref to existing upstream" check (reload-safe-skipped when
+// upstreams is empty).
+// -----------------------------------------------------------------------------
+void TestConfigLoaderRequiresIssuerUpstream() {
+    std::cout << "\n[TEST] ConfigLoader requires issuer.upstream..." << std::endl;
+    auto validate_expect_failure = [](const std::string& json,
+                                       const std::string& expected_phrase)
+        -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(cfg);
+            return "expected throw containing '" + expected_phrase +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
+                return "threw but message missing '" + expected_phrase +
+                       "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // Case 1: issuer omits `upstream` entirely — rejected as structural
+        // requirement (fires even on reload-path with empty upstreams).
+        std::string err = validate_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })", "upstream is required");
+        if (!err.empty()) throw std::runtime_error("missing upstream: " + err);
+
+        // Case 2: structural check fires on reload-path shape (empty
+        // upstreams) too. Before the split, a config with upstream=""
+        // and empty upstreams[] would silently accept because both
+        // branches of the combined check were short-circuited.
+        err = validate_expect_failure(R"({
+            "upstreams": [],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })", "upstream is required");
+        if (!err.empty()) throw std::runtime_error("empty-upstreams reload shape: " + err);
+
+        // Case 3: regression — upstream set but pointing at unknown name,
+        // with full startup upstreams list, STILL rejected by the
+        // cross-ref check.
+        err = validate_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "nonexistent",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })", "references unknown upstream");
+        if (!err.empty()) throw std::runtime_error("unknown upstream at startup: " + err);
+
+        // Case 4: regression — reload-safe path still skips cross-ref
+        // when upstreams is empty (avoids blocking unrelated hot reloads).
+        // Upstream IS set here; upstreams list is empty. Per the
+        // reload-safety contract, this is accepted (the structural check
+        // passed because upstream is non-empty; the cross-ref is skipped).
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [],
+                "auth": {
+                    "enabled": false,
+                    "issuers": {
+                        "ours": {
+                            "issuer_url": "https://issuer.example",
+                            "upstream": "somewhere",
+                            "mode": "jwt",
+                            "algorithms": ["RS256"]
+                        }
+                    }
+                }
+            })");
+            ConfigLoader::Validate(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("reload-shape (empty upstreams, upstream set) ")
+                + "should pass cross-ref check but threw: " + e.what());
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader requires issuer.upstream",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader requires issuer.upstream",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — header names must be RFC 7230 §3.2.6 tchar
+// (review P2 #2). Space, slash, paren, and other non-tchar characters
+// would produce malformed HTTP on the forwarded request.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderValidatesHeaderNameTchar() {
+    std::cout << "\n[TEST] ConfigLoader validates header-name tchar..." << std::endl;
+    auto validate_expect_tchar_reject = [](const std::string& field_fragment,
+                                            const std::string& offending_name)
+        -> std::string {
+        std::string json = R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                },
+                "forward": {)" + field_fragment + R"(}
+            }
+        })";
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(cfg);
+            return "expected tchar rejection for '" + offending_name +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find("not valid in an HTTP field name") == std::string::npos) {
+                return "threw but message lacked 'not valid in an HTTP "
+                       "field name'; got: " + msg;
+            }
+            if (msg.find(offending_name) == std::string::npos) {
+                return "threw but message lacked offending name '" +
+                       offending_name + "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // Case 1: space in subject_header — most common real-world typo.
+        std::string err = validate_expect_tchar_reject(
+            R"("subject_header": "X Bad")", "X Bad");
+        if (!err.empty()) throw std::runtime_error("space: " + err);
+
+        // Case 2: slash (common mistake from URL paths).
+        err = validate_expect_tchar_reject(
+            R"("raw_jwt_header": "X/Bad")", "X/Bad");
+        if (!err.empty()) throw std::runtime_error("slash: " + err);
+
+        // Case 3: paren (commonly copied from function names in config).
+        // Use a non-default raw-string delimiter `raw(...)raw` because the
+        // default `(...)` terminates at the first `)"` — which appears
+        // inside the literal header name `"X(Bad)"`.
+        err = validate_expect_tchar_reject(
+            R"raw("claims_to_headers": {"sub": "X(Bad)"})raw", "X(Bad)");
+        if (!err.empty()) throw std::runtime_error("paren: " + err);
+
+        // Case 4: at-sign.
+        err = validate_expect_tchar_reject(
+            R"("issuer_header": "X@Bad")", "X@Bad");
+        if (!err.empty()) throw std::runtime_error("at-sign: " + err);
+
+        // POSITIVE: valid tchar punctuation should be accepted.
+        // RFC 7230 allows !#$%&'*+-.^_`|~ in tchar.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+                "auth": {
+                    "enabled": false,
+                    "issuers": {
+                        "ours": {
+                            "issuer_url": "https://issuer.example",
+                            "upstream": "x",
+                            "mode": "jwt",
+                            "algorithms": ["RS256"]
+                        }
+                    },
+                    "forward": {
+                        "subject_header": "X-Auth-Subject",
+                        "claims_to_headers": {"email": "X-User.Email_v1"}
+                    }
+                }
+            })");
+            ConfigLoader::Validate(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("valid tchar names should be ACCEPTED but ")
+                + "rejected: " + e.what());
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader validates header-name tchar",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader validates header-name tchar",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -2147,6 +2510,9 @@ inline void RunAllTests() {
     TestConfigLoaderRejectsProxyConnectionInAuthForward();
     TestConfigLoaderRejectsEnabledPolicyWithoutAppliesTo();
     TestConfigLoaderValidatesIntrospectionKnobs();
+    TestConfigLoaderRejectsPatternedInlineAuthPrefix();
+    TestConfigLoaderRequiresIssuerUpstream();
+    TestConfigLoaderValidatesHeaderNameTchar();
     TestConfigLoaderClaimHeaderCollision();
 }
 
