@@ -1897,6 +1897,232 @@ void TestConfigLoaderRejectsProxyConnectionInAuthForward() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — enabled top-level policy must declare applies_to
+// (review P2 #1). A policy with enabled=true and no prefixes never matches
+// any path; the operator's intended-protected routes silently stay open.
+// Disabled policies allowed to be empty (mid-construction state during
+// rollout — same logic that lets us skip them in collision detection).
+// -----------------------------------------------------------------------------
+void TestConfigLoaderRejectsEnabledPolicyWithoutAppliesTo() {
+    std::cout << "\n[TEST] ConfigLoader rejects enabled policy without applies_to..." << std::endl;
+    try {
+        // Case 1: enabled + empty applies_to → reject.
+        const std::string bad = R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                },
+                "policies": [
+                    {"name":"dead", "enabled":true, "issuers":["google"]}
+                ]
+            }
+        })";
+        bool threw = false;
+        std::string err_msg;
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(bad);
+            ConfigLoader::Validate(cfg);
+        } catch (const std::invalid_argument& e) {
+            threw = true;
+            err_msg = e.what();
+        }
+        bool good_msg = threw &&
+            err_msg.find("applies_to") != std::string::npos &&
+            err_msg.find("never match") != std::string::npos;
+
+        // Case 2: disabled + empty applies_to → ACCEPT (mid-construction).
+        const std::string ok_disabled = R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                },
+                "policies": [
+                    {"name":"staged", "enabled":false, "issuers":["google"]}
+                ]
+            }
+        })";
+        bool disabled_passed = true;
+        try {
+            ServerConfig cfg2 = ConfigLoader::LoadFromString(ok_disabled);
+            ConfigLoader::Validate(cfg2);
+        } catch (const std::exception& e) {
+            disabled_passed = false;
+            err_msg = std::string("disabled+empty rejected when it shouldn't: ") + e.what();
+        }
+
+        bool pass = threw && good_msg && disabled_passed;
+        std::string err;
+        if (!threw) {
+            err = "expected enabled+empty applies_to to reject, but accepted";
+        } else if (!good_msg) {
+            err = "rejected but message missing 'applies_to' / 'never match'; got: " + err_msg;
+        } else if (!disabled_passed) {
+            err = err_msg;
+        }
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects enabled policy without applies_to",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects enabled policy without applies_to",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — introspection knobs (review P2 #2). auth_style
+// must be "basic"|"body"; timeout/cache/max_entries/shards must be > 0;
+// negative_cache_sec / stale_grace_sec must be >= 0 (0 disables feature).
+// -----------------------------------------------------------------------------
+void TestConfigLoaderValidatesIntrospectionKnobs() {
+    std::cout << "\n[TEST] ConfigLoader validates introspection knobs..." << std::endl;
+    auto introspection_with = [](const std::string& fields) -> std::string {
+        return R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://issuer.example/introspect")"
+            + fields + R"(
+                        }
+                    }
+                }
+            }
+        })";
+    };
+    auto validate_expect_failure = [&](const std::string& json,
+                                        const std::string& expected_phrase)
+        -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(cfg);
+            return "expected throw containing '" + expected_phrase +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
+                return "threw but message missing '" + expected_phrase +
+                       "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // 1. auth_style="weird" rejected.
+        std::string err = validate_expect_failure(
+            introspection_with(R"(, "auth_style": "weird")"),
+            "auth_style must be");
+        if (!err.empty()) throw std::runtime_error("auth_style: " + err);
+
+        // 2. timeout_sec=-1 rejected.
+        err = validate_expect_failure(
+            introspection_with(R"(, "timeout_sec": -1)"),
+            "timeout_sec must be > 0");
+        if (!err.empty()) throw std::runtime_error("timeout_sec=-1: " + err);
+
+        // 3. timeout_sec=0 also rejected (strict positive).
+        err = validate_expect_failure(
+            introspection_with(R"(, "timeout_sec": 0)"),
+            "timeout_sec must be > 0");
+        if (!err.empty()) throw std::runtime_error("timeout_sec=0: " + err);
+
+        // 4. cache_sec=0 rejected.
+        err = validate_expect_failure(
+            introspection_with(R"(, "cache_sec": 0)"),
+            "cache_sec must be > 0");
+        if (!err.empty()) throw std::runtime_error("cache_sec=0: " + err);
+
+        // 5. shards=0 rejected.
+        err = validate_expect_failure(
+            introspection_with(R"(, "shards": 0)"),
+            "shards must be > 0");
+        if (!err.empty()) throw std::runtime_error("shards=0: " + err);
+
+        // 6. max_entries=0 rejected.
+        err = validate_expect_failure(
+            introspection_with(R"(, "max_entries": 0)"),
+            "max_entries must be > 0");
+        if (!err.empty()) throw std::runtime_error("max_entries=0: " + err);
+
+        // 7. negative_cache_sec=-1 rejected.
+        err = validate_expect_failure(
+            introspection_with(R"(, "negative_cache_sec": -1)"),
+            "negative_cache_sec must be >= 0");
+        if (!err.empty()) throw std::runtime_error("negative_cache_sec=-1: " + err);
+
+        // 8. stale_grace_sec=-5 rejected.
+        err = validate_expect_failure(
+            introspection_with(R"(, "stale_grace_sec": -5)"),
+            "stale_grace_sec must be >= 0");
+        if (!err.empty()) throw std::runtime_error("stale_grace_sec=-5: " + err);
+
+        // 9. POSITIVE: negative_cache_sec=0 accepted (means "disable
+        // negative caching" — meaningful 0 semantics, not an error).
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(
+                introspection_with(R"(, "negative_cache_sec": 0)"));
+            ConfigLoader::Validate(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("negative_cache_sec=0 should be ACCEPTED ")
+                + "(disables feature) but rejected: " + e.what());
+        }
+
+        // 10. POSITIVE: stale_grace_sec=0 accepted (disable stale serving).
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(
+                introspection_with(R"(, "stale_grace_sec": 0)"));
+            ConfigLoader::Validate(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("stale_grace_sec=0 should be ACCEPTED ")
+                + "but rejected: " + e.what());
+        }
+
+        // 11. POSITIVE: auth_style="body" accepted.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(
+                introspection_with(R"(, "auth_style": "body")"));
+            ConfigLoader::Validate(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("auth_style=body should be ACCEPTED but ")
+                + "rejected: " + e.what());
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader validates introspection knobs",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader validates introspection knobs",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -1919,6 +2145,8 @@ inline void RunAllTests() {
     TestConfigLoaderDisabledTopLevelPoliciesDoNotCollide();
     TestConfigLoaderRejectsInlineAuthAppliesTo();
     TestConfigLoaderRejectsProxyConnectionInAuthForward();
+    TestConfigLoaderRejectsEnabledPolicyWithoutAppliesTo();
+    TestConfigLoaderValidatesIntrospectionKnobs();
     TestConfigLoaderClaimHeaderCollision();
 }
 

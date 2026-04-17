@@ -1733,6 +1733,55 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                         ctx + ".introspection.endpoint is required for "
                         "mode=\"introspection\"");
                 }
+                // auth_style — RFC 7662 doesn't standardize the credential
+                // delivery channel; we support two: "basic" (Authorization
+                // header) and "body" (urlencoded form). Anything else
+                // would silently choose one at request time, which is
+                // worse than a load-time reject.
+                const auto& is = ic.introspection;
+                if (is.auth_style != "basic" && is.auth_style != "body") {
+                    throw std::invalid_argument(
+                        ctx + ".introspection.auth_style must be \"basic\" "
+                        "or \"body\" (got \"" + is.auth_style + "\")");
+                }
+                // Numeric ranges. Strict-positive for fields where 0 makes
+                // no sense (a 0-second timeout cannot complete an HTTP
+                // request; a 0-entry cache is a contradiction; a 0-shard
+                // map cannot be indexed). Non-negative for fields where 0
+                // means "feature off" — negative caching and stale-grace
+                // both have meaningful 0-disables-feature semantics.
+                if (is.timeout_sec <= 0) {
+                    throw std::invalid_argument(
+                        ctx + ".introspection.timeout_sec must be > 0 (got " +
+                        std::to_string(is.timeout_sec) + ")");
+                }
+                if (is.cache_sec <= 0) {
+                    throw std::invalid_argument(
+                        ctx + ".introspection.cache_sec must be > 0 (got " +
+                        std::to_string(is.cache_sec) + ")");
+                }
+                if (is.negative_cache_sec < 0) {
+                    throw std::invalid_argument(
+                        ctx + ".introspection.negative_cache_sec must be >= 0 "
+                        "(0 = disable negative caching) (got " +
+                        std::to_string(is.negative_cache_sec) + ")");
+                }
+                if (is.stale_grace_sec < 0) {
+                    throw std::invalid_argument(
+                        ctx + ".introspection.stale_grace_sec must be >= 0 "
+                        "(0 = disable stale serving) (got " +
+                        std::to_string(is.stale_grace_sec) + ")");
+                }
+                if (is.max_entries <= 0) {
+                    throw std::invalid_argument(
+                        ctx + ".introspection.max_entries must be > 0 (got " +
+                        std::to_string(is.max_entries) + ")");
+                }
+                if (is.shards <= 0) {
+                    throw std::invalid_argument(
+                        ctx + ".introspection.shards must be > 0 (got " +
+                        std::to_string(is.shards) + ")");
+                }
             }
 
             // TLS-mandatory on actual outbound IdP endpoints, not just on
@@ -1801,6 +1850,20 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                         ctx + ".issuers references unknown issuer '" +
                         issuer_name + "'");
                 }
+            }
+            // applies_to is the prefix list that drives runtime matching;
+            // an enabled policy without it never matches any path → silent
+            // dead policy → routes the operator INTENDED to protect are
+            // left wide open at runtime. Reject loudly. Disabled policies
+            // are allowed to have empty applies_to (mid-construction state
+            // during the rollout — operator may be filling fields in
+            // increments before flipping enabled).
+            if (p.enabled && p.applies_to.empty()) {
+                throw std::invalid_argument(
+                    ctx + " is enabled but has no applies_to prefixes — "
+                    "the policy would never match any path. Add at least "
+                    "one prefix to applies_to, or set enabled=false until "
+                    "the prefix list is ready.");
             }
         }
 
