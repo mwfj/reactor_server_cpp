@@ -105,6 +105,12 @@ static bool IsReservedAuthForwardHeader(const std::string& lower) {
         "connection", "keep-alive", "proxy-authenticate",
         "proxy-authorization", "te", "trailer", "transfer-encoding",
         "upgrade",
+        // Non-standard hop-by-hop legacy header that
+        // HeaderRewriter::IsHopByHopHeader() also strips. Forwarding
+        // identity through `proxy-connection` would be silently dropped
+        // at outbound time, so reject at config load with a clear error
+        // instead of a confusing empty-header symptom later.
+        "proxy-connection",
         // Framing-critical (corrupting these is a smuggling/parser-confusion
         // vector against the upstream)
         "host", "content-length", "content-type", "content-encoding",
@@ -135,8 +141,18 @@ static nlohmann::json SerializeAuthPolicy(const auth::AuthPolicy& p) {
 // `upstreams[i].proxy.auth` and for top-level `auth.policies[]` entries.
 // `context` is embedded in error messages so operators can locate the
 // offending block.
+//
+// `allow_applies_to` controls whether the `applies_to` field is permitted
+// in this JSON. Top-level policies set it to true (applies_to is the
+// REQUIRED prefix declaration). Inline proxy.auth blocks set it to false:
+// per design spec §3.2 / §5.2, the prefix for an inline policy is
+// derived from `proxy.route_prefix` at AuthManager::RegisterPolicy time,
+// and an inline `applies_to` would be silently ignored — the JSON would
+// then describe a different protected path than what the runtime uses,
+// which is a config-correctness bug. Reject loudly at parse time.
 static void ParseAuthPolicy(const nlohmann::json& j, auth::AuthPolicy& out,
-                            const std::string& context) {
+                            const std::string& context,
+                            bool allow_applies_to = true) {
     if (!j.is_object()) {
         throw std::invalid_argument(context + " must be a JSON object");
     }
@@ -151,6 +167,20 @@ static void ParseAuthPolicy(const nlohmann::json& j, auth::AuthPolicy& out,
     out.name = j.value("name", std::string{});
     out.enabled = j.value("enabled", false);
     if (j.contains("applies_to")) {
+        // Inline-policy guard: applies_to is meaningless inside an inline
+        // proxy.auth block (the prefix comes from proxy.route_prefix).
+        // Accepting it would let the JSON describe one protected path
+        // while the runtime applies a different one — a misleading
+        // round-trip and a likely operator-confusion vector. Reject and
+        // tell the operator where the prefix actually comes from.
+        if (!allow_applies_to) {
+            throw std::invalid_argument(
+                context + ".applies_to is not permitted on inline auth "
+                "(the prefix is derived from the surrounding proxy's "
+                "route_prefix, see design spec §3.2 / §5.2). Remove "
+                "applies_to here, or move this policy to top-level "
+                "auth.policies[] if it needs an explicit prefix list.");
+        }
         if (!j["applies_to"].is_array()) {
             throw std::invalid_argument(
                 context + ".applies_to must be an array of strings");
@@ -612,12 +642,17 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 // Inline per-proxy auth policy. `applies_to` is derived from
                 // `route_prefix` at AuthManager::RegisterPolicy time — the
                 // inline stanza never declares its own `applies_to`. See
-                // design spec §3.2 / §5.2.
+                // design spec §3.2 / §5.2. Pass `allow_applies_to=false`
+                // so the parser rejects misleading inline applies_to
+                // declarations at parse time, before they can mislead an
+                // operator into thinking that field governs runtime
+                // matching.
                 if (proxy.contains("auth")) {
                     ParseAuthPolicy(
                         proxy["auth"],
                         upstream.proxy.auth,
-                        "upstreams[" + upstream.name + "].proxy.auth");
+                        "upstreams[" + upstream.name + "].proxy.auth",
+                        /*allow_applies_to=*/false);
                 }
             }
 
@@ -1866,8 +1901,21 @@ void ConfigLoader::Validate(const ServerConfig& config) {
         // was designed to enforce — ConfigLoader::Validate is the correct
         // place to call it because collisions must be a load-time error,
         // not a silent runtime first-wins.
+        //
+        // SYMMETRY with inline policies: only ENABLED top-level policies
+        // participate in the runtime longest-prefix matcher (per spec §3.2),
+        // so only they should drive collision detection. We already skip
+        // disabled inline proxy.auth above — applying the same rule to
+        // top-level keeps the two paths consistent and lets operators
+        // pre-stage disabled top-level policies during the rollout
+        // without spurious collision errors. (Without this, an operator
+        // who staged two top-level policies with identical applies_to
+        // — both disabled, intentionally inert — would see Validate
+        // reject the config even though the runtime would never match
+        // either of them.)
         for (size_t i = 0; i < config.auth.policies.size(); ++i) {
             const auto& p = config.auth.policies[i];
+            if (!p.enabled) continue;  // Symmetry with inline path
             const std::string policy_owner =
                 p.name.empty()
                     ? ("auth.policies[" + std::to_string(i) + "]")

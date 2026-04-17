@@ -1600,6 +1600,303 @@ void TestConfigLoaderRoundTripsAuthOnlyProxy() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — disabled top-level policies skip collision
+// detection, matching the inline-policy treatment (review P2 #1).
+// Operators staging policies during the rollout get a usable config; the
+// runtime matcher already ignores disabled entries so collision is moot.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderDisabledTopLevelPoliciesDoNotCollide() {
+    std::cout << "\n[TEST] ConfigLoader skips disabled top-level policies in collision check..." << std::endl;
+    try {
+        // Two top-level policies with IDENTICAL applies_to but BOTH
+        // disabled. Pre-fix: rejected with "exact-prefix collision".
+        // Post-fix: accepted (neither participates in runtime matching).
+        const std::string both_disabled = R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                },
+                "policies": [
+                    {"name":"a", "enabled":false, "applies_to":["/api/"], "issuers":["google"]},
+                    {"name":"b", "enabled":false, "applies_to":["/api/"], "issuers":["google"]}
+                ]
+            }
+        })";
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(both_disabled);
+            ConfigLoader::Validate(cfg);
+            // Expected: no throw.
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                "two disabled policies sharing a prefix should be ACCEPTED "
+                "(neither participates in runtime matching) but Validate "
+                "threw: " + std::string(e.what()));
+        }
+
+        // Regression: ENABLED policies with same prefix must STILL reject.
+        // Confirms the relaxation is scoped to disabled entries only.
+        const std::string both_enabled = R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                },
+                "policies": [
+                    {"name":"a", "enabled":true, "applies_to":["/api/"], "issuers":["google"]},
+                    {"name":"b", "enabled":true, "applies_to":["/api/"], "issuers":["google"]}
+                ]
+            }
+        })";
+        bool enabled_threw = false;
+        std::string enabled_err;
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(both_enabled);
+            ConfigLoader::Validate(cfg);
+        } catch (const std::invalid_argument& e) {
+            enabled_threw = true;
+            enabled_err = e.what();
+        }
+        bool enabled_collision_msg = enabled_threw &&
+            enabled_err.find("declared by both") != std::string::npos;
+
+        // Mixed: one enabled, one disabled with same prefix. Should NOT
+        // collide because the disabled one doesn't enter the registry.
+        const std::string mixed = R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                },
+                "policies": [
+                    {"name":"a", "enabled":true,  "applies_to":["/api/"], "issuers":["google"]},
+                    {"name":"b", "enabled":false, "applies_to":["/api/"], "issuers":["google"]}
+                ]
+            }
+        })";
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(mixed);
+            ConfigLoader::Validate(cfg);
+            // Expected: no throw.
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                "mixed enabled/disabled at same prefix should be ACCEPTED "
+                "but Validate threw: " + std::string(e.what()));
+        }
+
+        bool pass = enabled_collision_msg;
+        std::string err;
+        if (!enabled_threw) {
+            err = "two ENABLED policies sharing a prefix should still "
+                  "reject (regression check failed)";
+        } else if (!enabled_collision_msg) {
+            err = "enabled-collision threw but with wrong message; expected "
+                  "'declared by both', got: " + enabled_err;
+        }
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader skips disabled top-level policies in collision",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader skips disabled top-level policies in collision",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — inline proxy.auth must reject applies_to
+// (review P2 #2). The prefix is derived from proxy.route_prefix; an inline
+// applies_to is silently ignored at runtime, so a JSON with both would
+// describe a different protected path than what's actually enforced.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderRejectsInlineAuthAppliesTo() {
+    std::cout << "\n[TEST] ConfigLoader rejects applies_to inside inline proxy.auth..." << std::endl;
+    try {
+        const std::string bad = R"({
+            "upstreams": [
+                {"name":"x","host":"127.0.0.1","port":80},
+                {
+                    "name": "internal-api",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "proxy": {
+                        "route_prefix": "/api/",
+                        "auth": {
+                            "enabled": false,
+                            "applies_to": ["/admin/"],
+                            "issuers": ["google"]
+                        }
+                    }
+                }
+            ],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })";
+        bool threw = false;
+        std::string err_msg;
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(bad);
+            ConfigLoader::Validate(cfg);
+        } catch (const std::invalid_argument& e) {
+            threw = true;
+            err_msg = e.what();
+        }
+        // Message should mention applies_to and route_prefix so operators
+        // know the prefix actually comes from the surrounding proxy.
+        bool good_msg = threw &&
+            err_msg.find("applies_to") != std::string::npos &&
+            err_msg.find("route_prefix") != std::string::npos;
+        bool pass = threw && good_msg;
+        std::string err;
+        if (!threw) {
+            err = "expected inline applies_to to be rejected at parse time "
+                  "but config was accepted";
+        } else if (!good_msg) {
+            err = "threw but message lacked one of {'applies_to', "
+                  "'route_prefix'}; got: " + err_msg;
+        }
+
+        // Regression: TOP-LEVEL applies_to must STILL be accepted (only
+        // inline rejects it). Confirms the parser parameter is wired
+        // correctly per call site.
+        try {
+            const std::string ok = R"({
+                "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+                "auth": {
+                    "enabled": false,
+                    "issuers": {
+                        "google": {
+                            "issuer_url": "https://issuer.example",
+                            "upstream": "x",
+                            "mode": "jwt",
+                            "algorithms": ["RS256"]
+                        }
+                    },
+                    "policies": [
+                        {"name":"p", "enabled":false, "applies_to":["/admin/"], "issuers":["google"]}
+                    ]
+                }
+            })";
+            ServerConfig c2 = ConfigLoader::LoadFromString(ok);
+            ConfigLoader::Validate(c2);
+        } catch (const std::exception& e) {
+            err = "regression: top-level applies_to should still be accepted "
+                  "but threw: " + std::string(e.what());
+            pass = false;
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects applies_to in inline proxy.auth",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects applies_to in inline proxy.auth",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — Proxy-Connection is reserved (review P3).
+// HeaderRewriter::IsHopByHopHeader strips Proxy-Connection at outbound
+// time (server/header_rewriter.cc:18); auth.forward must reject it at
+// config load to avoid the silently-dropped-identity-header symptom.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderRejectsProxyConnectionInAuthForward() {
+    std::cout << "\n[TEST] ConfigLoader rejects Proxy-Connection in auth.forward..." << std::endl;
+    auto validate_expect_reserved = [](const std::string& bad_header_field,
+                                        const std::string& bad_name)
+        -> std::string {
+        std::string json = R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                },
+                "forward": {)" + bad_header_field + R"(}
+            }
+        })";
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(cfg);
+            return "expected reserved-name rejection for '" + bad_name +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find("reserved") == std::string::npos ||
+                msg.find(bad_name) == std::string::npos) {
+                return "threw but message missing 'reserved' or offending "
+                       "name '" + bad_name + "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // Test all three fixed-slot positions.
+        std::string err = validate_expect_reserved(
+            R"("subject_header": "Proxy-Connection")", "Proxy-Connection");
+        if (!err.empty()) throw std::runtime_error("subject_header: " + err);
+
+        err = validate_expect_reserved(
+            R"("raw_jwt_header": "Proxy-Connection")", "Proxy-Connection");
+        if (!err.empty()) throw std::runtime_error("raw_jwt_header: " + err);
+
+        err = validate_expect_reserved(
+            R"("claims_to_headers": {"sub": "Proxy-Connection"})",
+            "Proxy-Connection");
+        if (!err.empty()) throw std::runtime_error("claims_to_headers: " + err);
+
+        // Case-insensitive: lowercase variant rejected too.
+        err = validate_expect_reserved(
+            R"("subject_header": "proxy-connection")", "proxy-connection");
+        if (!err.empty()) throw std::runtime_error("lowercase: " + err);
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects Proxy-Connection in auth.forward",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects Proxy-Connection in auth.forward",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -1619,6 +1916,9 @@ inline void RunAllTests() {
     TestPopulateFromPayloadClearsStaleFields();
     TestConfigLoaderValidatesDisabledInlineAuth();
     TestConfigLoaderRoundTripsAuthOnlyProxy();
+    TestConfigLoaderDisabledTopLevelPoliciesDoNotCollide();
+    TestConfigLoaderRejectsInlineAuthAppliesTo();
+    TestConfigLoaderRejectsProxyConnectionInAuthForward();
     TestConfigLoaderClaimHeaderCollision();
 }
 
