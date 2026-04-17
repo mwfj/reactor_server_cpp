@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <unordered_set>
+#include <limits>
 
 using json = nlohmann::json;
 
@@ -27,6 +28,15 @@ using json = nlohmann::json;
 // This helper rejects non-integer JSON at parse time. `is_number_integer()`
 // is the right gate: it returns true for both signed and unsigned integers
 // and false for booleans, floats, null, strings, arrays, and objects.
+//
+// Range hardening (review round): `is_number_integer()` returns true for
+// ANY integer that fits in nlohmann/json's internal int64/uint64
+// representation, including ones that DON'T fit in `int`. Without an
+// explicit range check, `v.get<int>()` would wrap or truncate values like
+// 4294967297 — letting an operator's intended-large `leeway_sec` quietly
+// validate as a small wrapped value. We read as int64/uint64 first,
+// range-check against [INT_MIN, INT_MAX], and throw on overflow so
+// out-of-range never reaches the caller.
 static int ParseStrictInt(const nlohmann::json& j, const std::string& key,
                           int default_value, const std::string& context) {
     if (!j.contains(key)) return default_value;
@@ -37,7 +47,71 @@ static int ParseStrictInt(const nlohmann::json& j, const std::string& key,
             context + "." + key + " must be an integer "
             "(got " + std::string(v.type_name()) + ")");
     }
-    return v.get<int>();
+    // Unsigned values that overflow uint64-to-int64 must be caught with
+    // is_number_unsigned() FIRST — get<int64_t>() on a too-large unsigned
+    // value would itself wrap before our range check could catch it.
+    if (v.is_number_unsigned()) {
+        uint64_t u = v.get<uint64_t>();
+        if (u > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+            throw std::invalid_argument(
+                context + "." + key + " value " + std::to_string(u) +
+                " is out of int range (max " +
+                std::to_string(std::numeric_limits<int>::max()) + ")");
+        }
+        return static_cast<int>(u);
+    }
+    int64_t s = v.get<int64_t>();
+    if (s < std::numeric_limits<int>::min() ||
+        s > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument(
+            context + "." + key + " value " + std::to_string(s) +
+            " is out of int range [" +
+            std::to_string(std::numeric_limits<int>::min()) + ", " +
+            std::to_string(std::numeric_limits<int>::max()) + "]");
+    }
+    return static_cast<int>(s);
+}
+
+// Header-name allow-list helper for auth.forward.
+//
+// auth.forward injects HTTP request headers into the forwarded upstream
+// request via HeaderRewriter (Phase 2 wiring). If an operator misconfigures
+// the output names to reserved categories, the resulting request would be
+// either malformed, ambiguous, or spoofable:
+//
+//   - HTTP/2 pseudo-headers (`:method`, `:path`, `:scheme`, `:authority`,
+//     `:status`): nghttp2 rejects these as regular headers; injecting them
+//     would either fail the request or be silently dropped depending on
+//     the encoder.
+//   - Hop-by-hop headers (RFC 7230 §6.1: Connection, Keep-Alive,
+//     Proxy-Authenticate, Proxy-Authorization, TE, Trailer,
+//     Transfer-Encoding, Upgrade): these are local to a single hop and
+//     MUST NOT be forwarded; injecting them via auth would fight the
+//     existing HeaderRewriter hop-by-hop strip.
+//   - Framing-critical headers (Host, Content-Length, Content-Type,
+//     Content-Encoding): a client-controlled claim could rewrite Host
+//     (request smuggling vector against backends that trust it for
+//     virtual-hosting), Content-Length (HTTP request smuggling), or
+//     content typing (JSON/XML parser confusion).
+//   - Authorization: would conflict with `preserve_authorization` —
+//     either both write and one wins unpredictably, or the upstream
+//     receives a forged identity.
+//
+// Match is case-insensitive. Caller passes already-lowercased name.
+static bool IsReservedAuthForwardHeader(const std::string& lower) {
+    if (!lower.empty() && lower[0] == ':') return true;  // HTTP/2 pseudo
+    static const std::unordered_set<std::string> kReserved = {
+        // Hop-by-hop per RFC 7230 §6.1
+        "connection", "keep-alive", "proxy-authenticate",
+        "proxy-authorization", "te", "trailer", "transfer-encoding",
+        "upgrade",
+        // Framing-critical (corrupting these is a smuggling/parser-confusion
+        // vector against the upstream)
+        "host", "content-length", "content-type", "content-encoding",
+        // Conflicts with preserve_authorization
+        "authorization",
+    };
+    return kReserved.count(lower) > 0;
 }
 
 // Serialize a single AuthPolicy to JSON (mirror of ParseAuthPolicy for
@@ -1565,7 +1639,30 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                 }
             }
             // Referenced upstream must exist (for outbound IdP calls).
-            if (!ic.upstream.empty() && upstream_names.count(ic.upstream) == 0) {
+            //
+            // Reload-safe: HttpServer::Reload calls ConfigLoader::Validate on
+            // a copy whose upstreams[] has been deliberately stripped (see
+            // server/http_server.cc:3601 — `validation_copy.upstreams.clear()`)
+            // because upstream topology is restart-only and the reload path
+            // intentionally re-validates only the live-reloadable bits. If we
+            // ran the cross-reference check unconditionally, ANY hot reload
+            // of a config that has populated auth.issuers — even an
+            // entirely auth-unrelated reload (e.g. a rate-limit edit) —
+            // would fail with "unknown issuer upstream" because the source
+            // map is empty. That would block the forward-compatible auth
+            // schema the final enforcement-not-yet-wired gate intentionally
+            // permits.
+            //
+            // Skip the cross-ref when upstream_names is empty (i.e. we're
+            // running in a stripped reload context). The startup path
+            // always passes the full upstreams list, so the typo-catching
+            // value of this check is preserved there. When upstreams is
+            // truly empty at startup (a no-proxies gateway), the issuer's
+            // upstream reference is unverifiable here anyway — Phase 2's
+            // AuthManager::Start will surface it at first IdP outbound
+            // attempt, which is acceptable for that uncommon case.
+            if (!ic.upstream.empty() && !upstream_names.empty() &&
+                upstream_names.count(ic.upstream) == 0) {
                 throw std::invalid_argument(
                     ctx + ".upstream references unknown upstream '" +
                     ic.upstream + "' — define it under `upstreams[]` first");
@@ -1765,6 +1862,19 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                 for (char c : name) {
                     lower.push_back(static_cast<char>(
                         std::tolower(static_cast<unsigned char>(c))));
+                }
+                // Reserved-name check FIRST (security): hop-by-hop / pseudo /
+                // framing-critical / Authorization names would corrupt or
+                // spoof the forwarded request. See IsReservedAuthForwardHeader
+                // for the full categorization. Reject before the duplicate
+                // check so the operator sees the more-actionable error.
+                if (IsReservedAuthForwardHeader(lower)) {
+                    throw std::invalid_argument(
+                        "auth.forward." + which + " '" + name +
+                        "' is a reserved/hop-by-hop/pseudo/framing header "
+                        "name and must not be used as an auth-forward output "
+                        "(would corrupt or spoof the upstream request); pick "
+                        "an X-prefixed name like 'X-Auth-Subject' instead");
                 }
                 if (!output_headers.insert(lower).second) {
                     throw std::invalid_argument(

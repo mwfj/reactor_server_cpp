@@ -987,6 +987,275 @@ void TestPopulateFromPayloadOptionalIssSub() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — issuer.upstream cross-reference is reload-safe
+// (review P2 #1). HttpServer::Reload() validates a copy with upstreams[]
+// stripped (server/http_server.cc:3601) so the topology-restart-only path
+// can be re-validated for live-reloadable bits without dragging restart
+// constraints. Before this fix, the issuer.upstream check would fire on
+// the empty upstream_names set and reject ANY reload of a config that has
+// auth.issuers populated — even an entirely auth-unrelated reload like a
+// rate-limit edit. This test pins the relaxation: with upstreams empty,
+// the cross-reference check is skipped (typo-catching value preserved at
+// startup where upstreams is always full).
+// -----------------------------------------------------------------------------
+void TestConfigLoaderUpstreamCrossRefReloadSafe() {
+    std::cout << "\n[TEST] ConfigLoader issuer.upstream cross-ref is reload-safe..." << std::endl;
+    try {
+        // Simulate the reload-validation context: full auth schema, but
+        // upstreams[] cleared (mimics HttpServer::Reload's validation_copy).
+        const std::string reload_shape = R"({
+            "bind_host": "127.0.0.1",
+            "bind_port": 8080,
+            "upstreams": [],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://accounts.google.com",
+                        "upstream": "idp_google",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })";
+
+        bool threw = false;
+        std::string err_msg;
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(reload_shape);
+            ConfigLoader::Validate(cfg);
+        } catch (const std::exception& e) {
+            threw = true;
+            err_msg = e.what();
+        }
+
+        // Regression check: at STARTUP (full upstreams, no idp_google), the
+        // check should still fire. This confirms we relaxed only the
+        // empty-upstreams branch, not the entire check.
+        const std::string startup_shape = R"({
+            "bind_host": "127.0.0.1",
+            "bind_port": 8080,
+            "upstreams": [{"name":"some_other_upstream","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://accounts.google.com",
+                        "upstream": "idp_google",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })";
+        bool startup_threw = false;
+        std::string startup_err;
+        try {
+            ServerConfig cfg2 = ConfigLoader::LoadFromString(startup_shape);
+            ConfigLoader::Validate(cfg2);
+        } catch (const std::exception& e) {
+            startup_threw = true;
+            startup_err = e.what();
+        }
+
+        bool reload_pass = !threw;
+        bool startup_pass = startup_threw &&
+            startup_err.find("references unknown upstream") != std::string::npos;
+
+        bool pass = reload_pass && startup_pass;
+        std::string err;
+        if (!reload_pass) {
+            err = "reload-shape (empty upstreams) should NOT throw on "
+                  "issuer.upstream cross-ref but did: " + err_msg;
+        } else if (!startup_pass) {
+            err = startup_threw
+                ? "startup-shape threw but with wrong error (expected "
+                  "'references unknown upstream'); got: " + startup_err
+                : "startup-shape (full upstreams, missing idp_google) "
+                  "should still reject the cross-ref but accepted";
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader issuer.upstream check is reload-safe",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader issuer.upstream check is reload-safe",
+            false, std::string("unexpected harness error: ") + e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ParseStrictInt — out-of-int-range JSON integers must throw, not wrap
+// (review P2 #2). is_number_integer() returns true for any integer that
+// fits in nlohmann's internal int64/uint64 representation. v.get<int>()
+// then wraps/truncates oversized values — a 4294967297 leeway_sec would
+// silently become a small wrapped value. Pin both the unsigned-too-big
+// path (UINT_MAX > INT_MAX) and the signed-out-of-range path (negative
+// large or near-INT64 boundary).
+// -----------------------------------------------------------------------------
+void TestConfigLoaderRejectsOutOfRangeIntegers() {
+    std::cout << "\n[TEST] ConfigLoader rejects out-of-range integers..." << std::endl;
+    auto validate_expect_failure = [](const std::string& json,
+                                       const std::string& expected_phrase)
+        -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(cfg);
+            return "expected throw containing '" + expected_phrase +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
+                return "threw with wrong message; expected '" +
+                       expected_phrase + "', got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // Case 1: leeway_sec exceeding INT_MAX (2^32 + 1 = 4294967297).
+        std::string err = validate_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"],
+                        "leeway_sec": 4294967297
+                    }
+                }
+            }
+        })", "out of int range");
+        if (!err.empty()) throw std::runtime_error("oversized leeway_sec: " + err);
+
+        // Case 2: introspection.timeout_sec exceeding INT_MAX.
+        err = validate_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://issuer.example/introspect",
+                            "timeout_sec": 9999999999
+                        }
+                    }
+                }
+            }
+        })", "out of int range");
+        if (!err.empty()) throw std::runtime_error("oversized timeout_sec: " + err);
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects out-of-range integers",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects out-of-range integers",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — auth.forward header names must not be reserved
+// (review P2 #3). Hop-by-hop, HTTP/2 pseudo, framing-critical, and
+// Authorization names would corrupt or spoof the upstream request. Test
+// all four categories on different config positions (subject_header,
+// raw_jwt_header, claims_to_headers value).
+// -----------------------------------------------------------------------------
+void TestConfigLoaderRejectsReservedForwardHeaders() {
+    std::cout << "\n[TEST] ConfigLoader rejects reserved auth.forward header names..." << std::endl;
+    auto validate_expect_reserved = [](const std::string& bad_header_field,
+                                        const std::string& bad_header_name)
+        -> std::string {
+        std::string json = R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                },
+                "forward": {)" + bad_header_field + R"(}
+            }
+        })";
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(cfg);
+            return "expected reserved-name rejection for '" + bad_header_name +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find("reserved") == std::string::npos) {
+                return "threw but message lacked 'reserved'; got: " + msg;
+            }
+            if (msg.find(bad_header_name) == std::string::npos) {
+                return "threw but message lacked offending name '" +
+                       bad_header_name + "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // Case 1: hop-by-hop in subject_header.
+        std::string err = validate_expect_reserved(
+            R"("subject_header": "Connection")", "Connection");
+        if (!err.empty()) throw std::runtime_error("Connection: " + err);
+
+        // Case 2: HTTP/2 pseudo-header in raw_jwt_header.
+        err = validate_expect_reserved(
+            R"("raw_jwt_header": ":path")", ":path");
+        if (!err.empty()) throw std::runtime_error(":path: " + err);
+
+        // Case 3: framing-critical Host in claims_to_headers value.
+        err = validate_expect_reserved(
+            R"("claims_to_headers": {"sub": "Host"})", "Host");
+        if (!err.empty()) throw std::runtime_error("Host: " + err);
+
+        // Case 4: Content-Length (smuggling vector) in claims_to_headers.
+        err = validate_expect_reserved(
+            R"("claims_to_headers": {"sub": "Content-Length"})", "Content-Length");
+        if (!err.empty()) throw std::runtime_error("Content-Length: " + err);
+
+        // Case 5: Authorization (conflicts with preserve_authorization).
+        err = validate_expect_reserved(
+            R"("issuer_header": "Authorization")", "Authorization");
+        if (!err.empty()) throw std::runtime_error("Authorization: " + err);
+
+        // Case 6: case-insensitive — "connection" lowercase rejected too.
+        err = validate_expect_reserved(
+            R"("subject_header": "connection")", "connection");
+        if (!err.empty()) throw std::runtime_error("connection (lowercase): " + err);
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects reserved auth.forward headers",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects reserved auth.forward headers",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -1000,6 +1269,9 @@ inline void RunAllTests() {
     TestConfigLoaderRejectsProxyAuthEnabled();
     TestConfigLoaderRejectsPlaintextIdpEndpoints();
     TestPopulateFromPayloadOptionalIssSub();
+    TestConfigLoaderUpstreamCrossRefReloadSafe();
+    TestConfigLoaderRejectsOutOfRangeIntegers();
+    TestConfigLoaderRejectsReservedForwardHeaders();
     TestConfigLoaderClaimHeaderCollision();
 }
 
