@@ -4551,6 +4551,84 @@ void TestH2_StreamingSuppressesTrailerDeclarationUntilTrailersSupported() {
     }
 }
 
+void TestH2_StreamingStripsPseudoHeadersFromResponse() {
+    std::cout << "\n[TEST] H2 streaming: pseudo-headers stripped from response submit..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync(
+            "/stream-pseudo-header-strip",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher /*push_resource*/,
+               HttpRouter::StreamingResponseSender stream_sender,
+               HttpRouter::AsyncCompletionCallback /*complete*/) {
+                HttpResponse head;
+                head.Status(200)
+                    .Header("Content-Type", "text/plain")
+                    .Header(":path", "/should-not-appear")
+                    .Header(":bogus", "1")
+                    .Header("X-Ok", "yes");
+                if (stream_sender.SendHeaders(head) < 0) {
+                    return;
+                }
+                if (stream_sender.SendData("ok", 2) ==
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                        SendResult::CLOSED) {
+                    return;
+                }
+                (void)stream_sender.End();
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/stream-pseudo-header-strip");
+            if (resp.error) {
+                pass = false;
+                err += "client error; ";
+            }
+            if (resp.rst) {
+                pass = false;
+                err += "unexpected RST_STREAM; ";
+            }
+            if (resp.status != 200) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) + "; ";
+            }
+            if (resp.body != "ok") {
+                pass = false;
+                err += "body mismatch; ";
+            }
+            if (FindHeaderValueCI(resp.headers, ":path") ||
+                FindHeaderValueCI(resp.headers, ":bogus")) {
+                pass = false;
+                err += "pseudo-header leaked into response; ";
+            }
+            auto x_ok = FindHeaderValueCI(resp.headers, "x-ok");
+            if (!x_ok || *x_ok != "yes") {
+                pass = false;
+                err += "regular header missing; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: pseudo-headers stripped from response submit",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: pseudo-headers stripped from response submit",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestH2_StreamingBatchedWritesPastHighWaterStayAccepted() {
     std::cout << "\n[TEST] H2 streaming: batched writes past high-water stay accepted..."
               << std::endl;
@@ -5429,6 +5507,7 @@ void RunAllTests() {
     TestH2_StreamingUnknownLengthOmitsContentLength();
     TestH2_StreamingAbortOffDispatcherThreadRejected();
     TestH2_StreamingSuppressesTrailerDeclarationUntilTrailersSupported();
+    TestH2_StreamingStripsPseudoHeadersFromResponse();
     TestH2_StreamingBatchedWritesPastHighWaterStayAccepted();
     TestH2_StreamingEmptyEndInlineDoesNotResetStream();
     TestH2_StreamingControlMethodsOffDispatcherThreadRejected();

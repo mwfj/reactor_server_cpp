@@ -34,6 +34,21 @@ static ssize_t DataSourceReadCallback(
     return src->ReadChunk(buf, length, data_flags);
 }
 
+bool IsForbiddenSubmittedResponseHeader(const std::string& lower_name,
+                                        bool strip_trailer) {
+    if (lower_name == "connection" || lower_name == "keep-alive" ||
+        lower_name == "proxy-connection" || lower_name == "te" ||
+        lower_name == "transfer-encoding" || lower_name == "upgrade" ||
+        lower_name == "content-length" ||
+        (lower_name.size() >= 6 && lower_name.compare(0, 6, "proxy-") == 0)) {
+        return true;
+    }
+    if (strip_trailer && lower_name == "trailer") {
+        return true;
+    }
+    return !lower_name.empty() && lower_name.front() == ':';
+}
+
 // --- Static nghttp2 callback functions ---
 // Each retrieves Http2Session* via nghttp2_session_get_user_data().
 
@@ -969,13 +984,7 @@ int Http2Session::SubmitInterimHeaders(
         std::string lower = key;
         std::transform(lower.begin(), lower.end(), lower.begin(),
                        [](unsigned char c) { return std::tolower(c); });
-        if (lower == "connection" || lower == "keep-alive" ||
-            lower == "proxy-connection" || lower == "te" ||
-            lower == "transfer-encoding" || lower == "upgrade" ||
-            lower == "content-length" ||
-            (lower.size() >= 6 && lower.compare(0, 6, "proxy-") == 0) ||
-            lower == ":status" || lower == ":path" || lower == ":method" ||
-            lower == ":scheme" || lower == ":authority") {
+        if (IsForbiddenSubmittedResponseHeader(lower, false)) {
             logging::Get()->debug(
                 "H2 interim: forbidden header '{}' stripped stream={}",
                 key, stream_id);
@@ -1060,13 +1069,12 @@ int Http2Session::SubmitStreamingResponse(
         std::string key = hdr.first;
         std::transform(key.begin(), key.end(), key.begin(),
                        [](unsigned char c) { return std::tolower(c); });
-        if (key == "connection" || key == "keep-alive" ||
-            key == "proxy-connection" || key == "te" ||
-            key == "transfer-encoding" || key == "upgrade") {
+        if (IsForbiddenSubmittedResponseHeader(key, true)) {
+            logging::Get()->debug(
+                "H2 streaming: forbidden header '{}' stripped stream={}",
+                hdr.first, stream_id);
             continue;
         }
-        if (key == "trailer") continue;
-        if (key == "content-length") continue;
         lowered_names.push_back(std::move(key));
         nva.push_back({
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(

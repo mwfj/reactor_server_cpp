@@ -1593,8 +1593,8 @@ namespace HttpTests {
             std::string lower = body_and_trailers;
             std::transform(lower.begin(), lower.end(), lower.begin(),
                            [](unsigned char c) { return std::tolower(c); });
-            if (lower.find("x-keyinjected-name: abc") == std::string::npos) {
-                pass = false; err += "sanitized trailer name missing; ";
+            if (lower.find("x-keyinjected-name: abc") != std::string::npos) {
+                pass = false; err += "undeclared sanitized trailer name should be dropped; ";
             }
             if (lower.find("x-value: line1injected-value: leaked") == std::string::npos) {
                 pass = false; err += "sanitized trailer value missing; ";
@@ -1788,6 +1788,89 @@ namespace HttpTests {
         } catch (const std::exception& e) {
             TestFramework::RecordTest(
                 "H1 streaming trailers: declaration suppressed when framing is not chunked",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingTrailers_DropsUndeclaredFields() {
+        std::cout << "\n[TEST] H1 streaming trailers: undeclared fields dropped..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-trailer-undeclared-drop",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Trailer", "X-Declared");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    static constexpr char kBody[] = "ok";
+                    if (stream_sender.SendData(kBody, sizeof(kBody) - 1) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End({
+                        {"X-Declared", "yes"},
+                        {"X-Undeclared", "no"},
+                    });
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-trailer-undeclared-drop HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            auto header_end = resp.find("\r\n\r\n");
+            if (header_end == std::string::npos) {
+                pass = false; err += "missing header terminator; ";
+            } else {
+                std::string lower = resp;
+                std::transform(lower.begin(), lower.end(), lower.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                size_t trailer_decl = lower.find("\r\ntrailer: ");
+                if (trailer_decl == std::string::npos ||
+                    lower.find("x-declared", trailer_decl) == std::string::npos) {
+                    pass = false; err += "declared trailer missing from header; ";
+                }
+                if (lower.find("x-undeclared") != std::string::npos &&
+                    trailer_decl != std::string::npos &&
+                    lower.find("x-undeclared", trailer_decl) < header_end) {
+                    pass = false; err += "undeclared trailer advertised; ";
+                }
+
+                std::string body_and_trailers = lower.substr(header_end + 4);
+                if (body_and_trailers.find("x-declared: yes\r\n") ==
+                    std::string::npos) {
+                    pass = false; err += "declared trailer missing from final chunk; ";
+                }
+                if (body_and_trailers.find("x-undeclared: no\r\n") !=
+                    std::string::npos) {
+                    pass = false; err += "undeclared trailer serialized; ";
+                }
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming trailers: undeclared fields dropped",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming trailers: undeclared fields dropped",
                 false, e.what(), TestFramework::TestCategory::OTHER);
         }
     }
@@ -2681,6 +2764,7 @@ namespace HttpTests {
         TestH1_StreamingTrailers_CRLFSanitized();
         TestH1_StreamingTrailers_DeclarationFiltersForbiddenNames();
         TestH1_StreamingTrailers_SuppressedWhenNotChunked();
+        TestH1_StreamingTrailers_DropsUndeclaredFields();
         TestH1_Streaming205CanonicalizesContentLength();
         TestH1_StreamingDeduplicatesContentLength();
         TestH1_StreamingHttp10UnknownLengthOmitsContentLength();

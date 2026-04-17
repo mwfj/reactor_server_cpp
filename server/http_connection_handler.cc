@@ -6,6 +6,7 @@
 #include "log/log_utils.h"
 #include <cstdio>
 #include <sstream>
+#include <unordered_set>
 
 namespace {
 static constexpr size_t DEFAULT_STREAM_HIGH_WATER_BYTES = 1024 * 1024;
@@ -71,9 +72,12 @@ struct PreparedStreamingHead {
     bool body_suppressed = false;
 };
 
-std::optional<std::string> MergeAllowedTrailerDeclarations(
-    const std::vector<std::pair<std::string, std::string>>& headers) {
-    std::vector<std::string> allowed;
+using AllowedTrailerNameSet = std::unordered_set<std::string>;
+
+AllowedTrailerNameSet CollectAllowedTrailerNames(
+    const std::vector<std::pair<std::string, std::string>>& headers,
+    std::vector<std::string>* declared_names = nullptr) {
+    AllowedTrailerNameSet allowed_names;
     for (const auto& [key, value] : headers) {
         std::string lower = key;
         std::transform(lower.begin(), lower.end(), lower.begin(),
@@ -95,7 +99,10 @@ std::optional<std::string> MergeAllowedTrailerDeclarations(
                                lower_token.begin(),
                                [](unsigned char c) { return std::tolower(c); });
                 if (!IsForbiddenTrailerFieldName(lower_token)) {
-                    allowed.push_back(std::move(token));
+                    if (declared_names) {
+                        declared_names->push_back(token);
+                    }
+                    allowed_names.insert(std::move(lower_token));
                 }
             }
             if (comma == std::string::npos) {
@@ -105,14 +112,22 @@ std::optional<std::string> MergeAllowedTrailerDeclarations(
         }
     }
 
-    if (allowed.empty()) {
+    return allowed_names;
+}
+
+std::optional<std::string> MergeAllowedTrailerDeclarations(
+    const std::vector<std::pair<std::string, std::string>>& headers) {
+    std::vector<std::string> declared_names;
+    CollectAllowedTrailerNames(headers, &declared_names);
+
+    if (declared_names.empty()) {
         return std::nullopt;
     }
 
-    std::string merged = allowed.front();
-    for (size_t i = 1; i < allowed.size(); ++i) {
+    std::string merged = declared_names.front();
+    for (size_t i = 1; i < declared_names.size(); ++i) {
         merged += ", ";
-        merged += allowed[i];
+        merged += declared_names[i];
     }
     return merged;
 }
@@ -165,7 +180,8 @@ std::string SerializeStreamingHead(const HttpResponse& response,
 }
 
 std::string EncodeChunkTerminator(
-    const std::vector<std::pair<std::string, std::string>>& trailers) {
+    const std::vector<std::pair<std::string, std::string>>& trailers,
+    const AllowedTrailerNameSet& declared_trailer_names) {
     auto strip_crlf = [](std::string s) -> std::string {
         s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());
         s.erase(std::remove(s.begin(), s.end(), '\n'), s.end());
@@ -182,6 +198,13 @@ std::string EncodeChunkTerminator(
         if (IsForbiddenTrailerFieldName(lower)) {
             logging::Get()->warn(
                 "H1 streaming dropped forbidden trailer field '{}'",
+                key);
+            continue;
+        }
+        if (declared_trailer_names.find(lower) ==
+            declared_trailer_names.end()) {
+            logging::Get()->warn(
+                "H1 streaming dropped undeclared trailer field '{}'",
                 key);
             continue;
         }
@@ -266,6 +289,8 @@ public:
         use_chunked_ = prepared->use_chunked;
         should_close_ = prepared->should_close;
         body_suppressed_ = prepared->body_suppressed;
+        declared_trailer_names_ =
+            CollectAllowedTrailerNames(headers_only_response.GetHeaders());
         headers_sent_ = true;
         if (mark_response_committed_) {
             mark_response_committed_();
@@ -340,7 +365,8 @@ public:
         }
         terminal_ = true;
         if (use_chunked_) {
-            std::string final_chunk = EncodeChunkTerminator(trailers);
+            std::string final_chunk = EncodeChunkTerminator(
+                trailers, declared_trailer_names_);
             conn_->SendRaw(final_chunk.data(), final_chunk.size());
         }
         if (finalize_response_) {
@@ -504,6 +530,7 @@ private:
     bool use_chunked_ = false;
     bool should_close_ = false;
     bool body_suppressed_ = false;
+    AllowedTrailerNameSet declared_trailer_names_;
     bool above_high_water_ = false;
     bool drain_listener_scheduled_ = false;
     uint64_t drain_listener_generation_ = 0;
