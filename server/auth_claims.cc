@@ -59,13 +59,35 @@ bool PopulateFromPayload(const nlohmann::json& payload,
                          AuthContext& ctx) {
     if (!payload.is_object()) return false;
 
-    // `iss` and `sub` are mandatory (RFC 7519 §4.1.1 / §4.1.2) — a token
-    // without them is not considered valid for our purposes.
-    if (!payload.contains("iss") || !payload["iss"].is_string()) return false;
-    if (!payload.contains("sub") || !payload["sub"].is_string()) return false;
-
-    ctx.issuer = payload["iss"].get<std::string>();
-    ctx.subject = payload["sub"].get<std::string>();
+    // `iss` and `sub` are both OPTIONAL per RFC 7519 §4.1.1 / §4.1.2; the
+    // RFC 7662 introspection response also doesn't guarantee them (only
+    // `active` is required). Common cases where one or both are absent:
+    //
+    //   - Client-credentials / service-account access tokens: no human
+    //     `sub`. The OAuth client itself is identified by `client_id`,
+    //     which the verifier can pass through via `claims_to_headers`.
+    //   - Introspection responses from minimal IdPs: may return
+    //     `{"active": true, "scope": "read:data"}` and nothing else.
+    //   - Symmetric-key flows (deferred — HS256 is out of scope for v1):
+    //     issuer is implicit in the shared key.
+    //
+    // The verifier (Phase 2 `JwtVerifier`) is the layer that enforces
+    // `iss` matches a configured issuer, via jwt-cpp's `with_issuer(...)`
+    // — by the time we get here that constraint has already been
+    // applied. Our job here is claim EXTRACTION, not policy enforcement,
+    // so we populate what's present and leave what isn't empty. False is
+    // returned ONLY for a structurally-invalid payload (not an object).
+    //
+    // Downstream readers (the future HeaderRewriter overlay) must treat
+    // both `ctx.issuer` and `ctx.subject` as possibly-empty and skip
+    // emitting their respective headers when empty rather than emitting
+    // empty values that would mislead upstream services.
+    if (payload.contains("iss") && payload["iss"].is_string()) {
+        ctx.issuer = payload["iss"].get<std::string>();
+    }
+    if (payload.contains("sub") && payload["sub"].is_string()) {
+        ctx.subject = payload["sub"].get<std::string>();
+    }
     ctx.scopes = ExtractScopes(payload);
 
     // Copy only operator-requested claims into ctx.claims, to keep the

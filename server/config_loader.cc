@@ -1603,6 +1603,40 @@ void ConfigLoader::Validate(const ServerConfig& config) {
                 }
             }
 
+            // TLS-mandatory on actual outbound IdP endpoints, not just on
+            // issuer_url (design spec §9 item 4 hardening). The issuer_url
+            // check above protects discovery; these checks protect the two
+            // other URLs that carry security-sensitive data:
+            //
+            //   - jwks_uri (static, used when discovery=false): a plaintext
+            //     JWKS lets a network attacker substitute their own public
+            //     keys, which would cause our verifier to accept tokens
+            //     they signed → token forgery.
+            //   - introspection.endpoint: a plaintext POST exposes both the
+            //     bearer token (authentication credential) and our
+            //     client_id / client_secret (the gateway's IdP credential)
+            //     to anyone on the wire.
+            //
+            // Both checks are conditional — if the field is empty, mode
+            // validation above has already either required it (and would
+            // have thrown) or made it discovery-supplied (and the discovered
+            // URL gets validated at fetch time in Phase 2). We only need
+            // to validate the static value here.
+            if (!ic.jwks_uri.empty() &&
+                ic.jwks_uri.rfind("https://", 0) != 0) {
+                throw std::invalid_argument(
+                    ctx + ".jwks_uri must start with https:// — plaintext "
+                    "JWKS allows MITM key substitution and would compromise "
+                    "token verification (design spec §9 item 4)");
+            }
+            if (!ic.introspection.endpoint.empty() &&
+                ic.introspection.endpoint.rfind("https://", 0) != 0) {
+                throw std::invalid_argument(
+                    ctx + ".introspection.endpoint must start with https:// "
+                    "— plaintext introspection would leak bearer tokens and "
+                    "client credentials over the wire (design spec §9 item 4)");
+            }
+
             // Mode/endpoint mismatch — warn per design spec §5.3. Not a
             // hard-reject because operators sometimes template both blocks
             // and select mode dynamically; emitting a warn ensures the
@@ -1746,6 +1780,52 @@ void ConfigLoader::Validate(const ServerConfig& config) {
             for (const auto& [claim, header] :
                  config.auth.forward.claims_to_headers) {
                 add_header(header, "claims_to_headers[" + claim + "]");
+            }
+        }
+
+        // ----- Final gate: enforcement-not-yet-wired master rejection -----
+        //
+        // This PR (Phase 1, Steps 1–2) lands the auth config schema, the
+        // pure utilities (token_hasher / jwt_decode-via-jwt-cpp /
+        // auth_policy_matcher / auth_claims), and the data-structure plumbing
+        // (HttpRequest::auth, ProxyConfig::auth, ServerConfig::auth) — but
+        // request-time enforcement (AuthManager + middleware + JwtVerifier
+        // wiring) is scheduled for follow-up PRs per design spec §14
+        // (Phase 1 Steps 3–7 / Phase 2). Until that lands, a config that
+        // toggles auth ON would silently behave as unauthenticated — i.e.
+        // an operator who deploys `auth.enabled=true` thinking their proxy
+        // is now protected would be wrong. That's an authentication-bypass
+        // misconfiguration vector.
+        //
+        // To prevent silent unenforced-policy acceptance, the validator
+        // hard-rejects ANY config that flips an auth enable flag on. The
+        // schema (issuers, policies, forward) may stay populated for
+        // forward-compatibility — operators can prepare their config in
+        // advance of the enforcement PR — but the master switches must
+        // remain false until enforcement is wired.
+        //
+        // Same fail-closed discipline used for HS256 / alg:none / mode:auto
+        // throughout this design: features that are not safely usable yet
+        // must reject loudly at config load, not silently accept.
+        if (config.auth.enabled) {
+            throw std::invalid_argument(
+                "auth.enabled=true rejected: request-time enforcement "
+                "(AuthManager + middleware) is not yet wired in this build. "
+                "Schedule: design spec §14 Phase 2 / follow-up PR. To prevent "
+                "silent unenforced-policy acceptance, the validator hard-"
+                "rejects this flag until enforcement lands. Set "
+                "auth.enabled=false for now; auth.issuers / policies / "
+                "forward may remain populated for upgrade.");
+        }
+        for (const auto& u : config.upstreams) {
+            if (u.proxy.auth.enabled) {
+                throw std::invalid_argument(
+                    "upstreams['" + u.name +
+                    "'].proxy.auth.enabled=true rejected: request-time "
+                    "enforcement is not yet wired in this build (design spec "
+                    "§14 Phase 2). Set proxy.auth.enabled=false for now; the "
+                    "auth block (issuers reference, required_scopes, etc.) "
+                    "may remain populated for upgrade.");
             }
         }
     }

@@ -380,15 +380,42 @@ void TestConfigLoaderAuthRoundTrip() {
             }
         }
 
-        // Validation must accept this config (algorithms OK, upstream exists,
-        // no collisions, https issuer).
-        bool validation_ok = true;
+        // Validation behavior on this fixture (which has auth.enabled=true):
+        // The fixture is structurally well-formed (algorithms OK, upstream
+        // exists, no collisions, https issuer, etc.) AND it has the master
+        // auth flag flipped on. Until request-time enforcement lands per
+        // design spec §14 Phase 2, the validator's enforcement-not-yet-wired
+        // gate fires for any enabled=true config. This block confirms the
+        // gate behaves correctly on a fully-formed but enabled fixture —
+        // it must throw with the gate's distinctive "not yet wired" message,
+        // proving that all the structural checks passed (otherwise an
+        // earlier throw with a different message would fire).
+        //
+        // When enforcement lands, this assertion flips back to "must
+        // succeed" and the gate logic in ConfigLoader::Validate is removed.
+        bool validation_ok = false;  // success means gate fired with right msg
         std::string validation_err;
         try {
             ConfigLoader::Validate(c1);
+            validation_err = "Validate() unexpectedly accepted enabled=true; "
+                             "the enforcement-not-yet-wired gate should have "
+                             "rejected it";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find("not yet wired") != std::string::npos &&
+                msg.find("auth.enabled") != std::string::npos) {
+                validation_ok = true;
+            } else {
+                validation_err =
+                    "Validate() threw a DIFFERENT error than the expected "
+                    "enforcement-not-yet-wired gate (this means an earlier "
+                    "structural check failed when it shouldn't have); "
+                    "got: " + msg;
+            }
         } catch (const std::exception& e) {
-            validation_ok = false;
-            validation_err = e.what();
+            validation_err =
+                std::string("Validate() threw an unexpected exception type: ") +
+                e.what();
         }
 
         // Round-trip through ToJson → LoadFromString must preserve both
@@ -617,11 +644,17 @@ void TestLoadHmacKeyFromEnvStandardBase64() {
 void TestConfigLoaderClaimHeaderCollision() {
     std::cout << "\n[TEST] ConfigLoader rejects claim->same-header collision..." << std::endl;
     try {
+        // NOTE: enabled=false here is deliberate — the structural header-
+        // collision check runs unconditionally, and we want to exercise it
+        // in isolation. With enabled=true, the new "enforcement-not-yet-
+        // wired" gate would fire first and we'd never reach the collision
+        // check. The collision is purely a config-shape issue, not gated
+        // on the master switch.
         const std::string bad_json = R"({
             "bind_host": "127.0.0.1",
             "bind_port": 8080,
             "auth": {
-                "enabled": true,
+                "enabled": false,
                 "issuers": {
                     "google": {
                         "issuer_url": "https://accounts.google.com",
@@ -672,6 +705,288 @@ void TestConfigLoaderClaimHeaderCollision() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — auth-enabled fail-closed gate (review P1 #1).
+//
+// Until AuthManager + middleware lands (design spec §14 Phase 2), a config
+// that toggles auth ON would silently behave as unauthenticated — i.e. the
+// gateway would accept the config but route requests to upstreams without
+// any token validation. To prevent that auth-bypass-by-misconfig scenario,
+// Validate() hard-rejects any config with auth.enabled=true OR
+// upstreams[].proxy.auth.enabled=true. Schema fields (issuers, policies,
+// forward) may still be populated for forward-compatibility — only the
+// master switches are gated.
+//
+// These tests pin the gate. When enforcement actually lands, both
+// throw-cases below are removed (the gate logic is deleted from
+// ConfigLoader::Validate) AND these test cases are flipped to assert
+// successful validation. Until then, the gate is the safety net.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderRejectsAuthEnabled() {
+    std::cout << "\n[TEST] ConfigLoader rejects auth.enabled=true (gateway-wide)..." << std::endl;
+    try {
+        const std::string json_with_auth_enabled = R"({
+            "bind_host": "127.0.0.1",
+            "bind_port": 8080,
+            "auth": {
+                "enabled": true,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://accounts.google.com",
+                        "upstream": "idp_google",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            },
+            "upstreams": [{"name": "idp_google", "host": "127.0.0.1", "port": 443}]
+        })";
+        bool threw = false;
+        std::string err_msg;
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json_with_auth_enabled);
+            ConfigLoader::Validate(cfg);
+        } catch (const std::invalid_argument& e) {
+            threw = true;
+            err_msg = e.what();
+        }
+        // Contract: must throw, and message must be informative — mention
+        // both that enforcement isn't wired and how to disable. We check
+        // for the canonical phrase "not yet wired" and "auth.enabled" so
+        // the test fails loudly if the wording silently regresses to a
+        // less-actionable message.
+        bool good_msg = threw &&
+            err_msg.find("not yet wired") != std::string::npos &&
+            err_msg.find("auth.enabled") != std::string::npos;
+        bool pass = threw && good_msg;
+        std::string err;
+        if (!threw) {
+            err = "expected Validate() to reject auth.enabled=true but it accepted";
+        } else if (!good_msg) {
+            err = "Validate() threw but message lacked 'not yet wired' or "
+                  "'auth.enabled'; got: " + err_msg;
+        }
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects gateway auth.enabled=true",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects gateway auth.enabled=true",
+            false, std::string("unexpected harness error: ") + e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestConfigLoaderRejectsProxyAuthEnabled() {
+    std::cout << "\n[TEST] ConfigLoader rejects proxy.auth.enabled=true..." << std::endl;
+    try {
+        const std::string json_with_proxy_auth_enabled = R"({
+            "bind_host": "127.0.0.1",
+            "bind_port": 8080,
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://accounts.google.com",
+                        "upstream": "idp_google",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            },
+            "upstreams": [
+                {"name": "idp_google", "host": "127.0.0.1", "port": 443},
+                {
+                    "name": "internal-api",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "proxy": {
+                        "route_prefix": "/api/v1",
+                        "auth": {
+                            "enabled": true,
+                            "issuers": ["google"]
+                        }
+                    }
+                }
+            ]
+        })";
+        bool threw = false;
+        std::string err_msg;
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json_with_proxy_auth_enabled);
+            ConfigLoader::Validate(cfg);
+        } catch (const std::invalid_argument& e) {
+            threw = true;
+            err_msg = e.what();
+        }
+        // Message must name the offending upstream so operators can find it
+        // quickly, and mention the gate phrasing.
+        bool good_msg = threw &&
+            err_msg.find("not yet wired") != std::string::npos &&
+            err_msg.find("internal-api") != std::string::npos &&
+            err_msg.find("proxy.auth.enabled") != std::string::npos;
+        bool pass = threw && good_msg;
+        std::string err;
+        if (!threw) {
+            err = "expected Validate() to reject proxy.auth.enabled=true but it accepted";
+        } else if (!good_msg) {
+            err = "Validate() threw but message lacked one of "
+                  "{'not yet wired', 'internal-api', 'proxy.auth.enabled'}; "
+                  "got: " + err_msg;
+        }
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects per-proxy auth.enabled=true",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects per-proxy auth.enabled=true",
+            false, std::string("unexpected harness error: ") + e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — TLS-mandatory on outbound IdP endpoints
+// (review P1 #2). issuer_url already has the https check; this test pins
+// the same protection for jwks_uri (when discovery=false) and
+// introspection.endpoint. Plaintext on either is a critical security bug:
+//   - http://jwks → MITM key substitution → token forgery
+//   - http://introspect → bearer token + client credential exposure
+// -----------------------------------------------------------------------------
+void TestConfigLoaderRejectsPlaintextIdpEndpoints() {
+    std::cout << "\n[TEST] ConfigLoader rejects plaintext jwks_uri / introspection.endpoint..." << std::endl;
+    auto validate_expect_failure = [](const std::string& json,
+                                       const std::string& expected_phrase)
+        -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(cfg);
+            return "expected Validate() to throw containing '" +
+                   expected_phrase + "' but it accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
+                return "Validate() threw but message lacked '" +
+                       expected_phrase + "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // Case 1: plaintext jwks_uri (discovery=false case).
+        std::string err = validate_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "discovery": false,
+                        "jwks_uri": "http://issuer.example/jwks.json",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })", "jwks_uri must start with https://");
+        if (!err.empty()) throw std::runtime_error("plaintext jwks_uri case: " + err);
+
+        // Case 2: plaintext introspection.endpoint.
+        err = validate_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "http://issuer.example/introspect"
+                        }
+                    }
+                }
+            }
+        })", "introspection.endpoint must start with https://");
+        if (!err.empty()) throw std::runtime_error("plaintext introspection case: " + err);
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects plaintext IdP endpoints",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects plaintext IdP endpoints",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// PopulateFromPayload — iss/sub now optional (review P1 #3).
+// RFC 7519 §4.1.1 / §4.1.2 mark both as OPTIONAL; RFC 7662 introspection
+// only requires `active`. Common scenarios where one or both are absent:
+//   - Client-credentials access tokens (no human subject)
+//   - Minimal introspection responses ({"active": true, "scope": "..."})
+// Pre-fix behavior would 401 these tokens. This test pins that absent-but-
+// well-formed payloads now succeed and leave ctx fields empty for downstream
+// HeaderRewriter to skip emitting when populated values aren't present.
+// -----------------------------------------------------------------------------
+void TestPopulateFromPayloadOptionalIssSub() {
+    std::cout << "\n[TEST] PopulateFromPayload accepts payloads without iss/sub..." << std::endl;
+    try {
+        // Case 1: client-credentials shape — no `sub`, scope present.
+        nlohmann::json client_cred = nlohmann::json::parse(R"({
+            "iss": "https://issuer.example",
+            "client_id": "machine-a",
+            "scope": "read:data"
+        })");
+        auth::AuthContext ctx1;
+        bool ok1 = auth::PopulateFromPayload(client_cred, {"client_id"}, ctx1);
+        bool case1_pass = ok1 &&
+            ctx1.issuer == "https://issuer.example" &&
+            ctx1.subject.empty() &&
+            ctx1.scopes.size() == 1 && ctx1.scopes[0] == "read:data" &&
+            ctx1.claims.count("client_id") == 1 &&
+            ctx1.claims.at("client_id") == "machine-a";
+
+        // Case 2: minimal introspection response — only active + scope.
+        nlohmann::json minimal_introspect = nlohmann::json::parse(R"({
+            "active": true,
+            "scope": "read:data write:data"
+        })");
+        auth::AuthContext ctx2;
+        bool ok2 = auth::PopulateFromPayload(minimal_introspect, {}, ctx2);
+        bool case2_pass = ok2 &&
+            ctx2.issuer.empty() &&
+            ctx2.subject.empty() &&
+            ctx2.scopes.size() == 2;
+
+        // Case 3: structurally invalid payload (not an object) — STILL rejected.
+        // The relaxation is only about iss/sub; structural validity is
+        // unchanged.
+        nlohmann::json not_an_object = nlohmann::json::parse(R"("a string")");
+        auth::AuthContext ctx3;
+        bool ok3 = auth::PopulateFromPayload(not_an_object, {}, ctx3);
+        bool case3_pass = !ok3;  // must return false
+
+        bool pass = case1_pass && case2_pass && case3_pass;
+        std::string err;
+        if (!case1_pass) err = "client-credentials case (no sub) failed";
+        else if (!case2_pass) err = "minimal introspection case (no iss, no sub) failed";
+        else if (!case3_pass) err = "non-object payload should still be rejected";
+
+        TestFramework::RecordTest(
+            "AuthFoundation: PopulateFromPayload accepts payloads without iss/sub",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: PopulateFromPayload accepts payloads without iss/sub",
+            false, std::string("unexpected exception: ") + e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -681,6 +996,10 @@ inline void RunAllTests() {
     TestExtractScopesScpAsString();
     TestConfigLoaderAuthRoundTrip();
     TestConfigLoaderAuthValidation();
+    TestConfigLoaderRejectsAuthEnabled();
+    TestConfigLoaderRejectsProxyAuthEnabled();
+    TestConfigLoaderRejectsPlaintextIdpEndpoints();
+    TestPopulateFromPayloadOptionalIssSub();
     TestConfigLoaderClaimHeaderCollision();
 }
 
