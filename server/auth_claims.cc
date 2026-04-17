@@ -42,14 +42,25 @@ std::vector<std::string> ExtractScopes(const nlohmann::json& payload) {
             return SplitWhitespace(v.get<std::string>());
         }
     }
-    // Azure AD and friends.
-    if (payload.contains("scopes") && payload["scopes"].is_array()) {
-        std::vector<std::string> out;
-        out.reserve(payload["scopes"].size());
-        for (const auto& v : payload["scopes"]) {
-            if (v.is_string()) out.push_back(v.get<std::string>());
+    // Azure AD and friends. Accept both array-of-strings AND a single
+    // whitespace-delimited string — matches the dual-form handling of
+    // `scp` above. Some identity providers (and custom introspection
+    // endpoints) serialize scopes as a single string even though the
+    // field name is plural; rejecting that form would make
+    // required_scopes wrongly reject otherwise-valid tokens.
+    if (payload.contains("scopes")) {
+        const auto& v = payload["scopes"];
+        if (v.is_array()) {
+            std::vector<std::string> out;
+            out.reserve(v.size());
+            for (const auto& s : v) {
+                if (s.is_string()) out.push_back(s.get<std::string>());
+            }
+            return out;
         }
-        return out;
+        if (v.is_string()) {
+            return SplitWhitespace(v.get<std::string>());
+        }
     }
     return {};
 }

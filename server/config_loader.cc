@@ -2244,6 +2244,41 @@ void ConfigLoader::ValidateProxyAuth(const ServerConfig& config) {
     // the reload path can invoke them against the REAL upstreams[] list
     // even when Validate() is called on a stripped validation_copy.
     // See config_loader.h docstring for the full motivation.
+
+    // Issuer upstream cross-reference — Validate() normally handles this
+    // in its main issuer loop, but its reload-path call (reload_copy=true
+    // on a stripped validation_copy) SKIPS the cross-ref because
+    // `upstream_names` is empty. That leaves staged issuer typos
+    // slipping through reload and only surfacing at the next restart's
+    // full Validate(). Run the check here on the REAL upstreams so the
+    // reload path is enforcement-symmetric with startup. Startup still
+    // runs this check via the in-Validate path (no double-check — the
+    // full Validate doesn't call ValidateProxyAuth internally).
+    {
+        std::unordered_set<std::string> upstream_names;
+        upstream_names.reserve(config.upstreams.size());
+        for (const auto& u : config.upstreams) {
+            upstream_names.insert(u.name);
+        }
+        for (const auto& [name, ic] : config.auth.issuers) {
+            if (ic.upstream.empty()) {
+                // Structural "must be non-empty" check — identical to the
+                // one in Validate(). Duplicated because structural checks
+                // must fire in BOTH entry points.
+                throw std::invalid_argument(
+                    "auth.issuers." + name + ".upstream is required — each "
+                    "issuer must bind to an existing UpstreamHostPool so "
+                    "JWKS / discovery / introspection traffic has a "
+                    "configured outbound path");
+            }
+            if (upstream_names.count(ic.upstream) == 0) {
+                throw std::invalid_argument(
+                    "auth.issuers." + name + ".upstream references "
+                    "unknown upstream '" + ic.upstream + "' — define it "
+                    "under `upstreams[]` first");
+            }
+        }
+    }
     for (const auto& u : config.upstreams) {
         const auto& p = u.proxy.auth;
         const std::string ctx = "upstreams['" + u.name + "'].proxy.auth";

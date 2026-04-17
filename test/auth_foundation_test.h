@@ -2869,6 +2869,276 @@ void TestValidateProxyAuthReloadGate() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// ExtractScopes — `scopes` claim as a whitespace-delimited STRING is also
+// accepted (review P2). The helper already handled `scope` and `scp` in
+// both array + string forms; `scopes` only accepted the array form which
+// inconsistently rejected legitimate tokens from providers that serialize
+// scopes as a single string under the plural field name.
+// -----------------------------------------------------------------------------
+void TestExtractScopesScopesAsString() {
+    std::cout << "\n[TEST] ExtractScopes handles 'scopes' as string..." << std::endl;
+    try {
+        // Case 1: `scopes` as a whitespace-separated string.
+        nlohmann::json p1 = nlohmann::json::parse(R"({
+            "scopes": "read:data write:data admin:all"
+        })");
+        auto scopes1 = auth::ExtractScopes(p1);
+        bool case1 = scopes1.size() == 3 &&
+            scopes1[0] == "read:data" &&
+            scopes1[1] == "write:data" &&
+            scopes1[2] == "admin:all";
+
+        // Case 2: `scopes` as an array still works (regression).
+        nlohmann::json p2 = nlohmann::json::parse(R"({
+            "scopes": ["read:data", "write:data"]
+        })");
+        auto scopes2 = auth::ExtractScopes(p2);
+        bool case2 = scopes2.size() == 2 &&
+            scopes2[0] == "read:data" &&
+            scopes2[1] == "write:data";
+
+        // Case 3: `scope` precedence over `scopes` (when both are
+        // present — `scope` wins, matches existing behavior).
+        nlohmann::json p3 = nlohmann::json::parse(R"({
+            "scope": "a b",
+            "scopes": "x y z"
+        })");
+        auto scopes3 = auth::ExtractScopes(p3);
+        bool case3 = scopes3.size() == 2 && scopes3[0] == "a" && scopes3[1] == "b";
+
+        // Case 4: `scopes` as a non-string/non-array (e.g. object) —
+        // returns empty (graceful degradation).
+        nlohmann::json p4 = nlohmann::json::parse(R"({
+            "scopes": {"something": "weird"}
+        })");
+        auto scopes4 = auth::ExtractScopes(p4);
+        bool case4 = scopes4.empty();
+
+        bool pass = case1 && case2 && case3 && case4;
+        std::string err;
+        if (!case1) err = "string form of scopes returned " +
+            std::to_string(scopes1.size()) + " tokens (expected 3)";
+        else if (!case2) err = "array form of scopes broke";
+        else if (!case3) err = "scope-precedence-over-scopes broke";
+        else if (!case4) err = "non-string/non-array scopes should return empty";
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ExtractScopes handles scopes-as-string",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ExtractScopes handles scopes-as-string",
+            false, std::string("unexpected exception: ") + e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ValidateProxyAuth — runs the issuer.upstream cross-reference check
+// (review P3 #1). The reload path's stripped-copy Validate skips this
+// because reload_copy=true disables cross-refs; ValidateProxyAuth now
+// runs it explicitly on the real upstreams so reload and startup enforce
+// this equally.
+// -----------------------------------------------------------------------------
+void TestValidateProxyAuthIssuerUpstreamCrossRef() {
+    std::cout << "\n[TEST] ValidateProxyAuth rejects unknown issuer.upstream..." << std::endl;
+    try {
+        // Case 1: issuer.upstream points at a non-existent pool.
+        const std::string bad = R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "typo_not_a_real_upstream",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })";
+        bool threw = false;
+        std::string err_msg;
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(bad);
+            ConfigLoader::ValidateProxyAuth(cfg);
+        } catch (const std::invalid_argument& e) {
+            threw = true;
+            err_msg = e.what();
+        }
+        bool good_msg = threw &&
+            err_msg.find("references unknown upstream") != std::string::npos &&
+            err_msg.find("typo_not_a_real_upstream") != std::string::npos;
+
+        // Case 2: missing upstream field entirely — also rejected as
+        // structural error.
+        const std::string missing = R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })";
+        bool missing_threw = false;
+        std::string missing_err;
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(missing);
+            ConfigLoader::ValidateProxyAuth(cfg);
+        } catch (const std::invalid_argument& e) {
+            missing_threw = true;
+            missing_err = e.what();
+        }
+        bool missing_msg = missing_threw &&
+            missing_err.find("upstream is required") != std::string::npos;
+
+        // Case 3: POSITIVE — valid cross-ref passes.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+                "auth": {
+                    "enabled": false,
+                    "issuers": {
+                        "google": {
+                            "issuer_url": "https://issuer.example",
+                            "upstream": "x",
+                            "mode": "jwt",
+                            "algorithms": ["RS256"]
+                        }
+                    }
+                }
+            })");
+            ConfigLoader::ValidateProxyAuth(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("valid upstream ref should be ACCEPTED but ")
+                + "ValidateProxyAuth threw: " + e.what());
+        }
+
+        bool pass = threw && good_msg && missing_threw && missing_msg;
+        std::string err;
+        if (!threw) {
+            err = "unknown-upstream case should reject but accepted";
+        } else if (!good_msg) {
+            err = "rejected but wrong message; got: " + err_msg;
+        } else if (!missing_threw) {
+            err = "missing-upstream case should reject but accepted";
+        } else if (!missing_msg) {
+            err = "missing case rejected but wrong message; got: " + missing_err;
+        }
+        TestFramework::RecordTest(
+            "AuthFoundation: ValidateProxyAuth rejects unknown issuer.upstream",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ValidateProxyAuth rejects unknown issuer.upstream",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// LoadHmacKeyFromEnv — raw env keys containing middle '%3d' or '=' must
+// be preserved verbatim (review P3 #2). jwt::base::trim uses find() so
+// it truncates at the FIRST occurrence of the padding sequence;
+// previously this mis-decoded raw keys with embedded padding as 32-byte
+// base64 keys. The fix strips padding only at the tail.
+// -----------------------------------------------------------------------------
+void TestLoadHmacKeyFromEnvPreservesMiddlePadding() {
+    std::cout << "\n[TEST] LoadHmacKeyFromEnv preserves middle %3d / = chars..." << std::endl;
+
+    const char* kVarName = "REACTOR_TEST_AUTH_MID_PAD_KEY";
+    auto restore_env = [](const char* name, const char* prev, bool had) {
+        if (had) setenv(name, prev, 1);
+        else unsetenv(name);
+    };
+
+    const char* prev = std::getenv(kVarName);
+    std::string saved = prev ? prev : "";
+    bool had_original = (prev != nullptr);
+
+    try {
+        // Case 1: raw env key with "%3d" in the MIDDLE. Under the
+        // previous jwt::base::trim behavior this would be truncated at
+        // the first '%3d', leaving a short prefix that might decode to
+        // 32 bytes → silent HMAC key change. Post-fix: the middle '%3d'
+        // is preserved and the raw string is used verbatim (falls
+        // through to raw-bytes after base64 decode fails).
+        const std::string tricky = "AAAA%3dBBBBCCCCDDDDEEEEFFFF";
+        setenv(kVarName, tricky.c_str(), 1);
+        std::string loaded1 = auth::LoadHmacKeyFromEnv(kVarName);
+        // The string is not a valid 32-byte base64/base64url decode, so
+        // it falls through to raw-bytes and is returned verbatim. The
+        // CRITICAL assertion: the returned bytes are the full tricky
+        // string, NOT a truncated substring.
+        bool case1 = loaded1 == tricky;
+
+        // Case 2: raw env key with literal '=' in the middle — similar
+        // concern (the loop at the top strips TRAILING '=' only; middle
+        // '=' should remain intact).
+        const std::string tricky_eq = "AAAA=BBBBCCCCDDDDEEEEFFFF";
+        setenv(kVarName, tricky_eq.c_str(), 1);
+        std::string loaded2 = auth::LoadHmacKeyFromEnv(kVarName);
+        bool case2 = loaded2 == tricky_eq;
+
+        // Case 3: REGRESSION — valid base64url still decodes to 32 bytes
+        // when the operator provides that form. Uses jwt::base::encode
+        // so the encoding is exactly what the decoder expects.
+        std::string raw_key(32, 'K');
+        std::string encoded =
+            jwt::base::encode<jwt::alphabet::base64url>(raw_key);
+        // Strip standard '=' padding (operator-typical form).
+        while (!encoded.empty() && encoded.back() == '=') encoded.pop_back();
+        setenv(kVarName, encoded.c_str(), 1);
+        std::string loaded3 = auth::LoadHmacKeyFromEnv(kVarName);
+        bool case3 = loaded3.size() == 32 && loaded3 == raw_key;
+
+        // Case 4: raw key with TRAILING '%3d' — should still strip
+        // (that's the legitimate padding case). The remainder
+        // ("AAAABBBB") should decode to 6 bytes via base64url, but that
+        // doesn't equal 32 so falls to raw. Returned value must equal
+        // the original string (with padding stripped OR kept — test
+        // accepts either; the PRIMARY contract is "not mid-truncated").
+        const std::string trailing = "AAAABBBB%3d";
+        setenv(kVarName, trailing.c_str(), 1);
+        std::string loaded4 = auth::LoadHmacKeyFromEnv(kVarName);
+        // Must be either the full string OR the stripped-tail version.
+        // Must NOT be empty and must NOT be a middle-truncated variant
+        // (i.e. if we see just "AAAABBBB" that's fine; if we see
+        // anything shorter that's a bug).
+        bool case4 = (loaded4 == trailing) || (loaded4 == "AAAABBBB");
+
+        restore_env(kVarName, saved.c_str(), had_original);
+
+        bool pass = case1 && case2 && case3 && case4;
+        std::string err;
+        if (!case1) err = "middle '%3d' caused truncation — got '" +
+            loaded1 + "' (expected '" + tricky + "')";
+        else if (!case2) err = "middle '=' caused truncation — got '" +
+            loaded2 + "' (expected '" + tricky_eq + "')";
+        else if (!case3) err = "valid base64url decode regression — got size=" +
+            std::to_string(loaded3.size());
+        else if (!case4) err = "trailing '%3d' case produced unexpected "
+            "result '" + loaded4 + "'";
+
+        TestFramework::RecordTest(
+            "AuthFoundation: LoadHmacKeyFromEnv preserves middle padding",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        restore_env(kVarName, saved.c_str(), had_original);
+        TestFramework::RecordTest(
+            "AuthFoundation: LoadHmacKeyFromEnv preserves middle padding",
+            false, std::string("unexpected exception: ") + e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -2898,6 +3168,9 @@ inline void RunAllTests() {
     TestConfigLoaderValidatesHeaderNameTchar();
     TestConfigLoaderAcceptsLiteralPatternCharsInAppliesTo();
     TestValidateProxyAuthReloadGate();
+    TestExtractScopesScopesAsString();
+    TestValidateProxyAuthIssuerUpstreamCrossRef();
+    TestLoadHmacKeyFromEnvPreservesMiddlePadding();
     TestConfigLoaderClaimHeaderCollision();
 }
 

@@ -97,6 +97,11 @@ public:
     // those checks without reintroducing the topology-restart noise.
     //
     // Runs (against `config.upstreams`):
+    //   - issuer.upstream cross-reference — each auth.issuers.*.upstream
+    //     must name an existing entry in config.upstreams. This check is
+    //     skipped by the stripped-copy Validate (reload_copy=true), so
+    //     running it here on the real upstreams is how reload and
+    //     startup enforce issuer refs consistently.
     //   - on_undetermined value check
     //   - issuer references resolve to `config.auth.issuers`
     //   - populated-inline-auth requires non-empty `proxy.route_prefix`

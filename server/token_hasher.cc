@@ -106,17 +106,34 @@ std::string LoadHmacKeyFromEnv(const std::string& env_var_name) {
     // Catch at this boundary and fall through to the raw-bytes interpretation
     // — a malformed env value must not propagate as an exception into
     // AuthManager::Start(), which would abort startup.
+    // TRAILING-only padding strip (review round: avoid silent truncation
+    // of raw env keys that happen to contain padding sequences in the
+    // middle). jwt::base::trim<alphabet> uses find() to locate the fill
+    // string — which strips at the FIRST occurrence, not just the tail.
+    // So a raw key like "AAAA...%3dRAW" (perfectly valid as a binary
+    // HMAC secret) would get truncated at the middle "%3d" and then
+    // potentially decode to 32 bytes, silently changing the operator's
+    // configured HMAC key. We strip only real trailing padding below,
+    // then skip jwt-cpp's trim entirely and feed the candidate directly
+    // into pad() + decode() — pad() adds correct trailing padding if
+    // needed, and decode() rejects obviously-invalid input by throwing,
+    // which our catch handles via the raw-bytes fallback.
     std::string candidate = raw;
-    // Step 1: strip standard '=' padding (if operator encoded with the
-    // legacy base64 form).
+    // Strip trailing '=' (standard base64 padding).
     while (!candidate.empty() && candidate.back() == '=') candidate.pop_back();
-    // Step 2: strip jwt-cpp "%3d" padding too — trim() returns the substring
-    // before the first occurrence of the fill string.
-    std::string candidate_b64url =
-        jwt::base::trim<jwt::alphabet::base64url>(candidate);
+    // Strip trailing '%3d' (jwt-cpp's URL-safe escaped padding). MUST
+    // happen after the '=' strip in case an operator's pad sequence
+    // mixes forms (unlikely but harmless).
+    while (candidate.size() >= 3 &&
+           candidate.compare(candidate.size() - 3, 3, "%3d") == 0) {
+        candidate.resize(candidate.size() - 3);
+    }
+
+    // Step 2: try base64url decoding (the common case — `openssl rand
+    // -base64 32 | tr '+/' '-_' | tr -d '='` style keys).
     try {
         std::string decoded = jwt::base::decode<jwt::alphabet::base64url>(
-            jwt::base::pad<jwt::alphabet::base64url>(candidate_b64url));
+            jwt::base::pad<jwt::alphabet::base64url>(candidate));
         if (decoded.size() == 32) {
             // Silent-swap corner case: an operator's raw 43-char key
             // composed entirely of base64url alphabet chars [A-Za-z0-9_-]
@@ -147,11 +164,11 @@ std::string LoadHmacKeyFromEnv(const std::string& env_var_name) {
     // base64url). base64url's alphabet excludes '+' and '/', so the first
     // attempt above throws on those characters and we fall through here.
     // The decoded bytes are identical as long as the key is 32 bytes.
+    // Same rationale for skipping jwt-cpp's trim — we feed the candidate
+    // directly into pad()+decode().
     try {
-        std::string trimmed_b64 =
-            jwt::base::trim<jwt::alphabet::base64>(candidate);
         std::string decoded_b64 = jwt::base::decode<jwt::alphabet::base64>(
-            jwt::base::pad<jwt::alphabet::base64>(trimmed_b64));
+            jwt::base::pad<jwt::alphabet::base64>(candidate));
         if (decoded_b64.size() == 32) {
             logging::Get()->debug(
                 "LoadHmacKeyFromEnv: env var '{}' interpreted as "
