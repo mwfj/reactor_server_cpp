@@ -3771,9 +3771,49 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // (rate<=0, invalid key_type, duplicate zone names) must be caught.
         validation_copy.rate_limit = new_config.rate_limit;
         try {
-            ConfigLoader::Validate(validation_copy);
+            // reload_copy=true — signals the validator that upstreams[]
+            // has been deliberately stripped above, so topology cross-
+            // reference checks (e.g. `auth.issuers.*.upstream` pointing
+            // at a pool name) should be skipped in this context.
+            // Startup validation passes false (the default), so genuine
+            // startup configs with no upstreams still get their cross-
+            // refs checked. See ConfigLoader::Validate docstring.
+            ConfigLoader::Validate(validation_copy, /*reload_copy=*/true);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Reload() rejected invalid config: {}", e.what());
+            return false;
+        }
+
+        // Inline proxy.auth validation runs AGAINST the original
+        // new_config (full upstreams), not validation_copy. The strip
+        // above skips the in-Validate per-upstream auth loop entirely
+        // — which would let a reload that toggled
+        // `upstreams[i].proxy.auth.enabled=true` slip past the
+        // enforcement-not-yet-wired gate AND let bad inline issuer
+        // references slide through structural validation until the
+        // next restart. ValidateProxyAuth re-runs those checks on the
+        // real upstream list so the strict reload gate is
+        // enforcement-complete for inline auth too. (Collision
+        // detection stays in the main Validate — it requires the
+        // cross-source view that the full Validate owns.)
+        // Build the live-upstream-names set ONCE here; both
+        // ValidateProxyAuth and ValidateHotReloadable use it to scope
+        // their per-upstream checks to entries actually running today.
+        // Same rationale for both: new/restart-only proxies don't take
+        // effect until restart, so the strict reload gate shouldn't
+        // fail on them. The `main.cc::ReloadConfig` warn-downgrade
+        // path covers operator notification for staged-but-not-live
+        // edits.
+        std::unordered_set<std::string> live_names;
+        live_names.reserve(upstream_configs_.size());
+        for (const auto& u : upstream_configs_) {
+            live_names.insert(u.name);
+        }
+        try {
+            ConfigLoader::ValidateProxyAuth(new_config, live_names);
+        } catch (const std::invalid_argument& e) {
+            logging::Get()->error("Reload() rejected invalid inline auth: {}",
+                                  e.what());
             return false;
         }
         // Strict gate for hot-reloadable CB fields + duplicate names.
@@ -3786,11 +3826,6 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // block otherwise-safe reloads. `upstream_configs_` is the
         // post-Start snapshot of running upstreams.
         {
-            std::unordered_set<std::string> live_names;
-            live_names.reserve(upstream_configs_.size());
-            for (const auto& u : upstream_configs_) {
-                live_names.insert(u.name);
-            }
             try {
                 ConfigLoader::ValidateHotReloadable(new_config, live_names);
             } catch (const std::invalid_argument& e) {

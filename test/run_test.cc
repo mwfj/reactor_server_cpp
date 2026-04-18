@@ -23,6 +23,7 @@
 #include "circuit_breaker_wait_queue_drain_test.h"
 #include "circuit_breaker_observability_test.h"
 #include "circuit_breaker_reload_test.h"
+#include "auth_foundation_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -118,6 +119,9 @@ void RunAllTest(){
     // Run circuit-breaker hot-reload tests
     CircuitBreakerReloadTests::RunAllTests();
 
+    // Run auth foundation tests (minimal — pins r3/r5 security invariants)
+    AuthFoundationTests::RunAllTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -139,8 +143,10 @@ void PrintUsage(const char* program_name) {
     std::cout << "  upstream, -U    Run upstream connection pool tests only" << std::endl;
     std::cout << "  proxy,    -P    Run proxy engine tests only" << std::endl;
     std::cout << "  rate_limit, -L  Run rate limit tests only" << std::endl;
+    std::cout << "  circuit_breaker, -B  Run circuit-breaker tests only" << std::endl;
+    std::cout << "  auth,     -A    Run auth foundation tests only" << std::endl;
     std::cout << "  help,     -h    Show this help message" << std::endl;
-    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route + kqueue + upstream + proxy + rate_limit)" << std::endl;
+    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route + kqueue + upstream + proxy + rate_limit + circuit_breaker + auth)" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -207,6 +213,9 @@ int main(int argc, char* argv[]) {
             CircuitBreakerWaitQueueDrainTests::RunAllTests();
             CircuitBreakerObservabilityTests::RunAllTests();
             CircuitBreakerReloadTests::RunAllTests();
+        // Run auth foundation tests (token_hasher + base64url env auto-detect + scope extractors)
+        }else if(mode == "auth" || mode == "-A"){
+            AuthFoundationTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "common.h"
+#include "auth/auth_context.h"
+#include <optional>
 // <unordered_map> provided by common.h
 
 struct HttpRequest {
@@ -87,6 +89,15 @@ struct HttpRequest {
     // Dispatcher-thread only.
     mutable int async_cap_sec_override = -1;
 
+    // Authenticated identity populated by the auth middleware on successful
+    // validation. Read by downstream middleware / handlers and by
+    // HeaderRewriter when constructing the outbound upstream request.
+    //
+    // Mutable because, like params / client_ip / async_cancel_slot, it is
+    // populated during dispatch through a const HttpRequest&.
+    // Dispatcher-thread only. Left empty when no auth policy matches.
+    mutable std::optional<AUTH_NAMESPACE::AuthContext> auth;
+
     // Case-insensitive header lookup
     std::string GetHeader(const std::string& name) const {
         std::string lower = name;
@@ -123,5 +134,6 @@ struct HttpRequest {
         client_fd = -1;
         async_cancel_slot.reset();
         async_cap_sec_override = -1;
+        auth.reset();
     }
 };

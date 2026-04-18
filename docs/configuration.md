@@ -295,6 +295,10 @@ Throws `std::invalid_argument` on validation failure.
 
 - `size_t` fields (`max_header_size`, `max_body_size`, `max_ws_message_size`) use `is_number_unsigned()` to reject negative JSON values (prevents unsigned wrap-around)
 - Integer env vars use `std::stoi()` (not `atoi()`) for proper error detection on non-numeric input
+- All `int`-typed config fields go through a strict integer parser (`ParseStrictInt`) that rejects:
+  - Non-integer JSON (`true`, `1.9`, `"42"`, `null`, arrays, objects)
+  - Values outside `[INT_MIN, INT_MAX]` — without this, `nlohmann/json`'s `.get<int>()` silently wraps oversized unsigned values (e.g. `{"bind_port": 4294967297}` would load as port 1)
+  - Applies to top-level fields (`bind_port`, `max_connections`, `idle_timeout_sec`, `worker_threads`, `request_timeout_sec`, `shutdown_drain_timeout_sec`), nested integers (`log.max_files`, `rate_limit.status_code`, `rate_limit.zones[].max_entries`), and every `auth.*` / `circuit_breaker.*` integer
 
 ## Rate Limiting
 
@@ -493,11 +497,132 @@ Use `logging::SanitizePath(path)` to strip query parameters and fragments from U
 - `CheckRotation()` is thread-safe (acquires internal mutex)
 - If `Init()` not called, `Get()` returns spdlog's default logger
 
+## Authentication (OAuth 2.0 Token Validation)
+
+> **Status — Phase 1 (foundation only):** This release lands the auth config schema, the data structures (`AuthConfig`, `IssuerConfig`, `AuthPolicy`, `AuthForwardConfig`, `IntrospectionConfig`), and the pure utilities (token hashing, claim extraction, policy matcher). Request-time enforcement (`AuthManager`, JWT verification, the per-route middleware, JWKS fetch, introspection POST, and `auth.forward` header overlay) is **not yet wired**. The validator hard-rejects any config with `auth.enabled: true` or `proxy.auth.enabled: true` so that operators cannot deploy a config that would silently behave as unauthenticated. Full enforcement lands in Phase 2.
+
+### Top-Level `auth` Block
+
+```json
+{
+  "auth": {
+    "enabled": false,
+    "hmac_cache_key_env": "REACTOR_AUTH_CACHE_KEY",
+    "issuers": {
+      "google": {
+        "issuer_url": "https://accounts.google.com",
+        "discovery": true,
+        "upstream": "google-idp",
+        "mode": "jwt",
+        "audiences": ["https://api.example.com"],
+        "algorithms": ["RS256", "ES256"],
+        "leeway_sec": 30,
+        "jwks_cache_sec": 300,
+        "jwks_refresh_timeout_sec": 5,
+        "discovery_retry_sec": 30,
+        "required_claims": []
+      },
+      "ours": {
+        "issuer_url": "https://idp.internal",
+        "discovery": false,
+        "jwks_uri": "https://idp.internal/.well-known/jwks.json",
+        "upstream": "internal-idp",
+        "mode": "introspection",
+        "introspection": {
+          "endpoint": "https://idp.internal/oauth2/introspect",
+          "client_id": "reactor-gateway",
+          "client_secret_env": "REACTOR_INTROSPECTION_SECRET",
+          "auth_style": "basic",
+          "timeout_sec": 3,
+          "cache_sec": 60,
+          "negative_cache_sec": 10,
+          "stale_grace_sec": 30,
+          "max_entries": 100000,
+          "shards": 16
+        }
+      }
+    },
+    "policies": [
+      {
+        "name": "admin-only",
+        "enabled": false,
+        "applies_to": ["/admin/"],
+        "issuers": ["ours"],
+        "required_scopes": ["admin"],
+        "required_audience": "https://api.example.com",
+        "on_undetermined": "deny",
+        "realm": "admin"
+      }
+    ],
+    "forward": {
+      "subject_header": "X-Auth-Subject",
+      "issuer_header": "X-Auth-Issuer",
+      "scopes_header": "X-Auth-Scopes",
+      "raw_jwt_header": "",
+      "claims_to_headers": {
+        "email": "X-Auth-Email"
+      },
+      "strip_inbound_identity_headers": true,
+      "preserve_authorization": true
+    }
+  }
+}
+```
+
+### Inline `proxy.auth` Block
+
+Per-upstream auth policies live inline on the proxy entry — the prefix is derived from `proxy.route_prefix`, so inline policies do **not** carry an `applies_to`.
+
+```json
+{
+  "upstreams": [{
+    "name": "billing-api",
+    "host": "127.0.0.1",
+    "port": 9000,
+    "proxy": {
+      "route_prefix": "/billing/",
+      "auth": {
+        "enabled": false,
+        "issuers": ["ours"],
+        "required_scopes": ["billing.read"],
+        "on_undetermined": "deny"
+      }
+    }
+  }]
+}
+```
+
+### Validation Rules
+
+`ConfigLoader::Validate()` enforces (Phase 1):
+
+- **Master gate** — `auth.enabled` and `proxy.auth.enabled` MUST be `false` until Phase 2 enforcement lands. Any `true` is hard-rejected at startup and on SIGHUP reload.
+- **TLS-mandatory upstream endpoints** — `jwks_uri` and `introspection.endpoint` MUST be `https://`. Plain HTTP is hard-rejected (token-bearing exchanges over plaintext are a credential leak).
+- **Inline `client_secret` is forbidden** — only `client_secret_env` (env-var indirection) is accepted. Prevents secrets from sitting in versioned config files.
+- **Issuer cross-references** — `auth.issuers.<name>.upstream` must name an existing entry in `upstreams[]` (skipped on reload-stripped copies; `ValidateProxyAuth` re-checks against the live upstream set).
+- **Top-level policy `name` is required** — array-index-based log lines are unstable across config edits; every operator-visible log/metric must cite a stable identifier.
+- **Reserved auth.forward names** — `subject_header` / `issuer_header` / `scopes_header` / `raw_jwt_header` and every `claims_to_headers` value are rejected if they collide with:
+  - HTTP/2 pseudo-headers (`:method`, `:path`, `:scheme`, `:authority`, `:status`)
+  - Hop-by-hop headers (RFC 7230 §6.1: `Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, plus the legacy `Proxy-Connection`)
+  - Framing-critical headers (`Host`, `Content-Length`, `Content-Type`, `Content-Encoding`)
+  - `Authorization` (would conflict with `preserve_authorization`)
+  - HeaderRewriter-owned hop-identity headers (`Via`, `X-Forwarded-For`, `X-Forwarded-Proto`) — these names are rewritten on every outbound request, so an auth.forward mapping to one would silently mangle either the identity signal or the proxy chain
+- **Header-name validity** — every output header name is checked against RFC 7230 §3.2.6 `tchar` (rejects spaces, slashes, colons, etc.).
+- **Inline auth requires a literal byte-prefix `route_prefix`** — patterned routes (e.g. `/api/:version/`) are rejected for inline auth because the matcher does literal byte-prefix matching, not trie pattern matching, and the JSON would otherwise describe a different protected path than the runtime applies.
+- **`applies_to` on top-level policies** — required when `enabled: true`; literal byte prefixes (printable characters allowed, including `:` / `*` for legitimate literal URLs).
+- **`on_undetermined`** — must be `"deny"` (default) or `"allow"`.
+- **Strict integer parsing** — every `auth.*` integer (`leeway_sec`, `jwks_cache_sec`, `introspection.timeout_sec`, etc.) goes through `ParseStrictInt` (see Type Safety above).
+
+### Reload Semantics (Phase 1)
+
+The full Phase 2 hot-reload story (live JWKS rotation, runtime-mutable forward overlay, etc.) lands with the enforcement layer. In Phase 1, SIGHUP reload runs the same auth validation as startup — any post-reload config that flips `auth.enabled` to `true` is rejected before the new config is committed.
+
 ## Third-Party Dependencies
 
-| Library | Version | Path | Purpose |
-|---------|---------|------|---------|
-| nlohmann/json | 3.11.3 | `third_party/nlohmann/json.hpp` | Single-header JSON parsing |
-| spdlog | 1.15.1 | `third_party/spdlog/` | Header-only structured logging |
+| Library | Version | Path | Purpose | License |
+|---------|---------|------|---------|---------|
+| nlohmann/json | 3.11.3 | `third_party/nlohmann/json.hpp` | Single-header JSON parsing | MIT |
+| spdlog | 1.15.1 | `third_party/spdlog/` | Header-only structured logging | MIT |
+| jwt-cpp | 0.7.1 | `third_party/jwt-cpp/` | Header-only JWT decoding/verification (compiled with `JWT_DISABLE_PICOJSON` so the project's existing nlohmann/json carries the JSON traits) | MIT |
 
-Both are MIT-licensed, vendored in the repository.
+All vendored in the repository.
