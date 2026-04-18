@@ -2388,7 +2388,14 @@ void TestIntegrationDownstreamBackpressureSuspendsIdleTimeout() {
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
-        std::string full = RecvUntilClose(client_fd, 5000);
+        // Under the intentionally tiny downstream receive buffer, draining the
+        // final chunked response can take well beyond a single short poll gap
+        // even when the relay is healthy. Wait for the terminating chunk
+        // marker instead of assuming the connection will close quickly.
+        std::string full = RecvUntilContains(client_fd, "0\r\n\r\n", 20000);
+        if (full.find("0\r\n\r\n") == std::string::npos) {
+            full += RecvUntilClose(client_fd, 2000);
+        }
         close(client_fd);
 
         bool pass = true;
