@@ -251,7 +251,12 @@ public:
           mark_response_committed_(std::move(mark_response_committed)) {}
 
     int SendHeaders(const HttpResponse& headers_only_response) override {
-        if (!conn_ || conn_->IsClosing()) return -1;
+        if (!conn_ || conn_->IsClosing()) {
+            logging::Get()->debug(
+                "H1 streaming SendHeaders rejected fd={} connection unavailable",
+                conn_ ? conn_->fd() : -1);
+            return -1;
+        }
         if (!conn_->IsOnDispatcherThread()) {
             logging::Get()->error(
                 "H1 streaming SendHeaders called off dispatcher fd={}",
@@ -259,6 +264,9 @@ public:
             return -1;
         }
         if (terminal_ || programmer_error_ || headers_sent_) {
+            logging::Get()->debug(
+                "H1 streaming SendHeaders rejected fd={} terminal={} programmer_error={} headers_sent={}",
+                conn_->fd(), terminal_, programmer_error_, headers_sent_);
             return -1;
         }
         if (headers_only_response.GetStatusCode() < HttpStatus::OK) {
@@ -282,6 +290,9 @@ public:
         if (!claimed_response_) {
             if (!claim_response_ || !claim_response_()) {
                 terminal_ = true;
+                logging::Get()->debug(
+                    "H1 streaming SendHeaders failed to claim final response fd={}",
+                    conn_->fd());
                 return -1;
             }
             claimed_response_ = true;
@@ -302,6 +313,9 @@ public:
 
     SendResult SendData(const char* data, size_t len) override {
         if (!conn_ || conn_->IsClosing()) {
+            logging::Get()->debug(
+                "H1 streaming SendData rejected fd={} connection unavailable len={}",
+                conn_ ? conn_->fd() : -1, len);
             return SendResult::CLOSED;
         }
         if (!conn_->IsOnDispatcherThread()) {
@@ -314,6 +328,9 @@ public:
             return HandleProgrammerError("SendData");
         }
         if (terminal_ || programmer_error_) {
+            logging::Get()->debug(
+                "H1 streaming SendData rejected fd={} terminal={} programmer_error={} len={}",
+                conn_->fd(), terminal_, programmer_error_, len);
             return SendResult::CLOSED;
         }
         if (body_suppressed_) {
@@ -349,6 +366,9 @@ public:
     SendResult End(
         const std::vector<std::pair<std::string, std::string>>& trailers) override {
         if (!conn_ || conn_->IsClosing()) {
+            logging::Get()->debug(
+                "H1 streaming End rejected fd={} connection unavailable",
+                conn_ ? conn_->fd() : -1);
             return SendResult::CLOSED;
         }
         if (!conn_->IsOnDispatcherThread()) {
@@ -362,7 +382,15 @@ public:
             return SendResult::CLOSED;
         }
         if (terminal_ || programmer_error_) {
+            logging::Get()->debug(
+                "H1 streaming End rejected fd={} terminal={} programmer_error={}",
+                conn_->fd(), terminal_, programmer_error_);
             return SendResult::CLOSED;
+        }
+        if (!use_chunked_ && !trailers.empty()) {
+            logging::Get()->debug(
+                "H1 streaming End dropping trailers on non-chunked response fd={} trailer_count={}",
+                conn_->fd(), trailers.size());
         }
         terminal_ = true;
         if (use_chunked_) {

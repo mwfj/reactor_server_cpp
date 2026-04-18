@@ -69,6 +69,9 @@ public:
         if (buffer_.empty()) {
             if (!RebuildBuffer(std::max(high_water_, required))) {
                 Abort();
+                logging::Get()->debug(
+                    "H2 streaming relay failed to allocate initial buffer size={} required={}",
+                    size_, required);
                 return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
             }
         } else if (required > buffer_.size()) {
@@ -79,12 +82,11 @@ public:
             // overshooting more than the already-buffered payload demands.
             if (!RebuildBuffer(required)) {
                 Abort();
+                logging::Get()->debug(
+                    "H2 streaming relay failed to grow buffer current_cap={} required={}",
+                    buffer_.size(), required);
                 return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
             }
-        }
-        if (buffer_.empty()) {
-            Abort();
-            return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
         }
         size_t first = std::min(len, buffer_.size() - write_off_);
         std::memcpy(buffer_.data() + write_off_, data, first);
@@ -115,6 +117,8 @@ public:
                 *data_flags |= NGHTTP2_DATA_FLAG_EOF;
                 return 0;
             }
+            logging::Get()->debug(
+                "H2 streaming data source deferred stream read waiting for more bytes");
             return NGHTTP2_ERR_DEFERRED;
         }
 
@@ -213,7 +217,12 @@ public:
         auto self = handler_.lock();
         auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
         auto conn = self ? self->GetConnection() : nullptr;
-        if (!self || !session || !conn || conn->IsClosing()) return -1;
+        if (!self || !session || !conn || conn->IsClosing()) {
+            logging::Get()->debug(
+                "H2 streaming SendHeaders rejected stream={} handler/session/conn unavailable",
+                stream_id_);
+            return -1;
+        }
         if (!conn->IsOnDispatcherThread()) {
             logging::Get()->error(
                 "H2 streaming SendHeaders called off dispatcher stream={}",
@@ -221,11 +230,17 @@ public:
             return -1;
         }
         if (terminal_ || programmer_error_ || headers_sent_) {
+            logging::Get()->debug(
+                "H2 streaming SendHeaders rejected stream={} terminal={} programmer_error={} headers_sent={}",
+                stream_id_, terminal_, programmer_error_, headers_sent_);
             return -1;
         }
         if (!claimed_response_) {
             if (!claim_response_ || !claim_response_()) {
                 terminal_ = true;
+                logging::Get()->debug(
+                    "H2 streaming SendHeaders failed to claim final response stream={}",
+                    stream_id_);
                 return -1;
             }
             claimed_response_ = true;
@@ -238,6 +253,9 @@ public:
             session, stream_id_, headers_only_response);
         if (session->SubmitStreamingResponse(
                 stream_id_, headers_only_response, data_source_) != 0) {
+            logging::Get()->warn(
+                "H2 streaming SendHeaders submit failed stream={}",
+                stream_id_);
             terminal_ = true;
             body_suppressed_ = false;
             if (data_source_) {
@@ -264,12 +282,18 @@ public:
             return HandleProgrammerError("SendData");
         }
         if (terminal_ || programmer_error_ || !data_source_) {
+            logging::Get()->debug(
+                "H2 streaming SendData rejected stream={} terminal={} programmer_error={} has_data_source={} len={}",
+                stream_id_, terminal_, programmer_error_, data_source_ != nullptr, len);
             return SendResult::CLOSED;
         }
         auto self = handler_.lock();
         auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
         auto conn = self ? self->GetConnection() : nullptr;
         if (!self || !session || !conn || conn->IsClosing()) {
+            logging::Get()->debug(
+                "H2 streaming SendData rejected stream={} handler/session/conn unavailable len={}",
+                stream_id_, len);
             return SendResult::CLOSED;
         }
         if (!conn->IsOnDispatcherThread()) {
@@ -282,6 +306,9 @@ public:
             return SendResult::ACCEPTED_BELOW_WATER;
         }
         if (data_source_->Append(data, len) == SendResult::CLOSED) {
+            logging::Get()->warn(
+                "H2 streaming SendData failed to append stream={} len={}",
+                stream_id_, len);
             return SendResult::CLOSED;
         }
         // While we're still inside nghttp2_session_mem_recv2, the stream has
@@ -291,6 +318,9 @@ public:
         if (!session->InReceiveData()) {
             int rv = session->ResumeStreamData(stream_id_);
             if (rv != 0) {
+                logging::Get()->warn(
+                    "H2 streaming SendData resume failed stream={} rv={}",
+                    stream_id_, rv);
                 AbortInternal(false, AbortReason::CLIENT_DISCONNECT);
                 return SendResult::CLOSED;
             }
@@ -306,6 +336,9 @@ public:
             return SendResult::CLOSED;
         }
         if (terminal_ || programmer_error_ || !data_source_) {
+            logging::Get()->debug(
+                "H2 streaming End rejected stream={} terminal={} programmer_error={} has_data_source={}",
+                stream_id_, terminal_, programmer_error_, data_source_ != nullptr);
             return SendResult::CLOSED;
         }
         if (!trailers.empty()) {
@@ -317,6 +350,9 @@ public:
         auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
         auto conn = self ? self->GetConnection() : nullptr;
         if (!self || !session || !conn || conn->IsClosing()) {
+            logging::Get()->debug(
+                "H2 streaming End rejected stream={} handler/session/conn unavailable",
+                stream_id_);
             return SendResult::CLOSED;
         }
         if (!conn->IsOnDispatcherThread()) {
@@ -337,6 +373,9 @@ public:
         if (!session->InReceiveData()) {
             int rv = session->ResumeStreamData(stream_id_);
             if (rv != 0) {
+                logging::Get()->warn(
+                    "H2 streaming End resume failed stream={} rv={}",
+                    stream_id_, rv);
                 AbortInternal(false, AbortReason::CLIENT_DISCONNECT);
                 return SendResult::CLOSED;
             }

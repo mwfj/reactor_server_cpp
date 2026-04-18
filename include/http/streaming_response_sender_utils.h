@@ -1,11 +1,11 @@
 #pragma once
 
-#include "http/http_callbacks.h"
+#include "http/streaming_response_sender.h"
 
 inline const char* StreamingAbortReasonToString(
-    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason reason) {
+    HTTP_STREAMING_NAMESPACE::StreamingResponseSender::AbortReason reason) {
     using AbortReason =
-        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason;
+        HTTP_STREAMING_NAMESPACE::StreamingResponseSender::AbortReason;
     switch (reason) {
         case AbortReason::UPSTREAM_TRUNCATED: return "upstream_truncated";
         case AbortReason::UPSTREAM_TIMEOUT: return "upstream_timeout";
