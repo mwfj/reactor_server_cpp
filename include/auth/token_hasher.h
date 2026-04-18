@@ -4,7 +4,7 @@
 #include <optional>
 // <string>, <cstdint> via common.h
 
-namespace auth {
+namespace AUTH_NAMESPACE {
 
 // Keyed HMAC-SHA256 hasher used to derive cache keys for the introspection
 // cache. Takes raw bearer tokens and returns a 128-bit (16-byte) truncated
@@ -77,4 +77,4 @@ std::string GenerateHmacKey();
 // the raw bytes explicitly, or (b) use a key length other than 43/44 chars.
 std::string LoadHmacKeyFromEnv(const std::string& env_var_name);
 
-}  // namespace auth
+}  // namespace AUTH_NAMESPACE

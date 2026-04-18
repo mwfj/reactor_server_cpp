@@ -2,7 +2,7 @@
 
 #include <sstream>
 
-namespace auth {
+namespace AUTH_NAMESPACE {
 
 namespace {
 
@@ -195,4 +195,4 @@ bool MatchesAudience(const nlohmann::json& payload,
     return false;
 }
 
-}  // namespace auth
+}  // namespace AUTH_NAMESPACE

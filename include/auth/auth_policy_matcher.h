@@ -4,7 +4,7 @@
 #include "auth/auth_config.h"
 // <vector>, <string> via common.h
 
-namespace auth {
+namespace AUTH_NAMESPACE {
 
 // AppliedPolicy is a (path_prefix, policy) pair. One policy may have many
 // applied entries (one per prefix in its applies_to list). AppliedPolicyList
@@ -56,4 +56,4 @@ const AppliedPolicy* FindPolicyForPath(const AppliedPolicyList& policies,
 bool ValidatePolicyList(const AppliedPolicyList& policies,
                         std::string& err_out);
 
-}  // namespace auth
+}  // namespace AUTH_NAMESPACE

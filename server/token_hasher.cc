@@ -9,7 +9,7 @@
 #include <cstring>
 #include <cstdlib>
 
-namespace auth {
+namespace AUTH_NAMESPACE {
 
 namespace {
 
@@ -185,4 +185,4 @@ std::string LoadHmacKeyFromEnv(const std::string& env_var_name) {
     return raw;
 }
 
-}  // namespace auth
+}  // namespace AUTH_NAMESPACE

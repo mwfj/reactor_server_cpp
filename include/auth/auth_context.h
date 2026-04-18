@@ -4,7 +4,7 @@
 #include <optional>
 // <string>, <vector>, <map>, <optional> via common.h
 
-namespace auth {
+namespace AUTH_NAMESPACE {
 
 // AuthContext is the output of the auth middleware on successful validation.
 // Attached to HttpRequest via a mutable field (see include/http/http_request.h).
@@ -39,4 +39,4 @@ struct AuthContext {
     }
 };
 
-}  // namespace auth
+}  // namespace AUTH_NAMESPACE

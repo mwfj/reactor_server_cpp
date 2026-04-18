@@ -2,7 +2,7 @@
 
 #include <unordered_map>
 
-namespace auth {
+namespace AUTH_NAMESPACE {
 
 const AppliedPolicy* FindPolicyForPath(const AppliedPolicyList& policies,
                                        const std::string& path) {
@@ -49,4 +49,4 @@ bool ValidatePolicyList(const AppliedPolicyList& policies,
     return true;
 }
 
-}  // namespace auth
+}  // namespace AUTH_NAMESPACE

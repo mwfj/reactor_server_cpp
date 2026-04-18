@@ -3,7 +3,7 @@
 #include "common.h"
 // <string>, <vector>, <map>, <unordered_map> via common.h
 
-namespace auth {
+namespace AUTH_NAMESPACE {
 
 // ---------------------------------------------------------------------------
 // Introspection-mode config (RFC 7662 token introspection).
@@ -141,4 +141,4 @@ struct AuthConfig {
     bool operator!=(const AuthConfig& o) const { return !(*this == o); }
 };
 
-}  // namespace auth
+}  // namespace AUTH_NAMESPACE

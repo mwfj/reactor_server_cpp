@@ -47,7 +47,7 @@ AllUpstreamNames(const ServerConfig& cfg) {
 void TestHasherBasicDeterminism() {
     std::cout << "\n[TEST] TokenHasher::Hash determinism + optional contract..." << std::endl;
     try {
-        auth::TokenHasher hasher(std::string(32, 'k'));
+        AUTH_NAMESPACE::TokenHasher hasher(std::string(32, 'k'));
 
         auto a1 = hasher.Hash("token-A");
         auto a2 = hasher.Hash("token-A");
@@ -107,7 +107,7 @@ void TestLoadHmacKeyFromEnvDoesNotThrow() {
         std::string bad_key;
         bool threw = false;
         try {
-            bad_key = auth::LoadHmacKeyFromEnv(kVarName);
+            bad_key = AUTH_NAMESPACE::LoadHmacKeyFromEnv(kVarName);
         } catch (const std::exception& e) {
             threw = true;
         }
@@ -125,7 +125,7 @@ void TestLoadHmacKeyFromEnvDoesNotThrow() {
         std::string short_key;
         bool threw2 = false;
         try {
-            short_key = auth::LoadHmacKeyFromEnv(kVarName);
+            short_key = AUTH_NAMESPACE::LoadHmacKeyFromEnv(kVarName);
         } catch (const std::exception& e) {
             threw2 = true;
         }
@@ -189,19 +189,19 @@ void TestLoadHmacKeyFromEnvAutoDetect() {
         // Case A: unpadded base64url (RFC 7515 standard — the review's
         // finding that this branch must work).
         setenv(kVarName, base64url_unpadded.c_str(), 1);
-        std::string decoded_unpadded = auth::LoadHmacKeyFromEnv(kVarName);
+        std::string decoded_unpadded = AUTH_NAMESPACE::LoadHmacKeyFromEnv(kVarName);
 
         // Case B: same value but with jwt-cpp "%3d" padding (what
         // jwt::base::encode produces natively) — must also work.
         std::string base64url_padded =
             jwt::base::encode<jwt::alphabet::base64url>(raw32);
         setenv(kVarName, base64url_padded.c_str(), 1);
-        std::string decoded_padded = auth::LoadHmacKeyFromEnv(kVarName);
+        std::string decoded_padded = AUTH_NAMESPACE::LoadHmacKeyFromEnv(kVarName);
 
         // Case C: raw fallback — 16-char string decodes to 12 bytes (not 32)
         // so auto-detect should decline and return the raw bytes.
         setenv(kVarName, "AAAAAAAAAAAAAAAA", 1);
-        std::string raw_fallback = auth::LoadHmacKeyFromEnv(kVarName);
+        std::string raw_fallback = AUTH_NAMESPACE::LoadHmacKeyFromEnv(kVarName);
 
         restore_env(kVarName, had_original ? saved.c_str() : nullptr);
 
@@ -248,17 +248,17 @@ void TestExtractScopesScpAsString() {
         // Azure AD delegated flow: scp is a space-separated string.
         auto payload_str = nlohmann::json::parse(
             R"({"scp":"read:data read:profile write:data"})");
-        auto scopes_str = auth::ExtractScopes(payload_str);
+        auto scopes_str = AUTH_NAMESPACE::ExtractScopes(payload_str);
 
         // Traditional array form must still work.
         auto payload_arr = nlohmann::json::parse(
             R"({"scp":["read:data","read:profile"]})");
-        auto scopes_arr = auth::ExtractScopes(payload_arr);
+        auto scopes_arr = AUTH_NAMESPACE::ExtractScopes(payload_arr);
 
         // `scope` (space-sep string, OAuth2 classic) must still work.
         auto payload_scope = nlohmann::json::parse(
             R"({"scope":"alpha beta gamma"})");
-        auto scopes_scope = auth::ExtractScopes(payload_scope);
+        auto scopes_scope = AUTH_NAMESPACE::ExtractScopes(payload_scope);
 
         bool str_ok = scopes_str.size() == 3 &&
                       scopes_str[0] == "read:data" &&
@@ -615,7 +615,7 @@ void TestLoadHmacKeyFromEnvStandardBase64() {
         }
 
         setenv(kVarName, encoded.c_str(), 1);
-        std::string decoded_key = auth::LoadHmacKeyFromEnv(kVarName);
+        std::string decoded_key = AUTH_NAMESPACE::LoadHmacKeyFromEnv(kVarName);
 
         restore_env(kVarName, saved.c_str(), had_original);
 
@@ -957,8 +957,8 @@ void TestPopulateFromPayloadOptionalIssSub() {
             "client_id": "machine-a",
             "scope": "read:data"
         })");
-        auth::AuthContext ctx1;
-        bool ok1 = auth::PopulateFromPayload(client_cred, {"client_id"}, ctx1);
+        AUTH_NAMESPACE::AuthContext ctx1;
+        bool ok1 = AUTH_NAMESPACE::PopulateFromPayload(client_cred, {"client_id"}, ctx1);
         bool case1_pass = ok1 &&
             ctx1.issuer == "https://issuer.example" &&
             ctx1.subject.empty() &&
@@ -971,8 +971,8 @@ void TestPopulateFromPayloadOptionalIssSub() {
             "active": true,
             "scope": "read:data write:data"
         })");
-        auth::AuthContext ctx2;
-        bool ok2 = auth::PopulateFromPayload(minimal_introspect, {}, ctx2);
+        AUTH_NAMESPACE::AuthContext ctx2;
+        bool ok2 = AUTH_NAMESPACE::PopulateFromPayload(minimal_introspect, {}, ctx2);
         bool case2_pass = ok2 &&
             ctx2.issuer.empty() &&
             ctx2.subject.empty() &&
@@ -982,8 +982,8 @@ void TestPopulateFromPayloadOptionalIssSub() {
         // The relaxation is only about iss/sub; structural validity is
         // unchanged.
         nlohmann::json not_an_object = nlohmann::json::parse(R"("a string")");
-        auth::AuthContext ctx3;
-        bool ok3 = auth::PopulateFromPayload(not_an_object, {}, ctx3);
+        AUTH_NAMESPACE::AuthContext ctx3;
+        bool ok3 = AUTH_NAMESPACE::PopulateFromPayload(not_an_object, {}, ctx3);
         bool case3_pass = !ok3;  // must return false
 
         bool pass = case1_pass && case2_pass && case3_pass;
@@ -1329,7 +1329,7 @@ void TestConfigLoaderRejectsReservedForwardHeaders() {
 void TestPopulateFromPayloadClearsStaleFields() {
     std::cout << "\n[TEST] PopulateFromPayload clears stale fields on reuse..." << std::endl;
     try {
-        auth::AuthContext ctx;
+        AUTH_NAMESPACE::AuthContext ctx;
 
         // First call: populate ctx with iss/sub/email/groups (groups
         // ignored — it's an array — but email is a scalar that lands
@@ -1340,7 +1340,7 @@ void TestPopulateFromPayloadClearsStaleFields() {
             "email": "alice@example.com",
             "scope": "read:data"
         })");
-        bool ok1 = auth::PopulateFromPayload(first, {"email"}, ctx);
+        bool ok1 = AUTH_NAMESPACE::PopulateFromPayload(first, {"email"}, ctx);
         bool first_pass = ok1 &&
             ctx.issuer == "https://issuer-A.example" &&
             ctx.subject == "alice" &&
@@ -1360,7 +1360,7 @@ void TestPopulateFromPayloadClearsStaleFields() {
         nlohmann::json second = nlohmann::json::parse(R"({
             "scope": "write:data"
         })");
-        bool ok2 = auth::PopulateFromPayload(second, {"email"}, ctx);
+        bool ok2 = AUTH_NAMESPACE::PopulateFromPayload(second, {"email"}, ctx);
 
         bool second_pass = ok2 &&
             ctx.issuer.empty() &&         // NOT "https://issuer-A.example"
@@ -1376,7 +1376,7 @@ void TestPopulateFromPayloadClearsStaleFields() {
         ctx.subject = "leftover";
         ctx.claims["leftover"] = "leftover";
         nlohmann::json bad = nlohmann::json::parse(R"("a string")");
-        bool ok3 = auth::PopulateFromPayload(bad, {}, ctx);
+        bool ok3 = AUTH_NAMESPACE::PopulateFromPayload(bad, {}, ctx);
         bool third_pass = !ok3 &&  // returns false on non-object
             ctx.issuer.empty() &&
             ctx.subject.empty() &&
@@ -2192,7 +2192,7 @@ void TestConfigLoaderValidatesIntrospectionKnobs() {
 
 // -----------------------------------------------------------------------------
 // ConfigLoader::Validate — inline auth rejects patterned route_prefix
-// (review P1). auth::FindPolicyForPath does byte-prefix matching; a proxy
+// (review P1). AUTH_NAMESPACE::FindPolicyForPath does byte-prefix matching; a proxy
 // with /api/:v/users/*path cannot be matched via the auth overlay because
 // the literal string never appears in real request paths. Reject at load.
 // -----------------------------------------------------------------------------
@@ -2903,7 +2903,7 @@ void TestExtractScopesScopesAsString() {
         nlohmann::json p1 = nlohmann::json::parse(R"({
             "scopes": "read:data write:data admin:all"
         })");
-        auto scopes1 = auth::ExtractScopes(p1);
+        auto scopes1 = AUTH_NAMESPACE::ExtractScopes(p1);
         bool case1 = scopes1.size() == 3 &&
             scopes1[0] == "read:data" &&
             scopes1[1] == "write:data" &&
@@ -2913,7 +2913,7 @@ void TestExtractScopesScopesAsString() {
         nlohmann::json p2 = nlohmann::json::parse(R"({
             "scopes": ["read:data", "write:data"]
         })");
-        auto scopes2 = auth::ExtractScopes(p2);
+        auto scopes2 = AUTH_NAMESPACE::ExtractScopes(p2);
         bool case2 = scopes2.size() == 2 &&
             scopes2[0] == "read:data" &&
             scopes2[1] == "write:data";
@@ -2924,7 +2924,7 @@ void TestExtractScopesScopesAsString() {
             "scope": "a b",
             "scopes": "x y z"
         })");
-        auto scopes3 = auth::ExtractScopes(p3);
+        auto scopes3 = AUTH_NAMESPACE::ExtractScopes(p3);
         bool case3 = scopes3.size() == 2 && scopes3[0] == "a" && scopes3[1] == "b";
 
         // Case 4: `scopes` as a non-string/non-array (e.g. object) —
@@ -2932,7 +2932,7 @@ void TestExtractScopesScopesAsString() {
         nlohmann::json p4 = nlohmann::json::parse(R"({
             "scopes": {"something": "weird"}
         })");
-        auto scopes4 = auth::ExtractScopes(p4);
+        auto scopes4 = AUTH_NAMESPACE::ExtractScopes(p4);
         bool case4 = scopes4.empty();
 
         bool pass = case1 && case2 && case3 && case4;
@@ -3092,7 +3092,7 @@ void TestLoadHmacKeyFromEnvPreservesMiddlePadding() {
         // through to raw-bytes after base64 decode fails).
         const std::string tricky = "AAAA%3dBBBBCCCCDDDDEEEEFFFF";
         setenv(kVarName, tricky.c_str(), 1);
-        std::string loaded1 = auth::LoadHmacKeyFromEnv(kVarName);
+        std::string loaded1 = AUTH_NAMESPACE::LoadHmacKeyFromEnv(kVarName);
         // The string is not a valid 32-byte base64/base64url decode, so
         // it falls through to raw-bytes and is returned verbatim. The
         // CRITICAL assertion: the returned bytes are the full tricky
@@ -3104,7 +3104,7 @@ void TestLoadHmacKeyFromEnvPreservesMiddlePadding() {
         // '=' should remain intact).
         const std::string tricky_eq = "AAAA=BBBBCCCCDDDDEEEEFFFF";
         setenv(kVarName, tricky_eq.c_str(), 1);
-        std::string loaded2 = auth::LoadHmacKeyFromEnv(kVarName);
+        std::string loaded2 = AUTH_NAMESPACE::LoadHmacKeyFromEnv(kVarName);
         bool case2 = loaded2 == tricky_eq;
 
         // Case 3: REGRESSION — valid base64url still decodes to 32 bytes
@@ -3116,7 +3116,7 @@ void TestLoadHmacKeyFromEnvPreservesMiddlePadding() {
         // Strip standard '=' padding (operator-typical form).
         while (!encoded.empty() && encoded.back() == '=') encoded.pop_back();
         setenv(kVarName, encoded.c_str(), 1);
-        std::string loaded3 = auth::LoadHmacKeyFromEnv(kVarName);
+        std::string loaded3 = AUTH_NAMESPACE::LoadHmacKeyFromEnv(kVarName);
         bool case3 = loaded3.size() == 32 && loaded3 == raw_key;
 
         // Case 4: raw key with TRAILING '%3d' — should still strip
@@ -3127,7 +3127,7 @@ void TestLoadHmacKeyFromEnvPreservesMiddlePadding() {
         // accepts either; the PRIMARY contract is "not mid-truncated").
         const std::string trailing = "AAAABBBB%3d";
         setenv(kVarName, trailing.c_str(), 1);
-        std::string loaded4 = auth::LoadHmacKeyFromEnv(kVarName);
+        std::string loaded4 = AUTH_NAMESPACE::LoadHmacKeyFromEnv(kVarName);
         // Must be either the full string OR the stripped-tail version.
         // Must NOT be empty and must NOT be a middle-truncated variant
         // (i.e. if we see just "AAAABBBB" that's fine; if we see
@@ -3755,7 +3755,7 @@ void TestConfigLoaderStrictRateLimitMaxEntries() {
 // default without updating the parser, or vice versa), the reset would
 // quietly produce non-default state on a removed-key reload. This test
 // pins the invariant down by parsing minimal JSON and comparing against
-// `auth::AuthConfig{}` / `auth::IssuerConfig{}`.
+// `AUTH_NAMESPACE::AuthConfig{}` / `AUTH_NAMESPACE::IssuerConfig{}`.
 //
 // The IssuerConfig::algorithms default ({"RS256"}) is the trap that this
 // test is most directly guarding: a `.clear()`-style reset would set it
@@ -3769,7 +3769,7 @@ void TestConfigLoaderParseFreshDefaultsMatchStructDefaults() {
         ServerConfig cfg_min = ConfigLoader::LoadFromString(R"({
             "auth": { "enabled": false }
         })");
-        auth::AuthConfig fresh_auth{};
+        AUTH_NAMESPACE::AuthConfig fresh_auth{};
         if (cfg_min.auth != fresh_auth) {
             throw std::runtime_error(
                 "minimal-JSON AuthConfig differs from fresh-construction "
@@ -3799,10 +3799,10 @@ void TestConfigLoaderParseFreshDefaultsMatchStructDefaults() {
         if (it == cfg_iss.auth.issuers.end()) {
             throw std::runtime_error("issuer 'idp1' not parsed");
         }
-        const auth::IssuerConfig& parsed = it->second;
+        const AUTH_NAMESPACE::IssuerConfig& parsed = it->second;
         // Build the expected fresh issuer (only the explicitly-set fields
         // diverge from `IssuerConfig{}`).
-        auth::IssuerConfig expected{};
+        AUTH_NAMESPACE::IssuerConfig expected{};
         expected.name = "idp1";
         expected.issuer_url = "https://idp.example.com";
         expected.upstream = "idp";

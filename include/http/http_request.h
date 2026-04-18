@@ -96,7 +96,7 @@ struct HttpRequest {
     // Mutable because, like params / client_ip / async_cancel_slot, it is
     // populated during dispatch through a const HttpRequest&.
     // Dispatcher-thread only. Left empty when no auth policy matches.
-    mutable std::optional<auth::AuthContext> auth;
+    mutable std::optional<AUTH_NAMESPACE::AuthContext> auth;
 
     // Case-insensitive header lookup
     std::string GetHeader(const std::string& name) const {

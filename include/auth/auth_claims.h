@@ -5,7 +5,7 @@
 #include <nlohmann/json.hpp>
 // <string>, <vector> via common.h
 
-namespace auth {
+namespace AUTH_NAMESPACE {
 
 // Helpers that translate a decoded-JWT payload OR an introspection-response
 // JSON into the AuthContext we attach to HttpRequest.
@@ -54,4 +54,4 @@ bool HasRequiredScopes(const std::vector<std::string>& have,
 bool MatchesAudience(const nlohmann::json& payload,
                      const std::string& required);
 
-}  // namespace auth
+}  // namespace AUTH_NAMESPACE

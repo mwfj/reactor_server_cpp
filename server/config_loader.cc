@@ -190,7 +190,7 @@ static bool IsReservedAuthForwardHeader(const std::string& lower) {
 // ToJson round-trip). Omits defaulted fields only when they would collapse
 // noisily; defaulted simple fields are always emitted to keep the output
 // shape stable across round-trips.
-static nlohmann::json SerializeAuthPolicy(const auth::AuthPolicy& p) {
+static nlohmann::json SerializeAuthPolicy(const AUTH_NAMESPACE::AuthPolicy& p) {
     nlohmann::json out;
     if (!p.name.empty()) out["name"] = p.name;
     out["enabled"] = p.enabled;
@@ -216,7 +216,7 @@ static nlohmann::json SerializeAuthPolicy(const auth::AuthPolicy& p) {
 // and an inline `applies_to` would be silently ignored — the JSON would
 // then describe a different protected path than what the runtime uses,
 // which is a config-correctness bug. Reject loudly at parse time.
-static void ParseAuthPolicy(const nlohmann::json& j, auth::AuthPolicy& out,
+static void ParseAuthPolicy(const nlohmann::json& j, AUTH_NAMESPACE::AuthPolicy& out,
                             const std::string& context,
                             bool allow_applies_to = true) {
     if (!j.is_object()) {
@@ -293,7 +293,7 @@ static void ParseAuthPolicy(const nlohmann::json& j, auth::AuthPolicy& out,
 // Parse a single IssuerConfig JSON object for the top-level
 // `auth.issuers[name]` map.
 static void ParseIssuerConfig(const std::string& name, const nlohmann::json& j,
-                              auth::IssuerConfig& out) {
+                              AUTH_NAMESPACE::IssuerConfig& out) {
     const std::string ctx = "auth.issuers." + name;
     if (!j.is_object()) {
         throw std::invalid_argument(ctx + " must be a JSON object");
@@ -318,7 +318,7 @@ static void ParseIssuerConfig(const std::string& name, const nlohmann::json& j,
     // from the new JSON. Source defaults from a fresh struct so removed
     // keys behave identically to fresh construction (e.g. algorithms
     // returns to {"RS256"}, not empty).
-    static const auth::IssuerConfig kDefaults{};
+    static const AUTH_NAMESPACE::IssuerConfig kDefaults{};
     out.audiences = kDefaults.audiences;
     out.algorithms = kDefaults.algorithms;
     out.required_claims = kDefaults.required_claims;
@@ -400,7 +400,7 @@ static void ParseIssuerConfig(const std::string& name, const nlohmann::json& j,
 }
 
 // Parse the top-level `auth` block into ServerConfig::auth.
-static void ParseAuthConfig(const nlohmann::json& j, auth::AuthConfig& out) {
+static void ParseAuthConfig(const nlohmann::json& j, AUTH_NAMESPACE::AuthConfig& out) {
     if (!j.is_object()) {
         throw std::invalid_argument("auth must be a JSON object");
     }
@@ -414,7 +414,7 @@ static void ParseAuthConfig(const nlohmann::json& j, auth::AuthConfig& out) {
     // those keys were removed from the new JSON.
     out.issuers.clear();
     out.policies.clear();
-    out.forward = auth::AuthForwardConfig{};
+    out.forward = AUTH_NAMESPACE::AuthForwardConfig{};
 
     if (j.contains("issuers")) {
         if (!j["issuers"].is_object()) {
@@ -422,7 +422,7 @@ static void ParseAuthConfig(const nlohmann::json& j, auth::AuthConfig& out) {
                 "auth.issuers must be an object mapping name -> IssuerConfig");
         }
         for (auto it = j["issuers"].begin(); it != j["issuers"].end(); ++it) {
-            auth::IssuerConfig ic;
+            AUTH_NAMESPACE::IssuerConfig ic;
             ParseIssuerConfig(it.key(), it.value(), ic);
             out.issuers.emplace(it.key(), std::move(ic));
         }
@@ -434,7 +434,7 @@ static void ParseAuthConfig(const nlohmann::json& j, auth::AuthConfig& out) {
                 "auth.policies must be an array of AuthPolicy objects");
         }
         for (size_t i = 0; i < j["policies"].size(); ++i) {
-            auth::AuthPolicy p;
+            AUTH_NAMESPACE::AuthPolicy p;
             ParseAuthPolicy(j["policies"][i], p,
                             "auth.policies[" + std::to_string(i) + "]");
             out.policies.push_back(std::move(p));
@@ -2042,7 +2042,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     "the prefix list is ready.");
             }
 
-            // applies_to entries are consumed ONLY by auth::FindPolicyForPath
+            // applies_to entries are consumed ONLY by AUTH_NAMESPACE::FindPolicyForPath
             // which does literal byte-prefix matching (design spec §3.2).
             // No route_trie is involved in this path — the string is taken
             // verbatim as the prefix to compare against each request's URL
@@ -2126,7 +2126,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             // (even with no other fields) is signaling intent and should
             // still be told their proxy lacks a route_prefix. Same for
             // any other non-default field.
-            const bool inline_auth_populated = (p != auth::AuthPolicy{});
+            const bool inline_auth_populated = (p != AUTH_NAMESPACE::AuthPolicy{});
             if (inline_auth_populated && u.proxy.route_prefix.empty()) {
                 throw std::invalid_argument(
                     ctx + " has no route_prefix — inline auth requires a "
@@ -2134,7 +2134,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             }
 
             // route_prefix must be a LITERAL byte prefix when inline auth
-            // is populated. auth::FindPolicyForPath does literal-prefix
+            // is populated. AUTH_NAMESPACE::FindPolicyForPath does literal-prefix
             // matching (design spec §3.2) — it has no understanding of the
             // route_trie's :param / *splat syntax. A proxy with
             // `/api/:version/users/*path` routes real requests like
@@ -2430,7 +2430,7 @@ void ConfigLoader::ValidateProxyAuth(
         // actually populated the inline auth block. See the parallel
         // in-Validate comment for the rationale (programmatic-only
         // proxies with no auth block skip this check).
-        const bool inline_auth_populated = (p != auth::AuthPolicy{});
+        const bool inline_auth_populated = (p != AUTH_NAMESPACE::AuthPolicy{});
         if (inline_auth_populated && u.proxy.route_prefix.empty()) {
             throw std::invalid_argument(
                 ctx + " has no route_prefix — inline auth requires a "
@@ -2550,7 +2550,7 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
         // get its entire proxy block (including `auth`) silently dropped
         // by ToJson(). Round-trip would lose the staged policy. Treat
         // any non-default auth as sufficient reason to serialize.
-        if (u.proxy != ProxyConfig{} || u.proxy.auth != auth::AuthPolicy{}) {
+        if (u.proxy != ProxyConfig{} || u.proxy.auth != AUTH_NAMESPACE::AuthPolicy{}) {
             nlohmann::json pj;
             pj["route_prefix"] = u.proxy.route_prefix;
             pj["strip_prefix"] = u.proxy.strip_prefix;
@@ -2577,7 +2577,7 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             // default — same shape as the circuit_breaker block below —
             // because an empty/disabled stanza is the common case and
             // serializing it adds noise to every config dump.
-            if (u.proxy.auth != auth::AuthPolicy{}) {
+            if (u.proxy.auth != AUTH_NAMESPACE::AuthPolicy{}) {
                 pj["auth"] = SerializeAuthPolicy(u.proxy.auth);
             }
 
@@ -2634,7 +2634,7 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
 
     // Auth top-level block serialization. Emitted whenever it differs
     // from defaults so a round-trip preserves operator intent.
-    if (config.auth != auth::AuthConfig{}) {
+    if (config.auth != AUTH_NAMESPACE::AuthConfig{}) {
         nlohmann::json aj;
         aj["enabled"] = config.auth.enabled;
         if (!config.auth.hmac_cache_key_env.empty()) {
@@ -2658,7 +2658,7 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
                 if (!ic.required_claims.empty()) {
                     ijv["required_claims"] = ic.required_claims;
                 }
-                if (ic.introspection != auth::IntrospectionConfig{}) {
+                if (ic.introspection != AUTH_NAMESPACE::IntrospectionConfig{}) {
                     nlohmann::json inj;
                     inj["endpoint"] = ic.introspection.endpoint;
                     inj["client_id"] = ic.introspection.client_id;
@@ -2686,7 +2686,7 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             }
             aj["policies"] = pj;
         }
-        if (config.auth.forward != auth::AuthForwardConfig{}) {
+        if (config.auth.forward != AUTH_NAMESPACE::AuthForwardConfig{}) {
             nlohmann::json fj;
             fj["subject_header"] = config.auth.forward.subject_header;
             fj["issuer_header"] = config.auth.forward.issuer_header;

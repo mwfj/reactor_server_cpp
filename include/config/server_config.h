@@ -135,7 +135,7 @@ struct ProxyConfig {
     // warning in HttpServer::Reload(). See `DEVELOPMENT_RULES.md` under
     // *"Live-reloadable config fields in restart-required equality operators
     // — ordering matters"* for the rationale.
-    auth::AuthPolicy auth;
+    AUTH_NAMESPACE::AuthPolicy auth;
 
     // Excludes `auth` — auth policy edits are live-reloadable via
     // `AuthManager::Reload`, which `HttpServer::Reload` invokes on every
@@ -279,5 +279,5 @@ struct ServerConfig {
     Http2Config http2;
     std::vector<UpstreamConfig> upstreams;
     RateLimitConfig rate_limit;
-    auth::AuthConfig auth;
+    AUTH_NAMESPACE::AuthConfig auth;
 };
