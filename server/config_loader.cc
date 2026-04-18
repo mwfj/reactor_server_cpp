@@ -1988,6 +1988,34 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             const auto& p = config.auth.policies[i];
             const std::string ctx =
                 "auth.policies[" + std::to_string(i) + "]";
+            // Per AuthPolicy contract (auth_config.h): top-level policies
+            // require a non-empty `name`. Inline policies (proxy.auth) are
+            // anonymous because they're identified by their parent
+            // upstream's name, but top-level entries have no surrounding
+            // context — without a name, log lines and metrics for a deny
+            // / 401 / collision can only point to the array index, which
+            // is unstable across config edits and useless once the config
+            // file is reordered. Reject empty/whitespace-only names so
+            // every operator-visible log line for a top-level policy
+            // names something stable.
+            bool name_blank = p.name.empty();
+            if (!name_blank) {
+                name_blank = true;
+                for (char c : p.name) {
+                    if (!std::isspace(static_cast<unsigned char>(c))) {
+                        name_blank = false;
+                        break;
+                    }
+                }
+            }
+            if (name_blank) {
+                throw std::invalid_argument(
+                    ctx + ".name is required for top-level policies "
+                    "(inline proxy.auth policies inherit identity from "
+                    "their parent upstream; top-level entries have none "
+                    "and operator-visible logs/metrics need a stable "
+                    "identifier — array index is unstable across edits)");
+            }
             if (p.on_undetermined != "deny" && p.on_undetermined != "allow") {
                 throw std::invalid_argument(
                     ctx + ".on_undetermined must be \"deny\" or \"allow\"");

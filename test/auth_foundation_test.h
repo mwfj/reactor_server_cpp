@@ -4071,6 +4071,97 @@ void TestConfigLoaderStrictTopLevelIntegers() {
     }
 }
 
+// Top-level auth.policies[].name is REQUIRED per AuthPolicy contract
+// (auth_config.h:79). Inline proxy.auth policies are anonymous because
+// they're identified by their parent upstream's name, but top-level
+// entries have no surrounding context — without a name, log lines and
+// metrics for a deny / 401 / collision can only point to an unstable
+// array index. Validate() rejects empty/whitespace-only names so every
+// operator-visible log line for a top-level policy names something stable.
+void TestConfigLoaderRequiresTopLevelPolicyName() {
+    std::cout << "\n[TEST] ConfigLoader requires top-level policy name..." << std::endl;
+    auto validate_expect = [](const std::string& policies_array,
+                              const std::string& expected_phrase)
+        -> std::string {
+        std::string json = R"({
+            "auth": {
+                "enabled": false,
+                "issuers": {},
+                "policies": )" + policies_array + R"(
+            }
+        })";
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(cfg);
+            return "expected '" + expected_phrase + "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
+                return "threw but message missing '" + expected_phrase +
+                       "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+    try {
+        // Case 1: name field absent.
+        std::string err = validate_expect(
+            R"([{"enabled": false, "applies_to": ["/api/"]}])",
+            "name is required for top-level policies");
+        if (!err.empty()) throw std::runtime_error("name absent: " + err);
+
+        // Case 2: name explicitly empty string.
+        err = validate_expect(
+            R"([{"name": "", "enabled": false, "applies_to": ["/api/"]}])",
+            "name is required for top-level policies");
+        if (!err.empty()) throw std::runtime_error("name empty: " + err);
+
+        // Case 3: name whitespace-only — equivalent to empty for log purposes.
+        err = validate_expect(
+            R"([{"name": "   \t  ", "enabled": false, "applies_to": ["/api/"]}])",
+            "name is required for top-level policies");
+        if (!err.empty()) throw std::runtime_error("name whitespace: " + err);
+
+        // POSITIVE: a non-empty name passes validation. Use disabled +
+        // empty applies_to — disabled policies don't require applies_to,
+        // so the only thing this case tests is the name rule itself.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "auth": {
+                    "enabled": false,
+                    "issuers": {},
+                    "policies": [{
+                        "name": "admin-strict",
+                        "enabled": false,
+                        "applies_to": []
+                    }]
+                }
+            })");
+            ConfigLoader::Validate(cfg);
+            if (cfg.auth.policies.size() != 1 ||
+                cfg.auth.policies[0].name != "admin-strict") {
+                throw std::runtime_error(
+                    "valid named policy parsed but value didn't land");
+            }
+        } catch (const std::runtime_error& e) {
+            throw;
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("valid named policy rejected: ") + e.what());
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader requires top-level policy name",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader requires top-level policy name",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -4113,6 +4204,7 @@ inline void RunAllTests() {
     TestConfigLoaderParseFreshDefaultsMatchStructDefaults();
     TestConfigLoaderRejectsHeaderRewriterOwnedAuthForwardNames();
     TestConfigLoaderStrictTopLevelIntegers();
+    TestConfigLoaderRequiresTopLevelPolicyName();
 }
 
 }  // namespace AuthFoundationTests

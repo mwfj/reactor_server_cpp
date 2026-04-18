@@ -70,8 +70,9 @@ std::string GenerateHmacKey();
 // characters ([A-Za-z0-9_-], which includes UUID-like strings since `-` is
 // in the alphabet) is silently interpreted as base64url rather than raw.
 // HMAC security is preserved either way (both give 32 bytes of key material),
-// but the derived HMAC key differs between interpretations. An `info` log
-// line fires when this branch is taken so operators can disambiguate. To
+// but the derived HMAC key differs between interpretations. A `debug` log
+// line fires when this branch is taken so operators can disambiguate
+// without the line spamming every restart at default `info` level. To
 // force raw-bytes interpretation for such keys, either (a) base64url-encode
 // the raw bytes explicitly, or (b) use a key length other than 43/44 chars.
 std::string LoadHmacKeyFromEnv(const std::string& env_var_name);

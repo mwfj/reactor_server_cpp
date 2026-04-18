@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all tests (372 tests across 16 suites)
+make test               # Build and run all tests (570 tests across 24 suites)
 ./test_runner                   # Run all tests directly (after building)
 
 # Individual test suites
@@ -21,6 +21,8 @@ make test               # Build and run all tests (372 tests across 16 suites)
 ./test_runner upstream          # Upstream connection pool tests (or: ./test_runner -U)
 ./test_runner proxy             # Proxy engine tests (or: ./test_runner -P)
 ./test_runner rate_limit        # Rate limit tests (or: ./test_runner -L)
+./test_runner circuit_breaker   # Circuit breaker tests (or: ./test_runner -B)
+./test_runner auth              # OAuth Phase 1 foundation tests (or: ./test_runner -A)
 ./test_runner kqueue            # macOS kqueue platform tests (or: ./test_runner -K)
 ./test_runner help              # Show all options
 
@@ -37,6 +39,8 @@ make test_cli           # Build and run CLI tests
 make test_upstream      # Build and run upstream pool tests
 make test_proxy         # Build and run proxy engine tests
 make test_rate_limit    # Build and run rate limit tests
+make test_circuit_breaker # Build and run circuit breaker tests
+make test_auth          # Build and run OAuth Phase 1 foundation tests
 ```
 
 ## Test Suites
@@ -57,6 +61,14 @@ make test_rate_limit    # Build and run rate limit tests
 | Upstream Pool | 30 | ephemeral | `test/upstream_pool_test.h` | `./test_runner upstream` |
 | Proxy | 56 | ephemeral | `test/proxy_test.h` | `./test_runner proxy` |
 | Rate Limit | 46 | ephemeral | `test/rate_limit_test.h` | `./test_runner rate_limit` |
+| Circuit Breaker (state machine + window) | 45 | N/A | `test/circuit_breaker_test.h` | `./test_runner circuit_breaker` |
+| Circuit Breaker (components) | 11 | N/A | `test/circuit_breaker_components_test.h` | (bundled with `circuit_breaker`) |
+| Circuit Breaker (integration) | 14 | ephemeral | `test/circuit_breaker_integration_test.h` | (bundled with `circuit_breaker`) |
+| Circuit Breaker (retry budget) | 4 | ephemeral | `test/circuit_breaker_retry_budget_test.h` | (bundled with `circuit_breaker`) |
+| Circuit Breaker (wait-queue drain) | 2 | ephemeral | `test/circuit_breaker_wait_queue_drain_test.h` | (bundled with `circuit_breaker`) |
+| Circuit Breaker (observability) | 3 | ephemeral | `test/circuit_breaker_observability_test.h` | (bundled with `circuit_breaker`) |
+| Circuit Breaker (reload) | 7 | ephemeral | `test/circuit_breaker_reload_test.h` | (bundled with `circuit_breaker`) |
+| Auth Foundation (Phase 1) | 41 | N/A | `test/auth_foundation_test.h` | `./test_runner auth` |
 | Kqueue | 7 | ephemeral | `test/kqueue_test.h` | `./test_runner kqueue` (macOS only, skipped on Linux) |
 
 ### Basic Tests

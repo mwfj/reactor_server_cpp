@@ -23,12 +23,20 @@ std::vector<std::string> ExtractScopes(const nlohmann::json& payload);
 // into AuthContext::claims, to keep the context small).
 //
 // Also sets:
-//   ctx.issuer  = payload["iss"] (if string)
-//   ctx.subject = payload["sub"] (if string)
+//   ctx.issuer  = payload["iss"] (if string; left empty when absent)
+//   ctx.subject = payload["sub"] (if string; left empty when absent)
 //   ctx.scopes  = ExtractScopes(payload)
 //
-// Returns true when `sub` and `iss` are both present and string; false
-// otherwise (caller returns 401 invalid_token).
+// Returns true when `payload` is a JSON object (the only structural
+// requirement). `iss` and `sub` are both OPTIONAL per RFC 7519
+// §4.1.1/§4.1.2 — absent string values leave the corresponding ctx
+// field empty rather than failing. Caller policy decides whether to
+// require non-empty subject/issuer for a given route. Returns false
+// only when `payload` is not a JSON object.
+//
+// Pre-condition: callers should clear `ctx` (issuer/subject/scopes/
+// claims) before reuse. The implementation also clears these fields
+// at function entry as a defense in depth.
 bool PopulateFromPayload(const nlohmann::json& payload,
                          const std::vector<std::string>& claims_keys,
                          AuthContext& ctx);

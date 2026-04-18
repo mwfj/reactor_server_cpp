@@ -43,7 +43,9 @@ Layer 1: ConnectionHandler, Channel,        (reactor core)
          Dispatcher, EventHandler
 ```
 
-Layers 1–2 are the transport. Layers 3–5 are the protocol. Layer 6 is the gateway (upstream connectivity). Layer 7 is the inbound traffic-management middleware (rate limiting). HTTP/1.x and HTTP/2 are parallel handlers at Layer 3, selected by `ProtocolDetector` at connection time. Both converge on the same `HttpRouter` at Layer 4. ConnectionHandler supports both inbound (server) and outbound (client) connections.
+Layers 1–2 are the transport. Layers 3–5 are the protocol. Layer 6 is the gateway (upstream connectivity). Layer 7 is the inbound traffic-management middleware (rate limiting and circuit breaking). HTTP/1.x and HTTP/2 are parallel handlers at Layer 3, selected by `ProtocolDetector` at connection time. Both converge on the same `HttpRouter` at Layer 4. ConnectionHandler supports both inbound (server) and outbound (client) connections.
+
+> **Auth foundation (Phase 1):** OAuth 2.0 token-validation data structures, the policy matcher, and the pure utilities (token hasher, claim extraction) ship in `include/auth/`. Request-time enforcement (the AuthManager middleware, JWT verification, JWKS fetching, and token introspection) is **not yet wired** — the validator hard-rejects any config that flips `auth.enabled` or `proxy.auth.enabled` to `true`. Full enforcement will land as a Phase 2 middleware sitting between Layer 4 (router) and Layer 7 (rate-limit / circuit-breaker). See `docs/configuration.md` for the config schema and the Phase 1/Phase 2 boundary.
 
 ## Core Components
 
