@@ -966,6 +966,13 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
 }
 
 bool PoolPartition::ValidateConnection(UpstreamConnection* conn) {
+    auto transport = conn ? conn->GetTransport() : nullptr;
+    if (transport && transport->IsOnDispatcherThread() &&
+        transport->InputBufferSize() > 0) {
+        logging::Get()->debug("UpstreamConnection fd={} has buffered input, "
+                              "marking non-reusable", conn->fd());
+        return false;
+    }
     if (!conn->IsAlive()) return false;
     if (conn->IsExpired(config_.max_lifetime_sec,
                          config_.max_requests_per_conn)) return false;
@@ -1253,6 +1260,10 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
     transport->SetWriteProgressCb(nullptr);
     transport->SetConnectCompleteCallback(nullptr);
     transport->SetDeadlineTimeoutCb(nullptr);
+    // Idle pooled transports must never sit with an unbounded read cap.
+    // Unexpected bytes are treated as poison below, but ConnectionHandler
+    // reads into input_bf_ before the callback runs.
+    transport->SetMaxInputSize(MAX_BUFFER_SIZE);
 
     // Install pool-owned idle read handler: any data received on an idle
     // pooled connection is suspicious (late response chunk, protocol

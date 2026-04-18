@@ -1,6 +1,585 @@
 #include "http2/http2_connection_handler.h"
 #include "http/http_response.h"
+#include "http/http_status.h"
+#include "http/streaming_response_sender_utils.h"
 #include "log/logger.h"
+#include <nghttp2/nghttp2.h>
+#include <new>
+
+namespace {
+
+static constexpr size_t DEFAULT_STREAM_HIGH_WATER_BYTES = 1024 * 1024;
+static constexpr size_t DEFAULT_STREAM_LOW_WATER_BYTES =
+    DEFAULT_STREAM_HIGH_WATER_BYTES / 2;
+
+bool IsBodySuppressedStreamingResponse(
+    Http2Session* session,
+    int32_t stream_id,
+    const HttpResponse& response) {
+    auto* stream = session ? session->FindStream(stream_id) : nullptr;
+    if (!stream) {
+        return false;
+    }
+    int status_code = response.GetStatusCode();
+    const HttpRequest& req = stream->GetRequest();
+    return req.method == "HEAD" ||
+           status_code == HttpStatus::NO_CONTENT ||
+           status_code == HttpStatus::RESET_CONTENT ||
+           status_code == HttpStatus::NOT_MODIFIED;
+}
+
+class StreamingH2DataSource final : public ResponseDataSource,
+                                    public std::enable_shared_from_this<StreamingH2DataSource> {
+public:
+    explicit StreamingH2DataSource(std::shared_ptr<ConnectionHandler> conn)
+        : conn_(std::move(conn)) {}
+
+    void ConfigureWatermarks(size_t high_water_bytes) {
+        if (high_water_bytes == 0) return;
+        high_water_ = high_water_bytes;
+        low_water_ = high_water_ / 2;
+        if (buffer_.empty()) {
+            return;
+        }
+        size_t target = std::max(size_, high_water_);
+        if (buffer_.size() == target) {
+            return;
+        }
+        if (!RebuildBuffer(target)) {
+            Abort();
+        }
+    }
+
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult Append(
+        const char* data, size_t len) {
+        if (aborted_ || finished_) {
+            return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
+        }
+        if (len == 0) {
+            return EvaluateOccupancy();
+        }
+        if (len > SIZE_MAX - size_) {
+            logging::Get()->error(
+                "H2 streaming relay size overflow size={} append={} high_water={}",
+                size_, len, high_water_);
+            Abort();
+            return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
+        }
+        size_t required = size_ + len;
+        if (buffer_.empty()) {
+            if (!RebuildBuffer(std::max(high_water_, required))) {
+                Abort();
+                logging::Get()->debug(
+                    "H2 streaming relay failed to allocate initial buffer size={} required={}",
+                    size_, required);
+                return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
+            }
+        } else if (required > buffer_.size()) {
+            // `high_water_` is a backpressure threshold, not a hard append cap:
+            // SendData must keep accepting bytes and report ABOVE_HIGH_WATER so
+            // the caller can pause upstream reads, matching the H1 sender
+            // contract. Grow only to the exact required size to avoid
+            // overshooting more than the already-buffered payload demands.
+            if (!RebuildBuffer(required)) {
+                Abort();
+                logging::Get()->debug(
+                    "H2 streaming relay failed to grow buffer current_cap={} required={}",
+                    buffer_.size(), required);
+                return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED;
+            }
+        }
+        size_t first = std::min(len, buffer_.size() - write_off_);
+        std::memcpy(buffer_.data() + write_off_, data, first);
+        if (len > first) {
+            std::memcpy(buffer_.data(), data + first, len - first);
+        }
+        write_off_ = (write_off_ + len) % buffer_.size();
+        size_ += len;
+        return EvaluateOccupancy();
+    }
+
+    void Finish() {
+        finished_ = true;
+    }
+
+    void Abort() {
+        aborted_ = true;
+        finished_ = true;
+        size_ = 0;
+        read_off_ = 0;
+        write_off_ = 0;
+    }
+
+    ssize_t ReadChunk(uint8_t* buf, size_t length,
+                      uint32_t* data_flags) override {
+        if (size_ == 0) {
+            if (finished_) {
+                *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+                return 0;
+            }
+            logging::Get()->debug(
+                "H2 streaming data source deferred stream read waiting for more bytes");
+            return NGHTTP2_ERR_DEFERRED;
+        }
+
+        size_t to_copy = std::min(length, size_);
+        size_t first = std::min(to_copy, buffer_.size() - read_off_);
+        std::memcpy(buf, buffer_.data() + read_off_, first);
+        if (to_copy > first) {
+            std::memcpy(buf + first, buffer_.data(), to_copy - first);
+        }
+        read_off_ = (read_off_ + to_copy) % buffer_.size();
+        size_ -= to_copy;
+
+        if (size_ == 0 && finished_) {
+            *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+        }
+        return static_cast<ssize_t>(to_copy);
+    }
+
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult
+    EvaluateOccupancy() {
+        using SendResult =
+            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult;
+        if (aborted_) {
+            return SendResult::CLOSED;
+        }
+        if (size_ >= high_water_) {
+            above_high_water_ = true;
+            return SendResult::ACCEPTED_ABOVE_HIGH_WATER;
+        }
+        above_high_water_ = false;
+        return SendResult::ACCEPTED_BELOW_WATER;
+    }
+
+    size_t BufferedBytes() const { return size_; }
+    size_t LowWatermark() const { return low_water_; }
+
+private:
+    bool RebuildBuffer(size_t new_cap) {
+        try {
+            std::vector<char> new_buf(new_cap);
+            if (size_ > 0 && !buffer_.empty()) {
+                size_t first = std::min(size_, buffer_.size() - read_off_);
+                std::memcpy(new_buf.data(), buffer_.data() + read_off_, first);
+                if (size_ > first) {
+                    std::memcpy(new_buf.data() + first, buffer_.data(), size_ - first);
+                }
+            }
+            buffer_.swap(new_buf);
+            read_off_ = 0;
+            write_off_ = size_;
+            return true;
+        } catch (const std::bad_alloc&) {
+            logging::Get()->error(
+                "H2 streaming relay buffer allocation failed cap={}",
+                new_cap);
+            return false;
+        }
+    }
+
+    std::shared_ptr<ConnectionHandler> conn_;
+    std::vector<char> buffer_;
+    size_t read_off_ = 0;
+    size_t write_off_ = 0;
+    size_t size_ = 0;
+    size_t high_water_ = DEFAULT_STREAM_HIGH_WATER_BYTES;
+    size_t low_water_ = DEFAULT_STREAM_LOW_WATER_BYTES;
+    bool finished_ = false;
+    bool aborted_ = false;
+    bool above_high_water_ = false;
+};
+
+class H2StreamingResponseSenderImpl final
+    : public HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::Impl,
+      public std::enable_shared_from_this<H2StreamingResponseSenderImpl> {
+public:
+    using SendResult =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult;
+    using AbortReason =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason;
+    using DrainListener =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::DrainListener;
+
+    H2StreamingResponseSenderImpl(
+        std::weak_ptr<Http2ConnectionHandler> handler,
+        int32_t stream_id,
+        std::function<bool()> claim_response,
+        std::function<void()> release_response_claim,
+        std::function<void()> finalize_request)
+        : handler_(std::move(handler)),
+          stream_id_(stream_id),
+          claim_response_(std::move(claim_response)),
+          release_response_claim_(std::move(release_response_claim)),
+          finalize_request_(std::move(finalize_request)) {}
+
+    int SendHeaders(const HttpResponse& headers_only_response) override {
+        auto self = handler_.lock();
+        auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
+        auto conn = self ? self->GetConnection() : nullptr;
+        if (!self || !session || !conn || conn->IsClosing()) {
+            logging::Get()->debug(
+                "H2 streaming SendHeaders rejected stream={} handler/session/conn unavailable",
+                stream_id_);
+            return -1;
+        }
+        if (!conn->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H2 streaming SendHeaders called off dispatcher stream={}",
+                stream_id_);
+            return -1;
+        }
+        if (terminal_ || programmer_error_ || headers_sent_) {
+            logging::Get()->debug(
+                "H2 streaming SendHeaders rejected stream={} terminal={} programmer_error={} headers_sent={}",
+                stream_id_, terminal_, programmer_error_, headers_sent_);
+            return -1;
+        }
+        if (!claimed_response_) {
+            if (!claim_response_ || !claim_response_()) {
+                terminal_ = true;
+                logging::Get()->debug(
+                    "H2 streaming SendHeaders failed to claim final response stream={}",
+                    stream_id_);
+                return -1;
+            }
+            claimed_response_ = true;
+        }
+        if (!data_source_) {
+            data_source_ = std::make_shared<StreamingH2DataSource>(conn);
+            data_source_->ConfigureWatermarks(high_water_);
+        }
+        body_suppressed_ = IsBodySuppressedStreamingResponse(
+            session, stream_id_, headers_only_response);
+        if (session->SubmitStreamingResponse(
+                stream_id_, headers_only_response, data_source_) != 0) {
+            logging::Get()->warn(
+                "H2 streaming SendHeaders submit failed stream={}",
+                stream_id_);
+            terminal_ = true;
+            body_suppressed_ = false;
+            if (data_source_) {
+                data_source_->Abort();
+                data_source_.reset();
+            }
+            drain_listener_ = nullptr;
+            if (claimed_response_ && release_response_claim_) {
+                release_response_claim_();
+                claimed_response_ = false;
+            }
+            return -1;
+        }
+        headers_sent_ = true;
+        if (!session->InReceiveData()) {
+            session->SendPendingFrames();
+            self->RecheckShutdownDrainAfterFlush();
+        }
+        return 0;
+    }
+
+    SendResult SendData(const char* data, size_t len) override {
+        if (!headers_sent_) {
+            return HandleProgrammerError("SendData");
+        }
+        if (terminal_ || programmer_error_ || !data_source_) {
+            logging::Get()->debug(
+                "H2 streaming SendData rejected stream={} terminal={} programmer_error={} has_data_source={} len={}",
+                stream_id_, terminal_, programmer_error_, data_source_ != nullptr, len);
+            return SendResult::CLOSED;
+        }
+        auto self = handler_.lock();
+        auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
+        auto conn = self ? self->GetConnection() : nullptr;
+        if (!self || !session || !conn || conn->IsClosing()) {
+            logging::Get()->debug(
+                "H2 streaming SendData rejected stream={} handler/session/conn unavailable len={}",
+                stream_id_, len);
+            return SendResult::CLOSED;
+        }
+        if (!conn->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H2 streaming SendData called off dispatcher stream={}",
+                stream_id_);
+            return SendResult::CLOSED;
+        }
+        if (body_suppressed_) {
+            return SendResult::ACCEPTED_BELOW_WATER;
+        }
+        if (data_source_->Append(data, len) == SendResult::CLOSED) {
+            logging::Get()->warn(
+                "H2 streaming SendData failed to append stream={} len={}",
+                stream_id_, len);
+            return SendResult::CLOSED;
+        }
+        // While we're still inside nghttp2_session_mem_recv2, the stream has
+        // not yet had a chance to return NGHTTP2_ERR_DEFERRED from the data
+        // provider. Resuming before that point returns INVALID_ARGUMENT and
+        // would incorrectly reset a healthy inline-streamed response.
+        if (!session->InReceiveData()) {
+            int rv = session->ResumeStreamData(stream_id_);
+            if (rv != 0) {
+                logging::Get()->warn(
+                    "H2 streaming SendData resume failed stream={} rv={}",
+                    stream_id_, rv);
+                AbortInternal(false, AbortReason::CLIENT_DISCONNECT);
+                return SendResult::CLOSED;
+            }
+            session->SendPendingFrames();
+        }
+        return EvaluateCombinedOccupancy();
+    }
+
+    SendResult End(
+        const std::vector<std::pair<std::string, std::string>>& trailers) override {
+        if (!headers_sent_) {
+            HandleProgrammerError("End");
+            return SendResult::CLOSED;
+        }
+        if (terminal_ || programmer_error_ || !data_source_) {
+            logging::Get()->debug(
+                "H2 streaming End rejected stream={} terminal={} programmer_error={} has_data_source={}",
+                stream_id_, terminal_, programmer_error_, data_source_ != nullptr);
+            return SendResult::CLOSED;
+        }
+        if (!trailers.empty()) {
+            logging::Get()->warn(
+                "H2 streaming trailers requested but not forwarded stream={}",
+                stream_id_);
+        }
+        auto self = handler_.lock();
+        auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
+        auto conn = self ? self->GetConnection() : nullptr;
+        if (!self || !session || !conn || conn->IsClosing()) {
+            logging::Get()->debug(
+                "H2 streaming End rejected stream={} handler/session/conn unavailable",
+                stream_id_);
+            return SendResult::CLOSED;
+        }
+        if (!conn->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H2 streaming End called off dispatcher stream={}",
+                stream_id_);
+            return SendResult::CLOSED;
+        }
+        terminal_ = true;
+        if (body_suppressed_) {
+            data_source_.reset();
+            if (finalize_request_) {
+                finalize_request_();
+            }
+            return SendResult::ACCEPTED_BELOW_WATER;
+        }
+        data_source_->Finish();
+        if (!session->InReceiveData()) {
+            int rv = session->ResumeStreamData(stream_id_);
+            if (rv != 0) {
+                logging::Get()->warn(
+                    "H2 streaming End resume failed stream={} rv={}",
+                    stream_id_, rv);
+                AbortInternal(false, AbortReason::CLIENT_DISCONNECT);
+                return SendResult::CLOSED;
+            }
+            session->SendPendingFrames();
+            self->RecheckShutdownDrainAfterFlush();
+        }
+        if (finalize_request_) {
+            finalize_request_();
+        }
+        return SendResult::ACCEPTED_BELOW_WATER;
+    }
+
+    void Abort(AbortReason reason) override {
+        auto self = handler_.lock();
+        auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
+        auto conn = self ? self->GetConnection() : nullptr;
+        if (!self || !session || !conn || conn->IsClosing()) {
+            return;
+        }
+        if (!conn->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H2 streaming Abort called off dispatcher stream={}",
+                stream_id_);
+            return;
+        }
+        AbortInternal(false, reason);
+    }
+
+    void SetDrainListener(DrainListener listener) override {
+        auto self = handler_.lock();
+        auto conn = self ? self->GetConnection() : nullptr;
+        if (!self || !conn || conn->IsClosing()) {
+            return;
+        }
+        if (!conn->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H2 streaming SetDrainListener called off dispatcher stream={}",
+                stream_id_);
+            return;
+        }
+        drain_listener_ = std::move(listener);
+        ++drain_listener_generation_;
+        drain_listener_scheduled_ = false;
+        if (!drain_listener_) {
+            above_high_water_ = false;
+            return;
+        }
+        MaybeScheduleDrain();
+    }
+
+    void ConfigureWatermarks(size_t high_water_bytes) override {
+        auto self = handler_.lock();
+        auto conn = self ? self->GetConnection() : nullptr;
+        if (!self || !conn || conn->IsClosing()) {
+            return;
+        }
+        if (!conn->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H2 streaming ConfigureWatermarks called off dispatcher stream={}",
+                stream_id_);
+            return;
+        }
+        high_water_ = high_water_bytes;
+        if (data_source_) {
+            data_source_->ConfigureWatermarks(high_water_bytes);
+        }
+    }
+
+    Dispatcher* GetDispatcher() override {
+        auto self = handler_.lock();
+        auto conn = self ? self->GetConnection() : nullptr;
+        return conn ? conn->GetDispatcher() : nullptr;
+    }
+
+    void OnDownstreamWriteProgress(size_t /*remaining_bytes*/) override {
+        MaybeScheduleDrain();
+    }
+
+    void OnDownstreamWriteComplete() override {
+        MaybeScheduleDrain();
+    }
+
+private:
+    SendResult HandleProgrammerError(const char* op) {
+        if (!programmer_error_) {
+            logging::Get()->error(
+                "H2 streaming {} called before SendHeaders — programmer error stream={}",
+                op, stream_id_);
+            programmer_error_ = true;
+            AbortInternal(true, AbortReason::UPSTREAM_ERROR);
+        }
+        return SendResult::CLOSED;
+    }
+
+    void AbortInternal(bool from_programmer_error, AbortReason reason) {
+        if (terminal_ && !from_programmer_error) return;
+        terminal_ = true;
+        drain_listener_ = nullptr;
+        ++drain_listener_generation_;
+        above_high_water_ = false;
+        drain_listener_scheduled_ = false;
+
+        if (!claimed_response_) {
+            if (!claim_response_ || !claim_response_()) {
+                return;
+            }
+            claimed_response_ = true;
+        }
+
+        auto self = handler_.lock();
+        auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
+        if (data_source_) {
+            data_source_->Abort();
+        }
+        logging::Get()->debug(
+            "H2 streaming abort stream={} reason={} programmer_error={}",
+            stream_id_,
+            StreamingAbortReasonToString(reason),
+            from_programmer_error);
+        if (session) {
+            session->ResetStream(
+                stream_id_, HTTP2_CONSTANTS::ERROR_INTERNAL_ERROR);
+        }
+        if (finalize_request_) {
+            finalize_request_();
+        }
+    }
+
+    size_t CombinedBufferedBytes() const {
+        auto self = handler_.lock();
+        auto conn = self ? self->GetConnection() : nullptr;
+        size_t stream_bytes = data_source_ ? data_source_->BufferedBytes() : 0;
+        size_t transport_bytes = conn ? conn->OutputBufferSize() : 0;
+        if (stream_bytes > SIZE_MAX - transport_bytes) {
+            return SIZE_MAX;
+        }
+        return stream_bytes + transport_bytes;
+    }
+
+    SendResult EvaluateCombinedOccupancy() {
+        auto self = handler_.lock();
+        auto conn = self ? self->GetConnection() : nullptr;
+        if (!self || !conn || conn->IsClosing() || !data_source_) {
+            return SendResult::CLOSED;
+        }
+        size_t buffered = CombinedBufferedBytes();
+        if (buffered >= high_water_) {
+            above_high_water_ = true;
+            return SendResult::ACCEPTED_ABOVE_HIGH_WATER;
+        }
+        return SendResult::ACCEPTED_BELOW_WATER;
+    }
+
+    void MaybeScheduleDrain() {
+        if (!above_high_water_ || !drain_listener_ || drain_listener_scheduled_ ||
+            terminal_ || programmer_error_ || !data_source_) {
+            return;
+        }
+        if (CombinedBufferedBytes() > data_source_->LowWatermark()) {
+            return;
+        }
+        above_high_water_ = false;
+        drain_listener_scheduled_ = true;
+        auto listener = drain_listener_;
+        const uint64_t generation = drain_listener_generation_;
+        auto self = handler_.lock();
+        auto conn = self ? self->GetConnection() : nullptr;
+        if (!conn) {
+            drain_listener_scheduled_ = false;
+            return;
+        }
+        std::weak_ptr<H2StreamingResponseSenderImpl> weak_self =
+            shared_from_this();
+        conn->RunOnDispatcher(
+            [weak_self, listener = std::move(listener), generation]() mutable {
+                if (auto self = weak_self.lock()) {
+                    if (self->drain_listener_generation_ != generation) {
+                        return;
+                    }
+                    self->drain_listener_scheduled_ = false;
+                    if (listener) listener();
+                }
+            });
+    }
+
+    std::weak_ptr<Http2ConnectionHandler> handler_;
+    int32_t stream_id_;
+    std::function<bool()> claim_response_;
+    std::function<void()> release_response_claim_;
+    std::function<void()> finalize_request_;
+    std::shared_ptr<StreamingH2DataSource> data_source_;
+    DrainListener drain_listener_;
+    bool claimed_response_ = false;
+    bool headers_sent_ = false;
+    bool terminal_ = false;
+    bool programmer_error_ = false;
+    bool body_suppressed_ = false;
+    bool above_high_water_ = false;
+    bool drain_listener_scheduled_ = false;
+    uint64_t drain_listener_generation_ = 0;
+    size_t high_water_ = DEFAULT_STREAM_HIGH_WATER_BYTES;
+};
+
+}  // namespace
 
 Http2ConnectionHandler::Http2ConnectionHandler(
     std::shared_ptr<ConnectionHandler> conn,
@@ -10,6 +589,26 @@ Http2ConnectionHandler::Http2ConnectionHandler(
 
 Http2ConnectionHandler::~Http2ConnectionHandler() = default;
 
+Http2ConnectionHandler::StreamCloseCallback
+Http2ConnectionHandler::WrapStreamCloseCallback(StreamCloseCallback callback) {
+    return [callback = std::move(callback)](
+               std::shared_ptr<Http2ConnectionHandler> self,
+               int32_t stream_id,
+               uint32_t error_code) mutable {
+        // During session teardown nghttp2 can close any remaining live
+        // streams after Http2Session::Owner() has already expired. The
+        // server compensates that path separately, so never forward a null
+        // handler into callbacks that assume a live owner.
+        if (!self) {
+            return;
+        }
+        self->active_stream_sender_impls_.erase(stream_id);
+        if (callback) {
+            callback(std::move(self), stream_id, error_code);
+        }
+    };
+}
+
 void Http2ConnectionHandler::SetRequestCallback(RequestCallback callback) {
     pending_request_cb_ = callback;  // Store for Initialize()
     if (session_) {
@@ -18,9 +617,10 @@ void Http2ConnectionHandler::SetRequestCallback(RequestCallback callback) {
 }
 
 void Http2ConnectionHandler::SetStreamCloseCallback(StreamCloseCallback callback) {
-    pending_stream_close_cb_ = callback;  // Store for Initialize()
+    auto wrapped = WrapStreamCloseCallback(std::move(callback));
+    pending_stream_close_cb_ = wrapped;  // Store for Initialize()
     if (session_) {
-        session_->SetStreamCloseCallback(std::move(callback));
+        session_->SetStreamCloseCallback(std::move(wrapped));
     }
 }
 
@@ -407,17 +1007,11 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
     // inbound frame, shutdown, or timeout happens to flush it — hanging
     // any async H2 route.
     session_->SendPendingFrames();
+    RecheckShutdownDrainAfterFlush();
+}
 
-    // Check if this async response was the last active stream during a
-    // graceful shutdown drain. The normal drain check in OnRawData runs
-    // after ReceiveData, but async completions arrive via RunOnDispatcher
-    // — no inbound data triggers OnRawData. OnSendComplete can also miss
-    // this: it fires when the output buffer empties, but the stream close
-    // callback inside nghttp2_session_send (called by SendPendingFrames)
-    // fires during the send, before FlushDeferredRemovals updates
-    // ActiveStreamCount. By the time SendPendingFrames returns, the count
-    // IS updated, but OnSendComplete already ran and saw a stale count.
-    // Without this check, the connection waits until the drain timeout.
+void Http2ConnectionHandler::RecheckShutdownDrainAfterFlush() {
+    if (!session_) return;
     if (shutdown_requested_.load(std::memory_order_acquire) &&
         session_->ActiveStreamCount() == 0 && !drain_notified_) {
         // Do NOT call UpdateDeadline() here. Clearing has_deadline_ during
@@ -443,12 +1037,37 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
             conn_->OutputBufferSize() == 0) {
             NotifyDrainComplete();
         }
-    } else {
-        // Normal operation or shutdown with active streams remaining:
-        // recompute deadline so it tracks the oldest incomplete stream,
-        // or clears it when no streams remain (idle keep-alive).
-        UpdateDeadline();
+        return;
     }
+
+    // Normal operation or shutdown with active streams remaining:
+    // recompute deadline so it tracks the oldest incomplete stream,
+    // or clears it when no streams remain (idle keep-alive).
+    UpdateDeadline();
+}
+
+HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender
+Http2ConnectionHandler::CreateStreamingResponseSender(
+    int32_t stream_id,
+    std::function<bool()> claim_response,
+    std::function<void()> release_response_claim,
+    std::function<void()> finalize_request) {
+    std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
+    auto finalize_with_unregister =
+        [weak_self, stream_id, finalize_request = std::move(finalize_request)]() {
+            if (auto self = weak_self.lock()) {
+                self->active_stream_sender_impls_.erase(stream_id);
+            }
+            if (finalize_request) {
+                finalize_request();
+            }
+        };
+    auto impl = std::make_shared<H2StreamingResponseSenderImpl>(
+        weak_from_this(), stream_id, std::move(claim_response),
+        std::move(release_response_claim),
+        std::move(finalize_with_unregister));
+    active_stream_sender_impls_[stream_id] = impl;
+    return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender(std::move(impl));
 }
 
 bool Http2ConnectionHandler::SendInterimResponse(
@@ -509,32 +1128,11 @@ int32_t Http2ConnectionHandler::PushResource(
     const std::string& authority, const std::string& path,
     const HttpResponse& response) {
     if (!conn_) return -1;
-    // Off-dispatcher callers auto-hop so the API is usable from async
-    // handlers. Because we can't synchronously observe the submit
-    // outcome from the worker thread, we return -1 — the same sentinel
-    // used for any other failure — rather than inventing a third state
-    // (the previous 0 return broke the ResourcePusher contract, which
-    // the async caller may test with `if (id > 0)` or `if (id != -1)`
-    // to decide on a Link-header fallback; 0 would misclassify queued
-    // calls whose dispatcher-side submit later fails for real reasons
-    // like shutdown / peer refused / GOAWAY sent).
-    //
-    // Handlers that need the promised id MUST call from the dispatcher
-    // (sync handler, inside a RunOnDispatcher lambda, or inside the
-    // complete-callback before enqueuing complete()). Off-thread calls
-    // are "best effort": the push still goes through on the dispatcher,
-    // but caller treats the return as failure for decision purposes.
     if (!conn_->IsOnDispatcherThread()) {
-        std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
-        conn_->RunOnDispatcher(
-            [weak_self, parent_stream_id, method, scheme,
-             authority, path, response]() {
-            if (auto self = weak_self.lock()) {
-                self->PushResource(parent_stream_id, method, scheme,
-                                    authority, path, response);
-            }
-        });
-        return -1;  // queued; caller treats as "id not available" → fallback
+        logging::Get()->debug(
+            "PushResource called off dispatcher parent={}; drop",
+            parent_stream_id);
+        return -1;
     }
     if (!session_) {
         logging::Get()->debug(
@@ -610,6 +1208,8 @@ void Http2ConnectionHandler::OnSendComplete() {
         return;
     }
 
+    NotifyActiveStreamSendersWriteComplete();
+
     // Output buffer drained to zero AND no deferred nghttp2 frames AND
     // nghttp2 has nothing more to send. All bytes are on the wire.
     // If shutdown drain is active and all streams completed, drain is done.
@@ -639,7 +1239,36 @@ void Http2ConnectionHandler::OnWriteProgress(size_t remaining_bytes) {
             if (self->session_) {
                 self->session_->ResumeOutput();
             }
+            self->NotifyActiveStreamSendersWriteProgress(
+                self->conn_ ? self->conn_->OutputBufferSize() : 0);
         });
+        return;
+    }
+    NotifyActiveStreamSendersWriteProgress(remaining_bytes);
+}
+
+void Http2ConnectionHandler::NotifyActiveStreamSendersWriteProgress(
+    size_t remaining_bytes) {
+    for (auto it = active_stream_sender_impls_.begin();
+         it != active_stream_sender_impls_.end();) {
+        if (auto impl = it->second.lock()) {
+            impl->OnDownstreamWriteProgress(remaining_bytes);
+            ++it;
+        } else {
+            it = active_stream_sender_impls_.erase(it);
+        }
+    }
+}
+
+void Http2ConnectionHandler::NotifyActiveStreamSendersWriteComplete() {
+    for (auto it = active_stream_sender_impls_.begin();
+         it != active_stream_sender_impls_.end();) {
+        if (auto impl = it->second.lock()) {
+            impl->OnDownstreamWriteComplete();
+            ++it;
+        } else {
+            it = active_stream_sender_impls_.erase(it);
+        }
     }
 }
 

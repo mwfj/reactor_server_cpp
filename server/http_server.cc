@@ -14,6 +14,7 @@
 #include "log/log_utils.h"
 #include <algorithm>
 #include <set>
+#include <unordered_set>
 
 // Definition of the per-thread sync push slot. See declaration in
 // include/http/http_server.h. Initial value is nullptr — the helper
@@ -253,6 +254,103 @@ static bool IsRepeatableResponseHeader(const std::string& name) {
            lower == "allow" ||
            lower == "content-language";
 }
+
+static std::string LowerHeaderName(const std::string& name) {
+    std::string lower(name);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return lower;
+}
+
+static HttpResponse MergeAsyncResponseHeaders(
+    const HttpResponse& final_resp,
+    const std::vector<std::pair<std::string, std::string>>& mw_headers) {
+    HttpResponse merged;
+    merged.Status(final_resp.GetStatusCode(),
+                  final_resp.GetStatusReason());
+    merged.Body(final_resp.GetBody());
+    if (final_resp.IsContentLengthPreserved()) {
+        merged.PreserveContentLength();
+    }
+
+    std::unordered_set<std::string> final_non_repeatable;
+    std::vector<const std::pair<std::string, std::string>*> final_headers_to_append;
+    final_headers_to_append.reserve(final_resp.GetHeaders().size());
+    for (const auto& fh : final_resp.GetHeaders()) {
+        if (IsRepeatableResponseHeader(fh.first)) {
+            final_headers_to_append.push_back(&fh);
+            continue;
+        }
+        std::string lower = LowerHeaderName(fh.first);
+        if (final_non_repeatable.insert(std::move(lower)).second) {
+            final_headers_to_append.push_back(&fh);
+        }
+    }
+    for (const auto& mh : mw_headers) {
+        std::string lower = LowerHeaderName(mh.first);
+        if (!IsRepeatableResponseHeader(mh.first) &&
+            final_non_repeatable.count(lower)) {
+            continue;
+        }
+        merged.AppendHeader(mh.first, mh.second);
+    }
+
+    for (const auto* fh : final_headers_to_append) {
+        merged.AppendHeader(fh->first, fh->second);
+    }
+    return merged;
+}
+
+class MiddlewareMergingStreamSenderImpl final
+    : public HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::Impl {
+public:
+    using SendResult =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult;
+    using AbortReason =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason;
+    using DrainListener =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::DrainListener;
+
+    MiddlewareMergingStreamSenderImpl(
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender inner,
+        std::vector<std::pair<std::string, std::string>> mw_headers)
+        : inner_(std::move(inner)),
+          mw_headers_(std::move(mw_headers)) {}
+
+    int SendHeaders(const HttpResponse& headers_only_response) override {
+        return inner_.SendHeaders(
+            MergeAsyncResponseHeaders(headers_only_response, mw_headers_));
+    }
+
+    SendResult SendData(const char* data, size_t len) override {
+        return inner_.SendData(data, len);
+    }
+
+    SendResult End(
+        const std::vector<std::pair<std::string, std::string>>& trailers) override {
+        return inner_.End(trailers);
+    }
+
+    void Abort(AbortReason reason) override {
+        inner_.Abort(reason);
+    }
+
+    void SetDrainListener(DrainListener listener) override {
+        inner_.SetDrainListener(std::move(listener));
+    }
+
+    void ConfigureWatermarks(size_t high_water_bytes) override {
+        inner_.ConfigureWatermarks(high_water_bytes);
+    }
+
+    Dispatcher* GetDispatcher() override {
+        return inner_.GetDispatcher();
+    }
+
+private:
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender inner_;
+    std::vector<std::pair<std::string, std::string>> mw_headers_;
+};
 
 // Ensure the pattern has a NAMED catch-all so ProxyHandler can extract the
 // strip_prefix tail from request.params. Handles three cases:
@@ -706,14 +804,23 @@ void HttpServer::WireNetServerCallbacks() {
     // Http2ConnectionHandler::OnSendComplete().
     net_server_.SetSendCompletionCb(
         [this](std::shared_ptr<ConnectionHandler> conn) {
+            std::shared_ptr<HttpConnectionHandler> http_conn;
             std::shared_ptr<Http2ConnectionHandler> h2_conn;
             {
                 std::lock_guard<std::mutex> lck(conn_mtx_);
+                auto h1_it = http_connections_.find(conn->fd());
+                if (h1_it != http_connections_.end() &&
+                    h1_it->second->GetConnection() == conn) {
+                    http_conn = h1_it->second;
+                }
                 auto it = h2_connections_.find(conn->fd());
                 if (it != h2_connections_.end() &&
                     it->second->GetConnection() == conn) {
                     h2_conn = it->second;
                 }
+            }
+            if (http_conn) {
+                http_conn->OnSendComplete();
             }
             if (h2_conn) {
                 h2_conn->OnSendComplete();
@@ -723,14 +830,23 @@ void HttpServer::WireNetServerCallbacks() {
     // Resume deferred H2 output at the low watermark (partial writes).
     net_server_.SetWriteProgressCb(
         [this](std::shared_ptr<ConnectionHandler> conn, size_t remaining) {
+            std::shared_ptr<HttpConnectionHandler> http_conn;
             std::shared_ptr<Http2ConnectionHandler> h2_conn;
             {
                 std::lock_guard<std::mutex> lck(conn_mtx_);
+                auto h1_it = http_connections_.find(conn->fd());
+                if (h1_it != http_connections_.end() &&
+                    h1_it->second->GetConnection() == conn) {
+                    http_conn = h1_it->second;
+                }
                 auto it = h2_connections_.find(conn->fd());
                 if (it != h2_connections_.end() &&
                     it->second->GetConnection() == conn) {
                     h2_conn = it->second;
                 }
+            }
+            if (http_conn) {
+                http_conn->OnWriteProgress(remaining);
             }
             if (h2_conn) {
                 h2_conn->OnWriteProgress(remaining);
@@ -1315,8 +1431,10 @@ void HttpServer::Proxy(const std::string& route_pattern,
                 [handler](const HttpRequest& request,
                           HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
                           HTTP_CALLBACKS_NAMESPACE::ResourcePusher        /*push_resource*/,
+                          HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender,
                           HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
-                    handler->Handle(request, std::move(complete));
+                    handler->Handle(request, std::move(stream_sender),
+                                    std::move(complete));
                 });
             // Mark the derived bare-prefix companion only for the
             // methods this proxy actually registers on it. A method
@@ -1721,8 +1839,10 @@ void HttpServer::RegisterProxyRoutes() {
                     [handler](const HttpRequest& request,
                               HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
                               HTTP_CALLBACKS_NAMESPACE::ResourcePusher        /*push_resource*/,
+                              HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender,
                               HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
-                        handler->Handle(request, std::move(complete));
+                        handler->Handle(request, std::move(stream_sender),
+                                        std::move(complete));
                     });
                 if (!derived_companion.empty() && pattern == derived_companion) {
                     router_.MarkProxyCompanion(mr.method, pattern);
@@ -2378,17 +2498,12 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
 
                 std::weak_ptr<HttpConnectionHandler> weak_self = self;
                 auto active_counter = active_requests_;
-                // Two guards for the complete-then-throw edge case:
-                //   completed: one-shot entry — prevents duplicate callback
-                //              invocations (handler calls complete twice).
-                //   cancelled: set by the catch block — prevents the INNER
-                //              RunOnDispatcher lambda from running after the
-                //              outer catch already sent a 500. Without this,
-                //              a handler that calls complete() synchronously
-                //              and then throws would double-finish: the
-                //              enqueued lambda runs CompleteAsyncResponse +
-                //              decrements, and the guard also decrements.
-                auto completed = std::make_shared<std::atomic<bool>>(false);
+                auto response_claimed =
+                    std::make_shared<std::atomic<bool>>(false);
+                auto streaming_started =
+                    std::make_shared<std::atomic<bool>>(false);
+                auto bookkeeping_done =
+                    std::make_shared<std::atomic<bool>>(false);
                 auto cancelled = std::make_shared<std::atomic<bool>>(false);
                 // Allocate a cancel slot for handler-installed cleanup
                 // (e.g., ProxyHandler registers tx->Cancel() here).
@@ -2400,80 +2515,55 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 request.async_cancel_slot = cancel_slot;
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, active_counter,
-                     mw_headers, completed, cancelled](HttpResponse final_resp) {
-                        if (completed->exchange(true)) return;
-                        // Merge middleware + handler headers: middleware
-                        // first (base), handler second (overrides for
-                        // non-repeatable, appends for repeatable).
-                        HttpResponse merged;
-                        merged.Status(final_resp.GetStatusCode(),
-                                      final_resp.GetStatusReason());
-                        merged.Body(final_resp.GetBody());
-                        // Preserve proxy HEAD Content-Length flag across merge
-                        if (final_resp.IsContentLengthPreserved()) {
-                            merged.PreserveContentLength();
+                     mw_headers, response_claimed, bookkeeping_done,
+                     cancelled](HttpResponse final_resp) {
+                        if (response_claimed->exchange(
+                                true, std::memory_order_acq_rel)) {
+                            return;
                         }
-                        std::set<std::string> final_non_repeatable;
-                        for (const auto& fh : final_resp.GetHeaders()) {
-                            if (!IsRepeatableResponseHeader(fh.first)) {
-                                std::string lower = fh.first;
-                                std::transform(
-                                    lower.begin(), lower.end(), lower.begin(),
-                                    [](unsigned char c) { return std::tolower(c); });
-                                final_non_repeatable.insert(std::move(lower));
-                            }
-                        }
-                        for (const auto& mh : mw_headers) {
-                            std::string lower = mh.first;
-                            std::transform(
-                                lower.begin(), lower.end(), lower.begin(),
-                                [](unsigned char c) { return std::tolower(c); });
-                            if (!IsRepeatableResponseHeader(mh.first) &&
-                                final_non_repeatable.count(lower)) {
-                                continue;
-                            }
-                            merged.AppendHeader(mh.first, mh.second);
-                        }
-                        // Dedupe non-repeatable headers WITHIN the final
-                        // response too. Without this, a buggy upstream
-                        // or handler that emits duplicate Content-Type
-                        // / Location / etc. would have both copies
-                        // forwarded verbatim, producing a malformed
-                        // downstream response. Repeatable headers
-                        // (Set-Cookie, Cache-Control, Link, Via, ...)
-                        // are still appended in full.
-                        std::set<std::string> seen_final_non_repeatable;
-                        for (const auto& fh : final_resp.GetHeaders()) {
-                            if (!IsRepeatableResponseHeader(fh.first)) {
-                                std::string lower = fh.first;
-                                std::transform(
-                                    lower.begin(), lower.end(), lower.begin(),
-                                    [](unsigned char c) { return std::tolower(c); });
-                                if (!seen_final_non_repeatable.insert(lower).second) {
-                                    continue;  // already emitted first copy
-                                }
-                            }
-                            merged.AppendHeader(fh.first, fh.second);
-                        }
+                        HttpResponse merged = MergeAsyncResponseHeaders(
+                            final_resp, mw_headers);
                         auto s = weak_self.lock();
                         if (!s) {
-                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                            if (!bookkeeping_done->exchange(
+                                    true, std::memory_order_acq_rel)) {
+                                active_counter->fetch_sub(
+                                    1, std::memory_order_relaxed);
+                            }
                             return;
                         }
                         auto conn = s->GetConnection();
                         if (!conn) {
-                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                            if (!bookkeeping_done->exchange(
+                                    true, std::memory_order_acq_rel)) {
+                                active_counter->fetch_sub(
+                                    1, std::memory_order_relaxed);
+                            }
                             return;
                         }
                         auto shared_resp = std::make_shared<HttpResponse>(
                             std::move(merged));
                         conn->RunOnDispatcher(
-                            [s, shared_resp, active_counter, cancelled]() {
+                            [s, shared_resp, active_counter,
+                             bookkeeping_done, cancelled]() {
                             if (cancelled->load(std::memory_order_acquire)) return;
                             s->CompleteAsyncResponse(std::move(*shared_resp));
-                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                            if (!bookkeeping_done->exchange(
+                                    true, std::memory_order_acq_rel)) {
+                                active_counter->fetch_sub(
+                                    1, std::memory_order_relaxed);
+                            }
                         });
                     };
+
+                auto finalize_request =
+                    [active_counter, bookkeeping_done]() {
+                    if (!bookkeeping_done->exchange(
+                            true, std::memory_order_acq_rel)) {
+                        active_counter->fetch_sub(
+                            1, std::memory_order_relaxed);
+                    }
+                };
 
                 // Don't release the guard until the handler returns
                 // successfully. If the handler throws, the guard fires
@@ -2504,10 +2594,10 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 // for my request" — whether or not the lambda has run.
                 std::weak_ptr<HttpConnectionHandler> weak_h1_self = self;
                 auto send_interim =
-                    [weak_h1_self, completed](
+                    [weak_h1_self, response_claimed](
                         int status_code,
                         const std::vector<std::pair<std::string, std::string>>& hdrs) {
-                    if (completed->load(std::memory_order_acquire)) {
+                    if (response_claimed->load(std::memory_order_acquire)) {
                         // Request A's complete() has already been called.
                         // Drop synchronously — no hop needed.
                         return;
@@ -2542,9 +2632,10 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         std::weak_ptr<HttpConnectionHandler> weak = h;
                         auto hdrs_copy = hdrs;
                         conn->RunOnDispatcher(
-                            [weak, completed, status_code,
+                            [weak, response_claimed, status_code,
                              hdrs_copy = std::move(hdrs_copy)]() {
-                            if (completed->load(std::memory_order_acquire)) return;
+                            if (response_claimed->load(
+                                    std::memory_order_acquire)) return;
                             if (auto self2 = weak.lock()) {
                                 self2->SendInterimResponse(status_code, hdrs_copy);
                             }
@@ -2562,11 +2653,28 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     logging::Get()->debug("push_resource no-op (H1)");
                     return -1;
                 };
+                auto claim_streaming =
+                    [response_claimed, streaming_started]() -> bool {
+                    bool expected = false;
+                    if (!response_claimed->compare_exchange_strong(
+                            expected, true, std::memory_order_acq_rel)) {
+                        return false;
+                    }
+                    streaming_started->store(
+                        true, std::memory_order_release);
+                    return true;
+                };
+                auto raw_stream_sender = self->CreateStreamingResponseSender(
+                    claim_streaming, finalize_request);
+                auto stream_sender = HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender(
+                    std::make_shared<MiddlewareMergingStreamSenderImpl>(
+                        std::move(raw_stream_sender), mw_headers));
                 try {
                     if (async_head_fallback) {
                         HttpRequest get_req = request;
                         get_req.method = "GET";
-                        async_handler(get_req, send_interim, push_resource, std::move(complete));
+                        async_handler(get_req, send_interim, push_resource,
+                                      stream_sender, std::move(complete));
                         // Propagate request-scoped overrides the handler
                         // may have written to the clone back to the
                         // live request object. Only fields handlers are
@@ -2586,15 +2694,30 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         request.async_cap_sec_override =
                             get_req.async_cap_sec_override;
                     } else {
-                        async_handler(request, send_interim, push_resource, std::move(complete));
+                        async_handler(request, send_interim, push_resource,
+                                      stream_sender, std::move(complete));
                     }
                 } catch (...) {
-                    // Mark both flags: completed stops a stored callback
-                    // from re-entering; cancelled stops any already-queued
-                    // RunOnDispatcher lambda from running (handles the
-                    // complete-then-throw case). CancelAsyncResponse clears
-                    // deferred state so the outer catch's 500 + close works.
-                    completed->store(true, std::memory_order_relaxed);
+                    if (streaming_started->load(std::memory_order_acquire)) {
+                        cancelled->store(true, std::memory_order_release);
+                        if (cancel_slot && *cancel_slot) {
+                            auto local = std::move(*cancel_slot);
+                            *cancel_slot = nullptr;
+                            try { local(); }
+                            catch (const std::exception& e) {
+                                logging::Get()->error(
+                                    "Async cancel slot threw during streaming "
+                                    "handler exception cleanup: {}",
+                                    e.what());
+                            }
+                        }
+                        stream_sender.Abort(
+                            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
+                        finalize_request();
+                        guard.release();
+                        return;
+                    }
+                    response_claimed->store(true, std::memory_order_release);
                     cancelled->store(true, std::memory_order_release);
                     // Fire the handler-installed cancel slot if it was
                     // populated before the throw. ProxyHandler and other
@@ -2634,9 +2757,10 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 // can release pool capacity instead of running to
                 // completion against a disconnected client.
                 self->SetAsyncAbortHook(
-                    [completed, cancelled, active_counter, cancel_slot]() {
-                        if (!completed->exchange(true,
-                                                 std::memory_order_acq_rel)) {
+                    [bookkeeping_done, cancelled, active_counter,
+                     cancel_slot]() {
+                        if (!bookkeeping_done->exchange(
+                                true, std::memory_order_acq_rel)) {
                             cancelled->store(true, std::memory_order_release);
                             active_counter->fetch_sub(
                                 1, std::memory_order_relaxed);
@@ -3275,13 +3399,12 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 auto mw_headers = response.GetHeaders();
                 std::weak_ptr<Http2ConnectionHandler> weak_self = self;
                 auto active_counter = active_requests_;
-                // Guard against double-submit: if the handler stores the
-                // callback and then throws, the outer catch in OnRequest
-                // synthesizes a 500 on the same stream. Without this flag,
-                // the stored callback fires later → double submit + double
-                // decrement of active_requests_. The catch path below
-                // marks `completed` so the callback becomes a no-op.
-                auto completed = std::make_shared<std::atomic<bool>>(false);
+                auto response_claimed =
+                    std::make_shared<std::atomic<bool>>(false);
+                auto streaming_started =
+                    std::make_shared<std::atomic<bool>>(false);
+                auto bookkeeping_done =
+                    std::make_shared<std::atomic<bool>>(false);
                 auto cancelled = std::make_shared<std::atomic<bool>>(false);
                 // Handler-installed cancel slot — mirrors HTTP/1.
                 // Populated before async_handler runs; fired by the
@@ -3292,79 +3415,55 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 request.async_cancel_slot = cancel_slot;
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, stream_id, active_counter,
-                     mw_headers, completed, cancelled](HttpResponse final_resp) {
-                        if (completed->exchange(true)) return;
-                        // Same merge as H1: middleware first, handler second.
-                        // Use AppendHeader to preserve repeated upstream
-                        // headers (Cache-Control, Link, Via, etc.).
-                        HttpResponse merged;
-                        merged.Status(final_resp.GetStatusCode(),
-                                      final_resp.GetStatusReason());
-                        merged.Body(final_resp.GetBody());
-                        if (final_resp.IsContentLengthPreserved()) {
-                            merged.PreserveContentLength();
+                     mw_headers, response_claimed, bookkeeping_done,
+                     cancelled](HttpResponse final_resp) {
+                        if (response_claimed->exchange(
+                                true, std::memory_order_acq_rel)) {
+                            return;
                         }
-                        std::set<std::string> final_non_repeatable;
-                        for (const auto& fh : final_resp.GetHeaders()) {
-                            if (!IsRepeatableResponseHeader(fh.first)) {
-                                std::string lower = fh.first;
-                                std::transform(
-                                    lower.begin(), lower.end(), lower.begin(),
-                                    [](unsigned char c) { return std::tolower(c); });
-                                final_non_repeatable.insert(std::move(lower));
-                            }
-                        }
-                        for (const auto& mh : mw_headers) {
-                            std::string lower = mh.first;
-                            std::transform(
-                                lower.begin(), lower.end(), lower.begin(),
-                                [](unsigned char c) { return std::tolower(c); });
-                            if (!IsRepeatableResponseHeader(mh.first) &&
-                                final_non_repeatable.count(lower)) {
-                                continue;
-                            }
-                            merged.AppendHeader(mh.first, mh.second);
-                        }
-                        // Dedupe non-repeatable headers WITHIN the final
-                        // response too. Without this, a buggy upstream
-                        // or handler that emits duplicate Content-Type
-                        // / Location / etc. would have both copies
-                        // forwarded verbatim, producing a malformed
-                        // downstream response. Repeatable headers
-                        // (Set-Cookie, Cache-Control, Link, Via, ...)
-                        // are still appended in full.
-                        std::set<std::string> seen_final_non_repeatable;
-                        for (const auto& fh : final_resp.GetHeaders()) {
-                            if (!IsRepeatableResponseHeader(fh.first)) {
-                                std::string lower = fh.first;
-                                std::transform(
-                                    lower.begin(), lower.end(), lower.begin(),
-                                    [](unsigned char c) { return std::tolower(c); });
-                                if (!seen_final_non_repeatable.insert(lower).second) {
-                                    continue;  // already emitted first copy
-                                }
-                            }
-                            merged.AppendHeader(fh.first, fh.second);
-                        }
+                        HttpResponse merged = MergeAsyncResponseHeaders(
+                            final_resp, mw_headers);
                         auto s = weak_self.lock();
                         if (!s) {
-                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                            if (!bookkeeping_done->exchange(
+                                    true, std::memory_order_acq_rel)) {
+                                active_counter->fetch_sub(
+                                    1, std::memory_order_relaxed);
+                            }
                             return;
                         }
                         auto conn = s->GetConnection();
                         if (!conn) {
-                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                            if (!bookkeeping_done->exchange(
+                                    true, std::memory_order_acq_rel)) {
+                                active_counter->fetch_sub(
+                                    1, std::memory_order_relaxed);
+                            }
                             return;
                         }
                         auto shared_resp = std::make_shared<HttpResponse>(
                             std::move(merged));
                         conn->RunOnDispatcher(
-                            [s, stream_id, shared_resp, active_counter, cancelled]() {
+                            [s, stream_id, shared_resp, active_counter,
+                             bookkeeping_done, cancelled]() {
                             if (cancelled->load(std::memory_order_acquire)) return;
                             s->SubmitStreamResponse(stream_id, *shared_resp);
-                            active_counter->fetch_sub(1, std::memory_order_relaxed);
+                            if (!bookkeeping_done->exchange(
+                                    true, std::memory_order_acq_rel)) {
+                                active_counter->fetch_sub(
+                                    1, std::memory_order_relaxed);
+                            }
                         });
                     };
+
+                auto finalize_request =
+                    [active_counter, bookkeeping_done]() {
+                    if (!bookkeeping_done->exchange(
+                            true, std::memory_order_acq_rel)) {
+                        active_counter->fetch_sub(
+                            1, std::memory_order_relaxed);
+                    }
+                };
 
                 // Real H2 send_interim + push_resource. Both capture a
                 // weak_ptr to the H2 handler and the per-stream id and
@@ -3387,32 +3486,78 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 // inside complete() BEFORE the lambda is enqueued, so
                 // checking it here reliably gates late emissions.
                 auto send_interim =
-                    [h2_weak, stream_id, completed](
+                    [h2_weak, stream_id, response_claimed](
                         int status_code,
                         const std::vector<std::pair<std::string, std::string>>& hdrs) {
-                    if (completed->load(std::memory_order_acquire)) return;
+                    if (response_claimed->load(std::memory_order_acquire)) return;
                     auto h2 = h2_weak.lock();
                     if (!h2) return;
+                    auto conn = h2->GetConnection();
+                    if (!conn) return;
+                    // Request-scoped guard must survive the dispatcher hop.
+                    // Without re-checking response_claimed inside the queued
+                    // lambda, an off-thread send_interim() followed by
+                    // complete() in the same continuation can still emit a
+                    // stale 103 after the request was already claimed.
+                    if (!conn->IsOnDispatcherThread()) {
+                        std::weak_ptr<Http2ConnectionHandler> weak = h2;
+                        auto hdrs_copy = hdrs;
+                        conn->RunOnDispatcher(
+                            [weak, response_claimed, stream_id, status_code,
+                             hdrs_copy = std::move(hdrs_copy)]() {
+                            if (response_claimed->load(
+                                    std::memory_order_acquire)) return;
+                            if (auto self2 = weak.lock()) {
+                                self2->SendInterimResponse(
+                                    stream_id, status_code, hdrs_copy);
+                            }
+                        });
+                        return;
+                    }
                     h2->SendInterimResponse(stream_id, status_code, hdrs);
                 };
                 auto push_resource =
-                    [h2_weak, stream_id, completed](
+                    [h2_weak, stream_id, response_claimed](
                         const std::string& method,
                         const std::string& scheme,
                         const std::string& authority,
                         const std::string& path,
                         const HttpResponse& resp) -> int32_t {
-                    if (completed->load(std::memory_order_acquire)) return -1;
+                    if (response_claimed->load(std::memory_order_acquire)) return -1;
                     auto h2 = h2_weak.lock();
                     if (!h2) return -1;
                     return h2->PushResource(stream_id, method, scheme,
                                              authority, path, resp);
                 };
+                auto claim_streaming =
+                    [response_claimed, streaming_started]() -> bool {
+                    bool expected = false;
+                    if (!response_claimed->compare_exchange_strong(
+                            expected, true, std::memory_order_acq_rel)) {
+                        return false;
+                    }
+                    streaming_started->store(
+                        true, std::memory_order_release);
+                    return true;
+                };
+                auto release_streaming_claim =
+                    [response_claimed, streaming_started]() {
+                    response_claimed->store(false, std::memory_order_release);
+                    streaming_started->store(
+                        false, std::memory_order_release);
+                };
+                auto raw_stream_sender = self->CreateStreamingResponseSender(
+                    stream_id, claim_streaming, release_streaming_claim,
+                    finalize_request);
+                auto stream_sender = HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender(
+                    std::make_shared<MiddlewareMergingStreamSenderImpl>(
+                        std::move(raw_stream_sender), mw_headers));
                 try {
                     if (async_head_fallback) {
                         HttpRequest get_req = request;
                         get_req.method = "GET";
-                        async_handler(get_req, send_interim, push_resource, std::move(complete));
+                        async_handler(get_req, send_interim, push_resource,
+                                      stream_sender, std::move(complete));
                         // Propagate handler-written request-scoped state
                         // back to the live request (same rationale as
                         // the H1 HEAD-fallback path): the value-type
@@ -3426,10 +3571,30 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         request.async_cap_sec_override =
                             get_req.async_cap_sec_override;
                     } else {
-                        async_handler(request, send_interim, push_resource, std::move(complete));
+                        async_handler(request, send_interim, push_resource,
+                                      stream_sender, std::move(complete));
                     }
                 } catch (...) {
-                    completed->store(true, std::memory_order_relaxed);
+                    if (streaming_started->load(std::memory_order_acquire)) {
+                        cancelled->store(true, std::memory_order_release);
+                        if (cancel_slot && *cancel_slot) {
+                            auto local = std::move(*cancel_slot);
+                            *cancel_slot = nullptr;
+                            try { local(); }
+                            catch (const std::exception& e) {
+                                logging::Get()->error(
+                                    "Async cancel slot threw during H2 "
+                                    "streaming handler exception cleanup: {}",
+                                    e.what());
+                            }
+                        }
+                        stream_sender.Abort(
+                            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
+                        finalize_request();
+                        guard.release();
+                        return;
+                    }
+                    response_claimed->store(true, std::memory_order_release);
                     cancelled->store(true, std::memory_order_release);
                     // Same cleanup as the H1 catch: fire the handler's
                     // cancel slot if populated before the throw, so
@@ -3466,9 +3631,10 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 // released back to the pool on client-side abort.
                 self->SetStreamAbortHook(
                     stream_id,
-                    [completed, cancelled, active_counter, cancel_slot]() {
-                        if (!completed->exchange(true,
-                                                 std::memory_order_acq_rel)) {
+                    [bookkeeping_done, cancelled, active_counter,
+                     cancel_slot]() {
+                        if (!bookkeeping_done->exchange(
+                                true, std::memory_order_acq_rel)) {
                             cancelled->store(true, std::memory_order_release);
                             active_counter->fetch_sub(
                                 1, std::memory_order_relaxed);
@@ -3730,8 +3896,9 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
             for (auto& h2conn : snap.h2) {
                 auto conn = h2conn->GetConnection();
                 if (!conn) continue;
-                conn->RunOnDispatcher([h2conn, conn, body, final_cap]() {
+                conn->RunOnDispatcher([h2conn, conn, body, header, final_cap]() {
                     h2conn->SetMaxBodySize(body);
+                    h2conn->SetMaxHeaderSize(header);
                     conn->SetMaxInputSize(final_cap);
                 });
             }

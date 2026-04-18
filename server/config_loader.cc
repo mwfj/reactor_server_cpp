@@ -477,6 +477,19 @@ static void ParseAuthConfig(const nlohmann::json& j, AUTH_NAMESPACE::AuthConfig&
     }
 }
 
+// PR #20 streaming-response validation bounds. Anonymous namespace keeps
+// these file-private without colliding with the `static`-qualified helpers
+// above; both patterns coexist in this file.
+namespace {
+
+constexpr uint32_t kMinRelayBufferLimitBytes = 16 * 1024;
+constexpr uint32_t kMaxRelayBufferLimitBytes = 64 * 1024 * 1024;
+constexpr uint32_t kMaxStreamIdleTimeoutSec = 3600;
+constexpr uint32_t kMaxStreamDurationSec = 86400;
+constexpr int kMaxProxyRetryCount = 10;
+
+}  // namespace
+
 ServerConfig ConfigLoader::LoadFromFile(const std::string& path) {
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -698,6 +711,19 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 if (!item["proxy"].is_object())
                     throw std::runtime_error("upstream proxy must be an object");
                 auto& proxy = item["proxy"];
+                upstream.proxy.buffering = proxy.value("buffering", "auto");
+                upstream.proxy.relay_buffer_limit_bytes =
+                    proxy.value("relay_buffer_limit_bytes", 1048576u);
+                upstream.proxy.auto_stream_content_length_threshold_bytes =
+                    proxy.value("auto_stream_content_length_threshold_bytes", 262144u);
+                upstream.proxy.stream_idle_timeout_sec =
+                    proxy.value("stream_idle_timeout_sec", 30u);
+                upstream.proxy.stream_max_duration_sec =
+                    proxy.value("stream_max_duration_sec", 0u);
+                upstream.proxy.h10_streaming =
+                    proxy.value("h10_streaming", "close");
+                upstream.proxy.forward_trailers =
+                    proxy.value("forward_trailers", false);
                 upstream.proxy.route_prefix = proxy.value("route_prefix", "");
                 upstream.proxy.strip_prefix = proxy.value("strip_prefix", false);
                 upstream.proxy.response_timeout_ms = ParseStrictInt(
@@ -1471,10 +1497,61 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     "'): proxy.response_timeout_ms must be 0 (disabled) "
                     "or >= 1000 (timer scan resolution is 1s)");
             }
-            if (u.proxy.retry.max_retries < 0 || u.proxy.retry.max_retries > 10) {
+            if (u.proxy.buffering != "always" &&
+                u.proxy.buffering != "never" &&
+                u.proxy.buffering != "auto") {
                 throw std::invalid_argument(
                     idx + " ('" + u.name +
-                    "'): proxy.retry.max_retries must be >= 0 and <= 10");
+                    "'): proxy.buffering must be one of always|never|auto");
+            }
+            if (u.proxy.h10_streaming != "close" &&
+                u.proxy.h10_streaming != "buffer") {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.h10_streaming must be one of close|buffer");
+            }
+            if (u.proxy.relay_buffer_limit_bytes < kMinRelayBufferLimitBytes ||
+                u.proxy.relay_buffer_limit_bytes > kMaxRelayBufferLimitBytes) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.relay_buffer_limit_bytes must be in [" +
+                    std::to_string(kMinRelayBufferLimitBytes) + ", " +
+                    std::to_string(kMaxRelayBufferLimitBytes) + "]");
+            }
+            if (u.proxy.auto_stream_content_length_threshold_bytes >
+                u.proxy.relay_buffer_limit_bytes) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.auto_stream_content_length_threshold_bytes must be <= "
+                    "proxy.relay_buffer_limit_bytes");
+            }
+            if (u.proxy.stream_idle_timeout_sec > kMaxStreamIdleTimeoutSec) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.stream_idle_timeout_sec must be <= " +
+                    std::to_string(kMaxStreamIdleTimeoutSec));
+            }
+            if (u.proxy.stream_max_duration_sec > kMaxStreamDurationSec) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.stream_max_duration_sec must be <= " +
+                    std::to_string(kMaxStreamDurationSec));
+            }
+            if (u.proxy.stream_max_duration_sec > 0 &&
+                u.proxy.stream_idle_timeout_sec >
+                    u.proxy.stream_max_duration_sec) {
+                logging::Get()->warn(
+                    "{} ('{}'): proxy.stream_idle_timeout_sec ({}) exceeds "
+                    "proxy.stream_max_duration_sec ({})",
+                    idx, u.name, u.proxy.stream_idle_timeout_sec,
+                    u.proxy.stream_max_duration_sec);
+            }
+            if (u.proxy.retry.max_retries < 0 ||
+                u.proxy.retry.max_retries > kMaxProxyRetryCount) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): proxy.retry.max_retries must be >= 0 and <= " +
+                    std::to_string(kMaxProxyRetryCount));
             }
 
             // Circuit breaker validation.
@@ -2552,6 +2629,14 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
         // any non-default auth as sufficient reason to serialize.
         if (u.proxy != ProxyConfig{} || u.proxy.auth != AUTH_NAMESPACE::AuthPolicy{}) {
             nlohmann::json pj;
+            pj["buffering"] = u.proxy.buffering;
+            pj["relay_buffer_limit_bytes"] = u.proxy.relay_buffer_limit_bytes;
+            pj["auto_stream_content_length_threshold_bytes"] =
+                u.proxy.auto_stream_content_length_threshold_bytes;
+            pj["stream_idle_timeout_sec"] = u.proxy.stream_idle_timeout_sec;
+            pj["stream_max_duration_sec"] = u.proxy.stream_max_duration_sec;
+            pj["h10_streaming"] = u.proxy.h10_streaming;
+            pj["forward_trailers"] = u.proxy.forward_trailers;
             pj["route_prefix"] = u.proxy.route_prefix;
             pj["strip_prefix"] = u.proxy.strip_prefix;
             pj["response_timeout_ms"] = u.proxy.response_timeout_ms;

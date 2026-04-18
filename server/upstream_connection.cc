@@ -44,6 +44,37 @@ void UpstreamConnection::IncrementRequestCount() {
     ++request_count_;
 }
 
+void UpstreamConnection::IncReadDisable() {
+    int previous = read_disable_count_.fetch_add(1, std::memory_order_acq_rel);
+    if (previous == 0 && conn_) {
+        conn_->PauseReadPump();
+    }
+}
+
+void UpstreamConnection::DecReadDisable() {
+    int current = read_disable_count_.load(std::memory_order_acquire);
+    if (current <= 0) {
+        logging::Get()->warn(
+            "UpstreamConnection read-disable underflow fd={} host={}:{} count={}",
+            fd(), upstream_host_, upstream_port_, current);
+        return;
+    }
+    while (current > 0) {
+        if (read_disable_count_.compare_exchange_weak(
+                current, current - 1,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            if (current == 1 && conn_) {
+                conn_->ResumeReadPump();
+            }
+            return;
+        }
+    }
+    logging::Get()->warn(
+        "UpstreamConnection read-disable underflow raced to zero fd={} host={}:{}",
+        fd(), upstream_host_, upstream_port_);
+}
+
 bool UpstreamConnection::IsAlive() const {
     int conn_fd = fd();
     if (conn_fd < 0) return false;

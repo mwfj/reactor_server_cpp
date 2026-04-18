@@ -100,6 +100,7 @@ ProxyHandler::~ProxyHandler() {
 
 void ProxyHandler::Handle(
     const HttpRequest& request,
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender,
     HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
 
     logging::Get()->debug("ProxyHandler::Handle service={} client_fd={} "
@@ -146,6 +147,7 @@ void ProxyHandler::Handle(
     auto txn = std::make_shared<ProxyTransaction>(
         service_name_,
         request,
+        std::move(stream_sender),
         std::move(complete),
         upstream_manager_,
         config_,

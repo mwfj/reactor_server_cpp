@@ -1,5 +1,6 @@
 #include "http2/http2_stream.h"
 #include "log/logger.h"
+#include <nghttp2/nghttp2.h>
 #include <algorithm>
 
 // Returns the default port for a given HTTP(S) scheme. Empty string if
@@ -86,6 +87,22 @@ Http2Stream::Http2Stream(int32_t stream_id)
 }
 
 Http2Stream::~Http2Stream() = default;
+
+ssize_t BufferedResponseDataSource::ReadChunk(
+    uint8_t* buf, size_t length, uint32_t* data_flags) {
+    size_t remaining = body_.size() - offset_;
+    size_t to_copy = std::min(remaining, length);
+
+    if (to_copy > 0) {
+        std::memcpy(buf, body_.data() + offset_, to_copy);
+        offset_ += to_copy;
+    }
+
+    if (offset_ >= body_.size()) {
+        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    }
+    return static_cast<ssize_t>(to_copy);
+}
 
 int Http2Stream::AddHeader(const std::string& name, const std::string& value) {
     // Handle pseudo-headers (RFC 9113 Section 8.3)

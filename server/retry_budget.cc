@@ -88,6 +88,10 @@ void RetryBudget::ReleaseRetry() {
     retries_in_flight_.fetch_sub(1, std::memory_order_relaxed);
 }
 
+void RetryBudget::RecordSkippedRetry() {
+    retries_rejected_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void RetryBudget::Reload(int percent, int min_concurrency) {
     percent_.store(ClampPercent(percent), std::memory_order_relaxed);
     min_concurrency_.store(ClampMinConcurrency(min_concurrency),
