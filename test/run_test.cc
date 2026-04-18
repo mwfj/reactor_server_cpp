@@ -1,3 +1,6 @@
+#include "proxy_transaction_internal_test.h"
+#include "http_internal_test.h"
+#include "http2_internal_test.h"
 #include "stress_test.h"
 #include "basic_test.h"
 #include "race_condition_test.h"
@@ -54,6 +57,12 @@ void RunAllTest(){
     // Run config tests
     ConfigTests::RunAllTests();
 
+    // Run focused internal proxy transaction regressions
+    ProxyTransactionInternalTests::RunAllTests();
+
+    // Run focused internal HTTP/1 streaming regressions
+    HttpInternalTests::RunAllTests();
+
     // Run HTTP tests
     HttpTests::RunAllTests();
 
@@ -65,6 +74,9 @@ void RunAllTest(){
 
     // Run CLI tests
     CliTests::RunAllTests();
+
+    // Run focused internal HTTP/2 regressions
+    Http2InternalTests::RunAllTests();
 
     // Run HTTP/2 tests
     Http2Tests::RunAllTests();
@@ -156,6 +168,7 @@ int main(int argc, char* argv[]) {
             ConfigTests::RunAllTests();
         // Run HTTP tests
         }else if(mode == "http" || mode == "-H"){
+            HttpInternalTests::RunAllTests();
             HttpTests::RunAllTests();
         // Run WebSocket tests
         }else if(mode == "ws" || mode == "-w"){
@@ -168,6 +181,7 @@ int main(int argc, char* argv[]) {
             CliTests::RunAllTests();
         // Run HTTP/2 tests
         }else if(mode == "http2" || mode == "-2"){
+            Http2InternalTests::RunAllTests();
             Http2Tests::RunAllTests();
         // Run route trie / router pattern tests
         }else if(mode == "route" || mode == "-R"){

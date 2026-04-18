@@ -329,8 +329,9 @@ void TestRetryBudgetObservability() {
             }
         } guard{logger, ring, prev_level};
 
-        // One client request: first attempt hits backend (502), retry
-        // blocked by budget → 503 + X-Retry-Budget-Exhausted.
+        // One client request: first attempt hits backend (502), retry is
+        // blocked locally by the budget, and the original upstream 502 is
+        // relayed to the client per R11.
         TestHttpClient::HttpGet(gw_port, "/fail", 5000);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(50));

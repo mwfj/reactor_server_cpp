@@ -1,5 +1,6 @@
 #pragma once
 
+#include "http/http_callbacks.h"
 #include "http2/http2_session.h"
 #include "http2/http2_callbacks.h"
 #include "connection_handler.h"
@@ -69,6 +70,17 @@ public:
     // Http2Session handles the missing-stream case internally.
     void SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
 
+    // Internal: after an explicit SendPendingFrames() flush, re-check whether
+    // graceful shutdown can now complete or whether the normal deadline
+    // tracking should be refreshed.
+    void RecheckShutdownDrainAfterFlush();
+
+    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender CreateStreamingResponseSender(
+        int32_t stream_id,
+        std::function<bool()> claim_response,
+        std::function<void()> release_response_claim,
+        std::function<void()> finalize_request);
+
     // Submit a non-final 1xx informational response (e.g. 103 Early Hints)
     // on a specific stream and flush nghttp2 output.
     //
@@ -88,8 +100,8 @@ public:
     // `parent_stream_id` and the associated response on the freshly
     // promised stream, then flushes nghttp2 output.
     //
-    // Thread-safe: off-dispatcher callers are internally hopped to the
-    // dispatcher. Return value semantics (consistent with the
+    // Thread-safe: off-dispatcher callers are rejected safely with no
+    // side effects. Return value semantics (consistent with the
     // ResourcePusher public contract: >0 = promised id, -1 = failure):
     //   - On dispatcher: the promised stream_id (>0) on success, -1
     //     on validation / state failure (shutdown requested, push
@@ -97,15 +109,11 @@ public:
     //     already submitted, invalid method/scheme/path/authority,
     //     nghttp2 failure — see Http2Session::SubmitPushPromise for
     //     the full validation list).
-    //   - Off dispatcher: returns -1 (the call was queued, but the
-    //     off-thread caller cannot synchronously observe the submit
-    //     outcome, so we return the failure sentinel — callers that
-    //     use the return value to decide on a Link-header fallback
-    //     see "no id available" and fall back correctly). The push
-    //     still proceeds on the dispatcher on a best-effort basis.
-    //     Handlers that need the promised id MUST call from the
-    //     dispatcher thread (sync handler or inside a RunOnDispatcher
-    //     lambda before enqueuing complete()).
+    //   - Off dispatcher: returns -1 and does NOT queue a push. A
+    //     failure sentinel must not have a hidden side effect because
+    //     callers may use -1 to trigger a Link-header fallback.
+    //     Handlers that need push semantics MUST call from the
+    //     dispatcher thread.
     //
     // Application code should use the bound ResourcePusher closure
     // (async routes) or HTTP2_PUSH_NAMESPACE::PushResource (sync
@@ -183,6 +191,20 @@ public:
     }
 
 private:
+    StreamCloseCallback WrapStreamCloseCallback(StreamCloseCallback callback);
+
+    // Dispatcher-thread-only weak refs to active per-stream streaming senders.
+    // Used to forward transport write-progress events so H2 backpressure can
+    // account for bytes already drained out of nghttp2's per-stream ring and
+    // now buffered on the shared connection output buffer.
+    std::unordered_map<
+        int32_t,
+        std::weak_ptr<HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::Impl>>
+        active_stream_sender_impls_;
+
+    void NotifyActiveStreamSendersWriteProgress(size_t remaining_bytes);
+    void NotifyActiveStreamSendersWriteComplete();
+
     std::shared_ptr<ConnectionHandler> conn_;
     std::unique_ptr<Http2Session> session_;
     Http2Session::Settings settings_;

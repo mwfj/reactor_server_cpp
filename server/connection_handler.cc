@@ -165,6 +165,10 @@ void ConnectionHandler::OnMessage(){
         // Otherwise fall through to read loop
     }
 
+    if (read_pump_paused_.load(std::memory_order_acquire)) {
+        return;
+    }
+
     bool peer_closed = false;  // Track if we saw EOF, close after dispatching buffered data
     bool stopped_for_cap = false; // True when we stopped reading due to input cap
     char buffer[MAX_BUFFER_SIZE];
@@ -327,7 +331,8 @@ void ConnectionHandler::OnMessage(){
     // both raw TCP and TLS without needing EPOLL_CTL_MOD re-arm.
     if (stopped_for_cap &&
         !is_closing_.load(std::memory_order_acquire) &&
-        !close_after_write_.load(std::memory_order_acquire)) {
+        !close_after_write_.load(std::memory_order_acquire) &&
+        !read_pump_paused_.load(std::memory_order_acquire)) {
         std::weak_ptr<ConnectionHandler> weak_self = shared_from_this();
         event_dispatcher_->EnQueue([weak_self]() {
             if (auto self = weak_self.lock()) {
@@ -869,6 +874,10 @@ void ConnectionHandler::CallWriteCb(){
 
 void ConnectionHandler::SetOnMessageCb(CALLBACKS_NAMESPACE::ConnOnMsgCallback fn){
     callbacks_.on_message_callback = std::move(fn);
+    has_on_message_callback_.store(
+        static_cast<bool>(callbacks_.on_message_callback),
+        std::memory_order_release);
+    on_message_cb_epoch_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void ConnectionHandler::SetCompletionCb(CALLBACKS_NAMESPACE::ConnCompleteCallback fn){
@@ -890,6 +899,80 @@ void ConnectionHandler::SetErrorCb(CALLBACKS_NAMESPACE::ConnErrorCallback fn){
 void ConnectionHandler::SetTlsConnection(std::unique_ptr<TlsConnection> tls) {
     tls_ = std::move(tls);
     tls_state_ = TlsState::HANDSHAKE;
+}
+
+void ConnectionHandler::EnableReadMode() {
+    auto fn = [weak_self = weak_from_this()]() {
+        if (auto self = weak_self.lock()) {
+            if (self->client_channel_ && !self->client_channel_->is_channel_closed()) {
+                self->client_channel_->EnableReadMode();
+            }
+        }
+    };
+    if (event_dispatcher_ && event_dispatcher_->is_on_loop_thread()) {
+        fn();
+        return;
+    }
+    if (event_dispatcher_) {
+        event_dispatcher_->EnQueue(std::move(fn));
+    }
+}
+
+void ConnectionHandler::DisableReadMode() {
+    auto fn = [weak_self = weak_from_this()]() {
+        if (auto self = weak_self.lock()) {
+            if (self->client_channel_ && !self->client_channel_->is_channel_closed()) {
+                self->client_channel_->DisableReadMode();
+            }
+        }
+    };
+    if (event_dispatcher_ && event_dispatcher_->is_on_loop_thread()) {
+        fn();
+        return;
+    }
+    if (event_dispatcher_) {
+        event_dispatcher_->EnQueue(std::move(fn));
+    }
+}
+
+bool ConnectionHandler::IsReadModeEnabled() const {
+    return client_channel_ && client_channel_->isEnableReadMode();
+}
+
+void ConnectionHandler::PauseReadPump() {
+    read_pump_paused_.store(true, std::memory_order_release);
+}
+
+void ConnectionHandler::ResumeReadPump() {
+    if (!read_pump_paused_.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    uint64_t expected_epoch =
+        on_message_cb_epoch_.load(std::memory_order_acquire);
+    auto fn = [weak_self = weak_from_this(), expected_epoch]() {
+        if (auto self = weak_self.lock()) {
+            if (self->is_closing_.load(std::memory_order_acquire) ||
+                self->read_pump_paused_.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (!self->has_on_message_callback_.load(std::memory_order_acquire) ||
+                self->on_message_cb_epoch_.load(std::memory_order_acquire) !=
+                    expected_epoch) {
+                return;
+            }
+            self->OnMessage();
+        }
+    };
+
+    if (event_dispatcher_) {
+        // Always enqueue, even on the loop thread, to avoid reentering the
+        // read path from arbitrary caller contexts (e.g. drain listeners).
+        event_dispatcher_->EnQueue(std::move(fn));
+        return;
+    }
+
+    fn();
 }
 
 void ConnectionHandler::RunOnDispatcher(std::function<void()> task) {

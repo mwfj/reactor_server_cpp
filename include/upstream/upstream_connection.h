@@ -2,7 +2,8 @@
 
 #include "common.h"
 #include "connection_handler.h"
-// <memory>, <functional>, <chrono>, <string> provided by common.h (via connection_handler.h)
+// <memory>, <functional>, <chrono>, <string>, <atomic> provided by common.h
+// (via connection_handler.h)
 
 // Forward declarations
 class TlsClientContext;
@@ -56,6 +57,15 @@ public:
     std::chrono::steady_clock::time_point last_used_at() const { return last_used_at_; }
     uint64_t request_count() const { return request_count_; }
     void IncrementRequestCount();
+    // Ref-counted upstream read suppression used by the proxy relay's
+    // downstream backpressure path. Thread-safe: the count itself is atomic,
+    // and the transition edges pause/resume the transport's logical read
+    // pump without depending on ET read-interest re-registration.
+    void IncReadDisable();
+    void DecReadDisable();
+    bool IsReadDisabled() const {
+        return read_disable_count_.load(std::memory_order_relaxed) > 0;
+    }
 
     // Access to underlying transport.
     // IMPORTANT: Borrowers MUST NOT overwrite SetCloseCb or SetErrorCb
@@ -75,4 +85,5 @@ private:
     std::chrono::steady_clock::time_point created_at_;
     std::chrono::steady_clock::time_point last_used_at_;
     uint64_t request_count_ = 0;
+    std::atomic<int> read_disable_count_{0};
 };

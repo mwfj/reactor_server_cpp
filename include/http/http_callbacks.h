@@ -1,12 +1,14 @@
 #pragma once
 
 #include "common.h"
+#include "http/streaming_response_sender.h"
 // <functional>, <memory>, <string>, <cstdint> provided by common.h
 
 // Forward declarations
 class HttpConnectionHandler;
 class ConnectionHandler;
 class WebSocketConnection;
+class Dispatcher;
 struct HttpRequest;
 class HttpResponse;
 
@@ -82,15 +84,11 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     // sent, parent stream closed OR its final response already
     // submitted, nghttp2 submit failure.
     //
-    // Thread-safe: off-dispatcher callers are auto-hopped internally.
-    // Off-thread callers cannot synchronously observe the submit
-    // outcome, so they receive -1 (the failure sentinel) — a
-    // "caller-friendly" choice that lets `if (id > 0)` and
-    // `if (id != -1)` correctly branch into the Link-header / preload
-    // fallback path. The push itself still proceeds on the dispatcher
-    // on a best-effort basis. Application code that needs the promised
-    // id MUST call from the dispatcher thread (sync handler, inside a
-    // RunOnDispatcher lambda, or before enqueuing complete()).
+    // Thread-safe: off-dispatcher callers are rejected safely with -1
+    // and no side effects. Application code that needs a real push
+    // MUST call from the dispatcher thread (sync handler or inline
+    // during the async handler's dispatcher invocation, before
+    // enqueuing complete()).
     // See design spec §2.2.
     using ResourcePusher = std::function<int32_t(
         const std::string& method,
@@ -100,24 +98,37 @@ namespace HTTP_CALLBACKS_NAMESPACE {
         const HttpResponse& response
     )>;
 
+    // StreamingResponseSender is declared in
+    // include/http/streaming_response_sender.h so this header remains focused
+    // on callback typedefs while still exposing the type through AsyncHandler.
+    using StreamingResponseSender = HTTP_STREAMING_NAMESPACE::StreamingResponseSender;
+
     // Async handler for HTTP requests. Used when the request handler needs to
     // dispatch async work (e.g. upstream proxy via UpstreamManager::CheckoutAsync)
     // and deliver the response later. The handler receives the request plus
-    // a completion callback and is responsible for invoking `complete(resp)`
-    // exactly once. The framework:
+    // an interim sender, an H2 push helper, a streaming final-response sender,
+    // and a completion callback. The handler either:
+    //   - invokes `complete(resp)` exactly once for buffered completion, or
+    //   - uses `stream_sender` (`SendHeaders` + `SendData*` + `End/Abort`)
+    //     for protocol-native streaming completion.
+    //
+    // The framework:
     //   - Runs middleware before invoking the async handler (auth, CORS, etc.)
     //   - Blocks the HTTP/1 parser from accepting new requests until the
-    //     completion fires, preserving response ordering on keep-alive
+    //     final response completes, preserving response ordering on keep-alive
     //   - Marks the connection as shutdown-exempt while the async work is
     //     pending so graceful shutdown waits for the reply
     //   - Applies Connection: close / keep-alive / HEAD body-stripping to
-    //     the completion response using the original request's metadata
+    //     buffered completions using the original request's metadata
+    //   - Binds protocol-specific streaming senders so the handler can use
+    //     one API across HTTP/1.1 and HTTP/2
     // Invoked by HttpServer (NOT HttpRouter — the router has no transport
     // context). See design §2.2 and §4.2.
     using AsyncHandler = std::function<void(
         const HttpRequest& request,
         InterimResponseSender send_interim,
         ResourcePusher        push_resource,
+        StreamingResponseSender stream_sender,
         AsyncCompletionCallback complete
     )>;
 

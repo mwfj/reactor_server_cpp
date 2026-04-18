@@ -1,10 +1,18 @@
 #include "http/http_connection_handler.h"
 #include "http/http_status.h"
+#include "http/trailer_policy.h"
+#include "http/streaming_response_sender_utils.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
+#include <cstdio>
 #include <sstream>
+#include <unordered_set>
 
 namespace {
+static constexpr size_t DEFAULT_STREAM_HIGH_WATER_BYTES = 1024 * 1024;
+static constexpr size_t DEFAULT_STREAM_LOW_WATER_BYTES =
+    DEFAULT_STREAM_HIGH_WATER_BYTES / 2;
+
 // Overhead budget above max_body_size_ + max_header_size_ for any extra
 // request-line, headers, and framing bytes that may accumulate while an
 // async response is pending on a pipelined keep-alive connection.
@@ -45,6 +53,520 @@ const char* InterimReasonPhrase(int code) {
     }
 }
 
+std::optional<std::string> FirstHeaderValueCI(
+    const std::vector<std::pair<std::string, std::string>>& headers,
+    const std::string& lower_name) {
+    for (const auto& [key, value] : headers) {
+        std::string lower = key;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lower == lower_name) return value;
+    }
+    return std::nullopt;
+}
+
+struct PreparedStreamingHead {
+    std::string wire;
+    bool use_chunked = false;
+    bool should_close = false;
+    bool body_suppressed = false;
+};
+
+using AllowedTrailerNameSet = std::unordered_set<std::string>;
+
+AllowedTrailerNameSet CollectAllowedTrailerNames(
+    const std::vector<std::pair<std::string, std::string>>& headers,
+    std::vector<std::string>* declared_names = nullptr) {
+    AllowedTrailerNameSet allowed_names;
+    for (const auto& [key, value] : headers) {
+        std::string lower = key;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lower != "trailer") {
+            continue;
+        }
+
+        size_t start = 0;
+        while (start <= value.size()) {
+            size_t comma = value.find(',', start);
+            std::string token = TrimOptionalWhitespace(
+                value.substr(start, comma == std::string::npos
+                                        ? std::string::npos
+                                        : comma - start));
+            if (!token.empty()) {
+                std::string lower_token = token;
+                std::transform(lower_token.begin(), lower_token.end(),
+                               lower_token.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                if (!IsForbiddenTrailerFieldName(lower_token)) {
+                    if (declared_names) {
+                        declared_names->push_back(token);
+                    }
+                    allowed_names.insert(std::move(lower_token));
+                }
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            start = comma + 1;
+        }
+    }
+
+    return allowed_names;
+}
+
+std::optional<std::string> MergeAllowedTrailerDeclarations(
+    const std::vector<std::pair<std::string, std::string>>& headers) {
+    std::vector<std::string> declared_names;
+    CollectAllowedTrailerNames(headers, &declared_names);
+
+    if (declared_names.empty()) {
+        return std::nullopt;
+    }
+
+    std::string merged = declared_names.front();
+    for (size_t i = 1; i < declared_names.size(); ++i) {
+        merged += ", ";
+        merged += declared_names[i];
+    }
+    return merged;
+}
+
+std::optional<std::string> ComputeEffectiveStreamingContentLength(
+    const HttpResponse& response) {
+    const int status_code = response.GetStatusCode();
+    if (response.IsContentLengthPreserved() ||
+        status_code == HttpStatus::RESET_CONTENT ||
+        status_code == HttpStatus::NOT_MODIFIED) {
+        return response.ComputeWireContentLength(status_code);
+    }
+    return std::nullopt;
+}
+
+std::string SerializeStreamingHead(const HttpResponse& response,
+                                   int http_minor,
+                                   bool use_chunked,
+                                   bool allow_content_length = true) {
+    std::ostringstream oss;
+    // Streaming headers are emitted before the final body length is known. Only
+    // preserve an explicit known length (or status-defined wire values like
+    // 205/304); never auto-compute from the empty headers-only body.
+    std::optional<std::string> effective_cl =
+        (!allow_content_length || use_chunked) ? std::nullopt
+                                               : ComputeEffectiveStreamingContentLength(response);
+    auto merged_trailer = MergeAllowedTrailerDeclarations(response.GetHeaders());
+
+    oss << "HTTP/1." << http_minor << " " << response.GetStatusCode()
+        << " " << response.GetStatusReason() << "\r\n";
+    for (const auto& [key, value] : response.GetHeaders()) {
+        std::string lower = key;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lower == "transfer-encoding") continue;
+        if (lower == "content-length") continue;
+        if (lower == "trailer") continue;
+        oss << key << ": " << value << "\r\n";
+    }
+    if (use_chunked && merged_trailer) {
+        oss << "Trailer: " << *merged_trailer << "\r\n";
+    }
+    if (effective_cl) {
+        oss << "Content-Length: " << *effective_cl << "\r\n";
+    }
+    if (use_chunked) {
+        oss << "Transfer-Encoding: chunked\r\n";
+    }
+    oss << "\r\n";
+    return oss.str();
+}
+
+std::string EncodeChunkTerminator(
+    const std::vector<std::pair<std::string, std::string>>& trailers,
+    const AllowedTrailerNameSet& declared_trailer_names) {
+    auto strip_crlf = [](std::string s) -> std::string {
+        s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());
+        s.erase(std::remove(s.begin(), s.end(), '\n'), s.end());
+        return s;
+    };
+
+    std::string out = "0\r\n";
+    for (const auto& [key, value] : trailers) {
+        std::string sanitized_key = strip_crlf(key);
+        std::string sanitized_value = strip_crlf(value);
+        std::string lower = sanitized_key;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (IsForbiddenTrailerFieldName(lower)) {
+            logging::Get()->warn(
+                "H1 streaming dropped forbidden trailer field '{}'",
+                key);
+            continue;
+        }
+        if (declared_trailer_names.find(lower) ==
+            declared_trailer_names.end()) {
+            logging::Get()->warn(
+                "H1 streaming dropped undeclared trailer field '{}'",
+                key);
+            continue;
+        }
+        out += sanitized_key;
+        out += ": ";
+        out += sanitized_value;
+        out += "\r\n";
+    }
+    out += "\r\n";
+    return out;
+}
+
+class H1StreamingResponseSenderImpl final
+    : public HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::Impl,
+      public std::enable_shared_from_this<H1StreamingResponseSenderImpl> {
+public:
+    using SendResult =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult;
+    using AbortReason =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason;
+    using DrainListener =
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::DrainListener;
+
+    using PrepareHeadCallback = std::function<std::optional<PreparedStreamingHead>(
+        const HttpResponse&)>;
+    using FinalizeResponseCallback = std::function<void(bool)>;
+    using AbortResponseCallback = std::function<void()>;
+
+    H1StreamingResponseSenderImpl(
+        std::shared_ptr<ConnectionHandler> conn,
+        std::function<bool()> claim_response,
+        std::function<void()> finalize_request,
+        PrepareHeadCallback prepare_head,
+        FinalizeResponseCallback finalize_response,
+        AbortResponseCallback abort_response,
+        std::function<void()> mark_response_committed)
+        : conn_(std::move(conn)),
+          claim_response_(std::move(claim_response)),
+          finalize_request_(std::move(finalize_request)),
+          prepare_head_(std::move(prepare_head)),
+          finalize_response_(std::move(finalize_response)),
+          abort_response_(std::move(abort_response)),
+          mark_response_committed_(std::move(mark_response_committed)) {}
+
+    int SendHeaders(const HttpResponse& headers_only_response) override {
+        if (!conn_ || conn_->IsClosing()) {
+            logging::Get()->debug(
+                "H1 streaming SendHeaders rejected fd={} connection unavailable",
+                conn_ ? conn_->fd() : -1);
+            return -1;
+        }
+        if (!conn_->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H1 streaming SendHeaders called off dispatcher fd={}",
+                conn_->fd());
+            return -1;
+        }
+        if (terminal_ || programmer_error_ || headers_sent_) {
+            logging::Get()->debug(
+                "H1 streaming SendHeaders rejected fd={} terminal={} programmer_error={} headers_sent={}",
+                conn_->fd(), terminal_, programmer_error_, headers_sent_);
+            return -1;
+        }
+        if (headers_only_response.GetStatusCode() < HttpStatus::OK) {
+            logging::Get()->error(
+                "H1 streaming SendHeaders called with {} "
+                "(1xx not supported as app final response) fd={}",
+                headers_only_response.GetStatusCode(),
+                conn_->fd());
+            return -1;
+        }
+        auto prepared = prepare_head_ ? prepare_head_(headers_only_response)
+                                      : std::nullopt;
+        if (!prepared) {
+            logging::Get()->debug(
+                "H1 streaming SendHeaders prepare_head rejected fd={} closing={}",
+                conn_ ? conn_->fd() : -1,
+                conn_ ? conn_->IsClosing() : true);
+            terminal_ = true;
+            return -1;
+        }
+        if (!claimed_response_) {
+            if (!claim_response_ || !claim_response_()) {
+                terminal_ = true;
+                logging::Get()->debug(
+                    "H1 streaming SendHeaders failed to claim final response fd={}",
+                    conn_->fd());
+                return -1;
+            }
+            claimed_response_ = true;
+        }
+
+        use_chunked_ = prepared->use_chunked;
+        should_close_ = prepared->should_close;
+        body_suppressed_ = prepared->body_suppressed;
+        declared_trailer_names_ =
+            CollectAllowedTrailerNames(headers_only_response.GetHeaders());
+        headers_sent_ = true;
+        if (mark_response_committed_) {
+            mark_response_committed_();
+        }
+        conn_->SendRaw(prepared->wire.data(), prepared->wire.size());
+        return 0;
+    }
+
+    SendResult SendData(const char* data, size_t len) override {
+        if (!conn_ || conn_->IsClosing()) {
+            logging::Get()->debug(
+                "H1 streaming SendData rejected fd={} connection unavailable len={}",
+                conn_ ? conn_->fd() : -1, len);
+            return SendResult::CLOSED;
+        }
+        if (!conn_->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H1 streaming SendData called off dispatcher fd={}",
+                conn_->fd());
+            return SendResult::CLOSED;
+        }
+        if (!headers_sent_) {
+            return HandleProgrammerError("SendData");
+        }
+        if (terminal_ || programmer_error_) {
+            logging::Get()->debug(
+                "H1 streaming SendData rejected fd={} terminal={} programmer_error={} len={}",
+                conn_->fd(), terminal_, programmer_error_, len);
+            return SendResult::CLOSED;
+        }
+        if (body_suppressed_) {
+            return SendResult::ACCEPTED_BELOW_WATER;
+        }
+        if (use_chunked_) {
+            if (len == 0) {
+                return EvaluateOccupancy();
+            }
+            static constexpr size_t CHUNK_HEADER_BUF_SIZE = 32;
+            char header[CHUNK_HEADER_BUF_SIZE];
+            int header_len = std::snprintf(header, sizeof(header),
+                                           "%zx\r\n", len);
+            if (header_len <= 0 ||
+                static_cast<size_t>(header_len) >= sizeof(header)) {
+                logging::Get()->error(
+                    "H1 streaming chunk header encode failed fd={} len={}",
+                    conn_->fd(), len);
+                AbortInternal(
+                    true,
+                    AbortReason::UPSTREAM_ERROR);
+                return SendResult::CLOSED;
+            }
+            conn_->SendRaw(header, static_cast<size_t>(header_len));
+            conn_->SendRaw(data, len);
+            conn_->SendRaw("\r\n", 2);
+        } else {
+            conn_->SendRaw(data, len);
+        }
+        return EvaluateOccupancy();
+    }
+
+    SendResult End(
+        const std::vector<std::pair<std::string, std::string>>& trailers) override {
+        if (!conn_ || conn_->IsClosing()) {
+            logging::Get()->debug(
+                "H1 streaming End rejected fd={} connection unavailable",
+                conn_ ? conn_->fd() : -1);
+            return SendResult::CLOSED;
+        }
+        if (!conn_->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H1 streaming End called off dispatcher fd={}",
+                conn_->fd());
+            return SendResult::CLOSED;
+        }
+        if (!headers_sent_) {
+            HandleProgrammerError("End");
+            return SendResult::CLOSED;
+        }
+        if (terminal_ || programmer_error_) {
+            logging::Get()->debug(
+                "H1 streaming End rejected fd={} terminal={} programmer_error={}",
+                conn_->fd(), terminal_, programmer_error_);
+            return SendResult::CLOSED;
+        }
+        if (!use_chunked_ && !trailers.empty()) {
+            logging::Get()->debug(
+                "H1 streaming End dropping trailers on non-chunked response fd={} trailer_count={}",
+                conn_->fd(), trailers.size());
+        }
+        terminal_ = true;
+        if (use_chunked_) {
+            std::string final_chunk = EncodeChunkTerminator(
+                trailers, declared_trailer_names_);
+            conn_->SendRaw(final_chunk.data(), final_chunk.size());
+        }
+        if (finalize_response_) {
+            finalize_response_(should_close_);
+        }
+        if (finalize_request_) {
+            finalize_request_();
+        }
+        return SendResult::ACCEPTED_BELOW_WATER;
+    }
+
+    void Abort(AbortReason reason) override {
+        if (!conn_ || conn_->IsClosing()) {
+            return;
+        }
+        if (!conn_->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H1 streaming Abort called off dispatcher fd={}",
+                conn_->fd());
+            return;
+        }
+        AbortInternal(false, reason);
+    }
+
+    void SetDrainListener(DrainListener listener) override {
+        if (!conn_ || conn_->IsClosing()) {
+            return;
+        }
+        if (!conn_->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H1 streaming SetDrainListener called off dispatcher fd={}",
+                conn_->fd());
+            return;
+        }
+        drain_listener_ = std::move(listener);
+        ++drain_listener_generation_;
+        drain_listener_scheduled_ = false;
+        if (!drain_listener_) {
+            above_high_water_ = false;
+            return;
+        }
+        MaybeFireDrainListener(conn_->OutputBufferSize());
+    }
+
+    void ConfigureWatermarks(size_t high_water_bytes) override {
+        if (!conn_ || conn_->IsClosing()) {
+            return;
+        }
+        if (!conn_->IsOnDispatcherThread()) {
+            logging::Get()->error(
+                "H1 streaming ConfigureWatermarks called off dispatcher fd={}",
+                conn_->fd());
+            return;
+        }
+        if (high_water_bytes == 0) return;
+        high_water_ = high_water_bytes;
+        low_water_ = high_water_ / 2;
+    }
+
+    Dispatcher* GetDispatcher() override {
+        return conn_ ? conn_->GetDispatcher() : nullptr;
+    }
+
+    void OnDownstreamWriteProgress(size_t remaining_bytes) override {
+        MaybeFireDrainListener(remaining_bytes);
+    }
+
+    void OnDownstreamWriteComplete() override {
+        MaybeFireDrainListener(0);
+    }
+
+private:
+    SendResult HandleProgrammerError(const char* op) {
+        if (!programmer_error_) {
+            logging::Get()->error(
+                "H1 streaming {} called before SendHeaders — programmer error fd={}",
+                op, conn_ ? conn_->fd() : -1);
+            programmer_error_ = true;
+            AbortInternal(true, AbortReason::UPSTREAM_ERROR);
+        }
+        return SendResult::CLOSED;
+    }
+
+    void AbortInternal(bool from_programmer_error, AbortReason reason) {
+        if (terminal_ && !from_programmer_error) return;
+        terminal_ = true;
+        drain_listener_ = nullptr;
+        ++drain_listener_generation_;
+        above_high_water_ = false;
+        drain_listener_scheduled_ = false;
+        if (!claimed_response_) {
+            if (!claim_response_ || !claim_response_()) {
+                return;
+            }
+            claimed_response_ = true;
+        }
+        if (mark_response_committed_) {
+            mark_response_committed_();
+        }
+        logging::Get()->debug(
+            "H1 streaming abort fd={} reason={} programmer_error={}",
+            conn_ ? conn_->fd() : -1,
+            StreamingAbortReasonToString(reason),
+            from_programmer_error);
+        if (abort_response_) {
+            abort_response_();
+        }
+        if (finalize_request_) {
+            finalize_request_();
+        }
+    }
+
+    SendResult EvaluateOccupancy() {
+        if (!conn_ || conn_->IsClosing()) {
+            return SendResult::CLOSED;
+        }
+        if (conn_->OutputBufferSize() >= high_water_) {
+            above_high_water_ = true;
+            return SendResult::ACCEPTED_ABOVE_HIGH_WATER;
+        }
+        return SendResult::ACCEPTED_BELOW_WATER;
+    }
+
+    void MaybeFireDrainListener(size_t remaining_bytes) {
+        if (!above_high_water_ || !drain_listener_ || drain_listener_scheduled_) {
+            return;
+        }
+        if (remaining_bytes > low_water_) {
+            return;
+        }
+        above_high_water_ = false;
+        drain_listener_scheduled_ = true;
+        auto listener = drain_listener_;
+        const uint64_t generation = drain_listener_generation_;
+        std::weak_ptr<H1StreamingResponseSenderImpl> weak_self =
+            shared_from_this();
+        conn_->RunOnDispatcher(
+            [weak_self, listener = std::move(listener), generation]() mutable {
+                if (auto self = weak_self.lock()) {
+                    if (self->drain_listener_generation_ != generation) {
+                        return;
+                    }
+                    self->drain_listener_scheduled_ = false;
+                    if (listener) listener();
+                }
+            });
+    }
+
+    std::shared_ptr<ConnectionHandler> conn_;
+    std::function<bool()> claim_response_;
+    std::function<void()> finalize_request_;
+    PrepareHeadCallback prepare_head_;
+    FinalizeResponseCallback finalize_response_;
+    AbortResponseCallback abort_response_;
+    std::function<void()> mark_response_committed_;
+    DrainListener drain_listener_;
+    bool claimed_response_ = false;
+    bool headers_sent_ = false;
+    bool terminal_ = false;
+    bool programmer_error_ = false;
+    bool use_chunked_ = false;
+    bool should_close_ = false;
+    bool body_suppressed_ = false;
+    AllowedTrailerNameSet declared_trailer_names_;
+    bool above_high_water_ = false;
+    bool drain_listener_scheduled_ = false;
+    uint64_t drain_listener_generation_ = 0;
+    size_t high_water_ = DEFAULT_STREAM_HIGH_WATER_BYTES;
+    size_t low_water_ = DEFAULT_STREAM_LOW_WATER_BYTES;
+};
+
 }  // namespace
 
 HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn)
@@ -64,6 +586,137 @@ void HttpConnectionHandler::SetMiddlewareCallback(MiddlewareCallback callback) {
 
 void HttpConnectionHandler::SetUpgradeCallback(UpgradeCallback callback) {
     callbacks_.upgrade_callback = std::move(callback);
+}
+
+HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender
+HttpConnectionHandler::CreateStreamingResponseSender(
+    std::function<bool()> claim_response,
+    std::function<void()> finalize_request) {
+    auto weak_self = weak_from_this();
+    auto prepare_head =
+        [weak_self](const HttpResponse& input)
+            -> std::optional<PreparedStreamingHead> {
+        auto self = weak_self.lock();
+        if (!self || !self->conn_ || self->conn_->IsClosing()) {
+            return std::nullopt;
+        }
+
+        HttpResponse response = input;
+        const int status_code = response.GetStatusCode();
+        bool body_suppressed =
+            self->deferred_was_head_ ||
+            status_code < HttpStatus::OK ||
+            status_code == HttpStatus::SWITCHING_PROTOCOLS ||
+            status_code == HttpStatus::NO_CONTENT ||
+            status_code == HttpStatus::RESET_CONTENT ||
+            status_code == HttpStatus::NOT_MODIFIED;
+        if (status_code == HttpStatus::RESET_CONTENT &&
+            !FirstHeaderValueCI(response.GetHeaders(), "content-length")) {
+            response.Header("Content-Length", "0");
+        }
+
+        const bool shutting_down =
+            (self->callbacks_.shutdown_check_callback &&
+             self->callbacks_.shutdown_check_callback()) ||
+            (self->conn_ && self->conn_->IsCloseDeferred());
+        const bool effective_keep_alive =
+            self->deferred_keep_alive_ && !shutting_down;
+        const int http_minor =
+            self->current_http_minor_.load(std::memory_order_acquire);
+        bool should_close = self->NormalizeOutgoingResponse(
+            response, effective_keep_alive, http_minor);
+
+        const bool has_effective_content_length =
+            ComputeEffectiveStreamingContentLength(response).has_value();
+        bool use_chunked = false;
+        bool allow_content_length = true;
+        if (!body_suppressed) {
+            if (http_minor == 0) {
+                // H1.0 streaming fallback is close-delimited, even when a
+                // handler supplied a fixed length. This keeps the generic
+                // streaming API aligned with the documented EOF-framed mode.
+                response.Header("Connection", "close");
+                should_close = true;
+                allow_content_length = false;
+            } else if (!has_effective_content_length) {
+                use_chunked = true;
+            }
+        }
+
+        return PreparedStreamingHead{
+            SerializeStreamingHead(
+                response, http_minor, use_chunked, allow_content_length),
+            use_chunked,
+            should_close,
+            body_suppressed};
+    };
+
+    auto finalize_response = [weak_self](bool should_close) {
+        auto self = weak_self.lock();
+        if (!self || !self->conn_) return;
+
+        self->deferred_response_pending_ = false;
+        self->deferred_response_committed_ = false;
+        self->deferred_was_head_ = false;
+        self->deferred_keep_alive_ = true;
+        self->deferred_start_ = std::chrono::steady_clock::time_point{};
+        self->async_abort_hook_ = nullptr;
+
+        if (self->conn_->IsClosing()) {
+            self->conn_->SetShutdownExempt(false);
+            self->deferred_pending_buf_.clear();
+            return;
+        }
+        if (should_close) {
+            self->deferred_pending_buf_.clear();
+            self->CloseConnection();
+            self->conn_->SetShutdownExempt(false);
+            return;
+        }
+
+        self->conn_->SetShutdownExempt(false);
+        self->conn_->ClearDeadline();
+        self->conn_->SetDeadlineTimeoutCb(nullptr);
+
+        if (!self->deferred_pending_buf_.empty()) {
+            std::string pending = std::move(self->deferred_pending_buf_);
+            self->deferred_pending_buf_.clear();
+            self->OnRawData(self->conn_, pending);
+        }
+    };
+
+    auto abort_response = [weak_self]() {
+        auto self = weak_self.lock();
+        if (!self || !self->conn_) return;
+
+        self->deferred_response_pending_ = false;
+        self->deferred_response_committed_ = false;
+        self->deferred_was_head_ = false;
+        self->deferred_keep_alive_ = true;
+        self->deferred_pending_buf_.clear();
+        self->deferred_start_ = std::chrono::steady_clock::time_point{};
+        self->async_abort_hook_ = nullptr;
+        self->conn_->SetShutdownExempt(false);
+        self->conn_->ClearDeadline();
+        self->conn_->SetDeadlineTimeoutCb(nullptr);
+        if (!self->conn_->IsClosing()) {
+            self->conn_->ForceClose();
+        }
+    };
+
+    auto mark_response_committed = [weak_self]() {
+        if (auto self = weak_self.lock()) {
+            self->final_response_sent_.store(true, std::memory_order_release);
+            self->deferred_response_committed_ = true;
+        }
+    };
+
+    auto impl = std::make_shared<H1StreamingResponseSenderImpl>(
+        conn_, std::move(claim_response), std::move(finalize_request),
+        std::move(prepare_head), std::move(finalize_response),
+        std::move(abort_response), std::move(mark_response_committed));
+    active_stream_sender_impl_ = impl;
+    return HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender(std::move(impl));
 }
 
 void HttpConnectionHandler::SetRequestCountCallback(
@@ -197,6 +850,7 @@ void HttpConnectionHandler::StripResponseBodyForHead(std::string& wire) {
 
 void HttpConnectionHandler::BeginAsyncResponse(const HttpRequest& req) {
     deferred_response_pending_ = true;
+    deferred_response_committed_ = false;
     deferred_was_head_ = (req.method == "HEAD");
     deferred_keep_alive_ = req.keep_alive;
     // Reset so interim responses can be emitted before the final response
@@ -215,6 +869,7 @@ void HttpConnectionHandler::BeginAsyncResponse(const HttpRequest& req) {
 
 void HttpConnectionHandler::CancelAsyncResponse() {
     deferred_response_pending_ = false;
+    deferred_response_committed_ = false;
     deferred_was_head_ = false;
     deferred_keep_alive_ = true;
     deferred_pending_buf_.clear();
@@ -313,6 +968,7 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     // flags are false causes the drain loop to exit and stop the event
     // loop, truncating the response bytes we just queued with SendRaw.
     deferred_response_pending_ = false;
+    deferred_response_committed_ = false;
     deferred_was_head_ = false;
     deferred_keep_alive_ = true;
     deferred_start_ = std::chrono::steady_clock::time_point{};
@@ -485,6 +1141,18 @@ bool HttpConnectionHandler::SendInterimResponse(
     logging::Get()->debug(
         "SendInterimResponse sent status={} fd={}", status_code, conn_->fd());
     return true;
+}
+
+void HttpConnectionHandler::OnSendComplete() {
+    if (auto impl = active_stream_sender_impl_.lock()) {
+        impl->OnDownstreamWriteComplete();
+    }
+}
+
+void HttpConnectionHandler::OnWriteProgress(size_t remaining_bytes) {
+    if (auto impl = active_stream_sender_impl_.lock()) {
+        impl->OnDownstreamWriteProgress(remaining_bytes);
+    }
 }
 
 void HttpConnectionHandler::CloseConnection() {
@@ -879,6 +1547,12 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                     // because CompleteAsyncResponse clears the deadline,
                     // but handle defensively).
                     return false;
+                }
+                if (self->deferred_response_committed_) {
+                    auto now_steady = std::chrono::steady_clock::now();
+                    self->conn_->SetDeadline(
+                        now_steady + std::chrono::seconds(heartbeat_sec));
+                    return true;
                 }
                 // Absolute safety cap: if configured AND exceeded,
                 // abort the deferred state and send 504. This catches

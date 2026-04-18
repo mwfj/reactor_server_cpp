@@ -655,6 +655,7 @@ namespace HttpTests {
                 [&](const HttpRequest&,
                     HttpRouter::InterimResponseSender /*send_interim*/,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback complete) {
                     handler_called.store(true);
                     HttpResponse r;
@@ -699,6 +700,7 @@ namespace HttpTests {
                 [&sched](const HttpRequest&,
                          HttpRouter::InterimResponseSender /*send_interim*/,
                          HttpRouter::ResourcePusher        /*push_resource*/,
+                         HttpRouter::StreamingResponseSender /*stream_sender*/,
                          HttpRouter::AsyncCompletionCallback complete) {
                     // Defer completion by ~150 ms on a background thread.
                     auto shared = std::make_shared<
@@ -759,6 +761,7 @@ namespace HttpTests {
                 [&](const HttpRequest& req,
                     HttpRouter::InterimResponseSender /*send_interim*/,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback complete) {
                     if (req.method == "GET")  saw_get.store(true);
                     if (req.method == "HEAD") saw_head.store(true);
@@ -801,6 +804,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender /*send_interim*/,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback c) {
                     HttpResponse r;
                     r.Status(202).Text("accepted");
@@ -846,6 +850,7 @@ namespace HttpTests {
                 [&sched](const HttpRequest&,
                          HttpRouter::InterimResponseSender /*send_interim*/,
                          HttpRouter::ResourcePusher        /*push_resource*/,
+                         HttpRouter::StreamingResponseSender /*stream_sender*/,
                          HttpRouter::AsyncCompletionCallback complete) {
                     auto shared = std::make_shared<
                         HttpRouter::AsyncCompletionCallback>(std::move(complete));
@@ -896,6 +901,7 @@ namespace HttpTests {
                 [&sched](const HttpRequest&,
                          HttpRouter::InterimResponseSender /*send_interim*/,
                          HttpRouter::ResourcePusher        /*push_resource*/,
+                         HttpRouter::StreamingResponseSender /*stream_sender*/,
                          HttpRouter::AsyncCompletionCallback complete) {
                     auto shared = std::make_shared<
                         HttpRouter::AsyncCompletionCallback>(std::move(complete));
@@ -960,6 +966,7 @@ namespace HttpTests {
                 [&](const HttpRequest&,
                     HttpRouter::InterimResponseSender /*send_interim*/,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback c) {
                     handler_called.store(true);
                     HttpResponse r;
@@ -1031,6 +1038,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender send_interim,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback complete) {
                     send_interim(103, {{"Link", "</style.css>; rel=preload; as=style"}});
                     HttpResponse r;
@@ -1092,6 +1100,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender send_interim,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback complete) {
                     send_interim(103, {{"Link", "</a.css>; rel=preload"}});
                     send_interim(103, {{"Link", "</b.js>; rel=preload"}});
@@ -1142,6 +1151,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender send_interim,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback complete) {
                     send_interim(103, {{"Link", "</x.css>; rel=preload"}});
                     HttpResponse r;
@@ -1185,6 +1195,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender send_interim,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback complete) {
                     send_interim(103, {
                         {"Link", "</a.css>; rel=preload"},
@@ -1271,6 +1282,7 @@ namespace HttpTests {
                     const HttpRequest&,
                     HttpRouter::InterimResponseSender send_interim,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback complete) {
                     // Complete with the final 200 first. This enqueues
                     // CompleteAsyncResponse on the dispatcher (task A).
@@ -1341,6 +1353,7 @@ namespace HttpTests {
                 [&sched](const HttpRequest&,
                           HttpRouter::InterimResponseSender send_interim,
                           HttpRouter::ResourcePusher        /*push_resource*/,
+                          HttpRouter::StreamingResponseSender /*stream_sender*/,
                           HttpRouter::AsyncCompletionCallback complete) {
                     // 103 emitted synchronously; final 200 via background task.
                     send_interim(103, {{"Link", "</style.css>; rel=preload"}});
@@ -1474,6 +1487,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender send_interim,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback complete) {
                     send_interim(103, {
                         {"Link", "</a.css>; rel=preload\r\nInjected: leaked"}
@@ -1515,6 +1529,991 @@ namespace HttpTests {
         }
     }
 
+    void TestH1_StreamingTrailers_CRLFSanitized() {
+        std::cout << "\n[TEST] H1 streaming trailers: CR/LF sanitized..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-trailer-inject",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Trailer", "X-Key, X-Value");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    static constexpr char kBody[] = "hello";
+                    if (stream_sender.SendData(kBody, sizeof(kBody) - 1) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End({
+                        {"X-Key\r\nInjected-Name", "abc"},
+                        {"X-Value", "line1\r\nInjected-Value: leaked"},
+                    });
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-trailer-inject HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            if (resp.find("HTTP/1.1 200") == std::string::npos) {
+                pass = false; err += "missing 200; ";
+            }
+            if (resp.find("5\r\nhello\r\n") == std::string::npos) {
+                pass = false; err += "chunked body missing; ";
+            }
+            auto header_end = resp.find("\r\n\r\n");
+            std::string body_and_trailers =
+                (header_end == std::string::npos) ? std::string() :
+                resp.substr(header_end + 4);
+            if (body_and_trailers.find("0\r\n") == std::string::npos) {
+                pass = false; err += "final zero chunk missing; ";
+            }
+            if (body_and_trailers.find("\r\nInjected-Name:") != std::string::npos) {
+                pass = false; err += "trailer name injection observed; ";
+            }
+            if (body_and_trailers.find("\r\nInjected-Value:") != std::string::npos) {
+                pass = false; err += "trailer value injection observed; ";
+            }
+            std::string lower = body_and_trailers;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("x-keyinjected-name: abc") != std::string::npos) {
+                pass = false; err += "undeclared sanitized trailer name should be dropped; ";
+            }
+            if (lower.find("x-value: line1injected-value: leaked") == std::string::npos) {
+                pass = false; err += "sanitized trailer value missing; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming trailers: CR/LF sanitized",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming trailers: CR/LF sanitized",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingTrailers_DeclarationFiltersForbiddenNames() {
+        std::cout << "\n[TEST] H1 streaming trailers: declaration filters forbidden names..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-trailer-declaration-filter",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Trailer",
+                                "X-Allowed, Content-Length, X-Extra, Host, "
+                                "Transfer-Encoding");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    static constexpr char kBody[] = "ok";
+                    if (stream_sender.SendData(kBody, sizeof(kBody) - 1) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End({
+                        {"X-Allowed", "one"},
+                        {"Content-Length", "should-drop"},
+                        {"Host", "should-drop"},
+                        {"X-Extra", "two"},
+                    });
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-trailer-declaration-filter HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            auto header_end = resp.find("\r\n\r\n");
+            if (header_end == std::string::npos) {
+                pass = false; err += "missing header terminator; ";
+            } else {
+                std::string head = resp.substr(0, header_end);
+                std::string lower_head = head;
+                std::transform(lower_head.begin(), lower_head.end(), lower_head.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                size_t trailer_pos = lower_head.find("\r\ntrailer: ");
+                if (trailer_pos == std::string::npos) {
+                    pass = false; err += "filtered trailer declaration missing; ";
+                } else {
+                    size_t trailer_end = lower_head.find("\r\n", trailer_pos + 2);
+                    std::string trailer_line = lower_head.substr(
+                        trailer_pos + 2,
+                        trailer_end == std::string::npos
+                            ? std::string::npos
+                            : trailer_end - (trailer_pos + 2));
+                    if (trailer_line.find("x-allowed") == std::string::npos ||
+                        trailer_line.find("x-extra") == std::string::npos) {
+                        pass = false; err += "allowed trailer name missing from declaration; ";
+                    }
+                    if (trailer_line.find("content-length") != std::string::npos ||
+                        trailer_line.find("host") != std::string::npos ||
+                        trailer_line.find("transfer-encoding") != std::string::npos) {
+                        pass = false; err += "forbidden trailer name declared; ";
+                    }
+                }
+
+                std::string body_and_trailers = resp.substr(header_end + 4);
+                std::string lower_body = body_and_trailers;
+                std::transform(lower_body.begin(), lower_body.end(), lower_body.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                if (lower_body.find("2\r\nok\r\n0\r\n") == std::string::npos) {
+                    pass = false; err += "chunked body missing; ";
+                }
+                if (lower_body.find("x-allowed: one\r\n") == std::string::npos ||
+                    lower_body.find("x-extra: two\r\n") == std::string::npos) {
+                    pass = false; err += "allowed trailers missing; ";
+                }
+                if (lower_body.find("content-length: should-drop") !=
+                        std::string::npos ||
+                    lower_body.find("host: should-drop") != std::string::npos) {
+                    pass = false; err += "forbidden trailer serialized; ";
+                }
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming trailers: declaration filters forbidden names",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming trailers: declaration filters forbidden names",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingTrailers_SuppressedWhenNotChunked() {
+        std::cout << "\n[TEST] H1 streaming trailers: declaration suppressed when framing is not chunked..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-trailer-fixed-length",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Content-Length", "5")
+                        .PreserveContentLength()
+                        .Header("Trailer", "X-Checksum");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    static constexpr char kBody[] = "hello";
+                    if (stream_sender.SendData(kBody, sizeof(kBody) - 1) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End({{"X-Checksum", "abc123"}});
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-trailer-fixed-length HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            auto header_end = lower.find("\r\n\r\n");
+            if (header_end == std::string::npos) {
+                pass = false; err += "missing header terminator; ";
+            } else {
+                std::string headers = lower.substr(0, header_end);
+                std::string body = lower.substr(header_end + 4);
+                if (headers.find("content-length: 5") == std::string::npos) {
+                    pass = false; err += "content-length missing; ";
+                }
+                if (headers.find("transfer-encoding: chunked") != std::string::npos) {
+                    pass = false; err += "unexpected chunked framing; ";
+                }
+                if (headers.find("trailer:") != std::string::npos) {
+                    pass = false; err += "Trailer declaration should be stripped; ";
+                }
+                if (body != "hello") {
+                    pass = false; err += "body mismatch; ";
+                }
+                if (body.find("x-checksum: abc123") != std::string::npos) {
+                    pass = false; err += "unexpected trailer block serialized; ";
+                }
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming trailers: declaration suppressed when framing is not chunked",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming trailers: declaration suppressed when framing is not chunked",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingTrailers_DropsUndeclaredFields() {
+        std::cout << "\n[TEST] H1 streaming trailers: undeclared fields dropped..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-trailer-undeclared-drop",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Trailer", "X-Declared");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    static constexpr char kBody[] = "ok";
+                    if (stream_sender.SendData(kBody, sizeof(kBody) - 1) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End({
+                        {"X-Declared", "yes"},
+                        {"X-Undeclared", "no"},
+                    });
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-trailer-undeclared-drop HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            auto header_end = resp.find("\r\n\r\n");
+            if (header_end == std::string::npos) {
+                pass = false; err += "missing header terminator; ";
+            } else {
+                std::string lower = resp;
+                std::transform(lower.begin(), lower.end(), lower.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                size_t trailer_decl = lower.find("\r\ntrailer: ");
+                if (trailer_decl == std::string::npos ||
+                    lower.find("x-declared", trailer_decl) == std::string::npos) {
+                    pass = false; err += "declared trailer missing from header; ";
+                }
+                if (lower.find("x-undeclared") != std::string::npos &&
+                    trailer_decl != std::string::npos &&
+                    lower.find("x-undeclared", trailer_decl) < header_end) {
+                    pass = false; err += "undeclared trailer advertised; ";
+                }
+
+                std::string body_and_trailers = lower.substr(header_end + 4);
+                if (body_and_trailers.find("x-declared: yes\r\n") ==
+                    std::string::npos) {
+                    pass = false; err += "declared trailer missing from final chunk; ";
+                }
+                if (body_and_trailers.find("x-undeclared: no\r\n") !=
+                    std::string::npos) {
+                    pass = false; err += "undeclared trailer serialized; ";
+                }
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming trailers: undeclared fields dropped",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming trailers: undeclared fields dropped",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_Streaming205CanonicalizesContentLength() {
+        std::cout << "\n[TEST] H1 streaming: 205 canonicalizes Content-Length..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-205",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(205)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Content-Length", "9");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    (void)stream_sender.SendData("ignored", 7);
+                    (void)stream_sender.End();
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-205 HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("http/1.1 205 reset content") == std::string::npos) {
+                pass = false; err += "missing 205 response; ";
+            }
+            size_t cl_count = 0;
+            size_t pos = 0;
+            while ((pos = lower.find("content-length:", pos)) != std::string::npos) {
+                ++cl_count;
+                pos += std::string("content-length:").size();
+            }
+            if (cl_count != 1) {
+                pass = false; err += "expected exactly one content-length; ";
+            }
+            if (lower.find("content-length: 0") == std::string::npos) {
+                pass = false; err += "content-length not canonicalized to 0; ";
+            }
+            if (lower.find("content-length: 9") != std::string::npos) {
+                pass = false; err += "stale content-length leaked; ";
+            }
+            if (!TestHttpClient::ExtractBody(resp).empty()) {
+                pass = false; err += "205 response leaked body; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: 205 canonicalizes Content-Length",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: 205 canonicalizes Content-Length",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingDeduplicatesContentLength() {
+        std::cout << "\n[TEST] H1 streaming: duplicate Content-Length canonicalized..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-dup-cl",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .PreserveContentLength()
+                        .AppendHeader("Content-Length", "10")
+                        .AppendHeader("Content-Length", "10");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    (void)stream_sender.SendData("hello", 5);
+                    (void)stream_sender.SendData("world", 5);
+                    (void)stream_sender.End();
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-dup-cl HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("http/1.1 200 ok") == std::string::npos) {
+                pass = false; err += "missing 200 response; ";
+            }
+            size_t cl_count = 0;
+            size_t pos = 0;
+            while ((pos = lower.find("content-length:", pos)) != std::string::npos) {
+                ++cl_count;
+                pos += std::string("content-length:").size();
+            }
+            if (cl_count != 1) {
+                pass = false; err += "expected exactly one content-length; ";
+            }
+            if (lower.find("content-length: 10") == std::string::npos) {
+                pass = false; err += "canonical content-length missing; ";
+            }
+            if (lower.find("transfer-encoding: chunked") != std::string::npos) {
+                pass = false; err += "unexpected chunked transfer-encoding; ";
+            }
+            if (TestHttpClient::ExtractBody(resp) != "helloworld") {
+                pass = false; err += "body mismatch; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: duplicate Content-Length canonicalized",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: duplicate Content-Length canonicalized",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingHttp10UnknownLengthOmitsContentLength() {
+        std::cout << "\n[TEST] H1 streaming: HTTP/1.0 unknown-length response omits Content-Length..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-http10-unknown",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Trailer", "X-Checksum");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    if (stream_sender.SendData("hello", 5) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                        return;
+                    }
+                    if (stream_sender.SendData("world", 5) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End({{"X-Checksum", "abc123"}});
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-http10-unknown HTTP/1.0\r\n"
+                "Host: x\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("http/1.0 200 ok") == std::string::npos) {
+                pass = false; err += "missing HTTP/1.0 200 response; ";
+            }
+            if (lower.find("content-length:") != std::string::npos) {
+                pass = false; err += "content-length should be omitted; ";
+            }
+            if (lower.find("transfer-encoding:") != std::string::npos) {
+                pass = false; err += "transfer-encoding should be omitted; ";
+            }
+            if (lower.find("trailer:") != std::string::npos) {
+                pass = false; err += "trailer declaration should be omitted; ";
+            }
+            if (TestHttpClient::ExtractBody(resp) != "helloworld") {
+                pass = false; err += "body mismatch; ";
+            }
+            if (lower.find("x-checksum: abc123") != std::string::npos) {
+                pass = false; err += "unexpected trailer block serialized; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: HTTP/1.0 unknown-length response omits Content-Length",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: HTTP/1.0 unknown-length response omits Content-Length",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingHttp10FixedLengthUsesCloseMode() {
+        std::cout << "\n[TEST] H1 streaming: HTTP/1.0 fixed-length response uses close mode..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-http10-fixed",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Content-Length", "10")
+                        .PreserveContentLength();
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    if (stream_sender.SendData("hello", 5) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    if (stream_sender.SendData("world", 5) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End();
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-http10-fixed HTTP/1.0\r\n"
+                "Host: x\r\n"
+                "Connection: keep-alive\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("http/1.0 200 ok") == std::string::npos) {
+                pass = false; err += "missing HTTP/1.0 200 response; ";
+            }
+            if (lower.find("connection: close") == std::string::npos) {
+                pass = false; err += "Connection: close missing; ";
+            }
+            if (lower.find("connection: keep-alive") != std::string::npos) {
+                pass = false; err += "unexpected keep-alive response header; ";
+            }
+            if (lower.find("content-length:") != std::string::npos) {
+                pass = false; err += "content-length should be omitted in close mode; ";
+            }
+            if (lower.find("transfer-encoding:") != std::string::npos) {
+                pass = false; err += "transfer-encoding should be omitted; ";
+            }
+            if (TestHttpClient::ExtractBody(resp) != "helloworld") {
+                pass = false; err += "body mismatch; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: HTTP/1.0 fixed-length response uses close mode",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: HTTP/1.0 fixed-length response uses close mode",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingAbortOffDispatcherThreadRejected() {
+        std::cout << "\n[TEST] H1 streaming: off-dispatcher Abort is rejected..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            auto worker_called = std::make_shared<std::atomic<bool>>(false);
+            server.GetAsync(
+                "/stream-abort-offthread",
+                [worker_called](const HttpRequest&,
+                                HttpRouter::InterimResponseSender /*send_interim*/,
+                                HttpRouter::ResourcePusher /*push_resource*/,
+                                HttpRouter::StreamingResponseSender stream_sender,
+                                HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    std::thread t([stream_sender, worker_called]() mutable {
+                        worker_called->store(true, std::memory_order_release);
+                        stream_sender.Abort(
+                            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                                AbortReason::UPSTREAM_ERROR);
+                    });
+                    t.join();
+
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Content-Length", "2")
+                        .PreserveContentLength();
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    if (stream_sender.SendData("ok", 2) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End();
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendHttpRequest(
+                port,
+                "GET /stream-abort-offthread HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n");
+
+            bool pass = true;
+            std::string err;
+            if (!TestHttpClient::HasStatus(resp, 200)) {
+                pass = false; err += "missing 200 response; ";
+            }
+            if (TestHttpClient::ExtractBody(resp) != "ok") {
+                pass = false; err += "body mismatch; ";
+            }
+            if (!worker_called->load(std::memory_order_acquire)) {
+                pass = false; err += "worker thread did not call Abort; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: off-dispatcher Abort is rejected",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: off-dispatcher Abort is rejected",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingRawContentLengthWithoutPreserveUsesChunkedFraming() {
+        std::cout << "\n[TEST] H1 streaming: raw Content-Length without preserve uses chunked framing..." << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-natural-cl",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Content-Length", "10");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    if (stream_sender.SendData("hello", 5) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    if (stream_sender.SendData("world", 5) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End();
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-natural-cl HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            size_t first_header_end = resp.find("\r\n\r\n");
+            if (first_header_end == std::string::npos) {
+                pass = false; err += "first response headers missing; ";
+            } else {
+                std::string first_header = resp.substr(0, first_header_end);
+                std::string lower_first = first_header;
+                std::transform(lower_first.begin(), lower_first.end(),
+                               lower_first.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                if (lower_first.find("http/1.1 200 ok") == std::string::npos) {
+                    pass = false; err += "first response status missing; ";
+                }
+                if (lower_first.find("transfer-encoding: chunked") ==
+                    std::string::npos) {
+                    pass = false; err += "first response not chunked; ";
+                }
+                if (lower_first.find("content-length:") != std::string::npos) {
+                    pass = false; err += "unexpected content-length in streamed head; ";
+                }
+            }
+
+            std::string lower_resp = resp;
+            std::transform(lower_resp.begin(), lower_resp.end(), lower_resp.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower_resp.find("5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n") ==
+                std::string::npos) {
+                pass = false;
+                err += "chunked body or terminator missing; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: raw Content-Length without preserve uses chunked framing",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: raw Content-Length without preserve uses chunked framing",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingCommittedResponseBypassesAsyncCap() {
+        std::cout << "\n[TEST] H1 streaming: committed response bypasses async cap..."
+                  << std::endl;
+        try {
+            auto enqueue_ok =
+                std::make_shared<std::atomic<bool>>(false);
+            auto delayed_fired =
+                std::make_shared<std::atomic<bool>>(false);
+
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-committed-cap",
+                [enqueue_ok, delayed_fired](
+                    const HttpRequest& req,
+                    HttpRouter::InterimResponseSender /*send_interim*/,
+                    HttpRouter::ResourcePusher /*push_resource*/,
+                    HttpRouter::StreamingResponseSender stream_sender,
+                    HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    req.async_cap_sec_override = 1;
+
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Content-Length", "2")
+                        .PreserveContentLength();
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+
+                    Dispatcher* dispatcher = stream_sender.GetDispatcher();
+                    if (!dispatcher) {
+                        enqueue_ok->store(false, std::memory_order_release);
+                        stream_sender.Abort(
+                            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                                AbortReason::SERVER_SHUTDOWN);
+                        return;
+                    }
+
+                    bool enqueued = dispatcher->EnQueueDelayed(
+                        [stream_sender, delayed_fired]() mutable {
+                            delayed_fired->store(true, std::memory_order_release);
+                            if (stream_sender.SendData("ok", 2) ==
+                                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                                    SendResult::CLOSED) {
+                                return;
+                            }
+                            (void)stream_sender.End();
+                        },
+                        std::chrono::milliseconds(1500));
+                    enqueue_ok->store(enqueued, std::memory_order_release);
+                    if (!enqueued) {
+                        stream_sender.Abort(
+                            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                                AbortReason::SERVER_SHUTDOWN);
+                    }
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-committed-cap HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                5000);
+
+            bool pass = true;
+            std::string err;
+            if (!enqueue_ok->load(std::memory_order_acquire)) {
+                pass = false; err += "delayed body send was not enqueued; ";
+            }
+            if (!delayed_fired->load(std::memory_order_acquire)) {
+                pass = false; err += "delayed body send did not fire; ";
+            }
+            if (!TestHttpClient::HasStatus(resp, 200)) {
+                pass = false; err += "missing 200 response; ";
+            }
+            if (resp.find("504 Gateway Timeout") != std::string::npos) {
+                pass = false; err += "async cap still injected a 504; ";
+            }
+            if (TestHttpClient::ExtractBody(resp) != "ok") {
+                pass = false; err += "body mismatch; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: committed response bypasses async cap",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: committed response bypasses async cap",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingControlMethodsOffDispatcherThreadRejected() {
+        std::cout << "\n[TEST] H1 streaming: off-dispatcher control methods are rejected..." << std::endl;
+        try {
+            auto worker_called = std::make_shared<std::atomic<bool>>(false);
+            auto first_result =
+                std::make_shared<std::atomic<int>>(static_cast<int>(
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED));
+
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-control-offthread",
+                [worker_called, first_result](
+                    const HttpRequest&,
+                    HttpRouter::InterimResponseSender /*send_interim*/,
+                    HttpRouter::ResourcePusher /*push_resource*/,
+                    HttpRouter::StreamingResponseSender stream_sender,
+                    HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    std::thread t([stream_sender, worker_called]() mutable {
+                        worker_called->store(true, std::memory_order_release);
+                        stream_sender.ConfigureWatermarks(1);
+                        stream_sender.SetDrainListener([]() {});
+                    });
+                    t.join();
+
+                    HttpResponse head;
+                    head.Status(200).Header("Content-Type", "text/plain");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    auto first = stream_sender.SendData("a", 1);
+                    first_result->store(static_cast<int>(first),
+                                        std::memory_order_release);
+                    if (first ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+
+                    std::string body(4096, 'x');
+                    stream_sender.ConfigureWatermarks(1);
+                    auto second = stream_sender.SendData(body.data(), body.size());
+                    if (second ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End();
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-control-offthread HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("http/1.1 200 ok") == std::string::npos) {
+                pass = false; err += "missing 200 response; ";
+            }
+            if (lower.find("transfer-encoding: chunked") == std::string::npos) {
+                pass = false; err += "expected chunked framing; ";
+            }
+            if (lower.find("1\r\na\r\n1000\r\n") == std::string::npos) {
+                pass = false; err += "expected streamed chunk sequence missing; ";
+            }
+            if (!worker_called->load(std::memory_order_acquire)) {
+                pass = false; err += "worker thread did not call control methods; ";
+            }
+            auto expected_first = static_cast<int>(
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::
+                    ACCEPTED_BELOW_WATER);
+            if (first_result->load(std::memory_order_acquire) != expected_first) {
+                pass = false;
+                err += "off-thread ConfigureWatermarks should be ignored; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: off-dispatcher control methods are rejected",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: off-dispatcher control methods are rejected",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // T8: Worker-thread interleave — a handler that calls complete() from
     // a worker thread followed by send_interim() from the same worker
     // must not be able to queue a 103 AFTER the 200 on the wire.
@@ -1543,6 +2542,7 @@ namespace HttpTests {
                 [p](const HttpRequest&,
                     HttpRouter::InterimResponseSender send_interim,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback complete) {
                     p->set_value(Payload{std::move(complete),
                                          std::move(send_interim)});
@@ -1657,6 +2657,7 @@ namespace HttpTests {
                 [p](const HttpRequest&,
                     HttpRouter::InterimResponseSender send_interim,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback complete) {
                     p->set_value(Payload{std::move(complete),
                                          std::move(send_interim)});
@@ -1665,6 +2666,7 @@ namespace HttpTests {
                 [](const HttpRequest&,
                    HttpRouter::InterimResponseSender /*send_interim*/,
                    HttpRouter::ResourcePusher        /*push_resource*/,
+                   HttpRouter::StreamingResponseSender /*stream_sender*/,
                    HttpRouter::AsyncCompletionCallback complete) {
                     HttpResponse r;
                     r.Status(200).Text("B-response");
@@ -1745,6 +2747,7 @@ namespace HttpTests {
                     const HttpRequest& req,
                     HttpRouter::InterimResponseSender /*send_interim*/,
                     HttpRouter::ResourcePusher        /*push_resource*/,
+                    HttpRouter::StreamingResponseSender /*stream_sender*/,
                     HttpRouter::AsyncCompletionCallback /*complete*/) {
                     // Simulate ProxyHandler::Handle: install cleanup
                     // hook in the cancel slot BEFORE kicking off the
@@ -1785,6 +2788,65 @@ namespace HttpTests {
         } catch (const std::exception& e) {
             TestFramework::RecordTest(
                 "H1 async: handler throw fires cancel slot",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    void TestH1_StreamingHandlerThrowAfterHeadersFinalizesRequest() {
+        std::cout << "\n[TEST] H1 streaming: throw after SendHeaders finalizes request..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-throw-after-headers",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200).Header("Content-Type", "text/plain");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    throw std::runtime_error("synthetic streaming failure");
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+            int64_t before = server.GetStats().active_requests;
+
+            (void)SendRawAndDrain(
+                port,
+                "GET /stream-throw-after-headers HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(2);
+            int64_t after = server.GetStats().active_requests;
+            while (after != before &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                after = server.GetStats().active_requests;
+            }
+
+            bool pass = (after == before);
+            std::string err;
+            if (!pass) {
+                err += "active_requests drifted from " +
+                       std::to_string(before) + " to " +
+                       std::to_string(after) + "; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: throw after SendHeaders finalizes request",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: throw after SendHeaders finalizes request",
                 false, e.what(), TestFramework::TestCategory::OTHER);
         }
     }
@@ -1836,9 +2898,22 @@ namespace HttpTests {
         TestH1_EarlyHints_DroppedAfterFinal();
         TestH1_EarlyHints_100ContinueThen103();
         TestH1_EarlyHints_CRLFSanitized();
+        TestH1_StreamingTrailers_CRLFSanitized();
+        TestH1_StreamingTrailers_DeclarationFiltersForbiddenNames();
+        TestH1_StreamingTrailers_SuppressedWhenNotChunked();
+        TestH1_StreamingTrailers_DropsUndeclaredFields();
+        TestH1_Streaming205CanonicalizesContentLength();
+        TestH1_StreamingDeduplicatesContentLength();
+        TestH1_StreamingHttp10UnknownLengthOmitsContentLength();
+        TestH1_StreamingHttp10FixedLengthUsesCloseMode();
+        TestH1_StreamingAbortOffDispatcherThreadRejected();
+        TestH1_StreamingRawContentLengthWithoutPreserveUsesChunkedFraming();
+        TestH1_StreamingCommittedResponseBypassesAsyncCap();
+        TestH1_StreamingControlMethodsOffDispatcherThreadRejected();
         TestH1_EarlyHints_WorkerThreadOrderingSafe();
         TestH1_EarlyHints_PipelinedKeepAliveNoStale();
         TestH1_Async_HandlerThrowFiresCancelSlot();
+        TestH1_StreamingHandlerThrowAfterHeadersFinalizesRequest();
     }
 
 }  // namespace HttpTests

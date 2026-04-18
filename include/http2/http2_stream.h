@@ -4,11 +4,24 @@
 #include "http/http_response.h"
 // <string>, <cstdint>, <memory> provided by common.h (via http_request.h)
 
-// Response body data source for nghttp2. Defined here so Http2Stream can
-// own it via unique_ptr, ensuring cleanup when the stream is removed.
-struct ResponseDataSource {
-    std::string body;
-    size_t offset = 0;
+class ResponseDataSource {
+public:
+    virtual ~ResponseDataSource() = default;
+    virtual ssize_t ReadChunk(uint8_t* buf, size_t length,
+                              uint32_t* data_flags) = 0;
+};
+
+class BufferedResponseDataSource final : public ResponseDataSource {
+public:
+    explicit BufferedResponseDataSource(std::string body)
+        : body_(std::move(body)) {}
+
+    ssize_t ReadChunk(uint8_t* buf, size_t length,
+                      uint32_t* data_flags) override;
+
+private:
+    std::string body_;
+    size_t offset_ = 0;
 };
 
 class Http2Stream {
@@ -124,7 +137,7 @@ public:
     // Owns the ResponseDataSource for this stream's response body.
     // nghttp2 holds a raw pointer to it via nghttp2_data_source.ptr;
     // we keep ownership here so it is freed when the stream is destroyed.
-    void SetDataSource(std::unique_ptr<ResponseDataSource> src) {
+    void SetDataSource(std::shared_ptr<ResponseDataSource> src) {
         data_source_ = std::move(src);
     }
 
@@ -149,7 +162,7 @@ private:
     std::string scheme_;
     bool has_authority_ = false;
     std::string authority_;
-    std::unique_ptr<ResponseDataSource> data_source_;
+    std::shared_ptr<ResponseDataSource> data_source_;
     std::chrono::steady_clock::time_point created_at_;
     // Sentinel = max() when the stream has not been dispatched yet.
     // Anchors the async-deferred safety cap so body-upload time is not

@@ -1331,6 +1331,7 @@ void TestRouterProxyHeadFollowsRegistrationOwner() {
             [proxy_a_hit](const HttpRequest&,
                           HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
                           HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
+                          HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*stream_sender*/,
                           HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *proxy_a_hit = true;
             });
@@ -1346,6 +1347,7 @@ void TestRouterProxyHeadFollowsRegistrationOwner() {
             [proxy_b_head_hit](const HttpRequest&,
                                HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
                                HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
+                               HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*stream_sender*/,
                                HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *proxy_b_head_hit = true;
             });
@@ -1367,6 +1369,7 @@ void TestRouterProxyHeadFollowsRegistrationOwner() {
                     [](int, const std::vector<std::pair<std::string,std::string>>&) {},
                     [](const std::string&, const std::string&, const std::string&,
                        const std::string&, const HttpResponse&) -> int32_t { return -1; },
+                    HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender{},
                     [](HttpResponse) {});
         }
 
@@ -1402,6 +1405,7 @@ void TestRouterProxyHeadKeptWhenSameRegistrationPair() {
             [get_hit](const HttpRequest&,
                       HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
                       HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
+                      HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*stream_sender*/,
                       HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *get_hit = true;
             });
@@ -1409,6 +1413,7 @@ void TestRouterProxyHeadKeptWhenSameRegistrationPair() {
             [head_hit](const HttpRequest&,
                        HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
                        HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
+                       HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*stream_sender*/,
                        HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *head_hit = true;
             });
@@ -1425,6 +1430,7 @@ void TestRouterProxyHeadKeptWhenSameRegistrationPair() {
                              [](int, const std::vector<std::pair<std::string,std::string>>&) {},
                              [](const std::string&, const std::string&, const std::string&,
                                 const std::string&, const HttpResponse&) -> int32_t { return -1; },
+                             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender{},
                              [](HttpResponse) {});
 
         // HEAD stays on the proxy's HEAD handler (not via HEAD→GET fallback).
@@ -1470,6 +1476,7 @@ void TestRouterProxyCompanionScopedByMethod() {
             [async_get_hit](const HttpRequest&,
                             HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
                             HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
+                            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*stream_sender*/,
                             HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *async_get_hit = true;
             });
@@ -1483,6 +1490,7 @@ void TestRouterProxyCompanionScopedByMethod() {
             [async_post_hit](const HttpRequest&,
                              HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
                              HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
+                             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*stream_sender*/,
                              HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *async_post_hit = true;
             });
@@ -1498,6 +1506,7 @@ void TestRouterProxyCompanionScopedByMethod() {
                              [](int, const std::vector<std::pair<std::string,std::string>>&) {},
                              [](const std::string&, const std::string&, const std::string&,
                                 const std::string&, const HttpResponse&) -> int32_t { return -1; },
+                             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender{},
                              [](HttpResponse) {});
 
         bool pass = (handler != nullptr) &&
@@ -1538,6 +1547,7 @@ void TestRouterProxyCompanionYieldsForMarkedMethod() {
             [async_get_hit](const HttpRequest&,
                             HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
                             HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
+                            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*stream_sender*/,
                             HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *async_get_hit = true;
             });
@@ -1603,6 +1613,7 @@ void TestRouterProxyDefaultHeadPairingPerPattern() {
             [user_get_hit](const HttpRequest&,
                            HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
                            HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
+                           HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*stream_sender*/,
                            HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *user_get_hit = true;
             });
@@ -1616,6 +1627,7 @@ void TestRouterProxyDefaultHeadPairingPerPattern() {
             [proxy_head_api_hit](const HttpRequest&,
                                  HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
                                  HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
+                                 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*stream_sender*/,
                                  HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *proxy_head_api_hit = true;
             });
@@ -1630,6 +1642,7 @@ void TestRouterProxyDefaultHeadPairingPerPattern() {
             [proxy_get_catchall_hit](const HttpRequest&,
                                       HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
                                       HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
+                                      HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*stream_sender*/,
                                       HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *proxy_get_catchall_hit = true;
             });
@@ -1637,6 +1650,7 @@ void TestRouterProxyDefaultHeadPairingPerPattern() {
             [proxy_head_catchall_hit](const HttpRequest&,
                                        HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
                                        HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
+                                       HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*stream_sender*/,
                                        HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *proxy_head_catchall_hit = true;
             });
@@ -1655,6 +1669,7 @@ void TestRouterProxyDefaultHeadPairingPerPattern() {
                                  [](int, const std::vector<std::pair<std::string,std::string>>&) {},
                                  [](const std::string&, const std::string&, const std::string&,
                                     const std::string&, const HttpResponse&) -> int32_t { return -1; },
+                                 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender{},
                                  [](HttpResponse) {});
 
             bool api_ok = (handler != nullptr) && head_fallback &&
@@ -1686,6 +1701,7 @@ void TestRouterProxyDefaultHeadPairingPerPattern() {
                                  [](int, const std::vector<std::pair<std::string,std::string>>&) {},
                                  [](const std::string&, const std::string&, const std::string&,
                                     const std::string&, const HttpResponse&) -> int32_t { return -1; },
+                                 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender{},
                                  [](HttpResponse) {});
 
             bool catchall_ok = (handler != nullptr) && !head_fallback &&
@@ -1728,6 +1744,7 @@ void TestRouterProxyCompanionDisjointRegex() {
             [async_hit](const HttpRequest&,
                         HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
                         HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*stream_sender*/,
                         HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {
                 *async_hit = true;
             });
@@ -1744,6 +1761,7 @@ void TestRouterProxyCompanionDisjointRegex() {
                              [](int, const std::vector<std::pair<std::string,std::string>>&) {},
                              [](const std::string&, const std::string&, const std::string&,
                                 const std::string&, const HttpResponse&) -> int32_t { return -1; },
+                             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender{},
                              [](HttpResponse) {});
 
         bool pass = (handler != nullptr) && *async_hit;
