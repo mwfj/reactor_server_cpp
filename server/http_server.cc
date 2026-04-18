@@ -3630,8 +3630,21 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // enforcement-complete for inline auth too. (Collision
         // detection stays in the main Validate — it requires the
         // cross-source view that the full Validate owns.)
+        // Build the live-upstream-names set ONCE here; both
+        // ValidateProxyAuth and ValidateHotReloadable use it to scope
+        // their per-upstream checks to entries actually running today.
+        // Same rationale for both: new/restart-only proxies don't take
+        // effect until restart, so the strict reload gate shouldn't
+        // fail on them. The `main.cc::ReloadConfig` warn-downgrade
+        // path covers operator notification for staged-but-not-live
+        // edits.
+        std::unordered_set<std::string> live_names;
+        live_names.reserve(upstream_configs_.size());
+        for (const auto& u : upstream_configs_) {
+            live_names.insert(u.name);
+        }
         try {
-            ConfigLoader::ValidateProxyAuth(new_config);
+            ConfigLoader::ValidateProxyAuth(new_config, live_names);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Reload() rejected invalid inline auth: {}",
                                   e.what());
@@ -3647,11 +3660,6 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // block otherwise-safe reloads. `upstream_configs_` is the
         // post-Start snapshot of running upstreams.
         {
-            std::unordered_set<std::string> live_names;
-            live_names.reserve(upstream_configs_.size());
-            for (const auto& u : upstream_configs_) {
-                live_names.insert(u.name);
-            }
             try {
                 ConfigLoader::ValidateHotReloadable(new_config, live_names);
             } catch (const std::invalid_argument& e) {

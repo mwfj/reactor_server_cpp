@@ -87,6 +87,24 @@ public:
     // (non-stripped) `upstreams[]` list even when the full Validate is
     // called on a reload-stripped copy.
     //
+    // `live_upstream_names` scopes the per-upstream checks the same way
+    // ValidateHotReloadable() does for circuit-breaker tuning. New /
+    // restart-only proxies (entries in `config.upstreams` whose name is
+    // NOT in `live_upstream_names`) are SKIPPED — those entries can
+    // contain inline auth typos or `proxy.auth.enabled=true` without
+    // failing the strict reload gate, because they don't take effect
+    // until the next restart anyway. The `main.cc::ReloadConfig`
+    // restart-required-warn path handles operator notification for
+    // those staged-but-not-yet-live blocks.
+    //
+    // Pass `live_upstream_names = {}` (empty) to validate NO inline
+    // auth (only the issuer.upstream cross-ref runs); pass a set
+    // containing every name in `config.upstreams` to validate
+    // everything (matches startup behavior). HttpServer::Reload passes
+    // the post-Start snapshot of running upstream names so the strict
+    // reload gate matches the same set CircuitBreakerManager::Reload
+    // applies to.
+    //
     // Motivation: HttpServer::Reload() strips `upstreams[]` from its
     // validation copy to skip topology-restart-only checks
     // (UpstreamTlsConfig/Pool ranges/etc.). That stripping also skips
@@ -121,7 +139,9 @@ public:
     //
     // Throws std::invalid_argument with an `upstreams['name'].proxy.auth...`
     // message on failure.
-    static void ValidateProxyAuth(const ServerConfig& config);
+    static void ValidateProxyAuth(
+        const ServerConfig& config,
+        const std::unordered_set<std::string>& live_upstream_names);
 
     // Return a ServerConfig with all default values.
     static ServerConfig Default();

@@ -21,11 +21,25 @@
 #include "config/config_loader.h"
 #include "jwt-cpp/base.h"
 #include <nlohmann/json.hpp>
+#include <unordered_set>
 
 #include <cstdlib>
 #include <string>
 
 namespace AuthFoundationTests {
+
+// Build a "validate every upstream" set from a parsed config — used by
+// tests that exercise ValidateProxyAuth and want it to behave as if all
+// upstreams are live (the startup-equivalent shape). Reload-scoping
+// behavior is exercised by the dedicated TestValidateProxyAuthLiveScoping
+// test that constructs its own subset.
+static inline std::unordered_set<std::string>
+AllUpstreamNames(const ServerConfig& cfg) {
+    std::unordered_set<std::string> names;
+    names.reserve(cfg.upstreams.size());
+    for (const auto& u : cfg.upstreams) names.insert(u.name);
+    return names;
+}
 
 // -----------------------------------------------------------------------------
 // TokenHasher::Hash — returns std::optional, never empty-string sentinel.
@@ -2646,7 +2660,7 @@ void TestValidateProxyAuthReloadGate() {
         -> std::string {
         try {
             ServerConfig cfg = ConfigLoader::LoadFromString(json);
-            ConfigLoader::ValidateProxyAuth(cfg);
+            ConfigLoader::ValidateProxyAuth(cfg, AllUpstreamNames(cfg));
             return "expected throw containing '" + expected_phrase +
                    "' but accepted";
         } catch (const std::invalid_argument& e) {
@@ -2822,7 +2836,7 @@ void TestValidateProxyAuthReloadGate() {
                     }
                 }
             })");
-            ConfigLoader::ValidateProxyAuth(cfg);
+            ConfigLoader::ValidateProxyAuth(cfg, AllUpstreamNames(cfg));
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 std::string("clean disabled inline auth should be ACCEPTED ")
@@ -2841,7 +2855,7 @@ void TestValidateProxyAuthReloadGate() {
                     }
                 ]
             })");
-            ConfigLoader::ValidateProxyAuth(cfg);
+            ConfigLoader::ValidateProxyAuth(cfg, AllUpstreamNames(cfg));
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 std::string("proxy without auth block should be ACCEPTED ")
@@ -2858,7 +2872,7 @@ void TestValidateProxyAuthReloadGate() {
                 "upstreams": [],
                 "auth": {"enabled": false}
             })");
-            ConfigLoader::ValidateProxyAuth(cfg);
+            ConfigLoader::ValidateProxyAuth(cfg, AllUpstreamNames(cfg));
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 std::string("empty upstreams should be a no-op for ")
@@ -2969,7 +2983,7 @@ void TestValidateProxyAuthIssuerUpstreamCrossRef() {
         std::string err_msg;
         try {
             ServerConfig cfg = ConfigLoader::LoadFromString(bad);
-            ConfigLoader::ValidateProxyAuth(cfg);
+            ConfigLoader::ValidateProxyAuth(cfg, AllUpstreamNames(cfg));
         } catch (const std::invalid_argument& e) {
             threw = true;
             err_msg = e.what();
@@ -2997,7 +3011,7 @@ void TestValidateProxyAuthIssuerUpstreamCrossRef() {
         std::string missing_err;
         try {
             ServerConfig cfg = ConfigLoader::LoadFromString(missing);
-            ConfigLoader::ValidateProxyAuth(cfg);
+            ConfigLoader::ValidateProxyAuth(cfg, AllUpstreamNames(cfg));
         } catch (const std::invalid_argument& e) {
             missing_threw = true;
             missing_err = e.what();
@@ -3021,7 +3035,7 @@ void TestValidateProxyAuthIssuerUpstreamCrossRef() {
                     }
                 }
             })");
-            ConfigLoader::ValidateProxyAuth(cfg);
+            ConfigLoader::ValidateProxyAuth(cfg, AllUpstreamNames(cfg));
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 std::string("valid upstream ref should be ACCEPTED but ")
@@ -3435,6 +3449,297 @@ void TestConfigLoaderStrictUpstreamIntegers() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// ValidateProxyAuth — live-upstream scoping (review P2 #1). When a reload
+// stages a new (restart-only) proxy with proxy.auth.enabled=true, that
+// entry must NOT block the strict reload gate because it doesn't take
+// effect until the next restart. Same scoping that ValidateHotReloadable
+// already does for circuit breaker.
+// -----------------------------------------------------------------------------
+void TestValidateProxyAuthLiveScoping() {
+    std::cout << "\n[TEST] ValidateProxyAuth live-upstream scoping..." << std::endl;
+    try {
+        // Config has TWO proxies: an existing one ("api") with clean
+        // disabled auth, and a NEW one ("staged") with auth.enabled=true
+        // (which would be rejected by the enforcement gate if validated).
+        ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+            "upstreams": [
+                {"name":"x","host":"127.0.0.1","port":80},
+                {
+                    "name": "api",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "proxy": {
+                        "route_prefix": "/api/v1/",
+                        "auth": {
+                            "enabled": false,
+                            "issuers": ["google"]
+                        }
+                    }
+                },
+                {
+                    "name": "staged",
+                    "host": "127.0.0.1",
+                    "port": 9090,
+                    "proxy": {
+                        "route_prefix": "/staged/",
+                        "auth": {
+                            "enabled": true,
+                            "issuers": ["google"]
+                        }
+                    }
+                }
+            ],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })");
+
+        // Case 1: live_names contains only "x" + "api". The "staged"
+        // proxy is not yet running — its enforcement gate violation
+        // must be SKIPPED.
+        std::unordered_set<std::string> live_only_existing = {"x", "api"};
+        try {
+            ConfigLoader::ValidateProxyAuth(cfg, live_only_existing);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("staged proxy auth.enabled=true should be ")
+                + "SKIPPED when not in live_upstream_names but threw: " +
+                e.what());
+        }
+
+        // Case 2: live_names INCLUDES "staged" (simulating restart).
+        // Now the enforcement gate must fire for that entry.
+        std::unordered_set<std::string> live_all = {"x", "api", "staged"};
+        bool threw = false;
+        std::string err_msg;
+        try {
+            ConfigLoader::ValidateProxyAuth(cfg, live_all);
+        } catch (const std::invalid_argument& e) {
+            threw = true;
+            err_msg = e.what();
+        }
+        bool gate_msg = threw &&
+            err_msg.find("staged") != std::string::npos &&
+            err_msg.find("proxy.auth.enabled=true rejected") != std::string::npos;
+
+        // Case 3: empty live_names — issuer.upstream cross-ref still
+        // runs (it operates on full config.upstreams, not live_names);
+        // per-upstream inline auth checks all skipped.
+        try {
+            ConfigLoader::ValidateProxyAuth(cfg, {});
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("empty live_names should accept (no per-")
+                + "upstream checks fire) but threw: " + e.what());
+        }
+
+        bool pass = threw && gate_msg;
+        std::string err;
+        if (!threw) {
+            err = "Case 2: live_names with 'staged' should reject the "
+                  "auth.enabled=true gate but accepted";
+        } else if (!gate_msg) {
+            err = "Case 2 rejected but message wrong; expected 'staged' "
+                  "and 'proxy.auth.enabled=true rejected'; got: " + err_msg;
+        }
+        TestFramework::RecordTest(
+            "AuthFoundation: ValidateProxyAuth live-upstream scoping",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ValidateProxyAuth live-upstream scoping",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader — circuit_breaker integers range-checked (review P2 #2).
+// Pre-existing wrap-on-overflow class fixed with ParseStrictInt.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderStrictCircuitBreakerIntegers() {
+    std::cout << "\n[TEST] ConfigLoader strict circuit_breaker integer parsing..." << std::endl;
+    auto load_expect_failure = [](const std::string& json,
+                                   const std::string& expected_phrase)
+        -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            return "expected throw containing '" + expected_phrase +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
+                return "threw but message missing '" + expected_phrase +
+                       "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // Case 1: oversized consecutive_failure_threshold rejected.
+        std::string err = load_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80,
+                "circuit_breaker":{"consecutive_failure_threshold":4294967297}}]
+        })", "out of int range");
+        if (!err.empty()) throw std::runtime_error("oversized threshold: " + err);
+
+        // Case 2: oversized window_seconds rejected.
+        err = load_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80,
+                "circuit_breaker":{"window_seconds":9999999999}}]
+        })", "out of int range");
+        if (!err.empty()) throw std::runtime_error("oversized window_seconds: " + err);
+
+        // Case 3: bool for permitted_half_open_calls also rejected
+        // (regression — make sure existing is_number_integer check
+        // still fires via ParseStrictInt).
+        err = load_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80,
+                "circuit_breaker":{"permitted_half_open_calls":true}}]
+        })", "must be an integer");
+        if (!err.empty()) throw std::runtime_error("bool: " + err);
+
+        // POSITIVE: valid integer parses.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [{"name":"x","host":"127.0.0.1","port":80,
+                    "circuit_breaker":{
+                        "consecutive_failure_threshold": 10,
+                        "window_seconds": 60,
+                        "permitted_half_open_calls": 3
+                    }}]
+            })");
+            const auto& cb = cfg.upstreams[0].circuit_breaker;
+            if (cb.consecutive_failure_threshold != 10 ||
+                cb.window_seconds != 60 ||
+                cb.permitted_half_open_calls != 3) {
+                throw std::runtime_error(
+                    "valid CB integers parsed but values didn't land");
+            }
+        } catch (const std::runtime_error& e) {
+            throw;
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("valid CB config rejected by strict parser: ")
+                + e.what());
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader strict circuit_breaker integers",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader strict circuit_breaker integers",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader — rate_limit max_entries range-checked (review P2 #3).
+// Pre-existing wrap-on-overflow: 4294967312 silently became 16, passing
+// the >= 16 shard check and shrinking the zone.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderStrictRateLimitMaxEntries() {
+    std::cout << "\n[TEST] ConfigLoader strict rate_limit max_entries..." << std::endl;
+    auto load_expect_failure = [](const std::string& json,
+                                   const std::string& expected_phrase)
+        -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            return "expected throw containing '" + expected_phrase +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
+                return "threw but message missing '" + expected_phrase +
+                       "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // Case 1: oversized max_entries (the reviewer's 4294967312 → 16
+        // wrap example) rejected.
+        std::string err = load_expect_failure(R"({
+            "rate_limit": {
+                "enabled": false,
+                "zones": [{
+                    "name": "z",
+                    "rate": 100,
+                    "capacity": 200,
+                    "key_type": "client_ip",
+                    "max_entries": 4294967312
+                }]
+            }
+        })", "out of int range");
+        if (!err.empty()) throw std::runtime_error("oversized max_entries: " + err);
+
+        // Case 2: bool for max_entries also rejected.
+        err = load_expect_failure(R"({
+            "rate_limit": {
+                "enabled": false,
+                "zones": [{
+                    "name": "z",
+                    "rate": 100,
+                    "capacity": 200,
+                    "key_type": "client_ip",
+                    "max_entries": true
+                }]
+            }
+        })", "must be an integer");
+        if (!err.empty()) throw std::runtime_error("bool: " + err);
+
+        // POSITIVE: valid max_entries parses.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "rate_limit": {
+                    "enabled": false,
+                    "zones": [{
+                        "name": "z",
+                        "rate": 100,
+                        "capacity": 200,
+                        "key_type": "client_ip",
+                        "max_entries": 50000
+                    }]
+                }
+            })");
+            if (cfg.rate_limit.zones.size() != 1 ||
+                cfg.rate_limit.zones[0].max_entries != 50000) {
+                throw std::runtime_error(
+                    "valid max_entries parsed but value didn't land");
+            }
+        } catch (const std::runtime_error& e) {
+            throw;
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("valid rate_limit rejected by strict parser: ")
+                + e.what());
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader strict rate_limit max_entries",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader strict rate_limit max_entries",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -3470,6 +3775,9 @@ inline void RunAllTests() {
     TestParseStrictIntRejectsNull();
     TestConfigLoaderRequiresIntrospectionCredentials();
     TestConfigLoaderStrictUpstreamIntegers();
+    TestValidateProxyAuthLiveScoping();
+    TestConfigLoaderStrictCircuitBreakerIntegers();
+    TestConfigLoaderStrictRateLimitMaxEntries();
     TestConfigLoaderClaimHeaderCollision();
 }
 

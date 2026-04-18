@@ -729,15 +729,15 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 // that nlohmann's default value<int>() would silently coerce
                 // (e.g., 1.9 → 1, true → 1). Without this, malformed configs
                 // pass Validate() and change breaker behavior in production.
+                // Delegate to ParseStrictInt so circuit_breaker integers
+                // get the same wrap-on-overflow protection as auth fields.
+                // Pre-existing fix: v.get<int>() silently wrapped oversized
+                // unsigned values (4294967297 → 1), letting bad CB tuning
+                // pass validation. ParseStrictInt range-checks against
+                // [INT_MIN, INT_MAX] before casting.
                 auto cb_int = [&cb](const char* name, int default_val) -> int {
-                    if (!cb.contains(name)) return default_val;
-                    const auto& v = cb[name];
-                    if (!v.is_number_integer()) {
-                        throw std::invalid_argument(
-                            std::string("circuit_breaker.") + name +
-                            " must be an integer");
-                    }
-                    return v.get<int>();
+                    return ParseStrictInt(cb, name, default_val,
+                                          "circuit_breaker");
                 };
                 auto cb_bool = [&cb](const char* name, bool default_val) -> bool {
                     if (!cb.contains(name)) return default_val;
@@ -823,7 +823,15 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     zone.capacity = item["capacity"].get<int64_t>();
                 }
                 zone.key_type = item.value("key_type", "client_ip");
-                zone.max_entries = item.value("max_entries", 100000);
+                // Range-check max_entries (consistent with auth /
+                // circuit_breaker hardening). Pre-existing wrap risk:
+                // 4294967312 silently became 16, then passed the later
+                // >= 16 shard check, shrinking the zone to the minimum
+                // shard count instead of failing fast.
+                const std::string zone_ctx =
+                    "rate_limit.zones['" + zone.name + "']";
+                zone.max_entries =
+                    ParseStrictInt(item, "max_entries", 100000, zone_ctx);
                 if (item.contains("applies_to")) {
                     if (!item["applies_to"].is_array())
                         throw std::runtime_error("rate_limit zone applies_to must be an array");
@@ -2288,11 +2296,14 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
     }
 }
 
-void ConfigLoader::ValidateProxyAuth(const ServerConfig& config) {
+void ConfigLoader::ValidateProxyAuth(
+    const ServerConfig& config,
+    const std::unordered_set<std::string>& live_upstream_names) {
     // Same per-upstream checks that Validate() runs inline, extracted so
     // the reload path can invoke them against the REAL upstreams[] list
     // even when Validate() is called on a stripped validation_copy.
-    // See config_loader.h docstring for the full motivation.
+    // See config_loader.h docstring for the full motivation, including
+    // why per-upstream checks are scoped to `live_upstream_names`.
 
     // Issuer upstream cross-reference — Validate() normally handles this
     // in its main issuer loop, but its reload-path call (reload_copy=true
@@ -2329,6 +2340,17 @@ void ConfigLoader::ValidateProxyAuth(const ServerConfig& config) {
         }
     }
     for (const auto& u : config.upstreams) {
+        // Skip non-live (new / restart-only) upstreams. The reload path
+        // passes the post-Start snapshot of running upstream names; new
+        // entries in the reloaded file aren't applied until restart, so
+        // failing the strict reload gate on their inline auth would
+        // block live-safe edits in the same file (e.g. a rate_limit
+        // tweak alongside a staged new proxy with auth.enabled=true).
+        // The startup path's in-Validate inline-auth loop catches new
+        // entries normally because startup HAS no live-vs-staged
+        // distinction.
+        if (live_upstream_names.count(u.name) == 0) continue;
+
         const auto& p = u.proxy.auth;
         const std::string ctx = "upstreams['" + u.name + "'].proxy.auth";
 
