@@ -3740,6 +3740,132 @@ void TestConfigLoaderStrictRateLimitMaxEntries() {
     }
 }
 
+// ParseIssuerConfig / ParseAuthConfig add a defensive reset of collection
+// and sub-object fields BEFORE the conditional parse blocks (mirrors the
+// pattern already in ParseAuthPolicy). Without this, a future code path
+// that reparses JSON into an existing AuthConfig / IssuerConfig (e.g. an
+// in-place SIGHUP reload of a manager that holds the struct long-term)
+// would silently keep stale audiences / algorithms / required_claims /
+// introspection / issuers / policies / forward state when those keys
+// disappear from the new JSON.
+//
+// The static `kDefaults` reset relies on a specific invariant: a parse
+// result with all optional keys MISSING must equal a default-constructed
+// struct exactly. If that ever drifts (e.g. someone changes the struct
+// default without updating the parser, or vice versa), the reset would
+// quietly produce non-default state on a removed-key reload. This test
+// pins the invariant down by parsing minimal JSON and comparing against
+// `auth::AuthConfig{}` / `auth::IssuerConfig{}`.
+//
+// The IssuerConfig::algorithms default ({"RS256"}) is the trap that this
+// test is most directly guarding: a `.clear()`-style reset would set it
+// to empty (mismatching fresh construction); using kDefaults as the reset
+// source keeps it correct.
+void TestConfigLoaderParseFreshDefaultsMatchStructDefaults() {
+    std::cout << "\n[TEST] ConfigLoader parse-with-defaults matches struct defaults..." << std::endl;
+    try {
+        // Case 1: AuthConfig with `enabled=false` and no other keys must
+        // round-trip to a default-constructed AuthConfig.
+        ServerConfig cfg_min = ConfigLoader::LoadFromString(R"({
+            "auth": { "enabled": false }
+        })");
+        auth::AuthConfig fresh_auth{};
+        if (cfg_min.auth != fresh_auth) {
+            throw std::runtime_error(
+                "minimal-JSON AuthConfig differs from fresh-construction "
+                "default — kDefaults reset would diverge from struct default");
+        }
+
+        // Case 2: IssuerConfig parsed with only the required-by-spec keys
+        // (issuer_url + upstream) must produce defaults for everything else,
+        // INCLUDING algorithms = {"RS256"} (non-empty default).
+        ServerConfig cfg_iss = ConfigLoader::LoadFromString(R"({
+            "upstreams": [{
+                "name": "idp",
+                "host": "127.0.0.1",
+                "port": 9443
+            }],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "idp1": {
+                        "issuer_url": "https://idp.example.com",
+                        "upstream": "idp"
+                    }
+                }
+            }
+        })");
+        auto it = cfg_iss.auth.issuers.find("idp1");
+        if (it == cfg_iss.auth.issuers.end()) {
+            throw std::runtime_error("issuer 'idp1' not parsed");
+        }
+        const auth::IssuerConfig& parsed = it->second;
+        // Build the expected fresh issuer (only the explicitly-set fields
+        // diverge from `IssuerConfig{}`).
+        auth::IssuerConfig expected{};
+        expected.name = "idp1";
+        expected.issuer_url = "https://idp.example.com";
+        expected.upstream = "idp";
+        if (parsed != expected) {
+            std::string detail;
+            if (parsed.algorithms != expected.algorithms) {
+                detail += " algorithms differs (got size=" +
+                          std::to_string(parsed.algorithms.size()) +
+                          ", expected {RS256})";
+            }
+            if (parsed.audiences != expected.audiences) detail += " audiences";
+            if (parsed.required_claims != expected.required_claims)
+                detail += " required_claims";
+            if (parsed.introspection != expected.introspection)
+                detail += " introspection";
+            throw std::runtime_error(
+                "minimal-JSON IssuerConfig differs from fresh-construction "
+                "default —" + (detail.empty() ? std::string(" (scalar field)")
+                                              : detail));
+        }
+
+        // Case 3: explicit `algorithms: ["ES256"]` must REPLACE the default
+        // {"RS256"}, not append (regression guard for the per-block clear()
+        // inside ParseIssuerConfig's algorithms branch).
+        ServerConfig cfg_alg = ConfigLoader::LoadFromString(R"({
+            "upstreams": [{
+                "name": "idp",
+                "host": "127.0.0.1",
+                "port": 9443
+            }],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "idp1": {
+                        "issuer_url": "https://idp.example.com",
+                        "upstream": "idp",
+                        "algorithms": ["ES256"]
+                    }
+                }
+            }
+        })");
+        const auto& algs = cfg_alg.auth.issuers.at("idp1").algorithms;
+        if (algs.size() != 1 || algs[0] != "ES256") {
+            std::string got;
+            for (const auto& a : algs) {
+                if (!got.empty()) got += ", ";
+                got += a;
+            }
+            throw std::runtime_error(
+                "explicit algorithms list did not REPLACE the default; "
+                "expected exactly [ES256], got [" + got + "]");
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader parse-with-defaults matches struct defaults",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader parse-with-defaults matches struct defaults",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -3779,6 +3905,7 @@ inline void RunAllTests() {
     TestConfigLoaderStrictCircuitBreakerIntegers();
     TestConfigLoaderStrictRateLimitMaxEntries();
     TestConfigLoaderClaimHeaderCollision();
+    TestConfigLoaderParseFreshDefaultsMatchStructDefaults();
 }
 
 }  // namespace AuthFoundationTests

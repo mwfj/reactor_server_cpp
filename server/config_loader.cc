@@ -289,11 +289,23 @@ static void ParseIssuerConfig(const std::string& name, const nlohmann::json& j,
     out.discovery_retry_sec =
         ParseStrictInt(j, "discovery_retry_sec", 30, ctx);
 
+    // Reset collection / sub-object fields BEFORE the conditional parse
+    // blocks. Without this, reparsing into an existing IssuerConfig (the
+    // SIGHUP reload path) would silently keep stale audiences / algorithms
+    // / required_claims / introspection settings if those keys were removed
+    // from the new JSON. Source defaults from a fresh struct so removed
+    // keys behave identically to fresh construction (e.g. algorithms
+    // returns to {"RS256"}, not empty).
+    static const auth::IssuerConfig kDefaults{};
+    out.audiences = kDefaults.audiences;
+    out.algorithms = kDefaults.algorithms;
+    out.required_claims = kDefaults.required_claims;
+    out.introspection = kDefaults.introspection;
+
     if (j.contains("audiences")) {
         if (!j["audiences"].is_array()) {
             throw std::invalid_argument(ctx + ".audiences must be an array");
         }
-        out.audiences.clear();
         for (const auto& v : j["audiences"]) {
             if (!v.is_string()) {
                 throw std::invalid_argument(
@@ -306,6 +318,9 @@ static void ParseIssuerConfig(const std::string& name, const nlohmann::json& j,
         if (!j["algorithms"].is_array()) {
             throw std::invalid_argument(ctx + ".algorithms must be an array");
         }
+        // Algorithms has a non-empty default ({"RS256"}). When the key is
+        // explicitly present in JSON, the user's list fully replaces the
+        // default — clear before pushing.
         out.algorithms.clear();
         for (const auto& v : j["algorithms"]) {
             if (!v.is_string()) {
@@ -320,7 +335,6 @@ static void ParseIssuerConfig(const std::string& name, const nlohmann::json& j,
             throw std::invalid_argument(
                 ctx + ".required_claims must be an array");
         }
-        out.required_claims.clear();
         for (const auto& v : j["required_claims"]) {
             if (!v.is_string()) {
                 throw std::invalid_argument(
@@ -370,6 +384,15 @@ static void ParseAuthConfig(const nlohmann::json& j, auth::AuthConfig& out) {
     }
     out.enabled = j.value("enabled", false);
     out.hmac_cache_key_env = j.value("hmac_cache_key_env", std::string{});
+
+    // Reset collection / sub-object fields BEFORE the conditional parse
+    // blocks. Mirrors the defensive reset already in ParseAuthPolicy.
+    // Without this, reparsing into an existing AuthConfig (SIGHUP reload)
+    // would silently keep stale issuers / policies / forward settings if
+    // those keys were removed from the new JSON.
+    out.issuers.clear();
+    out.policies.clear();
+    out.forward = auth::AuthForwardConfig{};
 
     if (j.contains("issuers")) {
         if (!j["issuers"].is_object()) {
