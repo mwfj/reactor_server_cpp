@@ -41,6 +41,10 @@ static int ParseStrictInt(const nlohmann::json& j, const std::string& key,
                           int default_value, const std::string& context) {
     if (!j.contains(key)) return default_value;
     const auto& v = j[key];
+    // Top-level callers pass an empty context; nested callers pass e.g.
+    // "circuit_breaker" or "auth.issuers.<name>". Build the prefix so the
+    // error reads naturally in both shapes (no leading "." on top level).
+    const std::string prefix = context.empty() ? key : (context + "." + key);
     // JSON null is NOT treated as "field absent" (earlier behavior). A
     // templated config that renders `"key": null` — typically because a
     // variable is missing or unrendered — should surface loudly, not
@@ -48,7 +52,7 @@ static int ParseStrictInt(const nlohmann::json& j, const std::string& key,
     // null fails the same way `true` or `1.9` would.
     if (!v.is_number_integer()) {
         throw std::invalid_argument(
-            context + "." + key + " must be an integer "
+            prefix + " must be an integer "
             "(got " + std::string(v.type_name()) + ")");
     }
     // Unsigned values that overflow uint64-to-int64 must be caught with
@@ -58,7 +62,7 @@ static int ParseStrictInt(const nlohmann::json& j, const std::string& key,
         uint64_t u = v.get<uint64_t>();
         if (u > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
             throw std::invalid_argument(
-                context + "." + key + " value " + std::to_string(u) +
+                prefix + " value " + std::to_string(u) +
                 " is out of int range (max " +
                 std::to_string(std::numeric_limits<int>::max()) + ")");
         }
@@ -68,7 +72,7 @@ static int ParseStrictInt(const nlohmann::json& j, const std::string& key,
     if (s < std::numeric_limits<int>::min() ||
         s > std::numeric_limits<int>::max()) {
         throw std::invalid_argument(
-            context + "." + key + " value " + std::to_string(s) +
+            prefix + " value " + std::to_string(s) +
             " is out of int range [" +
             std::to_string(std::numeric_limits<int>::min()) + ", " +
             std::to_string(std::numeric_limits<int>::max()) + "]");
@@ -100,6 +104,19 @@ static int ParseStrictInt(const nlohmann::json& j, const std::string& key,
 //   - Authorization: would conflict with `preserve_authorization` —
 //     either both write and one wins unpredictably, or the upstream
 //     receives a forged identity.
+//   - HeaderRewriter-owned hop-identity headers (Via, X-Forwarded-For,
+//     X-Forwarded-Proto): the existing forwarding path appends to or
+//     overwrites these on every outbound request. An auth.forward mapping
+//     to one of these names would fight the rewriter — Via would get the
+//     identity value clobbered (or appended onto) by the gateway's
+//     `VIA_ENTRY`; X-Forwarded-For would be appended to the client-IP
+//     chain, mangling both the identity signal and the proxy chain that
+//     downstream services rely on. Reject at config load instead of
+//     producing silently mangled headers at runtime. These names are
+//     reserved unconditionally — even if the operator turns off
+//     `set_via_header` / `set_x_forwarded_for` / `set_x_forwarded_proto`,
+//     the names retain their well-known semantics and should not be
+//     repurposed for identity injection.
 //
 // Match is case-insensitive. Caller passes already-lowercased name.
 // RFC 7230 §3.2.6 field-name validator (the `token` production).
@@ -160,6 +177,11 @@ static bool IsReservedAuthForwardHeader(const std::string& lower) {
         "host", "content-length", "content-type", "content-encoding",
         // Conflicts with preserve_authorization
         "authorization",
+        // Owned by HeaderRewriter on every outbound hop — see header
+        // comment. Reserved unconditionally (even with the rewriter's
+        // per-name flag off) because these names carry proxy-chain /
+        // hop semantics that must not be repurposed for identity.
+        "via", "x-forwarded-for", "x-forwarded-proto",
     };
     return kReserved.count(lower) > 0;
 }
@@ -482,26 +504,21 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
             throw std::runtime_error("bind_host must be a string");
         config.bind_host = j["bind_host"].get<std::string>();
     }
-    if (j.contains("bind_port")) {
-        if (!j["bind_port"].is_number_integer())
-            throw std::runtime_error("bind_port must be an integer");
-        config.bind_port = j["bind_port"].get<int>();
-    }
-    if (j.contains("max_connections")) {
-        if (!j["max_connections"].is_number_integer())
-            throw std::runtime_error("max_connections must be an integer");
-        config.max_connections = j["max_connections"].get<int>();
-    }
-    if (j.contains("idle_timeout_sec")) {
-        if (!j["idle_timeout_sec"].is_number_integer())
-            throw std::runtime_error("idle_timeout_sec must be an integer");
-        config.idle_timeout_sec = j["idle_timeout_sec"].get<int>();
-    }
-    if (j.contains("worker_threads")) {
-        if (!j["worker_threads"].is_number_integer())
-            throw std::runtime_error("worker_threads must be an integer");
-        config.worker_threads = j["worker_threads"].get<int>();
-    }
+    // Top-level integer fields go through ParseStrictInt for the same
+    // reasons the nested CB/auth/rate_limit blocks do: nlohmann's
+    // `.get<int>()` silently wraps oversized values (e.g. {"bind_port":
+    // 4294967297} loaded as port 1), and `.is_number_integer()` accepts
+    // any int64/uint64 that fits in JSON's representation, including
+    // ones that don't fit in `int`. ParseStrictInt range-checks against
+    // [INT_MIN, INT_MAX] before casting and rejects null/bool/float/string.
+    config.bind_port =
+        ParseStrictInt(j, "bind_port", config.bind_port, "");
+    config.max_connections =
+        ParseStrictInt(j, "max_connections", config.max_connections, "");
+    config.idle_timeout_sec =
+        ParseStrictInt(j, "idle_timeout_sec", config.idle_timeout_sec, "");
+    config.worker_threads =
+        ParseStrictInt(j, "worker_threads", config.worker_threads, "");
     if (j.contains("max_header_size")) {
         if (j["max_header_size"].is_number_unsigned()) {
             config.max_header_size = j["max_header_size"].get<size_t>();
@@ -523,16 +540,11 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
             throw std::runtime_error("max_ws_message_size must be a non-negative integer");
         }
     }
-    if (j.contains("request_timeout_sec")) {
-        if (!j["request_timeout_sec"].is_number_integer())
-            throw std::runtime_error("request_timeout_sec must be an integer");
-        config.request_timeout_sec = j["request_timeout_sec"].get<int>();
-    }
-    if (j.contains("shutdown_drain_timeout_sec")) {
-        if (!j["shutdown_drain_timeout_sec"].is_number_integer())
-            throw std::runtime_error("shutdown_drain_timeout_sec must be an integer");
-        config.shutdown_drain_timeout_sec = j["shutdown_drain_timeout_sec"].get<int>();
-    }
+    config.request_timeout_sec = ParseStrictInt(
+        j, "request_timeout_sec", config.request_timeout_sec, "");
+    config.shutdown_drain_timeout_sec = ParseStrictInt(
+        j, "shutdown_drain_timeout_sec",
+        config.shutdown_drain_timeout_sec, "");
 
     // TLS section
     if (j.contains("tls")) {
@@ -624,11 +636,8 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 throw std::runtime_error("log.max_file_size must be a non-negative integer");
             }
         }
-        if (log.contains("max_files")) {
-            if (!log["max_files"].is_number_integer())
-                throw std::runtime_error("log.max_files must be an integer");
-            config.log.max_files = log["max_files"].get<int>();
-        }
+        config.log.max_files =
+            ParseStrictInt(log, "max_files", config.log.max_files, "log");
     }
 
     // Upstreams section
@@ -817,11 +826,8 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 throw std::runtime_error("rate_limit.dry_run must be a boolean");
             config.rate_limit.dry_run = rl["dry_run"].get<bool>();
         }
-        if (rl.contains("status_code")) {
-            if (!rl["status_code"].is_number_integer())
-                throw std::runtime_error("rate_limit.status_code must be an integer");
-            config.rate_limit.status_code = rl["status_code"].get<int>();
-        }
+        config.rate_limit.status_code = ParseStrictInt(
+            rl, "status_code", config.rate_limit.status_code, "rate_limit");
         if (rl.contains("include_headers")) {
             if (!rl["include_headers"].is_boolean())
                 throw std::runtime_error("rate_limit.include_headers must be a boolean");

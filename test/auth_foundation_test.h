@@ -3866,6 +3866,211 @@ void TestConfigLoaderParseFreshDefaultsMatchStructDefaults() {
     }
 }
 
+// auth.forward.* must reject names owned by HeaderRewriter on the outbound
+// hop (Via, X-Forwarded-For, X-Forwarded-Proto). HeaderRewriter::RewriteRequest
+// appends to / overwrites those names per request — an auth.forward mapping
+// to one of them produces silently-mangled headers downstream once Phase 2
+// wiring lands. Reject at config load with a clear error.
+void TestConfigLoaderRejectsHeaderRewriterOwnedAuthForwardNames() {
+    std::cout << "\n[TEST] ConfigLoader rejects HeaderRewriter-owned auth.forward names..." << std::endl;
+    // The reserved-name check runs in Validate(), not LoadFromString().
+    // Mirror the existing TestConfigLoaderRejectsReservedForwardHeaders
+    // pattern: load, validate, expect rejection containing "reserved".
+    auto validate_expect = [](const std::string& bad_field_json,
+                              const std::string& bad_name) -> std::string {
+        std::string json = R"({
+            "auth": {
+                "enabled": false,
+                "forward": {)" + bad_field_json + R"(}
+            }
+        })";
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(cfg);
+            return "expected reserved-name rejection for '" + bad_name +
+                   "' but accepted";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find("reserved") == std::string::npos) {
+                return "threw but message lacked 'reserved'; got: " + msg;
+            }
+            if (msg.find(bad_name) == std::string::npos) {
+                return "threw but message lacked offending name '" +
+                       bad_name + "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+    try {
+        // subject_header = "Via" — HeaderRewriter owns Via on outbound.
+        std::string err = validate_expect(
+            R"("subject_header": "Via")", "Via");
+        if (!err.empty()) throw std::runtime_error("subject=Via: " + err);
+
+        // issuer_header = "X-Forwarded-For" — HeaderRewriter appends client IP.
+        err = validate_expect(
+            R"("issuer_header": "X-Forwarded-For")", "X-Forwarded-For");
+        if (!err.empty()) throw std::runtime_error("issuer=XFF: " + err);
+
+        // scopes_header = "x-forwarded-proto" (lowercase, case-insensitive).
+        err = validate_expect(
+            R"("scopes_header": "x-forwarded-proto")", "x-forwarded-proto");
+        if (!err.empty()) throw std::runtime_error("scopes=XFP lower: " + err);
+
+        // raw_jwt_header = "VIA" (uppercase, case-insensitive).
+        err = validate_expect(
+            R"("raw_jwt_header": "VIA")", "VIA");
+        if (!err.empty()) throw std::runtime_error("raw_jwt=VIA upper: " + err);
+
+        // claims_to_headers value = "X-Forwarded-For" — same enforcement.
+        err = validate_expect(
+            R"("claims_to_headers": {"sub": "X-Forwarded-For"})",
+            "X-Forwarded-For");
+        if (!err.empty()) throw std::runtime_error("claim->XFF: " + err);
+
+        // POSITIVE: a non-reserved X-prefixed name still parses + validates.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "auth": {
+                    "enabled": false,
+                    "forward": { "subject_header": "X-Auth-Subject-Custom" }
+                }
+            })");
+            ConfigLoader::Validate(cfg);
+            if (cfg.auth.forward.subject_header != "X-Auth-Subject-Custom") {
+                throw std::runtime_error(
+                    "valid subject_header parsed but value didn't land");
+            }
+        } catch (const std::runtime_error& e) {
+            throw;
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("valid auth.forward rejected: ") + e.what());
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects HeaderRewriter-owned auth.forward names",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects HeaderRewriter-owned auth.forward names",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Top-level integer fields (bind_port, max_connections, idle_timeout_sec,
+// worker_threads, request_timeout_sec, shutdown_drain_timeout_sec, log.max_files,
+// rate_limit.status_code) must use ParseStrictInt — without it, oversized
+// unsigned values silently wrap (e.g. {"bind_port": 4294967297} → port 1).
+// This test exercises the wrap-failure modes directly so the regression
+// catches any future code that reverts to bare `.get<int>()`.
+void TestConfigLoaderStrictTopLevelIntegers() {
+    std::cout << "\n[TEST] ConfigLoader strict top-level integer parsing..." << std::endl;
+    auto load_expect = [](const std::string& json,
+                          const std::string& expected_phrase) -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            return "expected throw containing '" + expected_phrase +
+                   "' but accepted (parsed value: bind_port=" +
+                   std::to_string(cfg.bind_port) + ")";
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
+                return "threw but message missing '" + expected_phrase +
+                       "'; got: " + msg;
+            }
+            return "";
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+    try {
+        // The reviewer's exact example: {"bind_port": 4294967297} would
+        // wrap to port 1 with bare .get<int>(). Must be rejected.
+        std::string err = load_expect(R"({"bind_port": 4294967297})",
+                                       "out of int range");
+        if (!err.empty()) throw std::runtime_error("bind_port wrap: " + err);
+
+        // max_connections oversized.
+        err = load_expect(R"({"max_connections": 9999999999})",
+                          "out of int range");
+        if (!err.empty()) throw std::runtime_error("max_connections wrap: " + err);
+
+        // worker_threads oversized.
+        err = load_expect(R"({"worker_threads": 9999999999})",
+                          "out of int range");
+        if (!err.empty()) throw std::runtime_error("worker_threads wrap: " + err);
+
+        // request_timeout_sec oversized.
+        err = load_expect(R"({"request_timeout_sec": 9999999999})",
+                          "out of int range");
+        if (!err.empty()) throw std::runtime_error("request_timeout wrap: " + err);
+
+        // shutdown_drain_timeout_sec oversized.
+        err = load_expect(R"({"shutdown_drain_timeout_sec": 9999999999})",
+                          "out of int range");
+        if (!err.empty()) throw std::runtime_error("drain_timeout wrap: " + err);
+
+        // idle_timeout_sec oversized (pre-existing same-bug-pattern fix).
+        err = load_expect(R"({"idle_timeout_sec": 9999999999})",
+                          "out of int range");
+        if (!err.empty()) throw std::runtime_error("idle_timeout wrap: " + err);
+
+        // log.max_files oversized.
+        err = load_expect(R"({"log": {"max_files": 9999999999}})",
+                          "out of int range");
+        if (!err.empty()) throw std::runtime_error("log.max_files wrap: " + err);
+
+        // rate_limit.status_code oversized.
+        err = load_expect(R"({"rate_limit": {"enabled": false,
+                                              "status_code": 9999999999}})",
+                          "out of int range");
+        if (!err.empty()) throw std::runtime_error("status_code wrap: " + err);
+
+        // Type rejection still works on top-level fields.
+        err = load_expect(R"({"bind_port": true})", "must be an integer");
+        if (!err.empty()) throw std::runtime_error("bind_port bool: " + err);
+
+        err = load_expect(R"({"worker_threads": "many"})", "must be an integer");
+        if (!err.empty()) throw std::runtime_error("worker_threads str: " + err);
+
+        // POSITIVE: in-range values still parse correctly.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "bind_port": 9090,
+                "max_connections": 5000,
+                "worker_threads": 4,
+                "request_timeout_sec": 60,
+                "shutdown_drain_timeout_sec": 15,
+                "idle_timeout_sec": 90
+            })");
+            if (cfg.bind_port != 9090 || cfg.max_connections != 5000 ||
+                cfg.worker_threads != 4 || cfg.request_timeout_sec != 60 ||
+                cfg.shutdown_drain_timeout_sec != 15 ||
+                cfg.idle_timeout_sec != 90) {
+                throw std::runtime_error(
+                    "in-range top-level integers parsed but values didn't land");
+            }
+        } catch (const std::runtime_error& e) {
+            throw;
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("valid in-range top-level integers rejected: ")
+                + e.what());
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader strict top-level integer parsing",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader strict top-level integer parsing",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n===== Auth Foundation Tests =====" << std::endl;
     TestHasherBasicDeterminism();
@@ -3906,6 +4111,8 @@ inline void RunAllTests() {
     TestConfigLoaderStrictRateLimitMaxEntries();
     TestConfigLoaderClaimHeaderCollision();
     TestConfigLoaderParseFreshDefaultsMatchStructDefaults();
+    TestConfigLoaderRejectsHeaderRewriterOwnedAuthForwardNames();
+    TestConfigLoaderStrictTopLevelIntegers();
 }
 
 }  // namespace AuthFoundationTests
