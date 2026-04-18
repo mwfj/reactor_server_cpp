@@ -4143,6 +4143,67 @@ void TestH2_Async_HandlerThrowFiresCancelSlot() {
     }
 }
 
+void TestH2_StreamingHandlerThrowAfterHeadersFinalizesRequest() {
+    std::cout << "\n[TEST] H2 streaming: throw after SendHeaders finalizes request..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync(
+            "/stream-throw-after-headers",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher /*push_resource*/,
+               HttpRouter::StreamingResponseSender stream_sender,
+               HttpRouter::AsyncCompletionCallback /*complete*/) {
+                HttpResponse head;
+                head.Status(200).Header("Content-Type", "text/plain");
+                if (stream_sender.SendHeaders(head) < 0) {
+                    return;
+                }
+                throw std::runtime_error("synthetic h2 streaming failure");
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+        int64_t before = server.GetStats().active_requests;
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/stream-throw-after-headers");
+            (void)resp;
+        }
+        client.Disconnect();
+
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(2);
+        int64_t after = server.GetStats().active_requests;
+        while (after != before &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            after = server.GetStats().active_requests;
+        }
+        if (after != before) {
+            pass = false;
+            err += "active_requests drifted from " +
+                   std::to_string(before) + " to " +
+                   std::to_string(after) + "; ";
+        }
+
+        TestFramework::RecordTest(
+            "H2 streaming: throw after SendHeaders finalizes request",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: throw after SendHeaders finalizes request",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestH2_StreamingAbortBeforeHeadersResetsStream() {
     std::cout << "\n[TEST] H2 streaming: Abort before SendHeaders resets stream..."
               << std::endl;
@@ -5578,6 +5639,7 @@ void RunAllTests() {
     TestH2_EarlyHints_OffDispatcherQueuedBeforeCompleteDropped();
     TestH2_EarlyHints_DroppedAfterCompleteSameThread();
     TestH2_Async_HandlerThrowFiresCancelSlot();
+    TestH2_StreamingHandlerThrowAfterHeadersFinalizesRequest();
     TestH2_StreamingAbortBeforeHeadersResetsStream();
     TestH2_StreamingNoBodyEndDoesNotResetStream();
     TestH2_StreamingBodylessSendDataDropsAndFinalizes();

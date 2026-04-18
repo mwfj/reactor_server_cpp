@@ -2713,6 +2713,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         }
                         stream_sender.Abort(
                             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
+                        finalize_request();
                         guard.release();
                         return;
                     }
@@ -3589,6 +3590,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         }
                         stream_sender.Abort(
                             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
+                        finalize_request();
                         guard.release();
                         return;
                     }

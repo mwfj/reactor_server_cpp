@@ -145,14 +145,15 @@ std::optional<std::string> ComputeEffectiveStreamingContentLength(
 
 std::string SerializeStreamingHead(const HttpResponse& response,
                                    int http_minor,
-                                   bool use_chunked) {
+                                   bool use_chunked,
+                                   bool allow_content_length = true) {
     std::ostringstream oss;
     // Streaming headers are emitted before the final body length is known. Only
     // preserve an explicit known length (or status-defined wire values like
     // 205/304); never auto-compute from the empty headers-only body.
     std::optional<std::string> effective_cl =
-        use_chunked ? std::nullopt
-                    : ComputeEffectiveStreamingContentLength(response);
+        (!allow_content_length || use_chunked) ? std::nullopt
+                                               : ComputeEffectiveStreamingContentLength(response);
     auto merged_trailer = MergeAllowedTrailerDeclarations(response.GetHeaders());
 
     oss << "HTTP/1." << http_minor << " " << response.GetStatusCode()
@@ -600,17 +601,23 @@ HttpConnectionHandler::CreateStreamingResponseSender(
         const bool has_effective_content_length =
             ComputeEffectiveStreamingContentLength(response).has_value();
         bool use_chunked = false;
-        if (!body_suppressed && !has_effective_content_length) {
-            if (http_minor >= 1) {
-                use_chunked = true;
-            } else {
+        bool allow_content_length = true;
+        if (!body_suppressed) {
+            if (http_minor == 0) {
+                // H1.0 streaming fallback is close-delimited, even when a
+                // handler supplied a fixed length. This keeps the generic
+                // streaming API aligned with the documented EOF-framed mode.
                 response.Header("Connection", "close");
                 should_close = true;
+                allow_content_length = false;
+            } else if (!has_effective_content_length) {
+                use_chunked = true;
             }
         }
 
         return PreparedStreamingHead{
-            SerializeStreamingHead(response, http_minor, use_chunked),
+            SerializeStreamingHead(
+                response, http_minor, use_chunked, allow_content_length),
             use_chunked,
             should_close,
             body_suppressed};

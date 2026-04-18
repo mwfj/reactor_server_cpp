@@ -614,6 +614,12 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
         // ReleaseBreakerAdmissionNeutral clears admission_generation_
         // internally, so Cleanup/destructor won't double-report.
         ReleaseBreakerAdmissionNeutral();
+        if (ResumeHeldRetryable5xxResponse("checkout_circuit_open")) {
+            return;
+        }
+        if (DeliverPendingRetryable5xxResponse("checkout_circuit_open")) {
+            return;
+        }
         DeliverResponse(MakeCircuitOpenResponse());
         return;
     }

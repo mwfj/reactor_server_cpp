@@ -762,6 +762,86 @@ void TestCheckoutLocalFailureRelaysStoredRetryable5xx() {
     }
 }
 
+void TestCheckoutCircuitOpenRelaysStoredRetryable5xx() {
+    std::cout << "\n[TEST] ProxyTransaction internal: checkout circuit-open relays stored retryable 5xx..."
+              << std::endl;
+    try {
+        HttpRequest request;
+        request.method = "GET";
+        request.url = "/checkout-circuit-open-fallback";
+        request.path = "/checkout-circuit-open-fallback";
+        request.headers["host"] = "example.test";
+        request.client_fd = 42;
+
+        bool delivered = false;
+        int delivered_status = 0;
+        std::string delivered_body;
+        bool saw_upstream_header = false;
+        bool saw_breaker_header = false;
+        auto tx = MakeInternalProxyTransaction(
+            request,
+            [&delivered, &delivered_status, &delivered_body,
+             &saw_upstream_header, &saw_breaker_header](HttpResponse response) {
+                delivered = true;
+                delivered_status = response.GetStatusCode();
+                delivered_body = response.GetBody();
+                for (const auto& [key, value] : response.GetHeaders()) {
+                    if (key == "X-Upstream-Source" && value == "backend") {
+                        saw_upstream_header = true;
+                    }
+                    if (key == "X-Circuit-Breaker") {
+                        saw_breaker_header = true;
+                    }
+                }
+            });
+
+        tx->state_ = ProxyTransaction::State::CHECKOUT_PENDING;
+        tx->attempt_ = 1;
+        tx->pending_retryable_5xx_response_ = true;
+        tx->pending_retryable_5xx_head_.status_code =
+            HttpStatus::SERVICE_UNAVAILABLE;
+        tx->pending_retryable_5xx_head_.status_reason =
+            "Service Unavailable";
+        tx->pending_retryable_5xx_head_.framing =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::
+                CONTENT_LENGTH;
+        tx->pending_retryable_5xx_head_.expected_length = 19;
+        tx->pending_retryable_5xx_head_.headers.push_back(
+            {"X-Upstream-Source", "backend"});
+        tx->pending_retryable_5xx_body_ = "backend-circuit-503";
+
+        tx->OnCheckoutError(-6);
+
+        bool pass = delivered &&
+                    delivered_status == HttpStatus::SERVICE_UNAVAILABLE &&
+                    delivered_body == "backend-circuit-503" &&
+                    saw_upstream_header &&
+                    !saw_breaker_header &&
+                    tx->state_ == ProxyTransaction::State::COMPLETE;
+        std::string err;
+        if (!delivered) err += "stored response not delivered; ";
+        if (delivered_status != HttpStatus::SERVICE_UNAVAILABLE) {
+            err += "status=" + std::to_string(delivered_status) + "; ";
+        }
+        if (delivered_body != "backend-circuit-503") {
+            err += "stored body not relayed; ";
+        }
+        if (!saw_upstream_header) err += "stored upstream headers missing; ";
+        if (saw_breaker_header) err += "synthetic circuit-open header leaked; ";
+        if (tx->state_ != ProxyTransaction::State::COMPLETE) {
+            err += "state should be COMPLETE; ";
+        }
+
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: checkout circuit-open relays stored retryable 5xx",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: checkout circuit-open relays stored retryable 5xx",
+            false, e.what());
+    }
+}
+
 void TestStreamingCommitFailureAbortsSenderOnHeaders() {
     std::cout << "\n[TEST] ProxyTransaction internal: streaming header commit failure aborts sender..."
               << std::endl;
@@ -879,6 +959,7 @@ void RunAllTests() {
     TestRetryable5xxIncompleteSnapshotKeepsLeaseDuringBackoff();
     TestHeldRetryable5xxIncompleteSnapshotResumesInsteadOfRetrying();
     TestCheckoutLocalFailureRelaysStoredRetryable5xx();
+    TestCheckoutCircuitOpenRelaysStoredRetryable5xx();
     TestStreamingCommitFailureAbortsSenderOnHeaders();
     TestHeldRetryable5xxCommitFailureAbortsSender();
 }

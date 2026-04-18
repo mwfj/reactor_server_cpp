@@ -2091,6 +2091,84 @@ namespace HttpTests {
         }
     }
 
+    void TestH1_StreamingHttp10FixedLengthUsesCloseMode() {
+        std::cout << "\n[TEST] H1 streaming: HTTP/1.0 fixed-length response uses close mode..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-http10-fixed",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200)
+                        .Header("Content-Type", "text/plain")
+                        .Header("Content-Length", "10")
+                        .PreserveContentLength();
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    if (stream_sender.SendData("hello", 5) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    if (stream_sender.SendData("world", 5) ==
+                        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::
+                            SendResult::CLOSED) {
+                        return;
+                    }
+                    (void)stream_sender.End();
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            std::string resp = SendRawAndDrain(
+                port,
+                "GET /stream-http10-fixed HTTP/1.0\r\n"
+                "Host: x\r\n"
+                "Connection: keep-alive\r\n"
+                "\r\n",
+                3000);
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("http/1.0 200 ok") == std::string::npos) {
+                pass = false; err += "missing HTTP/1.0 200 response; ";
+            }
+            if (lower.find("connection: close") == std::string::npos) {
+                pass = false; err += "Connection: close missing; ";
+            }
+            if (lower.find("connection: keep-alive") != std::string::npos) {
+                pass = false; err += "unexpected keep-alive response header; ";
+            }
+            if (lower.find("content-length:") != std::string::npos) {
+                pass = false; err += "content-length should be omitted in close mode; ";
+            }
+            if (lower.find("transfer-encoding:") != std::string::npos) {
+                pass = false; err += "transfer-encoding should be omitted; ";
+            }
+            if (TestHttpClient::ExtractBody(resp) != "helloworld") {
+                pass = false; err += "body mismatch; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: HTTP/1.0 fixed-length response uses close mode",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: HTTP/1.0 fixed-length response uses close mode",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     void TestH1_StreamingAbortOffDispatcherThreadRejected() {
         std::cout << "\n[TEST] H1 streaming: off-dispatcher Abort is rejected..." << std::endl;
         try {
@@ -2714,6 +2792,65 @@ namespace HttpTests {
         }
     }
 
+    void TestH1_StreamingHandlerThrowAfterHeadersFinalizesRequest() {
+        std::cout << "\n[TEST] H1 streaming: throw after SendHeaders finalizes request..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/stream-throw-after-headers",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(200).Header("Content-Type", "text/plain");
+                    if (stream_sender.SendHeaders(head) < 0) {
+                        return;
+                    }
+                    throw std::runtime_error("synthetic streaming failure");
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+            int64_t before = server.GetStats().active_requests;
+
+            (void)SendRawAndDrain(
+                port,
+                "GET /stream-throw-after-headers HTTP/1.1\r\n"
+                "Host: x\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                3000);
+
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(2);
+            int64_t after = server.GetStats().active_requests;
+            while (after != before &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                after = server.GetStats().active_requests;
+            }
+
+            bool pass = (after == before);
+            std::string err;
+            if (!pass) {
+                err += "active_requests drifted from " +
+                       std::to_string(before) + " to " +
+                       std::to_string(after) + "; ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: throw after SendHeaders finalizes request",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: throw after SendHeaders finalizes request",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // Run all HTTP tests
     void RunAllTests() {
         std::cout << "\n" << std::string(60, '=') << std::endl;
@@ -2768,6 +2905,7 @@ namespace HttpTests {
         TestH1_Streaming205CanonicalizesContentLength();
         TestH1_StreamingDeduplicatesContentLength();
         TestH1_StreamingHttp10UnknownLengthOmitsContentLength();
+        TestH1_StreamingHttp10FixedLengthUsesCloseMode();
         TestH1_StreamingAbortOffDispatcherThreadRejected();
         TestH1_StreamingRawContentLengthWithoutPreserveUsesChunkedFraming();
         TestH1_StreamingCommittedResponseBypassesAsyncCap();
@@ -2775,6 +2913,7 @@ namespace HttpTests {
         TestH1_EarlyHints_WorkerThreadOrderingSafe();
         TestH1_EarlyHints_PipelinedKeepAliveNoStale();
         TestH1_Async_HandlerThrowFiresCancelSlot();
+        TestH1_StreamingHandlerThrowAfterHeadersFinalizesRequest();
     }
 
 }  // namespace HttpTests
