@@ -505,6 +505,193 @@ void TestRetryable5xxRetryReleasesLeaseBeforeBackoff() {
     }
 }
 
+void TestRetryable5xxIncompleteSnapshotKeepsLeaseDuringBackoff() {
+    std::cout << "\n[TEST] ProxyTransaction internal: retryable 5xx incomplete snapshot keeps lease during backoff..."
+              << std::endl;
+    try {
+        int fds[2] = {-1, -1};
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+            throw std::runtime_error("socketpair failed");
+        }
+
+        auto dispatcher = std::make_shared<Dispatcher>();
+        auto transport = std::shared_ptr<ConnectionHandler>(new ConnectionHandler(
+            dispatcher,
+            std::unique_ptr<SocketHandler>(
+                new SocketHandler(fds[0], "127.0.0.1", 8080))));
+        auto upstream_conn =
+            std::make_unique<UpstreamConnection>(transport, "127.0.0.1", 8080);
+
+        HttpRequest request;
+        request.method = "GET";
+        request.url = "/retry-5xx-held";
+        request.path = "/retry-5xx-held";
+        request.headers["host"] = "example.test";
+        request.client_fd = 42;
+
+        ProxyConfig proxy_config;
+        HeaderRewriter::Config rewriter_config;
+        HeaderRewriter header_rewriter(rewriter_config);
+        RetryPolicy::Config retry_config;
+        retry_config.max_retries = 1;
+        retry_config.retry_on_5xx = true;
+        retry_config.retry_on_connect_failure = false;
+        RetryPolicy retry_policy(retry_config);
+
+        auto tx = std::make_shared<ProxyTransaction>(
+            "svc",
+            request,
+            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender(),
+            [](HttpResponse) {},
+            nullptr,
+            proxy_config,
+            header_rewriter,
+            retry_policy,
+            false,
+            "127.0.0.1",
+            8080,
+            "",
+            "",
+            "");
+
+        tx->dispatcher_ = dispatcher.get();
+        tx->state_ = ProxyTransaction::State::RECEIVING_BODY;
+        tx->lease_ = UpstreamLease(upstream_conn.get(), nullptr, nullptr);
+        tx->poison_connection_ = true;
+        tx->response_headers_seen_ = true;
+        tx->response_head_.status_code = HttpStatus::SERVICE_UNAVAILABLE;
+        tx->response_head_.status_reason = "Service Unavailable";
+        tx->response_head_.framing =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH;
+        tx->response_head_.expected_length = 11;
+        tx->response_body_ = "part";
+
+        tx->MaybeRetry(RetryPolicy::RetryCondition::RESPONSE_5XX);
+
+        bool pass = tx->lease_ &&
+                    tx->attempt_ == 1 &&
+                    tx->pending_retryable_5xx_response_ &&
+                    tx->pending_retryable_5xx_body_ == "part" &&
+                    !tx->pending_retryable_5xx_body_complete_ &&
+                    tx->holding_retryable_5xx_response_ &&
+                    !upstream_conn->IsClosing();
+        std::string err;
+        if (!tx->lease_) err += "lease should stay held for incomplete fallback body; ";
+        if (tx->attempt_ != 1) err += "attempt not incremented; ";
+        if (!tx->pending_retryable_5xx_response_) err += "stored 5xx missing; ";
+        if (tx->pending_retryable_5xx_body_ != "part") err += "stored body mismatch; ";
+        if (tx->pending_retryable_5xx_body_complete_) {
+            err += "incomplete fallback body marked complete; ";
+        }
+        if (!tx->holding_retryable_5xx_response_) {
+            err += "held 5xx transport should be preserved; ";
+        }
+        if (upstream_conn->IsClosing()) {
+            err += "held upstream connection should not be released yet; ";
+        }
+
+        tx->complete_cb_invoked_ = true;
+        tx->complete_cb_ = nullptr;
+        tx->Cleanup();
+        if (fds[1] >= 0) {
+            ::close(fds[1]);
+        }
+
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: retryable 5xx incomplete snapshot keeps lease during backoff",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: retryable 5xx incomplete snapshot keeps lease during backoff",
+            false, e.what());
+    }
+}
+
+void TestHeldRetryable5xxIncompleteSnapshotResumesInsteadOfRetrying() {
+    std::cout << "\n[TEST] ProxyTransaction internal: held 5xx incomplete snapshot resumes instead of retrying..."
+              << std::endl;
+    try {
+        int fds[2] = {-1, -1};
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+            throw std::runtime_error("socketpair failed");
+        }
+
+        auto dispatcher = std::make_shared<Dispatcher>();
+        auto transport = std::shared_ptr<ConnectionHandler>(new ConnectionHandler(
+            dispatcher,
+            std::unique_ptr<SocketHandler>(
+                new SocketHandler(fds[0], "127.0.0.1", 8080))));
+        auto upstream_conn =
+            std::make_unique<UpstreamConnection>(transport, "127.0.0.1", 8080);
+
+        HttpRequest request;
+        request.method = "GET";
+        request.url = "/held-incomplete";
+        request.path = "/held-incomplete";
+        request.headers["host"] = "example.test";
+        request.client_fd = 42;
+
+        bool delivered = false;
+        int delivered_status = 0;
+        auto tx = MakeInternalProxyTransaction(
+            request,
+            [&delivered, &delivered_status](HttpResponse response) {
+                delivered = true;
+                delivered_status = response.GetStatusCode();
+            });
+
+        tx->state_ = ProxyTransaction::State::RECEIVING_BODY;
+        tx->attempt_ = 1;
+        tx->relay_mode_ = ProxyTransaction::RelayMode::BUFFERED;
+        tx->response_headers_seen_ = true;
+        tx->holding_retryable_5xx_response_ = true;
+        tx->pending_retryable_5xx_response_ = true;
+        tx->pending_retryable_5xx_body_ = "partial";
+        tx->pending_retryable_5xx_body_complete_ = false;
+        tx->lease_ = UpstreamLease(upstream_conn.get(), nullptr, nullptr);
+        tx->response_head_.status_code = HttpStatus::SERVICE_UNAVAILABLE;
+        tx->response_head_.status_reason = "Service Unavailable";
+        tx->response_head_.framing =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::NO_BODY;
+
+        tx->BeginRetryAttemptFromHeld5xx();
+
+        bool pass = delivered &&
+                    delivered_status == HttpStatus::SERVICE_UNAVAILABLE &&
+                    tx->state_ == ProxyTransaction::State::COMPLETE &&
+                    !tx->lease_ &&
+                    !tx->holding_retryable_5xx_response_ &&
+                    !tx->pending_retryable_5xx_response_;
+        std::string err;
+        if (!delivered) err += "held 5xx was not resumed; ";
+        if (delivered_status != HttpStatus::SERVICE_UNAVAILABLE) {
+            err += "status=" + std::to_string(delivered_status) + "; ";
+        }
+        if (tx->state_ != ProxyTransaction::State::COMPLETE) {
+            err += "state should be COMPLETE after resuming held 5xx; ";
+        }
+        if (tx->lease_) err += "lease should be cleaned up after resume; ";
+        if (tx->holding_retryable_5xx_response_) {
+            err += "held flag should be cleared after resume; ";
+        }
+        if (tx->pending_retryable_5xx_response_) {
+            err += "stored fallback should be cleared after resume; ";
+        }
+
+        if (fds[1] >= 0) {
+            ::close(fds[1]);
+        }
+
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: held 5xx incomplete snapshot resumes instead of retrying",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: held 5xx incomplete snapshot resumes instead of retrying",
+            false, e.what());
+    }
+}
+
 void TestCheckoutLocalFailureRelaysStoredRetryable5xx() {
     std::cout << "\n[TEST] ProxyTransaction internal: checkout local failure relays stored retryable 5xx..."
               << std::endl;
@@ -689,6 +876,8 @@ void RunAllTests() {
     TestBufferedOverflowPoisonsConnection();
     TestCheckoutCapsAndCleanupRestoresIdleUpstreamTransportInputCap();
     TestRetryable5xxRetryReleasesLeaseBeforeBackoff();
+    TestRetryable5xxIncompleteSnapshotKeepsLeaseDuringBackoff();
+    TestHeldRetryable5xxIncompleteSnapshotResumesInsteadOfRetrying();
     TestCheckoutLocalFailureRelaysStoredRetryable5xx();
     TestStreamingCommitFailureAbortsSenderOnHeaders();
     TestHeldRetryable5xxCommitFailureAbortsSender();

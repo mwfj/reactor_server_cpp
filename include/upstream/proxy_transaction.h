@@ -236,6 +236,7 @@ private:
     UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead
         pending_retryable_5xx_head_;
     std::string pending_retryable_5xx_body_;
+    bool pending_retryable_5xx_body_complete_ = false;
     bool holding_retryable_5xx_response_ = false;
     bool held_retryable_5xx_saw_eof_ = false;
 

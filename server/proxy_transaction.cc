@@ -119,26 +119,34 @@ bool ShouldPreserveKnownContentLength(
            head.expected_length >= 0;
 }
 
-std::string SnapshotRetryable5xxBody(
+struct Retryable5xxBodySnapshot {
+    std::string body;
+    bool complete = false;
+};
+
+Retryable5xxBodySnapshot SnapshotRetryable5xxBody(
     const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head,
     const std::string& decoded_body,
     const std::string& paused_wire_body) {
-    std::string snapshot = decoded_body;
-    if (paused_wire_body.empty()) {
-        return snapshot;
-    }
+    Retryable5xxBodySnapshot snapshot;
+    snapshot.body = decoded_body;
 
     using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
     switch (head.framing) {
         case Framing::CONTENT_LENGTH:
-            snapshot.append(paused_wire_body);
+            snapshot.body.append(paused_wire_body);
             if (head.expected_length >= 0 &&
-                snapshot.size() > static_cast<size_t>(head.expected_length)) {
-                snapshot.resize(static_cast<size_t>(head.expected_length));
+                snapshot.body.size() > static_cast<size_t>(head.expected_length)) {
+                snapshot.body.resize(static_cast<size_t>(head.expected_length));
+            }
+            if (head.expected_length >= 0) {
+                snapshot.complete =
+                    snapshot.body.size() ==
+                    static_cast<size_t>(head.expected_length);
             }
             break;
         case Framing::EOF_TERMINATED:
-            snapshot.append(paused_wire_body);
+            snapshot.body.append(paused_wire_body);
             break;
         case Framing::CHUNKED: {
             size_t pos = 0;
@@ -157,12 +165,13 @@ std::string SnapshotRetryable5xxBody(
 
                 pos = line_end + 2;
                 if (chunk_size == 0) {
+                    snapshot.complete = true;
                     break;
                 }
                 if (paused_wire_body.size() - pos < chunk_size + 2) {
                     break;
                 }
-                snapshot.append(paused_wire_body.data() + pos, chunk_size);
+                snapshot.body.append(paused_wire_body.data() + pos, chunk_size);
                 pos += chunk_size;
                 if (paused_wire_body.compare(pos, 2, "\r\n") != 0) {
                     break;
@@ -172,6 +181,7 @@ std::string SnapshotRetryable5xxBody(
             break;
         }
         case Framing::NO_BODY:
+            snapshot.complete = true;
             break;
     }
     return snapshot;
@@ -787,8 +797,10 @@ void ProxyTransaction::OnUpstreamData(
         paused_parse_bytes_.assign(parse_input.data() + consumed,
                                    parse_input.size() - consumed);
         if (holding_retryable_5xx_response_) {
-            pending_retryable_5xx_body_ = SnapshotRetryable5xxBody(
+            auto snapshot = SnapshotRetryable5xxBody(
                 response_head_, response_body_, paused_parse_bytes_);
+            pending_retryable_5xx_body_ = std::move(snapshot.body);
+            pending_retryable_5xx_body_complete_ = snapshot.complete;
         }
     }
 
@@ -1095,11 +1107,14 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
     if (cancelled_) return;
     if (retry_policy_.ShouldRetry(attempt_, method_, condition, response_committed_)) {
         if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX) {
+            auto snapshot = SnapshotRetryable5xxBody(
+                response_head_, response_body_, paused_parse_bytes_);
             pending_retryable_5xx_response_ = true;
             pending_retryable_5xx_head_ = response_head_;
-            pending_retryable_5xx_body_ = SnapshotRetryable5xxBody(
-                response_head_, response_body_, paused_parse_bytes_);
-            holding_retryable_5xx_response_ = true;
+            pending_retryable_5xx_body_ = std::move(snapshot.body);
+            pending_retryable_5xx_body_complete_ = snapshot.complete;
+            holding_retryable_5xx_response_ =
+                !pending_retryable_5xx_body_complete_;
             held_retryable_5xx_saw_eof_ = false;
         } else {
             ClearPendingRetryable5xxResponse();
@@ -1113,17 +1128,26 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
 
         // Release the completed attempt immediately so backoff does not pin a
         // checked-out upstream lease or keep retry/in-flight accounting active
-        // for work that is merely waiting to retry. For retryable 5xx
-        // responses we retain a replayable snapshot of the original upstream
-        // error until the replacement attempt is actually live.
-        if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX) {
-            holding_retryable_5xx_response_ = false;
-            held_retryable_5xx_saw_eof_ = false;
+        // for work that is merely waiting to retry. The exception is a
+        // retryable 5xx whose saved fallback body is still incomplete: in that
+        // case we keep the original response paused so a later local retry
+        // reject can resume the real upstream 5xx instead of replaying a
+        // truncated snapshot.
+        bool keep_retryable_5xx_held =
+            condition == RetryPolicy::RetryCondition::RESPONSE_5XX &&
+            holding_retryable_5xx_response_;
+        if (keep_retryable_5xx_held) {
+            ReleaseAttemptAccounting();
         } else {
-            ClearPendingRetryable5xxResponse();
+            if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX) {
+                holding_retryable_5xx_response_ = false;
+                held_retryable_5xx_saw_eof_ = false;
+            } else {
+                ClearPendingRetryable5xxResponse();
+            }
+            Cleanup();
+            ResetForRetryAttempt();
         }
-        Cleanup();
-        ResetForRetryAttempt();
 
         // Condition-dependent first-retry policy:
         // Connection-level failures (stale keep-alive, connect refused)
@@ -1464,6 +1488,7 @@ void ProxyTransaction::ClearPendingRetryable5xxResponse() {
     pending_retryable_5xx_response_ = false;
     pending_retryable_5xx_head_ = {};
     pending_retryable_5xx_body_.clear();
+    pending_retryable_5xx_body_complete_ = false;
 }
 
 bool ProxyTransaction::DeliverPendingRetryable5xxResponse(
@@ -1568,6 +1593,14 @@ bool ProxyTransaction::ResumeHeldRetryable5xxResponse(
 
 void ProxyTransaction::BeginRetryAttemptFromHeld5xx() {
     if (cancelled_) return;
+    if (!pending_retryable_5xx_body_complete_) {
+        // The saved fallback is still partial. Releasing the held upstream
+        // response now would risk a later local retry failure replaying a
+        // truncated 5xx body, so prefer relaying the original response over
+        // starting a replacement attempt we cannot fall back from correctly.
+        ResumeHeldRetryable5xxResponse("retryable_5xx_body_incomplete");
+        return;
+    }
 
     state_ = State::CHECKOUT_PENDING;
     if (!PrepareAttemptAdmission()) {

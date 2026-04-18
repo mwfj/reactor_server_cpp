@@ -3154,22 +3154,37 @@ void TestH2_EarlyHints_OffDispatcherThread() {
               << std::endl;
     try {
         HttpServer server(MakeH2Config(0));
+        struct AsyncControls {
+            HttpRouter::InterimResponseSender send_interim;
+            HttpRouter::AsyncCompletionCallback complete;
+        };
+        auto p_controls = std::make_shared<std::promise<AsyncControls>>();
+        auto f_controls = p_controls->get_future().share();
         server.GetAsync("/offthread",
-            [](const HttpRequest&,
+            [p_controls](const HttpRequest&,
                HttpRouter::InterimResponseSender send_interim,
                HttpRouter::ResourcePusher        /*push_resource*/,
                HttpRouter::StreamingResponseSender /*stream_sender*/,
                HttpRouter::AsyncCompletionCallback complete) {
-                // Worker-thread send_interim: must auto-hop and
-                // emit BEFORE the handler calls complete().
-                std::thread t([send_interim]() {
-                    send_interim(103, {{"link", "</style.css>; rel=preload"}});
-                });
-                t.join();
-                HttpResponse r;
-                r.Status(200).Text("done");
-                complete(std::move(r));
+                p_controls->set_value(
+                    AsyncControls{send_interim, complete});
             });
+
+        std::thread watcher([f_controls]() mutable {
+            auto controls = f_controls.get();
+            controls.send_interim(103, {{"link", "</style.css>; rel=preload"}});
+            // Give the dispatcher time to run the hopped interim before the
+            // worker-thread continuation claims the final response.
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            HttpResponse r;
+            r.Status(200).Text("done");
+            controls.complete(std::move(r));
+        });
+        struct JoinGuard {
+            std::thread& t;
+            ~JoinGuard() { if (t.joinable()) t.join(); }
+        };
+        JoinGuard watcher_guard{watcher};
 
         TestServerRunner<HttpServer> runner(server);
         int port = runner.GetPort();
@@ -3183,10 +3198,9 @@ void TestH2_EarlyHints_OffDispatcherThread() {
             auto resp = client.Get("/offthread");
             if (resp.error)         { pass = false; err += "transport error; "; }
             if (resp.status != 200) { pass = false; err += "final status != 200; "; }
-            // The worker-thread interim is expected to land: we joined
-            // the thread before calling complete(), so the hopped
-            // send_interim lambda is enqueued before the final response
-            // submission — the 103 must precede the 200.
+            // The worker-thread interim is expected to land because the
+            // watcher waits before calling complete(), giving the dispatcher
+            // a chance to run the hopped send_interim first.
             if (resp.interim_statuses.size() != 1) {
                 pass = false;
                 err += "expected 1 interim after off-thread hop, got " +
@@ -4904,6 +4918,68 @@ void TestH2_StreamingControlMethodsOffDispatcherThreadRejected() {
     }
 }
 
+// Regression for the off-dispatcher H2 interim hop: if a worker-thread
+// continuation queues send_interim() and then immediately calls complete(),
+// the queued 103 must re-check the request-scoped completed flag on the
+// dispatcher and drop instead of slipping past the final-response claim.
+void TestH2_EarlyHints_OffDispatcherQueuedBeforeCompleteDropped() {
+    std::cout << "\n[TEST] H2 103 Early Hints: off-thread queued interim dropped after complete..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync("/offthread-drop",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender send_interim,
+               HttpRouter::ResourcePusher        /*push_resource*/,
+               HttpRouter::StreamingResponseSender /*stream_sender*/,
+               HttpRouter::AsyncCompletionCallback complete) {
+                std::thread t([send_interim, complete]() mutable {
+                    send_interim(103, {{"link", "</late.css>; rel=preload"}});
+                    HttpResponse r;
+                    r.Status(200).Text("done");
+                    complete(std::move(r));
+                });
+                t.join();
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/offthread-drop");
+            if (resp.error) {
+                pass = false;
+                err += "transport error; ";
+            }
+            if (resp.status != 200) {
+                pass = false;
+                err += "final status != 200; ";
+            }
+            if (!resp.interim_statuses.empty()) {
+                pass = false;
+                err += "queued off-thread 103 must be dropped after complete; got " +
+                       std::to_string(resp.interim_statuses.size()) +
+                       " interim(s); ";
+            }
+        }
+        client.Disconnect();
+
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: off-thread queued interim dropped after complete",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 103 Early Hints: off-thread queued interim dropped after complete",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression for PR #18 round-5 comment 2: H2 async handler that
 // calls complete() and then send_interim() inline on the dispatcher
 // thread (before returning from the handler body) must NOT land the
@@ -5499,6 +5575,7 @@ void RunAllTests() {
     TestH2_EarlyHints_StreamClosedByPeerSafe();
     TestH2_EarlyHints_100ContinueThen103();
     TestH2_EarlyHints_OffDispatcherThread();
+    TestH2_EarlyHints_OffDispatcherQueuedBeforeCompleteDropped();
     TestH2_EarlyHints_DroppedAfterCompleteSameThread();
     TestH2_Async_HandlerThrowFiresCancelSlot();
     TestH2_StreamingAbortBeforeHeadersResetsStream();

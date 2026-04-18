@@ -3491,6 +3491,28 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     if (response_claimed->load(std::memory_order_acquire)) return;
                     auto h2 = h2_weak.lock();
                     if (!h2) return;
+                    auto conn = h2->GetConnection();
+                    if (!conn) return;
+                    // Request-scoped guard must survive the dispatcher hop.
+                    // Without re-checking response_claimed inside the queued
+                    // lambda, an off-thread send_interim() followed by
+                    // complete() in the same continuation can still emit a
+                    // stale 103 after the request was already claimed.
+                    if (!conn->IsOnDispatcherThread()) {
+                        std::weak_ptr<Http2ConnectionHandler> weak = h2;
+                        auto hdrs_copy = hdrs;
+                        conn->RunOnDispatcher(
+                            [weak, response_claimed, stream_id, status_code,
+                             hdrs_copy = std::move(hdrs_copy)]() {
+                            if (response_claimed->load(
+                                    std::memory_order_acquire)) return;
+                            if (auto self2 = weak.lock()) {
+                                self2->SendInterimResponse(
+                                    stream_id, status_code, hdrs_copy);
+                            }
+                        });
+                        return;
+                    }
                     h2->SendInterimResponse(stream_id, status_code, hdrs);
                 };
                 auto push_resource =
