@@ -787,6 +787,11 @@ void ProxyTransaction::OnUpstreamData(
             return;
         }
         int upstream_fd = conn ? conn->fd() : -1;
+        logging::Get()->warn("ProxyTransaction upstream EOF with incomplete response "
+                             "client_fd={} service={} upstream_fd={} "
+                             "body_complete_={} codec_paused={} paused_bytes={}",
+                             client_fd_, service_name_, upstream_fd,
+                             body_complete_, codec_.IsPaused(), paused_parse_bytes_.size());
         logging::Get()->warn("ProxyTransaction upstream disconnect (EOF) "
                              "client_fd={} service={} upstream_fd={} "
                              "state={} attempt={}",

@@ -222,7 +222,11 @@ void ConnectionHandler::OnMessage(){
             break;
         } else if (nread < 0) {
             if (tls_state_ == TlsState::READY) {
-                // TLS read error — use CallCloseCb for proper cleanup
+                // TLS read error — use CallCloseCb for proper cleanup.
+                // Clear has_pending_reads_ so the new defer gate in CallCloseCb
+                // doesn't trap the close on a stale cap-stop flag from an
+                // earlier iteration. The socket is broken; no drain is coming.
+                has_pending_reads_.store(false, std::memory_order_release);
                 logging::Get()->warn("TLS read error fd={}, closing", fd());
                 CallCloseCb();
                 return;
@@ -239,6 +243,9 @@ void ConnectionHandler::OnMessage(){
             } else {
                 logging::Get()->warn("Read error fd={}: {} (errno={})", fd(), logging::SafeStrerror(saved_errno), saved_errno);
             }
+            // See TLS branch above: clear has_pending_reads_ before the close
+            // path so CallCloseCb's defer gate can't trap a broken socket.
+            has_pending_reads_.store(false, std::memory_order_release);
             CallCloseCb();
             return;
         } else {
@@ -293,6 +300,28 @@ void ConnectionHandler::OnMessage(){
     // full-disconnect) already funnels through the send-side fast-path
     // which sets close_after_write_ / calls ForceClose on EPIPE.
     if (peer_closed && !is_closing_.load(std::memory_order_acquire)) {
+        // Backpressure-drain replay: close was deferred while the pump was
+        // paused. Now that we've drained the kernel RCVBUF to EOF, complete
+        // the close rather than applying the H1 half-close heuristic (which
+        // would arm a 5 s deadline and wait for a second request that will
+        // never arrive). This path is taken on any deferred-close drain
+        // cycle (close_on_resume_ set by CallCloseCb).
+        if (close_on_resume_.load(std::memory_order_acquire)) {
+            close_on_resume_.store(false, std::memory_order_release);
+            logging::Get()->debug(
+                "Deferred close firing after backpressure drain fd={} callback_ran={} ibuf={}",
+                fd(), callback_ran, input_bf_.Size());
+            if (output_bf_.Size() > 0) {
+                // Still flushing downstream response — arm close-after-write
+                // so CallWriteCb closes when the buffer empties.
+                close_after_write_.store(true, std::memory_order_release);
+                client_channel_->EnableWriteMode();
+            } else {
+                ForceClose();
+            }
+            return;
+        }
+
         if (output_bf_.Size() > 0) {
             // Data still being flushed — enable write mode to drain it.
             // CallWriteCb will ForceClose when the buffer empties.
@@ -322,6 +351,19 @@ void ConnectionHandler::OnMessage(){
             // no handler in-flight) — nothing to wait for.
             ForceClose();
         }
+    }
+
+    // Track whether we still have unread bytes in the kernel RCVBUF.
+    // Set when we break out at the input cap (more data pending).
+    // Clear when we reach EAGAIN/EOF (kernel buffer fully drained).
+    // This flag causes CallCloseCb to defer when a kqueue EV_EOF event
+    // arrives coalesced with the read event — the synthetic OnMessage
+    // (enqueued below) must drain the remaining bytes before close fires.
+    if (stopped_for_cap) {
+        has_pending_reads_.store(true, std::memory_order_release);
+    } else {
+        // Read loop reached EAGAIN or EOF — no more bytes pending.
+        has_pending_reads_.store(false, std::memory_order_release);
     }
 
     // If we stopped reading due to the input cap (not EAGAIN/EOF), there's
@@ -558,14 +600,57 @@ void ConnectionHandler::CloseAfterWrite(){
 }
 
 void ConnectionHandler::ForceClose(){
-    // Skip the close_after_write defer — used when a deferred close stalls
-    // and the timer needs to reclaim the connection.
-    logging::Get()->debug("Force-closing fd={}", fd());
+    // Force close is the escape hatch for timer reclaim, shutdown, and
+    // upper-layer aborts. It must bypass the backpressure-drain defer —
+    // the transport is about to close regardless.
     close_after_write_.store(false, std::memory_order_release);
+    read_pump_paused_.store(false, std::memory_order_release);
+    close_on_resume_.store(false, std::memory_order_release);
+    has_pending_reads_.store(false, std::memory_order_release);
+    logging::Get()->debug("Force-closing fd={}", fd());
     CallCloseCb();
 }
 
 void ConnectionHandler::CallCloseCb(){
+    // Defer close when the upstream read pump is paused for backpressure —
+    // the kernel RCVBUF may still hold body bytes we haven't parsed yet.
+    // This covers both the initial deferral (close_on_resume_=false) and
+    // re-deferral on subsequent pause/resume cycles (close_on_resume_=true).
+    // Note: close_after_write_ may already be set (OnMessage sets it before the
+    // relay callback runs so that sync-path sends see the flag). We must defer
+    // even in that case; the close_after_write_ output-drain path fires only
+    // when the OUTPUT buffer empties, but we need to drain the INPUT first.
+    // ResumeReadPump's path will eventually drain the socket to EAGAIN/EOF;
+    // OnMessage's peer_closed branch then fires the real close via ForceClose.
+    // This gate is bypassed by ForceClose (which clears both close_on_resume_
+    // and read_pump_paused_). The wait is bounded by idle_timeout_sec.
+    // Defer close when the upstream read pump is paused (downstream backpressure)
+    // OR when the last OnMessage broke out at the input cap with bytes still in
+    // the kernel RCVBUF (has_pending_reads_=true). In both cases we must let the
+    // synthetic OnMessage run to drain all data before closing. On kqueue, EV_EOF
+    // is coalesced with the final EVFILT_READ event — the close callback fires in
+    // the same dispatch cycle, before the enqueued synthetic OnMessage executes.
+    bool backpressure_paused = read_pump_paused_.load(std::memory_order_acquire);
+    bool cap_stopped = has_pending_reads_.load(std::memory_order_acquire);
+    if ((backpressure_paused || cap_stopped) &&
+        !is_closing_.load(std::memory_order_acquire)) {
+        bool was_already_deferred =
+            close_on_resume_.load(std::memory_order_acquire);
+        if (!was_already_deferred) {
+            close_on_resume_.store(true, std::memory_order_release);
+        }
+        // Invariant: once close_on_resume_ is set, the peer_closed branch of
+        // a future OnMessage owns completing the close (by arming
+        // close_after_write_ + EnableWriteMode when output_bf_ is non-empty,
+        // or calling ForceClose directly when it's empty). Clearing
+        // close_after_write_ here is safe because that branch re-arms it.
+        close_after_write_.store(false, std::memory_order_release);
+        logging::Get()->debug(
+            "Close deferred fd={} backpressure_paused={} cap_stopped={} was_already_deferred={}",
+            fd(), backpressure_paused, cap_stopped, was_already_deferred);
+        return;
+    }
+
     // If close_after_write is armed, defer to the write path.
     // CallWriteCb will close after the buffer drains. For async handlers,
     // DoSend will enable write mode when data arrives. If nothing ever

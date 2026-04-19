@@ -1260,6 +1260,12 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
     transport->SetWriteProgressCb(nullptr);
     transport->SetConnectCompleteCallback(nullptr);
     transport->SetDeadlineTimeoutCb(nullptr);
+    // Reset transport-level flags that track an in-flight borrower's
+    // backpressure / cap-stop state. ForceClose clears these too; resetting
+    // here guarantees they can never survive the borrower-return boundary
+    // and poison the next checkout with a stale defer. See
+    // DEVELOPMENT_RULES.md ("kqueue EV_EOF coalescing").
+    transport->ResetForPoolReuse();
     // Idle pooled transports must never sit with an unbounded read cap.
     // Unexpected bytes are treated as poison below, but ConnectionHandler
     // reads into input_bf_ before the callback runs.

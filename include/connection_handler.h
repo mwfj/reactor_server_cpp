@@ -77,6 +77,22 @@ private:
     // toggling channel read interest, this keeps ET registration intact and
     // resumes by scheduling a synthetic OnMessage() drain when unpaused.
     std::atomic<bool> read_pump_paused_{false};
+    // When a peer-EOF close arrives while read_pump_paused_ is set, we defer
+    // the close so the drain listener can resume reads and drain any bytes
+    // still in the kernel RCVBUF. See DEVELOPMENT_RULES.md ("kqueue EV_EOF
+    // coalescing"). Cleared on ForceClose or when the peer_closed branch
+    // acts on it. Atomic for parity with read_pump_paused_.
+    std::atomic<bool> close_on_resume_{false};
+    // Set when OnMessage breaks out of the read loop due to the input cap
+    // (stopped_for_cap=true), meaning there are still bytes in the kernel
+    // RCVBUF that haven't been read yet. A synthetic OnMessage is enqueued
+    // to drain them. When a kqueue EV_EOF+data event is coalesced with the
+    // read event, the close callback fires BEFORE the synthetic OnMessage
+    // runs. We must defer CallCloseCb while this flag is set to avoid closing
+    // with unread bytes in the kernel buffer (which would cause codec_.Finish()
+    // to fail on an incomplete response). Cleared when OnMessage reads to
+    // EAGAIN/EOF or when ForceClose bypasses the defer.
+    std::atomic<bool> has_pending_reads_{false};
     // Every SetOnMessageCb() bumps this epoch. Synthetic read-pump resumes
     // capture it so a queued drain can tell whether ownership of the socket's
     // read callback changed before it ran (cleanup / pool rebind / new
@@ -141,6 +157,14 @@ public:
 
     void SetTlsConnection(std::unique_ptr<TlsConnection> tls);
     void SetMaxInputSize(size_t max) { max_input_size_ = max; }
+    // Clear transport-level flags so a pooled connection returning to idle
+    // cannot carry stale backpressure / cap-stop state into the next checkout.
+    // Paired with PoolPartition::WirePoolCallbacks. Dispatcher-thread-only.
+    void ResetForPoolReuse() {
+        read_pump_paused_.store(false, std::memory_order_release);
+        close_on_resume_.store(false, std::memory_order_release);
+        has_pending_reads_.store(false, std::memory_order_release);
+    }
     // Dispatcher-thread-only for reuse validation.
     size_t InputBufferSize() const { return input_bf_.Size(); }
     size_t OutputBufferSize() const { return output_bf_.Size(); }
