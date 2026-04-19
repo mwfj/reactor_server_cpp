@@ -7,6 +7,7 @@
 #include "http/http_request.h"
 #include "http/http_response.h"
 #include "http/http_status.h"
+#include "http/trailer_policy.h"  // TrimOptionalWhitespace (RFC 7230 §3.2.3)
 #include "log/log_utils.h"
 #include "log/logger.h"
 
@@ -50,6 +51,8 @@ AuthManager::AuthManager(const AuthConfig& config,
                           std::vector<std::shared_ptr<Dispatcher>> dispatchers)
     : upstream_manager_(upstream_manager),
       dispatchers_(std::move(dispatchers)) {
+    // Master switch — mirrored from AuthConfig::enabled and live-reloadable.
+    master_enabled_.store(config.enabled, std::memory_order_release);
     // Resolve the HMAC key: operator-supplied env var OR fresh random.
     if (!config.hmac_cache_key_env.empty()) {
         hmac_key_ = LoadHmacKeyFromEnv(config.hmac_cache_key_env);
@@ -144,8 +147,8 @@ std::shared_ptr<const AuthForwardConfig> AuthManager::ForwardConfig() const {
 bool AuthManager::Reload(const AuthConfig& new_config, std::string& err_out) {
     std::lock_guard<std::mutex> reload_lock(reload_mtx_);
 
-    // Pass 1 — validate + build candidate snapshots. No mutation yet.
-    //          Any topology change fails the whole reload.
+    // Pass 1 — topology check. Any add/remove/rename rejects the whole
+    //          reload; the manager preserves live state.
     if (new_config.issuers.size() != issuers_.size()) {
         err_out = "auth issuer topology change (add/remove) requires restart";
         return false;
@@ -163,13 +166,33 @@ bool AuthManager::Reload(const AuthConfig& new_config, std::string& err_out) {
         plan.emplace_back(it->second, normalized);
     }
 
-    // Pass 2 — apply reloadable fields. ApplyReload rejects topology-
-    //          restart-only divergence with a message; fall over into
-    //          err_out for operator visibility.
+    // Pass 2 — VALIDATE every issuer before mutating any. Prior behavior
+    //          applied each issuer sequentially, so a late failure left
+    //          earlier issuers already committed. With ValidateReload we
+    //          get atomicity across the set: if ANY issuer would reject,
+    //          no issuer changes live state.
+    for (auto& [issuer_ptr, new_cfg] : plan) {
+        std::string validate_err;
+        if (!issuer_ptr->ValidateReload(new_cfg, validate_err)) {
+            err_out = "issuer '" + new_cfg.name + "': " + validate_err;
+            return false;
+        }
+    }
+
+    // Pass 3 — APPLY. ApplyReload re-runs its own defence-in-depth
+    //          validation; we expect every call to succeed now, but if
+    //          one does fail (race with config mutation, or a field
+    //          missed by ValidateReload), log loudly — live state may be
+    //          partially updated at that point.
     for (auto& [issuer_ptr, new_cfg] : plan) {
         std::string apply_err;
         if (!issuer_ptr->ApplyReload(new_cfg, apply_err)) {
-            err_out = "issuer '" + new_cfg.name + "': " + apply_err;
+            logging::Get()->error(
+                "AuthManager::Reload apply failed AFTER validate passed — "
+                "live state may be partial issuer={} err={}",
+                new_cfg.name, apply_err);
+            err_out = "issuer '" + new_cfg.name
+                    + "' apply failed after validate: " + apply_err;
             return false;
         }
     }
@@ -180,13 +203,20 @@ bool AuthManager::Reload(const AuthConfig& new_config, std::string& err_out) {
         forward_ = std::make_shared<const AuthForwardConfig>(new_config.forward);
     }
 
+    // Update the master enforcement switch. This is the live-reloadable
+    // `auth.enabled` documented in the config schema — flipping true→false
+    // makes InvokeMiddleware pass-through; false→true re-engages
+    // enforcement without a restart (middleware is installed whenever
+    // AuthManager exists, see HttpServer::MarkServerReady).
+    master_enabled_.store(new_config.enabled, std::memory_order_release);
+
     // Policy list rebuild is driven by HttpServer::Reload via
     // RebuildPolicyListFromLiveSources after this returns.
     generation_.fetch_add(1, std::memory_order_release);
 
     logging::Get()->info(
-        "AuthManager reloaded issuers={} gen={}",
-        issuers_.size(),
+        "AuthManager reloaded enabled={} issuers={} gen={}",
+        new_config.enabled, issuers_.size(),
         generation_.load(std::memory_order_acquire));
     return true;
 }
@@ -228,6 +258,12 @@ Issuer* AuthManager::GetIssuer(const std::string& issuer_name) {
 
 bool AuthManager::InvokeMiddleware(const HttpRequest& req,
                                      HttpResponse& resp) {
+    // Master enforcement switch — `auth.enabled: false` passes through even
+    // when the middleware is installed (installed unconditionally so
+    // `auth.enabled: false → true` via SIGHUP takes effect without restart).
+    if (!master_enabled_.load(std::memory_order_acquire)) {
+        return true;
+    }
     // Ordering invariant: all RegisterPolicy() calls precede Start(), which
     // installs this middleware — the snapshot is always complete here.
     //
@@ -320,9 +356,22 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
         return false;
     }
 
+    // Operator-configured forward.claims_to_headers keys flow into
+    // Verify so PopulateFromPayload can copy them into ctx.claims for
+    // outbound injection. Policy-level required_claims are enforced
+    // inside Verify and do NOT need to appear here.
+    std::vector<std::string> claim_keys;
+    if (fwd_snap) {
+        claim_keys.reserve(fwd_snap->claims_to_headers.size());
+        for (const auto& kv : fwd_snap->claims_to_headers) {
+            claim_keys.push_back(kv.first);
+        }
+    }
+
     // Run the verifier. Never throws.
     AuthContext ctx;
-    VerifyResult vr = JwtVerifier::Verify(token, *chosen, policy, ctx);
+    VerifyResult vr =
+        JwtVerifier::Verify(token, *chosen, policy, claim_keys, ctx);
 
     switch (vr.outcome) {
         case VerifyOutcome::ALLOW: {
@@ -424,14 +473,9 @@ std::string AuthManager::ExtractBearerToken(const HttpRequest& req,
             return {};
         }
     }
-    std::string token = h.substr(plen);
-    // Trim leading whitespace per RFC.
-    while (!token.empty() && (token.front() == ' ' || token.front() == '\t')) {
-        token.erase(token.begin());
-    }
-    while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) {
-        token.pop_back();
-    }
+    // Trim OWS per RFC 7230 §3.2.3 via the shared helper used by every
+    // other HTTP header parser in this codebase.
+    std::string token = TrimOptionalWhitespace(h.substr(plen));
     if (token.empty()) {
         log_label_out = "empty_token";
         return {};

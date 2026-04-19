@@ -11,7 +11,7 @@ namespace AUTH_NAMESPACE {
 JwksCache::JwksCache(std::string issuer_name, int ttl_sec, size_t hard_cap)
     : issuer_name_(std::move(issuer_name)),
       ttl_sec_(ttl_sec > 0 ? ttl_sec : 300),
-      hard_cap_(hard_cap > 0 ? hard_cap : 64),
+      hard_cap_(hard_cap > 0 ? hard_cap : kDefaultJwksHardCap),
       keys_(std::make_shared<KeyMap>()) {
     logging::Get()->debug(
         "JwksCache created issuer={} ttl_sec={} hard_cap={}",

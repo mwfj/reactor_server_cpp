@@ -91,10 +91,20 @@ class Issuer : public std::enable_shared_from_this<Issuer> {
     // Idempotent. Called during AuthManager::Stop or before destruction.
     void Stop();
 
+    // Pure validation — no mutation. Returns true when the incoming config
+    // would be accepted by ApplyReload. Used by AuthManager::Reload to
+    // check every issuer BEFORE committing any of them (F5: avoid partial
+    // commits when a later issuer fails validation). Topology-restart-only
+    // mismatches also fail here so the caller sees them before any state
+    // is touched.
+    bool ValidateReload(const IssuerConfig& new_config,
+                         std::string& err_out) const;
+
     // Apply reloadable fields. Topology-restart-only fields (issuer_url,
     // mode, upstream, discovery) must match the current values — if not,
     // returns false with a message in err_out and the caller is expected
-    // to log and preserve the existing state.
+    // to log and preserve the existing state. Also runs the same range
+    // checks as ValidateReload for defence-in-depth.
     bool ApplyReload(const IssuerConfig& new_config, std::string& err_out);
 
     // Atomic-load the snapshot. Safe from any dispatcher thread.

@@ -2,6 +2,7 @@
 
 #include "auth/jwks_cache.h"
 #include "auth/jwks_fetcher.h"
+#include "auth/jws_algorithms.h"
 #include "auth/oidc_discovery.h"
 #include "auth/upstream_http_client.h"
 #include "upstream/upstream_manager.h"
@@ -12,6 +13,44 @@
 namespace AUTH_NAMESPACE {
 
 namespace {
+
+// Shared range + algorithm check used by ValidateReload and ApplyReload.
+// `mode` is the issuer's live mode (immutable post-construction) so callers
+// can run the same check pre-apply (validation pass) and mid-apply (defence
+// in depth).
+bool ValidateReloadableFields(const IssuerConfig& cfg,
+                               const std::string& live_mode,
+                               std::string& err_out) {
+    if (cfg.leeway_sec < 0) {
+        err_out = "leeway_sec must be >= 0";
+        return false;
+    }
+    if (cfg.jwks_cache_sec <= 0) {
+        err_out = "jwks_cache_sec must be > 0";
+        return false;
+    }
+    if (cfg.jwks_refresh_timeout_sec <= 0) {
+        err_out = "jwks_refresh_timeout_sec must be > 0";
+        return false;
+    }
+    if (cfg.discovery_retry_sec <= 0) {
+        err_out = "discovery_retry_sec must be > 0";
+        return false;
+    }
+    if (live_mode == "jwt" && cfg.algorithms.empty()) {
+        err_out = "algorithms must contain at least one entry for mode=\"jwt\"";
+        return false;
+    }
+    for (const auto& a : cfg.algorithms) {
+        if (!IsSupportedJwsAlg(a)) {
+            err_out = "algorithm '" + a + "' is not supported (v1: "
+                      "RS256/RS384/RS512/ES256/ES384). HS256/none/PS* are "
+                      "rejected per spec §5.3.";
+            return false;
+        }
+    }
+    return true;
+}
 
 // Builds a fresh mutable IssuerSnapshot. Caller is responsible for
 // converting to `shared_ptr<const IssuerSnapshot>` before swapping into
@@ -146,10 +185,10 @@ void Issuer::Stop() {
     if (jwks_fetcher_) jwks_fetcher_->CancelInflight();
 }
 
-bool Issuer::ApplyReload(const IssuerConfig& new_config, std::string& err_out) {
-    // Topology-restart-only fields. Same rule as CircuitBreakerManager /
-    // UpstreamManager reload: mismatched topology warns and preserves
-    // live state so subsequent reloads reason about the running shape.
+bool Issuer::ValidateReload(const IssuerConfig& new_config,
+                              std::string& err_out) const {
+    // Topology-restart-only fields — same checks as ApplyReload's prelude
+    // so AuthManager::Reload can catch these before mutating any issuer.
     if (new_config.name != name_) {
         err_out = "issuer name changed — restart required";
         return false;
@@ -170,28 +209,14 @@ bool Issuer::ApplyReload(const IssuerConfig& new_config, std::string& err_out) {
         err_out = "discovery toggle changed — restart required";
         return false;
     }
+    return ValidateReloadableFields(new_config, mode_, err_out);
+}
 
-    // Validate reloadable numeric ranges and required lists before touching
-    // live state. Mirrors the checks in ConfigLoader::ValidateHotReloadable —
-    // defence-in-depth so a caller who bypasses Validate still gets rejection.
-    if (new_config.leeway_sec < 0) {
-        err_out = "leeway_sec must be >= 0";
-        return false;
-    }
-    if (new_config.jwks_cache_sec <= 0) {
-        err_out = "jwks_cache_sec must be > 0";
-        return false;
-    }
-    if (new_config.jwks_refresh_timeout_sec <= 0) {
-        err_out = "jwks_refresh_timeout_sec must be > 0";
-        return false;
-    }
-    if (new_config.discovery_retry_sec <= 0) {
-        err_out = "discovery_retry_sec must be > 0";
-        return false;
-    }
-    if (new_config.mode == "jwt" && new_config.algorithms.empty()) {
-        err_out = "algorithms must contain at least one entry for mode=\"jwt\"";
+bool Issuer::ApplyReload(const IssuerConfig& new_config, std::string& err_out) {
+    // Validate before mutating. ValidateReload runs the full topology +
+    // range + algorithm-allowlist checks — keep ApplyReload as the single
+    // mutation path so out-of-band callers (tests) hit the same gate.
+    if (!ValidateReload(new_config, err_out)) {
         return false;
     }
 

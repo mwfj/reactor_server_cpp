@@ -959,6 +959,11 @@ void TestConfigLoaderRejectsPlaintextIdpEndpoints() {
         if (!err.empty()) throw std::runtime_error("plaintext jwks_uri case: " + err);
 
         // Case 2: plaintext introspection.endpoint.
+        // Case 2: mode=introspection itself is deferred to Phase 3; the
+        // config-loader rejects it BEFORE drilling into introspection.*
+        // field validation. The plaintext-endpoint check will be
+        // re-exercised when Phase 3 lifts the mode rejection — this test
+        // currently asserts the outer rejection fires.
         err = validate_expect_failure(R"({
             "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
             "auth": {
@@ -975,8 +980,8 @@ void TestConfigLoaderRejectsPlaintextIdpEndpoints() {
                     }
                 }
             }
-        })", "introspection.endpoint must start with https://");
-        if (!err.empty()) throw std::runtime_error("plaintext introspection case: " + err);
+        })", "mode=\"introspection\" is deferred to Phase 3");
+        if (!err.empty()) throw std::runtime_error("introspection mode case: " + err);
 
         TestFramework::RecordTest(
             "AuthFoundation: ConfigLoader rejects plaintext IdP endpoints",
@@ -2100,33 +2105,19 @@ void TestConfigLoaderRejectsEnabledPolicyWithoutAppliesTo() {
 }
 
 // -----------------------------------------------------------------------------
-// ConfigLoader::Validate — introspection knobs (review P2 #2). auth_style
-// must be "basic"|"body"; timeout/cache/max_entries/shards must be > 0;
-// negative_cache_sec / stale_grace_sec must be >= 0 (0 disables feature).
+// ConfigLoader::Validate — introspection mode is Phase-3-deferred. Until
+// Phase 3 lands the mode-dispatch in AuthManager, accepting `mode="introspection"`
+// would silently route opaque tokens into the JWT verifier which rejects
+// them as malformed — a fail-undetermined loop operators can't debug. The
+// config loader hard-rejects the mode at BOTH startup validation and
+// ValidateHotReloadable. When Phase 3 lifts this rejection, the original
+// per-field validator tests (auth_style / timeout_sec / cache_sec /
+// shards / max_entries / negative_cache_sec / stale_grace_sec) should be
+// re-expanded — the validation logic for each still lives in config_loader.cc
+// and will execute once the outer mode gate is relaxed.
 // -----------------------------------------------------------------------------
 void TestConfigLoaderValidatesIntrospectionKnobs() {
     std::cout << "\n[TEST] ConfigLoader validates introspection knobs..." << std::endl;
-    auto introspection_with = [](const std::string& fields) -> std::string {
-        return R"({
-            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
-            "auth": {
-                "enabled": false,
-                "issuers": {
-                    "ours": {
-                        "issuer_url": "https://issuer.example",
-                        "upstream": "x",
-                        "mode": "introspection",
-                        "introspection": {
-                            "endpoint": "https://issuer.example/introspect",
-                            "client_id": "c",
-                            "client_secret_env": "E")"
-            + fields + R"(
-                        }
-                    }
-                }
-            }
-        })";
-    };
     auto validate_expect_failure = [&](const std::string& json,
                                         const std::string& expected_phrase)
         -> std::string {
@@ -2148,87 +2139,27 @@ void TestConfigLoaderValidatesIntrospectionKnobs() {
     };
 
     try {
-        // 1. auth_style="weird" rejected.
-        std::string err = validate_expect_failure(
-            introspection_with(R"(, "auth_style": "weird")"),
-            "auth_style must be");
-        if (!err.empty()) throw std::runtime_error("auth_style: " + err);
-
-        // 2. timeout_sec=-1 rejected.
-        err = validate_expect_failure(
-            introspection_with(R"(, "timeout_sec": -1)"),
-            "timeout_sec must be > 0");
-        if (!err.empty()) throw std::runtime_error("timeout_sec=-1: " + err);
-
-        // 3. timeout_sec=0 also rejected (strict positive).
-        err = validate_expect_failure(
-            introspection_with(R"(, "timeout_sec": 0)"),
-            "timeout_sec must be > 0");
-        if (!err.empty()) throw std::runtime_error("timeout_sec=0: " + err);
-
-        // 4. cache_sec=0 rejected.
-        err = validate_expect_failure(
-            introspection_with(R"(, "cache_sec": 0)"),
-            "cache_sec must be > 0");
-        if (!err.empty()) throw std::runtime_error("cache_sec=0: " + err);
-
-        // 5. shards=0 rejected.
-        err = validate_expect_failure(
-            introspection_with(R"(, "shards": 0)"),
-            "shards must be > 0");
-        if (!err.empty()) throw std::runtime_error("shards=0: " + err);
-
-        // 6. max_entries=0 rejected.
-        err = validate_expect_failure(
-            introspection_with(R"(, "max_entries": 0)"),
-            "max_entries must be > 0");
-        if (!err.empty()) throw std::runtime_error("max_entries=0: " + err);
-
-        // 7. negative_cache_sec=-1 rejected.
-        err = validate_expect_failure(
-            introspection_with(R"(, "negative_cache_sec": -1)"),
-            "negative_cache_sec must be >= 0");
-        if (!err.empty()) throw std::runtime_error("negative_cache_sec=-1: " + err);
-
-        // 8. stale_grace_sec=-5 rejected.
-        err = validate_expect_failure(
-            introspection_with(R"(, "stale_grace_sec": -5)"),
-            "stale_grace_sec must be >= 0");
-        if (!err.empty()) throw std::runtime_error("stale_grace_sec=-5: " + err);
-
-        // 9. POSITIVE: negative_cache_sec=0 accepted (means "disable
-        // negative caching" — meaningful 0 semantics, not an error).
-        try {
-            ServerConfig cfg = ConfigLoader::LoadFromString(
-                introspection_with(R"(, "negative_cache_sec": 0)"));
-            ConfigLoader::Validate(cfg);
-        } catch (const std::exception& e) {
-            throw std::runtime_error(
-                std::string("negative_cache_sec=0 should be ACCEPTED ")
-                + "(disables feature) but rejected: " + e.what());
-        }
-
-        // 10. POSITIVE: stale_grace_sec=0 accepted (disable stale serving).
-        try {
-            ServerConfig cfg = ConfigLoader::LoadFromString(
-                introspection_with(R"(, "stale_grace_sec": 0)"));
-            ConfigLoader::Validate(cfg);
-        } catch (const std::exception& e) {
-            throw std::runtime_error(
-                std::string("stale_grace_sec=0 should be ACCEPTED ")
-                + "but rejected: " + e.what());
-        }
-
-        // 11. POSITIVE: auth_style="body" accepted.
-        try {
-            ServerConfig cfg = ConfigLoader::LoadFromString(
-                introspection_with(R"(, "auth_style": "body")"));
-            ConfigLoader::Validate(cfg);
-        } catch (const std::exception& e) {
-            throw std::runtime_error(
-                std::string("auth_style=body should be ACCEPTED but ")
-                + "rejected: " + e.what());
-        }
+        std::string err = validate_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://issuer.example/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E",
+                            "auth_style": "weird",
+                            "timeout_sec": -1
+                        }
+                    }
+                }
+            }
+        })", "mode=\"introspection\" is deferred to Phase 3");
+        if (!err.empty()) throw std::runtime_error("introspection rejected: " + err);
 
         TestFramework::RecordTest(
             "AuthFoundation: ConfigLoader validates introspection knobs",
@@ -3309,7 +3240,12 @@ void TestConfigLoaderRequiresIntrospectionCredentials() {
     };
 
     try {
-        // Case 1: missing client_id.
+        // Phase 3 deferral: introspection mode is rejected at the outer
+        // mode gate before the per-field credential validators run. When
+        // Phase 3 lifts the rejection, restore the original missing-
+        // client_id / missing-client_secret_env / positive-credentials
+        // sub-cases — the validation logic for those fields still lives
+        // in ParseIssuerConfig and will fire.
         std::string err = validate_expect_failure(R"({
             "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
             "auth": {
@@ -3326,55 +3262,8 @@ void TestConfigLoaderRequiresIntrospectionCredentials() {
                     }
                 }
             }
-        })", "client_id is required");
-        if (!err.empty()) throw std::runtime_error("missing client_id: " + err);
-
-        // Case 2: missing client_secret_env.
-        err = validate_expect_failure(R"({
-            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
-            "auth": {
-                "enabled": false,
-                "issuers": {
-                    "ours": {
-                        "issuer_url": "https://issuer.example",
-                        "upstream": "x",
-                        "mode": "introspection",
-                        "introspection": {
-                            "endpoint": "https://issuer.example/introspect",
-                            "client_id": "c"
-                        }
-                    }
-                }
-            }
-        })", "client_secret_env is required");
-        if (!err.empty()) throw std::runtime_error("missing client_secret_env: " + err);
-
-        // POSITIVE: with both credentials present, validation passes.
-        try {
-            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
-                "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
-                "auth": {
-                    "enabled": false,
-                    "issuers": {
-                        "ours": {
-                            "issuer_url": "https://issuer.example",
-                            "upstream": "x",
-                            "mode": "introspection",
-                            "introspection": {
-                                "endpoint": "https://issuer.example/introspect",
-                                "client_id": "c",
-                                "client_secret_env": "E"
-                            }
-                        }
-                    }
-                }
-            })");
-            ConfigLoader::Validate(cfg);
-        } catch (const std::exception& e) {
-            throw std::runtime_error(
-                std::string("introspection with credentials should pass but ")
-                + "threw: " + e.what());
-        }
+        })", "mode=\"introspection\" is deferred to Phase 3");
+        if (!err.empty()) throw std::runtime_error("introspection mode: " + err);
 
         // POSITIVE: jwt-mode issuer without credentials still valid.
         // (credentials are REQUIRED only for mode="introspection")

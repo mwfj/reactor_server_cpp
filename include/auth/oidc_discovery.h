@@ -54,6 +54,10 @@ class OidcDiscovery {
     }
 
  private:
+    // Fwd-declared so header stays pure-data. CycleState owns the recursive
+    // retry closure (`run`). OidcDiscovery holds the sole strong reference.
+    struct CycleState;
+
     std::string issuer_name_;
     std::string issuer_url_;
     std::shared_ptr<UpstreamHttpClient> client_;
@@ -65,6 +69,11 @@ class OidcDiscovery {
     // a retry task is queued on a Dispatcher.
     std::shared_ptr<std::atomic<bool>> ready_;
     std::shared_ptr<std::atomic<bool>> cancel_token_;
+    // Owns the recursive retry closure so delayed-retry callbacks can capture
+    // weak_ptr<CycleState> without the closure holding a strong self-reference
+    // (which would leak the CycleState forever). Cleared on Cancel() and
+    // ~OidcDiscovery so pending weak captures lock null and no-op.
+    std::shared_ptr<CycleState> cycle_state_;
 };
 
 }  // namespace AUTH_NAMESPACE

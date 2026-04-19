@@ -60,6 +60,15 @@ struct UpstreamHttpClient::Transaction
     size_t body_bytes_accumulated = 0;
     UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead head;
 
+    // Self-anchor: Issue() sets this to `shared_from_this()` before queueing
+    // the start_task so the transaction survives the async dispatch window
+    // (EnQueue on a non-local dispatcher drops the caller's local strong ref
+    // as soon as Issue() returns). Finish() clears it on every terminal path
+    // so the transaction destructs once pending callbacks drop their weaks.
+    // See DEVELOPMENT_RULES.md ("Delayed-retry closures capture raw pointers
+    // to object atomic members") for the class of bug this prevents.
+    std::shared_ptr<Transaction> self_anchor;
+
     // Mark complete/error exactly once. On any terminal path (success,
     // error, timeout, cancel) release the lease, clear transport callbacks,
     // and invoke the user's DoneCallback. Running on the dispatcher thread
@@ -67,6 +76,11 @@ struct UpstreamHttpClient::Transaction
     void Finish(UpstreamHttpClient::Response response) {
         if (finished) return;
         finished = true;
+        // Release the self-anchor AFTER marking finished. Any concurrent
+        // callback that still holds a strong ref via the self_anchor copy
+        // sees finished==true and bails; when the last such ref drops, the
+        // transaction destructs cleanly.
+        auto self_keepalive = std::move(self_anchor);
 
         // Clear any transport-level callbacks that would otherwise fire
         // on the now-torn-down transaction.
@@ -294,7 +308,29 @@ void UpstreamHttpClient::Issue(const std::string& upstream_pool_name,
                              std::string& data) {
                         auto t3 = weak2.lock();
                         if (!t3 || t3->finished) return;
-                        if (data.empty()) return;
+                        if (data.empty()) {
+                            // Empty data signals upstream EOF / disconnect
+                            // delivered by PoolPartition's on-close hook.
+                            // Drive codec to a terminal state: for close-
+                            // delimited responses codec.Finish() fires
+                            // OnComplete (which in turn calls Finish(resp)
+                            // with the accumulated body). If the response is
+                            // incomplete (truncated Content-Length, mid-
+                            // chunked) Finish returns false and we surface
+                            // upstream_disconnect so the done-callback fires
+                            // instead of hanging forever. Same pattern as
+                            // ProxyTransaction's upstream-close path.
+                            bool complete = t3->codec.Finish();
+                            if (t3->finished) return;  // OnComplete already ran
+                            UpstreamHttpClient::Response r;
+                            logging::Get()->warn(
+                                "UpstreamHttpClient upstream disconnect "
+                                "pool={} body_complete={} has_error={}",
+                                t3->pool_name, complete, t3->codec.HasError());
+                            r.error = "upstream_disconnect";
+                            t3->Finish(std::move(r));
+                            return;
+                        }
                         size_t consumed = t3->codec.Parse(
                             data.data(), data.size());
                         if (t3->codec.HasError() && !t3->finished) {
@@ -379,6 +415,13 @@ void UpstreamHttpClient::Issue(const std::string& upstream_pool_name,
             },
             /*cancel_token=*/nullptr);
     };
+
+    // Install the self-anchor BEFORE any async hand-off. The start_task
+    // itself captures weak_txn (to allow cancellation without pinning the
+    // transaction if Cancel races), but the caller's local `txn` drops on
+    // return — without the anchor a cross-dispatcher EnQueue would lose the
+    // transaction before start_task runs. Finish() clears the anchor.
+    txn->self_anchor = txn;
 
     if (txn->dispatcher && txn->dispatcher->is_on_loop_thread()) {
         start_task();

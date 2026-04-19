@@ -101,6 +101,14 @@ class AuthManager {
         return started_.load(std::memory_order_acquire);
     }
 
+    // Live view of the master enforcement switch — mirrors auth.enabled
+    // through Reload. Used by observability surfaces (snapshot endpoint,
+    // log lines) that need the running state rather than the staged
+    // config, because auth.enabled is live-reloadable.
+    bool IsEnforcing() const noexcept {
+        return master_enabled_.load(std::memory_order_acquire);
+    }
+
     // Access to the internal issuer by name — used by WebSocket upgrade
     // handlers that drive InvokeMiddleware manually. Returns nullptr when
     // the name is unknown.
@@ -135,6 +143,12 @@ class AuthManager {
     std::atomic<uint64_t> generation_{1};
     std::atomic<bool> started_{false};
     std::atomic<bool> stopping_{false};
+    // Master enforcement switch mirrored from AuthConfig::enabled. Live-
+    // updatable by Reload so `auth.enabled: true → false` (and vice versa)
+    // takes effect without restart. When false, InvokeMiddleware returns
+    // true immediately (pass-through). The middleware is installed whenever
+    // AuthManager exists (enabled or not) so a later reload can flip it on.
+    std::atomic<bool> master_enabled_{false};
 
     std::atomic<uint64_t> total_allowed_{0};
     std::atomic<uint64_t> total_denied_{0};

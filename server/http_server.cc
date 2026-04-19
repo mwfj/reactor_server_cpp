@@ -693,17 +693,35 @@ void HttpServer::MarkServerReady() {
     //   Prepending auth NOW — i.e. SECOND — makes auth the new front:
     //   [auth, rate_limit, ...]. Per-user rate-limit keys (future phase)
     //   can then key on the validated `sub`.
-    if (auth_config_.enabled) {
+    // Construct AuthManager whenever the schema has any meaningful content
+    // OR when auth.enabled=true. When the master switch is off but
+    // issuers/policies are staged, we still construct + Start + install
+    // the middleware so a SIGHUP that flips `auth.enabled: false → true`
+    // takes effect without a restart — InvokeMiddleware itself gates on
+    // master_enabled_ (default matches auth_config_.enabled).
+    const bool wants_auth_manager = auth_config_.enabled
+        || !auth_config_.issuers.empty()
+        || !auth_config_.policies.empty();
+    if (wants_auth_manager) {
         try {
             auth_manager_ = std::make_unique<AUTH_NAMESPACE::AuthManager>(
                 auth_config_, upstream_manager_.get(), dispatchers);
         } catch (const std::exception& e) {
-            logging::Get()->error(
-                "AuthManager init failed: {} — stopping server", e.what());
-            net_server_.Stop();
-            throw;
+            if (auth_config_.enabled) {
+                logging::Get()->error(
+                    "AuthManager init failed: {} — stopping server",
+                    e.what());
+                net_server_.Stop();
+                throw;
+            }
+            logging::Get()->warn(
+                "AuthManager (disabled) init failed: {} — auth stays off",
+                e.what());
+            auth_manager_.reset();
         }
+    }
 
+    if (auth_manager_) {
         // Register inline proxy.auth policies + top-level auth.policies
         // BEFORE Start() — RegisterPolicy rejects post-Start calls.
         for (const auto& u : upstream_configs_) {
@@ -720,29 +738,18 @@ void HttpServer::MarkServerReady() {
         // Start discovery / static-fetch asynchronously; non-blocking.
         auth_manager_->Start();
 
-        // Install auth middleware at the FRONT — running before the
-        // rate-limit middleware prepended earlier.
+        // Install the auth middleware UNCONDITIONALLY. InvokeMiddleware
+        // checks AuthManager::master_enabled_ and returns pass-through
+        // when false, so installing at boot time is the cleanest way to
+        // make `auth.enabled: false → true` live-reloadable (otherwise a
+        // SIGHUP can never retroactively add a middleware).
         router_.PrependMiddleware(
             AUTH_NAMESPACE::MakeMiddleware(auth_manager_.get()));
-    } else if (!auth_config_.issuers.empty() ||
-               !auth_config_.policies.empty()) {
-        // Config populated but master switch off — construct the
-        // manager in "disabled" mode so Reload can flip enabled→true
-        // without a restart. Start() is still called so issuer state
-        // (discovery / JWKS) is ready for the eventual flip.
-        try {
-            auth_manager_ = std::make_unique<AUTH_NAMESPACE::AuthManager>(
-                auth_config_, upstream_manager_.get(), dispatchers);
-            auth_manager_->Start();
-        } catch (const std::exception& e) {
-            logging::Get()->warn(
-                "AuthManager (disabled) init failed: {} — auth stays off",
-                e.what());
-            auth_manager_.reset();
-        }
+
         logging::Get()->info(
-            "AuthManager constructed in disabled mode "
-            "(auth.enabled=false; schema populated)");
+            "AuthManager installed enabled={} issuers={} policies={}",
+            auth_config_.enabled, auth_config_.issuers.size(),
+            auth_config_.policies.size());
     }
 
     // Process deferred Proxy() calls + auto-register proxy routes from

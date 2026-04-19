@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all tests (796 tests across 35 suites)
+make test               # Build and run all tests (799 tests across 35 suites, all pass)
 ./test_runner                   # Run all tests directly (after building)
 
 # Individual test suites
@@ -65,7 +65,7 @@ make test_auth_ws       # Build and run auth WebSocket-upgrade tests (6)
 make test_auth_race     # Build and run auth race-condition tests (10)
 ```
 
-At current head, `./test_runner` reports **795 / 796 passing**. The single failure is a pre-existing slow-client streaming backpressure test that is unrelated to the auth work and has been tracked separately.
+At current head, `./test_runner` reports **799 / 799 passing** (100 %). Three new backpressure integration tests were added alongside the kqueue EV_EOF coalescing fix — see `.claude/documents/bug-fixes/KQUEUE_EOF_COALESCING_RACE.md` for background.
 
 ## Test Suites
 

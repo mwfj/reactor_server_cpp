@@ -31,11 +31,27 @@ class Issuer;
 class JwtVerifier {
  public:
     // Verify a bearer token. On ALLOW, populates `out_ctx` with issuer,
-    // subject, scopes, and operator-selected claims. Never throws.
+    // subject, scopes, and operator-selected claims. `claim_keys` lists
+    // the payload keys to copy into `out_ctx.claims` — typically the
+    // union of `forward.claims_to_headers` keys + any policy-level
+    // extras. Passing an empty list leaves `out_ctx.claims` empty (the
+    // fast default for policies that don't forward custom claims).
+    // Never throws.
     static VerifyResult Verify(const std::string& token,
                                 Issuer& issuer,
                                 const AuthPolicy& policy,
+                                const std::vector<std::string>& claim_keys,
                                 AuthContext& out_ctx);
+
+    // Backward-compatible overload for callers that don't need custom
+    // claim forwarding (tests, legacy call sites). Delegates to the
+    // 5-arg overload with an empty key list.
+    static VerifyResult Verify(const std::string& token,
+                                Issuer& issuer,
+                                const AuthPolicy& policy,
+                                AuthContext& out_ctx) {
+        return Verify(token, issuer, policy, {}, out_ctx);
+    }
 
     // Decode the JWT and return the `iss` claim without verifying the
     // signature. Used by AuthManager to route a token to the right

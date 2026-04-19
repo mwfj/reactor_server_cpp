@@ -228,6 +228,7 @@ std::optional<std::string> JwtVerifier::PeekIssuer(const std::string& token) {
 VerifyResult JwtVerifier::Verify(const std::string& token,
                                   Issuer& issuer,
                                   const AuthPolicy& policy,
+                                  const std::vector<std::string>& claim_keys,
                                   AuthContext& out_ctx) {
     const std::string& issuer_name = issuer.name();
 
@@ -358,15 +359,11 @@ VerifyResult JwtVerifier::Verify(const std::string& token,
         }
     }
 
-    // Populate AuthContext from the verified payload.
-    std::vector<std::string> claim_keys;
-    // Policy-level extras + operator-configured forward.claims_to_headers
-    // keys are filled in by the middleware, not here. JwtVerifier is
-    // payload-centric: populate iss/sub/scopes plus any claims the
-    // middleware will want (middleware passes through claims_keys via
-    // the policy-aware caller path).
-    (void)claim_keys;
-    PopulateFromPayload(payload, /*claims_keys=*/{}, out_ctx);
+    // Populate AuthContext from the verified payload. `claim_keys` is the
+    // union of operator-configured forward.claims_to_headers keys built
+    // by AuthManager from its ForwardConfig snapshot; PopulateFromPayload
+    // copies exactly those keys into ctx.claims for outbound injection.
+    PopulateFromPayload(payload, claim_keys, out_ctx);
     out_ctx.issuer = issuer_name;  // normalize to configured name, not URL
 
     // Scope check against policy.required_scopes.

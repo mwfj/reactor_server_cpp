@@ -39,7 +39,15 @@ class JwksCache {
     using KeyMap = std::unordered_map<std::string,
                                         std::shared_ptr<const std::string>>;
 
-    JwksCache(std::string issuer_name, int ttl_sec, size_t hard_cap = 64);
+    // Defense-in-depth cap on JWKS key count. Real IdPs publish 2–5 keys;
+    // a pathological response with thousands of entries would otherwise
+    // bloat the per-issuer lookup map. Override via the ctor `hard_cap`
+    // parameter for tests.
+    static constexpr size_t kDefaultJwksHardCap = 64;
+
+    JwksCache(std::string issuer_name,
+              int ttl_sec,
+              size_t hard_cap = kDefaultJwksHardCap);
 
     // Lookup the PEM for a given kid. Returns nullptr on miss. Dispatcher-
     // thread safe. Empty kid is supported: when the installed map has
@@ -51,8 +59,10 @@ class JwksCache {
     // Accept a batch of (kid → PEM) pairs — typically produced by
     // JwksFetcher after jwt::parse_jwks. Trims to `hard_cap` with a warn
     // if the IdP returned more keys. Bumps `refresh_ok_` and
-    // `last_refresh_`; clears stale counter. Returns the number of keys
-    // installed.
+    // `last_refresh_`. Does NOT clear `stale_served_` counter — operators
+    // rely on it as a running total of how often stale-on-error served a
+    // response; resetting would hide a degraded-issuer trend. Returns the
+    // number of keys installed.
     size_t InstallKeys(std::vector<std::pair<std::string,
                                                std::string>> keys);
 

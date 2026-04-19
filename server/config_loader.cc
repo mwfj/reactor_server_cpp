@@ -1,5 +1,6 @@
 #include "config/config_loader.h"
 #include "auth/auth_config.h"
+#include "auth/jws_algorithms.h"
 #include "http2/http2_constants.h"
 #include "http/route_trie.h"         // ParsePattern, ValidatePattern for proxy route_prefix
 #include "log/logger.h"
@@ -1223,14 +1224,30 @@ void ConfigLoader::ValidateHotReloadable(
             throw std::invalid_argument(
                 ctx + ".discovery_retry_sec must be > 0");
         }
-        // algorithms must be non-empty for jwt mode. The validator does not
-        // exhaustively check each algorithm string here (format is validated
-        // at startup); but reject the empty list so AuthManager doesn't install
-        // an empty allowlist that silently rejects every token.
+        // algorithms must be non-empty for jwt mode AND must match the
+        // v1 asymmetric allowlist. Mirrors Validate() so hot-reload and
+        // startup reject the same set — without this a SIGHUP flipping
+        // algorithms to HS256/none/PS256 would install an empty runtime
+        // allowlist that returns UNDETERMINED for every subsequent token.
         if (ic.mode == "jwt" && ic.algorithms.empty()) {
             throw std::invalid_argument(
                 ctx + ".algorithms must contain at least one entry for "
                 "mode=\"jwt\" (supported: RS256/RS384/RS512/ES256/ES384)");
+        }
+        for (const auto& a : ic.algorithms) {
+            if (!AUTH_NAMESPACE::IsSupportedJwsAlg(a)) {
+                throw std::invalid_argument(
+                    ctx + ".algorithms contains unsupported value '" + a +
+                    "' (v1 supports only RS256/RS384/RS512/ES256/ES384; "
+                    "HS*/none/PS*/auto are deferred per design spec §15)");
+            }
+        }
+        // mode=introspection is deferred to Phase 3. Same rejection as
+        // startup — see ParseIssuerConfig for rationale.
+        if (ic.mode == "introspection") {
+            throw std::invalid_argument(
+                ctx + ".mode=\"introspection\" is deferred to Phase 3. "
+                "Use mode=\"jwt\" with a JWKS-backed issuer in v1.");
         }
     }
 }
@@ -1849,10 +1866,6 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
     // shape.
     // -------------------------------------------------------------------
     {
-        // Supported asymmetric algorithm allowlist — v1.
-        const std::unordered_set<std::string> kAllowedAlgs = {
-            "RS256", "RS384", "RS512", "ES256", "ES384"
-        };
         // Collect upstream names to validate `issuer.upstream` references.
         std::unordered_set<std::string> upstream_names;
         for (const auto& u : config.upstreams) upstream_names.insert(u.name);
@@ -1873,15 +1886,27 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     ctx + ".issuer_url must start with https:// (plaintext "
                     "IdP traffic is rejected for security)");
             }
-            // Mode whitelist; `auto` is deferred per spec §15.
+            // Mode whitelist. `auto` is deferred per spec §15. And until
+            // Phase 3 lands the introspection dispatch in AuthManager,
+            // accepting `mode="introspection"` would silently route opaque
+            // tokens into the JWT verifier which then rejects them as
+            // malformed — a fail-undetermined loop operators can't debug.
+            // Reject at config load (both startup and SIGHUP) so the
+            // config error is immediate and actionable.
             if (ic.mode != "jwt" && ic.mode != "introspection") {
                 throw std::invalid_argument(
                     ctx + ".mode must be one of: \"jwt\", \"introspection\"");
             }
+            if (ic.mode == "introspection") {
+                throw std::invalid_argument(
+                    ctx + ".mode=\"introspection\" is deferred to Phase 3. "
+                    "Use mode=\"jwt\" with a JWKS-backed issuer in v1 "
+                    "(see design spec §14 Phase 3 — introspection).");
+            }
             // Algorithm allowlist — reject HS*/none/PS*/unknown.
             // HS* requires symmetric-secret provisioning (deferred, spec §15).
             for (const auto& a : ic.algorithms) {
-                if (kAllowedAlgs.count(a) == 0) {
+                if (!AUTH_NAMESPACE::IsSupportedJwsAlg(a)) {
                     throw std::invalid_argument(
                         ctx + ".algorithms contains unsupported value '" + a +
                         "' (v1 supports only RS256/RS384/RS512/ES256/ES384; "

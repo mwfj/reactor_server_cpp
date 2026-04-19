@@ -23,6 +23,12 @@
 
 namespace AUTH_NAMESPACE {
 
+// Forward-declared in the header so the class definition stays pure-data.
+// Owns the recursive retry closure that drives OidcDiscovery::Start.
+struct OidcDiscovery::CycleState {
+    std::function<void(size_t)> run;
+};
+
 namespace {
 
 // Build the OIDC discovery endpoint from an issuer URL using ParseHttpsUri.
@@ -153,47 +159,46 @@ void OidcDiscovery::Start(size_t dispatcher_index,
     // cancel token (captured as `token`) already guards the cancel path.
     auto ready_flag = ready_;
 
-    // Recursive retry captured by shared_ptr so the lambda can re-queue
-    // itself via EnQueueDelayed on failure.
-    struct CycleState {
-        std::function<void(size_t)> run;
-    };
-    auto state = std::make_shared<CycleState>();
-    state->run = [state, issuer_name, issuer_url, pool_name, client_copy,
-                   dispatcher, retry_sec, generation, on_ready_cb, token,
-                   ready_flag](size_t disp_index) {
-        if (token->load(std::memory_order_acquire)) {
-            return;
-        }
+    // CycleState owns the recursive retry closure. OidcDiscovery holds the
+    // sole strong reference via cycle_state_; closures capture weak_ptr so
+    // destruction of OidcDiscovery (or an explicit Cancel()) releases the
+    // CycleState immediately. The previous implementation captured `state`
+    // strongly inside `state->run`, forming a self-referential cycle that
+    // leaked the CycleState + its captured function objects on every
+    // Issuer::Start / reload.
+    cycle_state_ = std::make_shared<CycleState>();
+    std::weak_ptr<CycleState> weak_state = cycle_state_;
+    cycle_state_->run =
+        [weak_state, issuer_name, issuer_url, pool_name, client_copy,
+         dispatcher, retry_sec, generation, on_ready_cb, token,
+         ready_flag](size_t disp_index) {
+            if (token->load(std::memory_order_acquire)) {
+                return;
+            }
 
-        UpstreamHttpClient::Request req;
-        auto ep = BuildDiscoveryEndpoint(issuer_url);
-        req.method = "GET";
-        req.path = ep.path_with_query;
-        req.host_header = ep.host;
-        req.headers["accept"] = "application/json";
-        req.timeout_sec = 10;
-        req.max_response_body = 64 * 1024;
+            UpstreamHttpClient::Request req;
+            auto ep = BuildDiscoveryEndpoint(issuer_url);
+            req.method = "GET";
+            req.path = ep.path_with_query;
+            req.host_header = ep.host;
+            req.headers["accept"] = "application/json";
+            req.timeout_sec = 10;
+            req.max_response_body = 64 * 1024;
 
-        client_copy->Issue(
-            pool_name, disp_index, std::move(req),
-            [state, issuer_name, dispatcher, retry_sec, generation,
-             on_ready_cb, token, ready_flag, disp_index](
-                    UpstreamHttpClient::Response resp) {
-                if (token->load(std::memory_order_acquire)) {
-                    return;
-                }
-                if (!resp.error.empty() || resp.status_code != 200) {
-                    logging::Get()->warn(
-                        "OIDC discovery failed issuer={} status={} error={} "
-                        "retry_in={}s",
-                        issuer_name, resp.status_code,
-                        resp.error.empty() ? "-" : resp.error, retry_sec);
-                    if (dispatcher) {
-                        // Re-arm after retry_sec seconds on the same
-                        // dispatcher. Capture `state` so the closure's
-                        // `run` is reachable for the recursion.
-                        std::weak_ptr<CycleState> weak_state = state;
+            client_copy->Issue(
+                pool_name, disp_index, std::move(req),
+                [weak_state, issuer_name, dispatcher, retry_sec, generation,
+                 on_ready_cb, token, ready_flag, disp_index](
+                        UpstreamHttpClient::Response resp) {
+                    if (token->load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    // Re-arm after retry_sec seconds on the same dispatcher.
+                    // weak_state avoids a strong self-cycle but still reaches
+                    // `run` because OidcDiscovery holds the sole strong ref.
+                    auto schedule_retry = [dispatcher, weak_state, disp_index,
+                                            retry_sec]() {
+                        if (!dispatcher) return;
                         dispatcher->EnQueueDelayed(
                             [weak_state, disp_index]() {
                                 if (auto s = weak_state.lock()) {
@@ -201,43 +206,41 @@ void OidcDiscovery::Start(size_t dispatcher_index,
                                 }
                             },
                             std::chrono::seconds(retry_sec));
+                    };
+                    if (!resp.error.empty() || resp.status_code != 200) {
+                        logging::Get()->warn(
+                            "OIDC discovery failed issuer={} status={} error={} "
+                            "retry_in={}s",
+                            issuer_name, resp.status_code,
+                            resp.error.empty() ? "-" : resp.error, retry_sec);
+                        schedule_retry();
+                        return;
                     }
-                    return;
-                }
-                std::string jwks_uri;
-                std::string intro_endpoint;
-                std::string reason;
-                ExtractEndpoints(resp.body, jwks_uri, intro_endpoint, reason);
-                if (jwks_uri.empty()) {
-                    logging::Get()->warn(
-                        "OIDC discovery parse failed issuer={} reason={} "
-                        "retry_in={}s",
-                        issuer_name, reason, retry_sec);
-                    if (dispatcher) {
-                        std::weak_ptr<CycleState> weak_state = state;
-                        dispatcher->EnQueueDelayed(
-                            [weak_state, disp_index]() {
-                                if (auto s = weak_state.lock()) {
-                                    s->run(disp_index);
-                                }
-                            },
-                            std::chrono::seconds(retry_sec));
+                    std::string jwks_uri;
+                    std::string intro_endpoint;
+                    std::string reason;
+                    ExtractEndpoints(resp.body, jwks_uri, intro_endpoint, reason);
+                    if (jwks_uri.empty()) {
+                        logging::Get()->warn(
+                            "OIDC discovery parse failed issuer={} reason={} "
+                            "retry_in={}s",
+                            issuer_name, reason, retry_sec);
+                        schedule_retry();
+                        return;
                     }
-                    return;
-                }
-                ready_flag->store(true, std::memory_order_release);
-                logging::Get()->info(
-                    "OIDC discovery ok issuer={} has_introspection={}",
-                    issuer_name, !intro_endpoint.empty());
-                if (on_ready_cb) {
-                    on_ready_cb(generation, jwks_uri, intro_endpoint);
-                }
-            },
-            token);
-    };
+                    ready_flag->store(true, std::memory_order_release);
+                    logging::Get()->info(
+                        "OIDC discovery ok issuer={} has_introspection={}",
+                        issuer_name, !intro_endpoint.empty());
+                    if (on_ready_cb) {
+                        on_ready_cb(generation, jwks_uri, intro_endpoint);
+                    }
+                },
+                token);
+        };
 
     if (dispatcher) {
-        state->run(dispatcher_index);
+        cycle_state_->run(dispatcher_index);
     }
 }
 
@@ -245,6 +248,9 @@ void OidcDiscovery::Cancel() {
     if (cancel_token_) {
         cancel_token_->store(true, std::memory_order_release);
     }
+    // Drop the CycleState so any delayed-retry weak_ptrs lock null. Without
+    // this, the closure would stay pinned by cycle_state_ until ~OidcDiscovery.
+    cycle_state_.reset();
 }
 
 }  // namespace AUTH_NAMESPACE
