@@ -83,7 +83,7 @@ static int ParseStrictInt(const nlohmann::json& j, const std::string& key,
 // Header-name allow-list helper for auth.forward.
 //
 // auth.forward injects HTTP request headers into the forwarded upstream
-// request via HeaderRewriter (Phase 2 wiring). If an operator misconfigures
+// request via HeaderRewriter. If an operator misconfigures
 // the output names to reserved categories, the resulting request would be
 // either malformed, ambiguous, or spoofable:
 //
@@ -222,10 +222,10 @@ static void ParseAuthPolicy(const nlohmann::json& j, AUTH_NAMESPACE::AuthPolicy&
     if (!j.is_object()) {
         throw std::invalid_argument(context + " must be a JSON object");
     }
-    // Defensive reset: callers today pass fresh AuthPolicy locals, but the
-    // reload path (future Phase 3) can easily re-parse into an existing
-    // object, in which case the *_vec fields would otherwise accumulate
-    // entries across reloads. Clear up front — the only state preserved
+    // Defensive reset: callers today pass fresh AuthPolicy locals, but a
+    // reload path can easily re-parse into an existing object, in which case
+    // the *_vec fields would otherwise accumulate entries across reloads.
+    // Clear up front — the only state preserved
     // across ParseAuthPolicy is what this function explicitly rewrites.
     out.applies_to.clear();
     out.issuers.clear();
@@ -477,9 +477,9 @@ static void ParseAuthConfig(const nlohmann::json& j, AUTH_NAMESPACE::AuthConfig&
     }
 }
 
-// PR #20 streaming-response validation bounds. Anonymous namespace keeps
-// these file-private without colliding with the `static`-qualified helpers
-// above; both patterns coexist in this file.
+// Streaming-response validation bounds. Anonymous namespace keeps these
+// file-private without colliding with the `static`-qualified helpers above;
+// both patterns coexist in this file.
 namespace {
 
 constexpr uint32_t kMinRelayBufferLimitBytes = 16 * 1024;
@@ -1196,6 +1196,43 @@ void ConfigLoader::ValidateHotReloadable(
                 "'): circuit_breaker.retry_budget_min_concurrency must be >= 0");
         }
     }
+
+    // Auth hot-reloadable field validation. Mirrors the per-issuer range and
+    // format checks in Validate(), but scoped to fields that AuthManager::Reload
+    // and Issuer::ApplyReload actually write into live state. Topology-restart
+    // fields (issuer_url, mode, upstream, discovery) are excluded — they are
+    // rejected by Issuer::ApplyReload before touching live state.
+    //
+    // This block runs for ALL issuers in the new config (not just live ones)
+    // because AuthManager::Reload rejects topology changes (add/remove issuer)
+    // before applying any field update — if the issuer count matches, every
+    // entry in the new config corresponds to a live issuer.
+    for (const auto& [name, ic] : config.auth.issuers) {
+        const std::string ctx = "auth.issuers." + name;
+        if (ic.leeway_sec < 0) {
+            throw std::invalid_argument(ctx + ".leeway_sec must be >= 0");
+        }
+        if (ic.jwks_cache_sec <= 0) {
+            throw std::invalid_argument(ctx + ".jwks_cache_sec must be > 0");
+        }
+        if (ic.jwks_refresh_timeout_sec <= 0) {
+            throw std::invalid_argument(
+                ctx + ".jwks_refresh_timeout_sec must be > 0");
+        }
+        if (ic.discovery_retry_sec <= 0) {
+            throw std::invalid_argument(
+                ctx + ".discovery_retry_sec must be > 0");
+        }
+        // algorithms must be non-empty for jwt mode. The validator does not
+        // exhaustively check each algorithm string here (format is validated
+        // at startup); but reject the empty list so AuthManager doesn't install
+        // an empty allowlist that silently rejects every token.
+        if (ic.mode == "jwt" && ic.algorithms.empty()) {
+            throw std::invalid_argument(
+                ctx + ".algorithms must contain at least one entry for "
+                "mode=\"jwt\" (supported: RS256/RS384/RS512/ES256/ES384)");
+        }
+    }
 }
 
 void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
@@ -1841,9 +1878,8 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 throw std::invalid_argument(
                     ctx + ".mode must be one of: \"jwt\", \"introspection\"");
             }
-            // Algorithm allowlist — reject HS*/none/PS*/unknown. Phase 1 is
-            // asymmetric-only; HS* needs symmetric-secret provisioning
-            // (deferred, spec §15).
+            // Algorithm allowlist — reject HS*/none/PS*/unknown.
+            // HS* requires symmetric-secret provisioning (deferred, spec §15).
             for (const auto& a : ic.algorithms) {
                 if (kAllowedAlgs.count(a) == 0) {
                     throw std::invalid_argument(
@@ -1852,11 +1888,10 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                         "HS*/none/PS*/auto are deferred per design spec §15)");
                 }
             }
-            // Referenced upstream is mandatory. An issuer without a bound
-            // UpstreamHostPool has no way to talk to the IdP in Phase 2 —
-            // JWKS refresh, OIDC discovery, and RFC 7662 introspection all
-            // route through UpstreamManager. Reject at config load so the
-            // misconfig surfaces here instead of at first request.
+            // Referenced upstream is mandatory — JWKS refresh, OIDC
+            // discovery, and RFC 7662 introspection all route through
+            // UpstreamManager. Reject at config load so the misconfig
+            // surfaces here instead of at first request.
             //
             // This is a STRUCTURAL check (is the field set at all?) and so
             // fires unconditionally — independent of the cross-reference
@@ -1912,9 +1947,8 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             }
 
             // Mode-specific required fields (design spec §5.3).
-            // jwt mode requires at least one algorithm (the allowlist the
-            // Phase-2 verifier will build `allow_algorithm(key)` calls over)
-            // and a key source — either OIDC discovery OR a static jwks_uri.
+            // jwt mode requires at least one algorithm and a key source —
+            // either OIDC discovery OR a static jwks_uri.
             // introspection mode requires the endpoint (the POST target).
             if (ic.mode == "jwt") {
                 if (ic.algorithms.empty()) {
@@ -1942,8 +1976,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 // staged with `mode="introspection"` + endpoint but no
                 // credentials would load successfully and fail every
                 // introspection call at request time. Reject at load
-                // instead, so the misconfig surfaces before enforcement
-                // lands in Phase 2.
+                // instead, so the misconfig surfaces early.
                 const auto& is = ic.introspection;
                 if (is.client_id.empty()) {
                     throw std::invalid_argument(
@@ -2025,9 +2058,9 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             //
             // Both checks are conditional — if the field is empty, mode
             // validation above has already either required it (and would
-            // have thrown) or made it discovery-supplied (and the discovered
-            // URL gets validated at fetch time in Phase 2). We only need
-            // to validate the static value here.
+            // have thrown) or made it discovery-supplied (discovered URLs
+            // are validated at fetch time). We only need to validate the
+            // static value here.
             if (!ic.jwks_uri.empty() &&
                 ic.jwks_uri.rfind("https://", 0) != 0) {
                 throw std::invalid_argument(
@@ -2382,49 +2415,34 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             }
         }
 
-        // ----- Final gate: enforcement-not-yet-wired master rejection -----
+        // Auth enforcement gate. Checks catch two mis-configuration shapes:
         //
-        // This PR (Phase 1, Steps 1–2) lands the auth config schema, the
-        // pure utilities (token_hasher / jwt_decode-via-jwt-cpp /
-        // auth_policy_matcher / auth_claims), and the data-structure plumbing
-        // (HttpRequest::auth, ProxyConfig::auth, ServerConfig::auth) — but
-        // request-time enforcement (AuthManager + middleware + JwtVerifier
-        // wiring) is scheduled for follow-up PRs per design spec §14
-        // (Phase 1 Steps 3–7 / Phase 2). Until that lands, a config that
-        // toggles auth ON would silently behave as unauthenticated — i.e.
-        // an operator who deploys `auth.enabled=true` thinking their proxy
-        // is now protected would be wrong. That's an authentication-bypass
-        // misconfiguration vector.
+        //   1. `auth.enabled=true` with no `issuers` — impossible to
+        //      verify ANY token. Reject with a clear message.
+        //   2. `proxy.auth.enabled=true` whose `issuers` list contains a
+        //      name absent from top-level `auth.issuers` — the policy is
+        //      unattachable. The issuer cross-ref already fires earlier
+        //      in this function; this is a belt-and-suspenders check
+        //      for the per-proxy flag specifically.
         //
-        // To prevent silent unenforced-policy acceptance, the validator
-        // hard-rejects ANY config that flips an auth enable flag on. The
-        // schema (issuers, policies, forward) may stay populated for
-        // forward-compatibility — operators can prepare their config in
-        // advance of the enforcement PR — but the master switches must
-        // remain false until enforcement is wired.
-        //
-        // Same fail-closed discipline used for HS256 / alg:none / mode:auto
-        // throughout this design: features that are not safely usable yet
-        // must reject loudly at config load, not silently accept.
-        if (config.auth.enabled) {
+        // Schema with enabled=false + issuers populated remains a valid
+        // "preparing for reload" shape — operators can deploy config
+        // without enforcement active, then flip on with SIGHUP.
+        if (config.auth.enabled && config.auth.issuers.empty()) {
             throw std::invalid_argument(
-                "auth.enabled=true rejected: request-time enforcement "
-                "(AuthManager + middleware) is not yet wired in this build. "
-                "Schedule: design spec §14 Phase 2 / follow-up PR. To prevent "
-                "silent unenforced-policy acceptance, the validator hard-"
-                "rejects this flag until enforcement lands. Set "
-                "auth.enabled=false for now; auth.issuers / policies / "
-                "forward may remain populated for upgrade.");
+                "auth.enabled=true rejected: auth.issuers is empty — a "
+                "gateway-wide auth gate with no issuers is unverifiable. "
+                "Populate auth.issuers[...] before enabling, or leave "
+                "auth.enabled=false.");
         }
         for (const auto& u : config.upstreams) {
-            if (u.proxy.auth.enabled) {
+            if (!u.proxy.auth.enabled) continue;
+            if (u.proxy.auth.issuers.empty()) {
                 throw std::invalid_argument(
                     "upstreams['" + u.name +
-                    "'].proxy.auth.enabled=true rejected: request-time "
-                    "enforcement is not yet wired in this build (design spec "
-                    "§14 Phase 2). Set proxy.auth.enabled=false for now; the "
-                    "auth block (issuers reference, required_scopes, etc.) "
-                    "may remain populated for upgrade.");
+                    "'].proxy.auth.enabled=true rejected: issuers list "
+                    "is empty — an inline proxy auth gate needs at least "
+                    "one configured issuer from auth.issuers.");
             }
         }
     }
@@ -2546,19 +2564,16 @@ void ConfigLoader::ValidateProxyAuth(
             }
         }
 
-        // Enforcement-not-yet-wired gate (the security-critical case
-        // the reviewer specifically flagged as bypassed by the reload
-        // strip). Same message as the in-Validate gate — operators
-        // should see the same wording regardless of which entry point
-        // (startup Validate / reload ValidateProxyAuth) surfaces it.
-        if (p.enabled) {
+        // Per-proxy gate: reject "enabled with nothing to do" configs.
+        // Parallel check to the top-level Validate gate (enabled + empty
+        // issuers). Message wording is distinct so operators can tell which
+        // entry point fired.
+        if (p.enabled && p.issuers.empty()) {
             throw std::invalid_argument(
                 "upstreams['" + u.name +
-                "'].proxy.auth.enabled=true rejected: request-time "
-                "enforcement is not yet wired in this build (design spec "
-                "§14 Phase 2). Set proxy.auth.enabled=false for now; the "
-                "auth block (issuers reference, required_scopes, etc.) "
-                "may remain populated for upgrade.");
+                "'].proxy.auth.enabled=true rejected: issuers list is "
+                "empty — an inline proxy auth gate needs at least one "
+                "configured issuer from auth.issuers.");
         }
     }
 }

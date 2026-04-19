@@ -26,8 +26,9 @@ The server uses the [Reactor pattern](https://en.wikipedia.org/wiki/Reactor_patt
 ## Layered Design
 
 ```
-Layer 7: RateLimitManager, RateLimitZone,   (rate limiting middleware)
-         TokenBucket
+Layer 7: AuthManager, AuthMiddleware,       (inbound middleware stack)
+         RateLimitManager, RateLimitZone,
+         TokenBucket, CircuitBreakerManager
 Layer 6: UpstreamManager, UpstreamHostPool, (upstream connection pooling)
          PoolPartition, UpstreamConnection,
          UpstreamLease, TlsClientContext
@@ -43,9 +44,11 @@ Layer 1: ConnectionHandler, Channel,        (reactor core)
          Dispatcher, EventHandler
 ```
 
-Layers 1–2 are the transport. Layers 3–5 are the protocol. Layer 6 is the gateway (upstream connectivity). Layer 7 is the inbound traffic-management middleware (rate limiting and circuit breaking). HTTP/1.x and HTTP/2 are parallel handlers at Layer 3, selected by `ProtocolDetector` at connection time. Both converge on the same `HttpRouter` at Layer 4. ConnectionHandler supports both inbound (server) and outbound (client) connections.
+Layers 1–2 are the transport. Layers 3–5 are the protocol. Layer 6 is the gateway (upstream connectivity). Layer 7 is the inbound traffic-management middleware (auth, rate limiting, circuit breaking). HTTP/1.x and HTTP/2 are parallel handlers at Layer 3, selected by `ProtocolDetector` at connection time. Both converge on the same `HttpRouter` at Layer 4. ConnectionHandler supports both inbound (server) and outbound (client) connections.
 
-> **Auth foundation (Phase 1):** OAuth 2.0 token-validation data structures, the policy matcher, and the pure utilities (token hasher, claim extraction) ship in `include/auth/`. Request-time enforcement (the AuthManager middleware, JWT verification, JWKS fetching, and token introspection) is **not yet wired** — the validator hard-rejects any config that flips `auth.enabled` or `proxy.auth.enabled` to `true`. Full enforcement will land as a Phase 2 middleware sitting between Layer 4 (router) and Layer 7 (rate-limit / circuit-breaker). See `docs/configuration.md` for the config schema and the Phase 1/Phase 2 boundary.
+**Middleware execution order on inbound requests**: auth → rate-limit → circuit-breaker (admission) → router dispatch. Authentication runs first so rate-limit and circuit-breaker counters don't consume quota on rejected traffic. See `HttpServer::MarkServerReady` for the exact install order; `HttpRouter::PrependMiddleware` pushes to the front of the chain, so the **last** prepend runs **first**.
+
+> **OAuth 2.0 token validation.** The gateway ships with a real JWT-mode resource-server validator. `AuthManager` (owned by `HttpServer`) installs a middleware at Layer 7 that matches per-route policies, verifies bearer tokens against cached JWKS keys, enforces scope / audience / algorithm constraints, and injects a sanitized identity overlay for the outbound hop. Introspection mode (RFC 7662) is scaffolded but deferred. See [docs/oauth2.md](oauth2.md) for the operator guide and [docs/configuration.md](configuration.md) for the full field reference.
 
 ## Core Components
 
@@ -132,7 +135,7 @@ See `docs/configuration.md` for the full config reference.
 
 ## Memory Management
 
-- `unique_ptr`: sole ownership (Dispatcher→EventHandler, Acceptor→SocketHandler, ConnectionHandler→SocketHandler, HttpServer→UpstreamManager, HttpServer→RateLimitManager, PoolPartition→UpstreamConnection)
+- `unique_ptr`: sole ownership (Dispatcher→EventHandler, Acceptor→SocketHandler, ConnectionHandler→SocketHandler, HttpServer→UpstreamManager, HttpServer→RateLimitManager, HttpServer→AuthManager, PoolPartition→UpstreamConnection)
 - `shared_ptr`: shared ownership (Channels in epoll map, ConnectionHandlers in connections map, TlsContext shared between HttpServer and NetServer, TlsClientContext shared across PoolPartitions)
 - `weak_ptr`: non-owning observers (Channel→Dispatcher, callback captures)
 - Two-phase init: callbacks registered after object is wrapped in shared_ptr, using weak_ptr captures to break circular references
@@ -184,8 +187,11 @@ SIGHUP triggers config reload in daemon mode (foreground: triggers shutdown). Re
 | `max_connections`, `max_body_size` | `tls.*`, `worker_threads` |
 | `max_header_size`, `max_ws_message_size` | `http2.enabled` |
 | `log.level`, `log.file`, `log.max_*` | `upstreams` (pool rebuild needed) |
-| `http2.max_concurrent_streams`, etc. | |
+| `http2.max_concurrent_streams`, etc. | `auth` topology (issuers, policy `applies_to`) |
 | `shutdown_drain_timeout_sec` | |
+| `auth.enabled`, `auth.forward.*` | |
+| Per-issuer reloadable: `audiences`, `algorithms`, `leeway_sec`, `jwks_cache_sec`, `required_claims` | |
+| Per-policy reloadable: `enabled`, `required_scopes`, `required_audience`, `on_undetermined`, `realm` | |
 
 The reload path is transactional: log changes are applied first, then server limits. If server limits are rejected, log changes are rolled back. Log file pruning is deferred until the full reload commits.
 

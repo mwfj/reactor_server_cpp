@@ -395,37 +395,20 @@ void TestConfigLoaderAuthRoundTrip() {
         }
 
         // Validation behavior on this fixture (which has auth.enabled=true):
-        // The fixture is structurally well-formed (algorithms OK, upstream
-        // exists, no collisions, https issuer, etc.) AND it has the master
-        // auth flag flipped on. Until request-time enforcement lands per
-        // design spec §14 Phase 2, the validator's enforcement-not-yet-wired
-        // gate fires for any enabled=true config. This block confirms the
-        // gate behaves correctly on a fully-formed but enabled fixture —
-        // it must throw with the gate's distinctive "not yet wired" message,
-        // proving that all the structural checks passed (otherwise an
-        // earlier throw with a different message would fire).
-        //
-        // When enforcement lands, this assertion flips back to "must
-        // succeed" and the gate logic in ConfigLoader::Validate is removed.
-        bool validation_ok = false;  // success means gate fired with right msg
+        // Phase 1b lifted the master enforcement gate — a structurally
+        // well-formed config with enabled=true + issuers populated is
+        // now accepted. This block confirms the validator accepts the
+        // fixture cleanly (no structural or enabled-gate rejection).
+        bool validation_ok = false;
         std::string validation_err;
         try {
             ConfigLoader::Validate(c1);
-            validation_err = "Validate() unexpectedly accepted enabled=true; "
-                             "the enforcement-not-yet-wired gate should have "
-                             "rejected it";
+            validation_ok = true;
         } catch (const std::invalid_argument& e) {
-            std::string msg = e.what();
-            if (msg.find("not yet wired") != std::string::npos &&
-                msg.find("auth.enabled") != std::string::npos) {
-                validation_ok = true;
-            } else {
-                validation_err =
-                    "Validate() threw a DIFFERENT error than the expected "
-                    "enforcement-not-yet-wired gate (this means an earlier "
-                    "structural check failed when it shouldn't have); "
-                    "got: " + msg;
-            }
+            validation_err =
+                std::string("Validate() rejected a valid "
+                            "auth.enabled=true+issuers config (master gate "
+                            "was lifted in Phase 1b): ") + e.what();
         } catch (const std::exception& e) {
             validation_err =
                 std::string("Validate() threw an unexpected exception type: ") +
@@ -737,8 +720,14 @@ void TestConfigLoaderClaimHeaderCollision() {
 // successful validation. Until then, the gate is the safety net.
 // -----------------------------------------------------------------------------
 void TestConfigLoaderRejectsAuthEnabled() {
-    std::cout << "\n[TEST] ConfigLoader rejects auth.enabled=true (gateway-wide)..." << std::endl;
+    // Renamed behaviour per Phase 1b: the master gate was lifted — a
+    // config with auth.enabled=true AND issuers populated is now valid.
+    // This test asserts the POSITIVE case (accepted) plus the soft-check
+    // edge case (enabled=true + empty issuers is rejected with a clear
+    // message). Pre-Phase-1b the whole enabled=true path was rejected.
+    std::cout << "\n[TEST] ConfigLoader accepts auth.enabled=true with issuers (gateway-wide)..." << std::endl;
     try {
+        // Case A — enabled=true + issuers populated: must PASS validation.
         const std::string json_with_auth_enabled = R"({
             "bind_host": "127.0.0.1",
             "bind_port": 8080,
@@ -755,45 +744,70 @@ void TestConfigLoaderRejectsAuthEnabled() {
             },
             "upstreams": [{"name": "idp_google", "host": "127.0.0.1", "port": 443}]
         })";
-        bool threw = false;
+        bool accepted = false;
         std::string err_msg;
         try {
             ServerConfig cfg = ConfigLoader::LoadFromString(json_with_auth_enabled);
             ConfigLoader::Validate(cfg);
+            accepted = true;
         } catch (const std::invalid_argument& e) {
-            threw = true;
             err_msg = e.what();
         }
-        // Contract: must throw, and message must be informative — mention
-        // both that enforcement isn't wired and how to disable. We check
-        // for the canonical phrase "not yet wired" and "auth.enabled" so
-        // the test fails loudly if the wording silently regresses to a
-        // less-actionable message.
-        bool good_msg = threw &&
-            err_msg.find("not yet wired") != std::string::npos &&
-            err_msg.find("auth.enabled") != std::string::npos;
-        bool pass = threw && good_msg;
+        if (!accepted) {
+            TestFramework::RecordTest(
+                "AuthFoundation: ConfigLoader accepts gateway auth.enabled=true",
+                false,
+                "expected Validate() to accept auth.enabled=true with issuers "
+                "populated (master gate lifted in Phase 1b); got: " + err_msg,
+                TestFramework::TestCategory::OTHER);
+            return;
+        }
+
+        // Case B — enabled=true + empty issuers: must REJECT with
+        // a clear message.
+        const std::string json_empty_issuers = R"({
+            "bind_host": "127.0.0.1",
+            "bind_port": 8080,
+            "auth": { "enabled": true, "issuers": {} }
+        })";
+        bool case_b_threw = false;
+        std::string case_b_err;
+        try {
+            ServerConfig cfg2 = ConfigLoader::LoadFromString(json_empty_issuers);
+            ConfigLoader::Validate(cfg2);
+        } catch (const std::invalid_argument& e) {
+            case_b_threw = true;
+            case_b_err = e.what();
+        }
+        bool case_b_good = case_b_threw &&
+            case_b_err.find("auth.issuers is empty") != std::string::npos;
+        bool pass = accepted && case_b_good;
         std::string err;
-        if (!threw) {
-            err = "expected Validate() to reject auth.enabled=true but it accepted";
-        } else if (!good_msg) {
-            err = "Validate() threw but message lacked 'not yet wired' or "
-                  "'auth.enabled'; got: " + err_msg;
+        if (!case_b_threw) {
+            err = "expected Validate() to reject auth.enabled=true with "
+                  "empty issuers, but accepted";
+        } else if (!case_b_good) {
+            err = "rejected empty-issuers but message lacked canonical "
+                  "phrase; got: " + case_b_err;
         }
         TestFramework::RecordTest(
-            "AuthFoundation: ConfigLoader rejects gateway auth.enabled=true",
+            "AuthFoundation: ConfigLoader accepts gateway auth.enabled=true",
             pass, err, TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "AuthFoundation: ConfigLoader rejects gateway auth.enabled=true",
+            "AuthFoundation: ConfigLoader accepts gateway auth.enabled=true",
             false, std::string("unexpected harness error: ") + e.what(),
             TestFramework::TestCategory::OTHER);
     }
 }
 
 void TestConfigLoaderRejectsProxyAuthEnabled() {
-    std::cout << "\n[TEST] ConfigLoader rejects proxy.auth.enabled=true..." << std::endl;
+    // Phase 1b: the proxy.auth.enabled=true gate was lifted. This test
+    // now asserts the POSITIVE case (accepted with referenced issuers)
+    // plus the empty-issuers rejection (must name the offending upstream).
+    std::cout << "\n[TEST] ConfigLoader accepts proxy.auth.enabled=true..." << std::endl;
     try {
+        // Case A — enabled=true with populated issuers: must PASS.
         const std::string json_with_proxy_auth_enabled = R"({
             "bind_host": "127.0.0.1",
             "bind_port": 8080,
@@ -824,36 +838,72 @@ void TestConfigLoaderRejectsProxyAuthEnabled() {
                 }
             ]
         })";
-        bool threw = false;
+        bool accepted = false;
         std::string err_msg;
         try {
             ServerConfig cfg = ConfigLoader::LoadFromString(json_with_proxy_auth_enabled);
             ConfigLoader::Validate(cfg);
+            accepted = true;
+        } catch (const std::invalid_argument& e) {
+            err_msg = e.what();
+        }
+        if (!accepted) {
+            TestFramework::RecordTest(
+                "AuthFoundation: ConfigLoader accepts per-proxy auth.enabled=true",
+                false,
+                "expected Validate() to accept proxy.auth.enabled=true with "
+                "issuers populated (gate lifted in Phase 1b); got: " + err_msg,
+                TestFramework::TestCategory::OTHER);
+            return;
+        }
+
+        // Case B — enabled=true with empty issuers list: must REJECT
+        // with a message naming the offending upstream.
+        const std::string json_empty_issuers = R"({
+            "bind_host": "127.0.0.1",
+            "bind_port": 8080,
+            "auth": { "enabled": false, "issuers": {} },
+            "upstreams": [
+                {
+                    "name": "internal-api",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "proxy": {
+                        "route_prefix": "/api/v1",
+                        "auth": { "enabled": true, "issuers": [] }
+                    }
+                }
+            ]
+        })";
+        bool threw = false;
+        err_msg.clear();
+        try {
+            ServerConfig cfg2 = ConfigLoader::LoadFromString(json_empty_issuers);
+            ConfigLoader::Validate(cfg2);
         } catch (const std::invalid_argument& e) {
             threw = true;
             err_msg = e.what();
         }
-        // Message must name the offending upstream so operators can find it
-        // quickly, and mention the gate phrasing.
         bool good_msg = threw &&
-            err_msg.find("not yet wired") != std::string::npos &&
+            err_msg.find("issuers list is empty") != std::string::npos &&
             err_msg.find("internal-api") != std::string::npos &&
             err_msg.find("proxy.auth.enabled") != std::string::npos;
-        bool pass = threw && good_msg;
+        bool pass = accepted && threw && good_msg;
         std::string err;
         if (!threw) {
-            err = "expected Validate() to reject proxy.auth.enabled=true but it accepted";
+            err = "expected Validate() to reject proxy.auth.enabled=true "
+                  "with empty issuers, but accepted";
         } else if (!good_msg) {
             err = "Validate() threw but message lacked one of "
-                  "{'not yet wired', 'internal-api', 'proxy.auth.enabled'}; "
+                  "{'issuers list is empty', 'internal-api', 'proxy.auth.enabled'}; "
                   "got: " + err_msg;
         }
         TestFramework::RecordTest(
-            "AuthFoundation: ConfigLoader rejects per-proxy auth.enabled=true",
+            "AuthFoundation: ConfigLoader accepts per-proxy auth.enabled=true",
             pass, err, TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "AuthFoundation: ConfigLoader rejects per-proxy auth.enabled=true",
+            "AuthFoundation: ConfigLoader accepts per-proxy auth.enabled=true",
             false, std::string("unexpected harness error: ") + e.what(),
             TestFramework::TestCategory::OTHER);
     }
@@ -2675,12 +2725,26 @@ void TestValidateProxyAuthReloadGate() {
         }
     };
 
+    auto validate_expect_accepted = [](const std::string& json,
+                                         const std::string& label)
+        -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::ValidateProxyAuth(cfg, AllUpstreamNames(cfg));
+            return "";
+        } catch (const std::exception& e) {
+            return label + " rejected (should be accepted): " + e.what();
+        }
+    };
+
     try {
-        // Case 1: enforcement gate — proxy.auth.enabled=true. This is
-        // the primary security concern the reviewer flagged: a reload
-        // toggling auth on MUST be rejected even when the full Validate
-        // runs on a stripped copy.
-        std::string err = validate_expect_failure(R"({
+        // Case 1 (POST-Phase-1b flip): proxy.auth.enabled=true with a
+        // referenced issuer populated MUST be accepted. The earlier
+        // "enforcement not yet wired" gate was lifted in Phase 1b —
+        // inline auth activates request-time enforcement. Empty-issuers
+        // + enabled=true still rejects (tested separately in the
+        // TestConfigLoaderRejectsProxyAuthEnabled test above).
+        std::string err = validate_expect_accepted(R"({
             "upstreams": [
                 {"name":"x","host":"127.0.0.1","port":80},
                 {
@@ -2697,7 +2761,7 @@ void TestValidateProxyAuthReloadGate() {
                 }
             ],
             "auth": {
-                "enabled": false,
+                "enabled": true,
                 "issuers": {
                     "google": {
                         "issuer_url": "https://issuer.example",
@@ -2707,8 +2771,8 @@ void TestValidateProxyAuthReloadGate() {
                     }
                 }
             }
-        })", "proxy.auth.enabled=true rejected");
-        if (!err.empty()) throw std::runtime_error("enforcement gate: " + err);
+        })", "Case 1 enabled=true with issuers");
+        if (!err.empty()) throw std::runtime_error("enabled gate flipped: " + err);
 
         // Case 2: structural — unknown issuer reference. Staged
         // disabled policy with a typo should fail the reload gate.
@@ -3516,20 +3580,21 @@ void TestValidateProxyAuthLiveScoping() {
                 e.what());
         }
 
-        // Case 2: live_names INCLUDES "staged" (simulating restart).
-        // Now the enforcement gate must fire for that entry.
+        // Case 2 (POST-Phase-1b flip): live_names INCLUDES "staged"
+        // (simulating restart). With the master gate lifted, a proxy.auth
+        // block that has enabled=true + non-empty issuers is valid — must
+        // be ACCEPTED. Structural validators (issuer cross-ref,
+        // on_undetermined, route_prefix) still fire; those are tested in
+        // TestValidateProxyAuthReloadGate.
         std::unordered_set<std::string> live_all = {"x", "api", "staged"};
-        bool threw = false;
-        std::string err_msg;
         try {
             ConfigLoader::ValidateProxyAuth(cfg, live_all);
-        } catch (const std::invalid_argument& e) {
-            threw = true;
-            err_msg = e.what();
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("Case 2 (Phase 1b): staged proxy with "
+                            "enabled=true + populated issuers should be ")
+                + "accepted but threw: " + e.what());
         }
-        bool gate_msg = threw &&
-            err_msg.find("staged") != std::string::npos &&
-            err_msg.find("proxy.auth.enabled=true rejected") != std::string::npos;
 
         // Case 3: empty live_names — issuer.upstream cross-ref still
         // runs (it operates on full config.upstreams, not live_names);
@@ -3542,18 +3607,9 @@ void TestValidateProxyAuthLiveScoping() {
                 + "upstream checks fire) but threw: " + e.what());
         }
 
-        bool pass = threw && gate_msg;
-        std::string err;
-        if (!threw) {
-            err = "Case 2: live_names with 'staged' should reject the "
-                  "auth.enabled=true gate but accepted";
-        } else if (!gate_msg) {
-            err = "Case 2 rejected but message wrong; expected 'staged' "
-                  "and 'proxy.auth.enabled=true rejected'; got: " + err_msg;
-        }
         TestFramework::RecordTest(
             "AuthFoundation: ValidateProxyAuth live-upstream scoping",
-            pass, err, TestFramework::TestCategory::OTHER);
+            true, "", TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "AuthFoundation: ValidateProxyAuth live-upstream scoping",

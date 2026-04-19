@@ -6,6 +6,8 @@
 #include "http2/http2_constants.h"
 #include "upstream/upstream_manager.h"
 #include "upstream/proxy_handler.h"
+#include "auth/auth_manager.h"
+#include "auth/auth_middleware.h"
 #include "circuit_breaker/circuit_breaker_manager.h"
 #include "circuit_breaker/circuit_breaker_host.h"
 #include "circuit_breaker/circuit_breaker_slice.h"
@@ -679,6 +681,70 @@ void HttpServer::MarkServerReady() {
         }
     }
 
+    // AuthManager — build AFTER upstream_manager_ (issuers reference
+    // upstream pool names; the manager must be live for Issuer::Start to
+    // resolve them) and BEFORE proxy route registration (ProxyHandler
+    // ctor captures a non-owning auth_manager_ pointer). Skipped when
+    // auth.enabled=false — downstream code handles null gracefully.
+    //
+    // Middleware install ordering (§3.4, §20 risk #5):
+    //   `PrependMiddleware` pushes to FRONT. Rate-limit was prepended
+    //   earlier at the top of MarkServerReady, producing [rate_limit, ...].
+    //   Prepending auth NOW — i.e. SECOND — makes auth the new front:
+    //   [auth, rate_limit, ...]. Per-user rate-limit keys (future phase)
+    //   can then key on the validated `sub`.
+    if (auth_config_.enabled) {
+        try {
+            auth_manager_ = std::make_unique<AUTH_NAMESPACE::AuthManager>(
+                auth_config_, upstream_manager_.get(), dispatchers);
+        } catch (const std::exception& e) {
+            logging::Get()->error(
+                "AuthManager init failed: {} — stopping server", e.what());
+            net_server_.Stop();
+            throw;
+        }
+
+        // Register inline proxy.auth policies + top-level auth.policies
+        // BEFORE Start() — RegisterPolicy rejects post-Start calls.
+        for (const auto& u : upstream_configs_) {
+            if (!u.proxy.auth.enabled) continue;
+            if (u.proxy.route_prefix.empty()) continue;
+            auth_manager_->RegisterPolicy({u.proxy.route_prefix},
+                                            u.proxy.auth);
+        }
+        for (const auto& p : auth_config_.policies) {
+            if (!p.enabled) continue;
+            auth_manager_->RegisterPolicy(p.applies_to, p);
+        }
+
+        // Start discovery / static-fetch asynchronously; non-blocking.
+        auth_manager_->Start();
+
+        // Install auth middleware at the FRONT — running before the
+        // rate-limit middleware prepended earlier.
+        router_.PrependMiddleware(
+            AUTH_NAMESPACE::MakeMiddleware(auth_manager_.get()));
+    } else if (!auth_config_.issuers.empty() ||
+               !auth_config_.policies.empty()) {
+        // Config populated but master switch off — construct the
+        // manager in "disabled" mode so Reload can flip enabled→true
+        // without a restart. Start() is still called so issuer state
+        // (discovery / JWKS) is ready for the eventual flip.
+        try {
+            auth_manager_ = std::make_unique<AUTH_NAMESPACE::AuthManager>(
+                auth_config_, upstream_manager_.get(), dispatchers);
+            auth_manager_->Start();
+        } catch (const std::exception& e) {
+            logging::Get()->warn(
+                "AuthManager (disabled) init failed: {} — auth stays off",
+                e.what());
+            auth_manager_.reset();
+        }
+        logging::Get()->info(
+            "AuthManager constructed in disabled mode "
+            "(auth.enabled=false; schema populated)");
+    }
+
     // Process deferred Proxy() calls + auto-register proxy routes from
     // upstream configs. Any validation failure in either path throws
     // std::invalid_argument — we catch it, stop the already-running
@@ -990,6 +1056,11 @@ HttpServer::HttpServer(const ServerConfig& config)
 
     // Store rate limit config for MarkServerReady()
     rate_limit_config_ = config.rate_limit;
+
+    // Store auth config for MarkServerReady (AuthManager is constructed
+    // there, alongside UpstreamManager — the manager needs the pool
+    // already wired so issuer `upstream` references resolve).
+    auth_config_ = config.auth;
 }
 
 size_t HttpServer::ComputeInputCap() const {
@@ -1221,7 +1292,8 @@ void HttpServer::Proxy(const std::string& route_pattern,
         found->host,
         found->port,
         found->tls.sni_hostname,
-        upstream_manager_.get());
+        upstream_manager_.get(),
+        auth_manager_.get());
 
     // Determine methods to register. HEAD is included so the proxy sends
     // HEAD upstream (not GET via fallback, which downloads the full body).
@@ -1663,7 +1735,8 @@ void HttpServer::RegisterProxyRoutes() {
             upstream.host,
             upstream.port,
             upstream.tls.sni_hostname,
-            upstream_manager_.get());
+            upstream_manager_.get(),
+            auth_manager_.get());
 
         // Same HEAD policy as Proxy() — HEAD included for correct upstream semantics
         static const std::vector<std::string> DEFAULT_PROXY_METHODS =
@@ -1917,6 +1990,14 @@ void HttpServer::Stop() {
     // between the WS snapshot and the H2 drain snapshot. Without this, a WS
     // accepted in the gap would miss the 1001 "Going Away" close frame.
     net_server_.StopAccepting();
+
+    // Cancel in-flight auth discovery / JWKS fetches before teardown. Each
+    // Issuer bumps its generation token so late-arriving completions drop
+    // cleanly. Idempotent — safe to call multiple times (~HttpServer
+    // destructor also calls ~AuthManager → Stop()). §20 risk #4.
+    if (auth_manager_) {
+        auth_manager_->Stop();
+    }
 
     // NOTE: upstream_manager_->InitiateShutdown() is NOT called here.
     // It is deferred to pre_stop_drain_cb (after H2/WS/H1 protocol drain)
@@ -4029,6 +4110,33 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     // so a CB-only SIGHUP is a clean hot reload with no spurious warn.
     if (circuit_breaker_manager_) {
         circuit_breaker_manager_->Reload(new_config.upstreams);
+    }
+
+    // Auth reload. Two passes:
+    //   1. AuthManager::Reload applies reloadable issuer fields + forward
+    //      config under its own mutex. Topology-restart fields (add /
+    //      remove issuer, change issuer_url / upstream / mode / discovery)
+    //      are rejected with a reason — we log and skip the policy rebuild
+    //      in that case to keep live state consistent with the rejected
+    //      staged config.
+    //   2. RebuildPolicyListFromLiveSources rebuilds the applied policy
+    //      list from live upstreams + new top-level policies and
+    //      atomic-swaps. Always called on success so inline proxy.auth
+    //      edits take effect live (matching the ProxyConfig::operator==
+    //      exclusion of `auth`).
+    // Same proxy.auth equality discipline documented in §11.1 —
+    // circuit-breaker precedent.
+    if (auth_manager_) {
+        std::string auth_err;
+        if (!auth_manager_->Reload(new_config.auth, auth_err)) {
+            logging::Get()->warn(
+                "Auth reload skipped: {} (live state preserved)", auth_err);
+        } else {
+            auth_manager_->RebuildPolicyListFromLiveSources(
+                new_config.upstreams,
+                new_config.auth.policies);
+            auth_config_ = new_config.auth;
+        }
     }
 
     // Upstream topology changes (host/port/pool/proxy/tls) require a

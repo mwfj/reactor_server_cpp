@@ -1,0 +1,250 @@
+#include "auth/oidc_discovery.h"
+
+#include "auth/auth_url_util.h"
+#include "auth/upstream_http_client.h"
+#include "dispatcher.h"
+#include "log/logger.h"
+
+#include <nlohmann/json.hpp>
+
+// ---------------------------------------------------------------------------
+// OIDC discovery: GET `issuer_url/.well-known/openid-configuration`, parse
+// the resulting JSON document, extract `jwks_uri` and (optionally)
+// `introspection_endpoint`, and hand them back via `on_ready_cb`. On
+// failure (network, timeout, non-200, JSON parse), schedules a retry
+// after `retry_sec` seconds via EnQueueDelayed on the originating
+// dispatcher.
+//
+// All nlohmann::json calls are wrapped in try/catch — the discovery
+// payload is upstream-controlled, so malformed JSON must never crash the
+// process (§4.5). Equivalent treatment to jwt-cpp's attacker-reachable
+// surfaces (§9 item 16).
+// ---------------------------------------------------------------------------
+
+namespace AUTH_NAMESPACE {
+
+namespace {
+
+// Build the OIDC discovery endpoint from an issuer URL using ParseHttpsUri.
+// RFC 8414 / RFC 5785: appends "/.well-known/openid-configuration" under
+// the issuer base path, collapsing a trailing slash.
+ParsedHttpsUri BuildDiscoveryEndpoint(const std::string& issuer_url) {
+    auto out = ParseHttpsUri(issuer_url);
+    std::string& path = out.path_with_query;
+    if (!path.empty() && path.back() == '/') {
+        path.pop_back();
+    }
+    path += "/.well-known/openid-configuration";
+    return out;
+}
+
+// Extract (jwks_uri, introspection_endpoint) from the discovery JSON
+// body. Returns non-empty jwks_uri on success; introspection_endpoint may
+// legitimately be empty (not all IdPs advertise it). On JSON or schema
+// failure, returns empty jwks_uri and sets `reason`.
+void ExtractEndpoints(const std::string& body,
+                       std::string& out_jwks_uri,
+                       std::string& out_introspection_endpoint,
+                       std::string& reason) {
+    try {
+        auto j = nlohmann::json::parse(body, /*cb=*/nullptr,
+                                        /*allow_exceptions=*/true);
+        if (!j.is_object()) {
+            reason = "not_object";
+            return;
+        }
+        auto jwks_it = j.find("jwks_uri");
+        if (jwks_it == j.end() || !jwks_it->is_string()) {
+            reason = "missing_jwks_uri";
+            return;
+        }
+        out_jwks_uri = jwks_it->get<std::string>();
+        auto intro_it = j.find("introspection_endpoint");
+        if (intro_it != j.end() && intro_it->is_string()) {
+            out_introspection_endpoint = intro_it->get<std::string>();
+        }
+        // Enforce https on jwks_uri to match the TLS-mandatory IdP policy.
+        if (out_jwks_uri.rfind("https://", 0) != 0) {
+            reason = "jwks_uri_not_https";
+            out_jwks_uri.clear();
+            return;
+        }
+    } catch (const nlohmann::json::exception& ex) {
+        reason = "json_exception";
+        logging::Get()->warn(
+            "OIDC discovery JSON parse failed: {}", ex.what());
+    } catch (const std::exception& ex) {
+        reason = "std_exception";
+        logging::Get()->warn(
+            "OIDC discovery parse threw: {}", ex.what());
+    } catch (...) {
+        reason = "unknown_exception";
+        logging::Get()->warn(
+            "OIDC discovery parse threw non-std exception");
+    }
+}
+
+}  // namespace
+
+OidcDiscovery::OidcDiscovery(std::string issuer_name,
+                              std::string issuer_url,
+                              std::shared_ptr<UpstreamHttpClient> client,
+                              std::string upstream_pool_name,
+                              int retry_sec)
+    : issuer_name_(std::move(issuer_name)),
+      issuer_url_(std::move(issuer_url)),
+      client_(std::move(client)),
+      upstream_pool_name_(std::move(upstream_pool_name)),
+      retry_sec_(retry_sec > 0 ? retry_sec : 30),
+      ready_(std::make_shared<std::atomic<bool>>(false)),
+      cancel_token_(std::make_shared<std::atomic<bool>>(false)) {
+    logging::Get()->debug(
+        "OidcDiscovery constructed issuer={} url={} pool={} retry_sec={}",
+        issuer_name_, issuer_url_, upstream_pool_name_, retry_sec_);
+}
+
+OidcDiscovery::~OidcDiscovery() {
+    Cancel();
+}
+
+void OidcDiscovery::Start(size_t dispatcher_index,
+                           uint64_t generation,
+                           std::function<void(uint64_t,
+                                               const std::string&,
+                                               const std::string&)> on_ready_cb) {
+    if (!client_) {
+        logging::Get()->error(
+            "OidcDiscovery::Start called with no UpstreamHttpClient "
+            "issuer={}", issuer_name_);
+        return;
+    }
+
+    // Refresh the cancel token per cycle; old token stays live only for
+    // the in-flight response it was captured into.
+    auto token = std::make_shared<std::atomic<bool>>(false);
+    cancel_token_ = token;
+    // Reset ready_ for this cycle (shared_ptr captured by closures for safe
+    // access after ~OidcDiscovery).
+    ready_->store(false, std::memory_order_release);
+
+    {
+        // Log the intended endpoint at Start time without building a
+        // redundant Request object — the actual request is built inside
+        // the state->run lambda.
+        auto ep = BuildDiscoveryEndpoint(issuer_url_);
+        logging::Get()->info(
+            "OIDC discovery starting issuer={} pool={} path={} host={} gen={}",
+            issuer_name_, upstream_pool_name_,
+            ep.path_with_query, ep.host, generation);
+    }
+
+    std::string issuer_name = issuer_name_;
+    std::string issuer_url = issuer_url_;
+    std::string pool_name = upstream_pool_name_;
+    auto client_copy = client_;
+    auto* dispatcher =
+        dispatcher_index < client_->dispatchers().size()
+            ? client_->dispatchers()[dispatcher_index].get()
+            : nullptr;
+    int retry_sec = retry_sec_;
+
+    // Capture ready_ by shared_ptr value so closures can safely access it
+    // after ~OidcDiscovery runs while a delayed retry task is queued. The
+    // cancel token (captured as `token`) already guards the cancel path.
+    auto ready_flag = ready_;
+
+    // Recursive retry captured by shared_ptr so the lambda can re-queue
+    // itself via EnQueueDelayed on failure.
+    struct CycleState {
+        std::function<void(size_t)> run;
+    };
+    auto state = std::make_shared<CycleState>();
+    state->run = [state, issuer_name, issuer_url, pool_name, client_copy,
+                   dispatcher, retry_sec, generation, on_ready_cb, token,
+                   ready_flag](size_t disp_index) {
+        if (token->load(std::memory_order_acquire)) {
+            return;
+        }
+
+        UpstreamHttpClient::Request req;
+        auto ep = BuildDiscoveryEndpoint(issuer_url);
+        req.method = "GET";
+        req.path = ep.path_with_query;
+        req.host_header = ep.host;
+        req.headers["accept"] = "application/json";
+        req.timeout_sec = 10;
+        req.max_response_body = 64 * 1024;
+
+        client_copy->Issue(
+            pool_name, disp_index, std::move(req),
+            [state, issuer_name, dispatcher, retry_sec, generation,
+             on_ready_cb, token, ready_flag, disp_index](
+                    UpstreamHttpClient::Response resp) {
+                if (token->load(std::memory_order_acquire)) {
+                    return;
+                }
+                if (!resp.error.empty() || resp.status_code != 200) {
+                    logging::Get()->warn(
+                        "OIDC discovery failed issuer={} status={} error={} "
+                        "retry_in={}s",
+                        issuer_name, resp.status_code,
+                        resp.error.empty() ? "-" : resp.error, retry_sec);
+                    if (dispatcher) {
+                        // Re-arm after retry_sec seconds on the same
+                        // dispatcher. Capture `state` so the closure's
+                        // `run` is reachable for the recursion.
+                        std::weak_ptr<CycleState> weak_state = state;
+                        dispatcher->EnQueueDelayed(
+                            [weak_state, disp_index]() {
+                                if (auto s = weak_state.lock()) {
+                                    s->run(disp_index);
+                                }
+                            },
+                            std::chrono::seconds(retry_sec));
+                    }
+                    return;
+                }
+                std::string jwks_uri;
+                std::string intro_endpoint;
+                std::string reason;
+                ExtractEndpoints(resp.body, jwks_uri, intro_endpoint, reason);
+                if (jwks_uri.empty()) {
+                    logging::Get()->warn(
+                        "OIDC discovery parse failed issuer={} reason={} "
+                        "retry_in={}s",
+                        issuer_name, reason, retry_sec);
+                    if (dispatcher) {
+                        std::weak_ptr<CycleState> weak_state = state;
+                        dispatcher->EnQueueDelayed(
+                            [weak_state, disp_index]() {
+                                if (auto s = weak_state.lock()) {
+                                    s->run(disp_index);
+                                }
+                            },
+                            std::chrono::seconds(retry_sec));
+                    }
+                    return;
+                }
+                ready_flag->store(true, std::memory_order_release);
+                logging::Get()->info(
+                    "OIDC discovery ok issuer={} has_introspection={}",
+                    issuer_name, !intro_endpoint.empty());
+                if (on_ready_cb) {
+                    on_ready_cb(generation, jwks_uri, intro_endpoint);
+                }
+            },
+            token);
+    };
+
+    if (dispatcher) {
+        state->run(dispatcher_index);
+    }
+}
+
+void OidcDiscovery::Cancel() {
+    if (cancel_token_) {
+        cancel_token_->store(true, std::memory_order_release);
+    }
+}
+
+}  // namespace AUTH_NAMESPACE

@@ -1,4 +1,7 @@
 #include "upstream/header_rewriter.h"
+
+#include "auth/auth_config.h"
+#include "auth/auth_context.h"
 #include "log/logger.h"
 #include <unordered_set>
 
@@ -62,6 +65,115 @@ std::vector<std::string> HeaderRewriter::ParseConnectionHeader(
     return tokens;
 }
 
+namespace {
+
+// Lowercase an ASCII header name in-place — mirrors the inbound parser's
+// HttpRequest::headers storage contract (lowercase keys).
+std::string LowercaseHeaderName(std::string name) {
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return name;
+}
+
+// Protective list of names the overlay MUST NOT touch — the config
+// validator (ConfigLoader::Validate) already rejects these at load, but
+// checking at runtime keeps the overlay safe if a future config path
+// bypasses validation. Defense-in-depth per DEVELOPMENT_RULES.md.
+bool IsReservedOverlayHeader(const std::string& lower) {
+    return lower == "authorization" ||
+           lower == "host" ||
+           lower == "connection" ||
+           lower == "keep-alive" ||
+           lower == "transfer-encoding" ||
+           lower == "te" ||
+           lower == "trailer" ||
+           lower == "upgrade" ||
+           lower == "proxy-connection" ||
+           lower == "proxy-authenticate" ||
+           lower == "proxy-authorization" ||
+           lower == "via" ||
+           lower == "x-forwarded-for" ||
+           lower == "x-forwarded-proto" ||
+           lower == "x-auth-undetermined" ||  // manager-owned
+           (!lower.empty() && lower.front() == ':');  // HTTP/2 pseudo-headers
+}
+
+// Strip headers matching the auth-forward configuration's identity
+// header names. Skips `authorization` (managed separately by
+// preserve_authorization) and skips any name the config-validator
+// should have rejected (defense-in-depth).
+void ApplyInboundIdentityStrip(
+        const AUTH_NAMESPACE::AuthForwardConfig& fwd,
+        std::map<std::string, std::string>& out) {
+    auto try_erase = [&](const std::string& header_name) {
+        if (header_name.empty()) return;
+        std::string lower = LowercaseHeaderName(header_name);
+        if (IsReservedOverlayHeader(lower)) return;
+        out.erase(lower);
+    };
+    try_erase(fwd.subject_header);
+    try_erase(fwd.issuer_header);
+    try_erase(fwd.scopes_header);
+    try_erase(fwd.raw_jwt_header);
+    for (const auto& [claim_name, header_name] : fwd.claims_to_headers) {
+        try_erase(header_name);
+    }
+}
+
+// Inject validated identity claims. Only runs on a populated AuthContext
+// that is NOT marked `undetermined`. Undetermined handling follows the
+// design's §6.4 step 5a.
+void ApplyIdentityInject(
+        const AUTH_NAMESPACE::AuthForwardConfig& fwd,
+        const AUTH_NAMESPACE::AuthContext& ctx,
+        std::map<std::string, std::string>& out) {
+    auto try_set = [&](const std::string& header_name,
+                        const std::string& value) {
+        if (header_name.empty() || value.empty()) return;
+        std::string lower = LowercaseHeaderName(header_name);
+        if (IsReservedOverlayHeader(lower)) return;
+        out[lower] = value;
+    };
+
+    if (!ctx.subject.empty()) {
+        try_set(fwd.subject_header, ctx.subject);
+    }
+    if (!ctx.issuer.empty()) {
+        try_set(fwd.issuer_header, ctx.issuer);
+    }
+    if (!ctx.scopes.empty() && !fwd.scopes_header.empty()) {
+        std::string joined;
+        for (const auto& s : ctx.scopes) {
+            if (!joined.empty()) joined += ' ';
+            joined += s;
+        }
+        try_set(fwd.scopes_header, joined);
+    }
+    for (const auto& [claim_name, header_name] : fwd.claims_to_headers) {
+        auto it = ctx.claims.find(claim_name);
+        if (it == ctx.claims.end()) continue;
+        try_set(header_name, it->second);
+    }
+    // Only emit the raw token header when the operator asked for it AND
+    // the middleware stashed the token (forward.raw_jwt_header was
+    // non-empty at verification time). The context's raw_token is kept
+    // empty otherwise (§9 item 9).
+    if (!fwd.raw_jwt_header.empty() && !ctx.raw_token.empty()) {
+        try_set(fwd.raw_jwt_header, ctx.raw_token);
+    }
+}
+
+void ApplyUndeterminedInject(
+        const AUTH_NAMESPACE::AuthForwardConfig& /*fwd*/,
+        std::map<std::string, std::string>& out) {
+    // The X-Auth-Undetermined flag is owned by the gateway itself, not by
+    // forward config — operators don't reconfigure this name. Matches
+    // §6.4's explicit guidance.
+    out["x-auth-undetermined"] = "true";
+}
+
+}  // namespace
+
 std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
     const std::map<std::string, std::string>& client_headers,
     const std::string& client_ip,
@@ -69,7 +181,9 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
     bool upstream_tls,
     const std::string& upstream_host,
     int upstream_port,
-    const std::string& sni_hostname) const {
+    const std::string& sni_hostname,
+    const AUTH_NAMESPACE::AuthForwardConfig* auth_forward,
+    const std::optional<AUTH_NAMESPACE::AuthContext>* auth_ctx) const {
 
     // Collect additional hop-by-hop headers from Connection header value
     std::unordered_set<std::string> connection_listed;
@@ -90,6 +204,16 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
             continue;
         }
         output[name] = value;
+    }
+
+    // Auth overlay step 2: strip inbound identity headers BEFORE any
+    // operator-XFF / Via / Host rewrite. Prevents a client from spoofing
+    // X-Auth-Subject / X-Auth-Issuer / claim headers on a route that
+    // doesn't require auth on the inbound path but injects identity on
+    // the outbound. Order rule per §6.4: strip before inject.
+    if (auth_forward != nullptr &&
+        auth_forward->strip_inbound_identity_headers) {
+        ApplyInboundIdentityStrip(*auth_forward, output);
     }
 
     // X-Forwarded-For: append client IP
@@ -145,9 +269,41 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
         }
     }
 
+    // Auth overlay step 5: inject validated identity. Only runs when
+    // BOTH a forward config AND an AuthContext are supplied. §6.4 step 5a:
+    // undetermined contexts emit X-Auth-Undetermined only (no
+    // subject/issuer/scopes/claims). Step 5b: normal ALLOW flows emit the
+    // configured header names.
+    //
+    // Security invariant: always strip the inbound x-auth-undetermined header
+    // before inject to prevent client spoofing. IsReservedOverlayHeader blocks
+    // the strip inside ApplyInboundIdentityStrip, so we must do it here
+    // unconditionally when auth is active (regardless of strip_inbound setting).
+    if (auth_forward != nullptr) {
+        output.erase("x-auth-undetermined");
+    }
+    if (auth_forward != nullptr &&
+        auth_ctx != nullptr && auth_ctx->has_value()) {
+        const auto& ctx = **auth_ctx;
+        if (ctx.undetermined) {
+            ApplyUndeterminedInject(*auth_forward, output);
+        } else {
+            ApplyIdentityInject(*auth_forward, ctx, output);
+        }
+    }
+
+    // Auth overlay step 6: Authorization preservation. When the operator
+    // sets preserve_authorization=false, strip Authorization so the
+    // upstream never sees the bearer token. Default true matches
+    // current behavior (token is forwarded alongside injected headers).
+    if (auth_forward != nullptr && !auth_forward->preserve_authorization) {
+        output.erase("authorization");
+    }
+
     logging::Get()->debug("HeaderRewriter::RewriteRequest: "
-                          "input={} output={} headers",
-                          client_headers.size(), output.size());
+                          "input={} output={} headers auth_overlay={}",
+                          client_headers.size(), output.size(),
+                          auth_forward != nullptr ? "on" : "off");
 
     return output;
 }

@@ -499,7 +499,9 @@ Use `logging::SanitizePath(path)` to strip query parameters and fragments from U
 
 ## Authentication (OAuth 2.0 Token Validation)
 
-> **Status — Phase 1 (foundation only):** This release lands the auth config schema, the data structures (`AuthConfig`, `IssuerConfig`, `AuthPolicy`, `AuthForwardConfig`, `IntrospectionConfig`), and the pure utilities (token hashing, claim extraction, policy matcher). Request-time enforcement (`AuthManager`, JWT verification, the per-route middleware, JWKS fetch, introspection POST, and `auth.forward` header overlay) is **not yet wired**. The validator hard-rejects any config with `auth.enabled: true` or `proxy.auth.enabled: true` so that operators cannot deploy a config that would silently behave as unauthenticated. Full enforcement lands in Phase 2.
+> **Status — Available (Phase 1b + Phase 2 shipped).** JWT verification, per-route policy enforcement, multi-issuer routing, JWKS caching, OIDC discovery, and the `auth.forward` outbound-header overlay are all wired and tested. For a practical operator walkthrough including failure modes, header injection semantics, and troubleshooting, see [`docs/oauth2.md`](oauth2.md). This section is the **field reference** — defaults, validation rules, and reload semantics for every key under `auth.*` and `proxy.auth.*`.
+>
+> **Phase 3 — introspection mode** (RFC 7662 opaque-token validation via a POST to the IdP) is scaffolded in the schema (the `introspection` block parses and validates) but the enforcement path is **not yet implemented**. `mode: "introspection"` is rejected at startup with a clear error; JWT mode is the only runtime-accepted mode.
 
 ### Top-Level `auth` Block
 
@@ -592,11 +594,64 @@ Per-upstream auth policies live inline on the proxy entry — the prefix is deri
 }
 ```
 
+### Field Reference
+
+All `auth.*` and `proxy.auth.*` keys, with defaults and whether they are live-reloadable via SIGHUP.
+
+**Top-level `auth`**
+
+| Field | Default | Reloadable | Notes |
+|---|---|---|---|
+| `auth.enabled` | `false` | yes | Master switch. When `false`, the middleware no-ops with a single atomic-load per request. |
+| `auth.hmac_cache_key_env` | `""` | no (process-local) | Environment variable holding the HMAC-SHA256 key used to hash token-cache lookup keys. Supports base64url, standard base64 (with or without padding), or raw bytes; auto-detected. When unset and `auth.enabled=true`, a per-process random key is generated on startup. |
+
+**Per-issuer (`auth.issuers.<name>`)**
+
+| Field | Default | Reloadable | Notes |
+|---|---|---|---|
+| `issuer_url` | required | no (topology) | The IdP's issuer string; must match the `iss` claim on incoming tokens. |
+| `discovery` | `false` | no (topology) | When `true`, fetch `.well-known/openid-configuration`. When `false`, `jwks_uri` must be provided. |
+| `jwks_uri` | `""` | no (topology) | Required if `discovery=false`. Must be `https://`. Ignored when `discovery=true`. |
+| `upstream` | required | no (topology) | Name of the `upstreams[]` entry used to reach the IdP. |
+| `mode` | `"jwt"` | no (topology) | `"jwt"` (local signature verification) or `"introspection"` (Phase 3 — rejected at load). |
+| `audiences` | `[]` | yes | Accepted `aud` claim values. Empty list means any audience — not recommended. |
+| `algorithms` | `["RS256"]` | yes | Allowlist: `RS256`, `RS384`, `RS512`, `ES256`, `ES384`. `HS*` and `none` are not supported. |
+| `leeway_sec` | `30` | yes | Clock-skew tolerance for `exp` / `nbf`. |
+| `jwks_cache_sec` | `300` | yes | JWKS TTL. |
+| `jwks_refresh_timeout_sec` | `5` | yes | Upstream timeout for the JWKS GET. |
+| `discovery_retry_sec` | `30` | yes | Retry interval for failed OIDC discovery. |
+| `required_claims` | `[]` | yes | Additional claim names that must be present (any value). |
+| `introspection.*` | — | no (topology) | Phase 3 opaque-token introspection. Parsed but not enforced; selecting `mode: "introspection"` is rejected. |
+
+**Per-policy (`auth.policies[]` top-level) / (`proxy.auth` inline)**
+
+| Field | Default | Reloadable | Notes |
+|---|---|---|---|
+| `name` | required (top-level only) | no | Must be a non-empty, non-whitespace identifier. Inline policies take their name from the parent upstream. |
+| `enabled` | `false` | yes | When `false`, the policy parses but doesn't enforce. |
+| `applies_to` | `[]` (top-level) | no (topology) | Literal byte-prefix path list. Required when `enabled=true` on top-level. Not accepted on inline policies (they derive their prefix from `proxy.route_prefix`). |
+| `issuers` | `[]` | yes | Allowlist of issuer names; at least one must be present when enabled. Multi-issuer: the gateway peeks the `iss` claim to pick the verifier. |
+| `required_scopes` | `[]` | yes | Every named scope must appear in the token's `scope` / `scp` claim. |
+| `required_audience` | `""` | yes | If non-empty, adds this audience to the issuer's allowed list for this policy only. |
+| `on_undetermined` | `"deny"` | yes | `"deny"` returns 503 with `Retry-After`; `"allow"` lets the request through with `X-Auth-Undetermined: true`. |
+| `realm` | `"api"` | yes | Value used for the `realm=` parameter in `WWW-Authenticate`. |
+
+**Forward overlay (`auth.forward`)** — all fields live-reloadable:
+
+| Field | Default | Notes |
+|---|---|---|
+| `subject_header` | `""` | Output header for verified `sub`. Empty omits. |
+| `issuer_header` | `""` | Output header for verified `iss`. |
+| `scopes_header` | `""` | Output header for extracted scope list (space-joined). |
+| `raw_jwt_header` | `""` | Output header for the raw compact JWT. **Opt-in; security-sensitive.** |
+| `claims_to_headers` | `{}` | Map of `<claim>: <header>` — forwards string/number claims. |
+| `strip_inbound_identity_headers` | `true` | Delete any client-provided copies of overlay-owned headers. Keep on. |
+| `preserve_authorization` | `true` | Forward the original `Authorization` header. Set to `false` to strip. |
+
 ### Validation Rules
 
-`ConfigLoader::Validate()` enforces (Phase 1):
+`ConfigLoader::Validate()` enforces:
 
-- **Master gate** — `auth.enabled` and `proxy.auth.enabled` MUST be `false` until Phase 2 enforcement lands. Any `true` is hard-rejected at startup and on SIGHUP reload.
 - **TLS-mandatory upstream endpoints** — `jwks_uri` and `introspection.endpoint` MUST be `https://`. Plain HTTP is hard-rejected (token-bearing exchanges over plaintext are a credential leak).
 - **Inline `client_secret` is forbidden** — only `client_secret_env` (env-var indirection) is accepted. Prevents secrets from sitting in versioned config files.
 - **Issuer cross-references** — `auth.issuers.<name>.upstream` must name an existing entry in `upstreams[]` (skipped on reload-stripped copies; `ValidateProxyAuth` re-checks against the live upstream set).
@@ -613,9 +668,111 @@ Per-upstream auth policies live inline on the proxy entry — the prefix is deri
 - **`on_undetermined`** — must be `"deny"` (default) or `"allow"`.
 - **Strict integer parsing** — every `auth.*` integer (`leeway_sec`, `jwks_cache_sec`, `introspection.timeout_sec`, etc.) goes through `ParseStrictInt` (see Type Safety above).
 
-### Reload Semantics (Phase 1)
+### Additional Examples
 
-The full Phase 2 hot-reload story (live JWKS rotation, runtime-mutable forward overlay, etc.) lands with the enforcement layer. In Phase 1, SIGHUP reload runs the same auth validation as startup — any post-reload config that flips `auth.enabled` to `true` is rejected before the new config is committed.
+**Google + private IdP on the same gateway.** Two issuers, two policies:
+
+```json
+"auth": {
+  "enabled": true,
+  "issuers": {
+    "google": {
+      "issuer_url": "https://accounts.google.com",
+      "discovery": true, "upstream": "google-idp",
+      "audiences": ["https://api.example.com"],
+      "algorithms": ["RS256"]
+    },
+    "ours": {
+      "issuer_url": "https://idp.internal",
+      "discovery": false,
+      "jwks_uri": "https://idp.internal/.well-known/jwks.json",
+      "upstream": "internal-idp",
+      "audiences": ["https://api.example.com"],
+      "algorithms": ["RS256", "ES256"]
+    }
+  },
+  "policies": [
+    {
+      "name": "admin-api",
+      "enabled": true,
+      "applies_to": ["/admin/"],
+      "issuers": ["ours"],
+      "required_scopes": ["admin"]
+    },
+    {
+      "name": "public-api",
+      "enabled": true,
+      "applies_to": ["/v1/"],
+      "issuers": ["google", "ours"]
+    }
+  ]
+}
+```
+
+**Advisory / shadow mode.** Log denials but admit traffic:
+
+```json
+{
+  "name": "shadow-api",
+  "enabled": true,
+  "applies_to": ["/v1/"],
+  "issuers": ["google"],
+  "on_undetermined": "allow"
+}
+```
+
+Requests with an `UNDETERMINED` outcome (IdP unreachable, kid miss, etc.) go through with `X-Auth-Undetermined: true`. Malformed tokens still 401 — advisory mode only covers "we don't know", not "we know it's bad."
+
+**Opt into raw JWT forwarding.** Advanced — only when the upstream genuinely needs to re-verify:
+
+```json
+"forward": {
+  "subject_header": "X-Auth-Subject",
+  "raw_jwt_header": "X-Auth-Raw-JWT",
+  "strip_inbound_identity_headers": true,
+  "preserve_authorization": false
+}
+```
+
+**Introspection (Phase 3 — declared but deferred).** The schema accepts the block so future releases can enable it without a config migration, but `mode: "introspection"` is rejected at startup today:
+
+```json
+"issuers": {
+  "opaque-idp": {
+    "issuer_url": "https://idp.internal",
+    "discovery": false,
+    "upstream": "internal-idp",
+    "mode": "introspection",
+    "introspection": {
+      "endpoint": "https://idp.internal/oauth2/introspect",
+      "client_id": "reactor-gateway",
+      "client_secret_env": "REACTOR_INTROSPECTION_SECRET",
+      "timeout_sec": 3,
+      "cache_sec": 60
+    }
+  }
+}
+```
+
+### Hot-reload behavior
+
+**Live-reloadable** (SIGHUP applies immediately):
+
+- `auth.enabled`
+- Per-issuer: `audiences`, `algorithms`, `leeway_sec`, `required_claims`, `jwks_cache_sec`, `jwks_refresh_timeout_sec`, `discovery_retry_sec`
+- Per-policy: `enabled`, `required_scopes`, `required_audience`, `on_undetermined`, `realm`
+- All `auth.forward.*` fields
+
+**Restart-required** (SIGHUP logs a warn; live state is preserved):
+
+- `auth.hmac_cache_key_env` (HMAC key is process-local)
+- Adding / removing issuers
+- Per-issuer: `issuer_url`, `discovery`, `jwks_uri`, `upstream`, `mode`
+- Policy topology: `applies_to` on top-level policies; `route_prefix` on inline policies; list of configured policies
+
+`ConfigLoader::ValidateHotReloadable()` runs hard-reject validation on the live-reloadable subset so invalid reloads never reach live state — broken values are rejected before the new config is committed. Restart-required field changes are logged and skipped (not rejected), so you can reload live fields even if a topology change is also staged in the config file; the topology just won't take effect until the next restart.
+
+In-flight requests always see the snapshot they started with (both `policies_` and `forward_` are `shared_ptr<const T>` swapped atomically).
 
 ## Third-Party Dependencies
 

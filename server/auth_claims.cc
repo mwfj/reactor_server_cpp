@@ -106,17 +106,16 @@ bool PopulateFromPayload(const nlohmann::json& payload,
     //   - Symmetric-key flows (deferred — HS256 is out of scope for v1):
     //     issuer is implicit in the shared key.
     //
-    // The verifier (Phase 2 `JwtVerifier`) is the layer that enforces
-    // `iss` matches a configured issuer, via jwt-cpp's `with_issuer(...)`
-    // — by the time we get here that constraint has already been
-    // applied. Our job here is claim EXTRACTION, not policy enforcement,
+    // JwtVerifier enforces `iss` matches a configured issuer via jwt-cpp's
+    // `with_issuer(...)` — by the time we get here that constraint has already
+    // been applied. Our job here is claim EXTRACTION, not policy enforcement,
     // so we populate what's present and leave what isn't empty. False is
     // returned ONLY for a structurally-invalid payload (not an object).
     //
-    // Downstream readers (the future HeaderRewriter overlay) must treat
-    // both `ctx.issuer` and `ctx.subject` as possibly-empty and skip
-    // emitting their respective headers when empty rather than emitting
-    // empty values that would mislead upstream services.
+    // Downstream readers (HeaderRewriter) must treat both `ctx.issuer` and
+    // `ctx.subject` as possibly-empty and skip emitting their respective
+    // headers when empty rather than emitting empty values that would mislead
+    // upstream services.
     if (payload.contains("iss") && payload["iss"].is_string()) {
         ctx.issuer = payload["iss"].get<std::string>();
     }
@@ -129,13 +128,9 @@ bool PopulateFromPayload(const nlohmann::json& payload,
     // context object small and to limit the data that flows into logs.
     //
     // Only scalar claims are flattened into the string-valued map. Array /
-    // object claims are SILENTLY SKIPPED — a common operator ask like
-    // "forward the `groups` array to X-Auth-Groups" will produce no header
-    // with the current Phase 1-2 model. That is intentional for this layer:
-    // array-to-header flattening (typically comma-separated, or multi-valued
-    // headers) is a HeaderRewriter / middleware concern because the
-    // serialization choice depends on what the upstream expects. Phase 3
-    // wiring should add that flattening at the overlay layer, not here.
+    // object claims are SILENTLY SKIPPED — array-to-header flattening
+    // (comma-separated or multi-valued) is a HeaderRewriter concern because
+    // the serialization choice depends on what the upstream expects.
     //
     // Numeric claims: check unsigned FIRST, then signed. This ordering
     // preserves uint64 values > INT64_MAX — e.g. OAuth numeric IDs for user
@@ -160,8 +155,7 @@ bool PopulateFromPayload(const nlohmann::json& payload,
         } else if (v.is_boolean()) {
             ctx.claims[key] = v.get<bool>() ? "true" : "false";
         }
-        // Arrays/objects: skip (see comment above — flattening is a Phase 3
-        // HeaderRewriter concern, not a claim-extraction concern).
+        // Arrays/objects: skip — see comment above.
     }
     return true;
 }
