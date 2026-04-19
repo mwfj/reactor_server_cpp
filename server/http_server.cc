@@ -264,6 +264,106 @@ static std::string LowerHeaderName(const std::string& name) {
     return lower;
 }
 
+struct TopLevelAuthPolicyMergeResult {
+    std::vector<AUTH_NAMESPACE::AuthPolicy> policies;
+    bool topology_changed = false;
+};
+
+// Preserve the LIVE top-level auth policy topology across SIGHUP. Top-level
+// policy fields (enabled / issuers / required_scopes / required_audience /
+// on_undetermined / realm) are live-reloadable, but the path topology
+// (`applies_to` plus the set of policy names) is not — changing either can
+// move auth coverage away from paths the running router still serves, or
+// silently add enforcement to paths a future restart has not yet committed.
+//
+// The merge runs per POLICY IDENTITY (stable `name`, required by the
+// top-level-policy validator). Index-based merging was incorrect: a
+// restart-only edit (add policy C) or even a pure reorder would fall back
+// to the entire live vector and silently suppress reloadable edits on the
+// unchanged identities A/B.
+//
+// Rules:
+//   - Live policy with a matching staged name: reloadable fields take
+//     effect; `applies_to` held at live (mark topology_changed when
+//     they diverge).
+//   - Live policy with NO staged match (removed/renamed in staged): keep
+//     live so running coverage stays put; mark topology_changed.
+//   - Staged policy with NO live match (added name): defer to restart
+//     (mark topology_changed) — do NOT add to the merged vector,
+//     otherwise the runtime enforces auth on paths a future restart
+//     hasn't yet committed to.
+//
+// Live vector ORDER is preserved so longest-prefix matcher tie-breaking
+// stays stable across the reload.
+static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopology(
+        const std::vector<AUTH_NAMESPACE::AuthPolicy>& live_policies,
+        const std::vector<AUTH_NAMESPACE::AuthPolicy>& staged_policies) {
+    TopLevelAuthPolicyMergeResult out;
+    out.policies.reserve(live_policies.size());
+
+    // Index staged by name for O(1) lookup. Duplicate names are rejected
+    // at validation time; first-wins here is a safe defensive subset for
+    // any malformed input that slips through.
+    std::unordered_map<std::string, const AUTH_NAMESPACE::AuthPolicy*>
+        staged_by_name;
+    staged_by_name.reserve(staged_policies.size());
+    for (const auto& p : staged_policies) {
+        staged_by_name.emplace(p.name, &p);
+    }
+
+    for (const auto& live : live_policies) {
+        auto it = staged_by_name.find(live.name);
+        if (it == staged_by_name.end()) {
+            // Staged removed or renamed this policy. Removal/rename is
+            // restart-required — preserve live so live coverage stays.
+            out.topology_changed = true;
+            out.policies.push_back(live);
+            continue;
+        }
+        const auto& staged = *it->second;
+        AUTH_NAMESPACE::AuthPolicy merged = staged;
+        merged.name = live.name;  // stable identity across edits
+        if (live.applies_to != staged.applies_to) {
+            // applies_to is topology — keep live so the matcher's path
+            // coverage matches what the router actually serves.
+            out.topology_changed = true;
+            merged.applies_to = live.applies_to;
+        }
+        out.policies.push_back(std::move(merged));
+    }
+
+    // Detect ADDED policies (present in staged, absent in live). Topology-
+    // required — flag for the warn log; the merged vector intentionally
+    // does NOT include them.
+    if (!out.topology_changed) {
+        std::unordered_set<std::string> live_names;
+        live_names.reserve(live_policies.size());
+        for (const auto& p : live_policies) live_names.insert(p.name);
+        for (const auto& p : staged_policies) {
+            if (live_names.count(p.name) == 0) {
+                out.topology_changed = true;
+                break;
+            }
+        }
+    }
+
+    return out;
+}
+
+static AUTH_NAMESPACE::AuthConfig BuildLiveAppliedAuthConfig(
+        const AUTH_NAMESPACE::AuthConfig& live_auth,
+        const AUTH_NAMESPACE::AuthConfig& staged_auth,
+        std::vector<AUTH_NAMESPACE::AuthPolicy> live_top_level_policies) {
+    AUTH_NAMESPACE::AuthConfig applied = live_auth;
+    applied.enabled = staged_auth.enabled;
+    applied.issuers = staged_auth.issuers;
+    applied.forward = staged_auth.forward;
+    applied.policies = std::move(live_top_level_policies);
+    // Process-local HMAC key material is startup-only.
+    applied.hmac_cache_key_env = live_auth.hmac_cache_key_env;
+    return applied;
+}
+
 static HttpResponse MergeAsyncResponseHeaders(
     const HttpResponse& final_resp,
     const std::vector<std::pair<std::string, std::string>>& mw_headers) {
@@ -4146,6 +4246,7 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     // Same proxy.auth equality discipline documented in §11.1 —
     // circuit-breaker precedent.
     bool auth_reload_ok = false;
+    TopLevelAuthPolicyMergeResult top_level_policy_merge;
     if (auth_manager_) {
         std::string auth_err;
         if (!auth_manager_->Reload(new_config.auth, auth_err)) {
@@ -4153,7 +4254,12 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
                 "Auth reload skipped: {} (live state preserved)", auth_err);
         } else {
             auth_reload_ok = true;
-            auth_config_ = new_config.auth;
+            top_level_policy_merge =
+                MergeTopLevelAuthPoliciesPreservingLiveTopology(
+                    auth_config_.policies, new_config.auth.policies);
+            auth_config_ = BuildLiveAppliedAuthConfig(
+                auth_config_, new_config.auth,
+                top_level_policy_merge.policies);
             // NOTE: the policy-list rebuild is INTENTIONALLY deferred until
             // after the upstream topology check below. Calling it here with
             // `new_config.upstreams` would commit staged `proxy.route_prefix`
@@ -4224,18 +4330,25 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         upstream_configs_ = new_config.upstreams;
     }
 
+    if (auth_reload_ok && top_level_policy_merge.topology_changed) {
+        logging::Get()->warn(
+            "Reload: top-level auth policy topology changes require a "
+            "restart to take effect (preserving live applies_to/name set)");
+    }
+
     // Rebuild the applied auth policy list from the LIVE upstream set.
     // When topology matched, upstream_configs_ now carries the new
     // proxy.auth fields (reload-safe) and route_prefix (unchanged). When
     // topology diverged, upstream_configs_ still holds the live values
     // — inline proxy.auth edits on mismatched topology are carried
     // alongside the staged prefix and would only re-apply on restart.
-    // Top-level auth.policies[] is live-reloadable and always reflects
-    // the NEW config.
+    // Top-level auth.policies[] contributes the live-applied subset:
+    // reloadable fields on stable identities take effect, while staged
+    // name/applies_to topology remains deferred until restart.
     if (auth_reload_ok) {
         auth_manager_->RebuildPolicyListFromLiveSources(
             upstream_configs_,
-            new_config.auth.policies);
+            auth_config_.policies);
     }
 
     return true;

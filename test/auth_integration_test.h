@@ -31,6 +31,7 @@
 //  18.  Reload: forward config update changes injected header names
 //  19.  AuthManager counters increment on deny/allow
 //  20.  WWW-Authenticate header present on 401 with realm set
+//  21.  HttpServer reload preserves live top-level policy topology
 // ============================================================================
 
 #include "test_framework.h"
@@ -1075,6 +1076,101 @@ static bool TestLongestPrefixWins() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 21: HttpServer::Reload preserves live top-level policy topology
+// Rationale: changing auth.policies[].applies_to is staged restart-only.
+// A live reload must keep protecting the old prefix even across a later
+// unrelated hot-reloadable auth edit.
+// ---------------------------------------------------------------------------
+static bool TestHttpServerReloadPreservesLiveTopLevelPolicyTopology() {
+    const std::string iss_name = "server-owned-iss";
+    const std::string iss_url  = "https://idp.server-owned";
+
+    auto make_server_config = [&](const std::string& policy_prefix) {
+        ServerConfig cfg;
+        cfg.bind_host = "127.0.0.1";
+        cfg.bind_port = 0;
+        cfg.worker_threads = 1;
+        cfg.http2.enabled = false;
+
+        UpstreamConfig idp_upstream;
+        idp_upstream.name = "idp-pool";
+        idp_upstream.host = "127.0.0.1";
+        idp_upstream.port = 9;
+        cfg.upstreams.push_back(idp_upstream);
+
+        cfg.auth.enabled = true;
+        auto issuer = MakeStaticIssuerCfg(iss_name, iss_url);
+        issuer.upstream = "idp-pool";
+        cfg.auth.issuers[iss_name] = issuer;
+        cfg.auth.policies.push_back(
+            MakePolicy("top-policy", policy_prefix, iss_name));
+        return cfg;
+    };
+
+    ServerConfig live_cfg = make_server_config("/old/");
+    HttpServer server(live_cfg);
+    server.Get("/old/secure", [](const HttpRequest&, HttpResponse& resp) {
+        resp.Status(200).Body("old", "text/plain");
+    });
+    server.Get("/new/secure", [](const HttpRequest&, HttpResponse& resp) {
+        resp.Status(200).Body("new", "text/plain");
+    });
+
+    TestServerRunner<HttpServer> runner(server);
+
+    auto old_before = SendHttp(runner.GetPort(), "/old/secure");
+    auto new_before = SendHttp(runner.GetPort(), "/new/secure");
+    bool before_ok =
+        ExtractStatus(old_before) == 401 &&
+        ExtractStatus(new_before) == 200;
+
+    ServerConfig staged_topology_cfg = live_cfg;
+    staged_topology_cfg.auth.policies[0].applies_to = {"/new/"};
+    bool reload1_ok = server.Reload(staged_topology_cfg);
+
+    auto old_after_reload1 = SendHttp(runner.GetPort(), "/old/secure");
+    auto new_after_reload1 = SendHttp(runner.GetPort(), "/new/secure");
+    bool after_reload1_ok =
+        ExtractStatus(old_after_reload1) == 401 &&
+        ExtractStatus(new_after_reload1) == 200;
+
+    ServerConfig unrelated_live_edit_cfg = staged_topology_cfg;
+    unrelated_live_edit_cfg.auth.forward.subject_header = "X-Reloaded-Subject";
+    bool reload2_ok = server.Reload(unrelated_live_edit_cfg);
+
+    auto old_after_reload2 = SendHttp(runner.GetPort(), "/old/secure");
+    auto new_after_reload2 = SendHttp(runner.GetPort(), "/new/secure");
+    bool after_reload2_ok =
+        ExtractStatus(old_after_reload2) == 401 &&
+        ExtractStatus(new_after_reload2) == 200;
+
+    bool ok = before_ok && reload1_ok && after_reload1_ok &&
+              reload2_ok && after_reload2_ok;
+    std::string err;
+    if (!before_ok) {
+        err = "initial policy coverage wrong old=" +
+              std::to_string(ExtractStatus(old_before)) + " new=" +
+              std::to_string(ExtractStatus(new_before));
+    } else if (!reload1_ok) {
+        err = "first reload returned false";
+    } else if (!after_reload1_ok) {
+        err = "staged applies_to affected live requests after first reload "
+              "old=" + std::to_string(ExtractStatus(old_after_reload1)) +
+              " new=" + std::to_string(ExtractStatus(new_after_reload1));
+    } else if (!reload2_ok) {
+        err = "second reload returned false";
+    } else if (!after_reload2_ok) {
+        err = "staged applies_to leaked into live state after later reload "
+              "old=" + std::to_string(ExtractStatus(old_after_reload2)) +
+              " new=" + std::to_string(ExtractStatus(new_after_reload2));
+    }
+    TestFramework::RecordTest(
+        "Auth integration: HttpServer reload preserves live top-level policy topology",
+        ok, err);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // RunAllTests
 // ---------------------------------------------------------------------------
 static void RunAllTests() {
@@ -1098,6 +1194,7 @@ static void RunAllTests() {
     TestReloadForwardConfigUpdates();
     TestEmptyBearerValue();
     TestLongestPrefixWins();
+    TestHttpServerReloadPreservesLiveTopLevelPolicyTopology();
 }
 
 }  // namespace AuthIntegrationTests
