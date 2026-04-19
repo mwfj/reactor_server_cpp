@@ -349,8 +349,14 @@ static bool ReloadConfig(const std::string& config_path,
         for (const auto& u : current_config.upstreams) {
             live_names.insert(u.name);
         }
+        std::unordered_set<std::string> live_issuer_names;
+        live_issuer_names.reserve(current_config.auth.issuers.size());
+        for (const auto& [name, _] : current_config.auth.issuers) {
+            live_issuer_names.insert(name);
+        }
         try {
-            ConfigLoader::ValidateHotReloadable(new_config, live_names);
+            ConfigLoader::ValidateHotReloadable(
+                new_config, live_names, live_issuer_names);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Config reload rejected: {}", e.what());
             reopen_existing_logs();

@@ -3914,8 +3914,20 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // block otherwise-safe reloads. `upstream_configs_` is the
         // post-Start snapshot of running upstreams.
         {
+            // Scope auth-issuer validation to the running AuthManager's
+            // issuer set so a typo in an ADDED/RENAMED issuer (rejected
+            // as restart-required anyway by AuthManager::Reload) doesn't
+            // abort unrelated live-safe edits.
+            std::unordered_set<std::string> live_issuer_names;
+            if (auth_manager_) {
+                live_issuer_names.reserve(auth_config_.issuers.size());
+                for (const auto& [name, _] : auth_config_.issuers) {
+                    live_issuer_names.insert(name);
+                }
+            }
             try {
-                ConfigLoader::ValidateHotReloadable(new_config, live_names);
+                ConfigLoader::ValidateHotReloadable(
+                    new_config, live_names, live_issuer_names);
             } catch (const std::invalid_argument& e) {
                 logging::Get()->error("Reload() rejected invalid config: {}",
                                       e.what());
@@ -4133,16 +4145,22 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     //      exclusion of `auth`).
     // Same proxy.auth equality discipline documented in §11.1 —
     // circuit-breaker precedent.
+    bool auth_reload_ok = false;
     if (auth_manager_) {
         std::string auth_err;
         if (!auth_manager_->Reload(new_config.auth, auth_err)) {
             logging::Get()->warn(
                 "Auth reload skipped: {} (live state preserved)", auth_err);
         } else {
-            auth_manager_->RebuildPolicyListFromLiveSources(
-                new_config.upstreams,
-                new_config.auth.policies);
+            auth_reload_ok = true;
             auth_config_ = new_config.auth;
+            // NOTE: the policy-list rebuild is INTENTIONALLY deferred until
+            // after the upstream topology check below. Calling it here with
+            // `new_config.upstreams` would commit staged `proxy.route_prefix`
+            // values to the auth matcher while the router still serves the
+            // old routes — requests to the still-live old prefixes would lose
+            // authentication coverage. The rebuild runs once upstream_configs_
+            // reflects the reality that will actually be served this run.
         }
     }
 
@@ -4204,6 +4222,20 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
                              "field edits, if any, were applied live)");
     } else {
         upstream_configs_ = new_config.upstreams;
+    }
+
+    // Rebuild the applied auth policy list from the LIVE upstream set.
+    // When topology matched, upstream_configs_ now carries the new
+    // proxy.auth fields (reload-safe) and route_prefix (unchanged). When
+    // topology diverged, upstream_configs_ still holds the live values
+    // — inline proxy.auth edits on mismatched topology are carried
+    // alongside the staged prefix and would only re-apply on restart.
+    // Top-level auth.policies[] is live-reloadable and always reflects
+    // the NEW config.
+    if (auth_reload_ok) {
+        auth_manager_->RebuildPolicyListFromLiveSources(
+            upstream_configs_,
+            new_config.auth.policies);
     }
 
     return true;

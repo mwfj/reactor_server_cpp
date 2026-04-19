@@ -140,36 +140,7 @@ void Issuer::Start() {
     } else if (discovery_ && oidc_discovery_) {
         logging::Get()->info(
             "Issuer start (discovery) issuer={}", name_);
-        // Capture a weak_ptr so that delayed OIDC retry closures that fire
-        // after ~Issuer (which cannot drain EnQueueDelayed tasks) safely
-        // observe the Issuer is gone rather than dereferencing freed memory.
-        // shared_from_this() is valid here because Issuer is always constructed
-        // via AuthManager which holds shared_ptr<Issuer>.
-        std::weak_ptr<Issuer> weak_self = weak_from_this();
-        oidc_discovery_->Start(
-            disp_idx, gen,
-            [weak_self, gen](uint64_t cb_gen, const std::string& jwks_uri,
-                              const std::string& introspection_endpoint) {
-                auto self = weak_self.lock();
-                if (!self) return;  // Issuer was destroyed while retry was queued
-                // Generation gate: reload / Stop() bumped generation_, so
-                // a late-arriving discovery response must drop.
-                if (cb_gen != self->generation_.load(std::memory_order_acquire)) {
-                    logging::Get()->info(
-                        "OIDC discovery drop stale gen issuer={} cb_gen={} "
-                        "current={}",
-                        self->name_, cb_gen,
-                        self->generation_.load(std::memory_order_acquire));
-                    return;
-                }
-                {
-                    std::lock_guard<std::mutex> lk(self->snapshot_mtx_);
-                    self->InstallJwksUriLocked(jwks_uri, introspection_endpoint);
-                }
-                self->ready_.store(true, std::memory_order_release);
-                self->ScheduleInitialFetch(/*dispatcher_index=*/0);
-                (void)gen;
-            });
+        KickOffOidcDiscovery(disp_idx, gen);
     } else {
         logging::Get()->warn(
             "Issuer start skipped: discovery=false and jwks_uri empty "
@@ -236,7 +207,23 @@ bool Issuer::ApplyReload(const IssuerConfig& new_config, std::string& err_out) {
     if (jwks_cache_) {
         jwks_cache_->SetTtlSec(new_config.jwks_cache_sec);
     }
-    generation_.fetch_add(1, std::memory_order_release);
+    const uint64_t new_gen =
+        generation_.fetch_add(1, std::memory_order_release) + 1;
+    // If discovery is still in its retry cycle (pre-first-success), the
+    // existing oidc_discovery_->Start callback captured the OLD generation.
+    // Bumping generation_ without re-arming discovery wedges the issuer:
+    // every future on_ready_cb is rejected as stale, so the retry cycle
+    // never reaches InstallJwksUriLocked / ready_. Re-kick with the new
+    // generation. For already-ready issuers we leave the running cycle
+    // alone — re-kicking would clear ready_ momentarily and drop in-flight
+    // JWKS fetches for no benefit.
+    if (discovery_ && oidc_discovery_ &&
+        !ready_.load(std::memory_order_acquire)) {
+        logging::Get()->info(
+            "Issuer reload: re-kicking OIDC discovery issuer={} new_gen={}",
+            name_, new_gen);
+        KickOffOidcDiscovery(PickDispatcherForFetch(0), new_gen);
+    }
     logging::Get()->info(
         "Issuer reloaded issuer={} leeway_sec={} audiences={} algorithms={}",
         name_, new_config.leeway_sec, new_config.audiences.size(),
@@ -253,7 +240,19 @@ std::shared_ptr<const std::string> Issuer::LookupKeyByKid(
         const std::string& kid, size_t dispatcher_index) {
     if (!jwks_cache_) return nullptr;
     auto pem = jwks_cache_->LookupKeyByKid(kid);
-    if (pem) return pem;
+    if (pem) {
+        // Hit: honor jwks_cache_sec TTL by scheduling a background refresh
+        // when the cached copy is stale. Serve the stale key for THIS
+        // request (stale-on-error is the documented policy for healthy
+        // relays). Without this, a key rotation that keeps the same `kid`
+        // (or a revocation) would remain trusted indefinitely — the
+        // miss-only refresh path never fires for same-kid hits.
+        if (ready_.load(std::memory_order_acquire) &&
+            jwks_cache_->IsTtlExpired()) {
+            ScheduleInitialFetch(PickDispatcherForFetch(dispatcher_index));
+        }
+        return pem;
+    }
 
     // Miss: schedule a coalesced refresh on the caller's dispatcher. The
     // caller sees UNDETERMINED for THIS request; once the refresh lands,
@@ -290,6 +289,42 @@ size_t Issuer::PickDispatcherForFetch(size_t caller_dispatcher_index) const noex
         return caller_dispatcher_index;
     }
     return 0;
+}
+
+void Issuer::KickOffOidcDiscovery(size_t dispatcher_index, uint64_t generation) {
+    if (!oidc_discovery_) return;
+    // Capture a weak_ptr so delayed retry closures that fire after
+    // ~Issuer (EnQueueDelayed tasks the Dispatcher cannot drain) safely
+    // observe the Issuer is gone rather than dereferencing freed memory.
+    // shared_from_this() is valid because Issuer is always constructed
+    // via AuthManager which holds shared_ptr<Issuer>.
+    std::weak_ptr<Issuer> weak_self = weak_from_this();
+    oidc_discovery_->Start(
+        dispatcher_index, generation,
+        [weak_self](uint64_t cb_gen, const std::string& jwks_uri,
+                     const std::string& introspection_endpoint) {
+            auto self = weak_self.lock();
+            if (!self) return;  // Issuer was destroyed while retry was queued.
+            // Generation gate: reload / Stop() bumped generation_, so a
+            // late-arriving discovery response from a superseded cycle
+            // must drop. The restart path in ApplyReload calls this
+            // function again with the NEW generation, so the fresh cycle
+            // passes the gate.
+            if (cb_gen != self->generation_.load(std::memory_order_acquire)) {
+                logging::Get()->info(
+                    "OIDC discovery drop stale gen issuer={} cb_gen={} "
+                    "current={}",
+                    self->name_, cb_gen,
+                    self->generation_.load(std::memory_order_acquire));
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(self->snapshot_mtx_);
+                self->InstallJwksUriLocked(jwks_uri, introspection_endpoint);
+            }
+            self->ready_.store(true, std::memory_order_release);
+            self->ScheduleInitialFetch(/*dispatcher_index=*/0);
+        });
 }
 
 void Issuer::InstallJwksUriLocked(const std::string& uri,

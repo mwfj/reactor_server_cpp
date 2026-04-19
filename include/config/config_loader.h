@@ -76,9 +76,17 @@ public:
     //
     // Throws std::invalid_argument with a message identifying the
     // offending upstream and field.
+    // `live_upstream_names` scopes per-upstream CB validation to running
+    // pools. `live_issuer_names` scopes the auth-issuer range/allowlist
+    // checks to issuers that actually exist in the running AuthManager —
+    // a typo in an ADDED or RENAMED issuer would be rejected by
+    // AuthManager::Reload as restart-required anyway, so failing the whole
+    // hot-reload on it would block unrelated live-safe edits. Empty set is
+    // safe: "no live issuers" skips the per-issuer loop entirely.
     static void ValidateHotReloadable(
         const ServerConfig& config,
-        const std::unordered_set<std::string>& live_upstream_names);
+        const std::unordered_set<std::string>& live_upstream_names,
+        const std::unordered_set<std::string>& live_issuer_names = {});
 
     // Validate inline per-proxy auth blocks (structural checks +
     // enforcement-not-yet-wired gate). Runs the SAME per-upstream auth

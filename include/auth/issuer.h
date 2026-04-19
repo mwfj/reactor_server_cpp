@@ -167,6 +167,13 @@ class Issuer : public std::enable_shared_from_this<Issuer> {
     // LookupKeyByKid's refresh trigger use the same policy.
     size_t PickDispatcherForFetch(size_t caller_dispatcher_index) const noexcept;
 
+    // Kick off (or restart) OIDC discovery with a fresh generation. Used
+    // by Start() and by ApplyReload() when reload bumps the generation
+    // while discovery is still retrying — without a restart, the old
+    // retry's callback carries a stale `cb_gen` and gets rejected by the
+    // ready-callback's generation gate, wedging the issuer permanently.
+    void KickOffOidcDiscovery(size_t dispatcher_index, uint64_t generation);
+
     // Apply the effective jwks_uri (from discovery or static override)
     // into the snapshot. Called under snapshot_mtx_ — used by both Start
     // (static override) and the OIDC discovery completion callback.

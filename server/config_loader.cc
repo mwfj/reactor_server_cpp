@@ -1092,7 +1092,8 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
 
 void ConfigLoader::ValidateHotReloadable(
         const ServerConfig& config,
-        const std::unordered_set<std::string>& live_upstream_names) {
+        const std::unordered_set<std::string>& live_upstream_names,
+        const std::unordered_set<std::string>& live_issuer_names) {
     // Mirrors the circuit_breaker validation block in Validate().
     // Kept in lock-step with that block — any rule added there for a
     // hot-reloadable field must be added here too, or the SIGHUP
@@ -1204,11 +1205,18 @@ void ConfigLoader::ValidateHotReloadable(
     // fields (issuer_url, mode, upstream, discovery) are excluded — they are
     // rejected by Issuer::ApplyReload before touching live state.
     //
-    // This block runs for ALL issuers in the new config (not just live ones)
-    // because AuthManager::Reload rejects topology changes (add/remove issuer)
-    // before applying any field update — if the issuer count matches, every
-    // entry in the new config corresponds to a live issuer.
+    // Scoping: only validate issuers that EXIST in the running AuthManager.
+    // A new/renamed issuer has no live peer to apply to and will be rejected
+    // as restart-required by AuthManager::Reload; failing the whole hot-
+    // reload on a typo in such a staged-only issuer would block unrelated
+    // live-safe edits (e.g. rate_limit tuning, CB thresholds). The full
+    // startup Validate catches those typos when the operator restarts.
+    // An empty live set means "no live issuers" — skip the whole block.
     for (const auto& [name, ic] : config.auth.issuers) {
+        if (!live_issuer_names.empty() &&
+            live_issuer_names.count(name) == 0) {
+            continue;
+        }
         const std::string ctx = "auth.issuers." + name;
         if (ic.leeway_sec < 0) {
             throw std::invalid_argument(ctx + ".leeway_sec must be >= 0");

@@ -228,13 +228,20 @@ void OidcDiscovery::Start(size_t dispatcher_index,
                         schedule_retry();
                         return;
                     }
-                    ready_flag->store(true, std::memory_order_release);
                     logging::Get()->info(
                         "OIDC discovery ok issuer={} has_introspection={}",
                         issuer_name, !intro_endpoint.empty());
+                    // Flip ready_flag AFTER on_ready_cb runs so this
+                    // OidcDiscovery::IsReady() cannot briefly report true
+                    // for a cycle whose callback the Issuer's own
+                    // generation gate would reject. Issuer::ready_ is the
+                    // authoritative admission flag; this ordering makes
+                    // OidcDiscovery's own IsReady() safely consistent with
+                    // it for any future consumer that reads this flag.
                     if (on_ready_cb) {
                         on_ready_cb(generation, jwks_uri, intro_endpoint);
                     }
+                    ready_flag->store(true, std::memory_order_release);
                 },
                 token);
         };
