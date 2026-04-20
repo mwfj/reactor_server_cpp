@@ -278,12 +278,21 @@ void ProxyTransaction::Start() {
     sse_stream_ = false;
     ClearPendingRetryable5xxResponse();
 
-    // Take a stack-local ForwardConfig() snapshot. `shared_ptr` keeps the
-    // config alive for the duration of RewriteRequest even if a
-    // concurrent Reload swaps the AuthManager's internal pointer.
-    // §3.4 snapshot discipline.
+    // Take a stack-local ForwardConfig() snapshot, but ONLY when
+    // enforcement is live. The IsEnforcing() gate is at the CALLER
+    // (design §4.7 / §6.1 / §14 step 21): `ForwardConfig()` returns
+    // the stored snapshot unconditionally even when IsEnforcing()=false
+    // (AuthManager may exist in a "disabled but constructed" state so
+    // SIGHUP can flip `auth.enabled: false → true` without a restart).
+    // Unconditional snapshotting would let a staged
+    // `forward.preserve_authorization=false` strip `Authorization`,
+    // or let any identity-inject / undetermined-header-strip fire on
+    // proxy hops whose auth is OFF — leaking overlay semantics onto
+    // routes the operator has not yet opted into. The `shared_ptr`
+    // keeps the snapshot alive for the duration of RewriteRequest even
+    // if a concurrent Reload swaps the AuthManager's internal pointer.
     std::shared_ptr<const AUTH_NAMESPACE::AuthForwardConfig> fwd_snap;
-    if (auth_manager_) {
+    if (auth_manager_ && auth_manager_->IsEnforcing()) {
         fwd_snap = auth_manager_->ForwardConfig();
     }
 

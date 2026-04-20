@@ -363,8 +363,18 @@ VerifyResult JwtVerifier::Verify(const std::string& token,
     // union of operator-configured forward.claims_to_headers keys built
     // by AuthManager from its ForwardConfig snapshot; PopulateFromPayload
     // copies exactly those keys into ctx.claims for outbound injection.
+    //
+    // AuthContext::issuer carries the VERIFIED `iss` claim (the token's
+    // actual issuer URL), NOT the configured local alias. jwt-cpp's
+    // with_issuer(ic.issuer_url) pre-verification has already bound the
+    // payload's `iss` to the configured URL, so PopulateFromPayload's
+    // `ctx.issuer = payload["iss"]` write is the validated value that
+    // downstream consumers (HeaderRewriter's issuer_header, handlers
+    // reading req.auth.issuer) must see. Overwriting with the local
+    // alias name (e.g. "google" vs "https://accounts.google.com") would
+    // publish the wrong identity to upstreams and break anyone verifying
+    // issuer URLs server-side.
     PopulateFromPayload(payload, claim_keys, out_ctx);
-    out_ctx.issuer = issuer_name;  // normalize to configured name, not URL
 
     // Scope check against policy.required_scopes.
     if (!HasRequiredScopes(out_ctx.scopes, policy.required_scopes)) {

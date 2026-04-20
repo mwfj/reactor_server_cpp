@@ -349,11 +349,12 @@ static bool ReloadConfig(const std::string& config_path,
         for (const auto& u : current_config.upstreams) {
             live_names.insert(u.name);
         }
-        std::unordered_set<std::string> live_issuer_names;
-        live_issuer_names.reserve(current_config.auth.issuers.size());
-        for (const auto& [name, _] : current_config.auth.issuers) {
-            live_issuer_names.insert(name);
-        }
+        // Live scope sourced from the running AuthManager, NOT
+        // `current_config.auth.issuers` (which carries staged-but-
+        // deferred topology after `current_config = new_config`
+        // below). See AuthManager::LiveIssuerNames for the rationale.
+        std::unordered_set<std::string> live_issuer_names =
+            server.LiveAuthIssuerNames();
         try {
             ConfigLoader::ValidateHotReloadable(
                 new_config, live_names, live_issuer_names);

@@ -264,6 +264,17 @@ Issuer* AuthManager::GetIssuer(const std::string& issuer_name) {
     return it->second.get();
 }
 
+std::unordered_set<std::string> AuthManager::LiveIssuerNames() const {
+    // Topology-stable post-Start → lock-free copy. See header for the
+    // full thread-safety contract.
+    std::unordered_set<std::string> out;
+    out.reserve(issuers_.size());
+    for (const auto& kv : issuers_) {
+        out.insert(kv.first);
+    }
+    return out;
+}
+
 bool AuthManager::InvokeMiddleware(const HttpRequest& req,
                                      HttpResponse& resp) {
     // Master enforcement switch — `auth.enabled: false` passes through even

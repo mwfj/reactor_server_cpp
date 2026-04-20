@@ -1275,13 +1275,14 @@ void ConfigLoader::ValidateHotReloadable(
     }
 
     // Policies referencing staged-only issuers are NOT rejected here — they
-    // are handled in the reload merge by preserving the live issuers list
-    // for the affected policy and flagging topology_changed (see
-    // HttpServer::MergeTopLevelAuthPoliciesPreservingLiveTopology). Hard-
-    // rejecting here would turn a restart-only auth topology change into
-    // a hard abort that blocks unrelated live-safe edits, contradicting
-    // the documented warn-and-defer contract for auth topology changes
-    // (docs/configuration.md §Auth hot-reload + §11.2 reload sequencing).
+    // are handled in the reload merge via whole-policy defer: the ENTIRE
+    // live policy is preserved for the affected identity (not just the
+    // issuers list) and topology_changed is flagged (see
+    // HttpServer::MergeTopLevelAuthPoliciesPreservingLiveTopology and
+    // design §11.2 step 4 / §18.5). Hard-rejecting here would turn a
+    // restart-only auth topology change into a hard abort that blocks
+    // unrelated live-safe edits, contradicting the documented warn-and-
+    // defer contract for auth topology changes.
 }
 
 void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {

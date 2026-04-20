@@ -270,37 +270,58 @@ struct TopLevelAuthPolicyMergeResult {
 };
 
 // Preserve the LIVE top-level auth policy topology across SIGHUP. Top-level
-// policy fields (enabled / issuers / required_scopes / required_audience /
-// on_undetermined / realm) are live-reloadable, but the path topology
-// (`applies_to` plus the set of policy names) is not — changing either can
-// move auth coverage away from paths the running router still serves, or
-// silently add enforcement to paths a future restart has not yet committed.
+// policy fields (enabled / applies_to / issuers / required_scopes /
+// required_audience / on_undetermined / realm) are live-reloadable per
+// design §11.2 step 4 — BY IDENTITY, using stable `name` (required +
+// uniqueness enforced by the top-level-policy validator).
 //
-// The merge runs per POLICY IDENTITY (stable `name`, required by the
-// top-level-policy validator). Index-based merging was incorrect: a
-// restart-only edit (add policy C) or even a pure reorder would fall back
-// to the entire live vector and silently suppress reloadable edits on the
-// unchanged identities A/B.
+// The hazardous case is a policy edit whose staged `issuers[]` references
+// an issuer that isn't in the LIVE AuthManager::issuers_ map (issuer add
+// is restart-required). Operators typically edit staged peer fields
+// (`required_audience`, `required_scopes`, `on_undetermined`, `realm`,
+// `applies_to`, `enabled`) TO MATCH the new issuer in the same reload.
+// A partial-apply that took the staged peers while pinning issuers to
+// the live list would apply new-issuer-tuned rules to old-issuer traffic
+// → 401/403 on previously-working tokens. Design §11.2 step 4 / §18.5
+// mandate **whole-policy defer** for that case: preserve the ENTIRE
+// live policy for that identity, not just the issuers list.
 //
-// Rules:
-//   - Live policy with a matching staged name: reloadable fields take
-//     effect; `applies_to` held at live (mark topology_changed when
-//     they diverge).
-//   - Live policy with NO staged match (removed/renamed in staged): keep
-//     live so running coverage stays put; mark topology_changed.
-//   - Staged policy with NO live match (added name): defer to restart
-//     (mark topology_changed) — do NOT add to the merged vector,
-//     otherwise the runtime enforces auth on paths a future restart
-//     hasn't yet committed to.
+// Rules (per design §11.2 step 4):
+//   - Edit (name matches live): if staged.issuers[] ⊆ live_issuer_names,
+//     commit staged wholesale (all reloadable fields take effect). If
+//     ANY staged issuer is non-live, preserve the ENTIRE live policy
+//     and flag topology_changed.
+//   - Removed / renamed (live name absent in staged): preserve live so
+//     running coverage stays; flag topology_changed.
+//   - Added (staged name absent in live): if staged.issuers[] ⊆
+//     live_issuer_names, commit live (append to merged vector). If any
+//     staged issuer is non-live, defer the SINGLE policy add (don't
+//     enter merged vector) and flag topology_changed. Per-add gating —
+//     unrelated adds whose issuers are all live still apply immediately.
 //
-// Live vector ORDER is preserved so longest-prefix matcher tie-breaking
-// stays stable across the reload.
+// Live vector ORDER is preserved for matched identities; new live-safe
+// adds append at the end. Longest-prefix matching is the sole runtime
+// tie-breaker (design §3.2), so vector order only affects inert cases.
 static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopology(
         const std::vector<AUTH_NAMESPACE::AuthPolicy>& live_policies,
         const std::vector<AUTH_NAMESPACE::AuthPolicy>& staged_policies,
         const std::unordered_set<std::string>& live_issuer_names) {
     TopLevelAuthPolicyMergeResult out;
     out.policies.reserve(live_policies.size());
+
+    auto issuers_all_live = [&](const AUTH_NAMESPACE::AuthPolicy& p) {
+        // Fail-closed when there is no live auth runtime but the policy
+        // names issuers: the policy can't match anything safely, so
+        // whole-policy defer (matches "never fail open" — rules file).
+        // Empty staged issuers are fine — a policy with no issuer refs
+        // matches nothing anyway; no identity-check is meaningful.
+        if (p.issuers.empty()) return true;
+        if (live_issuer_names.empty()) return false;
+        for (const auto& iss : p.issuers) {
+            if (live_issuer_names.count(iss) == 0) return false;
+        }
+        return true;
+    };
 
     // Index staged by name for O(1) lookup. Duplicate names are rejected
     // at ConfigLoader::Validate time (uniqueness is load-bearing for this
@@ -313,7 +334,13 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
         staged_by_name.emplace(p.name, &p);
     }
 
+    // Build live_names alongside the edit walk so the ADDS loop below
+    // doesn't need a second O(N) pass over live_policies.
+    std::unordered_set<std::string> live_names;
+    live_names.reserve(live_policies.size());
+
     for (const auto& live : live_policies) {
+        live_names.insert(live.name);
         auto it = staged_by_name.find(live.name);
         if (it == staged_by_name.end()) {
             // Staged removed or renamed this policy. Removal/rename is
@@ -323,54 +350,32 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
             continue;
         }
         const auto& staged = *it->second;
-        AUTH_NAMESPACE::AuthPolicy merged = staged;
-        merged.name = live.name;  // stable identity across edits
-        if (live.applies_to != staged.applies_to) {
-            // applies_to is topology — keep live so the matcher's path
-            // coverage matches what the router actually serves.
+        if (!issuers_all_live(staged)) {
+            // Whole-policy defer (design §11.2 step 4 / §18.5). Applying
+            // ANY staged field (peer or issuers) would risk applying
+            // new-issuer-tuned rules (required_audience, scopes, etc.)
+            // to old-issuer traffic. Preserve the ENTIRE live policy
+            // for this identity and flag for the operator warn.
             out.topology_changed = true;
-            merged.applies_to = live.applies_to;
+            out.policies.push_back(live);
+            continue;
         }
-        // Issuers-list reference check. If the staged issuers list names
-        // any issuer that is NOT in the LIVE AuthManager::issuers_ map
-        // (e.g. operator staged a new issuer + updated this policy to
-        // reference it, but issuer topology is restart-required), the
-        // matcher would look up the non-live name at request time and
-        // fail every match. Treat as a topology change for THIS policy:
-        // keep the live issuers list and flag topology_changed for the
-        // operator warn. Reloadable peers on the same policy (enabled,
-        // required_scopes, required_audience, on_undetermined, realm)
-        // still take effect. Empty live_issuer_names means no live auth
-        // runtime — skip the check (the whole merge is a no-op then).
-        if (!live_issuer_names.empty()) {
-            bool issuers_list_is_live = true;
-            for (const auto& iss : staged.issuers) {
-                if (live_issuer_names.count(iss) == 0) {
-                    issuers_list_is_live = false;
-                    break;
-                }
-            }
-            if (!issuers_list_is_live) {
-                out.topology_changed = true;
-                merged.issuers = live.issuers;
-            }
-        }
+        AUTH_NAMESPACE::AuthPolicy merged = staged;
+        merged.name = live.name;
         out.policies.push_back(std::move(merged));
     }
 
-    // Detect ADDED policies (present in staged, absent in live). Topology-
-    // required — flag for the warn log; the merged vector intentionally
-    // does NOT include them.
-    if (!out.topology_changed) {
-        std::unordered_set<std::string> live_names;
-        live_names.reserve(live_policies.size());
-        for (const auto& p : live_policies) live_names.insert(p.name);
-        for (const auto& p : staged_policies) {
-            if (live_names.count(p.name) == 0) {
-                out.topology_changed = true;
-                break;
-            }
+    // ADDS (staged name absent in live). Per-add gating: live-safe adds
+    // commit immediately; adds whose issuers reference a non-live issuer
+    // defer per-policy. Runs regardless of whether the EDIT pass already
+    // flagged topology_changed — per-add deferral is independent.
+    for (const auto& p : staged_policies) {
+        if (live_names.count(p.name) != 0) continue;
+        if (!issuers_all_live(p)) {
+            out.topology_changed = true;
+            continue;
         }
+        out.policies.push_back(p);
     }
 
     return out;
@@ -570,6 +575,11 @@ bool HttpServer::HasPendingH1Output() {
         if (conn->IsShutdownExempt()) return true;
     }
     return false;
+}
+
+std::unordered_set<std::string> HttpServer::LiveAuthIssuerNames() const {
+    if (!auth_manager_) return {};
+    return auth_manager_->LiveIssuerNames();
 }
 
 void HttpServer::MarkServerReady() {

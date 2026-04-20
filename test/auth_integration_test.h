@@ -1076,12 +1076,24 @@ static bool TestLongestPrefixWins() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 21: HttpServer::Reload preserves live top-level policy topology
-// Rationale: changing auth.policies[].applies_to is staged restart-only.
-// A live reload must keep protecting the old prefix even across a later
-// unrelated hot-reloadable auth edit.
+// Test 21: HttpServer::Reload applies top-level policy applies_to edits live
+// Rationale: design §11.2 step 4 / §11 reloadable-fields summary classify
+// top-level `auth.policies[].applies_to` as **live-reloadable**. Unlike
+// inline `proxy.auth`, top-level policies have no coupling to
+// `proxy.route_prefix`; their applies_to protects arbitrary paths including
+// programmatic routes, so it is NOT a restart-required topology field.
+//
+// A prior implementation pinned applies_to at the live value on edit — an
+// over-correction that treated all policy edits as topology changes. This
+// test pins the corrected semantic: editing applies_to on an identity
+// whose issuers are all live takes effect on the live matcher, and a
+// subsequent unrelated hot-reloadable edit doesn't undo it either.
+// Whole-policy defer applies only when staged issuers reference a
+// non-live issuer — that case is covered at the merge-function unit
+// level below, not reachable here (AuthManager::Reload rejects topology
+// deltas before the merge runs in HttpServer::Reload).
 // ---------------------------------------------------------------------------
-static bool TestHttpServerReloadPreservesLiveTopLevelPolicyTopology() {
+static bool TestHttpServerReloadAppliesAppliesToLive() {
     const std::string iss_name = "server-owned-iss";
     const std::string iss_url  = "https://idp.server-owned";
 
@@ -1118,31 +1130,39 @@ static bool TestHttpServerReloadPreservesLiveTopLevelPolicyTopology() {
 
     TestServerRunner<HttpServer> runner(server);
 
+    // Before reload: /old/ is protected by the policy (401 unauthenticated),
+    // /new/ is unprotected (200).
     auto old_before = SendHttp(runner.GetPort(), "/old/secure");
     auto new_before = SendHttp(runner.GetPort(), "/new/secure");
     bool before_ok =
         ExtractStatus(old_before) == 401 &&
         ExtractStatus(new_before) == 200;
 
-    ServerConfig staged_topology_cfg = live_cfg;
-    staged_topology_cfg.auth.policies[0].applies_to = {"/new/"};
-    bool reload1_ok = server.Reload(staged_topology_cfg);
+    // Reload with applies_to moved from /old/ to /new/. All staged issuer
+    // refs are live, so the whole edit commits live.
+    ServerConfig applies_to_edit_cfg = live_cfg;
+    applies_to_edit_cfg.auth.policies[0].applies_to = {"/new/"};
+    bool reload1_ok = server.Reload(applies_to_edit_cfg);
 
+    // After reload: coverage has MOVED. /old/ is now unprotected (200),
+    // /new/ is now protected (401).
     auto old_after_reload1 = SendHttp(runner.GetPort(), "/old/secure");
     auto new_after_reload1 = SendHttp(runner.GetPort(), "/new/secure");
     bool after_reload1_ok =
-        ExtractStatus(old_after_reload1) == 401 &&
-        ExtractStatus(new_after_reload1) == 200;
+        ExtractStatus(old_after_reload1) == 200 &&
+        ExtractStatus(new_after_reload1) == 401;
 
-    ServerConfig unrelated_live_edit_cfg = staged_topology_cfg;
+    // A subsequent unrelated live edit (forward.subject_header) must not
+    // roll back the applies_to change from reload #1.
+    ServerConfig unrelated_live_edit_cfg = applies_to_edit_cfg;
     unrelated_live_edit_cfg.auth.forward.subject_header = "X-Reloaded-Subject";
     bool reload2_ok = server.Reload(unrelated_live_edit_cfg);
 
     auto old_after_reload2 = SendHttp(runner.GetPort(), "/old/secure");
     auto new_after_reload2 = SendHttp(runner.GetPort(), "/new/secure");
     bool after_reload2_ok =
-        ExtractStatus(old_after_reload2) == 401 &&
-        ExtractStatus(new_after_reload2) == 200;
+        ExtractStatus(old_after_reload2) == 200 &&
+        ExtractStatus(new_after_reload2) == 401;
 
     bool ok = before_ok && reload1_ok && after_reload1_ok &&
               reload2_ok && after_reload2_ok;
@@ -1152,20 +1172,24 @@ static bool TestHttpServerReloadPreservesLiveTopLevelPolicyTopology() {
               std::to_string(ExtractStatus(old_before)) + " new=" +
               std::to_string(ExtractStatus(new_before));
     } else if (!reload1_ok) {
-        err = "first reload returned false";
+        err = "applies_to-edit reload returned false";
     } else if (!after_reload1_ok) {
-        err = "staged applies_to affected live requests after first reload "
-              "old=" + std::to_string(ExtractStatus(old_after_reload1)) +
-              " new=" + std::to_string(ExtractStatus(new_after_reload1));
+        err = "applies_to edit did not take effect live "
+              "(old expected 200 got " +
+              std::to_string(ExtractStatus(old_after_reload1)) +
+              ", new expected 401 got " +
+              std::to_string(ExtractStatus(new_after_reload1)) + ")";
     } else if (!reload2_ok) {
         err = "second reload returned false";
     } else if (!after_reload2_ok) {
-        err = "staged applies_to leaked into live state after later reload "
-              "old=" + std::to_string(ExtractStatus(old_after_reload2)) +
-              " new=" + std::to_string(ExtractStatus(new_after_reload2));
+        err = "subsequent unrelated reload rolled back applies_to "
+              "(old expected 200 got " +
+              std::to_string(ExtractStatus(old_after_reload2)) +
+              ", new expected 401 got " +
+              std::to_string(ExtractStatus(new_after_reload2)) + ")";
     }
     TestFramework::RecordTest(
-        "Auth integration: HttpServer reload preserves live top-level policy topology",
+        "Auth integration: HttpServer reload applies top-level applies_to live",
         ok, err);
     return ok;
 }
@@ -1194,7 +1218,7 @@ static void RunAllTests() {
     TestReloadForwardConfigUpdates();
     TestEmptyBearerValue();
     TestLongestPrefixWins();
-    TestHttpServerReloadPreservesLiveTopLevelPolicyTopology();
+    TestHttpServerReloadAppliesAppliesToLive();
 }
 
 }  // namespace AuthIntegrationTests

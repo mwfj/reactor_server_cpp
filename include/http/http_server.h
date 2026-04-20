@@ -169,6 +169,12 @@ public:
         return upstream_manager_.get();
     }
 
+    // Forwarder to `AuthManager::LiveIssuerNames` — see that docstring
+    // for the "live runtime vs staged config" rationale and the
+    // reload-driver-thread contract. Returns empty when auth is not
+    // configured. Out-of-line because AuthManager is forward-declared.
+    std::unordered_set<std::string> LiveAuthIssuerNames() const;
+
 public:
     // Thread-local pointer to the active ResourcePusher for the sync request
     // currently executing on this thread. Installed by the H1 / H2 sync

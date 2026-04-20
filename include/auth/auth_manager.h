@@ -7,6 +7,7 @@
 #include "auth/auth_result.h"
 #include "auth/issuer.h"
 #include "config/server_config.h"
+#include <unordered_set>
 // <atomic>, <memory>, <mutex>, <unordered_map>, <vector> via common.h
 
 class UpstreamManager;
@@ -125,6 +126,26 @@ class AuthManager {
     // handlers that drive InvokeMiddleware manually. Returns nullptr when
     // the name is unknown.
     Issuer* GetIssuer(const std::string& issuer_name);
+
+    // Snapshot of the LIVE issuer name set — the keys of `issuers_` at
+    // call time. Used by the reload-validation path to scope per-issuer
+    // `ValidateHotReloadable` checks and by the top-level-policy merge
+    // to distinguish live issuer refs from staged-only ones.
+    //
+    // Source of truth is the running AuthManager, NOT `ServerConfig`:
+    // `main.cc::ReloadConfig` overwrites `current_config` with staged
+    // auth topology even when a SIGHUP issuer-topology edit was warned
+    // and deferred. Reading `current_config.auth.issuers` on the NEXT
+    // SIGHUP would then treat staged-only issuers as live and hard-
+    // reject unrelated reload-safe edits. Sourcing from `issuers_`
+    // keeps the reload scope in lock-step with what's actually running.
+    //
+    // Thread-safety: `issuers_` topology is mutated only by Start/Stop/
+    // Reload on the main/signal thread (topology deltas are rejected by
+    // `Reload` — §11.2 step 2 — so keys are stable post-Start). Callers
+    // on that same thread see a consistent view; dispatcher threads
+    // must not call this. Safe and lock-free in the reload-driver path.
+    std::unordered_set<std::string> LiveIssuerNames() const;
 
  private:
     // Extract the bearer token from an Authorization header. Returns an
