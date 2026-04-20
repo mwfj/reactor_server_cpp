@@ -2172,6 +2172,87 @@ void TestConfigLoaderValidatesIntrospectionKnobs() {
 }
 
 // -----------------------------------------------------------------------------
+// ConfigLoader::ValidateHotReloadable — `mode=introspection` is rejected
+// UNCONDITIONALLY on the SIGHUP path, including for staged-only issuers that
+// are not yet in the live AuthManager. Design §5.3 / §18.5: the check must
+// survive the master-gate lift and run even when live_issuer_names is empty
+// or does not contain the offender. Without this, a staged-only introspection
+// issuer would slip past SIGHUP validation, get deferred as "restart-only
+// topology change", and then fail the next startup Validate — the exact
+// "valid on SIGHUP, fails on restart" asymmetry this validator exists to
+// prevent.
+// -----------------------------------------------------------------------------
+void TestValidateHotReloadableRejectsIntrospectionUnconditionally() {
+    std::cout << "\n[TEST] ValidateHotReloadable rejects introspection unconditionally..."
+              << std::endl;
+    try {
+        // Parse-only load — LoadFromString does not call Validate, so the
+        // mode=introspection config survives into the ServerConfig struct
+        // and reaches ValidateHotReloadable directly.
+        ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "staged-idp": {
+                        "issuer_url": "https://staged.example",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://staged.example/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E"
+                        }
+                    }
+                }
+            }
+        })");
+
+        auto expect_throw = [&](const std::unordered_set<std::string>& live_upstreams,
+                                 const std::unordered_set<std::string>& live_issuers,
+                                 const std::string& case_label) {
+            try {
+                ConfigLoader::ValidateHotReloadable(cfg, live_upstreams,
+                                                    live_issuers);
+                throw std::runtime_error(
+                    case_label + ": ValidateHotReloadable accepted "
+                    "mode=introspection but should have rejected it");
+            } catch (const std::invalid_argument& e) {
+                std::string msg = e.what();
+                if (msg.find("mode=\"introspection\" is deferred to Phase 3")
+                    == std::string::npos) {
+                    throw std::runtime_error(
+                        case_label + ": threw but message missing Phase-3 "
+                        "deferral phrase; got: " + msg);
+                }
+            }
+        };
+
+        // Case 1: staged-only issuer, empty live_issuer_names. The mode
+        // gate must fire even though the live-scope filter would otherwise
+        // skip this issuer.
+        expect_throw({"x"}, /*live_issuers=*/{}, "staged-only issuer");
+
+        // Case 2: live_issuer_names doesn't contain the offender (it's an
+        // unrelated issuer name). Same expectation — the mode check runs
+        // before / outside the live-scope filter.
+        expect_throw({"x"}, /*live_issuers=*/{"other-idp"},
+                     "offender absent from live set");
+
+        // Case 3: issuer IS live. Check still fires — startup-symmetric.
+        expect_throw({"x"}, /*live_issuers=*/{"staged-idp"}, "live issuer");
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ValidateHotReloadable rejects introspection unconditionally",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ValidateHotReloadable rejects introspection unconditionally",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // ConfigLoader::Validate — inline auth rejects patterned route_prefix
 // (review P1). AUTH_NAMESPACE::FindPolicyForPath does byte-prefix matching; a proxy
 // with /api/:v/users/*path cannot be matched via the auth overlay because
@@ -4131,6 +4212,7 @@ inline void RunAllTests() {
     TestConfigLoaderRejectsProxyConnectionInAuthForward();
     TestConfigLoaderRejectsEnabledPolicyWithoutAppliesTo();
     TestConfigLoaderValidatesIntrospectionKnobs();
+    TestValidateHotReloadableRejectsIntrospectionUnconditionally();
     TestConfigLoaderRejectsPatternedInlineAuthPrefix();
     TestConfigLoaderRequiresIssuerUpstream();
     TestConfigLoaderValidatesHeaderNameTchar();

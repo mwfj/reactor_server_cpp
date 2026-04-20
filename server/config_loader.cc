@@ -1215,6 +1215,24 @@ void ConfigLoader::ValidateHotReloadable(
     // touch these fields, skip the block entirely (same pattern as the
     // live_upstream_names-scoped CB loop above). The `count(name) == 0`
     // test naturally skips every entry when the set is empty.
+    //
+    // EXCEPTION: `mode == "introspection"` is rejected UNCONDITIONALLY for
+    // every issuer in the staged config, live or not. Per design §5.3 /
+    // §18.5, introspection mode is deferred to Phase 3. Scoping the reject
+    // to live-only would mean a staged-only new issuer with
+    // mode=introspection passes SIGHUP validation silently (it's "restart-
+    // required topology" from the reload path's POV), the operator sees
+    // "reload OK", and the next server restart fails startup Validate.
+    // That's exactly the "valid on SIGHUP, fails on restart" asymmetry the
+    // hot-reload validator exists to prevent.
+    for (const auto& [name, ic] : config.auth.issuers) {
+        if (ic.mode == "introspection") {
+            throw std::invalid_argument(
+                "auth.issuers." + name +
+                ".mode=\"introspection\" is deferred to Phase 3. "
+                "Use mode=\"jwt\" with a JWKS-backed issuer in v1.");
+        }
+    }
     for (const auto& [name, ic] : config.auth.issuers) {
         if (live_issuer_names.count(name) == 0) {
             continue;
@@ -1252,13 +1270,8 @@ void ConfigLoader::ValidateHotReloadable(
                     "HS*/none/PS*/auto are deferred per design spec §15)");
             }
         }
-        // mode=introspection is deferred to Phase 3. Same rejection as
-        // startup — see ParseIssuerConfig for rationale.
-        if (ic.mode == "introspection") {
-            throw std::invalid_argument(
-                ctx + ".mode=\"introspection\" is deferred to Phase 3. "
-                "Use mode=\"jwt\" with a JWKS-backed issuer in v1.");
-        }
+        // mode=introspection is rejected unconditionally in the pre-pass
+        // above — no per-issuer check needed here.
     }
 
     // Policies referencing staged-only issuers are NOT rejected here — they
