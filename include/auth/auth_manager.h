@@ -26,7 +26,7 @@ class UpstreamHttpClient;
 // Thread-safety envelope:
 // - `InvokeMiddleware`, `ForwardConfig`, `SnapshotAll` — ANY dispatcher.
 // - `RegisterPolicy`, `Start`, `Stop`, `Reload`,
-//   `RebuildPolicyListFromLiveSources` — main / signal thread only;
+//   `CommitPolicyAndEnforcement` — main / signal thread only;
 //   internally serialised by `reload_mtx_`.
 //
 // Ownership is the canonical UPPER_SNAKE_CASE ownership tree from §3.4:
@@ -64,7 +64,7 @@ class AuthManager {
 
     // Register a policy against one or more path prefixes. Idempotent on
     // duplicate (prefix, policy_name) pairs. MUST be called before Start
-    // returns OR via `RebuildPolicyListFromLiveSources` during reload —
+    // returns OR via `CommitPolicyAndEnforcement` during reload —
     // post-Start ad-hoc calls log a warn + no-op to prevent races.
     void RegisterPolicy(std::vector<std::string> prefixes, AuthPolicy policy);
 
@@ -85,12 +85,24 @@ class AuthManager {
     // an error message in `err_out`. Never throws.
     bool Reload(const AuthConfig& new_config, std::string& err_out);
 
-    // Rebuild the AppliedPolicyList from live upstreams + new top-level
-    // policies and atomic-swap it. Called by HttpServer::Reload after
-    // AuthManager::Reload has applied the other reloadable fields.
-    void RebuildPolicyListFromLiveSources(
+    // Final reload cutover — rebuild the AppliedPolicyList from live
+    // upstreams + merged top-level policies AND flip `master_enabled_`
+    // under the SAME lock, in that order (policy swap first, then the
+    // release-store on `master_enabled_`). Called by HttpServer::Reload
+    // AFTER AuthManager::Reload() has applied issuer + forward snapshots
+    // AND the upstream topology check has completed, so `new_upstreams`
+    // reflects the prefixes the router will actually serve this run.
+    //
+    // Single publication edge: readers observing `master_enabled_=true`
+    // transitively see the new policy list, new forward snapshot, and
+    // new issuer snapshots. Without this atomic cutover, a `false → true`
+    // reload that also edited policies would expose a window where
+    // requests run with enforcement ON against the OLD policy list.
+    // See design doc §11.2 step 4 + §18.5 for the rationale.
+    void CommitPolicyAndEnforcement(
         const std::vector<UpstreamConfig>& new_upstreams,
-        const std::vector<AuthPolicy>& new_top_level_policies);
+        const std::vector<AuthPolicy>& new_top_level_policies,
+        bool new_master_enabled);
 
     // Snapshot of runtime counters + per-issuer views.
     SnapshotView SnapshotAll() const;
@@ -123,7 +135,7 @@ class AuthManager {
 
     // Build an AppliedPolicyList from live+top-level sources. Used by
     // both RegisterPolicy-driven startup (reused here) and by
-    // RebuildPolicyListFromLiveSources.
+    // CommitPolicyAndEnforcement.
     static std::shared_ptr<const AppliedPolicyList>
     BuildAppliedPolicyList(
         const std::vector<UpstreamConfig>& upstreams,

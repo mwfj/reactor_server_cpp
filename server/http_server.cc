@@ -4264,7 +4264,7 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     //      are rejected with a reason — we log and skip the policy rebuild
     //      in that case to keep live state consistent with the rejected
     //      staged config.
-    //   2. RebuildPolicyListFromLiveSources rebuilds the applied policy
+    //   2. CommitPolicyAndEnforcement rebuilds the applied policy
     //      list from live upstreams + new top-level policies and
     //      atomic-swaps. Always called on success so inline proxy.auth
     //      edits take effect live (matching the ProxyConfig::operator==
@@ -4381,10 +4381,18 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     // Top-level auth.policies[] contributes the live-applied subset:
     // reloadable fields on stable identities take effect, while staged
     // name/applies_to topology remains deferred until restart.
+    // Final atomic cutover: policy rebuild + master_enabled_ release-store
+    // under the same lock inside AuthManager::CommitPolicyAndEnforcement.
+    // This runs AFTER the upstream topology check so `upstream_configs_`
+    // reflects the prefixes the router will actually serve, and it closes
+    // the `false → true` reload window that a separate master-enabled
+    // flip in AuthManager::Reload would have left open. See design doc
+    // §11.2 step 4 + §18.5.
     if (auth_reload_ok) {
-        auth_manager_->RebuildPolicyListFromLiveSources(
+        auth_manager_->CommitPolicyAndEnforcement(
             upstream_configs_,
-            auth_config_.policies);
+            auth_config_.policies,
+            new_config.auth.enabled);
     }
 
     return true;

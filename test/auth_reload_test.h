@@ -499,8 +499,8 @@ static bool TestRebuildPolicyListFromLiveSources() {
     p1.issuers    = {iss_name};
 
     std::vector<UpstreamConfig> empty_upstreams;
-    mgr->RebuildPolicyListFromLiveSources(
-        empty_upstreams, {p0, p1});
+    mgr->CommitPolicyAndEnforcement(
+        empty_upstreams, {p0, p1}, /*new_master_enabled=*/true);
 
     auto snap1 = mgr->SnapshotAll();
     mgr->Stop();

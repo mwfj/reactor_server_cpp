@@ -498,9 +498,10 @@ static bool TestRebuildPolicyList() {
     // Rebuild with a new top-level policy.
     AUTH_NAMESPACE::AuthPolicy p_new = MakePolicy("new", {"/new/"}, {"a"}, true, "deny");
     p_new.applies_to = {"/new/"};
-    mgr->RebuildPolicyListFromLiveSources(
+    mgr->CommitPolicyAndEnforcement(
         {},        // new_upstreams
-        {p_new});  // new_top_level_policies
+        {p_new},   // new_top_level_policies
+        true);     // new_master_enabled — mirrors auth.enabled at cutover
 
     auto snap_after = mgr->SnapshotAll();
     // Policy list was replaced. snap_after.policy_count should reflect new_top_level_policies only.

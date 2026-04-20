@@ -203,34 +203,42 @@ bool AuthManager::Reload(const AuthConfig& new_config, std::string& err_out) {
         forward_ = std::make_shared<const AuthForwardConfig>(new_config.forward);
     }
 
-    // Update the master enforcement switch. This is the live-reloadable
-    // `auth.enabled` documented in the config schema — flipping true→false
-    // makes InvokeMiddleware pass-through; false→true re-engages
-    // enforcement without a restart (middleware is installed whenever
-    // AuthManager exists, see HttpServer::MarkServerReady).
-    master_enabled_.store(new_config.enabled, std::memory_order_release);
-
-    // Policy list rebuild is driven by HttpServer::Reload via
-    // RebuildPolicyListFromLiveSources after this returns.
+    // master_enabled_ is DELIBERATELY NOT touched here. The final cutover
+    // happens in CommitPolicyAndEnforcement, called by HttpServer::Reload
+    // after the upstream topology check. Flipping master_enabled_ here
+    // would reopen a `false → true` reload window: between this return
+    // and the separate policy rebuild, requests could run with
+    // enforcement ON against the OLD policy list.
     generation_.fetch_add(1, std::memory_order_release);
 
     logging::Get()->info(
-        "AuthManager reloaded enabled={} issuers={} gen={}",
+        "AuthManager reloaded (issuer+forward) enabled_pending={} issuers={} gen={}",
         new_config.enabled, issuers_.size(),
         generation_.load(std::memory_order_acquire));
     return true;
 }
 
-void AuthManager::RebuildPolicyListFromLiveSources(
+void AuthManager::CommitPolicyAndEnforcement(
         const std::vector<UpstreamConfig>& new_upstreams,
-        const std::vector<AuthPolicy>& new_top_level_policies) {
+        const std::vector<AuthPolicy>& new_top_level_policies,
+        bool new_master_enabled) {
     auto rebuilt = BuildAppliedPolicyList(new_upstreams,
                                             new_top_level_policies);
-    std::lock_guard<std::mutex> lk(snapshot_mtx_);
-    policies_ = rebuilt;
+    // Single atomic cutover under snapshot_mtx_: policy swap FIRST, then
+    // the master_enabled_ release-store. The release-store is the final
+    // publication edge — a reader observing master_enabled_=true sees the
+    // fresh policies_ pointer too. Ordering matters: flipping the enable
+    // flag before the policy swap would expose the window this method
+    // exists to close.
+    {
+        std::lock_guard<std::mutex> lk(snapshot_mtx_);
+        policies_ = rebuilt;
+        master_enabled_.store(new_master_enabled,
+                               std::memory_order_release);
+    }
     logging::Get()->info(
-        "AuthManager applied policy list rebuilt entries={}",
-        policies_ ? policies_->size() : 0);
+        "AuthManager commit: policies={} enforcing={}",
+        rebuilt ? rebuilt->size() : 0, new_master_enabled);
 }
 
 AuthManager::SnapshotView AuthManager::SnapshotAll() const {
