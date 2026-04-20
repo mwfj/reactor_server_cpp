@@ -1211,10 +1211,12 @@ void ConfigLoader::ValidateHotReloadable(
     // reload on a typo in such a staged-only issuer would block unrelated
     // live-safe edits (e.g. rate_limit tuning, CB thresholds). The full
     // startup Validate catches those typos when the operator restarts.
-    // An empty live set means "no live issuers" — skip the whole block.
+    // Empty live set means "no live auth runtime" — no apply path can
+    // touch these fields, skip the block entirely (same pattern as the
+    // live_upstream_names-scoped CB loop above). The `count(name) == 0`
+    // test naturally skips every entry when the set is empty.
     for (const auto& [name, ic] : config.auth.issuers) {
-        if (!live_issuer_names.empty() &&
-            live_issuer_names.count(name) == 0) {
+        if (live_issuer_names.count(name) == 0) {
             continue;
         }
         const std::string ctx = "auth.issuers." + name;
@@ -1258,6 +1260,15 @@ void ConfigLoader::ValidateHotReloadable(
                 "Use mode=\"jwt\" with a JWKS-backed issuer in v1.");
         }
     }
+
+    // Policies referencing staged-only issuers are NOT rejected here — they
+    // are handled in the reload merge by preserving the live issuers list
+    // for the affected policy and flagging topology_changed (see
+    // HttpServer::MergeTopLevelAuthPoliciesPreservingLiveTopology). Hard-
+    // rejecting here would turn a restart-only auth topology change into
+    // a hard abort that blocks unrelated live-safe edits, contradicting
+    // the documented warn-and-defer contract for auth topology changes
+    // (docs/configuration.md §Auth hot-reload + §11.2 reload sequencing).
 }
 
 void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
@@ -2126,7 +2137,15 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             }
         }
 
-        // Top-level policy validation.
+        // Top-level policy validation. Also enforce NAME UNIQUENESS across
+        // top-level policies — the merge at HttpServer::Reload keys by
+        // `name`, so a duplicate staged name would silently bind two live
+        // policies to the same staged entry (first-wins in the lookup
+        // map), letting the wrong reloadable fields leak into the other
+        // identity. Non-empty + unique is the invariant the reload path
+        // needs; enforce it here at load time.
+        std::unordered_set<std::string> top_level_policy_names;
+        top_level_policy_names.reserve(config.auth.policies.size());
         for (size_t i = 0; i < config.auth.policies.size(); ++i) {
             const auto& p = config.auth.policies[i];
             const std::string ctx =
@@ -2158,6 +2177,14 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     "their parent upstream; top-level entries have none "
                     "and operator-visible logs/metrics need a stable "
                     "identifier — array index is unstable across edits)");
+            }
+            if (!top_level_policy_names.insert(p.name).second) {
+                throw std::invalid_argument(
+                    ctx + ".name '" + p.name + "' is duplicated by another "
+                    "top-level policy. Top-level policy names MUST be "
+                    "unique — the reload merge uses `name` as identity, "
+                    "so a collision would silently bind two live policies "
+                    "to the same staged entry on the next SIGHUP.");
             }
             if (p.on_undetermined != "deny" && p.on_undetermined != "allow") {
                 throw std::invalid_argument(

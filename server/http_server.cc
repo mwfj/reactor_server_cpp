@@ -297,13 +297,15 @@ struct TopLevelAuthPolicyMergeResult {
 // stays stable across the reload.
 static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopology(
         const std::vector<AUTH_NAMESPACE::AuthPolicy>& live_policies,
-        const std::vector<AUTH_NAMESPACE::AuthPolicy>& staged_policies) {
+        const std::vector<AUTH_NAMESPACE::AuthPolicy>& staged_policies,
+        const std::unordered_set<std::string>& live_issuer_names) {
     TopLevelAuthPolicyMergeResult out;
     out.policies.reserve(live_policies.size());
 
     // Index staged by name for O(1) lookup. Duplicate names are rejected
-    // at validation time; first-wins here is a safe defensive subset for
-    // any malformed input that slips through.
+    // at ConfigLoader::Validate time (uniqueness is load-bearing for this
+    // merge — without it a collision would silently bind two live
+    // policies to the same staged entry).
     std::unordered_map<std::string, const AUTH_NAMESPACE::AuthPolicy*>
         staged_by_name;
     staged_by_name.reserve(staged_policies.size());
@@ -328,6 +330,30 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
             // coverage matches what the router actually serves.
             out.topology_changed = true;
             merged.applies_to = live.applies_to;
+        }
+        // Issuers-list reference check. If the staged issuers list names
+        // any issuer that is NOT in the LIVE AuthManager::issuers_ map
+        // (e.g. operator staged a new issuer + updated this policy to
+        // reference it, but issuer topology is restart-required), the
+        // matcher would look up the non-live name at request time and
+        // fail every match. Treat as a topology change for THIS policy:
+        // keep the live issuers list and flag topology_changed for the
+        // operator warn. Reloadable peers on the same policy (enabled,
+        // required_scopes, required_audience, on_undetermined, realm)
+        // still take effect. Empty live_issuer_names means no live auth
+        // runtime — skip the check (the whole merge is a no-op then).
+        if (!live_issuer_names.empty()) {
+            bool issuers_list_is_live = true;
+            for (const auto& iss : staged.issuers) {
+                if (live_issuer_names.count(iss) == 0) {
+                    issuers_list_is_live = false;
+                    break;
+                }
+            }
+            if (!issuers_list_is_live) {
+                out.topology_changed = true;
+                merged.issuers = live.issuers;
+            }
         }
         out.policies.push_back(std::move(merged));
     }
@@ -4254,9 +4280,19 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
                 "Auth reload skipped: {} (live state preserved)", auth_err);
         } else {
             auth_reload_ok = true;
+            // Build the live issuer name set once — the merge uses it to
+            // detect staged policies that reference non-live issuers (a
+            // restart-required delta; the merge preserves live issuers
+            // list and flags topology_changed for the operator warn).
+            std::unordered_set<std::string> live_issuer_names;
+            live_issuer_names.reserve(auth_config_.issuers.size());
+            for (const auto& [name, _] : auth_config_.issuers) {
+                live_issuer_names.insert(name);
+            }
             top_level_policy_merge =
                 MergeTopLevelAuthPoliciesPreservingLiveTopology(
-                    auth_config_.policies, new_config.auth.policies);
+                    auth_config_.policies, new_config.auth.policies,
+                    live_issuer_names);
             auth_config_ = BuildLiveAppliedAuthConfig(
                 auth_config_, new_config.auth,
                 top_level_policy_merge.policies);
