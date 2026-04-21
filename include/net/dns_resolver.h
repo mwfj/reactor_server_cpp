@@ -178,6 +178,14 @@ public:
     void SetResolverForTesting(
         std::function<ResolvedEndpoint(const ResolveRequest&)> fn);
 
+    // Test-only override for the queue cap. Production always uses
+    // `kMaxQueuedItems` (10 000) — realistic deployments never approach
+    // that value. Tests that need to exercise the saturation-sweep path
+    // with a small synthetic queue (e.g. 4 items) set this before the
+    // first ResolveAsync. Not exposed through DnsConfig — this is not
+    // an operator knob, just a unit-test hook.
+    void SetMaxQueuedItemsForTesting(std::size_t cap);
+
     // Static pure helpers — stateless; safe from any thread.
     static bool IsValidHostOrIpLiteral(const std::string& s);
     static bool IsIpLiteral(const std::string& s);
@@ -202,6 +210,11 @@ private:
                                            // until EnsurePoolStarted runs.
     std::once_flag             pool_started_;
     DnsConfig                  config_;
+    // Instance override of kMaxQueuedItems. Defaults to the class
+    // constant; only SetMaxQueuedItemsForTesting changes it. Read under
+    // state_->mtx inside ResolveAsync, so the test-only setter acquires
+    // the same lock to avoid a data race.
+    std::size_t                max_queued_items_ = kMaxQueuedItems;
 
     // Lazy pool spawn (§5.2.9). Called from ResolveAsync on the first
     // non-literal request. Throws std::runtime_error on pthread_create

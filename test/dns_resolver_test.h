@@ -137,6 +137,13 @@ inline void TestNormalizeHostToBare() {
         ok = ok && !DnsResolver::NormalizeHostToBare("[::1", &out);
         ok = ok && !DnsResolver::NormalizeHostToBare("[::1]:80", &out);
         ok = ok && !DnsResolver::NormalizeHostToBare("[notanip]", &out);
+        // Review-round: brackets are RFC 3986 §3.2.2 IPv6-only. IPv4
+        // literals inside brackets are malformed operator input and
+        // must reject — previously accepted via the permissive
+        // ParseLiteral helper.
+        ok = ok && !DnsResolver::NormalizeHostToBare("[127.0.0.1]", &out);
+        ok = ok && !DnsResolver::NormalizeHostToBare("[0.0.0.0]", &out);
+        ok = ok && !DnsResolver::NormalizeHostToBare("[192.168.1.1]", &out);
         Record("DnsResolver: NormalizeHostToBare", ok);
     } catch (const std::exception& e) {
         Record("DnsResolver: NormalizeHostToBare", false, e.what());
@@ -629,7 +636,7 @@ inline void TestResolveRequestExplicitFamilyOverridesConfig() {
 // ---------- Review-round P2: ParseHostPort rejects non-IP in brackets ----------
 
 inline void TestParseHostPortRejectsNonIpBrackets() {
-    std::cout << "\n[TEST] DnsResolver: ParseHostPort rejects non-IP brackets..."
+    std::cout << "\n[TEST] DnsResolver: ParseHostPort rejects non-IPv6 brackets..."
               << std::endl;
     try {
         std::string host;
@@ -642,6 +649,15 @@ inline void TestParseHostPortRejectsNonIpBrackets() {
         ok = ok && !DnsResolver::ParseHostPort("[notanip]", &host, &port);
         ok = ok && !DnsResolver::ParseHostPort("[not-an-ip]:8080", &host, &port);
         ok = ok && !DnsResolver::ParseHostPort("[]", &host, &port);
+
+        // Must REJECT: bracketed IPv4 literal (RFC 3986 §3.2.2 reserves
+        // brackets for IPv6 / IPvFuture only). Review-round fix — the
+        // previous round's ParseLiteral-based check accepted these.
+        ok = ok && !DnsResolver::ParseHostPort("[127.0.0.1]", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("[127.0.0.1]:443", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("[0.0.0.0]:8080", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("[192.168.1.1]", &host, &port);
+
         // Malformed bracketed forms that were already rejected — pin
         // the pre-existing behavior here too.
         ok = ok && !DnsResolver::ParseHostPort("[::1", &host, &port);
@@ -670,9 +686,9 @@ inline void TestParseHostPortRejectsNonIpBrackets() {
         ok = ok && DnsResolver::ParseHostPort("127.0.0.1:80", &host, &port)
                  && host == "127.0.0.1" && port == 80;
 
-        Record("DnsResolver: ParseHostPort rejects non-IP brackets", ok);
+        Record("DnsResolver: ParseHostPort rejects non-IPv6 brackets", ok);
     } catch (const std::exception& e) {
-        Record("DnsResolver: ParseHostPort rejects non-IP brackets",
+        Record("DnsResolver: ParseHostPort rejects non-IPv6 brackets",
                 false, e.what());
     }
 }
@@ -828,6 +844,137 @@ inline void TestQueuedItemExpiresDuringWorkerStall() {
     }
 }
 
+// ---------- Review-round: full sweep at saturation catches non-monotone expiry ----------
+
+inline void TestMixedTimeoutSaturationTriggersFullSweep() {
+    std::cout << "\n[TEST] DnsResolver: mixed-timeout saturation triggers full sweep..."
+              << std::endl;
+    try {
+        // Scenario the reviewer described: queue is AT capacity with a
+        // mixed-deadline mix where the FRONT is not yet expired but the
+        // body IS. Front-only sweep can't evict anything (front is
+        // live); without the full-sweep-at-saturation fix, fresh
+        // submissions would hit spurious "resolver saturated" even
+        // though most queued work is long dead.
+        //
+        // Uses the test-only SetMaxQueuedItemsForTesting hook so we can
+        // exercise the saturation path at 4-item cap instead of
+        // production's 10000.
+        struct Gate {
+            std::mutex m;
+            std::condition_variable cv;
+            bool release = false;
+        };
+        auto gate = std::make_shared<Gate>();
+
+        DnsResolver resolver(MakeFastConfig(1));   // single worker
+        resolver.SetMaxQueuedItemsForTesting(4);   // small cap for test
+
+        resolver.SetResolverForTesting([gate](const ResolveRequest& req) {
+            std::unique_lock<std::mutex> lk(gate->m);
+            gate->cv.wait(lk, [&] { return gate->release; });
+            ResolvedEndpoint r;
+            r.host = req.host; r.port = req.port; r.tag = req.tag;
+            r.addr = InetAddr("10.0.0.1", req.port);
+            return r;
+        });
+
+        // A: picked up by the single worker, wedges on the gate.
+        auto fut_a = resolver.ResolveAsync(
+            MakeReq("host.a", 80, std::chrono::milliseconds(5000)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // B_long: FRONT of queue, long timeout. Front-only sweep cannot
+        // evict B_long — if the fix were front-only the saturation
+        // check below would still reject fresh traffic.
+        auto fut_b_long = resolver.ResolveAsync(
+            MakeReq("host.b_long", 80, std::chrono::milliseconds(5000)));
+
+        // Fill to cap with SHORT-timeout stragglers.
+        auto fut_c = resolver.ResolveAsync(
+            MakeReq("host.c", 80, std::chrono::milliseconds(30)));
+        auto fut_d = resolver.ResolveAsync(
+            MakeReq("host.d", 80, std::chrono::milliseconds(30)));
+        auto fut_e = resolver.ResolveAsync(
+            MakeReq("host.e", 80, std::chrono::milliseconds(30)));
+
+        // Queue is now at the test cap: [B_long (5s), C (30ms),
+        // D (30ms), E (30ms)] — 4 items, max=4.
+
+        // Wait past the short-timeout deadlines. B_long stays live.
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+
+        // F: fresh submission. Flow under the fix:
+        //   - ResolveAsync acquires state_->mtx.
+        //   - Front-sweep: B_long is live → stop (no evictions).
+        //   - Saturation check: queue.size()==4 >= max==4 → enter
+        //     full-sweep branch.
+        //   - Full sweep: walk queue; C/D/E are expired → set_value
+        //     EAI_AGAIN, remove; B_long stays.
+        //   - queue.size()==1 < 4 → push F. F is queued, NOT rejected.
+        auto fut_f = resolver.ResolveAsync(
+            MakeReq("host.f", 80, std::chrono::milliseconds(5000)));
+
+        // F must be queued (future PENDING), not synchronously rejected
+        // with EAI_AGAIN "resolver saturated". If the full-sweep fix
+        // were absent, the call would have returned an immediate-ready
+        // saturated error future.
+        const bool f_queued =
+            fut_f.wait_for(std::chrono::milliseconds(10))
+                != std::future_status::ready;
+
+        // Release gate so the wedged worker drains A, then B_long, F.
+        {
+            std::lock_guard<std::mutex> lk(gate->m);
+            gate->release = true;
+        }
+        gate->cv.notify_all();
+
+        // Wait for F to complete (drains entire queue once gate released).
+        const bool f_completes =
+            fut_f.wait_for(std::chrono::milliseconds(1000))
+                == std::future_status::ready;
+        ResolvedEndpoint res_f;
+        if (f_completes) res_f = fut_f.get();
+
+        // Verify C/D/E were evicted with the queue-time timeout marker.
+        auto check_expired = [](std::future<ResolvedEndpoint>& fut) {
+            if (fut.wait_for(std::chrono::milliseconds(50))
+                    != std::future_status::ready) return false;
+            auto r = fut.get();
+            return r.error && r.error_code == EAI_AGAIN &&
+                   r.error_message.find("queue-time exceeded") !=
+                       std::string::npos;
+        };
+        const bool c_evicted = check_expired(fut_c);
+        const bool d_evicted = check_expired(fut_d);
+        const bool e_evicted = check_expired(fut_e);
+
+        // A and B_long must have succeeded (worker drained them after
+        // gate release).
+        (void)fut_a.wait_for(std::chrono::milliseconds(500));
+        (void)fut_b_long.wait_for(std::chrono::milliseconds(500));
+
+        bool ok = f_queued;
+        ok = ok && f_completes;
+        ok = ok && !res_f.error;          // F succeeded, not saturated
+        ok = ok && c_evicted;
+        ok = ok && d_evicted;
+        ok = ok && e_evicted;
+        Record("DnsResolver: mixed-timeout saturation triggers full sweep",
+                ok,
+                "f_queued=" + std::to_string(f_queued) +
+                " f_completes=" + std::to_string(f_completes) +
+                " f_err=" + std::to_string(res_f.error_code) +
+                " c_evicted=" + std::to_string(c_evicted) +
+                " d_evicted=" + std::to_string(d_evicted) +
+                " e_evicted=" + std::to_string(e_evicted));
+    } catch (const std::exception& e) {
+        Record("DnsResolver: mixed-timeout saturation triggers full sweep",
+                false, e.what());
+    }
+}
+
 // ---------- Queue-time deadline short-circuit ----------
 
 inline void TestQueueTimeDeadlineShortCircuits() {
@@ -881,6 +1028,7 @@ inline void RunAllTests() {
     TestParseHostPortRejectsNonIpBrackets();
     TestDnsResolverCtorRejectsNonPositiveInflight();
     TestQueuedItemExpiresDuringWorkerStall();
+    TestMixedTimeoutSaturationTriggersFullSweep();
     TestQueueTimeDeadlineShortCircuits();
 }
 

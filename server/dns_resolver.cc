@@ -67,6 +67,17 @@ bool ParseLiteral(const std::string& s) {
     return false;
 }
 
+// RFC 3986 §3.2.2 IP-literal grammar: brackets are reserved for IPv6
+// (and IPvFuture — not supported here). IPv4 literals MUST appear
+// unbracketed. Review-round fix: ParseHostPort and NormalizeHostToBare
+// use THIS helper for the bracketed branch rather than the permissive
+// ParseLiteral (which also accepted bracketed IPv4 like "[127.0.0.1]").
+bool ParseIpv6Literal(const std::string& s) {
+    if (s.empty()) return false;
+    unsigned char buf[sizeof(struct in6_addr)];
+    return ::inet_pton(AF_INET6, s.c_str(), buf) == 1;
+}
+
 // RFC 952 + 1123 hostname label grammar. Accepts one trailing '.' for
 // absolute FQDN (v0.30 round-29 P2). Rejects two-or-more trailing dots,
 // labels longer than 63 chars, totals longer than 253 chars, pure
@@ -192,19 +203,17 @@ bool DnsResolver::ParseHostPort(const std::string& s,
                                  std::string* host, int* port) {
     if (s.empty() || host == nullptr) return false;
     if (s.front() == '[') {
-        // RFC 3986 §3.2.2: bracketed authority is reserved for IP
-        // literals (IP-literal = "[" (IPv6address / IPvFuture) "]").
-        // Hostnames like [example.com] are malformed. Review-round P2
-        // fix: validate the inner token parses as an IP literal BEFORE
-        // returning success — otherwise a caller using ParseHostPort as
-        // an authority validator would silently accept operator/config
-        // typos like [example.com]:443 or [notanip] as if they were
-        // valid hostnames. `NormalizeHostToBare` already enforces this
-        // for its own bracketed branch; ParseHostPort now matches.
+        // RFC 3986 §3.2.2 strict form: IP-literal = "[" (IPv6address /
+        // IPvFuture) "]". Hostnames AND IPv4 literals are not permitted
+        // inside brackets. This is a stricter variant of the previous
+        // round's fix — previously we used `ParseLiteral` (accepts both
+        // AF_INET and AF_INET6), which incorrectly accepted
+        // `[127.0.0.1]:443`. Callers using ParseHostPort as an authority
+        // validator must be able to reject such malformed input.
         const auto rbracket = s.find(']');
         if (rbracket == std::string::npos) return false;
         const std::string inner = s.substr(1, rbracket - 1);
-        if (!ParseLiteral(inner)) return false;
+        if (!ParseIpv6Literal(inner)) return false;
         *host = inner;
         if (rbracket + 1 == s.size()) {
             if (port) *port = 0;
@@ -257,11 +266,17 @@ bool DnsResolver::NormalizeHostToBare(const std::string& in, std::string* out) {
     if (out == nullptr) return false;
     if (in.empty()) return false;
     if (in.front() == '[') {
+        // RFC 3986 §3.2.2 strict: brackets are ONLY for IPv6 literals.
+        // Review-round fix: IPv4 literals in brackets (e.g.
+        // `[127.0.0.1]`) are malformed operator input and must reject.
+        // Previously used `ParseLiteral` (IPv4-or-IPv6) — swapped to
+        // `ParseIpv6Literal` to match the authority-validation
+        // tightening in `ParseHostPort`.
         const auto rbracket = in.find(']');
         if (rbracket == std::string::npos) return false;
         if (rbracket + 1 != in.size()) return false;   // no trailing content
         const std::string inner = in.substr(1, rbracket - 1);
-        if (!ParseLiteral(inner)) return false;
+        if (!ParseIpv6Literal(inner)) return false;
         *out = inner;
         return true;
     }
@@ -603,13 +618,10 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
         //       a sustained DNS stall with ongoing submissions triggers
         //       spurious "resolver saturated" errors for fresh traffic.
         //
-        // Deadlines are approximately monotone in queue order — same-
-        // config callers submit with the same timeout over time, so
-        // front items are oldest and most likely to have expired.
-        // Front-only sweep: O(k) where k is the number of expired
-        // items at the front; zero cost when none are expired.
-        // Non-monotone stragglers (mixed-timeout callers) eventually
-        // bubble to the front and get evicted on subsequent submissions.
+        // Deadlines are approximately monotone in queue order when all
+        // callers use the same timeout (e.g. DnsConfig default). Front-
+        // only sweep is O(k) where k is the number of expired items at
+        // the front; zero cost when nothing is expired. Common case.
         const auto sweep_now = std::chrono::steady_clock::now();
         while (!state_->queue.empty() &&
                state_->queue.front().deadline <= sweep_now) {
@@ -622,13 +634,51 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
             state_->queue.pop_front();
         }
 
-        if (state_->queue.size() >= kMaxQueuedItems) {
-            // Bounded queue — synchronous saturation per §5.2.2.
-            std::promise<ResolvedEndpoint> p;
-            auto saturated = p.get_future();
-            p.set_value(MakeReadyErrorResult(
-                item.req, EAI_AGAIN, "resolver saturated"));
-            return saturated;
+        if (state_->queue.size() >= max_queued_items_) {
+            // Review-round fix (full saturation sweep). Mixed-timeout
+            // callers can leave a queue like `[5s, 50ms, 50ms, ...]`
+            // where the front is NOT yet expired but most of the body
+            // is. The front-only sweep above cannot catch these; a full
+            // pass would. This branch runs ONLY under saturation
+            // pressure — i.e. only when we are about to reject — so the
+            // amortised O(N) cost is paid in the one place where we
+            // would otherwise return spurious "resolver saturated" for
+            // queue slots already dead.
+            //
+            // Manual iteration (not std::remove_if) so the set_value
+            // side effect on each evicted promise is unambiguous per
+            // the C++ standard — remove_if's contract about predicate
+            // side effects is technically permissive but pedantically
+            // dodgy for move-only types like std::promise.
+            auto write = state_->queue.begin();
+            for (auto read = state_->queue.begin();
+                 read != state_->queue.end(); ++read) {
+                if (read->deadline <= sweep_now) {
+                    try {
+                        read->promise.set_value(MakeTimeoutResult(
+                            read->req, "queue-time exceeded deadline"));
+                    } catch (const std::future_error&) {}
+                    // Skip — don't move to write position. read is
+                    // left moved-from / destructible at erase-time.
+                } else {
+                    if (write != read) {
+                        *write = std::move(*read);
+                    }
+                    ++write;
+                }
+            }
+            state_->queue.erase(write, state_->queue.end());
+
+            if (state_->queue.size() >= max_queued_items_) {
+                // Still full after evicting every expired item — the
+                // queue is genuinely backlogged with live work. Return
+                // synchronous saturation per §5.2.2.
+                std::promise<ResolvedEndpoint> p;
+                auto saturated = p.get_future();
+                p.set_value(MakeReadyErrorResult(
+                    item.req, EAI_AGAIN, "resolver saturated"));
+                return saturated;
+            }
         }
         state_->queue.push_back(std::move(item));
     }
@@ -718,6 +768,16 @@ void DnsResolver::SetResolverForTesting(
     std::function<ResolvedEndpoint(const ResolveRequest&)> fn) {
     std::lock_guard<std::mutex> lk(state_->mtx);
     state_->test_seam = std::move(fn);
+}
+
+void DnsResolver::SetMaxQueuedItemsForTesting(std::size_t cap) {
+    // Acquire state_->mtx to mutually exclude with ResolveAsync's
+    // queue-size check — `max_queued_items_` is a plain size_t, and
+    // without the lock a concurrent read in ResolveAsync on another
+    // thread would race. Tests call this before the first resolve, so
+    // contention is zero in practice.
+    std::lock_guard<std::mutex> lk(state_->mtx);
+    max_queued_items_ = cap;
 }
 
 }  // namespace net_dns
