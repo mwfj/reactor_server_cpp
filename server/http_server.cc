@@ -294,18 +294,22 @@ struct TopLevelAuthPolicyMergeResult {
 //   - Removed (live name absent in staged): drop from the live matcher.
 //     Removal is the operator's explicit intent and is live-reloadable
 //     per the design; no topology_changed flag.
-//     EXCEPTION: if the SAME reload has any deferred ADD (staged add
-//     whose issuers reference a non-live issuer), preserve ALL removed
-//     live policies for this cycle and flag topology_changed. Rationale:
-//     operators frequently rename during issuer-migration reloads, and
-//     dropping the old policy while the add defers would silently open
-//     an auth-coverage gap until restart. Pure removals (no deferred
-//     add in the cycle) still drop as usual.
+//     EXCEPTION (prefix-scoped): if the same reload has a DEFERRED add
+//     (enabled, issuers-non-live) whose applies_to shares a prefix with
+//     the removed live policy, preserve THAT live policy (+ topology_
+//     changed). Rationale: operators frequently rename during issuer-
+//     migration reloads, and dropping the old policy while the add
+//     defers would silently open an auth-coverage gap on that prefix
+//     until restart. Unrelated removals on different prefixes still
+//     drop. Scope is per-prefix (not blanket) so an operator who
+//     removes /admin/ and separately stages an unrelated deferred add
+//     on /other/ sees /admin/ actually dropped.
 //   - Renamed: surfaces here as live-removal of the old name + add of
-//     the new name. With the EXCEPTION above, the live matcher keeps
-//     old-name coverage whenever the add's issuers aren't live yet;
-//     when the add CAN go live, the old name drops and the new name
-//     commits — net matcher swap with unchanged coverage.
+//     the new name. Under the prefix-scoped preserve, the live matcher
+//     keeps old-name coverage whenever the add's issuers aren't live
+//     yet AND both policies share a prefix; when the add CAN go live,
+//     the old name drops and the new name commits — net matcher swap
+//     with unchanged coverage.
 //   - Added (staged name absent in live): if staged.issuers[] ⊆
 //     live_issuer_names, commit live (append to merged vector). If any
 //     staged issuer is non-live, defer the SINGLE policy add (don't
@@ -353,20 +357,42 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
     live_names.reserve(live_policies.size());
     for (const auto& live : live_policies) live_names.insert(live.name);
 
-    // Pre-pass: detect whether the reload has any DEFERRED add — a staged
-    // policy whose name is absent from live AND whose issuers reference a
-    // non-live issuer. The EDIT pass below uses this as a "migration in
-    // progress" signal: if an add couldn't go live this cycle, removing
-    // the OLD live policy (which the operator may have renamed as part
-    // of the same migration) would leave the protected prefix completely
-    // unprotected until restart. Per design §11.2 step 4, restart-required
-    // auth-topology edits MUST warn-and-defer while keeping the live
-    // matcher intact — never silently open a gap.
-    bool any_add_deferred = false;
+    // Pre-pass: collect applies_to prefixes from DEFERRED ENABLED adds.
+    // A deferred add = staged policy whose name is absent from live AND
+    // whose issuers reference a non-live issuer. These prefixes are the
+    // ones where a concurrent REMOVE of a live policy would leave an
+    // auth-coverage gap — the operator's replacement can't go live this
+    // cycle, so dropping the old entry on the same prefix would silently
+    // unprotect it until restart.
+    //
+    // Disabled deferred adds don't participate — they never enter the
+    // matcher, so no preserve is needed to avoid a gap.
+    //
+    // Scope is PER-PREFIX (not blanket): an unrelated removed policy on
+    // a different prefix still drops as intended by the operator. This
+    // also prevents shadowing: a new live-commitable add on the same
+    // prefix as a removed policy can't be overshadowed by the old
+    // preserved entry, because the removed entry only preserves when a
+    // DEFERRED add shares its prefix (and the new live add committed
+    // this cycle is in the output ahead of any preserve).
+    std::unordered_set<std::string> deferred_add_prefixes;
     for (const auto& p : staged_policies) {
         if (live_names.count(p.name) != 0) continue;  // edit, handled later
-        if (!issuers_all_live(p)) { any_add_deferred = true; break; }
+        if (!p.enabled) continue;                      // inert, no matcher role
+        if (issuers_all_live(p)) continue;             // live-committable add
+        for (const auto& pref : p.applies_to) {
+            deferred_add_prefixes.insert(pref);
+        }
     }
+
+    auto live_policy_overlaps_deferred =
+        [&](const AUTH_NAMESPACE::AuthPolicy& live_p) {
+            if (deferred_add_prefixes.empty()) return false;
+            for (const auto& pref : live_p.applies_to) {
+                if (deferred_add_prefixes.count(pref)) return true;
+            }
+            return false;
+        };
 
     // EDIT pass.
     for (const auto& live : live_policies) {
@@ -374,16 +400,14 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
         if (it == staged_by_name.end()) {
             // Staged removed or renamed this policy. Default: drop
             // (live-reloadable removal per design §11.2 step 4). BUT if
-            // the same reload has a deferred ADD, treat this as a
-            // migration-in-progress and preserve the live entry to
-            // avoid a coverage gap. Pure removals (no deferred add in
-            // the same cycle) still drop. `any_add_deferred` signals
-            // "there's a staged replacement that can't go live this
-            // cycle" — conservative but safe: the cost of a spurious
-            // preserve on unrelated concurrent edits is one extra
-            // reload after restart, while the cost of dropping is a
-            // silent auth-coverage gap.
-            if (any_add_deferred) {
+            // the SAME reload has a DEFERRED ADD covering ONE OF THIS
+            // POLICY's prefixes, treat this as a migration-in-progress
+            // for that prefix and preserve the live entry to avoid a
+            // coverage gap. The prefix-scoped check replaces an earlier
+            // blanket preserve that kept unrelated removals alive and
+            // could also shadow new live-commitable adds on the same
+            // prefix.
+            if (live_policy_overlaps_deferred(live)) {
                 out.topology_changed = true;
                 out.policies.push_back(live);
             }

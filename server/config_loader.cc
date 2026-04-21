@@ -1283,16 +1283,24 @@ void ConfigLoader::ValidateHotReloadable(
         // above — no per-issuer check needed here.
     }
 
-    // Auth.forward and top-level policy structural validation. Both
-    // are hard-reject here so the SIGHUP path matches startup behavior:
-    // `AuthManager::Reload` + `CommitPolicyAndEnforcement` publish the
-    // forward snapshot AND the applied-policy list immediately, so a
-    // duplicate-name / reserved-header / bad-shape staged edit cannot
-    // be allowed to reach Commit. The outer `main.cc::ReloadConfig`
-    // downgrades the full Validate() failure to a warn (for restart-
-    // only fields), so without these hard-rejects here, malformed live
-    // auth edits would log a warning and STILL commit a runtime
-    // snapshot that startup would reject.
+    // Auth.forward and top-level policy structural validation. These
+    // hard-reject here — matching startup — but ONLY when the staged
+    // auth config is actually going to be published live this cycle.
+    // If the staged auth won't land (no live AuthManager runtime, or
+    // the staged issuer topology diverges from live so AuthManager::
+    // Reload will skip), the staged forward/policies never reach
+    // Commit — running the validators anyway would block unrelated
+    // live-safe edits (log level, rate_limit, etc.) on a reload whose
+    // auth portion is already being deferred.
+    //
+    // auth_will_publish mirrors the preconditions AuthManager::Reload
+    // uses to decide whether to publish:
+    //   * `live_issuer_names.empty()` → no live auth runtime (manager
+    //     absent or never had issuers) → Reload can't commit. Skip.
+    //   * Staged issuer name set != live set → topology change; Reload
+    //     rejects with "restart required" and preserves live state.
+    //     Skip so staged forward/policies that will never apply don't
+    //     abort the reload.
     //
     // Note on issuer-reference scope: staged policies referencing
     // staged-only issuers are NOT rejected here — handled by whole-
@@ -1300,9 +1308,25 @@ void ConfigLoader::ValidateHotReloadable(
     // helpers below only check that referenced issuer names exist in
     // the STAGED config (typo-rejection). Empty-issuer / empty-
     // applies_to / duplicate-name / reserved-header are live-safe
-    // shape checks that apply equally to startup and reload.
-    ValidateAuthForward(config);
-    ValidateTopLevelPolicies(config);
+    // shape checks that apply equally to startup and reload — but
+    // only matter on the reload path when auth actually publishes.
+    bool auth_will_publish = !live_issuer_names.empty();
+    if (auth_will_publish &&
+        config.auth.issuers.size() != live_issuer_names.size()) {
+        auth_will_publish = false;
+    }
+    if (auth_will_publish) {
+        for (const auto& [name, _] : config.auth.issuers) {
+            if (live_issuer_names.count(name) == 0) {
+                auth_will_publish = false;
+                break;
+            }
+        }
+    }
+    if (auth_will_publish) {
+        ValidateAuthForward(config);
+        ValidateTopLevelPolicies(config);
+    }
 }
 
 void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
