@@ -274,6 +274,27 @@ bool DnsResolver::NormalizeHostToBare(const std::string& in, std::string* out) {
 // ---------------------------------------------------------------------------
 
 DnsResolver::DnsResolver(const DnsConfig& config) : config_(config) {
+    // Review-round fix: reject non-positive resolver_max_inflight at
+    // construction. A zero value means EnsurePoolStarted would run its
+    // spawn loop for 0 iterations and succeed WITHOUT creating any
+    // workers; every hostname ResolveAsync thereafter would append to
+    // state_->queue with nothing to pop, so promises would never
+    // complete and DNS resolution would hang permanently. A negative
+    // value is even worse: the static_cast<size_t>(-1) in
+    // workers_.reserve() yields SIZE_MAX and either throws bad_alloc
+    // or attempts to spawn ~2^63 threads.
+    //
+    // ConfigLoader::Validate (step 6, §5.6) is where this is supposed
+    // to be caught in the server's config-loading path. This guard is
+    // defense-in-depth for DIRECT DnsResolver construction (tests,
+    // future embedders) that bypasses ServerConfig — so the error
+    // surfaces immediately at the ctor rather than manifesting as a
+    // cryptic "all hostname lookups hang" at runtime.
+    if (config.resolver_max_inflight <= 0) {
+        throw std::invalid_argument(
+            "DnsResolver: resolver_max_inflight must be > 0, got " +
+            std::to_string(config.resolver_max_inflight));
+    }
     state_ = std::make_shared<PoolState>();
     // NO worker spawn here. EnsurePoolStarted runs lazily on the first
     // non-literal resolve (§5.2.9). Literal-only servers never pay.
@@ -570,6 +591,37 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
 
     {
         std::lock_guard<std::mutex> lk(state_->mtx);
+
+        // Review-round fix: front-sweep expired items BEFORE the
+        // saturation check. If all workers are wedged in getaddrinfo(),
+        // items accumulate in the queue past their deadlines with no
+        // one to pop and expire them. Two harms result:
+        //   (a) the caller's future never becomes ready, forcing
+        //       reliance on caller-side future.wait_for timeouts for
+        //       bounded latency;
+        //   (b) stale slots stay consumed toward kMaxQueuedItems, so
+        //       a sustained DNS stall with ongoing submissions triggers
+        //       spurious "resolver saturated" errors for fresh traffic.
+        //
+        // Deadlines are approximately monotone in queue order — same-
+        // config callers submit with the same timeout over time, so
+        // front items are oldest and most likely to have expired.
+        // Front-only sweep: O(k) where k is the number of expired
+        // items at the front; zero cost when none are expired.
+        // Non-monotone stragglers (mixed-timeout callers) eventually
+        // bubble to the front and get evicted on subsequent submissions.
+        const auto sweep_now = std::chrono::steady_clock::now();
+        while (!state_->queue.empty() &&
+               state_->queue.front().deadline <= sweep_now) {
+            auto& front = state_->queue.front();
+            try {
+                front.promise.set_value(
+                    MakeTimeoutResult(front.req,
+                                       "queue-time exceeded deadline"));
+            } catch (const std::future_error&) { /* promise already set */ }
+            state_->queue.pop_front();
+        }
+
         if (state_->queue.size() >= kMaxQueuedItems) {
             // Bounded queue — synchronous saturation per §5.2.2.
             std::promise<ResolvedEndpoint> p;

@@ -12,6 +12,7 @@
 #include <netdb.h>   // EAI_* constants used in assertions
 
 #include <atomic>
+#include <limits>     // std::numeric_limits
 #include <chrono>
 #include <condition_variable>
 #include <future>
@@ -676,6 +677,157 @@ inline void TestParseHostPortRejectsNonIpBrackets() {
     }
 }
 
+// ---------- Review-round: ctor rejects non-positive resolver_max_inflight ----------
+
+inline void TestDnsResolverCtorRejectsNonPositiveInflight() {
+    std::cout << "\n[TEST] DnsResolver: ctor rejects non-positive resolver_max_inflight..."
+              << std::endl;
+    try {
+        bool threw_on_zero = false;
+        try {
+            DnsConfig c = MakeFastConfig(0);     // zero workers = silent hang
+            DnsResolver r(c);
+            (void)r;
+        } catch (const std::invalid_argument&) {
+            threw_on_zero = true;
+        }
+
+        bool threw_on_negative_one = false;
+        try {
+            DnsConfig c = MakeFastConfig(-1);    // cast to SIZE_MAX in reserve
+            DnsResolver r(c);
+            (void)r;
+        } catch (const std::invalid_argument&) {
+            threw_on_negative_one = true;
+        }
+
+        bool threw_on_int_min = false;
+        try {
+            DnsConfig c = MakeFastConfig(std::numeric_limits<int>::min());
+            DnsResolver r(c);
+            (void)r;
+        } catch (const std::invalid_argument&) {
+            threw_on_int_min = true;
+        }
+
+        // Control: positive value still accepts.
+        bool accepts_positive = false;
+        try {
+            DnsConfig c = MakeFastConfig(1);
+            DnsResolver r(c);
+            accepts_positive = true;
+        } catch (...) {
+            accepts_positive = false;
+        }
+
+        bool ok = threw_on_zero && threw_on_negative_one
+                   && threw_on_int_min && accepts_positive;
+        Record("DnsResolver: ctor rejects non-positive resolver_max_inflight",
+                ok,
+                "threw_on_zero=" + std::to_string(threw_on_zero) +
+                " threw_on_-1=" + std::to_string(threw_on_negative_one) +
+                " threw_on_INT_MIN=" + std::to_string(threw_on_int_min) +
+                " accepts_1=" + std::to_string(accepts_positive));
+    } catch (const std::exception& e) {
+        Record("DnsResolver: ctor rejects non-positive resolver_max_inflight",
+                false, e.what());
+    }
+}
+
+// ---------- Review-round: queued items expire while workers are wedged ----------
+
+inline void TestQueuedItemExpiresDuringWorkerStall() {
+    std::cout << "\n[TEST] DnsResolver: queued items expire during worker stall..."
+              << std::endl;
+    try {
+        // Scenario: every worker is wedged in the seam callable on a
+        // shared gate. A submitted item sits in the queue past its
+        // deadline — no worker can pop it. Pre-fix: item's future
+        // never becomes ready until we either release the gate or
+        // destroy the resolver. Post-fix: a subsequent ResolveAsync
+        // call triggers a front-sweep that evicts the expired item
+        // with EAI_AGAIN "queue-time exceeded".
+        struct Gate {
+            std::mutex m;
+            std::condition_variable cv;
+            bool release = false;
+        };
+        auto gate = std::make_shared<Gate>();
+
+        DnsResolver resolver(MakeFastConfig(1));   // 1 worker
+        resolver.SetResolverForTesting([gate](const ResolveRequest& req) {
+            // Wedge the single worker on the gate. Until release,
+            // the worker cannot pop further items from the queue.
+            std::unique_lock<std::mutex> lk(gate->m);
+            gate->cv.wait(lk, [&] { return gate->release; });
+            ResolvedEndpoint r;
+            r.host = req.host; r.port = req.port; r.tag = req.tag;
+            r.addr = InetAddr("10.0.0.1", req.port);
+            return r;
+        });
+
+        // A: picked up by the worker and wedges on the gate.
+        auto fut_a = resolver.ResolveAsync(
+            MakeReq("host.a", 80, std::chrono::milliseconds(500)));
+        // Give the worker a moment to dequeue A and park on the gate.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // B: submitted behind A with a SHORT timeout. No worker is
+        // available to pop it — it sits in the queue.
+        auto fut_b = resolver.ResolveAsync(
+            MakeReq("host.b", 80, std::chrono::milliseconds(30)));
+
+        // Sleep past B's deadline. Without the fix, B's future would
+        // still be pending at this point (no one has pulled it from
+        // the queue to fire the worker-side deadline short-circuit).
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+
+        // Pre-sweep check: B's future is NOT yet ready (nothing has
+        // evicted it — workers still wedged, no new submission yet).
+        const bool not_ready_before_sweep =
+            fut_b.wait_for(std::chrono::milliseconds(5))
+                != std::future_status::ready;
+
+        // C: submitting a new request triggers the front-sweep inside
+        // ResolveAsync, which evicts B (now past deadline at the front)
+        // before pushing C. C itself just queues behind the sweep.
+        auto fut_c = resolver.ResolveAsync(
+            MakeReq("host.c", 80, std::chrono::milliseconds(500)));
+
+        // Post-sweep: B should be ready with the queue-time timeout result.
+        const bool ready_after_sweep =
+            fut_b.wait_for(std::chrono::milliseconds(100))
+                == std::future_status::ready;
+        ResolvedEndpoint result_b;
+        if (ready_after_sweep) result_b = fut_b.get();
+
+        // Cleanup: release the gate so the wedged worker completes A
+        // (and pops/processes C). Drain both futures so ASAN/leak
+        // detectors see a clean teardown.
+        {
+            std::lock_guard<std::mutex> lk(gate->m);
+            gate->release = true;
+        }
+        gate->cv.notify_all();
+        (void)fut_a.wait_for(std::chrono::milliseconds(500));
+        (void)fut_c.wait_for(std::chrono::milliseconds(500));
+
+        bool ok = not_ready_before_sweep;
+        ok = ok && ready_after_sweep;
+        ok = ok && result_b.error;
+        ok = ok && result_b.error_code == EAI_AGAIN;
+        ok = ok && result_b.error_message.find("queue-time exceeded")
+                    != std::string::npos;
+        Record("DnsResolver: queued item expires during worker stall", ok,
+                "not_ready_pre=" + std::to_string(not_ready_before_sweep) +
+                " ready_post=" + std::to_string(ready_after_sweep) +
+                " err=" + std::to_string(result_b.error_code));
+    } catch (const std::exception& e) {
+        Record("DnsResolver: queued item expires during worker stall",
+                false, e.what());
+    }
+}
+
 // ---------- Queue-time deadline short-circuit ----------
 
 inline void TestQueueTimeDeadlineShortCircuits() {
@@ -727,6 +879,8 @@ inline void RunAllTests() {
     TestResolveRequestUnsetFamilyUsesConfig();
     TestResolveRequestExplicitFamilyOverridesConfig();
     TestParseHostPortRejectsNonIpBrackets();
+    TestDnsResolverCtorRejectsNonPositiveInflight();
+    TestQueuedItemExpiresDuringWorkerStall();
     TestQueueTimeDeadlineShortCircuits();
 }
 
