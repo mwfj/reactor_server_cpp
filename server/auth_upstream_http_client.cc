@@ -381,20 +381,29 @@ void UpstreamHttpClient::Issue(const std::string& upstream_pool_name,
                     transport->SetDeadline(
                         std::chrono::steady_clock::now() +
                         std::chrono::seconds(t2->req.timeout_sec));
-                    // On deadline expiry, raise a timeout error. Return
-                    // true to indicate we handled it — the connection
-                    // handler will then proceed with its own teardown.
                     transport->SetDeadlineTimeoutCb([weak2]() -> bool {
                         auto t3 = weak2.lock();
-                        if (!t3 || t3->finished) return false;
+                        // No transaction left (already dropped) — let the
+                        // connection close via the default path.
+                        if (!t3) return false;
+                        // Transaction already terminated through another
+                        // path (response complete, cancel, etc.) — same.
+                        if (t3->finished) return false;
                         logging::Get()->warn(
                             "UpstreamHttpClient response timeout pool={} "
                             "timeout_sec={}",
                             t3->pool_name, t3->req.timeout_sec);
                         UpstreamHttpClient::Response r;
                         r.error = "timeout";
+                        // Finish() releases the lease BACK to the pool. A
+                        // waiter can immediately borrow the same transport,
+                        // so the default close path (CloseAfterWrite on the
+                        // same ConnectionHandler) would tear down the next
+                        // borrower's in-flight request. Return true to
+                        // signal the timeout is handled — matches
+                        // ProxyTransaction::ArmResponseTimeout's contract.
                         t3->Finish(std::move(r));
-                        return false;  // allow default close behavior
+                        return true;
                     });
                 }
 
@@ -413,7 +422,13 @@ void UpstreamHttpClient::Issue(const std::string& upstream_pool_name,
                 r.error = label;
                 t2->Finish(std::move(r));
             },
-            /*cancel_token=*/nullptr);
+            // Pass the transaction's cancel_token through to the pool so
+            // a CancelInflight() / OidcDiscovery::Cancel() while the
+            // request is queued for a saturated IdP pool removes the dead
+            // waiter from the bounded wait queue. Hardcoding nullptr here
+            // would leave cancelled waiters consuming queue slots until
+            // they hit queue_timeout, which can block later live refreshes.
+            t->cancel_token);
     };
 
     // Install the self-anchor BEFORE any async hand-off. The start_task

@@ -180,6 +180,27 @@ bool Issuer::ValidateReload(const IssuerConfig& new_config,
         err_out = "discovery toggle changed — restart required";
         return false;
     }
+    // Static jwks_uri is part of issuer topology for discovery=false
+    // issuers: a reload that swaps the URL silently points future key
+    // refreshes at a different JWKS source — which can either start
+    // rejecting current tokens (keys no longer present in the new set)
+    // or trust an unintended JWKS (a different IdP entirely). Reject so
+    // AuthManager::Reload preserves live state; the operator can restart
+    // with the new URL intentionally. For discovery=true issuers the
+    // operator-supplied jwks_uri is ignored at runtime (discovery
+    // overwrites it on each OIDC-config fetch), so don't gate on it.
+    if (!discovery_) {
+        std::shared_ptr<const IssuerSnapshot> snap;
+        {
+            std::lock_guard<std::mutex> lk(snapshot_mtx_);
+            snap = snapshot_;
+        }
+        if (snap && new_config.jwks_uri != snap->jwks_uri) {
+            err_out = "jwks_uri changed on static (discovery=false) issuer "
+                      "— restart required";
+            return false;
+        }
+    }
     return ValidateReloadableFields(new_config, mode_, err_out);
 }
 

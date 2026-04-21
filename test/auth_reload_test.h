@@ -379,6 +379,41 @@ static bool TestReloadRejectsDiscoveryChange() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 11b: static jwks_uri change on discovery=false issuer rejected
+// Rationale: for static-configured issuers, jwks_uri IS the issuer
+// topology — changing it silently points future key refreshes at a
+// different JWKS source (either rejecting current tokens or trusting
+// an unintended IdP). AuthManager::Reload must preserve live state;
+// the operator restarts with the new URL intentionally. For
+// discovery=true issuers, the operator-supplied jwks_uri is ignored at
+// runtime (OIDC discovery overwrites on every fetch), so the gate
+// applies only to discovery=false.
+// ---------------------------------------------------------------------------
+static bool TestReloadRejectsStaticJwksUriChange() {
+    const std::string iss_name = "issuer-static-jwks";
+    const std::string iss_url  = "https://static-jwks.example.com";
+
+    AUTH_NAMESPACE::AuthConfig cfg0;
+    cfg0.enabled = true;
+    cfg0.issuers[iss_name] = MakeStaticIssuer(
+        iss_name, iss_url, {"RS256"}, 30, /*discovery=*/false);
+    cfg0.issuers[iss_name].jwks_uri =
+        "https://static-jwks.example.com/jwks.json";
+
+    auto mgr = MakeManager(cfg0);
+
+    AUTH_NAMESPACE::AuthConfig cfg1 = cfg0;
+    cfg1.issuers[iss_name].jwks_uri =
+        "https://attacker.example.com/jwks.json";
+
+    std::string err;
+    bool ok = mgr->Reload(cfg1, err);
+    mgr->Stop();
+
+    return !ok && err.find("jwks_uri") != std::string::npos;
+}
+
+// ---------------------------------------------------------------------------
 // Test 12: mode field change (jwt → introspection) rejected
 // Rationale: mode is topology-stable; switching between jwt and introspection
 // requires restarting the server.
@@ -548,6 +583,8 @@ static void RunAllTests() {
            TestReloadRejectsIssuerUrlChange);
     RunOne("AuthReload: discovery flag change - topology rejected",
            TestReloadRejectsDiscoveryChange);
+    RunOne("AuthReload: static jwks_uri change - topology rejected",
+           TestReloadRejectsStaticJwksUriChange);
     RunOne("AuthReload: mode field change - topology rejected",
            TestReloadRejectsModeChange);
     RunOne("AuthReload: ForwardConfig stable under concurrent Reload",
