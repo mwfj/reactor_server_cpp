@@ -1283,6 +1283,29 @@ void ConfigLoader::ValidateHotReloadable(
     // restart-only auth topology change into a hard abort that blocks
     // unrelated live-safe edits, contradicting the documented warn-and-
     // defer contract for auth topology changes.
+    //
+    // BUT: `enabled=true` + empty `issuers` IS hard-rejected (symmetric
+    // with inline `proxy.auth` and with the same check in Validate()).
+    // A policy with no issuers has no verification path; every matching
+    // request falls into InvokeMiddleware's no_issuer_for_policy branch
+    // and either 503s or passes through on `on_undetermined=allow` —
+    // never the gate the operator configured. This shape can slip past
+    // the startup Validate via a SIGHUP that introduces it, so mirror
+    // the check here to keep startup/reload symmetric. Runs on every
+    // staged policy (live or staged-only); disabled policies are fine.
+    for (size_t i = 0; i < config.auth.policies.size(); ++i) {
+        const auto& p = config.auth.policies[i];
+        if (p.enabled && p.issuers.empty()) {
+            const std::string policy_owner =
+                p.name.empty()
+                    ? ("auth.policies[" + std::to_string(i) + "]")
+                    : ("auth.policies['" + p.name + "']");
+            throw std::invalid_argument(
+                policy_owner + ".enabled=true rejected: issuers list is "
+                "empty — a top-level auth policy gate needs at least one "
+                "configured issuer from auth.issuers.");
+        }
+    }
 }
 
 void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
@@ -2210,6 +2233,22 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                         ctx + ".issuers references unknown issuer '" +
                         issuer_name + "'");
                 }
+            }
+            // An enabled policy with no issuers has no viable verification
+            // path: every matching request falls into InvokeMiddleware's
+            // no_issuer_for_policy branch and either 503s or passes
+            // through when on_undetermined=allow — neither is a gate the
+            // operator can rely on. Inline `proxy.auth` rejects this same
+            // shape; top-level must too. Disabled policies are allowed
+            // to have empty issuers (mid-construction state during
+            // rollout).
+            if (p.enabled && p.issuers.empty()) {
+                throw std::invalid_argument(
+                    ctx + ".enabled=true rejected: issuers list is empty "
+                    "— a top-level auth policy gate needs at least one "
+                    "configured issuer from auth.issuers. Populate "
+                    "issuers[...] before enabling, or set enabled=false "
+                    "until the issuer list is ready.");
             }
             // applies_to is the prefix list that drives runtime matching;
             // an enabled policy without it never matches any path → silent

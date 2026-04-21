@@ -2105,6 +2105,116 @@ void TestConfigLoaderRejectsEnabledPolicyWithoutAppliesTo() {
 }
 
 // -----------------------------------------------------------------------------
+// Top-level auth policy with enabled=true but no issuers is a dead gate:
+// InvokeMiddleware's no_issuer_for_policy branch either 503s or passes through
+// (depending on on_undetermined) — never the enforcement the operator asked
+// for. Inline proxy.auth already rejects the same shape at load + reload;
+// top-level must too. Validated on BOTH startup (Validate) and SIGHUP
+// (ValidateHotReloadable). Disabled policies are allowed to have empty
+// issuers (mid-construction rollout state).
+// -----------------------------------------------------------------------------
+void TestConfigLoaderRejectsEnabledPolicyWithoutIssuers() {
+    std::cout << "\n[TEST] ConfigLoader rejects enabled policy without issuers..." << std::endl;
+    try {
+        // Case 1: startup Validate — enabled + empty issuers → reject.
+        const std::string bad = R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                },
+                "policies": [
+                    {"name":"dead", "enabled":true,
+                     "applies_to":["/api/"], "issuers":[]}
+                ]
+            }
+        })";
+        bool startup_threw = false;
+        std::string startup_msg;
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(bad);
+            ConfigLoader::Validate(cfg);
+        } catch (const std::invalid_argument& e) {
+            startup_threw = true;
+            startup_msg = e.what();
+        }
+        bool startup_ok = startup_threw &&
+            startup_msg.find("issuers") != std::string::npos;
+
+        // Case 2: ValidateHotReloadable — same shape must hard-reject so a
+        // SIGHUP can't install a dead gate past the startup validator.
+        ServerConfig cfg2 = ConfigLoader::LoadFromString(bad);
+        bool reload_threw = false;
+        std::string reload_msg;
+        try {
+            ConfigLoader::ValidateHotReloadable(cfg2, {"x"}, {"google"});
+        } catch (const std::invalid_argument& e) {
+            reload_threw = true;
+            reload_msg = e.what();
+        }
+        bool reload_ok = reload_threw &&
+            reload_msg.find("issuers") != std::string::npos;
+
+        // Case 3: disabled + empty issuers → ACCEPT on both paths.
+        const std::string ok_disabled = R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "google": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    }
+                },
+                "policies": [
+                    {"name":"staged", "enabled":false,
+                     "applies_to":["/api/"], "issuers":[]}
+                ]
+            }
+        })";
+        bool disabled_passed = true;
+        std::string disabled_err;
+        try {
+            ServerConfig cfg3 = ConfigLoader::LoadFromString(ok_disabled);
+            ConfigLoader::Validate(cfg3);
+            ConfigLoader::ValidateHotReloadable(cfg3, {"x"}, {"google"});
+        } catch (const std::exception& e) {
+            disabled_passed = false;
+            disabled_err = std::string("disabled+empty rejected: ") + e.what();
+        }
+
+        bool pass = startup_ok && reload_ok && disabled_passed;
+        std::string err;
+        if (!startup_ok) {
+            err = startup_threw
+                ? ("startup rejected but message missing 'issuers'; got: " + startup_msg)
+                : "startup accepted enabled+empty-issuers — expected reject";
+        } else if (!reload_ok) {
+            err = reload_threw
+                ? ("reload rejected but message missing 'issuers'; got: " + reload_msg)
+                : "ValidateHotReloadable accepted enabled+empty-issuers — expected reject";
+        } else if (!disabled_passed) {
+            err = disabled_err;
+        }
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects enabled policy without issuers",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects enabled policy without issuers",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // ConfigLoader::Validate — introspection mode is Phase-3-deferred. Until
 // Phase 3 lands the mode-dispatch in AuthManager, accepting `mode="introspection"`
 // would silently route opaque tokens into the JWT verifier which rejects
@@ -4211,6 +4321,7 @@ inline void RunAllTests() {
     TestConfigLoaderRejectsInlineAuthAppliesTo();
     TestConfigLoaderRejectsProxyConnectionInAuthForward();
     TestConfigLoaderRejectsEnabledPolicyWithoutAppliesTo();
+    TestConfigLoaderRejectsEnabledPolicyWithoutIssuers();
     TestConfigLoaderValidatesIntrospectionKnobs();
     TestValidateHotReloadableRejectsIntrospectionUnconditionally();
     TestConfigLoaderRejectsPatternedInlineAuthPrefix();

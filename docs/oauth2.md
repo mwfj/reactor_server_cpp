@@ -221,14 +221,15 @@ Send `SIGHUP` (or `server_runner reload`) to reload. These fields are **live-rel
 
 - `auth.enabled` (master switch)
 - Per-issuer: `audiences`, `algorithms`, `leeway_sec`, `required_claims`, `jwks_cache_sec`, `jwks_refresh_timeout_sec`, `discovery_retry_sec`
-- Per-policy: `enabled`, `required_scopes`, `required_audience`, `on_undetermined`, `realm`
+- Top-level `auth.policies[]` — any field on any entry (add / remove / edit), including `applies_to`. Top-level policies aren't coupled to proxy route registration, so their prefixes are just inputs to the auth matcher and can change live. **Narrow exception:** when a staged policy's `issuers[]` references an issuer that isn't in the live server (i.e. an operator staged a new issuer in the same reload), the entire policy is deferred until restart so staged peer fields tuned for the new issuer don't get applied to old-issuer traffic.
+- Inline `upstreams[i].proxy.auth` reloadable fields: `enabled`, `issuers`, `required_scopes`, `required_audience`, `on_undetermined`, `realm`
 - All `auth.forward.*` fields
 
 These fields are **restart-required**:
 
 - Adding or removing issuers
 - Changing an issuer's `issuer_url`, `discovery`, `jwks_uri`, `upstream`, or `mode`
-- Changing the `applies_to` / inline `route_prefix` topology of policies (i.e. which routes are protected)
+- Changing inline `proxy.route_prefix` (the inline prefix is coupled to proxy route registration, so changing it live would diverge auth matching from what the router serves). Use a top-level `auth.policies[]` entry instead if you need to reload the protected prefix without a restart.
 
 A reload that only touches live-reloadable fields applies immediately to the next request. A reload that requests a topology change logs a warn ("restart required") and the live topology stays as-is — nothing silently diverges from what operators typed. Already-running requests continue with the snapshot they started against.
 
@@ -300,7 +301,7 @@ The token was valid, but the required scopes aren't present. The `WWW-Authentica
 
 ### "Reload logged 'restart required'"
 
-You changed a topology field (new issuer, new `applies_to`). The running server keeps the old topology. Restart to pick up the new layout, or if you only wanted to edit reloadable fields, undo the topology change and SIGHUP again.
+You changed a topology field (new issuer, inline `proxy.route_prefix`, or a top-level policy whose staged issuers include one that isn't live yet). The running server keeps the old topology. Restart to pick up the new layout, or if you only wanted to edit reloadable fields, undo the topology change and SIGHUP again.
 
 ### Clock skew across instances
 
