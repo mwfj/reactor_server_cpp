@@ -93,6 +93,25 @@ static std::shared_ptr<AUTH_NAMESPACE::AuthManager> MakeManager(
     return mgr;
 }
 
+// Reload + final cutover. forward_ is published only at the cutover (per
+// design §11.2 step 4 — single-snapshot publication of forward + policies +
+// master_enabled), so tests that observe forward changes after a reload
+// must invoke both stages. HttpServer::Reload is the production caller
+// that ties them together; this helper mirrors that for unit tests that
+// use AuthManager directly.
+static bool ReloadAndCommit(
+        AUTH_NAMESPACE::AuthManager& mgr,
+        const AUTH_NAMESPACE::AuthConfig& new_cfg,
+        std::string& err_out) {
+    if (!mgr.Reload(new_cfg, err_out)) return false;
+    mgr.CommitPolicyAndEnforcement(
+        /*new_upstreams=*/{},
+        new_cfg.policies,
+        new_cfg.forward,
+        new_cfg.enabled);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: forward subject_header update takes effect after Reload
 // ---------------------------------------------------------------------------
@@ -119,7 +138,7 @@ static bool TestReloadForwardSubjectHeader() {
     fwd1.subject_header = "X-Custom-Subject";
     auto cfg1 = MakeConfig(iss_name, iss_url, fwd1);
     std::string err;
-    bool ok = mgr->Reload(cfg1, err);
+    bool ok = ReloadAndCommit(*mgr, cfg1, err);
     if (!ok) {
         mgr->Stop();
         return false;
@@ -147,7 +166,7 @@ static bool TestReloadForwardScopesHeader() {
     fwd1.scopes_header = "X-Permissions";
     auto cfg1 = MakeConfig(iss_name, iss_url, fwd1);
     std::string err;
-    bool ok = mgr->Reload(cfg1, err);
+    bool ok = ReloadAndCommit(*mgr, cfg1, err);
 
     auto fwd_after = mgr->ForwardConfig();
     mgr->Stop();
@@ -178,7 +197,7 @@ static bool TestReloadRawJwtHeaderEnabled() {
     fwd1.raw_jwt_header = "X-Raw-Jwt";
     auto cfg1 = MakeConfig(iss_name, iss_url, fwd1);
     std::string err;
-    bool ok = mgr->Reload(cfg1, err);
+    bool ok = ReloadAndCommit(*mgr, cfg1, err);
 
     auto fwd_after = mgr->ForwardConfig();
     mgr->Stop();
@@ -488,7 +507,7 @@ static bool TestForwardConfigStableUnderConcurrentReload() {
         fwd.subject_header = (i % 2 == 0) ? "X-Auth-Subject" : "X-User-Id";
         auto reload_cfg = MakeConfig(iss_name, iss_url, fwd);
         std::string err;
-        mgr->Reload(reload_cfg, err);
+        ReloadAndCommit(*mgr, reload_cfg, err);
     }
 
     stop_readers.store(true, std::memory_order_release);
@@ -534,14 +553,112 @@ static bool TestRebuildPolicyListFromLiveSources() {
     p1.issuers    = {iss_name};
 
     std::vector<UpstreamConfig> empty_upstreams;
+    AUTH_NAMESPACE::AuthForwardConfig fwd;
     mgr->CommitPolicyAndEnforcement(
-        empty_upstreams, {p0, p1}, /*new_master_enabled=*/true);
+        empty_upstreams, {p0, p1}, fwd, /*new_master_enabled=*/true);
 
     auto snap1 = mgr->SnapshotAll();
     mgr->Stop();
 
     // Policy count should now be 2 (both enabled top-level policies have 1 prefix each)
     return snap1.policy_count > count0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: ConfigLoader::ValidateAuthPrefixCollisions rejects exact-prefix
+// collisions across inline and top-level. The reload path strips upstreams
+// before calling Validate(), so collision detection has to be invoked
+// separately on the full new_config — this test pins the helper itself.
+// ---------------------------------------------------------------------------
+static bool TestValidateAuthPrefixCollisionsRejectsCollisions() {
+    // Inline + top-level on the same prefix.
+    auto build_collision_cfg = []() {
+        ServerConfig cfg;
+        UpstreamConfig u;
+        u.name = "api";
+        u.host = "127.0.0.1";
+        u.port = 8080;
+        u.proxy.route_prefix = "/api/";
+        u.proxy.auth.enabled = true;
+        u.proxy.auth.issuers = {"google"};
+        cfg.upstreams.push_back(u);
+
+        AUTH_NAMESPACE::IssuerConfig ic;
+        ic.name = "google";
+        ic.issuer_url = "https://issuer.example";
+        ic.upstream = "api";
+        ic.mode = "jwt";
+        ic.algorithms = {"RS256"};
+        cfg.auth.issuers["google"] = ic;
+
+        AUTH_NAMESPACE::AuthPolicy p;
+        p.name = "top-clash";
+        p.enabled = true;
+        p.applies_to = {"/api/"};
+        p.issuers = {"google"};
+        cfg.auth.policies.push_back(p);
+        return cfg;
+    };
+
+    bool collision_rejected = false;
+    try {
+        ConfigLoader::ValidateAuthPrefixCollisions(build_collision_cfg());
+    } catch (const std::invalid_argument&) {
+        collision_rejected = true;
+    }
+
+    // Same shape but disabled inline — collision check ignores it.
+    bool disabled_accepted = true;
+    try {
+        ServerConfig cfg = build_collision_cfg();
+        cfg.upstreams[0].proxy.auth.enabled = false;
+        ConfigLoader::ValidateAuthPrefixCollisions(cfg);
+    } catch (const std::exception&) {
+        disabled_accepted = false;
+    }
+
+    return collision_rejected && disabled_accepted;
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: removed top-level policy is dropped from the live matcher.
+// Per design §11.2 step 4, removal is the operator's explicit intent and
+// is live-reloadable — the matcher must shrink, not preserve the live
+// entry. Verified via SnapshotAll().policy_count.
+// ---------------------------------------------------------------------------
+static bool TestReloadDropsRemovedTopLevelPolicy() {
+    const std::string iss_name = "issuer-rm";
+    const std::string iss_url  = "https://rm.example.com";
+
+    AUTH_NAMESPACE::AuthConfig cfg0 = MakeConfig(iss_name, iss_url);
+    AUTH_NAMESPACE::AuthPolicy p0;
+    p0.name = "to-remove";
+    p0.enabled = true;
+    p0.applies_to = {"/protected/"};
+    p0.issuers = {iss_name};
+    cfg0.policies.push_back(p0);
+    cfg0.enabled = true;
+
+    auto mgr = MakeManager(cfg0);
+
+    // Commit so policies_ reflects the initial top-level entry.
+    {
+        std::string err;
+        if (!ReloadAndCommit(*mgr, cfg0, err)) { mgr->Stop(); return false; }
+    }
+    auto snap_before = mgr->SnapshotAll();
+    if (snap_before.policy_count == 0) { mgr->Stop(); return false; }
+
+    // Reload with the policy REMOVED — same issuer set so AuthManager::
+    // Reload accepts. Merge should drop the removed name.
+    AUTH_NAMESPACE::AuthConfig cfg1 = MakeConfig(iss_name, iss_url);
+    cfg1.enabled = true;  // empty policies vector
+    std::string err;
+    bool ok = ReloadAndCommit(*mgr, cfg1, err);
+
+    auto snap_after = mgr->SnapshotAll();
+    mgr->Stop();
+    return ok && snap_after.policy_count == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +708,10 @@ static void RunAllTests() {
            TestForwardConfigStableUnderConcurrentReload);
     RunOne("AuthReload: RebuildPolicyListFromLiveSources updates entries",
            TestRebuildPolicyListFromLiveSources);
+    RunOne("AuthReload: ValidateAuthPrefixCollisions rejects collisions",
+           TestValidateAuthPrefixCollisionsRejectsCollisions);
+    RunOne("AuthReload: removed top-level policy dropped from matcher",
+           TestReloadDropsRemovedTopLevelPolicy);
 }
 
 }  // namespace AuthReloadTests

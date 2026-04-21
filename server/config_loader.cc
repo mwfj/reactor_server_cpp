@@ -2289,19 +2289,12 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             // intent would incorrectly reject legitimate literal URLs.
         }
 
-        // Inline proxy.auth validation + exact-prefix collision detection.
-        // Per spec §3.2 / §5.2: a prefix that appears in both an inline
-        // proxy.auth and a top-level auth.policies[].applies_to is a
-        // hard-reject config error (ambiguity, not resolved at runtime).
-        // Same rule applies across ALL prefix sources: two inline proxies
-        // with the same route_prefix, one top-level policy with the same
-        // prefix declared twice in its applies_to, or two top-level
-        // policies sharing any prefix.
-        //
-        // Unified `all_prefixes` map catches every collision shape. Keyed
-        // by prefix string; value is a human-readable owner description.
-        std::unordered_map<std::string, std::string> all_prefixes;
-
+        // Inline proxy.auth structural validation. Exact-prefix
+        // collision detection (across inline + top-level applies_to) is
+        // delegated to ValidateAuthPrefixCollisions below — keeping it
+        // separate lets the SIGHUP reload path call only the collision
+        // check against the full new_config when its `Validate` runs on
+        // a stripped-upstreams copy.
         for (const auto& u : config.upstreams) {
             const auto& p = u.proxy.auth;
             const std::string ctx = "upstreams['" + u.name + "'].proxy.auth";
@@ -2405,66 +2398,12 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 }
             }
 
-            // ---- Collision detection: ENABLED-only ----
-            //
-            // Per spec §3.2, only enabled inline policies participate in
-            // the runtime longest-prefix matcher. Disabled policies are
-            // inert at request time, so they shouldn't collide with each
-            // other or with top-level policies. (This matches the prior
-            // reviewer round's guidance that the "enable a disabled
-            // policy and discover a collision later" flow is a deliberate
-            // UX trade-off, not a bug — and confirms the gate is the
-            // right place to draw the structural-vs-collision line.)
-            if (!p.enabled) continue;
-
-            const std::string owner =
-                "inline proxy.auth on upstream '" + u.name + "'";
-            auto ins = all_prefixes.emplace(u.proxy.route_prefix, owner);
-            if (!ins.second) {
-                throw std::invalid_argument(
-                    "auth policy prefix '" + u.proxy.route_prefix +
-                    "' declared by both " + ins.first->second + " and " +
-                    owner + " — exact-prefix collisions must be resolved at "
-                    "config time (design spec §3.2)");
-            }
         }
-        // Top-level policies: catches (a) top-level vs inline, (b) two
-        // top-level policies sharing a prefix, (c) one top-level policy
-        // listing the same prefix twice in its applies_to. This is the
-        // guarantee the `auth_policy_matcher::ValidatePolicyList` helper
-        // was designed to enforce — ConfigLoader::Validate is the correct
-        // place to call it because collisions must be a load-time error,
-        // not a silent runtime first-wins.
-        //
-        // SYMMETRY with inline policies: only ENABLED top-level policies
-        // participate in the runtime longest-prefix matcher (per spec §3.2),
-        // so only they should drive collision detection. We already skip
-        // disabled inline proxy.auth above — applying the same rule to
-        // top-level keeps the two paths consistent and lets operators
-        // pre-stage disabled top-level policies during the rollout
-        // without spurious collision errors. (Without this, an operator
-        // who staged two top-level policies with identical applies_to
-        // — both disabled, intentionally inert — would see Validate
-        // reject the config even though the runtime would never match
-        // either of them.)
-        for (size_t i = 0; i < config.auth.policies.size(); ++i) {
-            const auto& p = config.auth.policies[i];
-            if (!p.enabled) continue;  // Symmetry with inline path
-            const std::string policy_owner =
-                p.name.empty()
-                    ? ("auth.policies[" + std::to_string(i) + "]")
-                    : ("auth.policies['" + p.name + "']");
-            for (const auto& pref : p.applies_to) {
-                auto ins = all_prefixes.emplace(pref, policy_owner);
-                if (!ins.second) {
-                    throw std::invalid_argument(
-                        "auth policy prefix '" + pref + "' declared by both " +
-                        ins.first->second + " and " + policy_owner +
-                        " — exact-prefix collisions must be resolved at "
-                        "config time (design spec §3.2)");
-                }
-            }
-        }
+        // Exact-prefix collision detection (inline ↔ top-level + within
+        // each set). Single call covers all four collision shapes per
+        // spec §3.2 / §5.2; same helper is invoked by HttpServer::Reload
+        // on the SIGHUP path so the strict reload gate is symmetric.
+        ValidateAuthPrefixCollisions(config);
 
         // Forward config: reject header-name collisions among the fixed
         // output slots and the claims_to_headers map. Design §5.3.
@@ -2556,6 +2495,48 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     "'].proxy.auth.enabled=true rejected: issuers list "
                     "is empty — an inline proxy auth gate needs at least "
                     "one configured issuer from auth.issuers.");
+            }
+        }
+    }
+}
+
+void ConfigLoader::ValidateAuthPrefixCollisions(const ServerConfig& config) {
+    // Unified prefix → owner map. Catches every collision shape per
+    // spec §3.2 / §5.2: inline-vs-inline, inline-vs-top-level, top-level-
+    // vs-top-level, and a top-level policy listing the same prefix twice
+    // in its own applies_to. Disabled policies don't participate (they
+    // don't drive the runtime matcher).
+    std::unordered_map<std::string, std::string> all_prefixes;
+
+    for (const auto& u : config.upstreams) {
+        const auto& p = u.proxy.auth;
+        if (!p.enabled) continue;
+        const std::string owner =
+            "inline proxy.auth on upstream '" + u.name + "'";
+        auto ins = all_prefixes.emplace(u.proxy.route_prefix, owner);
+        if (!ins.second) {
+            throw std::invalid_argument(
+                "auth policy prefix '" + u.proxy.route_prefix +
+                "' declared by both " + ins.first->second + " and " +
+                owner + " — exact-prefix collisions must be resolved at "
+                "config time (design spec §3.2)");
+        }
+    }
+    for (size_t i = 0; i < config.auth.policies.size(); ++i) {
+        const auto& p = config.auth.policies[i];
+        if (!p.enabled) continue;
+        const std::string policy_owner =
+            p.name.empty()
+                ? ("auth.policies[" + std::to_string(i) + "]")
+                : ("auth.policies['" + p.name + "']");
+        for (const auto& pref : p.applies_to) {
+            auto ins = all_prefixes.emplace(pref, policy_owner);
+            if (!ins.second) {
+                throw std::invalid_argument(
+                    "auth policy prefix '" + pref + "' declared by both " +
+                    ins.first->second + " and " + policy_owner +
+                    " — exact-prefix collisions must be resolved at "
+                    "config time (design spec §3.2)");
             }
         }
     }

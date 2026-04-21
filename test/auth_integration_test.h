@@ -970,11 +970,21 @@ static bool TestReloadForwardConfigUpdates() {
     auto fwd_before = mgr->ForwardConfig();
     bool before_ok = fwd_before && fwd_before->subject_header == "X-Old-Sub";
 
-    // Reload with new subject header name.
+    // Reload with new subject header name. Forward publishes only at
+    // the final cutover (single-snapshot publication of forward +
+    // policies + master_enabled per design §11.2 step 4); the
+    // production caller HttpServer::Reload ties Reload and
+    // CommitPolicyAndEnforcement together — this unit-style test does
+    // the same explicitly.
     AUTH_NAMESPACE::AuthConfig new_cfg = cfg;
     new_cfg.forward.subject_header = "X-New-Sub";
     std::string err;
     bool reloaded = mgr->Reload(new_cfg, err);
+    if (reloaded) {
+        AUTH_NAMESPACE::AuthForwardConfig fwd = new_cfg.forward;
+        mgr->CommitPolicyAndEnforcement(
+            /*new_upstreams=*/{}, new_cfg.policies, fwd, new_cfg.enabled);
+    }
 
     auto fwd_after = mgr->ForwardConfig();
     bool after_ok = reloaded && fwd_after && fwd_after->subject_header == "X-New-Sub";

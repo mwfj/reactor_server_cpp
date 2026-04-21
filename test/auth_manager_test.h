@@ -306,6 +306,16 @@ static bool TestReloadReloadableFields() {
 
     std::string err;
     bool reloaded = mgr->Reload(new_cfg, err);
+    if (reloaded) {
+        // Forward config publishes only at the final cutover (single-
+        // snapshot publication of forward + policies + master_enabled
+        // per design §11.2 step 4); production callers tie Reload and
+        // CommitPolicyAndEnforcement together via HttpServer::Reload,
+        // so this unit test does the same.
+        AUTH_NAMESPACE::AuthForwardConfig fwd = new_cfg.forward;
+        mgr->CommitPolicyAndEnforcement(
+            /*new_upstreams=*/{}, new_cfg.policies, fwd, new_cfg.enabled);
+    }
 
     uint64_t gen_after = mgr->SnapshotAll().generation;
     auto fwd_after = mgr->ForwardConfig();
@@ -498,9 +508,11 @@ static bool TestRebuildPolicyList() {
     // Rebuild with a new top-level policy.
     AUTH_NAMESPACE::AuthPolicy p_new = MakePolicy("new", {"/new/"}, {"a"}, true, "deny");
     p_new.applies_to = {"/new/"};
+    AUTH_NAMESPACE::AuthForwardConfig fwd;
     mgr->CommitPolicyAndEnforcement(
         {},        // new_upstreams
         {p_new},   // new_top_level_policies
+        fwd,       // new_forward — bundled into the same atomic cutover
         true);     // new_master_enabled — mirrors auth.enabled at cutover
 
     auto snap_after = mgr->SnapshotAll();

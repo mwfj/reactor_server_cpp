@@ -291,8 +291,13 @@ struct TopLevelAuthPolicyMergeResult {
 //     commit staged wholesale (all reloadable fields take effect). If
 //     ANY staged issuer is non-live, preserve the ENTIRE live policy
 //     and flag topology_changed.
-//   - Removed / renamed (live name absent in staged): preserve live so
-//     running coverage stays; flag topology_changed.
+//   - Removed (live name absent in staged): drop from the live matcher.
+//     Removal is the operator's explicit intent and is live-reloadable
+//     per the design; no topology_changed flag.
+//   - Renamed: surfaces here as live-removal of the old name + add of
+//     the new name. Net result is the matcher swaps from old name to
+//     new name; the ADDS loop below applies the same per-add gating as
+//     any other add (defers if staged issuers reference a non-live name).
 //   - Added (staged name absent in live): if staged.issuers[] ⊆
 //     live_issuer_names, commit live (append to merged vector). If any
 //     staged issuer is non-live, defer the SINGLE policy add (don't
@@ -343,10 +348,14 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
         live_names.insert(live.name);
         auto it = staged_by_name.find(live.name);
         if (it == staged_by_name.end()) {
-            // Staged removed or renamed this policy. Removal/rename is
-            // restart-required — preserve live so live coverage stays.
-            out.topology_changed = true;
-            out.policies.push_back(live);
+            // Staged removed or renamed this policy. Per design §11.2
+            // step 4, removal IS the operator's explicit intent and is
+            // live-reloadable: drop from the matcher (don't push live
+            // into out). A pure rename surfaces here as live-removal +
+            // staged-add of the new name in the ADDS loop below; the
+            // net effect is the matcher swap from old name to new name
+            // with unchanged coverage. No topology_changed flag — this
+            // is the documented happy path, not a deferred change.
             continue;
         }
         const auto& staged = *it->second;
@@ -4040,6 +4049,20 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
                                   e.what());
             return false;
         }
+        // Exact-prefix collision detection across the FULL new_config.
+        // The validation_copy.upstreams.clear() above hides inline
+        // proxy.auth prefixes from `Validate(reload_copy=true)`, so
+        // without this call a SIGHUP could introduce an inline policy
+        // sharing a prefix with an existing top-level policy and the
+        // collision would only be a warn at AppliedPolicyList rebuild
+        // time, with the inline entry silently winning first-match.
+        try {
+            ConfigLoader::ValidateAuthPrefixCollisions(new_config);
+        } catch (const std::invalid_argument& e) {
+            logging::Get()->error("Reload() rejected auth prefix collision: {}",
+                                  e.what());
+            return false;
+        }
         // Strict gate for hot-reloadable CB fields + duplicate names.
         // Mirrors main.cc::ReloadConfig — both entry points must reject
         // invalid CB tuning before it reaches live slices.
@@ -4402,6 +4425,7 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         auth_manager_->CommitPolicyAndEnforcement(
             upstream_configs_,
             auth_config_.policies,
+            new_config.auth.forward,
             new_config.auth.enabled);
     }
 

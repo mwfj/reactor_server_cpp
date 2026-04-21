@@ -197,18 +197,20 @@ bool AuthManager::Reload(const AuthConfig& new_config, std::string& err_out) {
         }
     }
 
-    // Forward config — atomic swap.
-    {
-        std::lock_guard<std::mutex> lk(snapshot_mtx_);
-        forward_ = std::make_shared<const AuthForwardConfig>(new_config.forward);
-    }
-
-    // master_enabled_ is DELIBERATELY NOT touched here. The final cutover
-    // happens in CommitPolicyAndEnforcement, called by HttpServer::Reload
-    // after the upstream topology check. Flipping master_enabled_ here
-    // would reopen a `false → true` reload window: between this return
-    // and the separate policy rebuild, requests could run with
-    // enforcement ON against the OLD policy list.
+    // forward_ and master_enabled_ are DELIBERATELY NOT touched here.
+    // The final cutover (forward_ + policies_ + master_enabled_) happens
+    // in CommitPolicyAndEnforcement under the same `snapshot_mtx_` lock,
+    // called by HttpServer::Reload after the upstream topology check.
+    //
+    // Why forward_ moved out of Reload (was here in earlier rounds):
+    // ProxyTransaction::Start reads ForwardConfig() per-hop whenever
+    // IsEnforcing() is true. On a TRUE→TRUE reload that combines a
+    // forward overlay edit with a policy edit, publishing forward_
+    // here would let in-flight requests apply the new overlay (header
+    // rename / claim re-injection / preserve_authorization=false strip)
+    // against the OLD policy list — silent header-shape divergence
+    // visible to upstreams. Single-snapshot cutover requires forward_
+    // to publish at the same publication edge as policies_.
     generation_.fetch_add(1, std::memory_order_release);
 
     logging::Get()->info(
@@ -221,17 +223,24 @@ bool AuthManager::Reload(const AuthConfig& new_config, std::string& err_out) {
 void AuthManager::CommitPolicyAndEnforcement(
         const std::vector<UpstreamConfig>& new_upstreams,
         const std::vector<AuthPolicy>& new_top_level_policies,
+        const AuthForwardConfig& new_forward,
         bool new_master_enabled) {
     auto rebuilt = BuildAppliedPolicyList(new_upstreams,
                                             new_top_level_policies);
-    // Single atomic cutover under snapshot_mtx_: policy swap FIRST, then
-    // the master_enabled_ release-store. The release-store is the final
-    // publication edge — a reader observing master_enabled_=true sees the
-    // fresh policies_ pointer too. Ordering matters: flipping the enable
-    // flag before the policy swap would expose the window this method
-    // exists to close.
+    auto fwd_snap = std::make_shared<const AuthForwardConfig>(new_forward);
+    // Single atomic cutover under snapshot_mtx_:
+    //   1. forward_ swap
+    //   2. policies_ swap
+    //   3. master_enabled_ release-store (final publication edge)
+    // A reader observing master_enabled_=true sees fresh forward_ and
+    // policies_ pointers via the lock-mutex acquire ordering. Forward is
+    // grouped here (not in Reload) so a TRUE→TRUE reload combining a
+    // forward overlay edit with a policy edit can't expose the window
+    // where ProxyTransaction reads new forward_ while the matcher is
+    // still on the old policy list.
     {
         std::lock_guard<std::mutex> lk(snapshot_mtx_);
+        forward_ = std::move(fwd_snap);
         policies_ = rebuilt;
         master_enabled_.store(new_master_enabled,
                                std::memory_order_release);

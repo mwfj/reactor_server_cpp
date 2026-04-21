@@ -86,23 +86,28 @@ class AuthManager {
     // an error message in `err_out`. Never throws.
     bool Reload(const AuthConfig& new_config, std::string& err_out);
 
-    // Final reload cutover — rebuild the AppliedPolicyList from live
-    // upstreams + merged top-level policies AND flip `master_enabled_`
-    // under the SAME lock, in that order (policy swap first, then the
-    // release-store on `master_enabled_`). Called by HttpServer::Reload
-    // AFTER AuthManager::Reload() has applied issuer + forward snapshots
-    // AND the upstream topology check has completed, so `new_upstreams`
-    // reflects the prefixes the router will actually serve this run.
+    // Final reload cutover — under the SAME `snapshot_mtx_` lock:
+    //   1. swap `forward_` to `new_forward`
+    //   2. swap `policies_` to a freshly-built AppliedPolicyList
+    //   3. release-store `master_enabled_` to `new_master_enabled`
+    // Called by HttpServer::Reload AFTER AuthManager::Reload() has
+    // applied issuer snapshots AND the upstream topology check has
+    // completed, so `new_upstreams` reflects the prefixes the router
+    // will actually serve this run.
     //
     // Single publication edge: readers observing `master_enabled_=true`
     // transitively see the new policy list, new forward snapshot, and
-    // new issuer snapshots. Without this atomic cutover, a `false → true`
-    // reload that also edited policies would expose a window where
-    // requests run with enforcement ON against the OLD policy list.
-    // See design doc §11.2 step 4 + §18.5 for the rationale.
+    // new issuer snapshots. forward_ is published HERE (not earlier in
+    // Reload) because ProxyTransaction reads ForwardConfig() per-hop
+    // whenever IsEnforcing() is true; if forward_ swapped before the
+    // policy rebuild on a TRUE→TRUE reload, requests during the gap
+    // would apply the new overlay (header rename / strip) against the
+    // OLD policy list — silent header-shape divergence visible to
+    // upstreams. See design doc §11.2 step 4 + §18.5.
     void CommitPolicyAndEnforcement(
         const std::vector<UpstreamConfig>& new_upstreams,
         const std::vector<AuthPolicy>& new_top_level_policies,
+        const AuthForwardConfig& new_forward,
         bool new_master_enabled);
 
     // Snapshot of runtime counters + per-issuer views.
