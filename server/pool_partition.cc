@@ -639,11 +639,44 @@ void PoolPartition::ForceCloseActive() {
 
 void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
                                          ErrorCallback error_cb) {
-    // Create outbound socket
-    int fd = SocketHandler::CreateClientSocket();
+    // Review-round IPv6-outbound fix. PARSE FIRST so we can both (a) pick
+    // the correct socket family (AF_INET vs AF_INET6) for CreateClientSocket
+    // and (b) fail fast on an invalid upstream literal without leaking an
+    // fd. Previously this path hand-rolled a sockaddr_in and called
+    // inet_addr() — IPv4-only — so an upstream configured with "::1" or
+    // any other IPv6 literal would connect() on an IPv4 socket with an
+    // IPv6 sockaddr and fail immediately, defeating the v0.45 IPv6
+    // groundwork for outbound connections.
+    //
+    // Bracketed IPv6 (e.g. "[::1]") still fails here — InetAddr's literal
+    // ctor rejects brackets; ConfigLoader::Normalize (§5.6, step 6) is
+    // responsible for stripping them. Hostnames also fail here — step 9
+    // replaces this block with an atomic_load on resolved_endpoint_ which
+    // will carry a pre-resolved InetAddr via the DNS pipeline. Both
+    // shortcomings are documented in the design (§5.5), and this fix is
+    // the minimum needed to unblock IPv6-literal upstreams today.
+    InetAddr upstream_addr(upstream_host_, upstream_port_);
+    if (!upstream_addr.is_valid()) {
+        logging::Get()->error(
+            "Invalid upstream host '{}': must be a bare IPv4 or IPv6 literal "
+            "(hostnames and bracketed IPv6 forms are not yet wired into the "
+            "outbound pool path; pending resolved_endpoint_ split in §5.5 step 9)",
+            upstream_host_);
+        error_cb(CHECKOUT_CONNECT_FAILED);
+        return;
+    }
+
+    const sa_family_t family =
+        (upstream_addr.family() == InetAddr::Family::kIPv6) ? AF_INET6 : AF_INET;
+
+    // Create outbound socket AFTER parsing — matches the parsed family so
+    // connect() does not immediately fail with EAFNOSUPPORT on an IPv6
+    // upstream. Order also means we never allocate an fd we might have
+    // to close on parse failure.
+    int fd = SocketHandler::CreateClientSocket(family);
     if (fd < 0) {
-        logging::Get()->error("Failed to create client socket for {}:{}",
-                              upstream_host_, upstream_port_);
+        logging::Get()->error("Failed to create client socket for {}:{} (family={})",
+                              upstream_host_, upstream_port_, (int)family);
         error_cb(CHECKOUT_CONNECT_FAILED);
         return;
     }
@@ -651,21 +684,7 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
     // Initiate non-blocking connect on the raw fd BEFORE wrapping in
     // ConnectionHandler. This avoids creating a temporary SocketHandler
     // that would close the fd in its destructor.
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(upstream_port_);
-    sa.sin_addr.s_addr = inet_addr(upstream_host_.c_str());
-    if (sa.sin_addr.s_addr == INADDR_NONE) {
-        logging::Get()->error("Invalid upstream host '{}': must be an IPv4 address",
-                              upstream_host_);
-        ::close(fd);
-        error_cb(CHECKOUT_CONNECT_FAILED);
-        return;
-    }
-
-    int connect_result = ::connect(fd, reinterpret_cast<struct sockaddr*>(&sa),
-                                    sizeof(sa));
+    int connect_result = ::connect(fd, upstream_addr.Addr(), upstream_addr.Len());
     if (connect_result < 0 && errno != EINPROGRESS && errno != EINTR) {
         int saved_errno = errno;
         logging::Get()->warn("connect() failed for {}:{}: {} (errno={})",
@@ -676,8 +695,10 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
         return;
     }
 
-    // Build socket handler and connection handler
-    auto sock = std::make_unique<SocketHandler>(fd);
+    // Build socket handler and connection handler. Thread the resolved
+    // family into SocketHandler so later observability / debug paths
+    // (e.g. GetBoundPort's getsockname) branch on ss_family correctly.
+    auto sock = std::make_unique<SocketHandler>(fd, family);
     auto conn_handler = std::make_shared<ConnectionHandler>(
         dispatcher_, std::move(sock));
 

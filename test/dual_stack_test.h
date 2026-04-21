@@ -8,15 +8,24 @@
 
 #include "test_framework.h"
 #include "http/http_server.h"
+#include "socket_handler.h"
+#include "inet_addr.h"
 #include "test_server_runner.h"
 #include "http_test_client.h"
 
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <unistd.h>
+#include <cerrno>
+#include <cstring>
 
+#include <atomic>
+#include <chrono>
+#include <future>
 #include <iostream>
 #include <string>
+#include <thread>
 
 namespace DualStackTests {
 
@@ -105,12 +114,189 @@ inline void TestAcceptorRejectsHostname() {
     }
 }
 
+// ---------- Outbound IPv6 primitive (pool partition path) ----------
+//
+// Pin the review-round fix that threads the resolved family into
+// PoolPartition::CreateNewConnection. Previously the pool called the
+// zero-arg CreateClientSocket() which defaulted to AF_INET; this test
+// exercises the corrected primitives: InetAddr("::1", port) drives
+// family detection, CreateClientSocket(AF_INET6) produces a matching
+// socket, and ::connect on the InetAddr's sockaddr succeeds.
+//
+// We cannot easily drive PoolPartition::CreateNewConnection directly
+// without standing up a full UpstreamManager/HostPool; step 9 will add
+// that end-to-end path. For now this microtest covers the exact
+// OS-level primitives the pool path uses.
+inline void TestOutboundIpv6LiteralConnectPrimitives() {
+    std::cout << "\n[TEST] DualStack: outbound IPv6 literal connect primitives..."
+              << std::endl;
+    try {
+        // ---- Listener on ::1:0 ----
+        int listen_fd = ::socket(AF_INET6, SOCK_STREAM, 0);
+        if (listen_fd < 0) {
+            // Host lacks IPv6 — the same accept-it-as-skipped pattern
+            // used by the Acceptor bind test above.
+            Record("DualStack: outbound IPv6 literal connect primitives",
+                    true, "skipped (no IPv6 loopback)");
+            return;
+        }
+        int on = 1;
+        ::setsockopt(listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+        ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+        sockaddr_in6 sa{};
+        sa.sin6_family = AF_INET6;
+        sa.sin6_port   = htons(0);
+        ::inet_pton(AF_INET6, "::1", &sa.sin6_addr);
+        if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) < 0) {
+            ::close(listen_fd);
+            Record("DualStack: outbound IPv6 literal connect primitives",
+                    true, "skipped (no IPv6 loopback bind)");
+            return;
+        }
+        if (::listen(listen_fd, 4) < 0) {
+            ::close(listen_fd);
+            Record("DualStack: outbound IPv6 literal connect primitives",
+                    false, "listen() failed");
+            return;
+        }
+        sockaddr_in6 bound{};
+        socklen_t bound_len = sizeof(bound);
+        ::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&bound), &bound_len);
+        const uint16_t bound_port = ntohs(bound.sin6_port);
+
+        // Accept on a worker and signal completion via a promise/future
+        // so we can wait for it EXPLICITLY before closing the listener.
+        // The previous atomic-flag pattern had a race: closing listen_fd
+        // while the thread was still in accept() would kick the thread
+        // out with EBADF and the flag would never get set, causing a
+        // flaky failure under load.
+        std::promise<bool> accept_signal;
+        auto accept_future = accept_signal.get_future();
+        std::thread acceptor([&]() {
+            sockaddr_in6 peer{};
+            socklen_t peer_len = sizeof(peer);
+            int cfd = ::accept(listen_fd, reinterpret_cast<sockaddr*>(&peer),
+                                 &peer_len);
+            accept_signal.set_value(cfd >= 0);
+            if (cfd >= 0) ::close(cfd);
+        });
+
+        // ---- Client: EXACT primitives PoolPartition::CreateNewConnection
+        //      uses post-fix ----
+        InetAddr upstream_addr("::1", bound_port);
+        bool ok = upstream_addr.is_valid();
+        ok = ok && (upstream_addr.family() == InetAddr::Family::kIPv6);
+
+        const sa_family_t family =
+            (upstream_addr.family() == InetAddr::Family::kIPv6)
+                ? AF_INET6 : AF_INET;
+        ok = ok && (family == AF_INET6);
+
+        int cfd = SocketHandler::CreateClientSocket(family);
+        ok = ok && (cfd >= 0);
+
+        const int rc = ::connect(cfd, upstream_addr.Addr(), upstream_addr.Len());
+        // Non-blocking connect on loopback typically returns 0; some
+        // kernels return -1 with errno=EINPROGRESS. EAFNOSUPPORT would
+        // be the pre-fix failure mode (family mismatch between socket
+        // and sockaddr). Reject that explicitly.
+        const int connect_errno = errno;
+        const bool connect_ok = (rc == 0) ||
+                                (rc == -1 && connect_errno == EINPROGRESS);
+        ok = ok && connect_ok;
+        if (!connect_ok) {
+            // Surface the pre-fix failure signal loudly.
+            Record("DualStack: outbound IPv6 literal connect primitives",
+                    false,
+                    std::string("connect returned ") + std::to_string(rc) +
+                    " errno=" + std::to_string(connect_errno) +
+                    " (" + std::strerror(connect_errno) + ") — "
+                    "EAFNOSUPPORT indicates the regression this test pins");
+            if (cfd >= 0) ::close(cfd);
+            ::close(listen_fd);
+            acceptor.join();
+            return;
+        }
+
+        // Wait for writability / the acceptor thread.
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(cfd, &wfds);
+        timeval tv{};
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        int sel = ::select(cfd + 1, nullptr, &wfds, nullptr, &tv);
+        ok = ok && (sel > 0);
+
+        // SO_ERROR must be zero — otherwise connect failed asynchronously.
+        int so_err = 0;
+        socklen_t so_err_len = sizeof(so_err);
+        ::getsockopt(cfd, SOL_SOCKET, SO_ERROR, &so_err, &so_err_len);
+        ok = ok && (so_err == 0);
+
+        // Wait up to 2 s for the acceptor thread to signal — must
+        // happen BEFORE we close listen_fd so the blocking accept()
+        // returns a real connection rather than EBADF. Without this
+        // sync the test was flaky under load.
+        bool accept_ok = false;
+        if (accept_future.wait_for(std::chrono::seconds(2))
+            == std::future_status::ready) {
+            accept_ok = accept_future.get();
+        }
+
+        // Cleanup (ordering doesn't matter now — accept has signalled).
+        ::close(cfd);
+        ::close(listen_fd);
+        acceptor.join();
+
+        ok = ok && accept_ok;
+        Record("DualStack: outbound IPv6 literal connect primitives", ok);
+    } catch (const std::exception& e) {
+        Record("DualStack: outbound IPv6 literal connect primitives",
+                false, e.what());
+    }
+}
+
+// ---------- PoolPartition's invalid-upstream guard ----------
+//
+// Pin that the post-fix invalid-literal path still fails cleanly (no
+// fd leak, no crash) — the fix moved the parse ABOVE the socket creation,
+// changing the failure-mode sequence from "create fd, parse, close fd"
+// to "parse, fail, return" which is cheaper AND avoids the fd-churn
+// class of TOCTOU.
+inline void TestOutboundRejectsInvalidUpstreamLiteral() {
+    std::cout << "\n[TEST] DualStack: outbound rejects invalid upstream literal..."
+              << std::endl;
+    try {
+        // Validate the fix's parse-first guard using InetAddr directly
+        // (mirrors the PoolPartition path without requiring a pool).
+        InetAddr a("not-a-literal", 80);
+        bool ok = !a.is_valid();
+        InetAddr b("[::1]", 80);           // bracketed — also rejected per §5.1
+        ok = ok && !b.is_valid();
+        InetAddr c("example.com", 80);     // hostname — rejected; step 9 takes it
+        ok = ok && !c.is_valid();
+        // Control: bare literals still parse.
+        InetAddr d("127.0.0.1", 80);
+        ok = ok && d.is_valid() && d.family() == InetAddr::Family::kIPv4;
+        InetAddr e("::1", 80);
+        ok = ok && e.is_valid() && e.family() == InetAddr::Family::kIPv6;
+        Record("DualStack: outbound rejects invalid upstream literal", ok);
+    } catch (const std::exception& ex) {
+        Record("DualStack: outbound rejects invalid upstream literal",
+                false, ex.what());
+    }
+}
+
 // ---------- Test registrar ----------
 
 inline void RunAllTests() {
     std::cout << "\n=== DualStack Tests ===" << std::endl;
     TestAcceptorIpv6LiteralBind();
     TestAcceptorRejectsHostname();
+    TestOutboundIpv6LiteralConnectPrimitives();
+    TestOutboundRejectsInvalidUpstreamLiteral();
 }
 
 }  // namespace DualStackTests
