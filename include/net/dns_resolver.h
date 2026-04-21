@@ -16,8 +16,18 @@ namespace net_dns {
 enum class LookupFamily {
     kV4Only,
     kV6Only,
-    kV4Preferred,   // default — try A, fall back to AAAA
+    kV4Preferred,   // operator config default — try A, fall back to AAAA
     kV6Preferred,
+    // Sentinel used ONLY as the ResolveRequest.family default. Mirror of
+    // the ResolveRequest.timeout==0 sentinel: "fall back to the
+    // DnsResolver's DnsConfig.lookup_family at submission time". Never
+    // produced by ParseLookupFamily (operators cannot type it in config);
+    // never stored in DnsConfig.lookup_family (which defaults to
+    // kV4Preferred — a real policy). The substitution in ResolveAsync /
+    // ResolveMany replaces kUnset with the resolver's configured policy
+    // BEFORE any family-sensitive path runs (literal short-circuit's
+    // family check, worker-side AiFamilyFor hint, address picker).
+    kUnset,
 };
 
 // Parse lowercase strings accepted by the JSON config and env overrides
@@ -50,7 +60,17 @@ struct DnsConfig {
 struct ResolveRequest {
     std::string  host;         // hostname OR bare IP literal (no brackets)
     int          port = 0;
-    LookupFamily family = LookupFamily::kV4Preferred;
+    // Family selector. The sentinel value `kUnset` means "fall back to
+    // the DnsResolver's DnsConfig.lookup_family at submission time"
+    // (review-round P2 fix). Same contract as the `timeout` sentinel
+    // below: callers that need a tighter-than-config override can set
+    // a real value (kV4Only / kV6Only / kV4Preferred / kV6Preferred);
+    // callers that just want the operator's resolver-wide policy can
+    // leave the field at its default. Without this sentinel, a caller
+    // that constructs ResolveRequest and only fills host/port would
+    // silently run under v4_preferred even when the resolver was
+    // configured with v6_only.
+    LookupFamily family = LookupFamily::kUnset;
     // Per-entry deadline. The sentinel value 0 ms means "fall back to the
     // DnsResolver's DnsConfig.resolve_timeout_ms at submission time".
     // P1 fix: lets operator-configured `dns.resolve_timeout_ms` propagate

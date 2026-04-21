@@ -534,6 +534,148 @@ inline void TestResolveManyPerEntryDeadlineFromDispatch() {
     }
 }
 
+// ---------- Review-round P2: lookup_family sentinel → config ----------
+
+inline void TestResolveRequestUnsetFamilyUsesConfig() {
+    std::cout << "\n[TEST] DnsResolver: unset ResolveRequest.family uses config..."
+              << std::endl;
+    try {
+        // Config policy says v6_only. Caller leaves ResolveRequest.family
+        // at the struct default (kUnset). Mock records whatever family
+        // it receives. Expect the mock to observe v6_only — proving the
+        // sentinel substitution replaced kUnset with config_.lookup_family.
+        DnsConfig c = MakeFastConfig(1);
+        c.lookup_family = LookupFamily::kV6Only;
+        DnsResolver resolver(c);
+
+        std::atomic<int> observed_family{-1};
+        resolver.SetResolverForTesting([&](const ResolveRequest& req) {
+            observed_family.store(static_cast<int>(req.family));
+            ResolvedEndpoint r;
+            r.host = req.host; r.port = req.port; r.tag = req.tag;
+            // We only care about the family the resolver saw — any
+            // non-error return is fine.
+            r.addr = InetAddr("::1", req.port);
+            return r;
+        });
+
+        ResolveRequest req;
+        req.host = "some.host";
+        req.port = 80;
+        // req.family left at struct default (kUnset — the sentinel).
+        req.timeout = std::chrono::milliseconds(200);
+        req.tag = "test";
+
+        auto fut = resolver.ResolveAsync(std::move(req));
+        bool ok = fut.wait_for(std::chrono::milliseconds(500))
+                    == std::future_status::ready;
+        (void)fut.get();   // drain so the worker doesn't leak.
+        ok = ok && observed_family.load()
+                    == static_cast<int>(LookupFamily::kV6Only);
+        Record("DnsResolver: unset ResolveRequest.family uses config", ok,
+                "observed_family=" + std::to_string(observed_family.load()) +
+                " (expected " + std::to_string(
+                    static_cast<int>(LookupFamily::kV6Only)) + ")");
+    } catch (const std::exception& e) {
+        Record("DnsResolver: unset ResolveRequest.family uses config",
+                false, e.what());
+    }
+}
+
+// ---------- Review-round P2: per-request family override beats config ----------
+
+inline void TestResolveRequestExplicitFamilyOverridesConfig() {
+    std::cout << "\n[TEST] DnsResolver: explicit ResolveRequest.family overrides config..."
+              << std::endl;
+    try {
+        // Config policy says v4_preferred. Caller explicitly sets family
+        // to kV6Only. The explicit value must win — sentinel substitution
+        // must not clobber a real caller-supplied value.
+        DnsConfig c = MakeFastConfig(1);
+        c.lookup_family = LookupFamily::kV4Preferred;
+        DnsResolver resolver(c);
+
+        std::atomic<int> observed_family{-1};
+        resolver.SetResolverForTesting([&](const ResolveRequest& req) {
+            observed_family.store(static_cast<int>(req.family));
+            ResolvedEndpoint r;
+            r.host = req.host; r.port = req.port; r.tag = req.tag;
+            r.addr = InetAddr("::1", req.port);
+            return r;
+        });
+
+        ResolveRequest req;
+        req.host = "some.host";
+        req.port = 80;
+        req.family = LookupFamily::kV6Only;   // explicit caller override
+        req.timeout = std::chrono::milliseconds(200);
+        req.tag = "test";
+
+        auto fut = resolver.ResolveAsync(std::move(req));
+        bool ok = fut.wait_for(std::chrono::milliseconds(500))
+                    == std::future_status::ready;
+        (void)fut.get();
+        ok = ok && observed_family.load()
+                    == static_cast<int>(LookupFamily::kV6Only);
+        Record("DnsResolver: explicit family overrides config", ok,
+                "observed_family=" + std::to_string(observed_family.load()));
+    } catch (const std::exception& e) {
+        Record("DnsResolver: explicit family overrides config",
+                false, e.what());
+    }
+}
+
+// ---------- Review-round P2: ParseHostPort rejects non-IP in brackets ----------
+
+inline void TestParseHostPortRejectsNonIpBrackets() {
+    std::cout << "\n[TEST] DnsResolver: ParseHostPort rejects non-IP brackets..."
+              << std::endl;
+    try {
+        std::string host;
+        int port = -1;
+        bool ok = true;
+
+        // Must REJECT: bracketed hostname (RFC 3986 violation).
+        ok = ok && !DnsResolver::ParseHostPort("[example.com]", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("[example.com]:443", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("[notanip]", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("[not-an-ip]:8080", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("[]", &host, &port);
+        // Malformed bracketed forms that were already rejected — pin
+        // the pre-existing behavior here too.
+        ok = ok && !DnsResolver::ParseHostPort("[::1", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("[::1]extra", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("[::1]x80", &host, &port);
+
+        // Must ACCEPT: genuine IPv6 literals in brackets.
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("[::1]", &host, &port)
+                 && host == "::1" && port == 0;
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("[::1]:443", &host, &port)
+                 && host == "::1" && port == 443;
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("[2001:db8::1]:8080", &host, &port)
+                 && host == "2001:db8::1" && port == 8080;
+
+        // Bare forms unaffected by the bracketed-path fix.
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("example.com", &host, &port)
+                 && host == "example.com" && port == 0;
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("example.com:443", &host, &port)
+                 && host == "example.com" && port == 443;
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("127.0.0.1:80", &host, &port)
+                 && host == "127.0.0.1" && port == 80;
+
+        Record("DnsResolver: ParseHostPort rejects non-IP brackets", ok);
+    } catch (const std::exception& e) {
+        Record("DnsResolver: ParseHostPort rejects non-IP brackets",
+                false, e.what());
+    }
+}
+
 // ---------- Queue-time deadline short-circuit ----------
 
 inline void TestQueueTimeDeadlineShortCircuits() {
@@ -582,6 +724,9 @@ inline void RunAllTests() {
     TestResolveRequestZeroTimeoutUsesConfig();
     TestResolveManyOneArgUsesConfigOverallTimeout();
     TestResolveManyPerEntryDeadlineFromDispatch();
+    TestResolveRequestUnsetFamilyUsesConfig();
+    TestResolveRequestExplicitFamilyOverridesConfig();
+    TestParseHostPortRejectsNonIpBrackets();
     TestQueueTimeDeadlineShortCircuits();
 }
 

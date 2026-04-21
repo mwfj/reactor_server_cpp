@@ -47,6 +47,7 @@ const char* LookupFamilyName(LookupFamily f) {
         case LookupFamily::kV6Only:      return "v6_only";
         case LookupFamily::kV4Preferred: return "v4_preferred";
         case LookupFamily::kV6Preferred: return "v6_preferred";
+        case LookupFamily::kUnset:       return "unset";
     }
     return "unknown";
 }
@@ -118,12 +119,17 @@ bool IsValidHostnameLabeled(const std::string& input) {
 
 // Build a getaddrinfo ai_family hint from LookupFamily. v4_preferred and
 // v6_preferred both use AF_UNSPEC and pick by preference post-resolve.
+// kUnset is treated like AF_UNSPEC as a defensive fallback — in the
+// normal flow substitution in ResolveAsync / ResolveMany replaces kUnset
+// with config_.lookup_family BEFORE reaching this helper, so the case
+// here only runs if a caller manages to bypass the substitution path.
 int AiFamilyFor(LookupFamily f) {
     switch (f) {
         case LookupFamily::kV4Only: return AF_INET;
         case LookupFamily::kV6Only: return AF_INET6;
         case LookupFamily::kV4Preferred:
         case LookupFamily::kV6Preferred:
+        case LookupFamily::kUnset:
         default:                    return AF_UNSPEC;
     }
 }
@@ -145,6 +151,13 @@ InetAddr PickAddress(const struct addrinfo* ai, LookupFamily pref, int port) {
         case LookupFamily::kV6Only:      chosen = first_v6; break;
         case LookupFamily::kV4Preferred: chosen = first_v4 ? first_v4 : first_v6; break;
         case LookupFamily::kV6Preferred: chosen = first_v6 ? first_v6 : first_v4; break;
+        case LookupFamily::kUnset:
+            // Defensive fallback only — substitution should have replaced
+            // kUnset with config_.lookup_family upstream. Treat like
+            // kV4Preferred so a bypassed path still returns an address
+            // rather than nullptr.
+            chosen = first_v4 ? first_v4 : first_v6;
+            break;
     }
     if (chosen == nullptr) return InetAddr{};
     return InetAddr::FromAddrInfo(chosen, port);
@@ -179,10 +192,20 @@ bool DnsResolver::ParseHostPort(const std::string& s,
                                  std::string* host, int* port) {
     if (s.empty() || host == nullptr) return false;
     if (s.front() == '[') {
-        // "[ipv6]" or "[ipv6]:port"
+        // RFC 3986 §3.2.2: bracketed authority is reserved for IP
+        // literals (IP-literal = "[" (IPv6address / IPvFuture) "]").
+        // Hostnames like [example.com] are malformed. Review-round P2
+        // fix: validate the inner token parses as an IP literal BEFORE
+        // returning success — otherwise a caller using ParseHostPort as
+        // an authority validator would silently accept operator/config
+        // typos like [example.com]:443 or [notanip] as if they were
+        // valid hostnames. `NormalizeHostToBare` already enforces this
+        // for its own bracketed branch; ParseHostPort now matches.
         const auto rbracket = s.find(']');
         if (rbracket == std::string::npos) return false;
-        *host = s.substr(1, rbracket - 1);
+        const std::string inner = s.substr(1, rbracket - 1);
+        if (!ParseLiteral(inner)) return false;
+        *host = inner;
         if (rbracket + 1 == s.size()) {
             if (port) *port = 0;
             return true;
@@ -499,6 +522,18 @@ ResolvedEndpoint DnsResolver::MakeTimeoutResult(const ResolveRequest& req,
 
 std::future<ResolvedEndpoint>
 DnsResolver::ResolveAsync(ResolveRequest req) {
+    // Review-round P2 fix: family sentinel falls back to DnsConfig.
+    // lookup_family. Substitute BEFORE the literal short-circuit so the
+    // family-constraint branch inside MakeReadyLiteralResult
+    // (kV4Only + IPv6 literal → reject, and the symmetric case) fires
+    // against the CONFIGURED policy, not against the kUnset sentinel
+    // (which those branches would silently ignore, accepting literals
+    // that the operator-configured v4_only / v6_only policy intended to
+    // reject).
+    if (req.family == LookupFamily::kUnset) {
+        req.family = config_.lookup_family;
+    }
+
     // P1 fix: zero-timeout sentinel falls back to DnsConfig.resolve_timeout_ms.
     // Substitute BEFORE the literal short-circuit so item.deadline
     // (computed below for queue-path items) consistently reflects the
@@ -579,6 +614,13 @@ DnsResolver::ResolveMany(std::vector<ResolveRequest> requests,
     per_entry_deadlines.reserve(requests.size());
 
     for (auto& req : requests) {
+        // Review-round P2 fix: family sentinel → config (same pattern
+        // as timeout below). Substitute in snapshot so error messages
+        // and test assertions see the effective family the resolver
+        // actually ran against.
+        if (req.family == LookupFamily::kUnset) {
+            req.family = config_.lookup_family;
+        }
         // P1 fix: sentinel substitution done HERE (before snapshotting
         // and before ResolveAsync also substitutes). Guarantees that
         // `per_entry_deadlines[i]` and `snapshot[i].timeout` both
