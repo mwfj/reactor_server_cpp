@@ -18,4 +18,10 @@ struct ParsedHttpsUri {
 
 ParsedHttpsUri ParseHttpsUri(const std::string& url);
 
+// Case-insensitive "starts with https://" check per RFC 3986 §3.1
+// (URI schemes are case-insensitive; "HTTPS://idp.example" / "HttpS://…"
+// are all valid). Used to reject plaintext IdP traffic without
+// incorrectly rejecting valid mixed-case scheme prefixes.
+bool HasHttpsScheme(const std::string& url) noexcept;
+
 }  // namespace AUTH_NAMESPACE

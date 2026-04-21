@@ -1,5 +1,6 @@
 #include "config/config_loader.h"
 #include "auth/auth_config.h"
+#include "auth/auth_url_util.h"        // AUTH_NAMESPACE::HasHttpsScheme
 #include "auth/jws_algorithms.h"
 #include "http2/http2_constants.h"
 #include "http/route_trie.h"         // ParsePattern, ValidatePattern for proxy route_prefix
@@ -1937,7 +1938,8 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 throw std::invalid_argument(ctx + ".issuer_url is required");
             }
             // TLS-mandatory to IdP (design spec §9 item 4). Plaintext rejected.
-            if (ic.issuer_url.rfind("https://", 0) != 0) {
+            // Case-insensitive scheme per RFC 3986 §3.1.
+            if (!AUTH_NAMESPACE::HasHttpsScheme(ic.issuer_url)) {
                 throw std::invalid_argument(
                     ctx + ".issuer_url must start with https:// (plaintext "
                     "IdP traffic is rejected for security)");
@@ -2142,15 +2144,16 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             // have thrown) or made it discovery-supplied (discovered URLs
             // are validated at fetch time). We only need to validate the
             // static value here.
+            // Case-insensitive scheme per RFC 3986 §3.1.
             if (!ic.jwks_uri.empty() &&
-                ic.jwks_uri.rfind("https://", 0) != 0) {
+                !AUTH_NAMESPACE::HasHttpsScheme(ic.jwks_uri)) {
                 throw std::invalid_argument(
                     ctx + ".jwks_uri must start with https:// — plaintext "
                     "JWKS allows MITM key substitution and would compromise "
                     "token verification (design spec §9 item 4)");
             }
             if (!ic.introspection.endpoint.empty() &&
-                ic.introspection.endpoint.rfind("https://", 0) != 0) {
+                !AUTH_NAMESPACE::HasHttpsScheme(ic.introspection.endpoint)) {
                 throw std::invalid_argument(
                     ctx + ".introspection.endpoint must start with https:// "
                     "— plaintext introspection would leak bearer tokens and "
@@ -2500,7 +2503,9 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
     }
 }
 
-void ConfigLoader::ValidateAuthPrefixCollisions(const ServerConfig& config) {
+void ConfigLoader::ValidateAuthPrefixCollisions(
+    const ServerConfig& config,
+    const std::unordered_set<std::string>& live_upstream_names) {
     // Unified prefix → owner map. Catches every collision shape per
     // spec §3.2 / §5.2: inline-vs-inline, inline-vs-top-level, top-level-
     // vs-top-level, and a top-level policy listing the same prefix twice
@@ -2508,9 +2513,15 @@ void ConfigLoader::ValidateAuthPrefixCollisions(const ServerConfig& config) {
     // don't drive the runtime matcher).
     std::unordered_map<std::string, std::string> all_prefixes;
 
+    const bool scope_to_live = !live_upstream_names.empty();
     for (const auto& u : config.upstreams) {
         const auto& p = u.proxy.auth;
         if (!p.enabled) continue;
+        // Reload path: staged inline prefixes on not-yet-live upstreams
+        // are deferred to restart by ValidateProxyAuth + applied-policy
+        // rebuild, so they must NOT drive collision rejection here.
+        if (scope_to_live &&
+            live_upstream_names.count(u.name) == 0) continue;
         const std::string owner =
             "inline proxy.auth on upstream '" + u.name + "'";
         auto ins = all_prefixes.emplace(u.proxy.route_prefix, owner);

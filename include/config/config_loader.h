@@ -157,13 +157,22 @@ public:
     // hard-reject config error (ambiguity unresolved at runtime).
     //
     // Extracted as its own entry point so the reload path can run it
-    // on the FULL `new_config` (with live upstreams) — `Validate` on
-    // the reload path operates on a stripped-upstreams copy and so
-    // can't see inline `proxy.auth` prefixes. Without this extra call,
-    // a SIGHUP could introduce an inline policy colliding with an
-    // existing top-level policy and the collision would only be logged
-    // as a warn by `BuildAppliedPolicyList` — the inline entry would
-    // silently win first-match selection.
+    // against the live-applyable subset without being blocked by staged
+    // inline prefixes that won't actually be installed this cycle.
+    //
+    // Scope of inline `proxy.auth` participation:
+    //   * Empty `live_upstream_names` (default): every enabled inline
+    //     entry participates — matches startup semantics where all
+    //     upstreams are about to go live.
+    //   * Non-empty set: only enabled inline entries whose upstream
+    //     `name` is in the set participate. Staged inline prefixes on
+    //     new/renamed upstreams are SKIPPED — those entries are
+    //     restart-required per `ValidateProxyAuth` and the applied-
+    //     policy rebuild both, so a collision against them would
+    //     spuriously block unrelated live-safe edits.
+    //
+    // Top-level policies participate regardless of scope — they are
+    // fully live-reloadable by identity.
     //
     // Only ENABLED policies participate (parallel to the in-Validate
     // path — disabled staged policies don't drive the matcher and
@@ -171,7 +180,9 @@ public:
     //
     // Throws std::invalid_argument with an "auth policy prefix '...'
     // declared by both <owner-a> and <owner-b>" message on collision.
-    static void ValidateAuthPrefixCollisions(const ServerConfig& config);
+    static void ValidateAuthPrefixCollisions(
+        const ServerConfig& config,
+        const std::unordered_set<std::string>& live_upstream_names = {});
 
     // Return a ServerConfig with all default values.
     static ServerConfig Default();

@@ -4049,15 +4049,21 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
                                   e.what());
             return false;
         }
-        // Exact-prefix collision detection across the FULL new_config.
+        // Exact-prefix collision detection, scoped to LIVE upstreams.
         // The validation_copy.upstreams.clear() above hides inline
         // proxy.auth prefixes from `Validate(reload_copy=true)`, so
-        // without this call a SIGHUP could introduce an inline policy
-        // sharing a prefix with an existing top-level policy and the
-        // collision would only be a warn at AppliedPolicyList rebuild
-        // time, with the inline entry silently winning first-match.
+        // without an explicit call here a SIGHUP could introduce an
+        // inline policy sharing a prefix with an existing top-level
+        // policy and the collision would only be a warn at
+        // AppliedPolicyList rebuild time. But the check MUST be scoped
+        // to `live_names` — inline entries on new/renamed upstreams are
+        // deferred to restart by ValidateProxyAuth and the applied-
+        // policy rebuild, so an unlivable collision against one of
+        // those would spuriously block unrelated live-safe edits in the
+        // same reload.
         try {
-            ConfigLoader::ValidateAuthPrefixCollisions(new_config);
+            ConfigLoader::ValidateAuthPrefixCollisions(new_config,
+                                                        live_names);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Reload() rejected auth prefix collision: {}",
                                   e.what());
@@ -4381,23 +4387,58 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
     };
     const auto old_map = by_name(upstream_configs_);
     const auto new_map = by_name(new_config.upstreams);
-    bool topology_match = old_map.size() == new_map.size();
-    if (topology_match) {
-        for (const auto& entry : old_map) {
-            auto it = new_map.find(entry.first);
-            if (it == new_map.end() || *entry.second != *it->second) {
-                topology_match = false;
-                break;
-            }
+
+    // Per-upstream merge: each LIVE upstream is evaluated independently
+    // against its staged counterpart. `UpstreamConfig::operator==` is
+    // defined to exclude live-reloadable fields (circuit_breaker and
+    // proxy.auth reloadable subset), so `==` means "restart-only fields
+    // match" — in that case we adopt the staged entry wholesale to pick
+    // up the reloadable edits. When restart-only fields differ, or the
+    // upstream is removed in staged, we keep the live entry (any
+    // reloadable edits bundled into the divergent staged copy are
+    // deferred to restart along with the topology change). New staged
+    // upstreams that don't exist live are also restart-required — they
+    // don't enter upstream_configs_ this cycle.
+    //
+    // Why per-upstream rather than all-or-nothing: the prior behavior
+    // rolled BACK reloadable edits on UNCHANGED upstreams whenever ANY
+    // other upstream had a restart-only divergence. That silently lost
+    // unrelated live-safe proxy.auth edits (design §11.2 step 4 — per-
+    // upstream deferral, not blanket rollback).
+    bool any_diverged = false;
+    std::vector<UpstreamConfig> merged;
+    merged.reserve(upstream_configs_.size());
+    for (const auto& live : upstream_configs_) {
+        auto it = new_map.find(live.name);
+        if (it == new_map.end()) {
+            // Removed in staged — restart-required; keep live.
+            any_diverged = true;
+            merged.push_back(live);
+            continue;
+        }
+        if (*it->second == live) {
+            // Restart-only fields match → reloadable-field delta only.
+            // Adopt staged so the new CB / proxy.auth reloadable fields
+            // carry into upstream_configs_ for the policy rebuild below.
+            merged.push_back(*it->second);
+        } else {
+            // Restart-only divergence on THIS upstream — keep live.
+            any_diverged = true;
+            merged.push_back(live);
         }
     }
-    if (!topology_match) {
+    // New upstreams (in staged, not live) are restart-required and
+    // skipped. Flag topology divergence so the operator sees the warn.
+    if (new_map.size() != old_map.size()) any_diverged = true;
+
+    if (any_diverged) {
         logging::Get()->warn("Reload: upstream topology changes require a "
-                             "restart to take effect (circuit-breaker "
-                             "field edits, if any, were applied live)");
-    } else {
-        upstream_configs_ = new_config.upstreams;
+                             "restart to take effect on the affected "
+                             "upstream(s); unchanged upstreams' live-"
+                             "reloadable fields (circuit_breaker, "
+                             "proxy.auth reloadable subset) were applied");
     }
+    upstream_configs_ = std::move(merged);
 
     if (auth_reload_ok && top_level_policy_merge.topology_changed) {
         logging::Get()->warn(

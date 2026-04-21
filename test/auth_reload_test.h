@@ -662,6 +662,128 @@ static bool TestReloadDropsRemovedTopLevelPolicy() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 17: collision-scope gate on reload. An inline prefix on a NOT-YET-
+// LIVE upstream must not trigger the collision reject — the reload path
+// would otherwise block unrelated live-safe edits even though
+// ValidateProxyAuth and the applied-policy rebuild both ignore that
+// upstream this cycle.
+// ---------------------------------------------------------------------------
+static bool TestValidateAuthPrefixCollisionsScopedByLive() {
+    auto build_cfg = []() {
+        ServerConfig cfg;
+        // Live upstream (present in live_upstream_names below).
+        UpstreamConfig live;
+        live.name = "live-up";
+        live.host = "127.0.0.1";
+        live.port = 8080;
+        cfg.upstreams.push_back(live);
+
+        // Staged-only upstream — an inline prefix here would otherwise
+        // collide with the top-level policy's applies_to.
+        UpstreamConfig staged;
+        staged.name = "staged-up";
+        staged.host = "127.0.0.1";
+        staged.port = 9090;
+        staged.proxy.route_prefix = "/api/";
+        staged.proxy.auth.enabled = true;
+        staged.proxy.auth.issuers = {"google"};
+        cfg.upstreams.push_back(staged);
+
+        AUTH_NAMESPACE::IssuerConfig ic;
+        ic.name = "google";
+        ic.issuer_url = "https://issuer.example";
+        ic.upstream = "live-up";
+        ic.mode = "jwt";
+        ic.algorithms = {"RS256"};
+        cfg.auth.issuers["google"] = ic;
+
+        // Top-level policy with same prefix as the staged inline.
+        AUTH_NAMESPACE::AuthPolicy p;
+        p.name = "top-on-api";
+        p.enabled = true;
+        p.applies_to = {"/api/"};
+        p.issuers = {"google"};
+        cfg.auth.policies.push_back(p);
+        return cfg;
+    };
+
+    // Reload-scoped: live_upstream_names = {"live-up"}. The staged
+    // inline entry on "staged-up" must be skipped → NO collision.
+    bool reload_accepted = true;
+    try {
+        ConfigLoader::ValidateAuthPrefixCollisions(
+            build_cfg(),
+            /*live_upstream_names=*/{"live-up"});
+    } catch (const std::exception&) {
+        reload_accepted = false;
+    }
+
+    // Startup-scoped (empty set = check all): SAME config rejects
+    // because the staged inline will become live at startup.
+    bool startup_rejected = false;
+    try {
+        ConfigLoader::ValidateAuthPrefixCollisions(build_cfg());
+    } catch (const std::invalid_argument&) {
+        startup_rejected = true;
+    }
+
+    return reload_accepted && startup_rejected;
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: mixed-case HTTPS scheme accepted (RFC 3986 §3.1). Operator
+// configs using HTTPS://..., HttpS://..., etc. should load cleanly.
+// ---------------------------------------------------------------------------
+static bool TestConfigLoaderAcceptsMixedCaseHttpsScheme() {
+    auto build_cfg = [](const std::string& scheme_prefix) {
+        ServerConfig cfg;
+        UpstreamConfig u;
+        u.name = "idp";
+        u.host = "127.0.0.1";
+        u.port = 8080;
+        cfg.upstreams.push_back(u);
+
+        AUTH_NAMESPACE::IssuerConfig ic;
+        ic.name = "primary";
+        ic.issuer_url = scheme_prefix + "issuer.example";
+        ic.jwks_uri = scheme_prefix + "issuer.example/jwks";
+        ic.upstream = "idp";
+        ic.mode = "jwt";
+        ic.algorithms = {"RS256"};
+        cfg.auth.issuers["primary"] = ic;
+        return cfg;
+    };
+
+    // Positive: uppercase scheme must load.
+    try {
+        ConfigLoader::Validate(build_cfg("HTTPS://"));
+    } catch (const std::exception&) {
+        return false;
+    }
+    // Positive: mixed-case scheme must load.
+    try {
+        ConfigLoader::Validate(build_cfg("HttPs://"));
+    } catch (const std::exception&) {
+        return false;
+    }
+    // Negative: lowercase http:// must still reject (not HTTPS).
+    try {
+        ConfigLoader::Validate(build_cfg("http://"));
+        return false;
+    } catch (const std::invalid_argument&) {
+        // expected
+    }
+    // Negative: mixed-case HTTP:// must also reject (still not HTTPS).
+    try {
+        ConfigLoader::Validate(build_cfg("HTTP://"));
+        return false;
+    } catch (const std::invalid_argument&) {
+        // expected
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Test runner
 // ---------------------------------------------------------------------------
 
@@ -712,6 +834,10 @@ static void RunAllTests() {
            TestValidateAuthPrefixCollisionsRejectsCollisions);
     RunOne("AuthReload: removed top-level policy dropped from matcher",
            TestReloadDropsRemovedTopLevelPolicy);
+    RunOne("AuthReload: collision check scoped to live upstreams",
+           TestValidateAuthPrefixCollisionsScopedByLive);
+    RunOne("AuthReload: accepts mixed-case HTTPS scheme",
+           TestConfigLoaderAcceptsMixedCaseHttpsScheme);
 }
 
 }  // namespace AuthReloadTests

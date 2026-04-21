@@ -70,7 +70,9 @@ void ExtractEndpoints(const std::string& body,
             out_introspection_endpoint = intro_it->get<std::string>();
         }
         // Enforce https on jwks_uri to match the TLS-mandatory IdP policy.
-        if (out_jwks_uri.rfind("https://", 0) != 0) {
+        // Case-insensitive scheme per RFC 3986 §3.1 — compliant IdPs may
+        // return `HTTPS://…` and shouldn't be rejected as plaintext.
+        if (!HasHttpsScheme(out_jwks_uri)) {
             reason = "jwks_uri_not_https";
             out_jwks_uri.clear();
             return;
