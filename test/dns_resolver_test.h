@@ -375,6 +375,165 @@ inline void TestShutdownDetachesWorkers() {
     }
 }
 
+// ---------- P1: zero ResolveRequest.timeout falls back to config ----------
+
+inline void TestResolveRequestZeroTimeoutUsesConfig() {
+    std::cout << "\n[TEST] DnsResolver: zero ResolveRequest.timeout uses config..."
+              << std::endl;
+    try {
+        // Config says resolve_timeout_ms=40 and overall_timeout_ms=400.
+        // Caller hands ResolveMany a request with timeout=0 (sentinel).
+        // Mock sleeps 150ms — longer than the config's per-entry budget,
+        // shorter than the overall. Expect timeout via config-derived
+        // per-entry deadline (~40ms), NOT via the batch ceiling.
+        DnsConfig c = MakeFastConfig(1);
+        c.resolve_timeout_ms = 40;
+        c.overall_timeout_ms = 400;
+        DnsResolver resolver(c);
+        resolver.SetResolverForTesting([](const ResolveRequest& req) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            ResolvedEndpoint r;
+            r.host = req.host; r.port = req.port; r.tag = req.tag;
+            r.addr = InetAddr("10.0.0.1", req.port);
+            return r;
+        });
+
+        ResolveRequest req;
+        req.host = "some.host";
+        req.port = 80;
+        req.family = LookupFamily::kV4Preferred;
+        // req.timeout left at struct default (0ms sentinel — P1 fix).
+        req.tag = "test";
+
+        std::vector<ResolveRequest> batch;
+        batch.push_back(req);
+        const auto start = std::chrono::steady_clock::now();
+        auto out = resolver.ResolveMany(std::move(batch),
+                                         std::chrono::milliseconds(400));
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+
+        bool ok = out.size() == 1;
+        ok = ok && out[0].error;
+        ok = ok && out[0].error_code == EAI_AGAIN;
+        // Config per-entry was 40ms; allow slack for scheduler but well
+        // under the 150ms mock sleep (which would fire if the sentinel
+        // failed to substitute and some hardcoded path took over).
+        ok = ok && elapsed_ms < 120;
+        Record("DnsResolver: zero ResolveRequest.timeout uses config", ok,
+                "elapsed=" + std::to_string(elapsed_ms) + "ms");
+    } catch (const std::exception& e) {
+        Record("DnsResolver: zero ResolveRequest.timeout uses config",
+                false, e.what());
+    }
+}
+
+// ---------- P1: one-arg ResolveMany uses config overall_timeout_ms ----------
+
+inline void TestResolveManyOneArgUsesConfigOverallTimeout() {
+    std::cout << "\n[TEST] DnsResolver: one-arg ResolveMany uses config overall..."
+              << std::endl;
+    try {
+        // Config says overall_timeout_ms=80. Single request with a
+        // per-entry timeout of 300ms — but the BATCH should time out at
+        // ~80ms because the one-arg form picks up config.overall.
+        DnsConfig c = MakeFastConfig(1);
+        c.resolve_timeout_ms = 300;
+        c.overall_timeout_ms = 80;
+        DnsResolver resolver(c);
+        resolver.SetResolverForTesting([](const ResolveRequest& req) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            ResolvedEndpoint r;
+            r.host = req.host; r.port = req.port; r.tag = req.tag;
+            r.addr = InetAddr("10.0.0.1", req.port);
+            return r;
+        });
+
+        std::vector<ResolveRequest> batch;
+        batch.push_back(MakeReq("some.host", 80,
+                                  std::chrono::milliseconds(300)));
+
+        const auto start = std::chrono::steady_clock::now();
+        auto out = resolver.ResolveMany(std::move(batch));   // one-arg form
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+
+        bool ok = out.size() == 1;
+        ok = ok && out[0].error;
+        ok = ok && out[0].error_code == EAI_AGAIN;
+        // Config overall was 80ms; tolerate scheduler slack up to 160ms.
+        ok = ok && elapsed_ms < 160;
+        Record("DnsResolver: one-arg ResolveMany uses config overall", ok,
+                "elapsed=" + std::to_string(elapsed_ms) + "ms");
+    } catch (const std::exception& e) {
+        Record("DnsResolver: one-arg ResolveMany uses config overall",
+                false, e.what());
+    }
+}
+
+// ---------- P2: per-entry deadline anchored at dispatch ----------
+
+inline void TestResolveManyPerEntryDeadlineFromDispatch() {
+    std::cout << "\n[TEST] DnsResolver: per-entry deadline from dispatch..."
+              << std::endl;
+    try {
+        // One worker, two requests with 100ms per-entry timeout. Mock
+        // sleeps 80ms per resolve. Overall budget 400ms.
+        //
+        // Timeline with fix:
+        //   T=0     Dispatch A, B. Per-entry deadlines anchored at T=0:
+        //           A_deadline=100ms, B_deadline=100ms.
+        //   T=~0    Worker picks up A, sleeps 80ms.
+        //   T=80    A returns. ResolveMany loop consumes A's future (ok).
+        //           Worker picks up B, sleeps 80ms.
+        //   T=80    Loop reaches B. Wait for min(B_deadline, batch) - now
+        //           = min(100, 400) - 80 = 20ms.
+        //   T=100   Wait times out. B → EAI_AGAIN.
+        //
+        // Timeline WITHOUT fix (the bug):
+        //   T=80    Loop reaches B; recompute B_deadline = now + 100
+        //           = 180ms (RESET). Wait 100ms.
+        //   T=160   Worker returns B successfully; loop observes READY.
+        //           elapsed ≈ 160ms, B.error == false → WRONG.
+        DnsConfig c = MakeFastConfig(1);   // single worker
+        DnsResolver resolver(c);
+        resolver.SetResolverForTesting([](const ResolveRequest& req) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            ResolvedEndpoint r;
+            r.host = req.host; r.port = req.port; r.tag = req.tag;
+            r.addr = InetAddr("10.0.0.1", req.port);
+            r.resolved_at = std::chrono::steady_clock::now();
+            return r;
+        });
+
+        std::vector<ResolveRequest> batch;
+        batch.push_back(MakeReq("host.a", 80, std::chrono::milliseconds(100)));
+        batch.push_back(MakeReq("host.b", 80, std::chrono::milliseconds(100)));
+        const auto start = std::chrono::steady_clock::now();
+        auto out = resolver.ResolveMany(std::move(batch),
+                                         std::chrono::milliseconds(400));
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+
+        bool ok = out.size() == 2;
+        ok = ok && !out[0].error;                   // A succeeded at T≈80.
+        ok = ok && out[1].error;                    // B timed out.
+        ok = ok && out[1].error_code == EAI_AGAIN;
+        // Fix puts elapsed at ~100ms. Bug would produce ~160ms. Allow
+        // generous scheduler slack (< 140) — still < bug's 160.
+        ok = ok && elapsed_ms < 140;
+        Record("DnsResolver: per-entry deadline anchored at dispatch", ok,
+                "elapsed=" + std::to_string(elapsed_ms) + "ms "
+                "(fix: ~100ms, bug: ~160ms)");
+    } catch (const std::exception& e) {
+        Record("DnsResolver: per-entry deadline anchored at dispatch",
+                false, e.what());
+    }
+}
+
 // ---------- Queue-time deadline short-circuit ----------
 
 inline void TestQueueTimeDeadlineShortCircuits() {
@@ -420,6 +579,9 @@ inline void RunAllTests() {
     TestResolveManyDeadlineBounded();
     TestTwoResolversAreIndependent();
     TestShutdownDetachesWorkers();
+    TestResolveRequestZeroTimeoutUsesConfig();
+    TestResolveManyOneArgUsesConfigOverallTimeout();
+    TestResolveManyPerEntryDeadlineFromDispatch();
     TestQueueTimeDeadlineShortCircuits();
 }
 

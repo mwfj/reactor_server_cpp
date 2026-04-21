@@ -51,7 +51,13 @@ struct ResolveRequest {
     std::string  host;         // hostname OR bare IP literal (no brackets)
     int          port = 0;
     LookupFamily family = LookupFamily::kV4Preferred;
-    std::chrono::milliseconds timeout{5000};   // per-entry deadline
+    // Per-entry deadline. The sentinel value 0 ms means "fall back to the
+    // DnsResolver's DnsConfig.resolve_timeout_ms at submission time".
+    // P1 fix: lets operator-configured `dns.resolve_timeout_ms` propagate
+    // without every caller having to read config and thread the value per
+    // request. Non-zero values take precedence over the config default,
+    // so callers that need a tighter-than-config bound can still opt in.
+    std::chrono::milliseconds timeout{0};
     std::string  tag;          // opaque correlation tag ("bind" | "upstream:name")
 };
 
@@ -119,12 +125,30 @@ public:
     std::future<ResolvedEndpoint> ResolveAsync(ResolveRequest req);
 
     // Dispatch all requests, wait on each up to its own timeout, AND
-    // enforce `overall_timeout` as a batch ceiling. Never throws —
-    // per-entry errors surface via ResolvedEndpoint::error. Order of
-    // returned vector matches order of `requests`.
+    // enforce a batch ceiling. Never throws — per-entry errors surface
+    // via ResolvedEndpoint::error. Order of returned vector matches
+    // order of `requests`.
+    //
+    // P2 fix (round-hostname-5): per-entry deadlines are measured from
+    // BATCH DISPATCH TIME, not from when the wait loop reaches each
+    // entry. An earlier implementation reset the budget per-entry at
+    // wait time, which silently stretched later entries' effective
+    // deadlines by the cumulative wait of earlier ones.
+    //
+    // Zero `ResolveRequest.timeout` falls back to
+    // DnsConfig.resolve_timeout_ms at dispatch time (§5.2 P1).
+
+    // One-arg form — uses DnsConfig.overall_timeout_ms as the batch
+    // ceiling. P1 fix: operator-configured overall timeout propagates
+    // automatically; callers no longer need to re-read config.
+    std::vector<ResolvedEndpoint> ResolveMany(
+        std::vector<ResolveRequest> requests);
+
+    // Explicit-ceiling form — used by tests and callers that need a
+    // tighter batch bound than DnsConfig.overall_timeout_ms.
     std::vector<ResolvedEndpoint> ResolveMany(
         std::vector<ResolveRequest> requests,
-        std::chrono::milliseconds overall_timeout = std::chrono::seconds(15));
+        std::chrono::milliseconds overall_timeout);
 
     // Per-instance test seam — replaces the getaddrinfo body. Ownership
     // rule (§5.2.3): the callable MUST own every piece of state it

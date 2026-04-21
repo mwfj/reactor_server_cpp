@@ -499,7 +499,15 @@ ResolvedEndpoint DnsResolver::MakeTimeoutResult(const ResolveRequest& req,
 
 std::future<ResolvedEndpoint>
 DnsResolver::ResolveAsync(ResolveRequest req) {
-    // Literal short-circuit FIRST (§5.2.9): ready-future path without
+    // P1 fix: zero-timeout sentinel falls back to DnsConfig.resolve_timeout_ms.
+    // Substitute BEFORE the literal short-circuit so item.deadline
+    // (computed below for queue-path items) consistently reflects the
+    // effective timeout regardless of caller pattern.
+    if (req.timeout.count() == 0) {
+        req.timeout = std::chrono::milliseconds(config_.resolve_timeout_ms);
+    }
+
+    // Literal short-circuit (§5.2.9): ready-future path without
     // spawning the pool. Keeps literal-only servers thread-free.
     if (IsIpLiteral(req.host)) {
         std::promise<ResolvedEndpoint> p;
@@ -542,18 +550,44 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
 }
 
 std::vector<ResolvedEndpoint>
+DnsResolver::ResolveMany(std::vector<ResolveRequest> requests) {
+    // P1 fix: one-arg form uses the operator-configured batch ceiling
+    // from DnsConfig, so callers do not have to re-read config.
+    return ResolveMany(std::move(requests),
+                        std::chrono::milliseconds(config_.overall_timeout_ms));
+}
+
+std::vector<ResolvedEndpoint>
 DnsResolver::ResolveMany(std::vector<ResolveRequest> requests,
                           std::chrono::milliseconds overall_timeout) {
-    const auto batch_deadline =
-        std::chrono::steady_clock::now() + overall_timeout;
+    // P2 fix: capture a SINGLE dispatch time at batch entry. Per-entry
+    // absolute deadlines are derived from this anchor BEFORE the wait
+    // loop starts — NOT from `now()` at the moment the loop reaches
+    // each entry. The prior implementation reset each entry's budget
+    // when the wait loop moved to it, which silently stretched later
+    // entries' effective per-entry timeouts by the cumulative wait
+    // time of earlier entries (worst case: last entry got overall-
+    // budget worth of per-entry time).
+    const auto dispatch_time = std::chrono::steady_clock::now();
+    const auto batch_deadline = dispatch_time + overall_timeout;
 
-    // Dispatch first — all calls are O(1). Futures land in the same
-    // order as requests so the result vector preserves caller order.
     std::vector<std::future<ResolvedEndpoint>> futures;
     futures.reserve(requests.size());
     std::vector<ResolveRequest> snapshot;
     snapshot.reserve(requests.size());
+    std::vector<std::chrono::steady_clock::time_point> per_entry_deadlines;
+    per_entry_deadlines.reserve(requests.size());
+
     for (auto& req : requests) {
+        // P1 fix: sentinel substitution done HERE (before snapshotting
+        // and before ResolveAsync also substitutes). Guarantees that
+        // `per_entry_deadlines[i]` and `snapshot[i].timeout` both
+        // reflect the effective value, keeping log messages and test
+        // assertions aligned with the deadline we actually enforced.
+        if (req.timeout.count() == 0) {
+            req.timeout = std::chrono::milliseconds(config_.resolve_timeout_ms);
+        }
+        per_entry_deadlines.push_back(dispatch_time + req.timeout);
         snapshot.push_back(req);
         futures.push_back(ResolveAsync(std::move(req)));
     }
@@ -561,10 +595,10 @@ DnsResolver::ResolveMany(std::vector<ResolveRequest> requests,
     std::vector<ResolvedEndpoint> results;
     results.reserve(futures.size());
     for (std::size_t i = 0; i < futures.size(); ++i) {
-        // Clamp each wait to min(per-entry timeout, remaining batch budget).
         const auto now = std::chrono::steady_clock::now();
-        const auto per_entry_deadline = now + snapshot[i].timeout;
-        const auto effective = std::min(per_entry_deadline, batch_deadline);
+        // Clamp each wait to min(dispatch-time per-entry deadline,
+        // batch deadline). See P2 comment at function top.
+        const auto effective = std::min(per_entry_deadlines[i], batch_deadline);
         auto remaining =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 effective - now);
