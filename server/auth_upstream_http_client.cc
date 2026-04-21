@@ -362,6 +362,12 @@ void UpstreamHttpClient::Issue(const std::string& upstream_pool_name,
                                 t3->pool_name);
                             UpstreamHttpClient::Response r;
                             r.error = "parse_error";
+                            // Parse failure leaves the HTTP stream in an
+                            // ambiguous state — untrusted tail bytes
+                            // would be misread as the next borrower's
+                            // response. Same contract as the timeout /
+                            // OnError paths.
+                            t3->PoisonLease();
                             t3->Finish(std::move(r));
                             return;
                         }

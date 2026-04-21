@@ -396,10 +396,17 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
         }
     }
 
-    // Run the verifier. Never throws.
+    // Run the verifier. Never throws. Pass the inbound request's
+    // dispatcher_index through so a kid-miss JWKS refresh stays on the
+    // caller's partition instead of always hitting partition 0. Fall
+    // back to 0 when unset (rare paths / tests that don't populate it).
     AuthContext ctx;
-    VerifyResult vr =
-        JwtVerifier::Verify(token, *chosen, policy, claim_keys, ctx);
+    const size_t verifier_dispatcher =
+        req.dispatcher_index >= 0
+            ? static_cast<size_t>(req.dispatcher_index)
+            : 0;
+    VerifyResult vr = JwtVerifier::Verify(
+        token, *chosen, policy, claim_keys, verifier_dispatcher, ctx);
 
     switch (vr.outcome) {
         case VerifyOutcome::ALLOW: {

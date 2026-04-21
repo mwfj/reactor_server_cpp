@@ -49,6 +49,14 @@ class OidcDiscovery {
     // Cancel in-flight discovery. Idempotent.
     void Cancel();
 
+    // Update the retry interval used by the NEXT Start() cycle. Must be
+    // called on the reload-driver thread (same synchronization envelope
+    // as Issuer::ApplyReload — only Start/Cancel/this from that thread).
+    // Issuer::ApplyReload calls this before re-kicking a non-ready
+    // discovery cycle so `discovery_retry_sec` is actually live-
+    // reloadable. Values <= 0 are clamped to the construction default.
+    void SetRetrySec(int retry_sec) noexcept;
+
     bool IsReady() const noexcept {
         return ready_ && ready_->load(std::memory_order_acquire);
     }

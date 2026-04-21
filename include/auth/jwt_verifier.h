@@ -36,21 +36,32 @@ class JwtVerifier {
     // union of `forward.claims_to_headers` keys + any policy-level
     // extras. Passing an empty list leaves `out_ctx.claims` empty (the
     // fast default for policies that don't forward custom claims).
+    //
+    // `dispatcher_index` is the dispatcher serving the inbound request;
+    // on a kid miss the triggered JWKS refresh is dispatched on that
+    // partition so refresh traffic stays partition-affine with the
+    // caller (matches the per-partition pool design). Pass 0 when
+    // caller has no preference (tests / rare code paths); production
+    // callers should forward `HttpRequest::dispatcher_index`.
+    //
     // Never throws.
     static VerifyResult Verify(const std::string& token,
                                 Issuer& issuer,
                                 const AuthPolicy& policy,
                                 const std::vector<std::string>& claim_keys,
+                                size_t dispatcher_index,
                                 AuthContext& out_ctx);
 
     // Backward-compatible overload for callers that don't need custom
-    // claim forwarding (tests, legacy call sites). Delegates to the
-    // 5-arg overload with an empty key list.
+    // claim forwarding OR dispatcher-affinity routing (tests, legacy
+    // call sites). Delegates to the 6-arg overload with an empty key
+    // list and dispatcher 0.
     static VerifyResult Verify(const std::string& token,
                                 Issuer& issuer,
                                 const AuthPolicy& policy,
                                 AuthContext& out_ctx) {
-        return Verify(token, issuer, policy, {}, out_ctx);
+        return Verify(token, issuer, policy, {}, /*dispatcher_index=*/0,
+                      out_ctx);
     }
 
     // Decode the JWT and return the `iss` claim without verifying the

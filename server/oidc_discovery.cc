@@ -115,6 +115,10 @@ OidcDiscovery::~OidcDiscovery() {
     Cancel();
 }
 
+void OidcDiscovery::SetRetrySec(int retry_sec) noexcept {
+    retry_sec_ = retry_sec > 0 ? retry_sec : 30;
+}
+
 void OidcDiscovery::Start(size_t dispatcher_index,
                            uint64_t generation,
                            std::function<void(uint64_t,

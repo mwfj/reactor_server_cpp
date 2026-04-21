@@ -229,6 +229,7 @@ VerifyResult JwtVerifier::Verify(const std::string& token,
                                   Issuer& issuer,
                                   const AuthPolicy& policy,
                                   const std::vector<std::string>& claim_keys,
+                                  size_t dispatcher_index,
                                   AuthContext& out_ctx) {
     const std::string& issuer_name = issuer.name();
 
@@ -277,10 +278,13 @@ VerifyResult JwtVerifier::Verify(const std::string& token,
                                            "alg_not_allowed");
     }
 
-    // Look up the PEM for the kid. A miss schedules an async refresh and
-    // returns nullptr — the current request fails with UNDETERMINED.
-    int dispatcher_hint = 0;  // Any dispatcher will do for a cache miss.
-    auto pem_sp = issuer.LookupKeyByKid(head.kid, dispatcher_hint);
+    // Look up the PEM for the kid. A miss schedules an async refresh
+    // and returns nullptr — the current request fails with
+    // UNDETERMINED. Pass the caller's dispatcher_index through so
+    // concurrent refreshes stay partition-affine with the inbound
+    // request's dispatcher (avoids funneling every JWKS refresh
+    // through partition 0 under load).
+    auto pem_sp = issuer.LookupKeyByKid(head.kid, dispatcher_index);
     if (!pem_sp) {
         if (!issuer.IsReady()) {
             logging::Get()->warn(

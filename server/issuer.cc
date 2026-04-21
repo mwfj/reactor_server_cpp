@@ -240,6 +240,13 @@ bool Issuer::ApplyReload(const IssuerConfig& new_config, std::string& err_out) {
     // JWKS fetches for no benefit.
     if (discovery_ && oidc_discovery_ &&
         !ready_.load(std::memory_order_acquire)) {
+        // Apply the reloaded retry interval to the live OidcDiscovery
+        // BEFORE re-kicking — Start() captures retry_sec_ by value into
+        // the new cycle, so without this the fresh cycle would still
+        // sleep on the old interval and `discovery_retry_sec` would not
+        // actually hot-reload in the state where it matters (retrying
+        // pre-first-success).
+        oidc_discovery_->SetRetrySec(new_config.discovery_retry_sec);
         logging::Get()->info(
             "Issuer reload: re-kicking OIDC discovery issuer={} new_gen={}",
             name_, new_gen);
