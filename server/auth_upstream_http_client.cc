@@ -69,6 +69,21 @@ struct UpstreamHttpClient::Transaction
     // to object atomic members") for the class of bug this prevents.
     std::shared_ptr<Transaction> self_anchor;
 
+    // Mark the lease's upstream connection as non-reusable so the pool
+    // destroys rather than recycles it on Finish(). MUST be called BEFORE
+    // Finish() at any terminal path where the HTTP stream cannot be
+    // trusted for the next borrower: non-keepalive responses, parse/
+    // protocol errors, response-budget timeouts, and body-cap overruns.
+    // All four shapes leave either a FIN imminent, ambiguous parser
+    // state, or a server still emitting bytes that would collide with
+    // the next request/response stream on the same partition.
+    void PoisonLease() {
+        if (!lease) return;
+        if (auto* upstream_conn = lease.Get()) {
+            upstream_conn->MarkClosing();
+        }
+    }
+
     // Mark complete/error exactly once. On any terminal path (success,
     // error, timeout, cancel) release the lease, clear transport callbacks,
     // and invoke the user's DoneCallback. Running on the dispatcher thread
@@ -134,15 +149,9 @@ struct UpstreamHttpClient::Transaction
             logging::Get()->warn(
                 "UpstreamHttpClient body too large pool={} accumulated={} "
                 "cap={}", pool_name, new_total, req.max_response_body);
-            // Mark the connection non-reusable BEFORE releasing the lease so
-            // the pool destroys rather than recycles it. The response is only
-            // partially read — tail bytes would corrupt the next borrower's
-            // response stream (same pattern as ProxyTransaction::poison_connection_).
-            if (lease) {
-                if (auto* upstream_conn = lease.Get()) {
-                    upstream_conn->MarkClosing();
-                }
-            }
+            // Partial read — tail bytes would corrupt the next borrower's
+            // response stream. Poison before Finish() recycles the lease.
+            PoisonLease();
             UpstreamHttpClient::Response r;
             r.error = "body_too_large";
             Finish(std::move(r));
@@ -166,6 +175,15 @@ struct UpstreamHttpClient::Transaction
         // Body: the codec accumulates the body itself via the codec's
         // UpstreamResponse; we trust it up to our cap check above.
         resp.body = codec.GetResponse().body;
+        // Non-keepalive responses (Connection: close, HTTP/1.0 without
+        // explicit keep-alive, etc.) have a peer FIN imminent. The pool
+        // can hand the socket to the next waiter before the FIN lands,
+        // so the next JWKS/OIDC request would see upstream_disconnect
+        // on an otherwise healthy IdP. Matches ProxyTransaction's
+        // `poison_connection_ = true` on `!head.keep_alive`.
+        if (!head.keep_alive) {
+            PoisonLease();
+        }
         Finish(std::move(resp));
     }
 
@@ -176,6 +194,10 @@ struct UpstreamHttpClient::Transaction
         logging::Get()->warn(
             "UpstreamHttpClient OnError pool={} code={} err={}",
             pool_name, error_code, r.error);
+        // Parse/protocol errors leave the HTTP stream in an ambiguous
+        // state — recycling the socket would risk interpreting trailing
+        // bytes as the next borrower's response.
+        PoisonLease();
         Finish(std::move(r));
     }
 };
@@ -395,14 +417,20 @@ void UpstreamHttpClient::Issue(const std::string& upstream_pool_name,
                             t3->pool_name, t3->req.timeout_sec);
                         UpstreamHttpClient::Response r;
                         r.error = "timeout";
-                        // Finish() releases the lease BACK to the pool. A
-                        // waiter can immediately borrow the same transport,
-                        // so the default close path (CloseAfterWrite on the
-                        // same ConnectionHandler) would tear down the next
-                        // borrower's in-flight request. Return true to
-                        // signal the timeout is handled — matches
-                        // ProxyTransaction::ArmResponseTimeout's contract.
+                        // Poison BEFORE Finish() releases the lease. The
+                        // upstream may still send late response bytes; if
+                        // the pool recycled this transport to another
+                        // auth fetch first, those bytes would be
+                        // interpreted as the next request's response.
+                        // MarkClosing ensures the pool destroys the
+                        // connection on return instead.
+                        t3->PoisonLease();
                         t3->Finish(std::move(r));
+                        // Return true to signal the timeout is handled —
+                        // otherwise the dispatcher's default close path
+                        // (CloseAfterWrite on the same ConnectionHandler)
+                        // would tear down the next borrower's in-flight
+                        // request. Matches ProxyTransaction::ArmResponseTimeout.
                         return true;
                     });
                 }

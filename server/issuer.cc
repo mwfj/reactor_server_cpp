@@ -270,6 +270,12 @@ std::shared_ptr<const std::string> Issuer::LookupKeyByKid(
         // miss-only refresh path never fires for same-kid hits.
         if (ready_.load(std::memory_order_acquire) &&
             jwks_cache_->IsTtlExpired()) {
+            // Observability: bump `jwks_stale_served` for this TTL-
+            // expired serve. Exposed via BuildView → /stats. Documented
+            // in jwks_cache.h as the counter operators watch to detect
+            // degraded IdP / refresh-failure scenarios; without this
+            // bump, the advertised signal is always zero.
+            jwks_cache_->IncrementStaleServed();
             ScheduleInitialFetch(PickDispatcherForFetch(dispatcher_index));
         }
         return pem;
