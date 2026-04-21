@@ -19,11 +19,16 @@ private:
     std::string ip_addr_;
     int port_;
     sa_family_t family_ = AF_UNSPEC;   // §5.3 dual-family — set by CreateSocket / accept-ctor
-    void SetNonBlocking(int fd);
+    static void SetNonBlocking(int fd);   // static per v0.45 step 4 — CreateSocket is static
 
 public:
     SocketHandler();
     explicit SocketHandler(int);
+    // v0.45 step 4: adopt an existing listen/client fd AND record the
+    // address family the fd was created with. Used by Acceptor when it
+    // creates the fd via CreateSocket(family) explicitly (so IPV6_V6ONLY
+    // can be applied before Bind per §5.4).
+    SocketHandler(int fd, sa_family_t family);
     SocketHandler(int fd, const std::string& ip, int port);
     ~SocketHandler();
     
@@ -69,7 +74,12 @@ public:
     // Dual-family per §5.3. `family` selects AF_INET or AF_INET6. The
     // AF_INET default preserves source compatibility for every existing
     // call site — IPv6 callers opt in explicitly.
-    int CreateSocket(sa_family_t family = AF_INET);
+    //
+    // v0.45 step 4: STATIC. Returns a new fd; caller decides what to do
+    // with it (wrap in SocketHandler(fd, family), or keep raw). Making
+    // this static lets Acceptor create the fd before constructing a
+    // SocketHandler, so IPV6_V6ONLY can be applied before Bind (§5.4).
+    static int CreateSocket(sa_family_t family = AF_INET);
     static int CreateClientSocket(sa_family_t family = AF_INET);
     void Bind(const InetAddr& servAddr);
     void Listen(int maxLen);

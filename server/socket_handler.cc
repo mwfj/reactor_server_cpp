@@ -4,10 +4,10 @@
 
 
 // Default ctor — preserves AF_INET behaviour for the single legacy call
-// site. IPv6 callers construct via `SocketHandler s; s.fd = CreateSocket(AF_INET6);`
-// or by passing the fd directly after a typed CreateSocket call.
+// site. IPv6 callers use `SocketHandler(CreateSocket(AF_INET6), AF_INET6)`.
 SocketHandler::SocketHandler() : fd_(CreateSocket(AF_INET)), port_(0), family_(AF_INET) {}
 SocketHandler::SocketHandler(int fd) : fd_(fd), port_(0), family_(AF_UNSPEC) {}
+SocketHandler::SocketHandler(int fd, sa_family_t family) : fd_(fd), port_(0), family_(family) {}
 SocketHandler::SocketHandler(int fd, const std::string& ip, int port) : fd_(fd), ip_addr_(ip), port_(port), family_(AF_UNSPEC) {}
 SocketHandler::~SocketHandler() { Close(); }
 
@@ -33,6 +33,9 @@ int SocketHandler::CreateSocket(sa_family_t family) {
     // that need IPv6 pass AF_INET6 explicitly. SOCK_CLOEXEC atomically
     // avoids the fd-leaks-into-fork-exec race on Linux; macOS uses
     // fcntl(F_SETFD) in SetNonBlocking.
+    //
+    // v0.45 step 4: static (no access to member family_). Caller records
+    // the family by wrapping the returned fd in `SocketHandler(fd, family)`.
 #if defined(__linux__)
     int listenfd = ::socket(family, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
 #else
@@ -51,7 +54,6 @@ int SocketHandler::CreateSocket(sa_family_t family) {
         ::close(listenfd);
         throw;
     }
-    family_ = family;
     return listenfd;
 }
 

@@ -8,9 +8,55 @@
 // init server socket
 Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _ip, const size_t _port):
     event_dispatcher_(_dispatcher),
-    servsock_(new SocketHandler())
+    servsock_(nullptr)
 {
+    // v0.45 step 4 (§5.4 IPv6 bind path). Parse the bind literal first,
+    // pick the socket family from its parsed kind, then create a socket
+    // of THAT family. For hostnames (Phase 1 doesn't resolve in this
+    // ctor — that's deferred to HttpServer::Start → DNS → NetServer::
+    // StartListening(InetAddr)), the string-based ctor is a legacy
+    // entry point kept for CLI / tests that pass an IP literal; it
+    // fails closed if the literal is malformed.
     InetAddr addr(_ip, _port);
+    if (!addr.is_valid()) {
+        throw std::runtime_error(
+            "Acceptor: bind address '" + _ip + "' is not a valid IP literal "
+            "(hostname resolution happens earlier in HttpServer::Start; "
+            "callers passing a hostname must go through that path).");
+    }
+    const sa_family_t family =
+        (addr.family() == InetAddr::Family::kIPv6) ? AF_INET6 : AF_INET;
+
+    // Create the listen fd with the selected family, wrap in a
+    // SocketHandler that records the family so later code can branch on
+    // it (e.g. GetBoundPort via getsockname on sockaddr_storage).
+    int listen_fd = SocketHandler::CreateSocket(family);
+    servsock_.reset(new SocketHandler(listen_fd, family));
+
+    // v0.45 step 4 (§5.4): RFC 3493 §5.3 IPv6 bind. For an AF_INET6
+    // listener, enable IPV6_V6ONLY so the socket does NOT accept
+    // v4-mapped peers. This is fail-closed: the §1.3 IP-based rate-limit
+    // / ACL contract depends on peer addresses being EITHER v4 or v6 —
+    // NOT v4-mapped-in-v6. If the platform refuses the setsockopt we
+    // refuse to start rather than silently fall back to dual-mapped
+    // semantics (matches DEVELOPMENT_RULES.md "never fail open on
+    // security-relevant setsockopt").
+    if (family == AF_INET6) {
+        int on = 1;
+        if (::setsockopt(servsock_->fd(), IPPROTO_IPV6, IPV6_V6ONLY,
+                         &on, sizeof(on)) != 0) {
+            int saved_errno = errno;
+            logging::Get()->error(
+                "Failed to enable IPV6_V6ONLY on bind socket: {} (errno={})",
+                logging::SafeStrerror(saved_errno), saved_errno);
+            throw std::runtime_error(
+                "Unable to enforce IPV6_V6ONLY on IPv6 listener; startup "
+                "aborted because dual-mapped peer semantics would violate "
+                "the Phase 1 IP-based rate-limiting / ACL contract "
+                "documented in §1.3.");
+        }
+    }
+
     servsock_->SetReuseAddr(true);
     servsock_->SetTcpNoDelay(true);
     servsock_->SetReusePort(true);

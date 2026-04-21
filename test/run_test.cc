@@ -24,6 +24,8 @@
 #include "circuit_breaker_observability_test.h"
 #include "circuit_breaker_reload_test.h"
 #include "auth_foundation_test.h"
+#include "dns_resolver_test.h"
+#include "dual_stack_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -121,6 +123,12 @@ void RunAllTest(){
 
     // Run auth foundation tests (minimal — pins r3/r5 security invariants)
     AuthFoundationTests::RunAllTests();
+
+    // Run DnsResolver tests (lazy pool, static helpers, detach-not-join)
+    DnsResolverTests::RunAllTests();
+
+    // Run dual-stack integration tests (IPv6 bind, hostname rejection, …)
+    DualStackTests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;
 }

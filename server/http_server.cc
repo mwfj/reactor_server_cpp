@@ -878,19 +878,25 @@ void HttpServer::WireNetServerCallbacks() {
         });
 }
 
-// Validate host is a strict dotted-quad IPv4 address. Uses inet_pton (not
-// inet_addr) to reject legacy shorthand forms like "1" or octal "0127.0.0.1".
+// v0.45 step 4 (§5.6 preview): accept IPv4 OR IPv6 literals. Hostnames
+// still reject here — Phase 1 resolves hostnames upstream in
+// HttpServer::Start → DnsResolver; the legacy (ip, port) ctor path is
+// literal-only. Step 6 replaces this with ConfigLoader::Normalize +
+// Validate via the PrepareConfig helper and removes ValidateHost
+// entirely; until then this is the minimum patch that unblocks IPv6
+// literal bind for tests and embedders.
 static const std::string& ValidateHost(const std::string& host) {
     if (host.empty()) {
         throw std::invalid_argument("bind host must not be empty");
     }
-    struct in_addr addr{};
-    if (inet_pton(AF_INET, host.c_str(), &addr) != 1) {
-        throw std::invalid_argument(
-            "Invalid bind host: '" + host +
-            "' (must be a dotted-quad IPv4 address, e.g. '0.0.0.0' or '127.0.0.1')");
-    }
-    return host;
+    unsigned char buf[sizeof(struct in6_addr)];
+    if (inet_pton(AF_INET,  host.c_str(), buf) == 1) return host;
+    if (inet_pton(AF_INET6, host.c_str(), buf) == 1) return host;
+    throw std::invalid_argument(
+        "Invalid bind host: '" + host +
+        "' (must be an IPv4 literal, e.g. '0.0.0.0', or a bare IPv6 literal, "
+        "e.g. '::1'; hostnames are resolved via HttpServer::Start's DNS path, "
+        "not through this ctor)");
 }
 
 // Validate port before member construction — must run in the initializer
