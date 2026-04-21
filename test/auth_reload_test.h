@@ -784,6 +784,170 @@ static bool TestConfigLoaderAcceptsMixedCaseHttpsScheme() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 19: rename-with-non-live-issuer preserves live coverage. When a
+// reload removes policy A AND adds policy B whose issuers reference an
+// issuer that isn't yet live, the merge MUST preserve A until restart
+// so the protected prefix doesn't silently lose auth.
+// ---------------------------------------------------------------------------
+static bool TestReloadPreservesLiveOnRenameWithNonLiveIssuer() {
+    const std::string iss_name = "live-iss";
+    const std::string iss_url  = "https://live-iss.example.com";
+
+    AUTH_NAMESPACE::AuthConfig cfg0 = MakeConfig(iss_name, iss_url);
+    AUTH_NAMESPACE::AuthPolicy p_old;
+    p_old.name = "policy-old";
+    p_old.enabled = true;
+    p_old.applies_to = {"/secure/"};
+    p_old.issuers = {iss_name};
+    cfg0.policies.push_back(p_old);
+    cfg0.enabled = true;
+
+    auto mgr = MakeManager(cfg0);
+    {
+        std::string err;
+        if (!ReloadAndCommit(*mgr, cfg0, err)) { mgr->Stop(); return false; }
+    }
+    auto snap0 = mgr->SnapshotAll();
+    if (snap0.policy_count == 0) { mgr->Stop(); return false; }
+
+    // Staged config: same live issuer (topology unchanged so AuthManager::
+    // Reload accepts) but operator has renamed "policy-old" → "policy-new"
+    // AND references a non-live issuer name. The ADD defers; the REMOVE
+    // must preserve live coverage for /secure/.
+    AUTH_NAMESPACE::AuthConfig cfg1 = MakeConfig(iss_name, iss_url);
+    cfg1.enabled = true;
+    AUTH_NAMESPACE::AuthPolicy p_new;
+    p_new.name = "policy-new";
+    p_new.enabled = true;
+    p_new.applies_to = {"/secure/"};
+    p_new.issuers = {"staged-only-issuer"};  // NOT in live issuer set
+    cfg1.policies.push_back(p_new);
+
+    std::string err;
+    bool ok = ReloadAndCommit(*mgr, cfg1, err);
+    auto snap1 = mgr->SnapshotAll();
+    mgr->Stop();
+
+    // Live policy preserved (policy_count >= 1) instead of dropping to 0.
+    return ok && snap1.policy_count >= 1;
+}
+
+// ---------------------------------------------------------------------------
+// Test 20: pure removal still drops. A reload that ONLY removes a policy
+// (no deferred add in the same cycle) must drop the live entry — the
+// migration-preserve heuristic must not regress the pure-removal path.
+// ---------------------------------------------------------------------------
+static bool TestReloadPureRemovalStillDrops() {
+    const std::string iss_name = "live-iss-rm2";
+    const std::string iss_url  = "https://rm2.example.com";
+
+    AUTH_NAMESPACE::AuthConfig cfg0 = MakeConfig(iss_name, iss_url);
+    AUTH_NAMESPACE::AuthPolicy p;
+    p.name = "to-remove";
+    p.enabled = true;
+    p.applies_to = {"/x/"};
+    p.issuers = {iss_name};
+    cfg0.policies.push_back(p);
+    cfg0.enabled = true;
+
+    auto mgr = MakeManager(cfg0);
+    {
+        std::string err;
+        if (!ReloadAndCommit(*mgr, cfg0, err)) { mgr->Stop(); return false; }
+    }
+
+    // No adds, no deferred — pure removal.
+    AUTH_NAMESPACE::AuthConfig cfg1 = MakeConfig(iss_name, iss_url);
+    cfg1.enabled = true;  // empty policies
+
+    std::string err;
+    bool ok = ReloadAndCommit(*mgr, cfg1, err);
+    auto snap = mgr->SnapshotAll();
+    mgr->Stop();
+
+    return ok && snap.policy_count == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 21: ValidateHotReloadable hard-rejects auth.forward with a
+// reserved header name. Without this, a SIGHUP that typed a reserved
+// subject_header would warn via the outer Validate catch-all and STILL
+// commit a live snapshot — startup would have rejected the same config.
+// ---------------------------------------------------------------------------
+static bool TestValidateHotReloadableRejectsAuthForward() {
+    const std::string json = R"({
+        "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+        "auth": {
+            "enabled": false,
+            "issuers": {
+                "a": {
+                    "issuer_url": "https://a.example",
+                    "upstream": "x",
+                    "mode": "jwt",
+                    "algorithms": ["RS256"]
+                }
+            },
+            "forward": { "subject_header": "Via" }
+        }
+    })";
+    ServerConfig cfg = ConfigLoader::LoadFromString(json);
+    bool threw = false;
+    std::string msg;
+    try {
+        ConfigLoader::ValidateHotReloadable(cfg, {"x"}, {"a"});
+    } catch (const std::invalid_argument& e) {
+        threw = true;
+        msg = e.what();
+    }
+    return threw && msg.find("reserved") != std::string::npos;
+}
+
+// ---------------------------------------------------------------------------
+// Test 22: ValidateHotReloadable hard-rejects duplicate top-level policy
+// names. A SIGHUP that introduces a duplicate must not slip to Commit.
+// ---------------------------------------------------------------------------
+static bool TestValidateHotReloadableRejectsDuplicatePolicyName() {
+    ServerConfig cfg;
+    UpstreamConfig u;
+    u.name = "x";
+    u.host = "127.0.0.1";
+    u.port = 80;
+    cfg.upstreams.push_back(u);
+
+    AUTH_NAMESPACE::IssuerConfig ic;
+    ic.name = "a";
+    ic.issuer_url = "https://a.example";
+    ic.upstream = "x";
+    ic.mode = "jwt";
+    ic.algorithms = {"RS256"};
+    cfg.auth.issuers["a"] = ic;
+
+    AUTH_NAMESPACE::AuthPolicy p1;
+    p1.name = "dup";
+    p1.enabled = true;
+    p1.applies_to = {"/one/"};
+    p1.issuers = {"a"};
+    cfg.auth.policies.push_back(p1);
+
+    AUTH_NAMESPACE::AuthPolicy p2;
+    p2.name = "dup";  // duplicate name
+    p2.enabled = true;
+    p2.applies_to = {"/two/"};
+    p2.issuers = {"a"};
+    cfg.auth.policies.push_back(p2);
+
+    bool threw = false;
+    std::string msg;
+    try {
+        ConfigLoader::ValidateHotReloadable(cfg, {"x"}, {"a"});
+    } catch (const std::invalid_argument& e) {
+        threw = true;
+        msg = e.what();
+    }
+    return threw && msg.find("duplicated") != std::string::npos;
+}
+
+// ---------------------------------------------------------------------------
 // Test runner
 // ---------------------------------------------------------------------------
 
@@ -838,6 +1002,14 @@ static void RunAllTests() {
            TestValidateAuthPrefixCollisionsScopedByLive);
     RunOne("AuthReload: accepts mixed-case HTTPS scheme",
            TestConfigLoaderAcceptsMixedCaseHttpsScheme);
+    RunOne("AuthReload: preserves live on rename with non-live issuer",
+           TestReloadPreservesLiveOnRenameWithNonLiveIssuer);
+    RunOne("AuthReload: pure removal still drops",
+           TestReloadPureRemovalStillDrops);
+    RunOne("AuthReload: ValidateHotReloadable rejects auth.forward reserved",
+           TestValidateHotReloadableRejectsAuthForward);
+    RunOne("AuthReload: ValidateHotReloadable rejects duplicate policy name",
+           TestValidateHotReloadableRejectsDuplicatePolicyName);
 }
 
 }  // namespace AuthReloadTests

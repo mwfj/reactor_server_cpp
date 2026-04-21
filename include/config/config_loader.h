@@ -151,6 +151,39 @@ public:
         const ServerConfig& config,
         const std::unordered_set<std::string>& live_upstream_names);
 
+    // Structural validation for `auth.forward.*` output header names:
+    //   * RFC 7230 §3.2.6 tchar validity (rejects spaces / punctuation /
+    //     pseudo-header colons)
+    //   * Reserved-name rejection (hop-by-hop, framing-critical,
+    //     HeaderRewriter-owned, gateway-owned sentinels — see
+    //     IsReservedAuthForwardHeader)
+    //   * Case-insensitive duplicate detection across the 4 fixed slots
+    //     (subject/issuer/scopes/raw_jwt) plus every claims_to_headers target.
+    //
+    // Shared entry point so startup `Validate` and `ValidateHotReloadable`
+    // apply the same rules — without this, a SIGHUP that introduces a
+    // bad forward-header name would only log a warn at the outer
+    // ReloadConfig catch-all and then commit the snapshot to live state,
+    // while startup with the identical config would reject outright.
+    //
+    // Throws std::invalid_argument on failure.
+    static void ValidateAuthForward(const ServerConfig& config);
+
+    // Structural validation for top-level `auth.policies[]` entries:
+    //   * `name` non-empty / not-whitespace-only + unique across policies
+    //   * `on_undetermined` ∈ {"deny", "allow"}
+    //   * each `issuers[]` name present in `config.auth.issuers`
+    //   * enabled && applies_to empty → reject
+    //   * enabled && issuers empty → reject
+    //
+    // Shared between startup `Validate` and `ValidateHotReloadable` for
+    // the same reason as `ValidateAuthForward`: malformed live policy
+    // edits must hard-reject before CommitPolicyAndEnforcement publishes
+    // them, not just warn via the outer reload catch-all.
+    //
+    // Throws std::invalid_argument on failure.
+    static void ValidateTopLevelPolicies(const ServerConfig& config);
+
     // Exact-prefix collision detection across inline `proxy.auth` and
     // top-level `auth.policies[].applies_to`. Per design §3.2 / §5.2,
     // a prefix that appears in two different policy owners is a

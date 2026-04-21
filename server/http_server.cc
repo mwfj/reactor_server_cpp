@@ -294,10 +294,18 @@ struct TopLevelAuthPolicyMergeResult {
 //   - Removed (live name absent in staged): drop from the live matcher.
 //     Removal is the operator's explicit intent and is live-reloadable
 //     per the design; no topology_changed flag.
+//     EXCEPTION: if the SAME reload has any deferred ADD (staged add
+//     whose issuers reference a non-live issuer), preserve ALL removed
+//     live policies for this cycle and flag topology_changed. Rationale:
+//     operators frequently rename during issuer-migration reloads, and
+//     dropping the old policy while the add defers would silently open
+//     an auth-coverage gap until restart. Pure removals (no deferred
+//     add in the cycle) still drop as usual.
 //   - Renamed: surfaces here as live-removal of the old name + add of
-//     the new name. Net result is the matcher swaps from old name to
-//     new name; the ADDS loop below applies the same per-add gating as
-//     any other add (defers if staged issuers reference a non-live name).
+//     the new name. With the EXCEPTION above, the live matcher keeps
+//     old-name coverage whenever the add's issuers aren't live yet;
+//     when the add CAN go live, the old name drops and the new name
+//     commits — net matcher swap with unchanged coverage.
 //   - Added (staged name absent in live): if staged.issuers[] ⊆
 //     live_issuer_names, commit live (append to merged vector). If any
 //     staged issuer is non-live, defer the SINGLE policy add (don't
@@ -339,23 +347,46 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
         staged_by_name.emplace(p.name, &p);
     }
 
-    // Build live_names alongside the edit walk so the ADDS loop below
-    // doesn't need a second O(N) pass over live_policies.
+    // Index live policies by name so the staged walks below don't need
+    // O(N*M) lookups against live_policies.
     std::unordered_set<std::string> live_names;
     live_names.reserve(live_policies.size());
+    for (const auto& live : live_policies) live_names.insert(live.name);
 
+    // Pre-pass: detect whether the reload has any DEFERRED add — a staged
+    // policy whose name is absent from live AND whose issuers reference a
+    // non-live issuer. The EDIT pass below uses this as a "migration in
+    // progress" signal: if an add couldn't go live this cycle, removing
+    // the OLD live policy (which the operator may have renamed as part
+    // of the same migration) would leave the protected prefix completely
+    // unprotected until restart. Per design §11.2 step 4, restart-required
+    // auth-topology edits MUST warn-and-defer while keeping the live
+    // matcher intact — never silently open a gap.
+    bool any_add_deferred = false;
+    for (const auto& p : staged_policies) {
+        if (live_names.count(p.name) != 0) continue;  // edit, handled later
+        if (!issuers_all_live(p)) { any_add_deferred = true; break; }
+    }
+
+    // EDIT pass.
     for (const auto& live : live_policies) {
-        live_names.insert(live.name);
         auto it = staged_by_name.find(live.name);
         if (it == staged_by_name.end()) {
-            // Staged removed or renamed this policy. Per design §11.2
-            // step 4, removal IS the operator's explicit intent and is
-            // live-reloadable: drop from the matcher (don't push live
-            // into out). A pure rename surfaces here as live-removal +
-            // staged-add of the new name in the ADDS loop below; the
-            // net effect is the matcher swap from old name to new name
-            // with unchanged coverage. No topology_changed flag — this
-            // is the documented happy path, not a deferred change.
+            // Staged removed or renamed this policy. Default: drop
+            // (live-reloadable removal per design §11.2 step 4). BUT if
+            // the same reload has a deferred ADD, treat this as a
+            // migration-in-progress and preserve the live entry to
+            // avoid a coverage gap. Pure removals (no deferred add in
+            // the same cycle) still drop. `any_add_deferred` signals
+            // "there's a staged replacement that can't go live this
+            // cycle" — conservative but safe: the cost of a spurious
+            // preserve on unrelated concurrent edits is one extra
+            // reload after restart, while the cost of dropping is a
+            // silent auth-coverage gap.
+            if (any_add_deferred) {
+                out.topology_changed = true;
+                out.policies.push_back(live);
+            }
             continue;
         }
         const auto& staged = *it->second;

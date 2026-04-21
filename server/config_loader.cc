@@ -1283,38 +1283,26 @@ void ConfigLoader::ValidateHotReloadable(
         // above — no per-issuer check needed here.
     }
 
-    // Policies referencing staged-only issuers are NOT rejected here — they
-    // are handled in the reload merge via whole-policy defer: the ENTIRE
-    // live policy is preserved for the affected identity (not just the
-    // issuers list) and topology_changed is flagged (see
-    // HttpServer::MergeTopLevelAuthPoliciesPreservingLiveTopology and
-    // design §11.2 step 4 / §18.5). Hard-rejecting here would turn a
-    // restart-only auth topology change into a hard abort that blocks
-    // unrelated live-safe edits, contradicting the documented warn-and-
-    // defer contract for auth topology changes.
+    // Auth.forward and top-level policy structural validation. Both
+    // are hard-reject here so the SIGHUP path matches startup behavior:
+    // `AuthManager::Reload` + `CommitPolicyAndEnforcement` publish the
+    // forward snapshot AND the applied-policy list immediately, so a
+    // duplicate-name / reserved-header / bad-shape staged edit cannot
+    // be allowed to reach Commit. The outer `main.cc::ReloadConfig`
+    // downgrades the full Validate() failure to a warn (for restart-
+    // only fields), so without these hard-rejects here, malformed live
+    // auth edits would log a warning and STILL commit a runtime
+    // snapshot that startup would reject.
     //
-    // BUT: `enabled=true` + empty `issuers` IS hard-rejected (symmetric
-    // with inline `proxy.auth` and with the same check in Validate()).
-    // A policy with no issuers has no verification path; every matching
-    // request falls into InvokeMiddleware's no_issuer_for_policy branch
-    // and either 503s or passes through on `on_undetermined=allow` —
-    // never the gate the operator configured. This shape can slip past
-    // the startup Validate via a SIGHUP that introduces it, so mirror
-    // the check here to keep startup/reload symmetric. Runs on every
-    // staged policy (live or staged-only); disabled policies are fine.
-    for (size_t i = 0; i < config.auth.policies.size(); ++i) {
-        const auto& p = config.auth.policies[i];
-        if (p.enabled && p.issuers.empty()) {
-            const std::string policy_owner =
-                p.name.empty()
-                    ? ("auth.policies[" + std::to_string(i) + "]")
-                    : ("auth.policies['" + p.name + "']");
-            throw std::invalid_argument(
-                policy_owner + ".enabled=true rejected: issuers list is "
-                "empty — a top-level auth policy gate needs at least one "
-                "configured issuer from auth.issuers.");
-        }
-    }
+    // Note on issuer-reference scope: staged policies referencing
+    // staged-only issuers are NOT rejected here — handled by whole-
+    // policy defer in the merge (design §11.2 step 4 / §18.5). The
+    // helpers below only check that referenced issuer names exist in
+    // the STAGED config (typo-rejection). Empty-issuer / empty-
+    // applies_to / duplicate-name / reserved-header are live-safe
+    // shape checks that apply equally to startup and reload.
+    ValidateAuthForward(config);
+    ValidateTopLevelPolicies(config);
 }
 
 void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
@@ -2185,120 +2173,18 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             }
         }
 
-        // Top-level policy validation. Also enforce NAME UNIQUENESS across
-        // top-level policies — the merge at HttpServer::Reload keys by
-        // `name`, so a duplicate staged name would silently bind two live
-        // policies to the same staged entry (first-wins in the lookup
-        // map), letting the wrong reloadable fields leak into the other
-        // identity. Non-empty + unique is the invariant the reload path
-        // needs; enforce it here at load time.
-        std::unordered_set<std::string> top_level_policy_names;
-        top_level_policy_names.reserve(config.auth.policies.size());
-        for (size_t i = 0; i < config.auth.policies.size(); ++i) {
-            const auto& p = config.auth.policies[i];
-            const std::string ctx =
-                "auth.policies[" + std::to_string(i) + "]";
-            // Per AuthPolicy contract (auth_config.h): top-level policies
-            // require a non-empty `name`. Inline policies (proxy.auth) are
-            // anonymous because they're identified by their parent
-            // upstream's name, but top-level entries have no surrounding
-            // context — without a name, log lines and metrics for a deny
-            // / 401 / collision can only point to the array index, which
-            // is unstable across config edits and useless once the config
-            // file is reordered. Reject empty/whitespace-only names so
-            // every operator-visible log line for a top-level policy
-            // names something stable.
-            bool name_blank = p.name.empty();
-            if (!name_blank) {
-                name_blank = true;
-                for (char c : p.name) {
-                    if (!std::isspace(static_cast<unsigned char>(c))) {
-                        name_blank = false;
-                        break;
-                    }
-                }
-            }
-            if (name_blank) {
-                throw std::invalid_argument(
-                    ctx + ".name is required for top-level policies "
-                    "(inline proxy.auth policies inherit identity from "
-                    "their parent upstream; top-level entries have none "
-                    "and operator-visible logs/metrics need a stable "
-                    "identifier — array index is unstable across edits)");
-            }
-            if (!top_level_policy_names.insert(p.name).second) {
-                throw std::invalid_argument(
-                    ctx + ".name '" + p.name + "' is duplicated by another "
-                    "top-level policy. Top-level policy names MUST be "
-                    "unique — the reload merge uses `name` as identity, "
-                    "so a collision would silently bind two live policies "
-                    "to the same staged entry on the next SIGHUP.");
-            }
-            if (p.on_undetermined != "deny" && p.on_undetermined != "allow") {
-                throw std::invalid_argument(
-                    ctx + ".on_undetermined must be \"deny\" or \"allow\"");
-            }
-            for (const auto& issuer_name : p.issuers) {
-                if (config.auth.issuers.count(issuer_name) == 0) {
-                    throw std::invalid_argument(
-                        ctx + ".issuers references unknown issuer '" +
-                        issuer_name + "'");
-                }
-            }
-            // An enabled policy with no issuers has no viable verification
-            // path: every matching request falls into InvokeMiddleware's
-            // no_issuer_for_policy branch and either 503s or passes
-            // through when on_undetermined=allow — neither is a gate the
-            // operator can rely on. Inline `proxy.auth` rejects this same
-            // shape; top-level must too. Disabled policies are allowed
-            // to have empty issuers (mid-construction state during
-            // rollout).
-            if (p.enabled && p.issuers.empty()) {
-                throw std::invalid_argument(
-                    ctx + ".enabled=true rejected: issuers list is empty "
-                    "— a top-level auth policy gate needs at least one "
-                    "configured issuer from auth.issuers. Populate "
-                    "issuers[...] before enabling, or set enabled=false "
-                    "until the issuer list is ready.");
-            }
-            // applies_to is the prefix list that drives runtime matching;
-            // an enabled policy without it never matches any path → silent
-            // dead policy → routes the operator INTENDED to protect are
-            // left wide open at runtime. Reject loudly. Disabled policies
-            // are allowed to have empty applies_to (mid-construction state
-            // during the rollout — operator may be filling fields in
-            // increments before flipping enabled).
-            if (p.enabled && p.applies_to.empty()) {
-                throw std::invalid_argument(
-                    ctx + " is enabled but has no applies_to prefixes — "
-                    "the policy would never match any path. Add at least "
-                    "one prefix to applies_to, or set enabled=false until "
-                    "the prefix list is ready.");
-            }
+        // Top-level policy structural validation (name uniqueness, on_
+        // undetermined, issuer xref, enabled-shape). Delegated so the
+        // SIGHUP path can run the same checks and hard-reject before
+        // Commit publishes the snapshot.
+        ValidateTopLevelPolicies(config);
 
-            // applies_to entries are consumed ONLY by AUTH_NAMESPACE::FindPolicyForPath
-            // which does literal byte-prefix matching (design spec §3.2).
-            // No route_trie is involved in this path — the string is taken
-            // verbatim as the prefix to compare against each request's URL
-            // path bytes. So applies_to values can legitimately contain
-            // any printable characters, including ':' and '*' that would
-            // look like route-trie pattern syntax (e.g. a docs system with
-            // `/docs/:faq` as a LITERAL URL, or `/assets/*latest` where
-            // `*latest` is a literal filename prefix).
-            //
-            // We deliberately do NOT run ROUTE_TRIE::ParsePattern here:
-            // there's no second matcher that interprets the pattern, so
-            // there's no mismatch risk (unlike inline `proxy.auth`, where
-            // the trie AND the auth matcher both consume the same
-            // route_prefix and disagree on semantics — that case still
-            // rejects patterned prefixes).
-            //
-            // If an operator writes `/api/:version/` here EXPECTING trie
-            // semantics, they'll get literal matching only. That's an
-            // operator-education problem, not a validator problem; the
-            // matcher's behavior is unambiguous and trying to guess
-            // intent would incorrectly reject legitimate literal URLs.
-        }
+        // applies_to on top-level `auth.policies[]` entries is consumed
+        // ONLY by the literal-byte-prefix matcher (design §3.2). Values
+        // like `/assets/*latest` or `/docs/:faq` are valid LITERAL URLs
+        // — unlike inline `proxy.auth.route_prefix`, there's no second
+        // matcher (route_trie) reinterpreting them, so no mismatch risk.
+        // No ROUTE_TRIE::ParsePattern check here.
 
         // Inline proxy.auth structural validation. Exact-prefix
         // collision detection (across inline + top-level applies_to) is
@@ -2416,67 +2302,10 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
         // on the SIGHUP path so the strict reload gate is symmetric.
         ValidateAuthPrefixCollisions(config);
 
-        // Forward config: reject header-name collisions among the fixed
-        // output slots and the claims_to_headers map. Design §5.3.
-        // Run unconditionally — the default AuthForwardConfig has three
-        // distinct non-empty header names that trivially pass the set
-        // insertion, and an operator who writes the defaults back
-        // explicitly in JSON gets the same (correct) treatment.
-        {
-            std::unordered_set<std::string> output_headers;
-            auto add_header = [&output_headers](const std::string& name,
-                                                const std::string& which) {
-                if (name.empty()) return;
-                // Validate the ORIGINAL case-preserved name against RFC
-                // 7230 §3.2.6 tchar. An invalid name would pass through
-                // HttpRequestSerializer verbatim and produce malformed
-                // HTTP on every forwarded request. Check first — a
-                // malformed name CAN'T meaningfully be reserved or
-                // non-reserved, so field-name validity is more
-                // fundamental than the reserved/duplicate checks below.
-                if (!IsValidHttpFieldName(name)) {
-                    throw std::invalid_argument(
-                        "auth.forward." + which + " '" + name +
-                        "' contains characters not valid in an HTTP field "
-                        "name (RFC 7230 §3.2.6 `token`: A-Z a-z 0-9 and "
-                        "!#$%&'*+-.^_`|~). Spaces, slashes, colons, and "
-                        "other punctuation are forbidden.");
-                }
-                std::string lower;
-                lower.reserve(name.size());
-                for (char c : name) {
-                    lower.push_back(static_cast<char>(
-                        std::tolower(static_cast<unsigned char>(c))));
-                }
-                // Reserved-name check FIRST (security): hop-by-hop / pseudo /
-                // framing-critical / Authorization names would corrupt or
-                // spoof the forwarded request. See IsReservedAuthForwardHeader
-                // for the full categorization. Reject before the duplicate
-                // check so the operator sees the more-actionable error.
-                if (IsReservedAuthForwardHeader(lower)) {
-                    throw std::invalid_argument(
-                        "auth.forward." + which + " '" + name +
-                        "' is a reserved/hop-by-hop/pseudo/framing header "
-                        "name and must not be used as an auth-forward output "
-                        "(would corrupt or spoof the upstream request); pick "
-                        "an X-prefixed name like 'X-Auth-Subject' instead");
-                }
-                if (!output_headers.insert(lower).second) {
-                    throw std::invalid_argument(
-                        "auth.forward." + which + " '" + name +
-                        "' collides with another output header name "
-                        "(case-insensitive)");
-                }
-            };
-            add_header(config.auth.forward.subject_header, "subject_header");
-            add_header(config.auth.forward.issuer_header, "issuer_header");
-            add_header(config.auth.forward.scopes_header, "scopes_header");
-            add_header(config.auth.forward.raw_jwt_header, "raw_jwt_header");
-            for (const auto& [claim, header] :
-                 config.auth.forward.claims_to_headers) {
-                add_header(header, "claims_to_headers[" + claim + "]");
-            }
-        }
+        // Forward-header structural validation (reserved / tchar /
+        // collision). Delegated so the SIGHUP path can call the same
+        // helper and reject before Commit publishes the snapshot.
+        ValidateAuthForward(config);
 
         // Auth enforcement gate. Checks catch two mis-configuration shapes:
         //
@@ -2507,6 +2336,129 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     "is empty — an inline proxy auth gate needs at least "
                     "one configured issuer from auth.issuers.");
             }
+        }
+    }
+}
+
+void ConfigLoader::ValidateAuthForward(const ServerConfig& config) {
+    std::unordered_set<std::string> output_headers;
+    auto add_header = [&output_headers](const std::string& name,
+                                         const std::string& which) {
+        if (name.empty()) return;
+        // Validate the ORIGINAL case-preserved name against RFC 7230
+        // §3.2.6 tchar. An invalid name would pass through
+        // HttpRequestSerializer verbatim and produce malformed HTTP on
+        // every forwarded request. Check first — a malformed name CAN'T
+        // meaningfully be reserved or non-reserved, so field-name
+        // validity is more fundamental than the reserved/duplicate
+        // checks below.
+        if (!IsValidHttpFieldName(name)) {
+            throw std::invalid_argument(
+                "auth.forward." + which + " '" + name +
+                "' contains characters not valid in an HTTP field "
+                "name (RFC 7230 §3.2.6 `token`: A-Z a-z 0-9 and "
+                "!#$%&'*+-.^_`|~). Spaces, slashes, colons, and "
+                "other punctuation are forbidden.");
+        }
+        std::string lower;
+        lower.reserve(name.size());
+        for (char c : name) {
+            lower.push_back(static_cast<char>(
+                std::tolower(static_cast<unsigned char>(c))));
+        }
+        // Reserved-name check FIRST (security): hop-by-hop / pseudo /
+        // framing-critical / Authorization / gateway-owned names would
+        // corrupt or spoof the forwarded request. See
+        // IsReservedAuthForwardHeader for the full categorization.
+        // Reject before the duplicate check so the operator sees the
+        // more-actionable error.
+        if (IsReservedAuthForwardHeader(lower)) {
+            throw std::invalid_argument(
+                "auth.forward." + which + " '" + name +
+                "' is a reserved/hop-by-hop/pseudo/framing header "
+                "name and must not be used as an auth-forward output "
+                "(would corrupt or spoof the upstream request); pick "
+                "an X-prefixed name like 'X-Auth-Subject' instead");
+        }
+        if (!output_headers.insert(lower).second) {
+            throw std::invalid_argument(
+                "auth.forward." + which + " '" + name +
+                "' collides with another output header name "
+                "(case-insensitive)");
+        }
+    };
+    add_header(config.auth.forward.subject_header, "subject_header");
+    add_header(config.auth.forward.issuer_header, "issuer_header");
+    add_header(config.auth.forward.scopes_header, "scopes_header");
+    add_header(config.auth.forward.raw_jwt_header, "raw_jwt_header");
+    for (const auto& [claim, header] :
+         config.auth.forward.claims_to_headers) {
+        add_header(header, "claims_to_headers[" + claim + "]");
+    }
+}
+
+void ConfigLoader::ValidateTopLevelPolicies(const ServerConfig& config) {
+    std::unordered_set<std::string> top_level_policy_names;
+    top_level_policy_names.reserve(config.auth.policies.size());
+    for (size_t i = 0; i < config.auth.policies.size(); ++i) {
+        const auto& p = config.auth.policies[i];
+        const std::string ctx =
+            "auth.policies[" + std::to_string(i) + "]";
+        bool name_blank = p.name.empty();
+        if (!name_blank) {
+            name_blank = true;
+            for (char c : p.name) {
+                if (!std::isspace(static_cast<unsigned char>(c))) {
+                    name_blank = false;
+                    break;
+                }
+            }
+        }
+        if (name_blank) {
+            throw std::invalid_argument(
+                ctx + ".name is required for top-level policies "
+                "(inline proxy.auth policies inherit identity from "
+                "their parent upstream; top-level entries have none "
+                "and operator-visible logs/metrics need a stable "
+                "identifier — array index is unstable across edits)");
+        }
+        if (!top_level_policy_names.insert(p.name).second) {
+            throw std::invalid_argument(
+                ctx + ".name '" + p.name + "' is duplicated by another "
+                "top-level policy. Top-level policy names MUST be "
+                "unique — the reload merge uses `name` as identity, "
+                "so a collision would silently bind two live policies "
+                "to the same staged entry on the next SIGHUP.");
+        }
+        if (p.on_undetermined != "deny" && p.on_undetermined != "allow") {
+            throw std::invalid_argument(
+                ctx + ".on_undetermined must be \"deny\" or \"allow\"");
+        }
+        for (const auto& issuer_name : p.issuers) {
+            if (config.auth.issuers.count(issuer_name) == 0) {
+                throw std::invalid_argument(
+                    ctx + ".issuers references unknown issuer '" +
+                    issuer_name + "'");
+            }
+        }
+        if (p.enabled && p.issuers.empty()) {
+            const std::string policy_owner =
+                p.name.empty()
+                    ? ctx
+                    : ("auth.policies['" + p.name + "']");
+            throw std::invalid_argument(
+                policy_owner + ".enabled=true rejected: issuers list is "
+                "empty — a top-level auth policy gate needs at least one "
+                "configured issuer from auth.issuers. Populate "
+                "issuers[...] before enabling, or set enabled=false "
+                "until the issuer list is ready.");
+        }
+        if (p.enabled && p.applies_to.empty()) {
+            throw std::invalid_argument(
+                ctx + " is enabled but has no applies_to prefixes — "
+                "the policy would never match any path. Add at least "
+                "one prefix to applies_to, or set enabled=false until "
+                "the prefix list is ready.");
         }
     }
 }
