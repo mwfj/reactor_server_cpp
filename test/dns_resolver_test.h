@@ -74,6 +74,10 @@ inline void TestIsValidHostOrIpLiteral() {
         ok = ok && DnsResolver::IsValidHostOrIpLiteral("localhost");
         ok = ok && DnsResolver::IsValidHostOrIpLiteral("backend.ns.svc.cluster.local");
         ok = ok && DnsResolver::IsValidHostOrIpLiteral("backend.ns.svc.cluster.local.");
+        // A label with a hyphen counts as "has letter or hyphen" per the
+        // review-round tightening — safe because inet_aton rejects
+        // strings containing '-'.
+        ok = ok && DnsResolver::IsValidHostOrIpLiteral("1-2");
         // Reject bracketed IPv6 (Normalize strips brackets BEFORE validation).
         ok = ok && !DnsResolver::IsValidHostOrIpLiteral("[::1]");
         // Reject malformed.
@@ -88,6 +92,53 @@ inline void TestIsValidHostOrIpLiteral() {
         Record("DnsResolver: IsValidHostOrIpLiteral", ok);
     } catch (const std::exception& e) {
         Record("DnsResolver: IsValidHostOrIpLiteral", false, e.what());
+    }
+}
+
+// Review-round: legacy numeric-dotted forms must NOT pass through to
+// getaddrinfo where glibc / BSD's NSS layer would reinterpret them via
+// inet_aton (classful / octal numeric parsing). These strings are not
+// strict dotted-quad IPv4 literals (inet_pton rejects them), and they
+// used to fall through to hostname validation. With the tightened
+// "must have letter or hyphen" rule, they now reject at validation
+// time, fail-closed before reaching the DNS layer.
+inline void TestIsValidHostOrIpLiteralRejectsLegacyNumericForms() {
+    std::cout << "\n[TEST] DnsResolver: IsValidHostOrIpLiteral rejects legacy numeric forms..."
+              << std::endl;
+    try {
+        bool ok = true;
+        // inet_aton-style reinterpretations that must be blocked:
+        //   "1.2.3"        → 1.2.0.3   (classful 3-part)
+        //   "1.2"          → 1.0.0.2   (classful 2-part)
+        //   "0127.0.0.1"   → 87.0.0.1  (octal first octet)
+        //   "1.1.1.1.1"    → not a valid IPv4 but some libcs may still
+        //                    try to interpret via gethostbyname legacy.
+        //   "12.345.67"    → 3-part with out-of-range middle — libc may
+        //                    still reinterpret via numeric path.
+        ok = ok && !DnsResolver::IsValidHostOrIpLiteral("1.2.3");
+        ok = ok && !DnsResolver::IsValidHostOrIpLiteral("1.2");
+        ok = ok && !DnsResolver::IsValidHostOrIpLiteral("0127.0.0.1");
+        ok = ok && !DnsResolver::IsValidHostOrIpLiteral("1.1.1.1.1");
+        ok = ok && !DnsResolver::IsValidHostOrIpLiteral("12.345.67");
+        // Trailing-dot forms of the same (FQDN notation over numeric).
+        ok = ok && !DnsResolver::IsValidHostOrIpLiteral("1.2.3.");
+        ok = ok && !DnsResolver::IsValidHostOrIpLiteral("0127.0.0.1.");
+
+        // Control: genuine strict IPv4 literals still accept.
+        ok = ok && DnsResolver::IsValidHostOrIpLiteral("127.0.0.1");
+        ok = ok && DnsResolver::IsValidHostOrIpLiteral("1.2.3.4");
+        // Control: hostnames that happen to start with digits still
+        // accept (a letter elsewhere in the string distinguishes them
+        // from numeric forms).
+        ok = ok && DnsResolver::IsValidHostOrIpLiteral("1.example.com");
+        ok = ok && DnsResolver::IsValidHostOrIpLiteral("1.2.example");
+        ok = ok && DnsResolver::IsValidHostOrIpLiteral("3com.com");
+
+        Record("DnsResolver: IsValidHostOrIpLiteral rejects legacy numeric forms",
+                ok);
+    } catch (const std::exception& e) {
+        Record("DnsResolver: IsValidHostOrIpLiteral rejects legacy numeric forms",
+                false, e.what());
     }
 }
 
@@ -975,6 +1026,80 @@ inline void TestMixedTimeoutSaturationTriggersFullSweep() {
     }
 }
 
+// ---------- Review-round: ParseHostPort rejects malformed port tokens ----------
+
+inline void TestParseHostPortRejectsMalformedPort() {
+    std::cout << "\n[TEST] DnsResolver: ParseHostPort rejects malformed port..."
+              << std::endl;
+    try {
+        std::string host;
+        int port = -1;
+        bool ok = true;
+
+        // Trailing non-digit junk after the port. std::stoi would have
+        // accepted these and returned only the leading digits.
+        ok = ok && !DnsResolver::ParseHostPort("[::1]:443junk", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("example.com:443junk", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("127.0.0.1:80abc", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("host:8080xyz", &host, &port);
+
+        // Negative sign — std::stoi would have returned -1, passing into
+        // InetAddr's uint16_t port (silently becoming 65535).
+        ok = ok && !DnsResolver::ParseHostPort("example.com:-1", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("[::1]:-80", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("host:-443", &host, &port);
+
+        // Out of uint16_t range. std::stoi would have returned the
+        // full value, later truncated into 16-bit port storage
+        // (silently targeting the wrong port).
+        ok = ok && !DnsResolver::ParseHostPort("example.com:65536", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("example.com:70000", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("[::1]:100000", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("host:999999", &host, &port);
+
+        // Empty host (":80" had port=80 host="" previously).
+        ok = ok && !DnsResolver::ParseHostPort(":80", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort(":", &host, &port);
+
+        // Leading zero beyond single "0" — strict parse rejects to
+        // avoid ambiguity with any downstream octal-aware tooling.
+        ok = ok && !DnsResolver::ParseHostPort("example.com:01", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("example.com:080", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("[::1]:00443", &host, &port);
+
+        // Whitespace and sign chars.
+        ok = ok && !DnsResolver::ParseHostPort("example.com:+80", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("example.com: 80", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("example.com:80 ", &host, &port);
+
+        // Empty port (":"-terminated host).
+        ok = ok && !DnsResolver::ParseHostPort("example.com:", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("[::1]:", &host, &port);
+
+        // Must ACCEPT: valid forms at the uint16_t boundaries.
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("example.com:0", &host, &port)
+                 && host == "example.com" && port == 0;
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("example.com:65535", &host, &port)
+                 && host == "example.com" && port == 65535;
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("[::1]:65535", &host, &port)
+                 && host == "::1" && port == 65535;
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("[::1]:0", &host, &port)
+                 && host == "::1" && port == 0;
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("127.0.0.1:80", &host, &port)
+                 && host == "127.0.0.1" && port == 80;
+
+        Record("DnsResolver: ParseHostPort rejects malformed port", ok);
+    } catch (const std::exception& e) {
+        Record("DnsResolver: ParseHostPort rejects malformed port",
+                false, e.what());
+    }
+}
+
 // ---------- Queue-time deadline short-circuit ----------
 
 inline void TestQueueTimeDeadlineShortCircuits() {
@@ -1029,6 +1154,8 @@ inline void RunAllTests() {
     TestDnsResolverCtorRejectsNonPositiveInflight();
     TestQueuedItemExpiresDuringWorkerStall();
     TestMixedTimeoutSaturationTriggersFullSweep();
+    TestIsValidHostOrIpLiteralRejectsLegacyNumericForms();
+    TestParseHostPortRejectsMalformedPort();
     TestQueueTimeDeadlineShortCircuits();
 }
 

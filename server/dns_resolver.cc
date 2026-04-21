@@ -78,6 +78,34 @@ bool ParseIpv6Literal(const std::string& s) {
     return ::inet_pton(AF_INET6, s.c_str(), buf) == 1;
 }
 
+// RFC 3986 §3.2.3 port = *DIGIT, capped by implementations at 16 bits.
+// Strict parser: accepts 1-5 ASCII digits forming a value in [0, 65535]
+// with no leading zeros (except the literal "0"). Rejects everything
+// else.
+//
+// Review-round fix replaces std::stoi, which silently accepted:
+//   - trailing non-digit junk ("443junk" -> 443)
+//   - negative sign ("-1" -> -1)
+//   - out-of-uint16_t range ("70000" -> 70000, later truncated)
+//   - leading whitespace (" 80" -> 80)
+// Any of those let malformed authority input reach InetAddr's uint16_t
+// port field, silently targeting the wrong port instead of failing
+// closed.
+bool ParseUnsignedPort(const std::string& s, int* out) {
+    if (s.empty() || s.size() > 5) return false;
+    // Single "0" is OK; "01", "00443" are not (avoids ambiguity with
+    // historical octal interpretation elsewhere in the toolchain).
+    if (s.size() > 1 && s[0] == '0') return false;
+    int value = 0;
+    for (char c : s) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+        value = value * 10 + (c - '0');
+        if (value > 65535) return false;
+    }
+    if (out) *out = value;
+    return true;
+}
+
 // RFC 952 + 1123 hostname label grammar. Accepts one trailing '.' for
 // absolute FQDN (v0.30 round-29 P2). Rejects two-or-more trailing dots,
 // labels longer than 63 chars, totals longer than 253 chars, pure
@@ -99,16 +127,28 @@ bool IsValidHostnameLabeled(const std::string& input) {
 
     if (s.size() > 253) return false;
 
-    // Reject all-digits (would be a pure integer like "1" that glibc
-    // treats as 0.0.0.1) — §5.6 explicit test case.
-    bool all_digits = true;
+    // Review-round fix: reject ANY string composed entirely of digits
+    // and dots. Strict IPv4 literals are already handled by inet_pton
+    // BEFORE this validator runs (see IsValidHostOrIpLiteral), so
+    // anything that reaches here with only digits-and-dots is a legacy
+    // numeric-dotted form ("1", "1.2.3", "0127.0.0.1", "1.1.1.1.1")
+    // that glibc / BSD's NSS layer in getaddrinfo may reinterpret via
+    // inet_aton's classful / octal parsing and resolve to an unintended
+    // IP. Strictly subsumes the old "all-digits" check ("1" → 0.0.0.1)
+    // and extends it to dotted forms ("1.2.3" → 1.2.0.3, "0127.0.0.1"
+    // → 87.0.0.1 via octal). The distinguishing property of a real
+    // hostname vs a numeric form is the presence of at least one
+    // letter or hyphen — inet_aton rejects both, so any label with a
+    // letter or hyphen cannot be reinterpreted numerically.
+    bool has_letter_or_hyphen = false;
     for (char c : s) {
-        if (!std::isdigit(static_cast<unsigned char>(c))) {
-            all_digits = false;
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (std::isalpha(u) || c == '-') {
+            has_letter_or_hyphen = true;
             break;
         }
     }
-    if (all_digits) return false;
+    if (!has_letter_or_hyphen) return false;
 
     // Label-wise check. Labels are 1-63 chars; [A-Za-z0-9-]; cannot start
     // or end with '-'.
@@ -221,10 +261,9 @@ bool DnsResolver::ParseHostPort(const std::string& s,
         }
         if (s[rbracket + 1] != ':') return false;
         const std::string port_str = s.substr(rbracket + 2);
-        if (port_str.empty()) return false;
-        try {
-            if (port) *port = std::stoi(port_str);
-        } catch (...) { return false; }
+        int p = 0;
+        if (!ParseUnsignedPort(port_str, &p)) return false;
+        if (port) *port = p;
         return true;
     }
     // Bare IPv6 with colons → no port.
@@ -237,10 +276,14 @@ bool DnsResolver::ParseHostPort(const std::string& s,
         // hostname:port form
         const auto colon = s.rfind(':');
         *host = s.substr(0, colon);
+        // Review-round fix: reject empty host (":80" → host=""). Parser
+        // must fail-closed on a missing host rather than emit an empty
+        // string that downstream validators may or may not catch.
+        if (host->empty()) return false;
         const std::string port_str = s.substr(colon + 1);
-        try {
-            if (port) *port = std::stoi(port_str);
-        } catch (...) { return false; }
+        int p = 0;
+        if (!ParseUnsignedPort(port_str, &p)) return false;
+        if (port) *port = p;
         return true;
     }
     *host = s;
