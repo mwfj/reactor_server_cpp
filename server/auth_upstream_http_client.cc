@@ -57,7 +57,13 @@ struct UpstreamHttpClient::Transaction
     UpstreamHttpCodec codec;
 
     bool finished = false;
-    size_t body_bytes_accumulated = 0;
+    // When a sink is installed on UpstreamHttpCodec (as here, see
+    // Issue()), the codec routes body bytes ONLY through OnBodyChunk and
+    // stops appending to `codec.GetResponse().body`. So the transaction
+    // is responsible for accumulating the body itself — OnComplete reads
+    // from `body_data` below instead of the codec response. Size is
+    // capped by req.max_response_body in OnBodyChunk.
+    std::string body_data;
     UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead head;
 
     // Self-anchor: Issue() sets this to `shared_from_this()` before queueing
@@ -138,13 +144,13 @@ struct UpstreamHttpClient::Transaction
     // --- UpstreamResponseSink -------------------------------------------
     bool OnHeaders(const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& h) override {
         head = h;
-        body_bytes_accumulated = 0;
+        body_data.clear();
         return true;
     }
 
     bool OnBodyChunk(const char* data, size_t len) override {
         if (finished) return false;
-        size_t new_total = body_bytes_accumulated + len;
+        const size_t new_total = body_data.size() + len;
         if (new_total > req.max_response_body) {
             logging::Get()->warn(
                 "UpstreamHttpClient body too large pool={} accumulated={} "
@@ -157,7 +163,7 @@ struct UpstreamHttpClient::Transaction
             Finish(std::move(r));
             return false;
         }
-        body_bytes_accumulated = new_total;
+        body_data.append(data, len);
         return true;
     }
 
@@ -172,9 +178,11 @@ struct UpstreamHttpClient::Transaction
         UpstreamHttpClient::Response resp;
         resp.status_code = codec.GetResponse().status_code;
         resp.headers = codec.GetResponse().headers;
-        // Body: the codec accumulates the body itself via the codec's
-        // UpstreamResponse; we trust it up to our cap check above.
-        resp.body = codec.GetResponse().body;
+        // Body accumulated by OnBodyChunk — the codec does NOT append
+        // to its own body buffer when a sink is installed (see
+        // server/upstream_http_codec.cc::on_body). Move into the
+        // response to avoid a copy.
+        resp.body = std::move(body_data);
         // Non-keepalive responses (Connection: close, HTTP/1.0 without
         // explicit keep-alive, etc.) have a peer FIN imminent. The pool
         // can hand the socket to the next waiter before the FIN lands,

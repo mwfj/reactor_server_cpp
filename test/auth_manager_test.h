@@ -417,7 +417,7 @@ static bool TestUndeterminedIssuerDeny503() {
     // "AAAA" = 4 chars (valid), decodes to 3 null bytes.
     HttpRequest req = MakeRequest("/secure/data",
         "eyJhbGciOiJSUzI1NiIsImtpZCI6ImtleS0xIn0."
-        "eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlLmNvbSIsInN1YiI6InUxIn0."
+        "eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlLmNvbSIsInN1YiI6InUxIiwiZXhwIjo5OTk5OTk5OTk5fQ."
         "AAAA");
     HttpResponse resp;
     bool cont = mgr->InvokeMiddleware(req, resp);
@@ -447,7 +447,7 @@ static bool TestUndeterminedAllow() {
 
     HttpRequest req = MakeRequest("/api/data",
         "eyJhbGciOiJSUzI1NiIsImtpZCI6ImtleS0xIn0."
-        "eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlLmNvbSIsInN1YiI6InUxIn0."
+        "eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlLmNvbSIsInN1YiI6InUxIiwiZXhwIjo5OTk5OTk5OTk5fQ."
         "fakesig");
     HttpResponse resp;
     bool cont = mgr->InvokeMiddleware(req, resp);
@@ -545,7 +545,7 @@ static bool TestLongestPrefixWins() {
     // Request to /api/v2/users — should hit the "long" policy (allow on undetermined).
     HttpRequest req = MakeRequest("/api/v2/users",
         "eyJhbGciOiJSUzI1NiIsImtpZCI6ImtleS0xIn0."
-        "eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlLmNvbSIsInN1YiI6InUxIn0."
+        "eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlLmNvbSIsInN1YiI6InUxIiwiZXhwIjo5OTk5OTk5OTk5fQ."
         "fakesig");
     HttpResponse resp;
     bool cont = mgr->InvokeMiddleware(req, resp);

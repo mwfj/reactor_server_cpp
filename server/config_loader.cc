@@ -184,6 +184,14 @@ static bool IsReservedAuthForwardHeader(const std::string& lower) {
         // per-name flag off) because these names carry proxy-chain /
         // hop semantics that must not be repurposed for identity.
         "via", "x-forwarded-for", "x-forwarded-proto",
+        // Gateway-owned: HeaderRewriter emits the undetermined sentinel
+        // here and unconditionally erases client copies on every
+        // outbound rewrite (server/header_rewriter.cc lines ~97 +
+        // ~172-283). An operator mapping subject_header / raw_jwt_header
+        // / a claims_to_headers target to this name would validate
+        // cleanly but see the configured value silently dropped at
+        // runtime — reject at load instead.
+        "x-auth-undetermined",
     };
     return kReserved.count(lower) > 0;
 }

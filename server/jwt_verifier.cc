@@ -251,6 +251,21 @@ VerifyResult JwtVerifier::Verify(const std::string& token,
         return VerifyResult::Undetermined("issuer_not_ready");
     }
 
+    // Require `exp` explicitly. jwt-cpp's `verify()` only validates the
+    // claim when it EXISTS, so a correctly-signed token with matching
+    // iss/aud but no `exp` would be accepted as non-expiring — a bearer
+    // token with unlimited lifetime. Operators cannot plausibly rely on
+    // a per-issuer `required_claims: [exp]` to cover this (the docs +
+    // IssuerConfig::required_claims contract mark required_claims as
+    // extensions BEYOND iss/exp/aud). Enforce unconditionally here so
+    // the minimum temporal-bound guarantee is an always-on property of
+    // the verifier rather than an operator-configuration concern.
+    if (!decoded.has_expires_at()) {
+        logging::Get()->info(
+            "auth_deny reason=missing_exp issuer={}", issuer_name);
+        return VerifyResult::InvalidToken("missing exp claim", "missing_exp");
+    }
+
     // Algorithm allowlist check — BEFORE any signature work (§9 item 11).
     // "none" is never in the list (ConfigLoader rejects it); still,
     // defense-in-depth: refuse unconditionally.

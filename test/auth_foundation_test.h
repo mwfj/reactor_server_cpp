@@ -4066,6 +4066,28 @@ void TestConfigLoaderRejectsHeaderRewriterOwnedAuthForwardNames() {
             "X-Forwarded-For");
         if (!err.empty()) throw std::runtime_error("claim->XFF: " + err);
 
+        // subject_header = "X-Auth-Undetermined" — gateway-owned sentinel.
+        // HeaderRewriter emits this itself and unconditionally strips
+        // client copies on every outbound rewrite; accepting the mapping
+        // at load time would silently drop the operator's configured
+        // value at runtime.
+        err = validate_expect(
+            R"("subject_header": "X-Auth-Undetermined")",
+            "X-Auth-Undetermined");
+        if (!err.empty()) throw std::runtime_error("subject=XAU: " + err);
+
+        // Case-insensitive: lowercase variant still rejected.
+        err = validate_expect(
+            R"("raw_jwt_header": "x-auth-undetermined")",
+            "x-auth-undetermined");
+        if (!err.empty()) throw std::runtime_error("raw_jwt=xau lower: " + err);
+
+        // claims_to_headers target = X-Auth-Undetermined — also rejected.
+        err = validate_expect(
+            R"("claims_to_headers": {"sub": "X-Auth-Undetermined"})",
+            "X-Auth-Undetermined");
+        if (!err.empty()) throw std::runtime_error("claim->XAU: " + err);
+
         // POSITIVE: a non-reserved X-prefixed name still parses + validates.
         try {
             ServerConfig cfg = ConfigLoader::LoadFromString(R"({

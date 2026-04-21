@@ -1217,11 +1217,80 @@ static void TestAlgorithmAllowlist() {
 }
 
 // ---------------------------------------------------------------------------
+// Missing `exp` claim — reject as invalid_token:missing_exp. jwt-cpp only
+// validates exp when present, so without the explicit check a correctly-
+// signed token with matching iss/aud and no exp would be a non-expiring
+// bearer token — unacceptable for a resource-server validator.
+// ---------------------------------------------------------------------------
+static void TestTokenMissingExpRejected() {
+    try {
+        auto rsa = GenerateRsaKey();
+        if (rsa.private_pem.empty() || rsa.public_pem.empty()) {
+            TestFramework::RecordTest("JwtVerifier: missing exp rejected",
+                                      false, "RSA key generation failed",
+                                      TestFramework::TestCategory::OTHER);
+            return;
+        }
+
+        const std::string issuer_url = "https://exp-test.example.com/";
+        const std::string kid = "test-kid-missing-exp";
+
+        // Sign a JWT that deliberately OMITS set_expires_at.
+        std::string token;
+        try {
+            token = jwt::create<jwt::traits::nlohmann_json>()
+                .set_issuer(issuer_url)
+                .set_subject("user-no-exp")
+                .set_audience("audience-1")
+                .set_issued_at(std::chrono::system_clock::now())
+                .set_key_id(kid)
+                .sign(jwt::algorithm::rs256("", rsa.private_pem, "", ""));
+        } catch (const std::exception& ex) {
+            TestFramework::RecordTest("JwtVerifier: missing exp rejected",
+                                      false, std::string("sign failed: ") + ex.what(),
+                                      TestFramework::TestCategory::OTHER);
+            return;
+        }
+
+        AUTH_NAMESPACE::IssuerConfig cfg;
+        cfg.name = "test-issuer";
+        cfg.issuer_url = issuer_url;
+        cfg.algorithms = {"RS256"};
+        cfg.audiences = {"audience-1"};
+        cfg.leeway_sec = 30;
+        cfg.discovery = false;
+
+        auto issuer = MakeFakeIssuer(cfg, rsa.public_pem, kid);
+        AUTH_NAMESPACE::AuthPolicy policy;
+        policy.issuers = {"test-issuer"};
+
+        AUTH_NAMESPACE::AuthContext ctx;
+        auto result = AUTH_NAMESPACE::JwtVerifier::Verify(token, *issuer, policy, ctx);
+
+        // 401-class deny with explicit missing_exp log reason. Enforces the
+        // minimum temporal-bound guarantee is an always-on property of the
+        // verifier, not an operator-configuration concern.
+        bool pass = result.is_deny() &&
+                    result.log_reason.find("missing_exp") != std::string::npos;
+        TestFramework::RecordTest("JwtVerifier: missing exp rejected",
+                                  pass,
+                                  pass ? "" : "expected DENY with missing_exp, got outcome=" +
+                                      std::string(result.is_allow() ? "ALLOW" : "DENY") +
+                                      " reason=" + result.log_reason,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("JwtVerifier: missing exp rejected",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 static void RunAllTests() {
     std::cout << "\n[JwtVerifier Tests]" << std::endl;
     TestRS256HappyPath();
+    TestTokenMissingExpRejected();
     TestES256HappyPath();
     TestES384HappyPath();
     TestAlgNoneRejected();
