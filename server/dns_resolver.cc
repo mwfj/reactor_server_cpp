@@ -650,78 +650,67 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
     {
         std::lock_guard<std::mutex> lk(state_->mtx);
 
-        // Review-round fix: front-sweep expired items BEFORE the
-        // saturation check. If all workers are wedged in getaddrinfo(),
-        // items accumulate in the queue past their deadlines with no
-        // one to pop and expire them. Two harms result:
-        //   (a) the caller's future never becomes ready, forcing
-        //       reliance on caller-side future.wait_for timeouts for
-        //       bounded latency;
-        //   (b) stale slots stay consumed toward kMaxQueuedItems, so
-        //       a sustained DNS stall with ongoing submissions triggers
-        //       spurious "resolver saturated" errors for fresh traffic.
+        // Full-queue expiry sweep on EVERY submission. Review-round
+        // evolution:
+        //   round 1 — front-only sweep (cheap, monotone-deadline only)
+        //   round 2 — + full sweep gated on saturation (caught the
+        //             mixed-deadline case, but only at cap)
+        //   round 3 — full sweep unconditionally (this version).
         //
-        // Deadlines are approximately monotone in queue order when all
-        // callers use the same timeout (e.g. DnsConfig default). Front-
-        // only sweep is O(k) where k is the number of expired items at
-        // the front; zero cost when nothing is expired. Common case.
+        // The two-tier version missed the non-saturated mixed-timeout
+        // case: `[5s_item, 30ms_item]` stays below the 10000-item
+        // saturation bar, but the 30ms item waits behind a live 5s
+        // head that the front-sweep refuses to evict. The caller's
+        // per-request deadline contract (§5.2.3 `ResolveRequest.timeout`)
+        // is silently violated whenever the worker pool is wedged.
+        //
+        // Always-sweep fixes both the drift problem (expired slots
+        // accumulating toward kMaxQueuedItems) AND the individual
+        // per-request deadline: any item whose deadline has passed
+        // is evicted at the next submission, no matter where it sits
+        // in the queue and no matter the queue size.
+        //
+        // Cost: O(N) per submission where N = queue size. Realistic
+        // queues are small (dozens to low hundreds), making sweep cost
+        // microseconds. Pathological 10000-item stall: ~1 ms per
+        // submission — absorbed by the one code path that actually
+        // wants sweep pressure. Workers pop one item under the same
+        // lock; they do NOT iterate the queue, so there is no nested-
+        // lock concern.
+        //
+        // Manual write/read iteration (not std::remove_if) so the
+        // set_value side effect on each evicted promise is unambiguous
+        // per the C++ standard for move-only WorkItem types.
         const auto sweep_now = std::chrono::steady_clock::now();
-        while (!state_->queue.empty() &&
-               state_->queue.front().deadline <= sweep_now) {
-            auto& front = state_->queue.front();
-            try {
-                front.promise.set_value(
-                    MakeTimeoutResult(front.req,
-                                       "queue-time exceeded deadline"));
-            } catch (const std::future_error&) { /* promise already set */ }
-            state_->queue.pop_front();
+        auto write = state_->queue.begin();
+        for (auto read = state_->queue.begin();
+             read != state_->queue.end(); ++read) {
+            if (read->deadline <= sweep_now) {
+                try {
+                    read->promise.set_value(MakeTimeoutResult(
+                        read->req, "queue-time exceeded deadline"));
+                } catch (const std::future_error&) {}
+                // Skip — don't move to write position. read is left
+                // moved-from / destructible at erase-time.
+            } else {
+                if (write != read) {
+                    *write = std::move(*read);
+                }
+                ++write;
+            }
         }
+        state_->queue.erase(write, state_->queue.end());
 
         if (state_->queue.size() >= max_queued_items_) {
-            // Review-round fix (full saturation sweep). Mixed-timeout
-            // callers can leave a queue like `[5s, 50ms, 50ms, ...]`
-            // where the front is NOT yet expired but most of the body
-            // is. The front-only sweep above cannot catch these; a full
-            // pass would. This branch runs ONLY under saturation
-            // pressure — i.e. only when we are about to reject — so the
-            // amortised O(N) cost is paid in the one place where we
-            // would otherwise return spurious "resolver saturated" for
-            // queue slots already dead.
-            //
-            // Manual iteration (not std::remove_if) so the set_value
-            // side effect on each evicted promise is unambiguous per
-            // the C++ standard — remove_if's contract about predicate
-            // side effects is technically permissive but pedantically
-            // dodgy for move-only types like std::promise.
-            auto write = state_->queue.begin();
-            for (auto read = state_->queue.begin();
-                 read != state_->queue.end(); ++read) {
-                if (read->deadline <= sweep_now) {
-                    try {
-                        read->promise.set_value(MakeTimeoutResult(
-                            read->req, "queue-time exceeded deadline"));
-                    } catch (const std::future_error&) {}
-                    // Skip — don't move to write position. read is
-                    // left moved-from / destructible at erase-time.
-                } else {
-                    if (write != read) {
-                        *write = std::move(*read);
-                    }
-                    ++write;
-                }
-            }
-            state_->queue.erase(write, state_->queue.end());
-
-            if (state_->queue.size() >= max_queued_items_) {
-                // Still full after evicting every expired item — the
-                // queue is genuinely backlogged with live work. Return
-                // synchronous saturation per §5.2.2.
-                std::promise<ResolvedEndpoint> p;
-                auto saturated = p.get_future();
-                p.set_value(MakeReadyErrorResult(
-                    item.req, EAI_AGAIN, "resolver saturated"));
-                return saturated;
-            }
+            // Bounded queue — synchronous saturation per §5.2.2. The
+            // sweep above has already removed every expired item, so
+            // this path fires only when the queue is genuinely
+            // backlogged with live work.
+            std::promise<ResolvedEndpoint> p;
+            auto saturated = p.get_future();
+            p.set_value(MakeReadyErrorResult(
+                item.req, EAI_AGAIN, "resolver saturated"));
+            return saturated;
         }
         state_->queue.push_back(std::move(item));
     }

@@ -895,6 +895,104 @@ inline void TestQueuedItemExpiresDuringWorkerStall() {
     }
 }
 
+// ---------- Review-round: non-saturated mixed-timeout queue ALSO expires ----------
+
+inline void TestNonSaturatedMixedTimeoutQueueExpires() {
+    std::cout << "\n[TEST] DnsResolver: non-saturated mixed-timeout queue expires..."
+              << std::endl;
+    try {
+        // Reviewer scenario: queue is [5s_item, 30ms_item]. The
+        // front-only sweep stops at the live 5s head; the saturation-
+        // gated full sweep does not fire because queue size (2) is
+        // nowhere near max (10000). Under a stalled-worker condition
+        // this left the 30ms caller's future pending indefinitely,
+        // breaking the per-request deadline contract.
+        //
+        // With the round-3 fix (full sweep on every submission, not
+        // gated on saturation), the 30ms item is evicted the next
+        // time any caller submits a resolve.
+        struct Gate {
+            std::mutex m;
+            std::condition_variable cv;
+            bool release = false;
+        };
+        auto gate = std::make_shared<Gate>();
+
+        DnsResolver resolver(MakeFastConfig(1));   // single worker
+        resolver.SetResolverForTesting([gate](const ResolveRequest& req) {
+            std::unique_lock<std::mutex> lk(gate->m);
+            gate->cv.wait(lk, [&] { return gate->release; });
+            ResolvedEndpoint r;
+            r.host = req.host; r.port = req.port; r.tag = req.tag;
+            r.addr = InetAddr("10.0.0.1", req.port);
+            return r;
+        });
+
+        // A: picked up by the worker, wedges on the gate.
+        auto fut_a = resolver.ResolveAsync(
+            MakeReq("host.a", 80, std::chrono::milliseconds(5000)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // B_long: queued, LONG (5s) deadline. Will block any front-only
+        // sweep — its deadline is far in the future.
+        auto fut_b_long = resolver.ResolveAsync(
+            MakeReq("host.b_long", 80, std::chrono::milliseconds(5000)));
+
+        // C: queued behind B_long with SHORT (30ms) deadline. Queue is
+        // now [B_long, C] — size 2, nowhere near max=10000 saturation.
+        auto fut_c = resolver.ResolveAsync(
+            MakeReq("host.c", 80, std::chrono::milliseconds(30)));
+
+        // Wait past C's deadline.
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+
+        // Pre-submission: C is NOT yet ready — no one has evicted it.
+        // Without the round-3 fix this state would persist until the
+        // resolver is destroyed or the queue reaches 10000.
+        const bool c_not_ready_before =
+            fut_c.wait_for(std::chrono::milliseconds(5))
+                != std::future_status::ready;
+
+        // D: any new submission. Triggers the unconditional full sweep
+        // in ResolveAsync which MUST evict C despite (a) queue being
+        // non-saturated and (b) the live 5s B_long head.
+        auto fut_d = resolver.ResolveAsync(
+            MakeReq("host.d", 80, std::chrono::milliseconds(5000)));
+
+        // Post-submission: C should be ready with queue-time-exceeded.
+        const bool c_ready_after =
+            fut_c.wait_for(std::chrono::milliseconds(100))
+                == std::future_status::ready;
+        ResolvedEndpoint res_c;
+        if (c_ready_after) res_c = fut_c.get();
+
+        // Cleanup.
+        {
+            std::lock_guard<std::mutex> lk(gate->m);
+            gate->release = true;
+        }
+        gate->cv.notify_all();
+        (void)fut_a.wait_for(std::chrono::milliseconds(500));
+        (void)fut_b_long.wait_for(std::chrono::milliseconds(500));
+        (void)fut_d.wait_for(std::chrono::milliseconds(500));
+
+        bool ok = c_not_ready_before;
+        ok = ok && c_ready_after;
+        ok = ok && res_c.error;
+        ok = ok && res_c.error_code == EAI_AGAIN;
+        ok = ok && res_c.error_message.find("queue-time exceeded")
+                    != std::string::npos;
+        Record("DnsResolver: non-saturated mixed-timeout queue expires",
+                ok,
+                "c_not_ready_before=" + std::to_string(c_not_ready_before) +
+                " c_ready_after=" + std::to_string(c_ready_after) +
+                " err=" + std::to_string(res_c.error_code));
+    } catch (const std::exception& e) {
+        Record("DnsResolver: non-saturated mixed-timeout queue expires",
+                false, e.what());
+    }
+}
+
 // ---------- Review-round: full sweep at saturation catches non-monotone expiry ----------
 
 inline void TestMixedTimeoutSaturationTriggersFullSweep() {
@@ -1153,6 +1251,7 @@ inline void RunAllTests() {
     TestParseHostPortRejectsNonIpBrackets();
     TestDnsResolverCtorRejectsNonPositiveInflight();
     TestQueuedItemExpiresDuringWorkerStall();
+    TestNonSaturatedMixedTimeoutQueueExpires();
     TestMixedTimeoutSaturationTriggersFullSweep();
     TestIsValidHostOrIpLiteralRejectsLegacyNumericForms();
     TestParseHostPortRejectsMalformedPort();
