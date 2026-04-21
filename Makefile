@@ -47,7 +47,7 @@ SERVER_TARGET = server_runner
 REACTOR_SRCS = $(SERVER_DIR)/dispatcher.cc $(SERVER_DIR)/event_handler.cc $(SERVER_DIR)/epoll_handler.cc $(SERVER_DIR)/kqueue_handler.cc $(SERVER_DIR)/channel.cc
 
 # Network components
-NETWORK_SRCS = $(SERVER_DIR)/socket_handler.cc $(SERVER_DIR)/acceptor.cc $(SERVER_DIR)/connection_handler.cc
+NETWORK_SRCS = $(SERVER_DIR)/inet_addr.cc $(SERVER_DIR)/socket_handler.cc $(SERVER_DIR)/acceptor.cc $(SERVER_DIR)/connection_handler.cc
 
 # Server and buffer
 SERVER_SRCS = $(SERVER_DIR)/net_server.cc $(SERVER_DIR)/buffer.cc

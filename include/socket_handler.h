@@ -18,6 +18,7 @@ private:
     int fd_;
     std::string ip_addr_;
     int port_;
+    sa_family_t family_ = AF_UNSPEC;   // §5.3 dual-family — set by CreateSocket / accept-ctor
     void SetNonBlocking(int fd);
 
 public:
@@ -32,9 +33,11 @@ public:
     
     // Move operations
     SocketHandler(SocketHandler&& other) noexcept
-        : fd_(other.fd_), ip_addr_(std::move(other.ip_addr_)), port_(other.port_) {
+        : fd_(other.fd_), ip_addr_(std::move(other.ip_addr_)),
+          port_(other.port_), family_(other.family_) {
         other.fd_ = -1;
         other.port_ = 0;
+        other.family_ = AF_UNSPEC;
     }
     SocketHandler& operator=(SocketHandler&& other) noexcept {
         if (this != &other) {
@@ -42,8 +45,10 @@ public:
             fd_ = other.fd_;
             ip_addr_ = std::move(other.ip_addr_);
             port_ = other.port_;
+            family_ = other.family_;
             other.fd_ = -1;
             other.port_ = 0;
+            other.family_ = AF_UNSPEC;
         }
         return *this;
     }
@@ -61,12 +66,20 @@ public:
     bool SetReusePort(bool);
     bool SetKeepAlive(bool);
     
-    int CreateSocket();
-    static int CreateClientSocket();
+    // Dual-family per §5.3. `family` selects AF_INET or AF_INET6. The
+    // AF_INET default preserves source compatibility for every existing
+    // call site — IPv6 callers opt in explicitly.
+    int CreateSocket(sa_family_t family = AF_INET);
+    static int CreateClientSocket(sa_family_t family = AF_INET);
     void Bind(const InetAddr& servAddr);
     void Listen(int maxLen);
     int Accept(InetAddr& clientAddr);
     void Close();
+
+    // Address family the underlying socket was created with. AF_UNSPEC
+    // if the fd was never set (moved-from, closed). Used by Acceptor to
+    // know whether to apply IPV6_V6ONLY before Bind.
+    sa_family_t family() const { return family_; }
 
     // Query the actual port bound by the OS (resolves ephemeral port 0).
     // Must be called after Bind(). Returns 0 if getsockname() fails.
