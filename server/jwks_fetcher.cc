@@ -152,11 +152,13 @@ ParseAndConvert(const std::string& body,
 JwksFetcher::JwksFetcher(std::string issuer_name,
                           std::shared_ptr<UpstreamHttpClient> client,
                           JwksCache* cache,
-                          std::string upstream_pool_name)
+                          std::string upstream_pool_name,
+                          const std::atomic<uint64_t>* owner_generation)
     : issuer_name_(std::move(issuer_name)),
       client_(std::move(client)),
       cache_(cache),
       upstream_pool_name_(std::move(upstream_pool_name)),
+      owner_generation_(owner_generation),
       cancel_token_(std::make_shared<std::atomic<bool>>(false)) {
     logging::Get()->debug(
         "JwksFetcher constructed issuer={} pool={}",
@@ -215,12 +217,13 @@ void JwksFetcher::StartFetch(const std::string& jwks_uri,
     std::string issuer_name = issuer_name_;
     JwksCache* cache = cache_;
     auto cb = after_cb;
+    const std::atomic<uint64_t>* owner_generation = owner_generation_;
 
     client_->Issue(
         upstream_pool_name_,
         dispatcher_index,
         std::move(req),
-        [cache, issuer_name, generation, cb, token](
+        [cache, issuer_name, generation, owner_generation, cb, token](
                 UpstreamHttpClient::Response resp) {
             // Terminal callback — guaranteed at most once. Always release
             // the refresh slot, regardless of outcome.
@@ -251,7 +254,28 @@ void JwksFetcher::StartFetch(const std::string& jwks_uri,
             if (pairs.empty()) {
                 if (cache) cache->OnFetchError(parse_reason);
             } else {
-                if (cache) cache->InstallKeys(std::move(pairs));
+                // Generation gate: drop the install if the Issuer's
+                // generation advanced while this fetch was in flight
+                // (reload bumped it, or Stop). Without this, an old
+                // response could overwrite cache state that has already
+                // been conceptually invalidated — subsequent verifies
+                // would run against stale keys until the next refresh.
+                // `owner_generation` is null only for legacy test
+                // fixtures that don't thread a generation; production
+                // (Issuer) always provides it.
+                const uint64_t current_gen =
+                    owner_generation
+                        ? owner_generation->load(std::memory_order_acquire)
+                        : generation;
+                if (current_gen != generation) {
+                    logging::Get()->info(
+                        "JwksFetcher drop stale install issuer={} "
+                        "captured_gen={} current_gen={}",
+                        issuer_name, generation, current_gen);
+                    if (cache) cache->OnFetchError("stale_generation");
+                } else if (cache) {
+                    cache->InstallKeys(std::move(pairs));
+                }
             }
             if (cache) cache->ReleaseRefreshSlot();
             if (cb) cb(generation);

@@ -4140,12 +4140,21 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // Build live_issuer_names once — reused by ValidateProxyAuth
         // (to scope `auth.issuers.*.upstream` xrefs to live issuers
         // only) and by ValidateHotReloadable below.
+        //
+        // Source of truth MUST be the running AuthManager, NOT
+        // `auth_config_.issuers`. BuildLiveAppliedAuthConfig below
+        // overwrites `auth_config_.issuers` with the STAGED issuer
+        // topology even when that topology was just rejected by
+        // AuthManager::Reload as restart-required. On the next
+        // in-process HttpServer::Reload call, reading from
+        // `auth_config_` would therefore treat staged-only issuers as
+        // live — the same bug `main.cc::ReloadConfig` fixed by
+        // switching to `LiveAuthIssuerNames()`. LiveIssuerNames reads
+        // from the runtime `issuers_` map, which is topology-stable
+        // post-Start.
         std::unordered_set<std::string> live_issuer_names;
         if (auth_manager_) {
-            live_issuer_names.reserve(auth_config_.issuers.size());
-            for (const auto& [name, _] : auth_config_.issuers) {
-                live_issuer_names.insert(name);
-            }
+            live_issuer_names = auth_manager_->LiveIssuerNames();
         }
         try {
             ConfigLoader::ValidateProxyAuth(new_config, live_names,

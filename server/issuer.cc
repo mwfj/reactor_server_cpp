@@ -97,7 +97,8 @@ Issuer::Issuer(const IssuerConfig& config,
     // kicks off the async work on the caller's chosen dispatcher. Both
     // helpers hold shared ownership of upstream_http_client_.
     jwks_fetcher_ = std::make_unique<JwksFetcher>(
-        config.name, upstream_http_client_, jwks_cache_.get(), upstream_);
+        config.name, upstream_http_client_, jwks_cache_.get(), upstream_,
+        /*owner_generation=*/&generation_);
     if (discovery_) {
         oidc_discovery_ = std::make_unique<OidcDiscovery>(
             config.name, issuer_url_, upstream_http_client_, upstream_,

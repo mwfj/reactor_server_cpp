@@ -31,10 +31,20 @@ class JwksFetcher {
     // `cache` is a non-owning pointer — the cache is owned by Issuer and
     // outlives the fetcher.
     // `upstream_pool_name` is the UpstreamHostPool name for outbound traffic.
+    // `owner_generation` is a non-owning pointer to the Issuer's generation
+    // atomic. When non-null, the completion compares the captured fetch
+    // generation against `owner_generation->load()` before committing keys
+    // and drops the install when they diverge — otherwise a reload that
+    // bumps the Issuer's generation while a JWKS fetch is in flight would
+    // let the stale response overwrite live cache state. Nullable so
+    // legacy tests that don't thread a generation still work; production
+    // callers (Issuer) always provide it. Guaranteed to outlive the
+    // fetcher by Issuer's member-declaration order.
     JwksFetcher(std::string issuer_name,
                  std::shared_ptr<UpstreamHttpClient> client,
                  JwksCache* cache,
-                 std::string upstream_pool_name);
+                 std::string upstream_pool_name,
+                 const std::atomic<uint64_t>* owner_generation = nullptr);
     ~JwksFetcher();
 
     JwksFetcher(const JwksFetcher&) = delete;
@@ -64,6 +74,7 @@ class JwksFetcher {
     std::shared_ptr<UpstreamHttpClient> client_;
     JwksCache* cache_;
     std::string upstream_pool_name_;
+    const std::atomic<uint64_t>* owner_generation_;  // non-owning, nullable
 
     // Cancel token for the in-flight call (per current cycle).
     std::shared_ptr<std::atomic<bool>> cancel_token_;
