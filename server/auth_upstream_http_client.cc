@@ -407,14 +407,21 @@ void UpstreamHttpClient::Issue(const std::string& upstream_pool_name,
                 // Build and ship the HTTP/1.1 request. We rely on the
                 // caller's host_header — if empty, fall back to the
                 // pool name so the upstream sees a plausible Host.
+                //
+                // Connection header is NOT auto-injected: HTTP/1.1's
+                // default is persistent, and UpstreamManager's pool is
+                // the whole point of this client. Forcing `Connection:
+                // close` on every JWKS / OIDC / introspection fetch
+                // would add a full TCP+TLS handshake per refresh and
+                // defeat pooling against a single IdP. Callers that
+                // genuinely need one-shot semantics can set
+                // `connection: close` in `req.headers` themselves;
+                // absence means "let the pool reuse this socket."
                 std::map<std::string, std::string> headers = t2->req.headers;
                 if (headers.find("host") == headers.end()) {
                     headers["host"] = t2->req.host_header.empty()
                         ? t2->pool_name
                         : t2->req.host_header;
-                }
-                if (headers.find("connection") == headers.end()) {
-                    headers["connection"] = "close";
                 }
                 std::string wire = HttpRequestSerializer::Serialize(
                     t2->req.method, t2->req.path, t2->req.query,
