@@ -228,6 +228,29 @@ private:
     // failure AFTER cleaning up any workers already spawned (detach).
     void EnsurePoolStarted();
 
+    // Shared submission path. Contains every step the public ResolveAsync
+    // runs (host/port validation, literal short-circuit, pool spawn,
+    // queue sweep, enqueue) EXCEPT deadline computation. The caller
+    // supplies an absolute `item_deadline`, which is stored in the
+    // queued WorkItem and consumed by both the submission-side sweep AND
+    // the reaper thread — so caller-visible expiry and internal item
+    // eviction are guaranteed to agree, even when the caller's dispatch
+    // frame (e.g. ResolveMany's `dispatch_time`) is earlier than the
+    // per-item `now()` at submission.
+    //
+    // Callers MUST have already applied LookupFamily::kUnset → config
+    // and timeout == 0 → config substitutions on `req` before calling.
+    // The public `ResolveAsync` does this and then computes an item
+    // deadline anchored at its own `now()` (preserving the single-caller
+    // budget contract); `ResolveMany` does it once per batch and then
+    // passes dispatch-anchored deadlines per entry (so timed-out batch
+    // entries are evicted from the resolver state at the same instant
+    // the caller reports them as timed out — no orphaned queue/in-flight
+    // items bleeding past the batch boundary).
+    std::future<ResolvedEndpoint> ResolveAsyncImpl(
+        ResolveRequest req,
+        std::chrono::steady_clock::time_point item_deadline);
+
     // Worker entry. The trampoline takes a heap-allocated
     // shared_ptr<PoolState> by pointer so pthread_create's void* argument
     // can transfer ownership across the thread boundary.

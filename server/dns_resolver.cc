@@ -841,7 +841,8 @@ ResolvedEndpoint DnsResolver::MakeTimeoutResult(const ResolveRequest& req,
 std::future<ResolvedEndpoint>
 DnsResolver::ResolveAsync(ResolveRequest req) {
     // Review-round P2 fix: family sentinel falls back to DnsConfig.
-    // lookup_family. Substitute BEFORE the literal short-circuit so the
+    // lookup_family. Substitute BEFORE computing the deadline and before
+    // the literal short-circuit inside ResolveAsyncImpl, so the
     // family-constraint branch inside MakeReadyLiteralResult
     // (kV4Only + IPv6 literal → reject, and the symmetric case) fires
     // against the CONFIGURED policy, not against the kUnset sentinel
@@ -853,18 +854,38 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
     }
 
     // P1 fix: zero-timeout sentinel falls back to DnsConfig.resolve_timeout_ms.
-    // Substitute BEFORE the literal short-circuit so item.deadline
-    // (computed below for queue-path items) consistently reflects the
-    // effective timeout regardless of caller pattern.
+    // Substitute BEFORE deadline computation so the WorkItem deadline
+    // consistently reflects the effective timeout regardless of caller
+    // pattern.
     if (req.timeout.count() == 0) {
         req.timeout = std::chrono::milliseconds(config_.resolve_timeout_ms);
     }
 
+    // Review-round fix (start timeout accounting at submission time):
+    // Capture `submission_time` BEFORE `EnsurePoolStarted()` (which runs
+    // inside ResolveAsyncImpl) so the per-request budget reflects the
+    // caller-visible `req.timeout` as measured from the call into
+    // `ResolveAsync`. Without this, the cold-start pool spawn
+    // (pthread_create × resolver_max_inflight + reaper; ~50-200 μs each
+    // on Linux, up to ~50 ms for large resolver_max_inflight on busy
+    // hosts) would silently eat into the caller's budget on the very
+    // first hostname request. Only matters for the queue-path item's
+    // deadline; literal/error paths return ready futures and don't
+    // consume the budget.
+    const auto item_deadline =
+        std::chrono::steady_clock::now() + req.timeout;
+    return ResolveAsyncImpl(std::move(req), item_deadline);
+}
+
+std::future<ResolvedEndpoint>
+DnsResolver::ResolveAsyncImpl(
+    ResolveRequest req,
+    std::chrono::steady_clock::time_point item_deadline) {
     // Review-round fix: fail-closed host validation BEFORE any pool
-    // interaction. ResolveAsync is the runtime gate; without this guard,
-    // legacy numeric-dotted forms like "0127.0.0.1" or "1.2.3" (already
-    // rejected by IsValidHostOrIpLiteral / ConfigLoader) could still
-    // reach getaddrinfo via a caller that skipped pre-validation and be
+    // interaction. This is the runtime gate; without it, legacy numeric-
+    // dotted forms like "0127.0.0.1" or "1.2.3" (already rejected by
+    // IsValidHostOrIpLiteral / ConfigLoader) could still reach
+    // getaddrinfo via a caller that skipped pre-validation and be
     // reinterpreted by glibc / BSD NSS via inet_aton's classful / octal
     // parsing. Obviously-malformed hosts would also consume a queue slot
     // before failing at the worker. Keeping the runtime path in lockstep
@@ -885,8 +906,8 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
 
     // Review-round fix (port range validation at resolver boundary):
     // `InetAddr` silently truncates `port` via `static_cast<uint16_t>`,
-    // so a literal `ResolveAsync` caller that constructs a ResolveRequest
-    // with port = -1 / 70000 / INT_MAX would otherwise resolve to an
+    // so a literal caller that constructs a ResolveRequest with
+    // port = -1 / 70000 / INT_MAX would otherwise resolve to an
     // unintended endpoint (e.g. -1 → 65535, 70000 → 4464). `ParseHostPort`
     // already rejects the same inputs from the parser path; the runtime
     // gate must match so the public API is self-consistent and
@@ -901,18 +922,6 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
             " (must be in [0, 65535])"));
         return fut;
     }
-
-    // Review-round fix (start timeout accounting at submission time):
-    // Capture `submission_time` BEFORE `EnsurePoolStarted()` so the
-    // per-request budget reflects the caller-visible `req.timeout` as
-    // measured from the call into `ResolveAsync`. Without this, the
-    // cold-start pool spawn (pthread_create × resolver_max_inflight +
-    // reaper; ~50-200 μs each on Linux, up to ~50 ms for large
-    // resolver_max_inflight on busy hosts) would silently eat into the
-    // caller's budget on the very first hostname request. Only matters
-    // for the queue-path item's deadline; literal/error paths return
-    // ready futures and don't consume the budget.
-    const auto submission_time = std::chrono::steady_clock::now();
 
     // Literal short-circuit (§5.2.9): ready-future path without
     // spawning the pool. Keeps literal-only servers thread-free.
@@ -937,7 +946,17 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
 
     auto item = std::make_shared<WorkItem>();
     item->req      = std::move(req);
-    item->deadline = submission_time + item->req.timeout;
+    // Review-round fix (ResolveMany's dispatch deadline propagates into
+    // queued work): `item_deadline` is pinned by the caller. For single-
+    // shot `ResolveAsync` this is submission_time + req.timeout (the
+    // single-caller budget contract). For `ResolveMany` this is
+    // dispatch_time + req.timeout so that caller-visible expiry (the
+    // wait loop's `per_entry_deadlines[i]`) and internal item eviction
+    // (submission-side sweep + reaper) converge on the same instant;
+    // no orphaned items stay alive in state_->queue / state_->in_flight
+    // past the batch's reported timeout, eliminating the saturation /
+    // worker-starvation risk for the next batch on the same resolver.
+    item->deadline = item_deadline;
     auto fut = item->promise.get_future();
 
     {
@@ -1050,16 +1069,37 @@ DnsResolver::ResolveMany(std::vector<ResolveRequest> requests,
             req.family = config_.lookup_family;
         }
         // P1 fix: sentinel substitution done HERE (before snapshotting
-        // and before ResolveAsync also substitutes). Guarantees that
-        // `per_entry_deadlines[i]` and `snapshot[i].timeout` both
-        // reflect the effective value, keeping log messages and test
-        // assertions aligned with the deadline we actually enforced.
+        // and before the enqueue path would otherwise substitute).
+        // Guarantees that `per_entry_deadlines[i]` and
+        // `snapshot[i].timeout` both reflect the effective value,
+        // keeping log messages and test assertions aligned with the
+        // deadline we actually enforced.
         if (req.timeout.count() == 0) {
             req.timeout = std::chrono::milliseconds(config_.resolve_timeout_ms);
         }
-        per_entry_deadlines.push_back(dispatch_time + req.timeout);
+        // Review-round P2 fix: pin the per-item deadline on
+        // `dispatch_time`, not on each item's own `now()` at submission.
+        // The single `item_deadline` here is used BOTH for the batch
+        // wait loop (`per_entry_deadlines[i]`) AND as the WorkItem's
+        // internal deadline via ResolveAsyncImpl. Without this, the
+        // public `ResolveAsync` path re-anchors each WorkItem at
+        // per-submission `now()`, so later entries in a large batch
+        // (or the first batch on a cold resolver with non-trivial
+        // `EnsurePoolStarted` burst) can remain in state_->queue /
+        // state_->in_flight AFTER ResolveMany has already returned a
+        // "resolve timeout exceeded" result for them — orphaned work
+        // that consumes queue slots / worker capacity on the resolver,
+        // causing `EAI_AGAIN "resolver saturated"` or worker starvation
+        // for the next batch. Sharing one deadline between caller wait
+        // and internal item expiry converges the two views.
+        const auto item_deadline = dispatch_time + req.timeout;
+        per_entry_deadlines.push_back(item_deadline);
         snapshot.push_back(req);
-        futures.push_back(ResolveAsync(std::move(req)));
+        // Bypass public ResolveAsync (which would re-anchor the deadline
+        // on its own `now()`); call ResolveAsyncImpl directly. Family /
+        // timeout substitution is already done above, so Impl's
+        // precondition is satisfied.
+        futures.push_back(ResolveAsyncImpl(std::move(req), item_deadline));
     }
 
     std::vector<ResolvedEndpoint> results;
