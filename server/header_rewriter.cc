@@ -1,5 +1,6 @@
 #include "upstream/header_rewriter.h"
 #include "log/logger.h"
+#include "net/dns_resolver.h"   // DnsResolver::FormatAuthority (§5.5.1)
 #include <unordered_set>
 
 HeaderRewriter::HeaderRewriter(const Config& config)
@@ -135,14 +136,18 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
             (upstream_tls && !sni_hostname.empty())
                 ? sni_hostname
                 : upstream_host;
-        bool omit_port = (!upstream_tls && upstream_port == 80) ||
-                         (upstream_tls && upstream_port == 443);
-        if (omit_port) {
-            output["host"] = host_value;
-        } else {
-            output["host"] = host_value + ":"
-                           + std::to_string(upstream_port);
-        }
+        const bool omit_port = (!upstream_tls && upstream_port == 80) ||
+                               (upstream_tls && upstream_port == 443);
+        // Review-round fix (§5.5.1 step-7 preview): emit the Host header
+        // via DnsResolver::FormatAuthority so IPv6 literals get RFC 3986
+        // §3.2.2 bracketing. Previous path built `host_value + ":" + port`
+        // verbatim, producing `::1:8080` for IPv6 upstreams — invalid
+        // authority that many backends reject or misroute. FormatAuthority
+        // produces identical output for hostnames / IPv4 literals (byte-
+        // for-byte) and `[::1]:8080` / `[::1]` for IPv6. Handles the same
+        // omit_port well-known-port rule the previous code had.
+        output["host"] = net_dns::DnsResolver::FormatAuthority(
+            host_value, upstream_port, omit_port);
     }
 
     logging::Get()->debug("HeaderRewriter::RewriteRequest: "

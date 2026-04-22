@@ -10,6 +10,7 @@
 #include "http/http_server.h"
 #include "socket_handler.h"
 #include "inet_addr.h"
+#include "upstream/header_rewriter.h"   // P1 IPv6 Host-header regression test
 #include "test_server_runner.h"
 #include "http_test_client.h"
 
@@ -289,6 +290,81 @@ inline void TestOutboundRejectsInvalidUpstreamLiteral() {
     }
 }
 
+// ---------- HeaderRewriter Host-header format (P1 review-round preview) ----------
+//
+// Pin the step-7 preview fix: HeaderRewriter::RewriteRequest must emit
+// RFC 3986 §3.2.2 authority — `[ipv6]:port` / `[ipv6]` for IPv6, bare
+// for hostnames and IPv4. Previously emitted `::1:8080` which breaks
+// backends. Exercises the code path the step-9 outbound IPv6 fix
+// actually uses when the proxy forwards to an IPv6 upstream.
+inline void TestHeaderRewriterIpv6HostAuthority() {
+    std::cout << "\n[TEST] DualStack: HeaderRewriter brackets IPv6 Host authority..."
+              << std::endl;
+    try {
+        HeaderRewriter::Config cfg;
+        cfg.rewrite_host = true;
+        HeaderRewriter rewriter(cfg);
+
+        // IPv6 upstream, non-well-known port → "[::1]:8080"
+        std::map<std::string, std::string> in1{{"host", "client.example"}};
+        auto out1 = rewriter.RewriteRequest(
+            in1, "10.0.0.5",                 // downstream peer
+            false,                           // downstream_tls
+            false,                           // upstream_tls
+            "::1", 8080,                     // upstream host / port
+            {});                             // sni_hostname
+        bool ok = out1["host"] == "[::1]:8080";
+
+        // IPv6 upstream on HTTP default port (80) → "[::1]" (port omitted)
+        std::map<std::string, std::string> in2{{"host", "client.example"}};
+        auto out2 = rewriter.RewriteRequest(
+            in2, "10.0.0.5", false, false, "::1", 80, {});
+        ok = ok && out2["host"] == "[::1]";
+
+        // IPv6 upstream on HTTPS default port (443) with upstream_tls:
+        // port omitted.
+        std::map<std::string, std::string> in3{{"host", "client.example"}};
+        auto out3 = rewriter.RewriteRequest(
+            in3, "10.0.0.5", false, true, "::1", 443, {});
+        ok = ok && out3["host"] == "[::1]";
+
+        // Full IPv6 address, non-default port.
+        std::map<std::string, std::string> in4{{"host", "client.example"}};
+        auto out4 = rewriter.RewriteRequest(
+            in4, "10.0.0.5", false, false, "2001:db8::1", 9000, {});
+        ok = ok && out4["host"] == "[2001:db8::1]:9000";
+
+        // Controls: IPv4 and hostname paths must produce identical output
+        // to the pre-fix construction (bare, no brackets).
+        std::map<std::string, std::string> in5{{"host", "c"}};
+        auto out5 = rewriter.RewriteRequest(
+            in5, "10.0.0.5", false, false, "127.0.0.1", 8080, {});
+        ok = ok && out5["host"] == "127.0.0.1:8080";
+
+        std::map<std::string, std::string> in6{{"host", "c"}};
+        auto out6 = rewriter.RewriteRequest(
+            in6, "10.0.0.5", false, false, "backend.example.com", 8080, {});
+        ok = ok && out6["host"] == "backend.example.com:8080";
+
+        std::map<std::string, std::string> in7{{"host", "c"}};
+        auto out7 = rewriter.RewriteRequest(
+            in7, "10.0.0.5", false, false, "backend.example.com", 80, {});
+        ok = ok && out7["host"] == "backend.example.com";
+
+        Record("DualStack: HeaderRewriter brackets IPv6 Host authority", ok,
+                "out1=" + out1["host"] +
+                " out2=" + out2["host"] +
+                " out3=" + out3["host"] +
+                " out4=" + out4["host"] +
+                " out5=" + out5["host"] +
+                " out6=" + out6["host"] +
+                " out7=" + out7["host"]);
+    } catch (const std::exception& e) {
+        Record("DualStack: HeaderRewriter brackets IPv6 Host authority",
+                false, e.what());
+    }
+}
+
 // ---------- Test registrar ----------
 
 inline void RunAllTests() {
@@ -297,6 +373,7 @@ inline void RunAllTests() {
     TestAcceptorRejectsHostname();
     TestOutboundIpv6LiteralConnectPrimitives();
     TestOutboundRejectsInvalidUpstreamLiteral();
+    TestHeaderRewriterIpv6HostAuthority();
 }
 
 }  // namespace DualStackTests
