@@ -295,15 +295,16 @@ struct TopLevelAuthPolicyMergeResult {
 //     Removal is the operator's explicit intent and is live-reloadable
 //     per the design; no topology_changed flag.
 //     EXCEPTION (prefix-scoped): if the same reload has a DEFERRED add
-//     (enabled, issuers-non-live) whose applies_to shares a prefix with
-//     the removed live policy, preserve THAT live policy (+ topology_
-//     changed). Rationale: operators frequently rename during issuer-
-//     migration reloads, and dropping the old policy while the add
-//     defers would silently open an auth-coverage gap on that prefix
-//     until restart. Unrelated removals on different prefixes still
-//     drop. Scope is per-prefix (not blanket) so an operator who
-//     removes /admin/ and separately stages an unrelated deferred add
-//     on /other/ sees /admin/ actually dropped.
+//     (enabled, issuers-non-live) whose applies_to shares SOME prefixes
+//     with the removed live policy, preserve a TRIMMED copy of the live
+//     policy covering only the overlapping prefixes (+ topology_changed).
+//     Non-overlapping prefixes still drop — operator's explicit removal
+//     of unrelated coverage takes effect. Example: live A has
+//     applies_to=["/admin/", "/internal/"]; deferred replacement covers
+//     only /admin/ ⇒ preserve A' with applies_to=["/admin/"] and drop
+//     /internal/ coverage. Rationale: whole-policy preserve would keep
+//     unrelated coverage alive on prefixes the operator asked to
+//     unprotect.
 //   - Renamed: surfaces here as live-removal of the old name + add of
 //     the new name. Under the prefix-scoped preserve, the live matcher
 //     keeps old-name coverage whenever the add's issuers aren't live
@@ -385,13 +386,17 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
         }
     }
 
-    auto live_policy_overlaps_deferred =
+    auto overlap_with_deferred =
         [&](const AUTH_NAMESPACE::AuthPolicy& live_p) {
-            if (deferred_add_prefixes.empty()) return false;
+            std::vector<std::string> out_prefixes;
+            if (deferred_add_prefixes.empty()) return out_prefixes;
+            out_prefixes.reserve(live_p.applies_to.size());
             for (const auto& pref : live_p.applies_to) {
-                if (deferred_add_prefixes.count(pref)) return true;
+                if (deferred_add_prefixes.count(pref)) {
+                    out_prefixes.push_back(pref);
+                }
             }
-            return false;
+            return out_prefixes;
         };
 
     // EDIT pass.
@@ -400,16 +405,22 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
         if (it == staged_by_name.end()) {
             // Staged removed or renamed this policy. Default: drop
             // (live-reloadable removal per design §11.2 step 4). BUT if
-            // the SAME reload has a DEFERRED ADD covering ONE OF THIS
-            // POLICY's prefixes, treat this as a migration-in-progress
-            // for that prefix and preserve the live entry to avoid a
-            // coverage gap. The prefix-scoped check replaces an earlier
-            // blanket preserve that kept unrelated removals alive and
-            // could also shadow new live-commitable adds on the same
-            // prefix.
-            if (live_policy_overlaps_deferred(live)) {
+            // the SAME reload has a DEFERRED ADD covering SOME of this
+            // policy's prefixes, treat those specific prefixes as a
+            // migration-in-progress and preserve a TRIMMED copy of the
+            // live policy that only covers the overlapping prefixes.
+            // Non-overlapping prefixes (the operator's explicit removals
+            // of unrelated coverage) actually drop. Whole-policy preserve
+            // would keep unrelated coverage alive — e.g. live A has
+            // applies_to=["/admin/", "/internal/"] and deferred staged
+            // replacement covers only /admin/ ⇒ /internal/ must drop
+            // because that's what the operator asked for.
+            auto preserved_prefixes = overlap_with_deferred(live);
+            if (!preserved_prefixes.empty()) {
                 out.topology_changed = true;
-                out.policies.push_back(live);
+                AUTH_NAMESPACE::AuthPolicy trimmed = live;
+                trimmed.applies_to = std::move(preserved_prefixes);
+                out.policies.push_back(std::move(trimmed));
             }
             continue;
         }
