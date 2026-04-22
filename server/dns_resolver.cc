@@ -883,6 +883,37 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
         return fut;
     }
 
+    // Review-round fix (port range validation at resolver boundary):
+    // `InetAddr` silently truncates `port` via `static_cast<uint16_t>`,
+    // so a literal `ResolveAsync` caller that constructs a ResolveRequest
+    // with port = -1 / 70000 / INT_MAX would otherwise resolve to an
+    // unintended endpoint (e.g. -1 → 65535, 70000 → 4464). `ParseHostPort`
+    // already rejects the same inputs from the parser path; the runtime
+    // gate must match so the public API is self-consistent and
+    // fail-closed. Accept [0, 65535]; port 0 is legitimate (ephemeral
+    // binds, ResolveRequest default).
+    if (req.port < 0 || req.port > 65535) {
+        std::promise<ResolvedEndpoint> p;
+        auto fut = p.get_future();
+        p.set_value(MakeReadyErrorResult(
+            req, EAI_NONAME,
+            "invalid port " + std::to_string(req.port) +
+            " (must be in [0, 65535])"));
+        return fut;
+    }
+
+    // Review-round fix (start timeout accounting at submission time):
+    // Capture `submission_time` BEFORE `EnsurePoolStarted()` so the
+    // per-request budget reflects the caller-visible `req.timeout` as
+    // measured from the call into `ResolveAsync`. Without this, the
+    // cold-start pool spawn (pthread_create × resolver_max_inflight +
+    // reaper; ~50-200 μs each on Linux, up to ~50 ms for large
+    // resolver_max_inflight on busy hosts) would silently eat into the
+    // caller's budget on the very first hostname request. Only matters
+    // for the queue-path item's deadline; literal/error paths return
+    // ready futures and don't consume the budget.
+    const auto submission_time = std::chrono::steady_clock::now();
+
     // Literal short-circuit (§5.2.9): ready-future path without
     // spawning the pool. Keeps literal-only servers thread-free.
     if (IsIpLiteral(req.host)) {
@@ -906,7 +937,7 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
 
     auto item = std::make_shared<WorkItem>();
     item->req      = std::move(req);
-    item->deadline = std::chrono::steady_clock::now() + item->req.timeout;
+    item->deadline = submission_time + item->req.timeout;
     auto fut = item->promise.get_future();
 
     {

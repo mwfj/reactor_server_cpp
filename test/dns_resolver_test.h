@@ -1513,6 +1513,193 @@ inline void TestInFlightItemExpiresAtDeadline() {
     }
 }
 
+// ---------- Review-round: port range validation at ResolveAsync ----------
+
+inline void TestResolveAsyncRejectsOutOfRangePort() {
+    std::cout << "\n[TEST] DnsResolver: ResolveAsync rejects out-of-range port..."
+              << std::endl;
+    try {
+        // Reviewer scenario: `InetAddr` silently truncates int->uint16_t, so
+        // a literal request with port < 0 or > 65535 would previously
+        // resolve to an UNINTENDED endpoint (e.g. -1 → 65535, 70000 →
+        // 4464). ParseHostPort already rejects these at the parser
+        // boundary; the runtime ResolveAsync path must match.
+        //
+        // Critical: test the LITERAL path specifically because that's the
+        // silent-truncation risk. Use a single resolver for all cases.
+        DnsResolver resolver(MakeFastConfig(1));
+
+        // Seam is installed so any accidental spawn-and-hostname-path
+        // would be detectable (we only submit literals, so seam should
+        // NEVER be called — but set it to be safe).
+        std::atomic<int> seam_calls{0};
+        resolver.SetResolverForTesting(
+            [&seam_calls](const ResolveRequest&) {
+                seam_calls.fetch_add(1, std::memory_order_relaxed);
+                ResolvedEndpoint r;
+                r.error = true; r.error_code = EAI_FAIL;
+                r.error_message = "seam should not be called";
+                return r;
+            });
+
+        struct Case {
+            int  port;
+            bool should_reject;
+            const char* label;
+        };
+        const Case cases[] = {
+            // Rejects (pre-fix: silently accepted via uint16_t truncation).
+            {    -1, true,  "port=-1 (→65535 pre-fix)" },
+            {  -100, true,  "port=-100" },
+            { 65536, true,  "port=65536" },
+            { 70000, true,  "port=70000 (→4464 pre-fix)" },
+            { 2147483647, true, "port=INT_MAX" },
+            // Accepts (controls: 0 is ephemeral, 65535 is max-valid).
+            {     0, false, "port=0 (ephemeral)" },
+            { 65535, false, "port=65535 (max)" },
+            {    80, false, "port=80 (common)" },
+        };
+
+        bool ok = true;
+        std::string failures;
+        for (const auto& c : cases) {
+            ResolveRequest req;
+            req.host    = "127.0.0.1";
+            req.port    = c.port;
+            req.family  = LookupFamily::kV4Preferred;
+            req.timeout = std::chrono::milliseconds(100);
+            req.tag     = c.label;
+            auto fut = resolver.ResolveAsync(std::move(req));
+            if (fut.wait_for(std::chrono::milliseconds(200))
+                != std::future_status::ready) {
+                ok = false;
+                failures += std::string(c.label) + ":hung ";
+                continue;
+            }
+            auto res = fut.get();
+            if (c.should_reject) {
+                if (!res.error || res.error_code != EAI_NONAME ||
+                    res.error_message.find("invalid port")
+                        == std::string::npos) {
+                    ok = false;
+                    failures += std::string(c.label) + ":accepted(err=" +
+                                std::to_string(res.error_code) + ",port=" +
+                                std::to_string(res.addr.Port()) + ") ";
+                }
+            } else {
+                if (res.error) {
+                    ok = false;
+                    failures += std::string(c.label) + ":rejected(err=" +
+                                std::to_string(res.error_code) + ",msg=" +
+                                res.error_message + ") ";
+                } else if (res.addr.Port() != c.port) {
+                    ok = false;
+                    failures += std::string(c.label) + ":port-mismatch(" +
+                                std::to_string(res.addr.Port()) + ") ";
+                }
+            }
+        }
+        // All test cases were literals — the pool seam must NEVER fire.
+        ok = ok && seam_calls.load(std::memory_order_relaxed) == 0;
+
+        Record("DnsResolver: ResolveAsync rejects out-of-range port", ok,
+                failures.empty()
+                    ? ("seam_calls=" + std::to_string(
+                        seam_calls.load(std::memory_order_relaxed)))
+                    : failures);
+    } catch (const std::exception& e) {
+        Record("DnsResolver: ResolveAsync rejects out-of-range port",
+                false, e.what());
+    }
+}
+
+// ---------- Review-round: deadline captured at submission time ----------
+
+inline void TestDeadlineCapturedBeforeLazyPoolSpawn() {
+    std::cout << "\n[TEST] DnsResolver: deadline captured before lazy pool spawn..."
+              << std::endl;
+    try {
+        // Reviewer scenario: cold-start pool spawn (pthread_create ×
+        // resolver_max_inflight + reaper) runs inside ResolveAsync BEFORE
+        // item->deadline is computed. With large inflight caps on busy
+        // hosts this can burn meaningful time (tens of ms). Pre-fix, the
+        // request's deadline would be (after-spawn-time + req.timeout),
+        // giving the caller MORE than req.timeout wall-clock budget on
+        // the very first hostname request. Post-fix, deadline is anchored
+        // at ResolveAsync entry (submission_time + req.timeout).
+        //
+        // Test strategy: use a large resolver_max_inflight (to slow down
+        // the lazy spawn burst a bit), install a seam that wedges the
+        // worker indefinitely, and submit a hostname request with a
+        // modest timeout. Measure wall-clock from ResolveAsync entry to
+        // future READY. Post-fix upper bound ~= timeout + reaper epsilon.
+        // Pre-fix upper bound was ~= spawn_time + timeout, potentially
+        // well past timeout.
+        DnsConfig c;
+        c.lookup_family         = LookupFamily::kV4Preferred;
+        c.resolve_timeout_ms    = 500;
+        c.overall_timeout_ms    = 1500;
+        c.stale_on_error        = true;
+        c.resolver_max_inflight = 64;  // force a larger spawn burst
+        DnsResolver resolver(c);
+
+        struct Gate {
+            std::mutex m;
+            std::condition_variable cv;
+            bool release = false;
+        };
+        auto gate = std::make_shared<Gate>();
+        resolver.SetResolverForTesting([gate](const ResolveRequest& req) {
+            std::unique_lock<std::mutex> lk(gate->m);
+            gate->cv.wait(lk, [&] { return gate->release; });
+            ResolvedEndpoint r;
+            r.host = req.host; r.port = req.port; r.tag = req.tag;
+            r.addr = InetAddr("10.0.0.1", req.port);
+            return r;
+        });
+
+        const auto t_entry = std::chrono::steady_clock::now();
+        auto fut = resolver.ResolveAsync(
+            MakeReq("cold-start-host", 80, std::chrono::milliseconds(80)));
+        // Post-fix: future becomes READY at ~80ms from ENTRY via reaper
+        // (in-flight item expires at submission_time + 80ms). Pre-fix:
+        // elapsed could be 80 + spawn_latency, which scales with
+        // resolver_max_inflight and system load.
+        const bool ready = fut.wait_for(std::chrono::milliseconds(400))
+                            == std::future_status::ready;
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_entry).count();
+        ResolvedEndpoint res;
+        if (ready) res = fut.get();
+
+        {
+            std::lock_guard<std::mutex> lk(gate->m);
+            gate->release = true;
+        }
+        gate->cv.notify_all();
+
+        bool ok = ready;
+        ok = ok && res.error;
+        ok = ok && res.error_code == EAI_AGAIN;
+        // Lower bound: 70ms catches "instantly ready" regressions.
+        ok = ok && elapsed_ms >= 70;
+        // Upper bound: 200ms. With submission-time anchoring, elapsed is
+        // 80ms + reaper scheduling epsilon. The 120ms slack accommodates
+        // CI jitter while still catching cases where the deadline was
+        // anchored AFTER spawn (which on a 64-worker resolver with
+        // scheduler contention could add 50-100+ ms).
+        ok = ok && elapsed_ms < 200;
+        Record("DnsResolver: deadline captured before lazy pool spawn", ok,
+                "ready=" + std::to_string(ready) +
+                " elapsed_ms=" + std::to_string(elapsed_ms) +
+                " err=" + std::to_string(res.error_code));
+    } catch (const std::exception& e) {
+        Record("DnsResolver: deadline captured before lazy pool spawn",
+                false, e.what());
+    }
+}
+
 // ---------- Queue-time deadline short-circuit ----------
 
 inline void TestQueueTimeDeadlineShortCircuits() {
@@ -1574,6 +1761,8 @@ inline void RunAllTests() {
     TestParseHostPortValidatesHostToken();
     TestQueuedItemExpiresWithoutFollowUpSubmission();
     TestInFlightItemExpiresAtDeadline();
+    TestResolveAsyncRejectsOutOfRangePort();
+    TestDeadlineCapturedBeforeLazyPoolSpawn();
     TestQueueTimeDeadlineShortCircuits();
 }
 
