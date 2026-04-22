@@ -6,8 +6,9 @@
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
+#include <list>   // PoolState::in_flight (shared-owned WorkItems in flight)
 
-namespace net_dns {
+namespace DNS_NAMESPACE {
 
 // ---------------------------------------------------------------------------
 // Internal pool-state types. Defined in the .cc so the header stays tight.
@@ -17,12 +18,30 @@ struct DnsResolver::WorkItem {
     ResolveRequest                              req;
     std::chrono::steady_clock::time_point       deadline;
     std::promise<ResolvedEndpoint>              promise;
+    // Guarded by PoolState::mtx. Set to true by whichever of {worker,
+    // reaper, dtor} first calls promise.set_value on this item; the
+    // others then skip their own set_value and skip any iterator erase
+    // on the in-flight list (the winner handled it). Review-round P1:
+    // enables the reaper to safely expire items that have already been
+    // popped off the queue by a worker but are still in-flight in the
+    // worker's blocking DoBlockingResolve / test seam.
+    bool                                        done = false;
 };
 
 struct DnsResolver::PoolState {
     std::mutex                                            mtx;
     std::condition_variable                               cv;
-    std::deque<WorkItem>                                  queue;
+    // Pending items awaiting a worker. Shared-owned so that once a
+    // worker pops and moves into `in_flight`, both the worker's stack
+    // reference and the in_flight list refer to the SAME WorkItem —
+    // letting the reaper expire in-flight items via the `done` flag
+    // without fighting the worker for promise ownership.
+    std::deque<std::shared_ptr<WorkItem>>                 queue;
+    // Items currently being processed by workers (popped from `queue`,
+    // blocking in DoBlockingResolve / seam). Reaper scans this list for
+    // expired items and races the worker via WorkItem::done — first to
+    // flip done wins the promise. Review-round P1 addition.
+    std::list<std::shared_ptr<WorkItem>>                  in_flight;
     std::atomic<bool>                                     shutting_down{false};
     std::function<ResolvedEndpoint(const ResolveRequest&)> test_seam;
 };
@@ -373,20 +392,44 @@ DnsResolver::DnsResolver(const DnsConfig& config) : config_(config) {
 }
 
 DnsResolver::~DnsResolver() {
-    // Drain queued items under the mutex and wake their futures with a
-    // shutdown-error result. In-flight items already on a worker's stack
-    // are not reachable here — they rely on their own future.wait_for
-    // bound per the §5.2.4 contract narrowing.
+    // Drain queued AND in-flight items under the mutex and wake their
+    // futures with a shutdown-error result. Review-round P1: in-flight
+    // items were previously NOT reachable from the dtor — the §5.2.4
+    // contract narrowing said they relied on their own future.wait_for
+    // bound. With the shared_ptr<WorkItem> + `done` flag machinery
+    // introduced for the reaper (so it can expire in-flight items at
+    // deadline), the dtor can safely set_value on in-flight items too:
+    // workers that later return from getaddrinfo see done=true and skip
+    // their own set_value. Net effect: every caller's future becomes
+    // ready by the time ~DnsResolver returns, not just queued ones.
     {
         std::lock_guard<std::mutex> lk(state_->mtx);
         state_->shutting_down.store(true, std::memory_order_release);
+        // Queue drain.
         while (!state_->queue.empty()) {
             auto& item = state_->queue.front();
-            try {
-                item.promise.set_value(
-                    MakeTimeoutResult(item.req, "resolver shutdown"));
-            } catch (const std::future_error&) { /* future gone */ }
+            if (item && !item->done) {
+                item->done = true;
+                try {
+                    item->promise.set_value(
+                        MakeTimeoutResult(item->req, "resolver shutdown"));
+                } catch (const std::future_error&) { /* future gone */ }
+            }
             state_->queue.pop_front();
+        }
+        // In-flight drain — set value but leave the list entries so
+        // workers can detect `done` when they eventually return and
+        // skip their own set_value. The list itself is destroyed when
+        // the last shared_ptr<PoolState> reference drops (detach-not-
+        // join; may be arbitrarily later for wedged workers).
+        for (auto& item : state_->in_flight) {
+            if (item && !item->done) {
+                item->done = true;
+                try {
+                    item->promise.set_value(
+                        MakeTimeoutResult(item->req, "resolver shutdown"));
+                } catch (const std::future_error&) { /* future gone */ }
+            }
         }
     }
     state_->cv.notify_all();
@@ -504,7 +547,16 @@ void* DnsResolver::WorkerTrampoline(void* raw) {
     delete static_cast<std::shared_ptr<PoolState>*>(raw);
 
     while (true) {
-        WorkItem item;
+        std::shared_ptr<WorkItem> item;
+        std::list<std::shared_ptr<WorkItem>>::iterator in_flight_it;
+        std::function<ResolvedEndpoint(const ResolveRequest&)> body;
+
+        // Phase 1 (under mtx): pop from queue, splice to in_flight,
+        // record the iterator so we can erase on completion. Copy the
+        // seam out of PoolState so concurrent SetResolverForTesting
+        // cannot mutate our reference mid-call. Do the queue-time
+        // deadline short-circuit here too — if already expired, we can
+        // shortcut without releasing the mutex.
         {
             std::unique_lock<std::mutex> lk(state->mtx);
             state->cv.wait(lk, [&] {
@@ -517,31 +569,53 @@ void* DnsResolver::WorkerTrampoline(void* raw) {
             }
             item = std::move(state->queue.front());
             state->queue.pop_front();
-        }
 
-        // Queue-time deadline short-circuit: if the caller's timeout
-        // already expired while this item waited, skip getaddrinfo.
-        if (std::chrono::steady_clock::now() >= item.deadline) {
-            try {
-                item.promise.set_value(
-                    MakeTimeoutResult(item.req, "queue-time exceeded deadline"));
-            } catch (const std::future_error&) {}
-            continue;
-        }
+            // Review-round P1: move the popped item into the in_flight
+            // list so the reaper can expire it at deadline even while
+            // the worker is blocked in DoBlockingResolve. Worker holds
+            // `item` (shared_ptr) to survive the reaper's erase of
+            // `in_flight_it` if the race goes the reaper's way.
+            state->in_flight.push_back(item);
+            in_flight_it = std::prev(state->in_flight.end());
 
-        // Copy the seam callable out of PoolState so a concurrent
-        // SetResolverForTesting doesn't mutate our reference mid-call.
-        std::function<ResolvedEndpoint(const ResolveRequest&)> body;
-        {
-            std::lock_guard<std::mutex> lk(state->mtx);
+            // Queue-time deadline short-circuit.
+            if (item && !item->done &&
+                std::chrono::steady_clock::now() >= item->deadline) {
+                item->done = true;
+                try {
+                    item->promise.set_value(MakeTimeoutResult(
+                        item->req, "queue-time exceeded deadline"));
+                } catch (const std::future_error&) {}
+                state->in_flight.erase(in_flight_it);
+                continue;
+            }
+            // Seam copy under the same lock.
             body = state->test_seam;
         }
-        ResolvedEndpoint result = body ? body(item.req)
-                                       : DoBlockingResolve(item.req);
 
-        try {
-            item.promise.set_value(std::move(result));
-        } catch (const std::future_error&) { /* future destroyed */ }
+        // Phase 2 (no lock): blocking resolve. Long-running.
+        ResolvedEndpoint result = body ? body(item->req)
+                                       : DoBlockingResolve(item->req);
+
+        // Phase 3 (under mtx): race the reaper on `done`. Whoever
+        // flipped `done` first is the unique owner of promise.set_value
+        // and the in_flight erase. The loser (reaper already expired
+        // this item) skips both — `in_flight_it` may have been
+        // invalidated by the reaper's erase but is never dereferenced
+        // here.
+        {
+            std::lock_guard<std::mutex> lk(state->mtx);
+            if (!item->done) {
+                item->done = true;
+                try {
+                    item->promise.set_value(std::move(result));
+                } catch (const std::future_error&) {}
+                state->in_flight.erase(in_flight_it);
+            }
+            // else: reaper beat us to it and already erased
+            // `in_flight_it`. Do nothing — our blocking work is
+            // discarded; the caller got the timeout result.
+        }
     }
 }
 
@@ -553,11 +627,17 @@ void* DnsResolver::WorkerTrampoline(void* raw) {
 // transition to READY at req.timeout even when:
 //   - the worker pool is stuck in getaddrinfo() (cap=1 + wedge case),
 //   - AND no follow-up submission triggers the ResolveAsync sweep,
-//   - AND no worker is available to run the post-pop deadline check.
+//   - AND no worker is available to run the post-pop deadline check,
+//   - AND (review-round P1 extension) the item has ALREADY been popped
+//     by a worker and is in-flight (blocked in getaddrinfo or a slow
+//     test seam). Scan both state->queue AND state->in_flight.
 //
 // The reaper sleeps on cv.wait_until(earliest_deadline); on wake it
-// scans the queue and evicts any item whose deadline has passed via
-// promise.set_value(MakeTimeoutResult(...)). Notifications from
+// scans both collections and evicts any item whose deadline has passed
+// via promise.set_value(MakeTimeoutResult(...)). For in-flight items
+// the reaper races the worker's Phase-3 completion via WorkItem::done;
+// whichever thread flips `done` first is the unique owner of
+// promise.set_value and the in_flight-list erase. Notifications from
 // ResolveAsync use notify_all so the reaper also wakes on new items
 // with deadlines earlier than its current wait target.
 //
@@ -576,23 +656,27 @@ void* DnsResolver::TimeoutReaperTrampoline(void* raw) {
             return nullptr;
         }
 
-        // Find the earliest deadline across the queue. Items are pushed
-        // back (FIFO), but deadlines are not monotone in queue order
-        // (mixed ResolveRequest.timeout callers), so scan the full queue.
+        // Find the earliest deadline across BOTH queue and in_flight.
+        // Skip items whose `done` flag is already set — a completed
+        // item cannot re-expire, and scanning it would busy-loop the
+        // reaper if the worker hasn't yet acquired the mtx to erase it.
         auto earliest = std::chrono::steady_clock::time_point::max();
         for (const auto& item : state->queue) {
-            if (item.deadline < earliest) earliest = item.deadline;
+            if (item && !item->done && item->deadline < earliest) {
+                earliest = item->deadline;
+            }
+        }
+        for (const auto& item : state->in_flight) {
+            if (item && !item->done && item->deadline < earliest) {
+                earliest = item->deadline;
+            }
         }
 
         // Wait until earliest deadline OR notify. Predicate-less waits
         // so ANY wakeup (notify from ResolveAsync push, deadline timeout,
         // spurious) re-enters the loop and re-computes earliest from the
-        // current queue state. Handles the "new item with deadline
-        // shorter than current wait target" case: ResolveAsync's
-        // notify_all wakes the reaper, which re-computes and re-waits
-        // against the new shorter deadline.
+        // current queue state.
         if (earliest == std::chrono::steady_clock::time_point::max()) {
-            // Queue empty — wait until notified.
             state->cv.wait(lk);
         } else {
             state->cv.wait_until(lk, earliest);
@@ -602,18 +686,24 @@ void* DnsResolver::TimeoutReaperTrampoline(void* raw) {
             return nullptr;
         }
 
-        // Evict expired items. Same write/read iteration pattern as the
-        // submission-side sweep in ResolveAsync (unambiguous promise
-        // set_value semantics for move-only WorkItem types).
+        // Evict expired items from the queue. Same write/read
+        // iteration pattern as the submission-side sweep in
+        // ResolveAsync (unambiguous promise set_value semantics for
+        // shared_ptr<WorkItem> elements).
         const auto now = std::chrono::steady_clock::now();
         auto write = state->queue.begin();
         for (auto read = state->queue.begin();
              read != state->queue.end(); ++read) {
-            if (read->deadline <= now) {
-                try {
-                    read->promise.set_value(MakeTimeoutResult(
-                        read->req, "queue-time exceeded deadline"));
-                } catch (const std::future_error&) {}
+            auto& sp = *read;
+            if (sp && sp->deadline <= now) {
+                if (!sp->done) {
+                    sp->done = true;
+                    try {
+                        sp->promise.set_value(MakeTimeoutResult(
+                            sp->req, "queue-time exceeded deadline"));
+                    } catch (const std::future_error&) {}
+                }
+                // Skip: drop from the new queue.
             } else {
                 if (write != read) {
                     *write = std::move(*read);
@@ -622,6 +712,32 @@ void* DnsResolver::TimeoutReaperTrampoline(void* raw) {
             }
         }
         state->queue.erase(write, state->queue.end());
+
+        // Evict expired items from in_flight. Here we ALSO erase on
+        // winning the `done` CAS — worker's Phase-3 completion sees
+        // done=true and skips its own erase (iterator would be invalid
+        // anyway). If we LOSE the race (worker finished first and is
+        // about to acquire the mtx), skip — worker will erase.
+        for (auto it = state->in_flight.begin();
+             it != state->in_flight.end(); ) {
+            auto& sp = *it;
+            if (sp && sp->deadline <= now) {
+                if (!sp->done) {
+                    sp->done = true;
+                    try {
+                        sp->promise.set_value(MakeTimeoutResult(
+                            sp->req, "queue-time exceeded deadline"));
+                    } catch (const std::future_error&) {}
+                    it = state->in_flight.erase(it);
+                } else {
+                    // Worker already completed this item. Worker will
+                    // erase under its own mtx acquisition. Skip.
+                    ++it;
+                }
+            } else {
+                ++it;
+            }
+        }
     }
 }
 
@@ -788,56 +904,47 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
         return fut;
     }
 
-    WorkItem item;
-    item.req      = std::move(req);
-    item.deadline = std::chrono::steady_clock::now() + item.req.timeout;
-    auto fut = item.promise.get_future();
+    auto item = std::make_shared<WorkItem>();
+    item->req      = std::move(req);
+    item->deadline = std::chrono::steady_clock::now() + item->req.timeout;
+    auto fut = item->promise.get_future();
 
     {
         std::lock_guard<std::mutex> lk(state_->mtx);
 
-        // Full-queue expiry sweep on EVERY submission. Review-round
-        // evolution:
+        // Full-queue expiry sweep on EVERY submission — see review-round
+        // evolution notes below. Items are now `shared_ptr<WorkItem>`
+        // for shared ownership with in-flight items (worker retains
+        // its own shared_ptr while the reaper may erase the list entry);
+        // iteration accesses fields via `(*read)->field`.
+        //
+        // Review-round evolution history:
         //   round 1 — front-only sweep (cheap, monotone-deadline only)
         //   round 2 — + full sweep gated on saturation (caught the
         //             mixed-deadline case, but only at cap)
-        //   round 3 — full sweep unconditionally (this version).
-        //
-        // The two-tier version missed the non-saturated mixed-timeout
-        // case: `[5s_item, 30ms_item]` stays below the 10000-item
-        // saturation bar, but the 30ms item waits behind a live 5s
-        // head that the front-sweep refuses to evict. The caller's
-        // per-request deadline contract (§5.2.3 `ResolveRequest.timeout`)
-        // is silently violated whenever the worker pool is wedged.
+        //   round 3 — full sweep unconditionally
+        //   round 4 — shared_ptr<WorkItem> + `done` flag so the reaper
+        //             can also safely expire in-flight items racing
+        //             the worker (this version).
         //
         // Always-sweep fixes both the drift problem (expired slots
-        // accumulating toward kMaxQueuedItems) AND the individual
-        // per-request deadline: any item whose deadline has passed
-        // is evicted at the next submission, no matter where it sits
-        // in the queue and no matter the queue size.
-        //
-        // Cost: O(N) per submission where N = queue size. Realistic
-        // queues are small (dozens to low hundreds), making sweep cost
-        // microseconds. Pathological 10000-item stall: ~1 ms per
-        // submission — absorbed by the one code path that actually
-        // wants sweep pressure. Workers pop one item under the same
-        // lock; they do NOT iterate the queue, so there is no nested-
-        // lock concern.
-        //
-        // Manual write/read iteration (not std::remove_if) so the
-        // set_value side effect on each evicted promise is unambiguous
-        // per the C++ standard for move-only WorkItem types.
+        // accumulating toward kMaxQueuedItems) AND the per-request
+        // deadline contract. Cost O(N) per submission; for realistic
+        // queue sizes, microseconds.
         const auto sweep_now = std::chrono::steady_clock::now();
         auto write = state_->queue.begin();
         for (auto read = state_->queue.begin();
              read != state_->queue.end(); ++read) {
-            if (read->deadline <= sweep_now) {
-                try {
-                    read->promise.set_value(MakeTimeoutResult(
-                        read->req, "queue-time exceeded deadline"));
-                } catch (const std::future_error&) {}
-                // Skip — don't move to write position. read is left
-                // moved-from / destructible at erase-time.
+            auto& sp = *read;
+            if (sp && sp->deadline <= sweep_now) {
+                if (!sp->done) {
+                    sp->done = true;
+                    try {
+                        sp->promise.set_value(MakeTimeoutResult(
+                            sp->req, "queue-time exceeded deadline"));
+                    } catch (const std::future_error&) {}
+                }
+                // Skip — drop from the new queue.
             } else {
                 if (write != read) {
                     *write = std::move(*read);
@@ -855,7 +962,7 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
             std::promise<ResolvedEndpoint> p;
             auto saturated = p.get_future();
             p.set_value(MakeReadyErrorResult(
-                item.req, EAI_AGAIN, "resolver saturated"));
+                item->req, EAI_AGAIN, "resolver saturated"));
             return saturated;
         }
         state_->queue.push_back(std::move(item));
@@ -968,4 +1075,4 @@ void DnsResolver::SetMaxQueuedItemsForTesting(std::size_t cap) {
     max_queued_items_ = cap;
 }
 
-}  // namespace net_dns
+}  // namespace DNS_NAMESPACE

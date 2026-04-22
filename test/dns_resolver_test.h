@@ -24,11 +24,11 @@
 
 namespace DnsResolverTests {
 
-using net_dns::DnsConfig;
-using net_dns::DnsResolver;
-using net_dns::LookupFamily;
-using net_dns::ResolvedEndpoint;
-using net_dns::ResolveRequest;
+using DNS_NAMESPACE::DnsConfig;
+using DNS_NAMESPACE::DnsResolver;
+using DNS_NAMESPACE::LookupFamily;
+using DNS_NAMESPACE::ResolvedEndpoint;
+using DNS_NAMESPACE::ResolveRequest;
 
 // ---------- Shared helpers ----------
 
@@ -205,12 +205,12 @@ inline void TestParseLookupFamily() {
     std::cout << "\n[TEST] DnsResolver: ParseLookupFamily..." << std::endl;
     try {
         bool ok = true;
-        ok = ok && net_dns::ParseLookupFamily("v4_only")      == LookupFamily::kV4Only;
-        ok = ok && net_dns::ParseLookupFamily("v6_only")      == LookupFamily::kV6Only;
-        ok = ok && net_dns::ParseLookupFamily("v4_preferred") == LookupFamily::kV4Preferred;
-        ok = ok && net_dns::ParseLookupFamily("v6_preferred") == LookupFamily::kV6Preferred;
+        ok = ok && DNS_NAMESPACE::ParseLookupFamily("v4_only")      == LookupFamily::kV4Only;
+        ok = ok && DNS_NAMESPACE::ParseLookupFamily("v6_only")      == LookupFamily::kV6Only;
+        ok = ok && DNS_NAMESPACE::ParseLookupFamily("v4_preferred") == LookupFamily::kV4Preferred;
+        ok = ok && DNS_NAMESPACE::ParseLookupFamily("v6_preferred") == LookupFamily::kV6Preferred;
         bool threw = false;
-        try { (void)net_dns::ParseLookupFamily("bogus"); }
+        try { (void)DNS_NAMESPACE::ParseLookupFamily("bogus"); }
         catch (const std::invalid_argument&) { threw = true; }
         ok = ok && threw;
         Record("DnsResolver: ParseLookupFamily", ok);
@@ -1428,6 +1428,91 @@ inline void TestQueuedItemExpiresWithoutFollowUpSubmission() {
     }
 }
 
+// ---------- Review-round: reaper expires in-flight items ----------
+
+inline void TestInFlightItemExpiresAtDeadline() {
+    std::cout << "\n[TEST] DnsResolver: in-flight item expires at deadline..."
+              << std::endl;
+    try {
+        // Reviewer scenario: the request has been POPPED from state->queue
+        // by a worker and is now in-flight (blocked in DoBlockingResolve /
+        // test seam). Previously the reaper only scanned state->queue so
+        // the in-flight item's future stayed pending until the blocking
+        // call returned. Post-fix: shared_ptr<WorkItem> + state->in_flight
+        // list + `done` flag let the reaper race the worker on set_value,
+        // so the future transitions to READY at the caller's deadline
+        // even while the worker's DoBlockingResolve is still blocked.
+        //
+        // Setup: cap=1, single worker. Submit ONE request with a 50ms
+        // timeout. Worker picks it up and wedges in the seam. No other
+        // item ever arrives. The reaper MUST fire the timeout at ~50ms.
+        struct Gate {
+            std::mutex m;
+            std::condition_variable cv;
+            bool release = false;
+        };
+        auto gate = std::make_shared<Gate>();
+
+        DnsResolver resolver(MakeFastConfig(1));   // cap=1 worker
+        resolver.SetResolverForTesting([gate](const ResolveRequest& req) {
+            // Wedge in the seam — this models getaddrinfo being stuck.
+            // The item has been popped from state->queue by the worker;
+            // it is now held on the worker's stack (in in_flight list).
+            std::unique_lock<std::mutex> lk(gate->m);
+            gate->cv.wait(lk, [&] { return gate->release; });
+            ResolvedEndpoint r;
+            r.host = req.host; r.port = req.port; r.tag = req.tag;
+            r.addr = InetAddr("10.0.0.1", req.port);
+            return r;
+        });
+
+        const auto t_submit = std::chrono::steady_clock::now();
+        auto fut = resolver.ResolveAsync(
+            MakeReq("wedged-target", 80, std::chrono::milliseconds(50)));
+
+        // Future must become READY at ~50ms via the reaper expiring the
+        // in-flight item. Without the fix, wait_for(250ms) would time
+        // out because the seam is still wedged and no one can reach
+        // the item.
+        const bool ready = fut.wait_for(std::chrono::milliseconds(250))
+                            == std::future_status::ready;
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_submit).count();
+
+        ResolvedEndpoint res;
+        if (ready) res = fut.get();
+
+        // Cleanup: release gate so the wedged worker eventually exits.
+        // Its Phase-3 completion will see `done=true` (reaper already
+        // flipped it) and skip set_value + skip in_flight.erase (reaper
+        // did both). No double-set, no UB.
+        {
+            std::lock_guard<std::mutex> lk(gate->m);
+            gate->release = true;
+        }
+        gate->cv.notify_all();
+
+        bool ok = ready;
+        ok = ok && res.error;
+        ok = ok && res.error_code == EAI_AGAIN;
+        ok = ok && res.error_message.find("queue-time exceeded")
+                    != std::string::npos;
+        // Elapsed bounds. Lower bound catches "instantly ready" regressions
+        // (would mean the deadline didn't actually fire via reaper);
+        // upper bound catches the pre-fix "never ready" hang.
+        ok = ok && elapsed_ms >= 40;
+        ok = ok && elapsed_ms < 200;
+        Record("DnsResolver: in-flight item expires at deadline", ok,
+                "ready=" + std::to_string(ready) +
+                " elapsed_ms=" + std::to_string(elapsed_ms) +
+                " err=" + std::to_string(res.error_code));
+    } catch (const std::exception& e) {
+        Record("DnsResolver: in-flight item expires at deadline",
+                false, e.what());
+    }
+}
+
 // ---------- Queue-time deadline short-circuit ----------
 
 inline void TestQueueTimeDeadlineShortCircuits() {
@@ -1488,6 +1573,7 @@ inline void RunAllTests() {
     TestResolveAsyncRejectsInvalidHostBeforeQueue();
     TestParseHostPortValidatesHostToken();
     TestQueuedItemExpiresWithoutFollowUpSubmission();
+    TestInFlightItemExpiresAtDeadline();
     TestQueueTimeDeadlineShortCircuits();
 }
 
