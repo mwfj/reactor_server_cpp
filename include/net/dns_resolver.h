@@ -208,6 +208,13 @@ private:
     std::shared_ptr<PoolState> state_;
     std::vector<pthread_t>     workers_;   // detached at ~DnsResolver; empty
                                            // until EnsurePoolStarted runs.
+    // Dedicated timeout-reaper thread. Spawned lazily alongside workers
+    // so the "literal-only resolver = zero threads" property is preserved.
+    // Wakes on cv.wait_until(earliest_deadline) and evicts any queue
+    // item whose deadline has passed — without requiring follow-up
+    // traffic or a non-wedged worker. Stored as 0 when not spawned.
+    // Detached at ~DnsResolver (same contract as workers).
+    pthread_t                  reaper_ = 0;
     std::once_flag             pool_started_;
     DnsConfig                  config_;
     // Instance override of kMaxQueuedItems. Defaults to the class
@@ -225,6 +232,13 @@ private:
     // shared_ptr<PoolState> by pointer so pthread_create's void* argument
     // can transfer ownership across the thread boundary.
     static void* WorkerTrampoline(void* raw);
+
+    // Reaper entry. Same ownership transfer pattern as WorkerTrampoline.
+    // Enforces per-request timeouts for items sitting in state_->queue
+    // when no worker is available to pop them and no follow-up
+    // ResolveAsync call has triggered the submission-side sweep. See
+    // the comment at the member declaration above for the full contract.
+    static void* TimeoutReaperTrampoline(void* raw);
 
     // Blocking getaddrinfo body. Runs on a worker thread.
     static ResolvedEndpoint DoBlockingResolve(const ResolveRequest& req);

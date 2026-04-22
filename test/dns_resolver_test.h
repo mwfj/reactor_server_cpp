@@ -844,29 +844,29 @@ inline void TestQueuedItemExpiresDuringWorkerStall() {
         auto fut_b = resolver.ResolveAsync(
             MakeReq("host.b", 80, std::chrono::milliseconds(30)));
 
-        // Sleep past B's deadline. Without the fix, B's future would
-        // still be pending at this point (no one has pulled it from
-        // the queue to fire the worker-side deadline short-circuit).
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
-
-        // Pre-sweep check: B's future is NOT yet ready (nothing has
-        // evicted it — workers still wedged, no new submission yet).
-        const bool not_ready_before_sweep =
-            fut_b.wait_for(std::chrono::milliseconds(5))
-                != std::future_status::ready;
-
-        // C: submitting a new request triggers the front-sweep inside
-        // ResolveAsync, which evicts B (now past deadline at the front)
-        // before pushing C. C itself just queues behind the sweep.
-        auto fut_c = resolver.ResolveAsync(
-            MakeReq("host.c", 80, std::chrono::milliseconds(500)));
-
-        // Post-sweep: B should be ready with the queue-time timeout result.
-        const bool ready_after_sweep =
-            fut_b.wait_for(std::chrono::milliseconds(100))
+        // Wait for B to become ready. Post-reaper: the reaper thread
+        // fires the timeout at B's deadline (~30ms), so the future
+        // transitions to READY without requiring a follow-up
+        // submission. (The earlier version of this test submitted a
+        // follow-up request to trigger the submission-side sweep, and
+        // asserted that B was NOT ready before that submission. That
+        // assertion no longer holds under the reaper, which closes the
+        // "future never becomes ready at timeout" API-contract hole;
+        // see TestQueuedItemExpiresWithoutFollowUpSubmission for the
+        // focused reaper test.) We still submit a follow-up request
+        // afterwards to exercise the submission-side sweep as a
+        // defense-in-depth path, but the correctness bar is simply
+        // that B gets EAI_AGAIN with the queue-time-exceeded marker.
+        const bool ready =
+            fut_b.wait_for(std::chrono::milliseconds(200))
                 == std::future_status::ready;
         ResolvedEndpoint result_b;
-        if (ready_after_sweep) result_b = fut_b.get();
+        if (ready) result_b = fut_b.get();
+
+        // Exercise the submission-side sweep as a defense-in-depth
+        // path (harmless; B is already evicted by the reaper).
+        auto fut_c = resolver.ResolveAsync(
+            MakeReq("host.c", 80, std::chrono::milliseconds(500)));
 
         // Cleanup: release the gate so the wedged worker completes A
         // (and pops/processes C). Drain both futures so ASAN/leak
@@ -879,15 +879,13 @@ inline void TestQueuedItemExpiresDuringWorkerStall() {
         (void)fut_a.wait_for(std::chrono::milliseconds(500));
         (void)fut_c.wait_for(std::chrono::milliseconds(500));
 
-        bool ok = not_ready_before_sweep;
-        ok = ok && ready_after_sweep;
+        bool ok = ready;
         ok = ok && result_b.error;
         ok = ok && result_b.error_code == EAI_AGAIN;
         ok = ok && result_b.error_message.find("queue-time exceeded")
                     != std::string::npos;
         Record("DnsResolver: queued item expires during worker stall", ok,
-                "not_ready_pre=" + std::to_string(not_ready_before_sweep) +
-                " ready_post=" + std::to_string(ready_after_sweep) +
+                "ready=" + std::to_string(ready) +
                 " err=" + std::to_string(result_b.error_code));
     } catch (const std::exception& e) {
         Record("DnsResolver: queued item expires during worker stall",
@@ -943,28 +941,27 @@ inline void TestNonSaturatedMixedTimeoutQueueExpires() {
         auto fut_c = resolver.ResolveAsync(
             MakeReq("host.c", 80, std::chrono::milliseconds(30)));
 
-        // Wait past C's deadline.
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
-
-        // Pre-submission: C is NOT yet ready — no one has evicted it.
-        // Without the round-3 fix this state would persist until the
-        // resolver is destroyed or the queue reaches 10000.
-        const bool c_not_ready_before =
-            fut_c.wait_for(std::chrono::milliseconds(5))
-                != std::future_status::ready;
-
-        // D: any new submission. Triggers the unconditional full sweep
-        // in ResolveAsync which MUST evict C despite (a) queue being
-        // non-saturated and (b) the live 5s B_long head.
-        auto fut_d = resolver.ResolveAsync(
-            MakeReq("host.d", 80, std::chrono::milliseconds(5000)));
-
-        // Post-submission: C should be ready with queue-time-exceeded.
-        const bool c_ready_after =
-            fut_c.wait_for(std::chrono::milliseconds(100))
+        // Wait for C to become ready. Post-reaper: the reaper fires
+        // at C's deadline (~30ms) independently of any follow-up
+        // submission, so the future transitions to READY directly.
+        // (The earlier version of this test relied on a follow-up
+        // submission to trigger the submission-side full sweep — that
+        // path still works as defense-in-depth, but the correctness
+        // bar is just that C gets EAI_AGAIN with the queue-time-
+        // exceeded marker, however it reaches that state. The focused
+        // reaper test is TestQueuedItemExpiresWithoutFollowUpSubmission.)
+        const bool c_ready =
+            fut_c.wait_for(std::chrono::milliseconds(200))
                 == std::future_status::ready;
         ResolvedEndpoint res_c;
-        if (c_ready_after) res_c = fut_c.get();
+        if (c_ready) res_c = fut_c.get();
+
+        // Also exercise the submission-side full sweep as defense-
+        // in-depth. Harmless since C has already been evicted by the
+        // reaper at ~30ms; this just demonstrates the mechanism is
+        // still reachable and non-saturated.
+        auto fut_d = resolver.ResolveAsync(
+            MakeReq("host.d", 80, std::chrono::milliseconds(5000)));
 
         // Cleanup.
         {
@@ -976,16 +973,14 @@ inline void TestNonSaturatedMixedTimeoutQueueExpires() {
         (void)fut_b_long.wait_for(std::chrono::milliseconds(500));
         (void)fut_d.wait_for(std::chrono::milliseconds(500));
 
-        bool ok = c_not_ready_before;
-        ok = ok && c_ready_after;
+        bool ok = c_ready;
         ok = ok && res_c.error;
         ok = ok && res_c.error_code == EAI_AGAIN;
         ok = ok && res_c.error_message.find("queue-time exceeded")
                     != std::string::npos;
         Record("DnsResolver: non-saturated mixed-timeout queue expires",
                 ok,
-                "c_not_ready_before=" + std::to_string(c_not_ready_before) +
-                " c_ready_after=" + std::to_string(c_ready_after) +
+                "c_ready=" + std::to_string(c_ready) +
                 " err=" + std::to_string(res_c.error_code));
     } catch (const std::exception& e) {
         Record("DnsResolver: non-saturated mixed-timeout queue expires",
@@ -1344,6 +1339,95 @@ inline void TestParseHostPortValidatesHostToken() {
     }
 }
 
+// ---------- Review-round: future becomes ready at timeout without follow-up traffic ----------
+
+inline void TestQueuedItemExpiresWithoutFollowUpSubmission() {
+    std::cout << "\n[TEST] DnsResolver: queued item expires without follow-up submission..."
+              << std::endl;
+    try {
+        // Reviewer scenario: cap=1, first request wedges the single
+        // worker, second request has a 50ms timeout, NO third submission
+        // arrives. Previously the second future stayed pending forever
+        // because neither expiry path fired (submission-side sweep
+        // needs a follow-up call; worker-side check needs the worker
+        // to pop the item). The new reaper thread sleeps on
+        // cv.wait_until(earliest_deadline), wakes at 50ms, evicts the
+        // expired item, and set_values the promise. Caller's future
+        // transitions to READY at ~50ms — the contract ResolveAsync
+        // was always supposed to provide.
+        struct Gate {
+            std::mutex m;
+            std::condition_variable cv;
+            bool release = false;
+        };
+        auto gate = std::make_shared<Gate>();
+
+        DnsResolver resolver(MakeFastConfig(1));   // cap = 1 worker
+        resolver.SetResolverForTesting([gate](const ResolveRequest& req) {
+            std::unique_lock<std::mutex> lk(gate->m);
+            gate->cv.wait(lk, [&] { return gate->release; });
+            ResolvedEndpoint r;
+            r.host = req.host; r.port = req.port; r.tag = req.tag;
+            r.addr = InetAddr("10.0.0.1", req.port);
+            return r;
+        });
+
+        // A: picked up by the single worker, wedges on the gate.
+        auto fut_a = resolver.ResolveAsync(
+            MakeReq("wedge", 80, std::chrono::milliseconds(5000)));
+        // Give the worker a moment to dequeue A and park on the gate.
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+        // B: queued with a 50ms deadline. No worker available to pop.
+        // No follow-up submission planned. The reaper MUST fire the
+        // timeout.
+        const auto t_submit = std::chrono::steady_clock::now();
+        auto fut_b = resolver.ResolveAsync(
+            MakeReq("target", 80, std::chrono::milliseconds(50)));
+
+        // Wait up to 250ms for the future to become READY (not just for
+        // our local wait_for to timeout, which is the pre-fix behaviour).
+        // If the reaper is working, elapsed should be ~50ms.
+        const bool ready =
+            fut_b.wait_for(std::chrono::milliseconds(250))
+                == std::future_status::ready;
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_submit).count();
+
+        ResolvedEndpoint res_b;
+        if (ready) res_b = fut_b.get();
+
+        // Cleanup: release the gate so the wedged worker finishes A.
+        {
+            std::lock_guard<std::mutex> lk(gate->m);
+            gate->release = true;
+        }
+        gate->cv.notify_all();
+        (void)fut_a.wait_for(std::chrono::milliseconds(500));
+
+        bool ok = ready;
+        ok = ok && res_b.error;
+        ok = ok && res_b.error_code == EAI_AGAIN;
+        ok = ok && res_b.error_message.find("queue-time exceeded")
+                    != std::string::npos;
+        // Sanity bounds. Elapsed should be at least ~40 ms (not
+        // instantaneous — would indicate something expired pre-deadline)
+        // and well under 200 ms (catches the pre-fix "never ready"
+        // bug where wait_for itself times out and elapsed ≈ 250).
+        ok = ok && elapsed_ms >= 40;
+        ok = ok && elapsed_ms < 200;
+        Record("DnsResolver: queued item expires without follow-up submission",
+                ok,
+                "ready=" + std::to_string(ready) +
+                " elapsed_ms=" + std::to_string(elapsed_ms) +
+                " err=" + std::to_string(res_b.error_code));
+    } catch (const std::exception& e) {
+        Record("DnsResolver: queued item expires without follow-up submission",
+                false, e.what());
+    }
+}
+
 // ---------- Queue-time deadline short-circuit ----------
 
 inline void TestQueueTimeDeadlineShortCircuits() {
@@ -1403,6 +1487,7 @@ inline void RunAllTests() {
     TestParseHostPortRejectsMalformedPort();
     TestResolveAsyncRejectsInvalidHostBeforeQueue();
     TestParseHostPortValidatesHostToken();
+    TestQueuedItemExpiresWithoutFollowUpSubmission();
     TestQueueTimeDeadlineShortCircuits();
 }
 

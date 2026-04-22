@@ -399,6 +399,15 @@ DnsResolver::~DnsResolver() {
     }
     workers_.clear();
 
+    // Detach the timeout reaper — same detach-not-join contract. The
+    // reaper sees shutting_down via the notify_all above and returns
+    // promptly (it's never blocked in getaddrinfo); under normal
+    // teardown this thread exits in microseconds.
+    if (reaper_ != 0) {
+        pthread_detach(reaper_);
+        reaper_ = 0;
+    }
+
     // state_ goes out of scope here. PoolState destructs when the last
     // shared_ptr reference is released — which may be inside this dtor
     // (all workers woke and returned) or arbitrarily later (wedged
@@ -433,10 +442,26 @@ void DnsResolver::EnsurePoolStarted() {
                 }
                 workers_.push_back(tid);
             }
+
+            // Review-round fix: spawn the timeout reaper AFTER workers.
+            // One reaper per pool. Same heap-allocated shared_ptr pattern
+            // as workers; reaper_ is reset to 0 on spawn failure so the
+            // partial-failure cleanup below doesn't try to detach a
+            // pthread_t that was never created.
+            auto reaper_raw = new std::shared_ptr<PoolState>(state_);
+            int reaper_rc = pthread_create(
+                &reaper_, &attr, &TimeoutReaperTrampoline, reaper_raw);
+            if (reaper_rc != 0) {
+                delete reaper_raw;
+                reaper_ = 0;
+                throw std::runtime_error(
+                    "DnsResolver: pthread_create failed for timeout reaper: " +
+                    std::string(std::strerror(reaper_rc)));
+            }
         } catch (...) {
             // Partial-failure cleanup (§5.2.9). Signal shutdown on the
-            // OLD state so already-started workers exit, then detach
-            // them so throw doesn't hang on a wedged worker.
+            // OLD state so already-started workers + reaper exit, then
+            // detach them so throw doesn't hang on a wedged thread.
             {
                 std::lock_guard<std::mutex> lk(state_->mtx);
                 state_->shutting_down.store(true, std::memory_order_release);
@@ -446,6 +471,10 @@ void DnsResolver::EnsurePoolStarted() {
                 pthread_detach(tid);
             }
             workers_.clear();
+            if (reaper_ != 0) {
+                pthread_detach(reaper_);
+                reaper_ = 0;
+            }
 
             // Replace state_ with a fresh PoolState so a subsequent
             // call_once retry (after transient failure like EAGAIN)
@@ -513,6 +542,86 @@ void* DnsResolver::WorkerTrampoline(void* raw) {
         try {
             item.promise.set_value(std::move(result));
         } catch (const std::future_error&) { /* future destroyed */ }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TimeoutReaperTrampoline — dedicated reaper thread
+// ---------------------------------------------------------------------------
+//
+// Review-round fix: direct ResolveAsync callers need their future to
+// transition to READY at req.timeout even when:
+//   - the worker pool is stuck in getaddrinfo() (cap=1 + wedge case),
+//   - AND no follow-up submission triggers the ResolveAsync sweep,
+//   - AND no worker is available to run the post-pop deadline check.
+//
+// The reaper sleeps on cv.wait_until(earliest_deadline); on wake it
+// scans the queue and evicts any item whose deadline has passed via
+// promise.set_value(MakeTimeoutResult(...)). Notifications from
+// ResolveAsync use notify_all so the reaper also wakes on new items
+// with deadlines earlier than its current wait target.
+//
+// Lifetime: captures shared_ptr<PoolState> by value (heap-allocated
+// pointer transfer via pthread_create, same pattern as WorkerTrampoline),
+// so the state outlives ~DnsResolver under detach-not-join teardown.
+// Exits when state_->shutting_down becomes true.
+void* DnsResolver::TimeoutReaperTrampoline(void* raw) {
+    auto state = *static_cast<std::shared_ptr<PoolState>*>(raw);
+    delete static_cast<std::shared_ptr<PoolState>*>(raw);
+
+    while (true) {
+        std::unique_lock<std::mutex> lk(state->mtx);
+
+        if (state->shutting_down.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+
+        // Find the earliest deadline across the queue. Items are pushed
+        // back (FIFO), but deadlines are not monotone in queue order
+        // (mixed ResolveRequest.timeout callers), so scan the full queue.
+        auto earliest = std::chrono::steady_clock::time_point::max();
+        for (const auto& item : state->queue) {
+            if (item.deadline < earliest) earliest = item.deadline;
+        }
+
+        // Wait until earliest deadline OR notify. Predicate-less waits
+        // so ANY wakeup (notify from ResolveAsync push, deadline timeout,
+        // spurious) re-enters the loop and re-computes earliest from the
+        // current queue state. Handles the "new item with deadline
+        // shorter than current wait target" case: ResolveAsync's
+        // notify_all wakes the reaper, which re-computes and re-waits
+        // against the new shorter deadline.
+        if (earliest == std::chrono::steady_clock::time_point::max()) {
+            // Queue empty — wait until notified.
+            state->cv.wait(lk);
+        } else {
+            state->cv.wait_until(lk, earliest);
+        }
+
+        if (state->shutting_down.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+
+        // Evict expired items. Same write/read iteration pattern as the
+        // submission-side sweep in ResolveAsync (unambiguous promise
+        // set_value semantics for move-only WorkItem types).
+        const auto now = std::chrono::steady_clock::now();
+        auto write = state->queue.begin();
+        for (auto read = state->queue.begin();
+             read != state->queue.end(); ++read) {
+            if (read->deadline <= now) {
+                try {
+                    read->promise.set_value(MakeTimeoutResult(
+                        read->req, "queue-time exceeded deadline"));
+                } catch (const std::future_error&) {}
+            } else {
+                if (write != read) {
+                    *write = std::move(*read);
+                }
+                ++write;
+            }
+        }
+        state->queue.erase(write, state->queue.end());
     }
 }
 
@@ -751,7 +860,17 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
         }
         state_->queue.push_back(std::move(item));
     }
-    state_->cv.notify_one();
+    // Review-round fix: notify_all (was notify_one). Wakes BOTH a
+    // worker (to pick up the new item) AND the timeout reaper (so it
+    // can re-compute earliest-deadline if this new item has a shorter
+    // deadline than whatever the reaper was previously waiting on).
+    // At cap=32 this is 33 wakeups per submission instead of 1; the
+    // extra scheduler cost (~100 µs of wakeup overhead per submission
+    // at realistic rates) is absorbed cheaply and is required to close
+    // the API-contract hole where a direct ResolveAsync caller could
+    // wait indefinitely for a future to become ready when traffic
+    // stopped behind a wedged worker.
+    state_->cv.notify_all();
     return fut;
 }
 
