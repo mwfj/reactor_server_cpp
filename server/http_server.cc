@@ -426,14 +426,34 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
         }
         const auto& staged = *it->second;
         if (!issuers_all_live(staged)) {
-            // Whole-policy defer (design §11.2 step 4 / §18.5). Applying
-            // ANY staged field (peer or issuers) would risk applying
-            // new-issuer-tuned rules (required_audience, scopes, etc.)
-            // to old-issuer traffic. Preserve the ENTIRE live policy
-            // for this identity and flag for the operator warn.
-            out.topology_changed = true;
-            out.policies.push_back(live);
-            continue;
+            // Issuer-refs point at non-live issuers. Two sub-cases:
+            //
+            // A) staged.enabled=true — whole-policy defer (design §11.2
+            //    step 4 / §18.5). Applying staged peer fields
+            //    (required_audience, required_scopes, etc.) against
+            //    traffic still flowing through the OLD live issuer
+            //    would 401/403 previously-working tokens. Preserve the
+            //    entire live policy for this identity.
+            //
+            // B) staged.enabled=false — the operator asked to DISABLE
+            //    the policy. A disabled policy doesn't enforce, so the
+            //    non-live-issuer-ref concern doesn't apply: there's no
+            //    traffic this policy will validate until the operator
+            //    re-enables post-restart. Preserving the live enabled
+            //    entry here would ignore the disable request — the
+            //    policy would keep enforcing on the existing prefix
+            //    until restart, silently overriding the operator's
+            //    explicit intent. Commit the staged disable live.
+            if (staged.enabled) {
+                out.topology_changed = true;
+                out.policies.push_back(live);
+                continue;
+            }
+            // fall through to the live-commit path below: publishing a
+            // disabled policy is a no-op for the matcher (disabled
+            // entries are filtered out by BuildAppliedPolicyList), so
+            // this is equivalent to removing the live coverage for
+            // this identity — which IS what the operator asked for.
         }
         AUTH_NAMESPACE::AuthPolicy merged = staged;
         merged.name = live.name;
@@ -4108,8 +4128,19 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         for (const auto& u : upstream_configs_) {
             live_names.insert(u.name);
         }
+        // Build live_issuer_names once — reused by ValidateProxyAuth
+        // (to scope `auth.issuers.*.upstream` xrefs to live issuers
+        // only) and by ValidateHotReloadable below.
+        std::unordered_set<std::string> live_issuer_names;
+        if (auth_manager_) {
+            live_issuer_names.reserve(auth_config_.issuers.size());
+            for (const auto& [name, _] : auth_config_.issuers) {
+                live_issuer_names.insert(name);
+            }
+        }
         try {
-            ConfigLoader::ValidateProxyAuth(new_config, live_names);
+            ConfigLoader::ValidateProxyAuth(new_config, live_names,
+                                             live_issuer_names);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Reload() rejected invalid inline auth: {}",
                                   e.what());
@@ -4144,26 +4175,18 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
         // so validating CB blocks for new/renamed entries would
         // block otherwise-safe reloads. `upstream_configs_` is the
         // post-Start snapshot of running upstreams.
-        {
+        try {
             // Scope auth-issuer validation to the running AuthManager's
-            // issuer set so a typo in an ADDED/RENAMED issuer (rejected
-            // as restart-required anyway by AuthManager::Reload) doesn't
-            // abort unrelated live-safe edits.
-            std::unordered_set<std::string> live_issuer_names;
-            if (auth_manager_) {
-                live_issuer_names.reserve(auth_config_.issuers.size());
-                for (const auto& [name, _] : auth_config_.issuers) {
-                    live_issuer_names.insert(name);
-                }
-            }
-            try {
-                ConfigLoader::ValidateHotReloadable(
-                    new_config, live_names, live_issuer_names);
-            } catch (const std::invalid_argument& e) {
-                logging::Get()->error("Reload() rejected invalid config: {}",
-                                      e.what());
-                return false;
-            }
+            // issuer set (live_issuer_names built above) so a typo in an
+            // ADDED/RENAMED issuer (rejected as restart-required anyway
+            // by AuthManager::Reload) doesn't abort unrelated live-safe
+            // edits.
+            ConfigLoader::ValidateHotReloadable(
+                new_config, live_names, live_issuer_names);
+        } catch (const std::invalid_argument& e) {
+            logging::Get()->error("Reload() rejected invalid config: {}",
+                                  e.what());
+            return false;
         }
     }
 

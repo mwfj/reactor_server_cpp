@@ -1046,6 +1046,65 @@ static bool TestValidateHotReloadableSkipsAuthOnIssuerTopologyMismatch() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 25: ValidateProxyAuth skips issuer.upstream cross-reference for
+// staged-only issuers on reload. A reload that ships a new (restart-only)
+// issuer alongside unrelated live-safe edits must NOT be aborted just
+// because the new issuer's `upstream` field is malformed — AuthManager::
+// Reload will reject the topology delta anyway, so the live server
+// never applies that value. Scope matches the existing live_issuer_names
+// gating in ValidateHotReloadable.
+// ---------------------------------------------------------------------------
+static bool TestValidateProxyAuthSkipsStagedOnlyIssuerUpstreamXref() {
+    ServerConfig cfg;
+    UpstreamConfig live_pool;
+    live_pool.name = "live-pool";
+    live_pool.host = "127.0.0.1";
+    live_pool.port = 8080;
+    cfg.upstreams.push_back(live_pool);
+
+    // Live issuer with correct upstream ref.
+    AUTH_NAMESPACE::IssuerConfig live_iss;
+    live_iss.name = "live-iss";
+    live_iss.issuer_url = "https://live.example";
+    live_iss.upstream = "live-pool";
+    live_iss.mode = "jwt";
+    live_iss.algorithms = {"RS256"};
+    cfg.auth.issuers["live-iss"] = live_iss;
+
+    // Staged-only issuer whose `upstream` references a non-existent
+    // pool — restart-required, AuthManager::Reload will reject the
+    // topology delta.
+    AUTH_NAMESPACE::IssuerConfig staged_iss;
+    staged_iss.name = "staged-iss";
+    staged_iss.issuer_url = "https://staged.example";
+    staged_iss.upstream = "no-such-pool";  // dangling ref
+    staged_iss.mode = "jwt";
+    staged_iss.algorithms = {"RS256"};
+    cfg.auth.issuers["staged-iss"] = staged_iss;
+
+    // Reload-scoped call with live_issuer_names = {"live-iss"}: the
+    // staged-iss dangling upstream ref must NOT trigger a reject.
+    bool reload_threw = false;
+    try {
+        ConfigLoader::ValidateProxyAuth(cfg, {"live-pool"},
+                                         /*live_issuer_names=*/{"live-iss"});
+    } catch (const std::invalid_argument&) {
+        reload_threw = true;
+    }
+
+    // Startup-style call with empty live_issuer_names (check ALL) must
+    // still reject — startup semantics unchanged.
+    bool startup_threw = false;
+    try {
+        ConfigLoader::ValidateProxyAuth(cfg, {"live-pool"});
+    } catch (const std::invalid_argument&) {
+        startup_threw = true;
+    }
+
+    return !reload_threw && startup_threw;
+}
+
+// ---------------------------------------------------------------------------
 // Test runner
 // ---------------------------------------------------------------------------
 
@@ -1112,6 +1171,8 @@ static void RunAllTests() {
            TestValidateHotReloadableSkipsAuthWhenNoLiveRuntime);
     RunOne("AuthReload: ValidateHotReloadable skips auth on issuer topology mismatch",
            TestValidateHotReloadableSkipsAuthOnIssuerTopologyMismatch);
+    RunOne("AuthReload: ValidateProxyAuth skips staged-only issuer upstream xref",
+           TestValidateProxyAuthSkipsStagedOnlyIssuerUpstreamXref);
 }
 
 }  // namespace AuthReloadTests

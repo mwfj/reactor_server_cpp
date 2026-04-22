@@ -2539,7 +2539,8 @@ void ConfigLoader::ValidateAuthPrefixCollisions(
 
 void ConfigLoader::ValidateProxyAuth(
     const ServerConfig& config,
-    const std::unordered_set<std::string>& live_upstream_names) {
+    const std::unordered_set<std::string>& live_upstream_names,
+    const std::unordered_set<std::string>& live_issuer_names) {
     // Same per-upstream checks that Validate() runs inline, extracted so
     // the reload path can invoke them against the REAL upstreams[] list
     // even when Validate() is called on a stripped validation_copy.
@@ -2561,7 +2562,20 @@ void ConfigLoader::ValidateProxyAuth(
         for (const auto& u : config.upstreams) {
             upstream_names.insert(u.name);
         }
+        const bool scope_to_live_issuers = !live_issuer_names.empty();
         for (const auto& [name, ic] : config.auth.issuers) {
+            // On the reload path, skip staged-only issuers: they're
+            // restart-only topology (AuthManager::Reload rejects any
+            // issuer-set delta), so validating their `upstream` field
+            // would abort the entire reload for something the runtime
+            // would never apply — blocking unrelated live-safe edits
+            // (rate_limit, log level) shipped in the same file. Startup
+            // passes an empty `live_issuer_names` and this skip never
+            // fires, preserving the full cross-reference check.
+            if (scope_to_live_issuers &&
+                live_issuer_names.count(name) == 0) {
+                continue;
+            }
             if (ic.upstream.empty()) {
                 // Structural "must be non-empty" check — identical to the
                 // one in Validate(). Duplicated because structural checks

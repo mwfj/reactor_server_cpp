@@ -110,6 +110,18 @@ struct UpstreamHttpClient::Transaction
                 if (auto transport = upstream_conn->GetTransport()) {
                     transport->SetOnMessageCb(nullptr);
                     transport->SetCompletionCb(nullptr);
+                    // Clear the response-budget deadline + timeout
+                    // callback we installed when the request was sent
+                    // (see start_task's SetDeadline/SetDeadlineTimeoutCb
+                    // path). PoolPartition::ReturnConnection rewires
+                    // OnMessage/Completion but does NOT sweep deadline
+                    // state, so leaving it here means the stale deadline
+                    // can fire later on an unrelated borrower and close
+                    // their healthy fetch as a spurious timeout. Clear
+                    // symmetric with install; safe on a transport that
+                    // never had one armed (no-op).
+                    transport->ClearDeadline();
+                    transport->SetDeadlineTimeoutCb(nullptr);
                     // Reset the transport's input cap — we installed a
                     // conservative cap when borrowing it and the pool's
                     // next borrower will re-apply their own.

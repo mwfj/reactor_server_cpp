@@ -145,11 +145,22 @@ public:
     // is safe to call a second time with the same config (all checks
     // are pure / side-effect-free / deterministic).
     //
+    // `live_issuer_names` scopes the `auth.issuers.*.upstream` cross-
+    // reference checks the same way `live_upstream_names` scopes the
+    // per-upstream inline-auth checks. Staged-only issuers (names not
+    // in `live_issuer_names`) are SKIPPED — those entries are restart-
+    // only topology and `AuthManager::Reload` will reject them anyway;
+    // validating their `upstream` field here would abort unrelated
+    // live-safe reloads that happen to ship alongside the staged
+    // issuer add. Default empty means "check all" (startup semantics,
+    // no live-runtime concept).
+    //
     // Throws std::invalid_argument with an `upstreams['name'].proxy.auth...`
     // message on failure.
     static void ValidateProxyAuth(
         const ServerConfig& config,
-        const std::unordered_set<std::string>& live_upstream_names);
+        const std::unordered_set<std::string>& live_upstream_names,
+        const std::unordered_set<std::string>& live_issuer_names = {});
 
     // Structural validation for `auth.forward.*` output header names:
     //   * RFC 7230 §3.2.6 tchar validity (rejects spaces / punctuation /
