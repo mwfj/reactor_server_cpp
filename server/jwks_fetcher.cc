@@ -151,14 +151,14 @@ ParseAndConvert(const std::string& body,
 
 JwksFetcher::JwksFetcher(std::string issuer_name,
                           std::shared_ptr<UpstreamHttpClient> client,
-                          JwksCache* cache,
+                          std::shared_ptr<JwksCache> cache,
                           std::string upstream_pool_name,
-                          const std::atomic<uint64_t>* owner_generation)
+                          std::shared_ptr<std::atomic<uint64_t>> owner_generation)
     : issuer_name_(std::move(issuer_name)),
       client_(std::move(client)),
-      cache_(cache),
+      cache_(std::move(cache)),
       upstream_pool_name_(std::move(upstream_pool_name)),
-      owner_generation_(owner_generation),
+      owner_generation_(std::move(owner_generation)),
       cancel_token_(std::make_shared<std::atomic<bool>>(false)) {
     logging::Get()->debug(
         "JwksFetcher constructed issuer={} pool={}",
@@ -215,14 +215,20 @@ void JwksFetcher::StartFetch(const std::string& jwks_uri,
         generation);
 
     std::string issuer_name = issuer_name_;
-    JwksCache* cache = cache_;
+    std::shared_ptr<JwksCache> cache = cache_;
     auto cb = after_cb;
-    const std::atomic<uint64_t>* owner_generation = owner_generation_;
+    std::shared_ptr<std::atomic<uint64_t>> owner_generation = owner_generation_;
 
     client_->Issue(
         upstream_pool_name_,
         dispatcher_index,
         std::move(req),
+        // Lambda captures `cache` + `owner_generation` as shared_ptr BY
+        // VALUE. If `~JwksFetcher` / `~Issuer` runs concurrently with
+        // the dispatcher-thread completion, the shared ownership keeps
+        // the cache and generation atomic alive until the lambda ends
+        // — avoids UAF that would otherwise arise from raw-pointer
+        // captures surviving into a teardown window.
         [cache, issuer_name, generation, owner_generation, cb, token](
                 UpstreamHttpClient::Response resp) {
             // Terminal callback — guaranteed at most once. Always release

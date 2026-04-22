@@ -128,7 +128,7 @@ class Issuer : public std::enable_shared_from_this<Issuer> {
     }
 
     uint64_t generation() const noexcept {
-        return generation_.load(std::memory_order_acquire);
+        return generation_->load(std::memory_order_acquire);
     }
 
     JwksCache* jwks_cache() noexcept { return jwks_cache_.get(); }
@@ -150,11 +150,23 @@ class Issuer : public std::enable_shared_from_this<Issuer> {
 
     std::atomic<bool> ready_{false};
     // Generation bumped on Stop() and on every successful ApplyReload.
-    // Captured by JwksFetcher / OidcDiscovery completion callbacks so
-    // stale responses that cross a reload or stop are dropped.
-    std::atomic<uint64_t> generation_{1};
+    // Heap-owned via shared_ptr so JwksFetcher / OidcDiscovery completion
+    // callbacks can safely capture it by value — if the Issuer is destroyed
+    // while a dispatcher completion is in flight, the atomic stays alive
+    // as long as any lambda holds a shared_ptr copy. Without this, the
+    // lambda's raw pointer would dangle after ~Issuer (UAF on the
+    // completion's generation comparison). Same protection as
+    // OidcDiscovery's cycle_state_ pattern.
+    std::shared_ptr<std::atomic<uint64_t>> generation_ =
+        std::make_shared<std::atomic<uint64_t>>(1);
 
-    std::unique_ptr<JwksCache> jwks_cache_;
+    // Heap-owned for the same lifetime reason as `generation_`:
+    // JwksFetcher's completion lambda calls `cache->InstallKeys` /
+    // `ReleaseRefreshSlot` on any terminal path. If a completion fires
+    // after ~Issuer destroys a unique_ptr-owned cache, those calls are
+    // UAF. Shared ownership lets the lambda keep the cache alive across
+    // the race.
+    std::shared_ptr<JwksCache> jwks_cache_;
     std::unique_ptr<JwksFetcher> jwks_fetcher_;
     std::unique_ptr<OidcDiscovery> oidc_discovery_;
     std::shared_ptr<UpstreamHttpClient> upstream_http_client_;

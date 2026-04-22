@@ -87,7 +87,7 @@ Issuer::Issuer(const IssuerConfig& config,
       upstream_(config.upstream),
       discovery_(config.discovery),
       snapshot_(BuildMutableSnapshotFromConfig(config)),
-      jwks_cache_(std::make_unique<JwksCache>(config.name,
+      jwks_cache_(std::make_shared<JwksCache>(config.name,
                                                 config.jwks_cache_sec)),
       upstream_http_client_(std::move(http_client)),
       upstream_manager_(upstream_manager),
@@ -97,8 +97,8 @@ Issuer::Issuer(const IssuerConfig& config,
     // kicks off the async work on the caller's chosen dispatcher. Both
     // helpers hold shared ownership of upstream_http_client_.
     jwks_fetcher_ = std::make_unique<JwksFetcher>(
-        config.name, upstream_http_client_, jwks_cache_.get(), upstream_,
-        /*owner_generation=*/&generation_);
+        config.name, upstream_http_client_, jwks_cache_, upstream_,
+        /*owner_generation=*/generation_);
     if (discovery_) {
         oidc_discovery_ = std::make_unique<OidcDiscovery>(
             config.name, issuer_url_, upstream_http_client_, upstream_,
@@ -130,7 +130,7 @@ void Issuer::Start() {
 
     auto snap = LoadSnapshot();
     const size_t disp_idx = PickDispatcherForFetch(0);
-    const uint64_t gen = generation_.load(std::memory_order_acquire);
+    const uint64_t gen = generation_->load(std::memory_order_acquire);
 
     if (!discovery_ && !snap->jwks_uri.empty()) {
         // Static override path: mark ready and schedule the initial fetch.
@@ -151,7 +151,7 @@ void Issuer::Start() {
 
 void Issuer::Stop() {
     // Bump the generation so in-flight completions drop as stale.
-    generation_.fetch_add(1, std::memory_order_release);
+    generation_->fetch_add(1, std::memory_order_release);
     ready_.store(false, std::memory_order_release);
     if (oidc_discovery_) oidc_discovery_->Cancel();
     if (jwks_fetcher_) jwks_fetcher_->CancelInflight();
@@ -230,7 +230,7 @@ bool Issuer::ApplyReload(const IssuerConfig& new_config, std::string& err_out) {
         jwks_cache_->SetTtlSec(new_config.jwks_cache_sec);
     }
     const uint64_t new_gen =
-        generation_.fetch_add(1, std::memory_order_release) + 1;
+        generation_->fetch_add(1, std::memory_order_release) + 1;
     // If discovery is still in its retry cycle (pre-first-success), the
     // existing oidc_discovery_->Start callback captured the OLD generation.
     // Bumping generation_ without re-arming discovery wedges the issuer:
@@ -345,12 +345,12 @@ void Issuer::KickOffOidcDiscovery(size_t dispatcher_index, uint64_t generation) 
             // must drop. The restart path in ApplyReload calls this
             // function again with the NEW generation, so the fresh cycle
             // passes the gate.
-            if (cb_gen != self->generation_.load(std::memory_order_acquire)) {
+            if (cb_gen != self->generation_->load(std::memory_order_acquire)) {
                 logging::Get()->info(
                     "OIDC discovery drop stale gen issuer={} cb_gen={} "
                     "current={}",
                     self->name_, cb_gen,
-                    self->generation_.load(std::memory_order_acquire));
+                    self->generation_->load(std::memory_order_acquire));
                 return;
             }
             {
@@ -389,7 +389,7 @@ void Issuer::ScheduleInitialFetch(size_t dispatcher_index) {
             "Issuer cannot fetch JWKS (empty jwks_uri) issuer={}", name_);
         return;
     }
-    const uint64_t gen = generation_.load(std::memory_order_acquire);
+    const uint64_t gen = generation_->load(std::memory_order_acquire);
     jwks_fetcher_->StartFetch(
         snap->jwks_uri, dispatcher_index,
         snap->jwks_refresh_timeout_sec, gen, /*after_cb=*/{});

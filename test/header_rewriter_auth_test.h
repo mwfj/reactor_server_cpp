@@ -571,6 +571,59 @@ static bool TestHopByHopStillStrippedWithAuth() {
 }
 
 // ---------------------------------------------------------------------------
+// Test N: auth-overlay values containing CR/LF are rejected, not emitted.
+// A signed-but-malicious token whose `sub` (or any mapped claim) contains
+// `\r\n` must not get written verbatim into the outbound header map —
+// HttpRequestSerializer would otherwise split the upstream request,
+// letting the token inject extra headers. Silently dropping the header
+// is the safe failure mode; the attempt surfaces via a warn log.
+// ---------------------------------------------------------------------------
+static bool TestCrLfInClaimValueDropped() {
+    auto rw = MakeRewriter(false, false, false, false);
+    AUTH_NAMESPACE::AuthForwardConfig fwd = MakeFwdConfig(true, true,
+        "x-auth-subject", "x-auth-issuer", "x-auth-scopes");
+
+    // Subject carries `\r\nHost: attacker.example` — a classic header-
+    // injection payload. The outbound map must NOT contain x-auth-subject.
+    std::optional<AUTH_NAMESPACE::AuthContext> ctx_opt = MakeCtx(
+        std::string("legit-user\r\nHost: attacker.example"),
+        "https://idp.example.com",
+        {"read"});
+
+    auto out = rw.RewriteRequest({}, "1.2.3.4", false, false,
+                                   "upstream", 80, "", &fwd, &ctx_opt);
+
+    // subject dropped; issuer (clean value) still emitted.
+    bool sub_dropped = out.count("x-auth-subject") == 0;
+    bool iss_ok = out.count("x-auth-issuer") &&
+                  out.at("x-auth-issuer") == "https://idp.example.com";
+
+    // Also verify other CTLs (NUL) are rejected on a claims_to_headers
+    // target — closes the "only CR/LF matters" mis-hardening.
+    AUTH_NAMESPACE::AuthForwardConfig fwd2 = fwd;
+    fwd2.claims_to_headers["custom_id"] = "X-Custom-Id";
+    AUTH_NAMESPACE::AuthContext ctx2 = *ctx_opt;
+    ctx2.subject = "safe-sub";
+    ctx2.claims["custom_id"] = std::string("payload\x01with_ctl");
+    std::optional<AUTH_NAMESPACE::AuthContext> ctx2_opt = ctx2;
+    auto out2 = rw.RewriteRequest({}, "1.2.3.4", false, false,
+                                    "upstream", 80, "", &fwd2, &ctx2_opt);
+    bool custom_dropped = out2.count("x-custom-id") == 0;
+    bool subject_still_ok = out2.count("x-auth-subject") &&
+                             out2.at("x-auth-subject") == "safe-sub";
+
+    bool ok = sub_dropped && iss_ok && custom_dropped && subject_still_ok;
+    TestFramework::RecordTest(
+        "HeaderRewriter auth: CR/LF/CTL in claim values dropped",
+        ok,
+        ok ? "" : "sub_dropped=" + std::to_string(sub_dropped) +
+            " iss_ok=" + std::to_string(iss_ok) +
+            " custom_dropped=" + std::to_string(custom_dropped) +
+            " subject_still_ok=" + std::to_string(subject_still_ok));
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // RunAllTests
 // ---------------------------------------------------------------------------
 static void RunAllTests() {
@@ -592,6 +645,7 @@ static void RunAllTests() {
     TestInboundUndeterminedHeaderStripped();
     TestEmptyAuthContextNoEmptyHeaders();
     TestHopByHopStillStrippedWithAuth();
+    TestCrLfInClaimValueDropped();
 }
 
 }  // namespace HeaderRewriterAuthTests

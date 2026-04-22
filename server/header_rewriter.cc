@@ -123,6 +123,22 @@ void ApplyInboundIdentityStrip(
 // Inject validated identity claims. Only runs on a populated AuthContext
 // that is NOT marked `undetermined`. Undetermined handling follows the
 // design's §6.4 step 5a.
+// RFC 7230 §3.2.6 field-value = *(VCHAR | HTAB | SP); CR/LF/other CTLs
+// are forbidden. Rejecting here prevents header injection / request
+// splitting from a malicious (but signed) JWT claim — the issuer may be
+// trusted, but a compromised or naive IdP can still sign whatever
+// payload bytes it is handed, including `\r\nHost: attacker\r\n`.
+static bool AuthOverlayValueIsSafe(const std::string& value) {
+    for (unsigned char c : value) {
+        // Reject all CTLs (0x00-0x1F, 0x7F) EXCEPT horizontal tab (0x09).
+        // CR (0x0D) and LF (0x0A) are the explicit injection vectors;
+        // other CTLs can also confuse intermediaries or upstream parsers.
+        if (c == '\t') continue;
+        if (c < 0x20 || c == 0x7F) return false;
+    }
+    return true;
+}
+
 void ApplyIdentityInject(
         const AUTH_NAMESPACE::AuthForwardConfig& fwd,
         const AUTH_NAMESPACE::AuthContext& ctx,
@@ -130,6 +146,18 @@ void ApplyIdentityInject(
     auto try_set = [&](const std::string& header_name,
                         const std::string& value) {
         if (header_name.empty() || value.empty()) return;
+        if (!AuthOverlayValueIsSafe(value)) {
+            // Silently dropping a safe-looking claim would mask attacks
+            // from operators; log loudly but still drop — emitting the
+            // value verbatim would let the attacker inject extra
+            // headers or split the backend request.
+            logging::Get()->warn(
+                "HeaderRewriter: dropping auth-overlay header '{}' — "
+                "value contains CR/LF/CTL (RFC 7230 §3.2.6 violation; "
+                "possible header-injection attempt)",
+                header_name);
+            return;
+        }
         std::string lower = LowercaseHeaderName(header_name);
         if (IsReservedOverlayHeader(lower)) return;
         out[lower] = value;
