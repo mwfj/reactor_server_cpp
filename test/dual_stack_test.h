@@ -11,8 +11,12 @@
 #include "socket_handler.h"
 #include "inet_addr.h"
 #include "upstream/header_rewriter.h"   // P1 IPv6 Host-header regression test
+#include "tls/tls_client_context.h"     // TLS SNI trailing-dot strip test
+#include "tls/tls_connection.h"
 #include "test_server_runner.h"
 #include "http_test_client.h"
+#include <openssl/ssl.h>
+#include <openssl/x509_vfy.h>
 
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -446,75 +450,134 @@ inline void TestHeaderRewriterStripsTrailingDotInHost() {
     }
 }
 
-// Review-round fix: InetAddr::Ip() must preserve IPv6 scope_id for
-// link-local peers. Without scope, fe80::1%eth0 and fe80::1%eth1 collapse
-// to the same identity (same rate-limit bucket, same XFF). This test
-// exercises InetAddr::Ip() directly using a sockaddr_in6 constructed with
-// a non-zero scope_id — the only reliable way to simulate an accept()
-// result with link-local-plus-scope without requiring a link-local
-// interface on the test host.
-inline void TestInetAddrIpPreservesIpv6Scope() {
-    std::cout << "\n[TEST] DualStack: InetAddr::Ip() preserves IPv6 scope..."
+// Review-round fix (revert): InetAddr::Ip() must remain a HEADER-SAFE
+// bare IP token. An earlier round appended RFC 4007 zone-id suffix
+// (`fe80::1%5`) to preserve link-local peer identity, but `Ip()` is read
+// transitively into X-Forwarded-For via HeaderRewriter, and zone-
+// qualified literals are rejected by widely deployed XFF parsers / ACL
+// engines / log pipelines — a P2 regression on the exact traffic the
+// earlier fix targeted. This test pins the header-safety invariant so
+// future attempts to "enrich" Ip() with scope/interface/etc must go
+// through a separate peer-identity API instead.
+inline void TestInetAddrIpIsHeaderSafe() {
+    std::cout << "\n[TEST] DualStack: InetAddr::Ip() returns header-safe bare IP..."
               << std::endl;
     try {
         bool ok = true;
         std::string details;
 
-        // Construct sockaddr_in6 for fe80::1 with scope_id=5.
+        // Link-local IPv6 with non-zero scope_id — the specific input
+        // shape that the reverted fix mis-handled. Must return bare
+        // "fe80::1" (no "%5" suffix), preserving XFF parser
+        // compatibility. Acknowledged consequence: link-local peers on
+        // different interfaces collapse to the same Ip(); tracked as a
+        // separate P3 deferred to a future phase (proper peer-identity
+        // API).
         sockaddr_in6 s6{};
         s6.sin6_family = AF_INET6;
         ::inet_pton(AF_INET6, "fe80::1", &s6.sin6_addr);
         s6.sin6_port = htons(443);
         s6.sin6_scope_id = 5;
         InetAddr a(reinterpret_cast<const sockaddr*>(&s6), sizeof(s6));
-        const std::string ip_with_scope = a.Ip();
-        // Post-fix: "%5" suffix. Pre-fix: bare "fe80::1".
-        ok = ok && ip_with_scope == "fe80::1%5";
-        details += "scope5=" + ip_with_scope + " ";
+        const std::string ip_a = a.Ip();
+        ok = ok && ip_a == "fe80::1";
+        details += "scope5_bare=" + ip_a + " ";
 
-        // Different scope_id (different interface) MUST produce a
-        // different string — the identity-preservation invariant that
-        // rate-limit / XFF rely on.
+        // No '%' character anywhere in the returned string — the
+        // invariant XFF / ACL parsers rely on.
+        ok = ok && ip_a.find('%') == std::string::npos;
+
+        // Control: scope_id=0 — same output.
         sockaddr_in6 s6b = s6;
-        s6b.sin6_scope_id = 7;
+        s6b.sin6_scope_id = 0;
         InetAddr b(reinterpret_cast<const sockaddr*>(&s6b), sizeof(s6b));
-        const std::string ip_b = b.Ip();
-        ok = ok && ip_b == "fe80::1%7";
-        ok = ok && ip_b != ip_with_scope;
-        details += "scope7=" + ip_b + " ";
+        ok = ok && b.Ip() == "fe80::1";
+        details += "scope0_bare=" + b.Ip() + " ";
 
-        // Control: scope_id=0 (non-link-local or untagged) → NO suffix.
-        // This is the case for every existing test using inet_pton
-        // literals and for every routable IPv6 peer.
-        sockaddr_in6 s6c = s6;
-        s6c.sin6_scope_id = 0;
-        InetAddr c(reinterpret_cast<const sockaddr*>(&s6c), sizeof(s6c));
-        const std::string ip_c = c.Ip();
-        ok = ok && ip_c == "fe80::1";
-        details += "scope0=" + ip_c + " ";
-
-        // Control: IPv4 peer (no scope concept) → bare dotted-quad.
+        // Control: IPv4 literal.
         sockaddr_in s4{};
         s4.sin_family = AF_INET;
         ::inet_pton(AF_INET, "192.0.2.1", &s4.sin_addr);
         s4.sin_port = htons(80);
         InetAddr d(reinterpret_cast<const sockaddr*>(&s4), sizeof(s4));
-        const std::string ip_d = d.Ip();
-        ok = ok && ip_d == "192.0.2.1";
-        details += "ipv4=" + ip_d + " ";
+        ok = ok && d.Ip() == "192.0.2.1";
+        details += "ipv4=" + d.Ip() + " ";
 
-        // Control: literal-ctor path — InetAddr("::1", 443) parses via
-        // inet_pton which memsets sockaddr_in6{} then fills sin6_addr.
-        // scope_id stays 0; Ip() returns "::1" unchanged.
+        // Control: literal-ctor path.
         InetAddr e("::1", 443);
         ok = ok && e.is_valid() && e.Ip() == "::1";
         details += "literal_v6=" + e.Ip() + " ";
 
-        Record("DualStack: InetAddr::Ip() preserves IPv6 scope", ok,
-                details);
+        Record("DualStack: InetAddr::Ip() returns header-safe bare IP",
+                ok, details);
     } catch (const std::exception& ex) {
-        Record("DualStack: InetAddr::Ip() preserves IPv6 scope",
+        Record("DualStack: InetAddr::Ip() returns header-safe bare IP",
                 false, ex.what());
+    }
+}
+
+// Review-round fix: `TlsConnection` must strip the trailing dot from
+// `sni_hostname` symmetrically with `HeaderRewriter`. Without this, an
+// operator configuring `tls.sni_hostname = "api.example.com."` would see
+// `Host: api.example.com` on the wire but TLS would negotiate SNI
+// `api.example.com.` and verify against `api.example.com.` — a real
+// Host/SNI mismatch that either hits the wrong vhost or fails
+// hostname verification on valid certs. Exercise `TlsConnection`'s
+// client-mode ctor directly and read back the effective SNI /
+// verify-name via OpenSSL introspection (no handshake required).
+inline void TestTlsConnectionStripsTrailingDotInSni() {
+    std::cout << "\n[TEST] DualStack: TlsConnection strips trailing dot in SNI..."
+              << std::endl;
+    try {
+        // socketpair produces two connected fds — we just need a valid
+        // fd for SSL_set_fd; no handshake is attempted.
+        int sv[2];
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+            Record("DualStack: TlsConnection strips trailing dot in SNI",
+                    false, "socketpair failed");
+            return;
+        }
+
+        TlsClientContext ctx("", /*verify_peer=*/true);
+        TlsConnection conn(ctx, sv[0], "api.example.com.");
+
+        // SSL_get_servername on a client SSL returns the SNI string
+        // set via SSL_set_tlsext_host_name. Post-fix: dotless.
+        SSL* ssl = conn.GetSslForTesting();
+        const char* sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+        const std::string sni_str = sni ? sni : "";
+
+        // X509_VERIFY_PARAM_get0_host(param, 0) returns the first
+        // hostname registered via SSL_set1_host. Post-fix: dotless.
+        X509_VERIFY_PARAM* vp = SSL_get0_param(ssl);
+        const char* verify_name =
+            (vp ? X509_VERIFY_PARAM_get0_host(vp, 0) : nullptr);
+        const std::string vfy_str = verify_name ? verify_name : "";
+
+        bool ok = true;
+        ok = ok && sni_str == "api.example.com";
+        ok = ok && vfy_str == "api.example.com";
+
+        // Control: dotless input passes through byte-identical.
+        TlsConnection conn2(ctx, sv[1], "api.example.com");
+        SSL* ssl2 = conn2.GetSslForTesting();
+        const char* sni2 = SSL_get_servername(ssl2, TLSEXT_NAMETYPE_host_name);
+        X509_VERIFY_PARAM* vp2 = SSL_get0_param(ssl2);
+        const char* verify_name2 =
+            (vp2 ? X509_VERIFY_PARAM_get0_host(vp2, 0) : nullptr);
+        ok = ok && (sni2 && std::string(sni2) == "api.example.com");
+        ok = ok && (verify_name2 &&
+                    std::string(verify_name2) == "api.example.com");
+
+        Record("DualStack: TlsConnection strips trailing dot in SNI", ok,
+                "sni=" + sni_str + " verify=" + vfy_str);
+
+        // Socket fds are owned by SSL via SSL_set_fd; but ~TlsConnection
+        // calls SSL_free which closes the underlying BIO — which in turn
+        // closes the fd. So we do NOT close sv[0]/sv[1] manually here.
+    } catch (const std::exception& e) {
+        Record("DualStack: TlsConnection strips trailing dot in SNI",
+                false, e.what());
     }
 }
 
@@ -528,7 +591,8 @@ inline void RunAllTests() {
     TestOutboundRejectsInvalidUpstreamLiteral();
     TestHeaderRewriterIpv6HostAuthority();
     TestHeaderRewriterStripsTrailingDotInHost();
-    TestInetAddrIpPreservesIpv6Scope();
+    TestInetAddrIpIsHeaderSafe();
+    TestTlsConnectionStripsTrailingDotInSni();
 }
 
 }  // namespace DualStackTests

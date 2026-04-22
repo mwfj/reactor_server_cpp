@@ -77,6 +77,18 @@ InetAddr InetAddr::FromAddrInfo(const struct addrinfo* ai, int port) {
 }
 
 std::string InetAddr::Ip() const {
+    // Produce a HEADER-SAFE bare IP token — no RFC 4007 zone-id suffix
+    // appended here. `Ip()` is read transitively by HeaderRewriter into
+    // `X-Forwarded-For`; zone-qualified literals like `fe80::1%5` are
+    // widely rejected by downstream XFF parsers, ACL engines, and log
+    // pipelines. An earlier review-round fix tried to append `%scope_id`
+    // to preserve link-local peer identity across interfaces, but that
+    // regressed header correctness on exactly the traffic the fix
+    // targeted (reviewer P2). The proper fix — separate peer-identity
+    // API + `InetAddr`-carrying `SocketHandler` — is deferred out of
+    // step-1 scope; link-local peer identity collapse on multi-interface
+    // hosts is an acknowledged P3 gap that will be addressed in a later
+    // phase alongside the observability work (§10 / §14).
     char buf[INET6_ADDRSTRLEN] = {0};
     if (family_ == Family::kIPv4) {
         if (::inet_ntop(AF_INET, &AsV4(&addr_)->sin_addr, buf,
@@ -86,25 +98,6 @@ std::string InetAddr::Ip() const {
     } else if (family_ == Family::kIPv6) {
         if (::inet_ntop(AF_INET6, &AsV6(&addr_)->sin6_addr, buf,
                         sizeof(buf)) != nullptr) {
-            // Review-round fix (preserve IPv6 scope for link-local peers).
-            // inet_ntop does NOT serialize sin6_scope_id — for link-local
-            // addresses (fe80::/10) that means two peers on different
-            // interfaces collapse to the same Ip() string, which in turn
-            // collapses request.client_ip / rate-limit identity / XFF
-            // across them. Append "%<scope_id>" in RFC 4007 §11 numeric
-            // zone-id form when scope_id is non-zero. Numeric (vs
-            // if_indextoname) keeps this allocation-free and portable —
-            // same uint32_t = same interface for identity purposes.
-            // For all non-link-local / scope_id=0 peers (i.e. every test
-            // case using inet_pton-parsed literals, and every routable
-            // IPv6 peer) the output is unchanged.
-            const uint32_t scope_id = AsV6(&addr_)->sin6_scope_id;
-            if (scope_id != 0) {
-                std::string out = buf;
-                out += '%';
-                out += std::to_string(scope_id);
-                return out;
-            }
             return buf;
         }
     }

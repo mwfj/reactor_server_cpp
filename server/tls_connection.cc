@@ -1,5 +1,6 @@
 #include "tls/tls_connection.h"
 #include "tls/tls_client_context.h"
+#include "net/dns_resolver.h"  // StripTrailingDot (§5.10 SNI/verify-name strip)
 #include "log/logger.h"
 #include <openssl/err.h>
 
@@ -34,21 +35,39 @@ TlsConnection::TlsConnection(TlsClientContext& ctx, int fd, const std::string& s
 
     // Set SNI hostname for virtual hosting — server uses this to select certificate
     if (!sni_hostname.empty()) {
-        if (SSL_set_tlsext_host_name(ssl_, sni_hostname.c_str()) != 1) {
+        // Review-round fix (§5.10 / §5.5.1 symmetric trailing-dot strip).
+        // Operators commonly add a trailing dot to `tls.sni_hostname` for
+        // absolute-FQDN semantics at the DNS layer. But RFC 6066 §3 SNI
+        // and X.509 SAN `dNSName` entries are dotless — passing
+        // `api.example.com.` into `SSL_set_tlsext_host_name` makes the
+        // server either miss the correct SNI vhost (many implementations
+        // do byte-level match on the ServerName) or return a cert whose
+        // SAN is `api.example.com`, which `SSL_set1_host` then rejects
+        // as a hostname-verification failure. The Host-header path in
+        // HeaderRewriter already strips in v0.46; applying the same
+        // strip here keeps the three consumers (Host, SNI, verify-name)
+        // in lockstep. `StripTrailingDot` is idempotent for dotless
+        // inputs — safe to call unconditionally. Design v0.37 moves
+        // this strip into `ConfigLoader::Normalize` (step 6, not landed
+        // yet); until then, per-consumer strips at the point of use are
+        // the parallel-safe approach.
+        const std::string effective_sni =
+            NET_DNS_NAMESPACE::DnsResolver::StripTrailingDot(sni_hostname);
+        if (SSL_set_tlsext_host_name(ssl_, effective_sni.c_str()) != 1) {
             SSL_free(ssl_);
             ssl_ = nullptr;
-            throw std::runtime_error("Failed to set SNI hostname: " + sni_hostname);
+            throw std::runtime_error("Failed to set SNI hostname: " + effective_sni);
         }
         // Enable hostname verification — SSL_VERIFY_PEER (set on the CTX) validates
         // chain trust, but SSL_set1_host() is required to verify the certificate's
         // CN/SAN matches the expected hostname, preventing MITM attacks.
-        if (SSL_set1_host(ssl_, sni_hostname.c_str()) != 1) {
+        if (SSL_set1_host(ssl_, effective_sni.c_str()) != 1) {
             SSL_free(ssl_);
             ssl_ = nullptr;
             throw std::runtime_error(
-                "Failed to enable hostname verification for: " + sni_hostname);
+                "Failed to enable hostname verification for: " + effective_sni);
         }
-        logging::Get()->debug("TlsConnection client: SNI + hostname verification set to {}", sni_hostname);
+        logging::Get()->debug("TlsConnection client: SNI + hostname verification set to {}", effective_sni);
     }
 
     // Allow retrying SSL_write with a different buffer address (same as server mode)
