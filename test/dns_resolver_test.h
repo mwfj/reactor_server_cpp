@@ -1198,6 +1198,152 @@ inline void TestParseHostPortRejectsMalformedPort() {
     }
 }
 
+// ---------- Review-round: ResolveAsync rejects invalid hosts before queuing ----------
+
+inline void TestResolveAsyncRejectsInvalidHostBeforeQueue() {
+    std::cout << "\n[TEST] DnsResolver: ResolveAsync rejects invalid host before queue..."
+              << std::endl;
+    try {
+        // The guard sits BEFORE EnsurePoolStarted, so a literal-only
+        // server that only ever submits invalid hostnames should NEVER
+        // spawn a worker. Instrument the seam to count invocations — if
+        // the guard misbehaves and a request slips through to the pool,
+        // the seam will fire. We expect zero fires because (a) invalid
+        // hostnames fail at the guard with a ready error future, and
+        // (b) valid IP literals short-circuit on the literal path.
+        DnsResolver resolver(MakeFastConfig(2));
+        std::atomic<int> seam_calls{0};
+        resolver.SetResolverForTesting([&](const ResolveRequest& req) {
+            seam_calls.fetch_add(1);
+            ResolvedEndpoint r;
+            r.host = req.host; r.port = req.port; r.tag = req.tag;
+            r.addr = InetAddr("10.0.0.1", req.port);
+            return r;
+        });
+
+        // Must REJECT: legacy numeric-dotted forms the validator
+        // rejects but that libc would reinterpret via inet_aton.
+        auto fut_1 = resolver.ResolveAsync(MakeReq("1.2.3", 80));
+        auto fut_2 = resolver.ResolveAsync(MakeReq("0127.0.0.1", 80));
+        auto fut_3 = resolver.ResolveAsync(MakeReq("1.2", 80));
+        // Must REJECT: obviously-malformed hostnames.
+        auto fut_4 = resolver.ResolveAsync(MakeReq("host..bad", 80));
+        auto fut_5 = resolver.ResolveAsync(MakeReq(".leading", 80));
+        auto fut_6 = resolver.ResolveAsync(MakeReq("end-", 80));
+        auto fut_7 = resolver.ResolveAsync(MakeReq("-start", 80));
+        auto fut_8 = resolver.ResolveAsync(MakeReq("", 80));
+        // Must REJECT: bracketed forms (caller should have Normalize'd
+        // before reaching here).
+        auto fut_9 = resolver.ResolveAsync(MakeReq("[::1]", 80));
+
+        auto check_rejected = [](std::future<ResolvedEndpoint>& f) {
+            if (f.wait_for(std::chrono::milliseconds(50))
+                    != std::future_status::ready) return false;
+            auto r = f.get();
+            return r.error && r.error_code == EAI_NONAME;
+        };
+        bool ok = true;
+        ok = ok && check_rejected(fut_1);
+        ok = ok && check_rejected(fut_2);
+        ok = ok && check_rejected(fut_3);
+        ok = ok && check_rejected(fut_4);
+        ok = ok && check_rejected(fut_5);
+        ok = ok && check_rejected(fut_6);
+        ok = ok && check_rejected(fut_7);
+        ok = ok && check_rejected(fut_8);
+        ok = ok && check_rejected(fut_9);
+
+        // Control: valid IPv4 literal short-circuits without seam call.
+        auto fut_ok_literal = resolver.ResolveAsync(MakeReq("127.0.0.1", 80));
+        ok = ok && fut_ok_literal.wait_for(std::chrono::milliseconds(50))
+                    == std::future_status::ready;
+        auto res_lit = fut_ok_literal.get();
+        ok = ok && !res_lit.error;
+
+        // Control: valid hostname goes through the pool (seam fires).
+        auto fut_ok_host = resolver.ResolveAsync(MakeReq("example.com", 80));
+        ok = ok && fut_ok_host.wait_for(std::chrono::milliseconds(500))
+                    == std::future_status::ready;
+        auto res_host = fut_ok_host.get();
+        ok = ok && !res_host.error;
+
+        // The seam should have fired ONCE for example.com. The 9
+        // invalid-host requests all failed at the guard, never reaching
+        // the pool — proving the runtime path is consistent with the
+        // validator AND that kMaxQueuedItems slots are not consumed by
+        // invalid requests under pathological inputs.
+        ok = ok && seam_calls.load() == 1;
+
+        Record("DnsResolver: ResolveAsync rejects invalid host before queue",
+                ok,
+                "seam_calls=" + std::to_string(seam_calls.load()) +
+                " (expected 1 for example.com only)");
+    } catch (const std::exception& e) {
+        Record("DnsResolver: ResolveAsync rejects invalid host before queue",
+                false, e.what());
+    }
+}
+
+// ---------- Review-round: ParseHostPort validates host token ----------
+
+inline void TestParseHostPortValidatesHostToken() {
+    std::cout << "\n[TEST] DnsResolver: ParseHostPort validates host token..."
+              << std::endl;
+    try {
+        std::string host;
+        int port = -1;
+        bool ok = true;
+
+        // Must REJECT: host that fails hostname grammar, with a port.
+        ok = ok && !DnsResolver::ParseHostPort("host..bad:80", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort(".leading:443", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("-start:80", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("end-:80", &host, &port);
+
+        // Must REJECT: legacy numeric-dotted forms, with a port.
+        ok = ok && !DnsResolver::ParseHostPort("0127.0.0.1:80", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("1.2.3:443", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("1.2:80", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("12.345.67:80", &host, &port);
+
+        // Must REJECT: same forms WITHOUT a port (bare fallback branch
+        // previously skipped host validation too).
+        ok = ok && !DnsResolver::ParseHostPort("host..bad", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("0127.0.0.1", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("1.2.3", &host, &port);
+        ok = ok && !DnsResolver::ParseHostPort("-start", &host, &port);
+
+        // Must ACCEPT: genuinely valid forms still round-trip cleanly.
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("example.com", &host, &port)
+                 && host == "example.com" && port == 0;
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("example.com:443", &host, &port)
+                 && host == "example.com" && port == 443;
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("127.0.0.1", &host, &port)
+                 && host == "127.0.0.1" && port == 0;
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("127.0.0.1:80", &host, &port)
+                 && host == "127.0.0.1" && port == 80;
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("[::1]:443", &host, &port)
+                 && host == "::1" && port == 443;
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("::1", &host, &port)
+                 && host == "::1" && port == 0;
+        // Trailing-dot FQDN form is a legitimate hostname.
+        host.clear(); port = -1;
+        ok = ok && DnsResolver::ParseHostPort("example.com.:443", &host, &port)
+                 && host == "example.com." && port == 443;
+
+        Record("DnsResolver: ParseHostPort validates host token", ok);
+    } catch (const std::exception& e) {
+        Record("DnsResolver: ParseHostPort validates host token",
+                false, e.what());
+    }
+}
+
 // ---------- Queue-time deadline short-circuit ----------
 
 inline void TestQueueTimeDeadlineShortCircuits() {
@@ -1255,6 +1401,8 @@ inline void RunAllTests() {
     TestMixedTimeoutSaturationTriggersFullSweep();
     TestIsValidHostOrIpLiteralRejectsLegacyNumericForms();
     TestParseHostPortRejectsMalformedPort();
+    TestResolveAsyncRejectsInvalidHostBeforeQueue();
+    TestParseHostPortValidatesHostToken();
     TestQueueTimeDeadlineShortCircuits();
 }
 

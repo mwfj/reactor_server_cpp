@@ -280,13 +280,27 @@ bool DnsResolver::ParseHostPort(const std::string& s,
         // must fail-closed on a missing host rather than emit an empty
         // string that downstream validators may or may not catch.
         if (host->empty()) return false;
+        // Review-round fix: validate the host token against the full
+        // host grammar (IPv4 literal, bare IPv6 literal, or RFC 1123
+        // hostname) before declaring parse success. Previously the
+        // bare branch returned any substring-before-colon verbatim,
+        // letting inputs like "host..bad:80" or "0127.0.0.1:80" succeed
+        // despite being rejected by this branch's own validator. Fail-
+        // closed at the authority boundary — callers get a single
+        // consistent notion of "valid authority host".
+        if (!IsValidHostOrIpLiteral(*host)) return false;
         const std::string port_str = s.substr(colon + 1);
         int p = 0;
         if (!ParseUnsignedPort(port_str, &p)) return false;
         if (port) *port = p;
         return true;
     }
+    // No colon → whole string is the host, no port.
     *host = s;
+    // Review-round fix: same host validation as the colon branch. A
+    // caller that passes "host..bad" or "0127.0.0.1" (no port) used to
+    // get a successful parse with the malformed host returned verbatim.
+    if (!IsValidHostOrIpLiteral(*host)) return false;
     if (port) *port = 0;
     return true;
 }
@@ -619,6 +633,29 @@ DnsResolver::ResolveAsync(ResolveRequest req) {
     // effective timeout regardless of caller pattern.
     if (req.timeout.count() == 0) {
         req.timeout = std::chrono::milliseconds(config_.resolve_timeout_ms);
+    }
+
+    // Review-round fix: fail-closed host validation BEFORE any pool
+    // interaction. ResolveAsync is the runtime gate; without this guard,
+    // legacy numeric-dotted forms like "0127.0.0.1" or "1.2.3" (already
+    // rejected by IsValidHostOrIpLiteral / ConfigLoader) could still
+    // reach getaddrinfo via a caller that skipped pre-validation and be
+    // reinterpreted by glibc / BSD NSS via inet_aton's classful / octal
+    // parsing. Obviously-malformed hosts would also consume a queue slot
+    // before failing at the worker. Keeping the runtime path in lockstep
+    // with the validator closes both holes: invalid hosts produce a
+    // ready error future, pool is untouched, kMaxQueuedItems is
+    // preserved for genuine work.
+    if (!IsValidHostOrIpLiteral(req.host)) {
+        std::promise<ResolvedEndpoint> p;
+        auto fut = p.get_future();
+        p.set_value(MakeReadyErrorResult(
+            req, EAI_NONAME,
+            "invalid host '" + req.host +
+            "' (must be a bare IP literal or RFC 1123 hostname; "
+            "bracketed IPv6 / legacy numeric-dotted forms are not "
+            "accepted at the resolver boundary)"));
+        return fut;
     }
 
     // Literal short-circuit (§5.2.9): ready-future path without
