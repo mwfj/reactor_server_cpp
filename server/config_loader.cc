@@ -2540,7 +2540,7 @@ void ConfigLoader::ValidateAuthPrefixCollisions(
 void ConfigLoader::ValidateProxyAuth(
     const ServerConfig& config,
     const std::unordered_set<std::string>& live_upstream_names,
-    const std::unordered_set<std::string>& live_issuer_names) {
+    std::optional<std::unordered_set<std::string>> live_issuer_names) {
     // Same per-upstream checks that Validate() runs inline, extracted so
     // the reload path can invoke them against the REAL upstreams[] list
     // even when Validate() is called on a stripped validation_copy.
@@ -2562,18 +2562,29 @@ void ConfigLoader::ValidateProxyAuth(
         for (const auto& u : config.upstreams) {
             upstream_names.insert(u.name);
         }
-        const bool scope_to_live_issuers = !live_issuer_names.empty();
+        // Scope semantics:
+        //   * nullopt  → startup: check every staged issuer.
+        //   * present  → reload: scope to the set. An empty set means
+        //                "reload with no live auth runtime" — no staged
+        //                auth can land live this cycle, so skip every
+        //                issuer.upstream xref. Rejecting here would
+        //                abort an otherwise-safe reload on a server
+        //                that booted with empty auth and is now staging
+        //                a new issuer (restart-required, but the reload
+        //                itself might carry unrelated live-safe edits
+        //                like rate-limit or log-level tuning).
+        const bool skip_all_issuer_xrefs =
+            live_issuer_names.has_value() && live_issuer_names->empty();
         for (const auto& [name, ic] : config.auth.issuers) {
-            // On the reload path, skip staged-only issuers: they're
-            // restart-only topology (AuthManager::Reload rejects any
-            // issuer-set delta), so validating their `upstream` field
-            // would abort the entire reload for something the runtime
-            // would never apply — blocking unrelated live-safe edits
-            // (rate_limit, log level) shipped in the same file. Startup
-            // passes an empty `live_issuer_names` and this skip never
-            // fires, preserving the full cross-reference check.
-            if (scope_to_live_issuers &&
-                live_issuer_names.count(name) == 0) {
+            if (skip_all_issuer_xrefs) continue;
+            if (live_issuer_names.has_value() &&
+                live_issuer_names->count(name) == 0) {
+                // On the reload path with some live issuers present,
+                // skip staged-only issuers: they're restart-only
+                // topology and AuthManager::Reload will reject the
+                // delta anyway — validating their `upstream` field
+                // would abort live-safe edits shipped alongside the
+                // staged issuer add.
                 continue;
             }
             if (ic.upstream.empty()) {

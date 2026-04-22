@@ -1,6 +1,7 @@
 #include "auth/jwt_verifier.h"
 
 #include "auth/issuer.h"
+#include "auth/jwks_cache.h"  // JwksCache::SnapshotStats — missing-kid gate
 #include "auth/auth_claims.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
@@ -291,6 +292,32 @@ VerifyResult JwtVerifier::Verify(const std::string& token,
             logging::SanitizeLogValue(head.alg), issuer_name);
         return VerifyResult::InvalidToken("algorithm not allowed",
                                            "alg_not_allowed");
+    }
+
+    // Missing `kid` with multi-key JWKS: reject as invalid_token before
+    // the lookup. Design spec tolerates a missing kid ONLY when the
+    // JWKS cache has exactly one key (no ambiguity about which key to
+    // verify against). With N>1 keys, a token with no kid header is
+    // unverifiable by construction — classifying it as UNDETERMINED
+    // would either 503 operators who asked on_undetermined=deny OR,
+    // worse, forward a structurally invalid token upstream on
+    // on_undetermined=allow. Gate BEFORE LookupKeyByKid so the
+    // rejection is deterministic. `key_count == 0` means the JWKS is
+    // not yet loaded; fall through so the existing issuer_not_ready /
+    // unknown_kid branch reports UNDETERMINED (a transient state worth
+    // a probe retry, not a client-token bug).
+    if (head.kid.empty()) {
+        size_t key_count = 0;
+        if (auto* cache = issuer.jwks_cache()) {
+            key_count = cache->SnapshotStats().key_count;
+        }
+        if (key_count > 1) {
+            logging::Get()->info(
+                "auth_deny reason=missing_kid_multi_key issuer={} key_count={}",
+                issuer_name, key_count);
+            return VerifyResult::InvalidToken("missing kid header",
+                                               "missing_kid_multi_key");
+        }
     }
 
     // Look up the PEM for the kid. A miss schedules an async refresh

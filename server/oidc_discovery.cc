@@ -45,10 +45,21 @@ ParsedHttpsUri BuildDiscoveryEndpoint(const std::string& issuer_url) {
 }
 
 // Extract (jwks_uri, introspection_endpoint) from the discovery JSON
-// body. Returns non-empty jwks_uri on success; introspection_endpoint may
-// legitimately be empty (not all IdPs advertise it). On JSON or schema
-// failure, returns empty jwks_uri and sets `reason`.
+// body, gated on the document's `issuer` field matching the configured
+// issuer URL. Returns non-empty jwks_uri on success; introspection_endpoint
+// may legitimately be empty (not all IdPs advertise it). On JSON or
+// schema failure, returns empty jwks_uri and sets `reason`.
+//
+// `expected_issuer` MUST be the `issuer_url` from the operator's config.
+// Per OIDC Connect Discovery 1.0 §4.3, the discovery response's
+// `issuer` claim "MUST be identical to the Issuer URL that was used as
+// the prefix to /.well-known/openid-configuration." Without this gate, a
+// misrouted / multi-tenant / compromised discovery endpoint could serve
+// a foreign tenant's JWKS; the verifier would then trust keys that are
+// not bound to this issuer, letting attacker-signed tokens validate
+// provided they set `iss` to the configured value.
 void ExtractEndpoints(const std::string& body,
+                       const std::string& expected_issuer,
                        std::string& out_jwks_uri,
                        std::string& out_introspection_endpoint,
                        std::string& reason) {
@@ -57,6 +68,19 @@ void ExtractEndpoints(const std::string& body,
                                         /*allow_exceptions=*/true);
         if (!j.is_object()) {
             reason = "not_object";
+            return;
+        }
+        // Validate `issuer` FIRST. If the response came from the wrong
+        // tenant / a spoofed endpoint, nothing else in it can be
+        // trusted (jwks_uri included).
+        auto iss_it = j.find("issuer");
+        if (iss_it == j.end() || !iss_it->is_string()) {
+            reason = "missing_issuer";
+            return;
+        }
+        const std::string doc_issuer = iss_it->get<std::string>();
+        if (doc_issuer != expected_issuer) {
+            reason = "issuer_mismatch";
             return;
         }
         auto jwks_it = j.find("jwks_uri");
@@ -193,8 +217,8 @@ void OidcDiscovery::Start(size_t dispatcher_index,
 
             client_copy->Issue(
                 pool_name, disp_index, std::move(req),
-                [weak_state, issuer_name, dispatcher, retry_sec, generation,
-                 on_ready_cb, token, ready_flag, disp_index](
+                [weak_state, issuer_name, issuer_url, dispatcher, retry_sec,
+                 generation, on_ready_cb, token, ready_flag, disp_index](
                         UpstreamHttpClient::Response resp) {
                     if (token->load(std::memory_order_acquire)) {
                         return;
@@ -225,7 +249,8 @@ void OidcDiscovery::Start(size_t dispatcher_index,
                     std::string jwks_uri;
                     std::string intro_endpoint;
                     std::string reason;
-                    ExtractEndpoints(resp.body, jwks_uri, intro_endpoint, reason);
+                    ExtractEndpoints(resp.body, issuer_url,
+                                     jwks_uri, intro_endpoint, reason);
                     if (jwks_uri.empty()) {
                         logging::Get()->warn(
                             "OIDC discovery parse failed issuer={} reason={} "

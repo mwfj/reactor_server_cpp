@@ -1285,12 +1285,90 @@ static void TestTokenMissingExpRejected() {
 }
 
 // ---------------------------------------------------------------------------
+// Missing `kid` with multi-key JWKS — reject as invalid_token
+// (missing_kid_multi_key), not UNDETERMINED. Design tolerates no-kid
+// ONLY when the cache has exactly one key; with >1 keys the token is
+// structurally unverifiable and must 401 rather than risk either a 503
+// (on_undetermined=deny) or a structurally invalid pass-through
+// (on_undetermined=allow).
+// ---------------------------------------------------------------------------
+static void TestMissingKidMultiKeyRejected() {
+    try {
+        auto rsa_a = GenerateRsaKey();
+        auto rsa_b = GenerateRsaKey();
+        if (rsa_a.private_pem.empty() || rsa_b.private_pem.empty()) {
+            TestFramework::RecordTest("JwtVerifier: missing kid multi-key rejected",
+                                      false, "RSA key generation failed",
+                                      TestFramework::TestCategory::OTHER);
+            return;
+        }
+
+        const std::string issuer_url = "https://multi-key.example.com/";
+
+        // Sign a JWT WITHOUT set_key_id (empty kid header).
+        std::string token;
+        try {
+            token = jwt::create<jwt::traits::nlohmann_json>()
+                .set_issuer(issuer_url)
+                .set_subject("user-no-kid")
+                .set_audience("audience-1")
+                .set_issued_at(std::chrono::system_clock::now())
+                .set_expires_at(std::chrono::system_clock::now() +
+                                 std::chrono::hours(1))
+                .sign(jwt::algorithm::rs256("", rsa_a.private_pem, "", ""));
+        } catch (const std::exception& ex) {
+            TestFramework::RecordTest("JwtVerifier: missing kid multi-key rejected",
+                                      false, std::string("sign failed: ") + ex.what(),
+                                      TestFramework::TestCategory::OTHER);
+            return;
+        }
+
+        AUTH_NAMESPACE::IssuerConfig cfg;
+        cfg.name = "multi-iss";
+        cfg.issuer_url = issuer_url;
+        cfg.algorithms = {"RS256"};
+        cfg.audiences = {"audience-1"};
+        cfg.leeway_sec = 30;
+        cfg.discovery = false;
+
+        // MakeFakeIssuer installs ONE kid — add a second directly so the
+        // cache has multi-key state.
+        auto issuer = MakeFakeIssuer(cfg, rsa_a.public_pem, "kid-a");
+        issuer->jwks_cache()->InstallKeys({
+            {"kid-a", rsa_a.public_pem},
+            {"kid-b", rsa_b.public_pem}
+        });
+
+        AUTH_NAMESPACE::AuthPolicy policy;
+        policy.issuers = {"multi-iss"};
+
+        AUTH_NAMESPACE::AuthContext ctx;
+        auto result = AUTH_NAMESPACE::JwtVerifier::Verify(
+            token, *issuer, policy, ctx);
+
+        bool pass = result.is_deny() &&
+                    result.log_reason.find("missing_kid_multi_key") !=
+                        std::string::npos;
+        TestFramework::RecordTest("JwtVerifier: missing kid multi-key rejected",
+                                  pass,
+                                  pass ? "" : "expected DENY missing_kid_multi_key, got outcome=" +
+                                      std::string(result.is_allow() ? "ALLOW" : "DENY") +
+                                      " reason=" + result.log_reason,
+                                  TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("JwtVerifier: missing kid multi-key rejected",
+                                  false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 static void RunAllTests() {
     std::cout << "\n[JwtVerifier Tests]" << std::endl;
     TestRS256HappyPath();
     TestTokenMissingExpRejected();
+    TestMissingKidMultiKeyRejected();
     TestES256HappyPath();
     TestES384HappyPath();
     TestAlgNoneRejected();

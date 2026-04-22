@@ -1086,14 +1086,63 @@ static bool TestValidateProxyAuthSkipsStagedOnlyIssuerUpstreamXref() {
     // staged-iss dangling upstream ref must NOT trigger a reject.
     bool reload_threw = false;
     try {
-        ConfigLoader::ValidateProxyAuth(cfg, {"live-pool"},
-                                         /*live_issuer_names=*/{"live-iss"});
+        ConfigLoader::ValidateProxyAuth(
+            cfg, {"live-pool"},
+            std::optional<std::unordered_set<std::string>>({"live-iss"}));
     } catch (const std::invalid_argument&) {
         reload_threw = true;
     }
 
-    // Startup-style call with empty live_issuer_names (check ALL) must
+    // Startup-style call with NO optional (nullopt → check all) must
     // still reject — startup semantics unchanged.
+    bool startup_threw = false;
+    try {
+        ConfigLoader::ValidateProxyAuth(cfg, {"live-pool"});
+    } catch (const std::invalid_argument&) {
+        startup_threw = true;
+    }
+
+    return !reload_threw && startup_threw;
+}
+
+// ---------------------------------------------------------------------------
+// Test 26: ValidateProxyAuth with EMPTY live_issuer_names as optional-present
+// (reload-with-no-live-auth) must skip all issuer.upstream xrefs. A server
+// that booted with empty auth has no live AuthManager issuer set; a later
+// reload staging a new issuer with a bad upstream ref would otherwise abort
+// unrelated live-safe edits. Startup semantics (nullopt) still check all.
+// ---------------------------------------------------------------------------
+static bool TestValidateProxyAuthSkipsOnEmptyLiveAuthRuntime() {
+    ServerConfig cfg;
+    UpstreamConfig live_pool;
+    live_pool.name = "live-pool";
+    live_pool.host = "127.0.0.1";
+    live_pool.port = 8080;
+    cfg.upstreams.push_back(live_pool);
+
+    // Staged issuer with dangling upstream ref — would reject at
+    // startup, but must NOT reject a reload on a no-live-auth server.
+    AUTH_NAMESPACE::IssuerConfig staged_iss;
+    staged_iss.name = "staged-iss";
+    staged_iss.issuer_url = "https://staged.example";
+    staged_iss.upstream = "no-such-pool";
+    staged_iss.mode = "jwt";
+    staged_iss.algorithms = {"RS256"};
+    cfg.auth.issuers["staged-iss"] = staged_iss;
+
+    // Reload with empty live_issuer_names (present-but-empty optional):
+    // reload with no live auth → skip every issuer.upstream xref.
+    bool reload_threw = false;
+    try {
+        ConfigLoader::ValidateProxyAuth(
+            cfg, {"live-pool"},
+            std::optional<std::unordered_set<std::string>>(
+                std::unordered_set<std::string>{}));
+    } catch (const std::invalid_argument&) {
+        reload_threw = true;
+    }
+
+    // Startup (nullopt default) still checks all → rejects dangling ref.
     bool startup_threw = false;
     try {
         ConfigLoader::ValidateProxyAuth(cfg, {"live-pool"});
@@ -1173,6 +1222,8 @@ static void RunAllTests() {
            TestValidateHotReloadableSkipsAuthOnIssuerTopologyMismatch);
     RunOne("AuthReload: ValidateProxyAuth skips staged-only issuer upstream xref",
            TestValidateProxyAuthSkipsStagedOnlyIssuerUpstreamXref);
+    RunOne("AuthReload: ValidateProxyAuth skips xref on empty live auth runtime",
+           TestValidateProxyAuthSkipsOnEmptyLiveAuthRuntime);
 }
 
 }  // namespace AuthReloadTests

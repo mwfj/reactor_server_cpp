@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config/server_config.h"
+#include <optional>
 #include <string>
 #include <stdexcept>
 #include <unordered_set>
@@ -146,21 +147,34 @@ public:
     // are pure / side-effect-free / deterministic).
     //
     // `live_issuer_names` scopes the `auth.issuers.*.upstream` cross-
-    // reference checks the same way `live_upstream_names` scopes the
-    // per-upstream inline-auth checks. Staged-only issuers (names not
-    // in `live_issuer_names`) are SKIPPED — those entries are restart-
-    // only topology and `AuthManager::Reload` will reject them anyway;
-    // validating their `upstream` field here would abort unrelated
-    // live-safe reloads that happen to ship alongside the staged
-    // issuer add. Default empty means "check all" (startup semantics,
-    // no live-runtime concept).
+    // reference checks. The parameter's TYPE distinguishes startup from
+    // reload semantics:
+    //
+    //   * `std::nullopt` — startup: no live-runtime concept, check
+    //     every staged issuer's `upstream` field. This is the default
+    //     for legacy test callers and any future in-process code path
+    //     that validates a fresh config before AuthManager exists.
+    //
+    //   * `std::optional<set>` present — reload: scope to the set.
+    //     Staged-only issuers (names not in the set) are SKIPPED
+    //     because `AuthManager::Reload` will reject their topology
+    //     change anyway; validating their `upstream` field here would
+    //     abort unrelated live-safe reloads that ship alongside a
+    //     staged issuer add.
+    //       Present-but-empty (`std::optional<set>({})`) = "reload with
+    //       NO live auth runtime" → skip every issuer.upstream check,
+    //       because no staged auth can land live this cycle. Without
+    //       this distinction, a boot-with-empty-auth server's first
+    //       reload would reject any staged-but-bad issuer ref and
+    //       block unrelated edits.
     //
     // Throws std::invalid_argument with an `upstreams['name'].proxy.auth...`
     // message on failure.
     static void ValidateProxyAuth(
         const ServerConfig& config,
         const std::unordered_set<std::string>& live_upstream_names,
-        const std::unordered_set<std::string>& live_issuer_names = {});
+        std::optional<std::unordered_set<std::string>> live_issuer_names
+            = std::nullopt);
 
     // Structural validation for `auth.forward.*` output header names:
     //   * RFC 7230 §3.2.6 tchar validity (rejects spaces / punctuation /
