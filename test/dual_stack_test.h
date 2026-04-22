@@ -365,6 +365,159 @@ inline void TestHeaderRewriterIpv6HostAuthority() {
     }
 }
 
+// Review-round fix: HeaderRewriter::RewriteRequest must strip a single
+// trailing '.' from absolute-FQDN upstream hosts before assembling Host.
+// Without this, `backend.example.com.` (operator uses trailing dot to
+// suppress /etc/resolv.conf search-domain expansion) emits
+// `Host: backend.example.com.` — many vhost backends treat the dotted
+// form as a distinct authority and 400 / misroute. Covers both source
+// branches: upstream_host (default) and sni_hostname (override).
+inline void TestHeaderRewriterStripsTrailingDotInHost() {
+    std::cout << "\n[TEST] DualStack: HeaderRewriter strips trailing dot in Host..."
+              << std::endl;
+    try {
+        HeaderRewriter::Config cfg;
+        cfg.rewrite_host = true;
+        HeaderRewriter rewriter(cfg);
+
+        bool ok = true;
+        std::string details;
+
+        // 1. upstream_host with trailing dot → Host must be dotless.
+        std::map<std::string, std::string> in1{{"host", "c"}};
+        auto out1 = rewriter.RewriteRequest(
+            in1, "10.0.0.5", false, false,
+            "backend.example.com.", 8080, {});
+        ok = ok && out1["host"] == "backend.example.com:8080";
+        details += "dotted_host_np=" + out1["host"] + " ";
+
+        // 2. upstream_host with trailing dot, HTTP well-known port (80):
+        // omit port AND strip dot → "backend.example.com".
+        std::map<std::string, std::string> in2{{"host", "c"}};
+        auto out2 = rewriter.RewriteRequest(
+            in2, "10.0.0.5", false, false,
+            "backend.example.com.", 80, {});
+        ok = ok && out2["host"] == "backend.example.com";
+        details += "dotted_host_80=" + out2["host"] + " ";
+
+        // 3. sni_hostname override with trailing dot (pre-v0.37 where
+        // Normalize does not yet strip overrides). Host source for an
+        // HTTPS upstream with sni_hostname set: sni_hostname wins.
+        std::map<std::string, std::string> in3{{"host", "c"}};
+        auto out3 = rewriter.RewriteRequest(
+            in3, "10.0.0.5", false,
+            true,                        // upstream_tls
+            "10.0.0.1", 443,             // upstream is IP literal
+            "api.example.com.");         // SNI override with trailing dot
+        ok = ok && out3["host"] == "api.example.com";  // strip + omit 443
+        details += "dotted_sni=" + out3["host"] + " ";
+
+        // 4. Control: dotless hostname input stays byte-identical (no
+        // double strip, no accidental trim).
+        std::map<std::string, std::string> in4{{"host", "c"}};
+        auto out4 = rewriter.RewriteRequest(
+            in4, "10.0.0.5", false, false,
+            "backend.example.com", 8080, {});
+        ok = ok && out4["host"] == "backend.example.com:8080";
+        details += "dotless_ctrl=" + out4["host"] + " ";
+
+        // 5. Control: IPv4 literal unaffected by trailing-dot path.
+        std::map<std::string, std::string> in5{{"host", "c"}};
+        auto out5 = rewriter.RewriteRequest(
+            in5, "10.0.0.5", false, false,
+            "127.0.0.1", 8080, {});
+        ok = ok && out5["host"] == "127.0.0.1:8080";
+        details += "ipv4_ctrl=" + out5["host"] + " ";
+
+        // 6. Control: IPv6 literal unaffected (no trailing dot in IP
+        // literal grammar; StripTrailingDot is a no-op).
+        std::map<std::string, std::string> in6{{"host", "c"}};
+        auto out6 = rewriter.RewriteRequest(
+            in6, "10.0.0.5", false, false,
+            "::1", 8080, {});
+        ok = ok && out6["host"] == "[::1]:8080";
+        details += "ipv6_ctrl=" + out6["host"] + " ";
+
+        Record("DualStack: HeaderRewriter strips trailing dot in Host",
+                ok, details);
+    } catch (const std::exception& e) {
+        Record("DualStack: HeaderRewriter strips trailing dot in Host",
+                false, e.what());
+    }
+}
+
+// Review-round fix: InetAddr::Ip() must preserve IPv6 scope_id for
+// link-local peers. Without scope, fe80::1%eth0 and fe80::1%eth1 collapse
+// to the same identity (same rate-limit bucket, same XFF). This test
+// exercises InetAddr::Ip() directly using a sockaddr_in6 constructed with
+// a non-zero scope_id — the only reliable way to simulate an accept()
+// result with link-local-plus-scope without requiring a link-local
+// interface on the test host.
+inline void TestInetAddrIpPreservesIpv6Scope() {
+    std::cout << "\n[TEST] DualStack: InetAddr::Ip() preserves IPv6 scope..."
+              << std::endl;
+    try {
+        bool ok = true;
+        std::string details;
+
+        // Construct sockaddr_in6 for fe80::1 with scope_id=5.
+        sockaddr_in6 s6{};
+        s6.sin6_family = AF_INET6;
+        ::inet_pton(AF_INET6, "fe80::1", &s6.sin6_addr);
+        s6.sin6_port = htons(443);
+        s6.sin6_scope_id = 5;
+        InetAddr a(reinterpret_cast<const sockaddr*>(&s6), sizeof(s6));
+        const std::string ip_with_scope = a.Ip();
+        // Post-fix: "%5" suffix. Pre-fix: bare "fe80::1".
+        ok = ok && ip_with_scope == "fe80::1%5";
+        details += "scope5=" + ip_with_scope + " ";
+
+        // Different scope_id (different interface) MUST produce a
+        // different string — the identity-preservation invariant that
+        // rate-limit / XFF rely on.
+        sockaddr_in6 s6b = s6;
+        s6b.sin6_scope_id = 7;
+        InetAddr b(reinterpret_cast<const sockaddr*>(&s6b), sizeof(s6b));
+        const std::string ip_b = b.Ip();
+        ok = ok && ip_b == "fe80::1%7";
+        ok = ok && ip_b != ip_with_scope;
+        details += "scope7=" + ip_b + " ";
+
+        // Control: scope_id=0 (non-link-local or untagged) → NO suffix.
+        // This is the case for every existing test using inet_pton
+        // literals and for every routable IPv6 peer.
+        sockaddr_in6 s6c = s6;
+        s6c.sin6_scope_id = 0;
+        InetAddr c(reinterpret_cast<const sockaddr*>(&s6c), sizeof(s6c));
+        const std::string ip_c = c.Ip();
+        ok = ok && ip_c == "fe80::1";
+        details += "scope0=" + ip_c + " ";
+
+        // Control: IPv4 peer (no scope concept) → bare dotted-quad.
+        sockaddr_in s4{};
+        s4.sin_family = AF_INET;
+        ::inet_pton(AF_INET, "192.0.2.1", &s4.sin_addr);
+        s4.sin_port = htons(80);
+        InetAddr d(reinterpret_cast<const sockaddr*>(&s4), sizeof(s4));
+        const std::string ip_d = d.Ip();
+        ok = ok && ip_d == "192.0.2.1";
+        details += "ipv4=" + ip_d + " ";
+
+        // Control: literal-ctor path — InetAddr("::1", 443) parses via
+        // inet_pton which memsets sockaddr_in6{} then fills sin6_addr.
+        // scope_id stays 0; Ip() returns "::1" unchanged.
+        InetAddr e("::1", 443);
+        ok = ok && e.is_valid() && e.Ip() == "::1";
+        details += "literal_v6=" + e.Ip() + " ";
+
+        Record("DualStack: InetAddr::Ip() preserves IPv6 scope", ok,
+                details);
+    } catch (const std::exception& ex) {
+        Record("DualStack: InetAddr::Ip() preserves IPv6 scope",
+                false, ex.what());
+    }
+}
+
 // ---------- Test registrar ----------
 
 inline void RunAllTests() {
@@ -374,6 +527,8 @@ inline void RunAllTests() {
     TestOutboundIpv6LiteralConnectPrimitives();
     TestOutboundRejectsInvalidUpstreamLiteral();
     TestHeaderRewriterIpv6HostAuthority();
+    TestHeaderRewriterStripsTrailingDotInHost();
+    TestInetAddrIpPreservesIpv6Scope();
 }
 
 }  // namespace DualStackTests

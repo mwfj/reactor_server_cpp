@@ -86,6 +86,25 @@ std::string InetAddr::Ip() const {
     } else if (family_ == Family::kIPv6) {
         if (::inet_ntop(AF_INET6, &AsV6(&addr_)->sin6_addr, buf,
                         sizeof(buf)) != nullptr) {
+            // Review-round fix (preserve IPv6 scope for link-local peers).
+            // inet_ntop does NOT serialize sin6_scope_id — for link-local
+            // addresses (fe80::/10) that means two peers on different
+            // interfaces collapse to the same Ip() string, which in turn
+            // collapses request.client_ip / rate-limit identity / XFF
+            // across them. Append "%<scope_id>" in RFC 4007 §11 numeric
+            // zone-id form when scope_id is non-zero. Numeric (vs
+            // if_indextoname) keeps this allocation-free and portable —
+            // same uint32_t = same interface for identity purposes.
+            // For all non-link-local / scope_id=0 peers (i.e. every test
+            // case using inet_pton-parsed literals, and every routable
+            // IPv6 peer) the output is unchanged.
+            const uint32_t scope_id = AsV6(&addr_)->sin6_scope_id;
+            if (scope_id != 0) {
+                std::string out = buf;
+                out += '%';
+                out += std::to_string(scope_id);
+                return out;
+            }
             return buf;
         }
     }
