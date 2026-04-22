@@ -1205,6 +1205,83 @@ static bool TestHttpServerReloadAppliesAppliesToLive() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 22: zero-auth boot → SIGHUP flipping auth.enabled=true actually
+// enforces. Regression guard for the "no AuthManager at boot, reload is
+// silent no-op" gap — HttpServer now constructs AuthManager
+// unconditionally so the master-switch flip wires through.
+//
+// The reload uses a pre-existing policy that's enabled=false at boot
+// (so AuthManager is constructed with the policy and issuer in place
+// but enforcement is off), then flips auth.enabled=true. Adding issuers
+// via SIGHUP is still restart-required by design; this test validates
+// the enabled-flag flip specifically.
+// ---------------------------------------------------------------------------
+static bool TestHttpServerReloadFlipsAuthEnabledLive() {
+    const std::string iss_name = "boot-iss";
+    const std::string iss_url  = "https://boot-iss.example.com";
+
+    ServerConfig cfg;
+    cfg.bind_host = "127.0.0.1";
+    cfg.bind_port = 0;
+    cfg.worker_threads = 1;
+    cfg.http2.enabled = false;
+
+    UpstreamConfig idp_upstream;
+    idp_upstream.name = "idp-pool";
+    idp_upstream.host = "127.0.0.1";
+    idp_upstream.port = 9;
+    cfg.upstreams.push_back(idp_upstream);
+
+    // auth is CONFIGURED but DISABLED at boot. Previously this shape
+    // skipped AuthManager construction when there was no enabled
+    // content; the fix constructs unconditionally.
+    cfg.auth.enabled = false;
+    auto issuer = MakeStaticIssuerCfg(iss_name, iss_url);
+    issuer.upstream = "idp-pool";
+    cfg.auth.issuers[iss_name] = issuer;
+    cfg.auth.policies.push_back(
+        MakePolicy("flip-policy", "/secret/", iss_name));
+
+    HttpServer server(cfg);
+    server.Get("/secret/data", [](const HttpRequest&, HttpResponse& resp) {
+        resp.Status(200).Body("ok", "text/plain");
+    });
+
+    TestServerRunner<HttpServer> runner(server);
+
+    // Before reload: auth.enabled=false → InvokeMiddleware pass-through → 200.
+    auto before = SendHttp(runner.GetPort(), "/secret/data");
+    bool before_ok = ExtractStatus(before) == 200;
+
+    // SIGHUP equivalent: flip auth.enabled=true. No topology change, so
+    // AuthManager::Reload succeeds; master_enabled_ flips at cutover;
+    // inbound requests to /secret/ now demand a valid token.
+    ServerConfig flipped = cfg;
+    flipped.auth.enabled = true;
+    bool reload_ok = server.Reload(flipped);
+
+    auto after = SendHttp(runner.GetPort(), "/secret/data");
+    bool after_ok = ExtractStatus(after) == 401;
+
+    bool ok = before_ok && reload_ok && after_ok;
+    std::string err;
+    if (!before_ok) {
+        err = "before-reload /secret/data expected 200 got " +
+              std::to_string(ExtractStatus(before));
+    } else if (!reload_ok) {
+        err = "Reload returned false";
+    } else if (!after_ok) {
+        err = "after-flip /secret/data expected 401 got " +
+              std::to_string(ExtractStatus(after)) +
+              " (auth.enabled flip did not take effect)";
+    }
+    TestFramework::RecordTest(
+        "Auth integration: HttpServer reload flips auth.enabled live",
+        ok, err);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // RunAllTests
 // ---------------------------------------------------------------------------
 static void RunAllTests() {
@@ -1229,6 +1306,7 @@ static void RunAllTests() {
     TestEmptyBearerValue();
     TestLongestPrefixWins();
     TestHttpServerReloadAppliesAppliesToLive();
+    TestHttpServerReloadFlipsAuthEnabledLive();
 }
 
 }  // namespace AuthIntegrationTests

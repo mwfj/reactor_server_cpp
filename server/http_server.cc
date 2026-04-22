@@ -924,32 +924,41 @@ void HttpServer::MarkServerReady() {
     //   Prepending auth NOW — i.e. SECOND — makes auth the new front:
     //   [auth, rate_limit, ...]. Per-user rate-limit keys (future phase)
     //   can then key on the validated `sub`.
-    // Construct AuthManager whenever the schema has any meaningful content
-    // OR when auth.enabled=true. When the master switch is off but
-    // issuers/policies are staged, we still construct + Start + install
-    // the middleware so a SIGHUP that flips `auth.enabled: false → true`
-    // takes effect without a restart — InvokeMiddleware itself gates on
-    // master_enabled_ (default matches auth_config_.enabled).
-    const bool wants_auth_manager = auth_config_.enabled
-        || !auth_config_.issuers.empty()
-        || !auth_config_.policies.empty();
-    if (wants_auth_manager) {
-        try {
-            auth_manager_ = std::make_unique<AUTH_NAMESPACE::AuthManager>(
-                auth_config_, upstream_manager_.get(), dispatchers);
-        } catch (const std::exception& e) {
-            if (auth_config_.enabled) {
-                logging::Get()->error(
-                    "AuthManager init failed: {} — stopping server",
-                    e.what());
-                net_server_.Stop();
-                throw;
-            }
-            logging::Get()->warn(
-                "AuthManager (disabled) init failed: {} — auth stays off",
+    // Construct AuthManager UNCONDITIONALLY at boot, even when
+    // auth_config_ is entirely empty (no issuers, no policies,
+    // enabled=false). InvokeMiddleware gates on master_enabled_ (set
+    // from auth_config_.enabled) and returns pass-through when false;
+    // empty issuer/policy maps make that gate trivially skip, so the
+    // runtime cost is a handful of atomic loads per request.
+    //
+    // Why always: the middleware is only installable during
+    // MarkServerReady (router_ is not safe for concurrent mutation
+    // post-Start). If we skipped construction when all auth fields
+    // were default, a later SIGHUP that adds `auth.enabled=true`
+    // couldn't retroactively wire the middleware — the flip would log
+    // success but every route would stay unauthenticated until a full
+    // restart. Always-construct makes `auth.enabled: false → true`
+    // genuinely live-reloadable per the documented contract.
+    //
+    // Issuer add/remove is still topology-restart: `AuthManager::Reload`
+    // rejects issuer-set deltas and warns "restart required." That's
+    // unchanged — this fix only closes the "no AuthManager at boot"
+    // silent-no-op gap.
+    try {
+        auth_manager_ = std::make_unique<AUTH_NAMESPACE::AuthManager>(
+            auth_config_, upstream_manager_.get(), dispatchers);
+    } catch (const std::exception& e) {
+        if (auth_config_.enabled) {
+            logging::Get()->error(
+                "AuthManager init failed: {} — stopping server",
                 e.what());
-            auth_manager_.reset();
+            net_server_.Stop();
+            throw;
         }
+        logging::Get()->warn(
+            "AuthManager (disabled) init failed: {} — auth stays off",
+            e.what());
+        auth_manager_.reset();
     }
 
     if (auth_manager_) {
