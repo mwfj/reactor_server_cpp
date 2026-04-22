@@ -3,6 +3,7 @@
 #include "http2/http2_constants.h"
 #include "http/route_trie.h"         // ParsePattern, ValidatePattern for proxy route_prefix
 #include "log/logger.h"
+#include "net/dns_resolver.h"        // IsValidHostOrIpLiteral grammar
 #include "rate_limit/rate_limit_zone.h"  // RateLimitZone::SHARD_COUNT
 #include "nlohmann/json.hpp"
 
@@ -1199,19 +1200,25 @@ void ConfigLoader::ValidateHotReloadable(
 }
 
 void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
-    // Validate bind_host is a strict dotted-quad IPv4 address.
-    // Use inet_pton (not inet_addr) to reject legacy shorthand forms
-    // like "1" (→ 0.0.0.1) or octal "0127.0.0.1" (→ 87.0.0.1).
+    // Review-round fix (P1 hostname bind): relax bind_host to accept any
+    // of (a) IPv4 literal, (b) bare IPv6 literal (no brackets — that
+    // lands with step 6's ConfigLoader::Normalize), (c) RFC 1123
+    // hostname. HttpServer's ctor-time `ResolveBindHost` handles the
+    // actual resolution of hostnames to literals before NetServer /
+    // Acceptor bind. Legacy numeric-dotted forms ("0127.0.0.1", "1.2.3")
+    // are still rejected by the `IsValidHostOrIpLiteral` grammar — the
+    // same fail-closed guard DnsResolver uses at its runtime boundary
+    // (§5.2 review round).
     if (config.bind_host.empty()) {
         throw std::invalid_argument("bind_host must not be empty");
     }
-    {
-        struct in_addr addr{};
-        if (inet_pton(AF_INET, config.bind_host.c_str(), &addr) != 1) {
-            throw std::invalid_argument(
-                "Invalid bind_host: '" + config.bind_host +
-                "' (must be a dotted-quad IPv4 address, e.g. '0.0.0.0' or '127.0.0.1')");
-        }
+    if (!NET_DNS_NAMESPACE::DnsResolver::IsValidHostOrIpLiteral(
+            config.bind_host)) {
+        throw std::invalid_argument(
+            "Invalid bind_host: '" + config.bind_host +
+            "' (must be an IP literal like '0.0.0.0' / '::1', OR a valid "
+            "RFC 1123 hostname like 'localhost'; legacy numeric-dotted "
+            "forms and bracketed IPv6 literals are not accepted)");
     }
 
     if (config.bind_port < 0 || config.bind_port > 65535) {

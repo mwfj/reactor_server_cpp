@@ -2,6 +2,7 @@
 #include "http/http_status.h"
 #include "http/push_helper.h"
 #include "config/config_loader.h"
+#include "net/dns_resolver.h"            // IsValidHostOrIpLiteral grammar
 #include "ws/websocket_frame.h"
 #include "http2/http2_constants.h"
 #include "upstream/upstream_manager.h"
@@ -12,6 +13,7 @@
 #include "upstream/pool_partition.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
+#include <netdb.h>                        // getaddrinfo (bind-host resolve)
 #include <algorithm>
 #include <set>
 #include <unordered_set>
@@ -878,25 +880,102 @@ void HttpServer::WireNetServerCallbacks() {
         });
 }
 
-// v0.45 step 4 (§5.6 preview): accept IPv4 OR IPv6 literals. Hostnames
-// still reject here — Phase 1 resolves hostnames upstream in
-// HttpServer::Start → DnsResolver; the legacy (ip, port) ctor path is
-// literal-only. Step 6 replaces this with ConfigLoader::Normalize +
-// Validate via the PrepareConfig helper and removes ValidateHost
-// entirely; until then this is the minimum patch that unblocks IPv6
-// literal bind for tests and embedders.
-static const std::string& ValidateHost(const std::string& host) {
+// Review-round fix (P1 hostname bind): resolve bind hostnames at ctor
+// time instead of rejecting them. This is a preview for step 3 + step 8
+// (pending): the eventual design routes hostname bind through
+// HttpServer::Start → DnsResolver → NetServer::StartListening(InetAddr),
+// but NetServer's ctor currently builds Acceptor eagerly (the three-
+// phase lifecycle split is step 3), so `HttpServer::Start()` can never
+// run for a hostname that was rejected in the member-init list. Until
+// step 3 lands, resolve synchronously here via `getaddrinfo` using the
+// same fail-closed grammar the DnsResolver runtime boundary enforces
+// (blocks legacy numeric-dotted forms like "0127.0.0.1" that glibc's
+// inet_aton reinterprets inside getaddrinfo — §5.2 review-round).
+//
+// Contract:
+//   - IP literals pass through unchanged (zero-cost fast path).
+//   - RFC 1123 hostnames get resolved to the first addrinfo result
+//     (AF_UNSPEC, AI_PASSIVE) and returned as a dotless bare IP string.
+//   - Empty / malformed / numeric-dotted inputs throw
+//     `std::invalid_argument` at ctor time.
+//
+// Non-goals (deferred to step 8 proper):
+//   - DnsConfig timeout / lookup_family policy is NOT honored — step 8
+//     wires the full DnsResolver-based flow with operator-configurable
+//     family preference and bounded timeout.
+//   - No observability / bind_resolved tracking (§10, step 14).
+static std::string ResolveBindHost(const std::string& host) {
     if (host.empty()) {
         throw std::invalid_argument("bind host must not be empty");
     }
+    // Fast path: already a strict IP literal (IPv4 or IPv6).
     unsigned char buf[sizeof(struct in6_addr)];
     if (inet_pton(AF_INET,  host.c_str(), buf) == 1) return host;
     if (inet_pton(AF_INET6, host.c_str(), buf) == 1) return host;
-    throw std::invalid_argument(
-        "Invalid bind host: '" + host +
-        "' (must be an IPv4 literal, e.g. '0.0.0.0', or a bare IPv6 literal, "
-        "e.g. '::1'; hostnames are resolved via HttpServer::Start's DNS path, "
-        "not through this ctor)");
+
+    // Hostname path: reject anything that isn't a valid RFC 1123 name
+    // BEFORE hitting getaddrinfo, using the same fail-closed grammar
+    // DnsResolver applies at its runtime boundary. This blocks legacy
+    // numeric-dotted forms ("0127.0.0.1", "1.2.3") that strict
+    // inet_pton rejects but glibc's inet_aton (invoked inside NSS)
+    // would reinterpret as classful/octal addresses — a silent
+    // unintended-endpoint hazard (§5.2 "reject legacy numeric-dotted
+    // hostnames" review round).
+    if (!NET_DNS_NAMESPACE::DnsResolver::IsValidHostOrIpLiteral(host)) {
+        throw std::invalid_argument(
+            "Invalid bind host: '" + host +
+            "' (must be an IP literal, e.g. '0.0.0.0' / '::1', OR a "
+            "valid RFC 1123 hostname; legacy numeric-dotted forms and "
+            "bracketed IPv6 literals are not accepted here)");
+    }
+
+    // Synchronous getaddrinfo for bind. AI_PASSIVE signals "this host
+    // is intended for bind()", AF_UNSPEC lets the resolver pick v4 or
+    // v6 based on system configuration. NOTE: this is the bind-side
+    // preview only; the full DnsConfig-aware path (honoring
+    // lookup_family / resolve_timeout_ms / stale_on_error) lands in
+    // step 8.
+    struct addrinfo hints{};
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_PASSIVE;
+    struct addrinfo* res = nullptr;
+    const int rc = ::getaddrinfo(host.c_str(), nullptr, &hints, &res);
+    if (rc != 0 || res == nullptr) {
+        const char* err = ::gai_strerror(rc);
+        if (res) ::freeaddrinfo(res);
+        throw std::invalid_argument(
+            "Failed to resolve bind host '" + host + "': " +
+            (err ? err : "unknown resolver error"));
+    }
+
+    char out[INET6_ADDRSTRLEN] = {0};
+    bool ok = false;
+    if (res->ai_family == AF_INET &&
+        res->ai_addrlen >= sizeof(sockaddr_in)) {
+        const auto* sin =
+            reinterpret_cast<const sockaddr_in*>(res->ai_addr);
+        if (::inet_ntop(AF_INET, &sin->sin_addr, out, sizeof(out))) {
+            ok = true;
+        }
+    } else if (res->ai_family == AF_INET6 &&
+               res->ai_addrlen >= sizeof(sockaddr_in6)) {
+        const auto* sin6 =
+            reinterpret_cast<const sockaddr_in6*>(res->ai_addr);
+        if (::inet_ntop(AF_INET6, &sin6->sin6_addr, out, sizeof(out))) {
+            ok = true;
+        }
+    }
+    ::freeaddrinfo(res);
+    if (!ok) {
+        throw std::invalid_argument(
+            "Resolved bind host '" + host +
+            "' returned an unsupported address family");
+    }
+    logging::Get()->info(
+        "HttpServer ctor: resolved bind host '{}' → '{}' (preview path; "
+        "step 8 will route through DnsResolver)", host, out);
+    return std::string(out);
 }
 
 // Validate port before member construction — must run in the initializer
@@ -910,7 +989,7 @@ static size_t ValidatePort(int port) {
 }
 
 HttpServer::HttpServer(const std::string& ip, int port)
-    : net_server_(ValidateHost(ip), ValidatePort(port),
+    : net_server_(ResolveBindHost(ip), ValidatePort(port),
                   ComputeTimerInterval(ServerConfig{}.idle_timeout_sec,
                                        ServerConfig{}.request_timeout_sec),
                   std::chrono::seconds(ServerConfig{}.idle_timeout_sec),
@@ -931,7 +1010,8 @@ static const ServerConfig& ValidateConfig(const ServerConfig& config) {
 }
 
 HttpServer::HttpServer(const ServerConfig& config)
-    : net_server_(ValidateConfig(config).bind_host, static_cast<size_t>(config.bind_port),
+    : net_server_(ResolveBindHost(ValidateConfig(config).bind_host),
+                  static_cast<size_t>(config.bind_port),
                   ComputeTimerInterval(config.idle_timeout_sec,
                                        config.request_timeout_sec),
                   // Pass idle_timeout_sec directly — 0 means disabled.

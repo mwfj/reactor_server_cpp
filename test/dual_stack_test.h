@@ -99,23 +99,31 @@ inline void TestAcceptorIpv6LiteralBind() {
 
 // ---------- Acceptor rejects non-literal bind ----------
 inline void TestAcceptorRejectsHostname() {
-    std::cout << "\n[TEST] DualStack: Acceptor rejects hostname bind..."
+    std::cout << "\n[TEST] DualStack: Acceptor rejects invalid bind host..."
               << std::endl;
     try {
-        // Hostnames are resolved by HttpServer::Start's DNS phase.
-        // The Acceptor ctor itself takes an InetAddr literal; legacy
-        // string entry-point must fail closed for non-literals.
+        // Post-hostname-preview state: valid RFC 1123 hostnames go
+        // through `HttpServer::ResolveBindHost`'s synchronous
+        // getaddrinfo. Grammar-violating inputs (underscore, legacy
+        // numeric-dotted forms) are rejected by
+        // `IsValidHostOrIpLiteral` BEFORE getaddrinfo is called — no
+        // real DNS query, so the test is fast and deterministic.
+        // (Old input "not-a-valid-ip-or-hostname-literal" was actually
+        // a valid single-label RFC 1123 hostname — system-dependent
+        // resolution could have made the assertion flaky post-fix.)
         bool threw = false;
         try {
-            HttpServer server("not-a-valid-ip-or-hostname-literal", 0);
+            // Underscore is invalid per RFC 1123 hostname grammar.
+            HttpServer server("bad_hostname", 0);
             TestServerRunner<HttpServer> runner(server);
         } catch (const std::exception&) {
             threw = true;
         }
-        Record("DualStack: Acceptor rejects hostname bind", threw,
-                threw ? "" : "Acceptor accepted non-literal host");
+        Record("DualStack: Acceptor rejects invalid bind host", threw,
+                threw ? "" : "Grammar-invalid hostname bind succeeded");
     } catch (const std::exception& e) {
-        Record("DualStack: Acceptor rejects hostname bind", false, e.what());
+        Record("DualStack: Acceptor rejects invalid bind host",
+                false, e.what());
     }
 }
 
@@ -581,6 +589,110 @@ inline void TestTlsConnectionStripsTrailingDotInSni() {
     }
 }
 
+// Review-round fix (P1): HttpServer ctor must accept hostnames as
+// bind_host by resolving them synchronously before NetServer / Acceptor
+// construction. Pre-fix, a hostname like "localhost" threw at
+// `Acceptor`'s literal-only validation (lines 20-25) INSIDE the member-
+// init list, so `HttpServer::Start()` could never run the advertised
+// resolution flow. Post-fix, `ResolveBindHost` resolves the hostname
+// via synchronous getaddrinfo (with the same fail-closed grammar as
+// DnsResolver) before the member-init list hits `net_server_`, so
+// construction completes and NetServer is handed a literal IP.
+//
+// Test strategy:
+//   - Happy path uses "localhost" which is guaranteed /etc/hosts-backed
+//     on POSIX — no real DNS query, fast and deterministic.
+//   - Negative paths use grammar-violating inputs (empty, underscore,
+//     legacy-numeric-dotted) that `IsValidHostOrIpLiteral` rejects
+//     BEFORE getaddrinfo is called — also no DNS, also fast.
+//   - Constructor-only (no Start()) to avoid port-allocation costs AND
+//     to keep the test focused on what the fix actually changed
+//     (pre-ctor resolution).
+inline void TestHostnameBindResolvesAtCtor() {
+    std::cout << "\n[TEST] DualStack: HttpServer ctor resolves hostname bind..."
+              << std::endl;
+    try {
+        bool ok = true;
+        std::string details;
+
+        // Happy path: "localhost" → /etc/hosts returns 127.0.0.1 or ::1.
+        // Ctor must complete without throwing. Pre-fix, this path
+        // threw at `ValidateHost` (or Acceptor's literal check) during
+        // member-init; post-fix, `ResolveBindHost` returns the literal
+        // and NetServer constructs normally.
+        bool localhost_ok = false;
+        try {
+            HttpServer server("localhost", 0);
+            localhost_ok = true;
+        } catch (const std::exception& e) {
+            details += std::string("localhost_exc=") + e.what() + " ";
+        }
+        ok = ok && localhost_ok;
+        details += "localhost_ctor=" +
+                   std::string(localhost_ok ? "ok" : "FAILED") + " ";
+
+        // Control 1: IP literal fast path unchanged — `inet_pton` in
+        // `ResolveBindHost` returns the input directly, skipping
+        // getaddrinfo.
+        bool ipv4_ok = false;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            ipv4_ok = true;
+        } catch (const std::exception& e) {
+            details += std::string("ipv4_exc=") + e.what() + " ";
+        }
+        ok = ok && ipv4_ok;
+        details += "ipv4_ctor=" +
+                   std::string(ipv4_ok ? "ok" : "FAILED") + " ";
+
+        // Control 2: legacy numeric-dotted form still fail-closed.
+        // `IsValidHostOrIpLiteral` rejects BEFORE getaddrinfo, so no
+        // DNS query and no risk of glibc inet_aton reinterpretation
+        // as `0127.0.0.1` → `87.0.0.1`.
+        bool got_legacy_reject = false;
+        try {
+            HttpServer server("0127.0.0.1", 0);
+            (void)server;
+        } catch (const std::invalid_argument&) {
+            got_legacy_reject = true;
+        }
+        ok = ok && got_legacy_reject;
+        details += "legacy_numeric_rejected=" +
+                   std::string(got_legacy_reject ? "yes" : "no") + " ";
+
+        // Control 3: underscore in hostname — invalid per RFC 1123,
+        // rejected by `IsValidHostOrIpLiteral`, no DNS query.
+        bool got_underscore_reject = false;
+        try {
+            HttpServer server("bad_host", 0);
+            (void)server;
+        } catch (const std::invalid_argument&) {
+            got_underscore_reject = true;
+        }
+        ok = ok && got_underscore_reject;
+        details += "underscore_rejected=" +
+                   std::string(got_underscore_reject ? "yes" : "no") + " ";
+
+        // Control 4: empty host still rejects with clear message.
+        bool got_empty_reject = false;
+        try {
+            HttpServer server("", 0);
+            (void)server;
+        } catch (const std::invalid_argument&) {
+            got_empty_reject = true;
+        }
+        ok = ok && got_empty_reject;
+        details += "empty_rejected=" +
+                   std::string(got_empty_reject ? "yes" : "no") + " ";
+
+        Record("DualStack: HttpServer ctor resolves hostname bind", ok,
+                details);
+    } catch (const std::exception& e) {
+        Record("DualStack: HttpServer ctor resolves hostname bind",
+                false, e.what());
+    }
+}
+
 // ---------- Test registrar ----------
 
 inline void RunAllTests() {
@@ -593,6 +705,7 @@ inline void RunAllTests() {
     TestHeaderRewriterStripsTrailingDotInHost();
     TestInetAddrIpIsHeaderSafe();
     TestTlsConnectionStripsTrailingDotInSni();
+    TestHostnameBindResolvesAtCtor();
 }
 
 }  // namespace DualStackTests
