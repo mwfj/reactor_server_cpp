@@ -8,7 +8,7 @@
 #include <cstdlib>
 #include <list>   // PoolState::in_flight (shared-owned WorkItems in flight)
 
-namespace DNS_NAMESPACE {
+namespace NET_DNS_NAMESPACE {
 
 // ---------------------------------------------------------------------------
 // Internal pool-state types. Defined in the .cc so the header stays tight.
@@ -1075,4 +1075,4 @@ void DnsResolver::SetMaxQueuedItemsForTesting(std::size_t cap) {
     max_queued_items_ = cap;
 }
 
-}  // namespace DNS_NAMESPACE
+}  // namespace NET_DNS_NAMESPACE

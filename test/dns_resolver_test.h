@@ -24,11 +24,11 @@
 
 namespace DnsResolverTests {
 
-using DNS_NAMESPACE::DnsConfig;
-using DNS_NAMESPACE::DnsResolver;
-using DNS_NAMESPACE::LookupFamily;
-using DNS_NAMESPACE::ResolvedEndpoint;
-using DNS_NAMESPACE::ResolveRequest;
+using NET_DNS_NAMESPACE::DnsConfig;
+using NET_DNS_NAMESPACE::DnsResolver;
+using NET_DNS_NAMESPACE::LookupFamily;
+using NET_DNS_NAMESPACE::ResolvedEndpoint;
+using NET_DNS_NAMESPACE::ResolveRequest;
 
 // ---------- Shared helpers ----------
 
@@ -205,12 +205,12 @@ inline void TestParseLookupFamily() {
     std::cout << "\n[TEST] DnsResolver: ParseLookupFamily..." << std::endl;
     try {
         bool ok = true;
-        ok = ok && DNS_NAMESPACE::ParseLookupFamily("v4_only")      == LookupFamily::kV4Only;
-        ok = ok && DNS_NAMESPACE::ParseLookupFamily("v6_only")      == LookupFamily::kV6Only;
-        ok = ok && DNS_NAMESPACE::ParseLookupFamily("v4_preferred") == LookupFamily::kV4Preferred;
-        ok = ok && DNS_NAMESPACE::ParseLookupFamily("v6_preferred") == LookupFamily::kV6Preferred;
+        ok = ok && NET_DNS_NAMESPACE::ParseLookupFamily("v4_only")      == LookupFamily::kV4Only;
+        ok = ok && NET_DNS_NAMESPACE::ParseLookupFamily("v6_only")      == LookupFamily::kV6Only;
+        ok = ok && NET_DNS_NAMESPACE::ParseLookupFamily("v4_preferred") == LookupFamily::kV4Preferred;
+        ok = ok && NET_DNS_NAMESPACE::ParseLookupFamily("v6_preferred") == LookupFamily::kV6Preferred;
         bool threw = false;
-        try { (void)DNS_NAMESPACE::ParseLookupFamily("bogus"); }
+        try { (void)NET_DNS_NAMESPACE::ParseLookupFamily("bogus"); }
         catch (const std::invalid_argument&) { threw = true; }
         ok = ok && threw;
         Record("DnsResolver: ParseLookupFamily", ok);

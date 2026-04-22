@@ -146,7 +146,7 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
         // produces identical output for hostnames / IPv4 literals (byte-
         // for-byte) and `[::1]:8080` / `[::1]` for IPv6. Handles the same
         // omit_port well-known-port rule the previous code had.
-        output["host"] = DNS_NAMESPACE::DnsResolver::FormatAuthority(
+        output["host"] = NET_DNS_NAMESPACE::DnsResolver::FormatAuthority(
             host_value, upstream_port, omit_port);
     }
 

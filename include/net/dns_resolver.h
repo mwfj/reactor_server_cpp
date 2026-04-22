@@ -8,7 +8,7 @@
 // .cc includes <netdb.h> to get the real definition.
 struct addrinfo;
 
-namespace DNS_NAMESPACE {
+namespace NET_DNS_NAMESPACE {
 
 // ---------------------------------------------------------------------------
 // Lookup family selection
@@ -252,4 +252,4 @@ private:
                                                const std::string& msg);
 };
 
-}  // namespace DNS_NAMESPACE
+}  // namespace NET_DNS_NAMESPACE
