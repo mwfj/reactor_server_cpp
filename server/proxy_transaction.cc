@@ -7,6 +7,7 @@
 #include "circuit_breaker/circuit_breaker_slice.h"
 #include "connection_handler.h"
 #include "dispatcher.h"
+#include "net/dns_resolver.h"  // FormatAuthority for IPv6 host:port rendering
 // config/server_config.h provided by proxy_transaction.h (ProxyConfig stored by value)
 #include "http/http_request.h"
 #include "http/http_status.h"
@@ -2145,8 +2146,12 @@ HttpResponse ProxyTransaction::MakeCircuitOpenResponse() const {
     // Hint operators (not clients) at which upstream tripped. Useful
     // when a gateway fronts multiple backends; without this header, a
     // 503 is opaque.
+    // §5.5.1: render authority via FormatAuthority so IPv6 literals get
+    // RFC 3986 §3.2.2 bracket wrapping. Byte-identical for hostnames
+    // and IPv4 literals.
     resp.Header("X-Upstream-Host",
-                   upstream_host_ + ":" + std::to_string(upstream_port_));
+                NET_DNS_NAMESPACE::DnsResolver::FormatAuthority(
+                    upstream_host_, upstream_port_, /*omit_port=*/false));
     resp.Header("Connection", "close");
     return resp;
 }

@@ -6,6 +6,7 @@
 #include "upstream/upstream_lease.h"
 #include "upstream/upstream_callbacks.h"
 #include "config/server_config.h"
+#include "net/dns_resolver.h"    // ResolvedEndpoint — held via atomic shared_ptr
 #include <condition_variable>
 // <memory>, <functional>, <deque>, <vector>, <chrono>, <atomic>, <mutex> provided by common.h
 
@@ -31,9 +32,19 @@ public:
     // circuit-open response a fresh requester would get.
     static constexpr int CHECKOUT_CIRCUIT_OPEN    = -6;
 
+    // §5.5 step 9 full: `upstream_host` is the ORIGINAL operator string
+    // (hostname or IP literal), kept for logging / observability only.
+    // `resolved_endpoint` carries the connect-bound `InetAddr` produced by
+    // HttpServer::Start's DNS batch (or synthesised from a literal by
+    // UpstreamManager's legacy ctor). `CreateNewConnection` reads it via
+    // `std::atomic_load_explicit(...memory_order_acquire)`; step 11's
+    // Reload path swaps it with `std::atomic_store_explicit(release)` so
+    // the "next NEW CONNECTION uses new endpoint" contract holds
+    // release-acquire without a mutex.
     PoolPartition(std::shared_ptr<Dispatcher> dispatcher,
                   const std::string& upstream_host, int upstream_port,
                   const std::string& sni_hostname,
+                  std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> resolved_endpoint,
                   const UpstreamPoolConfig& config,
                   std::shared_ptr<TlsClientContext> tls_ctx,
                   std::atomic<int64_t>& outstanding_conns,
@@ -125,11 +136,20 @@ public:
 
 private:
     std::shared_ptr<Dispatcher> dispatcher_;
-    std::string upstream_host_;
-    int upstream_port_;
-    std::string sni_hostname_;  // Empty = use upstream_host_ for SNI
+    std::string upstream_host_;     // Original operator host (hostname OR literal). LOGGING ONLY — connect reads resolved_endpoint_.
+    int upstream_port_;              // Original operator port. Logs / fallback SNI port.
+    std::string sni_hostname_;       // Empty = use upstream_host_ for SNI (§5.10)
     UpstreamPoolConfig config_;
     std::shared_ptr<TlsClientContext> tls_ctx_;
+
+    // §5.5 step 9 full: source of truth for outbound connect.
+    // Mutated only via `std::atomic_store_explicit(release)` from the
+    // reload path (step 11); read via `std::atomic_load_explicit(acquire)`
+    // inside `CreateNewConnection`. shared_ptr refcount guarantees an
+    // in-flight connect started with the OLD endpoint keeps that
+    // endpoint alive until the connection completes, even if a reload
+    // swaps the pointer concurrently.
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> resolved_endpoint_;
 
     // Manager-owned drain coordination — partitions signal when empty
     std::atomic<int64_t>& outstanding_conns_;

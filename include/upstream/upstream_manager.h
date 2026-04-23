@@ -4,6 +4,7 @@
 #include "upstream/upstream_host_pool.h"
 #include "upstream/pool_partition.h"
 #include "config/server_config.h"
+#include "net/dns_resolver.h"
 #include <condition_variable>
 // <memory>, <unordered_map>, <atomic>, <mutex> provided by common.h
 
@@ -15,6 +16,25 @@ class CircuitBreakerManager;
 
 class UpstreamManager {
 public:
+    // PRODUCTION ctor (§5.4a v0.8): resolved endpoints are provided by
+    // the caller — `HttpServer::MarkServerReady` passes
+    // `HttpServer::upstream_resolved_`, which `HttpServer::Start`
+    // populated via the DNS batch. The partitions use the resolved IP
+    // for connect; hostnames stay in upstream.host for logging /
+    // effective-SNI derivation (§5.10, formalised in step 9 full).
+    UpstreamManager(const std::vector<UpstreamConfig>& upstreams,
+                    const std::vector<std::shared_ptr<Dispatcher>>& dispatchers,
+                    NET_DNS_NAMESPACE::ResolvedMap resolved);
+
+    // LEGACY ctor (§5.4a v0.8): for unit tests and embedders that
+    // don't route through DnsResolver. Auto-fills the resolved map by
+    // parsing each `config.host` as a bare IP literal (after
+    // Normalize-style bracket stripping). Throws invalid_argument on
+    // the FIRST non-literal host — callers with hostnames must use the
+    // 3-arg ctor with a map produced by `DnsResolver::ResolveMany`.
+    //
+    // Delegates to the 3-arg ctor so both paths share the same
+    // partition-construction code.
     UpstreamManager(const std::vector<UpstreamConfig>& upstreams,
                     const std::vector<std::shared_ptr<Dispatcher>>& dispatchers);
     ~UpstreamManager();

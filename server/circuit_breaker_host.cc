@@ -1,6 +1,7 @@
 #include "circuit_breaker/circuit_breaker_host.h"
 #include "dispatcher.h"
 #include "log/logger.h"
+#include "net/dns_resolver.h"  // FormatAuthority for IPv6 log-label rendering
 
 #include <future>
 
@@ -34,8 +35,13 @@ CircuitBreakerHost::CircuitBreakerHost(std::string service_name,
         // Per-slice label for logs — lets operators grep logs for a
         // specific host:partition pair. Key=value form matches the
         // format documented in circuit_breaker_slice.h:host_label_.
+        // §5.5.1: FormatAuthority brackets IPv6 literals per RFC 3986 §3.2.2
+        // (`[::1]:8080`). Byte-identical to the old `host + ":" + port`
+        // form for hostnames / IPv4.
         std::string label = "service=" + service_name_ +
-                            " host=" + host_ + ":" + std::to_string(port_) +
+                            " host=" +
+                            NET_DNS_NAMESPACE::DnsResolver::FormatAuthority(
+                                host_, port_, /*omit_port=*/false) +
                             " partition=" + std::to_string(i);
         slices_.emplace_back(std::make_unique<CircuitBreakerSlice>(
             std::move(label), i, config_));

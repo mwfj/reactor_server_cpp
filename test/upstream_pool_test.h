@@ -21,6 +21,7 @@
 #include "upstream/upstream_manager.h"
 #include "upstream/upstream_host_pool.h"
 #include "upstream/pool_partition.h"
+#include "net/dns_resolver.h"
 #include "socket_handler.h"
 #include "connection_handler.h"
 #include "dispatcher.h"
@@ -1369,9 +1370,20 @@ void TestUpstreamHostPoolPartitionCount() {
         std::mutex drain_mtx;
         std::condition_variable drain_cv;
 
+        // §5.5 step 9 full: UpstreamHostPool now requires a resolved
+        // endpoint alongside the host/port strings. Synthesise one from
+        // the literal host since this test constructs the pool directly
+        // (bypassing UpstreamManager's map-based plumbing).
+        auto resolved = std::make_shared<NET_DNS_NAMESPACE::ResolvedEndpoint>();
+        resolved->addr = InetAddr(ucfg.host, ucfg.port);
+        resolved->host = ucfg.host;
+        resolved->port = ucfg.port;
+        resolved->resolved_at = std::chrono::steady_clock::now();
+
         UpstreamHostPool pool(
             ucfg.name, ucfg.host, ucfg.port,
             ucfg.tls.sni_hostname,
+            resolved,
             ucfg.pool, {d0, d1}, nullptr,
             outstanding, mgr_shutdown, drain_mtx, drain_cv);
 
@@ -1419,9 +1431,17 @@ void TestUpstreamHostPoolAccessors() {
         std::mutex drain_mtx;
         std::condition_variable drain_cv;
 
+        // §5.5 step 9 full: synthesize resolved endpoint from literal.
+        auto resolved = std::make_shared<NET_DNS_NAMESPACE::ResolvedEndpoint>();
+        resolved->addr = InetAddr(ucfg.host, ucfg.port);
+        resolved->host = ucfg.host;
+        resolved->port = ucfg.port;
+        resolved->resolved_at = std::chrono::steady_clock::now();
+
         UpstreamHostPool pool(
             ucfg.name, ucfg.host, ucfg.port,
             ucfg.tls.sni_hostname,
+            resolved,
             ucfg.pool, {dispatcher}, nullptr,
             outstanding, mgr_shutdown, drain_mtx, drain_cv);
 

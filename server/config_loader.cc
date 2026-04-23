@@ -920,6 +920,42 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
         ParseAuthConfig(j["auth"], config.auth);
     }
 
+    // DNS section (§6.1) — DnsConfig defaults are fine if the section is
+    // absent. resolver_max_inflight is restart-only (pool is persistent);
+    // the other fields are hot-reloadable via ValidateDnsHotReloadable.
+    if (j.contains("dns")) {
+        if (!j["dns"].is_object()) {
+            throw std::runtime_error("dns must be an object");
+        }
+        auto& dns = j["dns"];
+        if (dns.contains("lookup_family")) {
+            if (!dns["lookup_family"].is_string()) {
+                throw std::runtime_error("dns.lookup_family must be a string");
+            }
+            // ParseLookupFamily throws std::invalid_argument on unknown
+            // strings — surface under the loader's runtime_error contract.
+            try {
+                config.dns.lookup_family = NET_DNS_NAMESPACE::ParseLookupFamily(
+                    dns["lookup_family"].get<std::string>());
+            } catch (const std::invalid_argument& e) {
+                throw std::runtime_error(
+                    std::string("Invalid dns.lookup_family: ") + e.what());
+            }
+        }
+        config.dns.resolve_timeout_ms = ParseStrictInt(
+            dns, "resolve_timeout_ms", config.dns.resolve_timeout_ms, "dns");
+        config.dns.overall_timeout_ms = ParseStrictInt(
+            dns, "overall_timeout_ms", config.dns.overall_timeout_ms, "dns");
+        if (dns.contains("stale_on_error")) {
+            if (!dns["stale_on_error"].is_boolean()) {
+                throw std::runtime_error("dns.stale_on_error must be a boolean");
+            }
+            config.dns.stale_on_error = dns["stale_on_error"].get<bool>();
+        }
+        config.dns.resolver_max_inflight = ParseStrictInt(
+            dns, "resolver_max_inflight", config.dns.resolver_max_inflight, "dns");
+    }
+
     return config;
 }
 
@@ -1088,6 +1124,253 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     }
     val = std::getenv("REACTOR_RATE_LIMIT_STATUS_CODE");
     if (val) config.rate_limit.status_code = EnvToInt(val, "REACTOR_RATE_LIMIT_STATUS_CODE");
+
+    // DNS env overrides (§6.3). resolver_max_inflight is restart-only;
+    // no env override for it by design — operators edit the JSON.
+    val = std::getenv("REACTOR_DNS_LOOKUP_FAMILY");
+    if (val) {
+        try {
+            config.dns.lookup_family =
+                NET_DNS_NAMESPACE::ParseLookupFamily(std::string(val));
+        } catch (const std::invalid_argument& e) {
+            throw std::invalid_argument(
+                std::string("Invalid REACTOR_DNS_LOOKUP_FAMILY: ") + e.what());
+        }
+    }
+    val = std::getenv("REACTOR_DNS_RESOLVE_TIMEOUT_MS");
+    if (val) config.dns.resolve_timeout_ms = EnvToInt(val, "REACTOR_DNS_RESOLVE_TIMEOUT_MS");
+    val = std::getenv("REACTOR_DNS_OVERALL_TIMEOUT_MS");
+    if (val) config.dns.overall_timeout_ms = EnvToInt(val, "REACTOR_DNS_OVERALL_TIMEOUT_MS");
+    val = std::getenv("REACTOR_DNS_STALE_ON_ERROR");
+    if (val) {
+        std::string s(val);
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
+        if (s == "1" || s == "true" || s == "yes") {
+            config.dns.stale_on_error = true;
+        } else if (s == "0" || s == "false" || s == "no") {
+            config.dns.stale_on_error = false;
+        } else {
+            throw std::invalid_argument(
+                "Invalid REACTOR_DNS_STALE_ON_ERROR: '" + std::string(val) +
+                "' (must be true/false/yes/no/1/0)");
+        }
+    }
+}
+
+void ConfigLoader::Normalize(ServerConfig& config) {
+    // Canonicalizes host fields so downstream Validate / DNS paths see a
+    // bare-form string (no surrounding IPv6 brackets). Throws
+    // std::invalid_argument on structural failure — the error message is
+    // picked up by main.cc / HttpServer::Reload and warn-downgraded when
+    // the malformed field is restart-only, or surfaced as a hard error
+    // at startup.
+    auto normalize_one = [](std::string& host, const std::string& field_name) {
+        if (host.empty()) {
+            // Empty bind_host / upstreams[].host is a semantic error that
+            // Validate owns — leave the string empty and let Validate's
+            // explicit empty-check produce the field-named error message.
+            return;
+        }
+        std::string bare;
+        if (!NET_DNS_NAMESPACE::DnsResolver::NormalizeHostToBare(host, &bare)) {
+            throw std::invalid_argument(
+                field_name + ": malformed host '" + host +
+                "' (unbalanced brackets, invalid characters, or not a "
+                "valid IP literal / RFC 1123 hostname)");
+        }
+        host = std::move(bare);
+    };
+
+    normalize_one(config.bind_host, "bind_host");
+
+    for (size_t i = 0; i < config.upstreams.size(); ++i) {
+        auto& u = config.upstreams[i];
+        const std::string host_field =
+            "upstreams[" + std::to_string(i) + "] ('" + u.name + "').host";
+        normalize_one(u.host, host_field);
+
+        // tls.sni_hostname: strip ONE trailing '.' (§5.6 v0.37 round-36
+        // P2 + v0.38 round-37 P2 malformed-dot guard). SNI is NEVER a
+        // DNS input — only fed to SSL_set_tlsext_host_name /
+        // SSL_set1_host / Host-rewrite on TLS upstreams, all of which
+        // want the dotless form. An absolute-FQDN trailing dot here
+        // reintroduces the cert-mismatch / vhost-miss hazard that the
+        // u.host-derived SNI path already strips.
+        //
+        // Post-strip sanity check: reject empty or still-dotted results
+        // from pathological inputs (".", "api.com..", "....").
+        if (!u.tls.sni_hostname.empty()) {
+            const std::string orig = u.tls.sni_hostname;
+            u.tls.sni_hostname =
+                NET_DNS_NAMESPACE::DnsResolver::StripTrailingDot(u.tls.sni_hostname);
+            if (u.tls.sni_hostname.empty() ||
+                u.tls.sni_hostname.back() == '.') {
+                throw std::invalid_argument(
+                    "upstreams[" + std::to_string(i) + "] ('" + u.name +
+                    "').tls.sni_hostname: malformed input '" + orig +
+                    "' — after stripping one trailing dot, result is "
+                    "empty or still ends in '.'. Expected a valid "
+                    "hostname with at most one trailing '.'.");
+            }
+        }
+    }
+}
+
+// Rate-limit hot-reloadable subset (§6.4). All rate_limit.* fields are
+// live-reloadable — `RateLimitManager::Reload` applies every edit on
+// the next request — so the hot-reload gate must enforce the same
+// ranges the startup `Validate` does. Without a dedicated helper, the
+// warn-downgraded full `Validate` on the reload path would let bad
+// values (negative rate, zero capacity, unknown key_type) slip into
+// live zones until the next restart surfaces the error.
+//
+// Runs against:
+//   - rate_limit.enabled / dry_run (bool, no ranges)
+//   - rate_limit.status_code (400-599)
+//   - rate_limit.include_headers (bool)
+//   - each zone's name / rate / capacity / key_type / max_entries
+//   - duplicate zone name detection
+//
+// Throws std::invalid_argument with a field-named message on failure.
+// Called from both `Validate` (startup) and `ValidateHotReloadable`
+// (reload) so both paths see identical rejection behavior.
+static void ValidateRateLimitHotReloadable(const ServerConfig& config) {
+    const auto& rl = config.rate_limit;
+    if (rl.enabled && rl.zones.empty()) {
+        throw std::invalid_argument(
+            "rate_limit enabled but no zones configured");
+    }
+    if (rl.status_code < 400 || rl.status_code > 599) {
+        throw std::invalid_argument(
+            "rate_limit.status_code must be 400-599, got " +
+            std::to_string(rl.status_code));
+    }
+
+    static const std::unordered_set<std::string> valid_key_types = {
+        "client_ip", "path"
+    };
+    // key_type prefixes that require a suffix (e.g., "header:X-API-Key")
+    static const std::vector<std::string> valid_key_prefixes = {
+        "header:", "client_ip+path", "client_ip+header:"
+    };
+
+    // Bounds match the inline-block constants that previously lived
+    // inside Validate(). MIN_RATE: sub-millitoken rates truncate to 0
+    // and buckets never refill. MAX_RATE: guards `rate * 1000` in
+    // TokenBucket from int64_t overflow. MAX_CAPACITY: guards
+    // `capacity * 1000` in TokenBucket's ctor. RATE_LIMIT_SHARD_COUNT:
+    // pulled from RateLimitZone to stay in sync.
+    constexpr double  MIN_RATE     = 0.001;
+    constexpr double  MAX_RATE     = 1e9;
+    constexpr int64_t MAX_CAPACITY = 1'000'000'000'000LL;
+    const int RATE_LIMIT_SHARD_COUNT =
+        static_cast<int>(RateLimitZone::SHARD_COUNT);
+
+    std::unordered_set<std::string> seen_zone_names;
+    seen_zone_names.reserve(rl.zones.size());
+    for (size_t i = 0; i < rl.zones.size(); ++i) {
+        const auto& z = rl.zones[i];
+        const std::string idx = "rate_limit.zones[" + std::to_string(i) + "]";
+
+        if (z.name.empty()) {
+            throw std::invalid_argument(idx + ".name must not be empty");
+        }
+        if (!seen_zone_names.insert(z.name).second) {
+            throw std::invalid_argument(
+                "Duplicate rate_limit zone name: '" + z.name + "'");
+        }
+        if (z.rate < MIN_RATE) {
+            throw std::invalid_argument(
+                idx + " ('" + z.name + "'): rate must be >= " +
+                std::to_string(MIN_RATE) + " (got " + std::to_string(z.rate) + ")");
+        }
+        if (z.rate > MAX_RATE) {
+            throw std::invalid_argument(
+                idx + " ('" + z.name + "'): rate must be <= " +
+                std::to_string(MAX_RATE) + " (got " + std::to_string(z.rate) + ")");
+        }
+        if (z.capacity < 1) {
+            throw std::invalid_argument(
+                idx + " ('" + z.name + "'): capacity must be >= 1");
+        }
+        if (z.capacity > MAX_CAPACITY) {
+            throw std::invalid_argument(
+                idx + " ('" + z.name + "'): capacity must be <= " +
+                std::to_string(MAX_CAPACITY) +
+                " (got " + std::to_string(z.capacity) + ")");
+        }
+        if (z.max_entries < RATE_LIMIT_SHARD_COUNT) {
+            throw std::invalid_argument(
+                idx + " ('" + z.name + "'): max_entries must be >= " +
+                std::to_string(RATE_LIMIT_SHARD_COUNT) +
+                " (shard count; runtime cap is rounded down to a multiple "
+                "of shard count, minimum one entry per shard)");
+        }
+
+        // Validate key_type: exact match or prefix+name match.
+        bool valid_key = valid_key_types.count(z.key_type) > 0;
+        if (!valid_key) {
+            for (const auto& prefix : valid_key_prefixes) {
+                if (prefix.back() == ':') {
+                    if (z.key_type.size() > prefix.size() &&
+                        z.key_type.substr(0, prefix.size()) == prefix) {
+                        valid_key = true;
+                        break;
+                    }
+                } else {
+                    if (z.key_type == prefix) {
+                        valid_key = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!valid_key) {
+            throw std::invalid_argument(
+                idx + " ('" + z.name + "'): invalid key_type '" + z.key_type +
+                "' (must be client_ip, path, header:<name>, "
+                "client_ip+path, or client_ip+header:<name>)");
+        }
+
+        // Warn if capacity < rate (burst smaller than sustained rate)
+        if (static_cast<double>(z.capacity) < z.rate) {
+            logging::Get()->warn(
+                "rate_limit zone '{}': capacity ({}) < rate ({:.1f}) "
+                "— burst will be smaller than sustained rate",
+                z.name, z.capacity, z.rate);
+        }
+    }
+}
+
+// DNS hot-reloadable subset (§6.4). Reloadable fields:
+//   resolve_timeout_ms, overall_timeout_ms, stale_on_error.
+// Restart-only fields (lookup_family, resolver_max_inflight) are NOT
+// validated here — they flow through the warn-downgraded full Validate.
+//
+// Exposed as a file-static helper invoked from ValidateHotReloadable so
+// the reload path rejects invalid DNS tuning BEFORE it reaches the DNS
+// resolver's config cache. Without this, a SIGHUP with e.g.
+// `dns.resolve_timeout_ms = -1` would be swallowed by the warn-downgrade
+// and silently applied to the next reload's DNS batch.
+static void ValidateDnsHotReloadable(const ServerConfig& config) {
+    if (config.dns.resolve_timeout_ms <= 0) {
+        throw std::invalid_argument(
+            "dns.resolve_timeout_ms must be > 0, got " +
+            std::to_string(config.dns.resolve_timeout_ms));
+    }
+    if (config.dns.overall_timeout_ms <= 0) {
+        throw std::invalid_argument(
+            "dns.overall_timeout_ms must be > 0, got " +
+            std::to_string(config.dns.overall_timeout_ms));
+    }
+    if (config.dns.overall_timeout_ms < config.dns.resolve_timeout_ms) {
+        throw std::invalid_argument(
+            "dns.overall_timeout_ms (" +
+            std::to_string(config.dns.overall_timeout_ms) +
+            ") must be >= dns.resolve_timeout_ms (" +
+            std::to_string(config.dns.resolve_timeout_ms) + ")");
+    }
+    // stale_on_error is a bool — no range check needed.
 }
 
 void ConfigLoader::ValidateHotReloadable(
@@ -1197,6 +1480,16 @@ void ConfigLoader::ValidateHotReloadable(
                 "'): circuit_breaker.retry_budget_min_concurrency must be >= 0");
         }
     }
+
+    // DNS hot-reloadable subset (§6.4). Invariant: every reloadable
+    // field must be covered by a hard-reject helper here so nothing
+    // slips through the warn-downgrade in Validate.
+    ValidateDnsHotReloadable(config);
+
+    // Rate-limit hot-reloadable subset (§6.4). Step 6b (v0.49).
+    // RateLimitManager::Reload applies every edit live, so bad values
+    // must be rejected before the reload path commits them.
+    ValidateRateLimitHotReloadable(config);
 }
 
 void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
@@ -1259,6 +1552,40 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
         throw std::invalid_argument(
             "Invalid request_timeout_sec: " + std::to_string(config.request_timeout_sec) +
             " (must be >= 0, 0 = disabled)");
+    }
+
+    // DNS validation (§5.6 + §6.4). resolver_max_inflight is restart-
+    // only — validated here so every load path (JSON, env, CLI, in-
+    // process tests) trips the same guard. `EnsurePoolStarted` feeds
+    // the value directly into `workers_.reserve(...)` and the spawn
+    // loop; a zero value would silently yield a zero-worker pool that
+    // deadlocks the first hostname lookup, and a negative value would
+    // cast to SIZE_MAX and attempt to spawn 2^63 threads.
+    if (config.dns.resolver_max_inflight <= 0) {
+        throw std::invalid_argument(
+            "dns.resolver_max_inflight must be > 0, got " +
+            std::to_string(config.dns.resolver_max_inflight));
+    }
+    // Reloadable DNS fields — same rules enforced in the hot-reload
+    // path via ValidateDnsHotReloadable. Running them here too keeps
+    // startup and reload in lock-step and ensures JSON loaders and
+    // direct-construction callers see identical rejection behavior.
+    if (config.dns.resolve_timeout_ms <= 0) {
+        throw std::invalid_argument(
+            "dns.resolve_timeout_ms must be > 0, got " +
+            std::to_string(config.dns.resolve_timeout_ms));
+    }
+    if (config.dns.overall_timeout_ms <= 0) {
+        throw std::invalid_argument(
+            "dns.overall_timeout_ms must be > 0, got " +
+            std::to_string(config.dns.overall_timeout_ms));
+    }
+    if (config.dns.overall_timeout_ms < config.dns.resolve_timeout_ms) {
+        throw std::invalid_argument(
+            "dns.overall_timeout_ms (" +
+            std::to_string(config.dns.overall_timeout_ms) +
+            ") must be >= dns.resolve_timeout_ms (" +
+            std::to_string(config.dns.resolve_timeout_ms) + ")");
     }
 
     // Bound size limits to prevent overflow in ComputeInputCap() where
@@ -1411,16 +1738,18 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name + "'): host must not be empty");
             }
-            // Upstream host must be a dotted-quad IPv4 address (no hostnames).
-            // Hostnames would pass validation but fail at connect time with
-            // inet_addr() returning INADDR_NONE. Reject early with a clear error.
-            {
-                struct in_addr upstream_addr{};
-                if (inet_pton(AF_INET, u.host.c_str(), &upstream_addr) != 1) {
-                    throw std::invalid_argument(
-                        idx + " ('" + u.name + "'): host must be a valid IPv4 address, got '" +
-                        u.host + "'");
-                }
+            // Upstream host accepts an IPv4 literal, a bare IPv6 literal
+            // (brackets stripped by Normalize), or an RFC 1123 hostname.
+            // Hostnames are resolved by HttpServer::Start via DnsResolver
+            // before any connection attempt — `IsValidHostOrIpLiteral`
+            // enforces the same fail-closed grammar as the resolver's
+            // runtime boundary (rejects legacy numeric-dotted forms like
+            // "0127.0.0.1" that glibc's inet_aton would reinterpret).
+            if (!NET_DNS_NAMESPACE::DnsResolver::IsValidHostOrIpLiteral(u.host)) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name + "'): host must be a valid IP "
+                    "literal (e.g. '10.0.0.1' / '::1') or RFC 1123 "
+                    "hostname, got '" + u.host + "'");
             }
             if (u.port < 1 || u.port > 65535) {
                 throw std::invalid_argument(
@@ -1687,124 +2016,9 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
         }
     }
 
-    // Rate limit validation
-    {
-        const auto& rl = config.rate_limit;
-        if (rl.enabled && rl.zones.empty()) {
-            throw std::invalid_argument(
-                "rate_limit enabled but no zones configured");
-        }
-        if (rl.status_code < 400 || rl.status_code > 599) {
-            throw std::invalid_argument(
-                "rate_limit.status_code must be 400-599, got " +
-                std::to_string(rl.status_code));
-        }
-
-        static const std::unordered_set<std::string> valid_key_types = {
-            "client_ip", "path"
-        };
-        // key_type prefixes that require a suffix (e.g., "header:X-API-Key")
-        static const std::vector<std::string> valid_key_prefixes = {
-            "header:", "client_ip+path", "client_ip+header:"
-        };
-
-        // Rate limit zone bounds (scoped to this validation block).
-        //   MIN_RATE: sub-millitoken rates truncate to 0 and buckets never refill.
-        //   MAX_RATE: guards the `rate * 1000` conversion in TokenBucket from
-        //             int64_t overflow. 1e9 req/s is astronomical — real
-        //             deployments never approach this.
-        //   MAX_CAPACITY: guards `capacity * 1000` in TokenBucket's constructor
-        //                 from int64_t overflow. 1e12 is 1 trillion — more than
-        //                 any realistic burst budget.
-        //   RATE_LIMIT_SHARD_COUNT: pulled from RateLimitZone to stay in sync.
-        constexpr double MIN_RATE = 0.001;
-        constexpr double MAX_RATE = 1e9;
-        constexpr int64_t MAX_CAPACITY = 1'000'000'000'000LL;  // 1e12
-        constexpr int RATE_LIMIT_SHARD_COUNT =
-            static_cast<int>(RateLimitZone::SHARD_COUNT);
-
-        std::unordered_set<std::string> seen_zone_names;
-        for (size_t i = 0; i < rl.zones.size(); ++i) {
-            const auto& z = rl.zones[i];
-            const std::string idx = "rate_limit.zones[" + std::to_string(i) + "]";
-
-            if (z.name.empty()) {
-                throw std::invalid_argument(idx + ".name must not be empty");
-            }
-            if (!seen_zone_names.insert(z.name).second) {
-                throw std::invalid_argument(
-                    "Duplicate rate_limit zone name: '" + z.name + "'");
-            }
-            if (z.rate < MIN_RATE) {
-                throw std::invalid_argument(
-                    idx + " ('" + z.name + "'): rate must be >= " +
-                    std::to_string(MIN_RATE) + " (got " + std::to_string(z.rate) + ")");
-            }
-            if (z.rate > MAX_RATE) {
-                throw std::invalid_argument(
-                    idx + " ('" + z.name + "'): rate must be <= " +
-                    std::to_string(MAX_RATE) + " (got " + std::to_string(z.rate) + ")");
-            }
-            if (z.capacity < 1) {
-                throw std::invalid_argument(
-                    idx + " ('" + z.name + "'): capacity must be >= 1");
-            }
-            if (z.capacity > MAX_CAPACITY) {
-                throw std::invalid_argument(
-                    idx + " ('" + z.name + "'): capacity must be <= " +
-                    std::to_string(MAX_CAPACITY) +
-                    " (got " + std::to_string(z.capacity) + ")");
-            }
-            if (z.max_entries < RATE_LIMIT_SHARD_COUNT) {
-                // Below shard count, the runtime cap becomes SHARD_COUNT (one
-                // per shard) rather than max_entries. Reject to keep the
-                // configured value meaningful.
-                throw std::invalid_argument(
-                    idx + " ('" + z.name + "'): max_entries must be >= " +
-                    std::to_string(RATE_LIMIT_SHARD_COUNT) +
-                    " (shard count; runtime cap is rounded down to a multiple "
-                    "of shard count, minimum one entry per shard)");
-            }
-
-            // Validate key_type: exact match or prefix+name match.
-            // Bare prefixes like "header:" or "client_ip+header:" (no name
-            // after colon) are rejected — MakeKeyExtractor can't build a
-            // useful extractor and silently becomes pass-through.
-            bool valid_key = valid_key_types.count(z.key_type) > 0;
-            if (!valid_key) {
-                for (const auto& prefix : valid_key_prefixes) {
-                    if (prefix.back() == ':') {
-                        // Prefix ending with ':' requires at least one char after it
-                        if (z.key_type.size() > prefix.size() &&
-                            z.key_type.substr(0, prefix.size()) == prefix) {
-                            valid_key = true;
-                            break;
-                        }
-                    } else {
-                        // Exact match (e.g., "client_ip+path")
-                        if (z.key_type == prefix) {
-                            valid_key = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (!valid_key) {
-                throw std::invalid_argument(
-                    idx + " ('" + z.name + "'): invalid key_type '" + z.key_type +
-                    "' (must be client_ip, path, header:<name>, "
-                    "client_ip+path, or client_ip+header:<name>)");
-            }
-
-            // Warn if capacity < rate (burst smaller than sustained rate)
-            if (static_cast<double>(z.capacity) < z.rate) {
-                logging::Get()->warn(
-                    "rate_limit zone '{}': capacity ({}) < rate ({:.1f}) "
-                    "— burst will be smaller than sustained rate",
-                    z.name, z.capacity, z.rate);
-            }
-        }
-    }
+    // Rate limit validation — fully extracted into a shared helper so
+    // the hot-reload path enforces the same ranges (§6.4 invariant).
+    ValidateRateLimitHotReloadable(config);
 
     // -------------------------------------------------------------------
     // Auth validation (design spec §5.3).
@@ -2722,6 +2936,20 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             rlj["zones"].push_back(zj);
         }
         j["rate_limit"] = rlj;
+    }
+
+    // DNS section — always emitted so operators can see the effective
+    // defaults in `--dump-config`-style tooling without parsing
+    // dns_resolver.h. The one-line forms keep the JSON compact.
+    {
+        nlohmann::json dj;
+        dj["lookup_family"] =
+            NET_DNS_NAMESPACE::LookupFamilyName(config.dns.lookup_family);
+        dj["resolve_timeout_ms"]   = config.dns.resolve_timeout_ms;
+        dj["overall_timeout_ms"]   = config.dns.overall_timeout_ms;
+        dj["stale_on_error"]       = config.dns.stale_on_error;
+        dj["resolver_max_inflight"] = config.dns.resolver_max_inflight;
+        j["dns"] = dj;
     }
 
     // Auth top-level block serialization. Emitted whenever it differs

@@ -39,9 +39,53 @@ static void SuppressSigpipe() {
     }
 }
 
+// Build a literal-only `ResolvedMap` from the upstream configs. Used
+// by the 2-arg legacy ctor so unit tests and embedders that pass
+// IP-literal hosts keep working without going through DnsResolver.
+// Throws invalid_argument on the first non-literal host — callers with
+// hostnames must produce the map via `DnsResolver::ResolveMany` and
+// call the 3-arg ctor directly.
+static NET_DNS_NAMESPACE::ResolvedMap BuildResolvedFromLiterals(
+    const std::vector<UpstreamConfig>& upstreams)
+{
+    NET_DNS_NAMESPACE::ResolvedMap out;
+    out.reserve(upstreams.size());
+    for (const auto& u : upstreams) {
+        std::string bare;
+        if (!NET_DNS_NAMESPACE::DnsResolver::NormalizeHostToBare(u.host, &bare)) {
+            throw std::invalid_argument(
+                "UpstreamManager legacy ctor: upstream '" + u.name +
+                "' host '" + u.host + "' is malformed (unbalanced "
+                "brackets or invalid grammar).");
+        }
+        InetAddr addr(bare, u.port);
+        if (!addr.is_valid()) {
+            throw std::invalid_argument(
+                "UpstreamManager legacy ctor: upstream '" + u.name +
+                "' host '" + u.host + "' is not a literal IPv4/IPv6 "
+                "address. Use the 3-arg ctor with a resolved map "
+                "(from DnsResolver::ResolveMany) for hostnames.");
+        }
+        auto ep = std::make_shared<NET_DNS_NAMESPACE::ResolvedEndpoint>();
+        ep->addr        = addr;
+        ep->host        = bare;
+        ep->port        = u.port;
+        ep->resolved_at = std::chrono::steady_clock::now();
+        out.emplace(u.name, std::move(ep));
+    }
+    return out;
+}
+
 UpstreamManager::UpstreamManager(
     const std::vector<UpstreamConfig>& upstreams,
     const std::vector<std::shared_ptr<Dispatcher>>& dispatchers)
+    : UpstreamManager(upstreams, dispatchers,
+                      BuildResolvedFromLiterals(upstreams)) {}
+
+UpstreamManager::UpstreamManager(
+    const std::vector<UpstreamConfig>& upstreams,
+    const std::vector<std::shared_ptr<Dispatcher>>& dispatchers,
+    NET_DNS_NAMESPACE::ResolvedMap resolved)
     : dispatchers_(dispatchers)
 {
     // Check if any upstream uses TLS — suppress SIGPIPE if so.
@@ -82,10 +126,36 @@ UpstreamManager::UpstreamManager(
             }
         }
 
-        // Create the host pool
+        // §5.5 step 9 full: pass the ORIGINAL operator host (possibly a
+        // hostname) as the pool's host — it's used for logging and as
+        // the effective-SNI fallback. The connect-bound endpoint is
+        // carried separately via `resolved_endpoint` so the string and
+        // the socket address are never coupled by a bridge that
+        // rewrites one in terms of the other.
+        auto it = resolved.find(upstream.name);
+        if (it == resolved.end() || !it->second) {
+            throw std::invalid_argument(
+                "UpstreamManager: no resolved endpoint for upstream '" +
+                upstream.name + "'. HttpServer::Start should have "
+                "produced one via the DNS batch.");
+        }
+        std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>
+            resolved_endpoint = it->second;
+
+        // Effective SNI (§5.10 interim). Explicit sni_hostname wins;
+        // otherwise fall back to `upstream.host` so a hostname upstream
+        // matches its cert SAN. Full §5.10 matrix (IP-literal + verify_peer
+        // + empty SNI = reject) is a subsequent refinement — the current
+        // behaviour matches the pre-step-9 design and does not regress
+        // any existing TLS test.
+        const std::string& effective_sni =
+            !upstream.tls.sni_hostname.empty() ? upstream.tls.sni_hostname
+                                               : upstream.host;
+
         pools_[upstream.name] = std::make_unique<UpstreamHostPool>(
             upstream.name, upstream.host, upstream.port,
-            upstream.tls.sni_hostname,
+            effective_sni,
+            resolved_endpoint,
             upstream.pool, dispatchers, tls_ctx,
             outstanding_conns_, shutting_down_, drain_mtx_, drain_cv_);
     }

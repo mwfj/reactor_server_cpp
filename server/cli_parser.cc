@@ -1,6 +1,7 @@
 #include "cli/cli_parser.h"
 #include "cli/version.h"
 #include "log/logger.h"
+#include "net/dns_resolver.h"
 
 #include <getopt.h>
 #include <openssl/opensslv.h>
@@ -190,12 +191,29 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
             case 'p':
                 options.port = ParsePort(optarg);
                 break;
-            case 'H':
+            case 'H': {
                 if (optarg[0] == '\0') {
                     throw std::runtime_error("--host requires a non-empty address");
                 }
-                options.host = optarg;
+                // §5.8: CLI value is normalized inline at parse time —
+                // bracketed IPv6 → bare, RFC 1123 hostname grammar
+                // enforced. Uses the same DnsResolver helpers as
+                // ConfigLoader::Normalize so CLI + JSON + env agree on
+                // what a valid host looks like. Invalid grammar throws
+                // here; the ValidateHotReloadable / Validate pipeline
+                // downstream catches any edge cases missed at this
+                // boundary (e.g. scope-id rejection stays central).
+                std::string bare;
+                if (!NET_DNS_NAMESPACE::DnsResolver::NormalizeHostToBare(
+                        optarg, &bare)) {
+                    throw std::runtime_error(
+                        std::string("--host rejects '") + optarg +
+                        "': must be an IP literal (e.g. '10.0.0.1' / "
+                        "'::1' / '[::1]') or a valid RFC 1123 hostname");
+                }
+                options.host = std::move(bare);
                 break;
+            }
             case 'l':
                 options.log_level = ValidateLogLevel(optarg);
                 break;
@@ -290,7 +308,8 @@ void CliParser::PrintUsage(const char* program_name) {
         << "Start options:\n"
         << "  -c, --config <file>         Config file (default: config/server.json)\n"
         << "  -p, --port <port>           Override bind port (0-65535, 0=ephemeral)\n"
-        << "  -H, --host <address>        Override bind address (numeric IPv4 only)\n"
+        << "  -H, --host <address>        Override bind address: IPv4 literal,\n"
+        << "                              IPv6 literal (bare or bracketed), or hostname\n"
         << "  -l, --log-level <level>     Override log level\n"
         << "                              (trace, debug, info, warn, error, critical)\n"
         << "  -w, --workers <N>           Override worker thread count (0 = auto)\n"

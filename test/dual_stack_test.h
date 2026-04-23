@@ -599,15 +599,26 @@ inline void TestTlsConnectionStripsTrailingDotInSni() {
 // DnsResolver) before the member-init list hits `net_server_`, so
 // construction completes and NetServer is handed a literal IP.
 //
+// v0.48 step-6 update: the step-4 preview `ResolveBindHost` that did
+// synchronous getaddrinfo at ctor time has been removed in favour of
+// the PrepareConfig pipeline (Normalize + Validate only). Hostname
+// resolution moves to `HttpServer::Start` (step 8, pending). For now,
+// the ctor ACCEPTS hostnames at the validation layer (no throw) but
+// Start()/Acceptor will reject them until step 8 wires DnsResolver
+// into startup. This test pins the accept-at-ctor contract; a
+// follow-up step-8 test will pin the Start-time resolution contract.
+//
 // Test strategy:
-//   - Happy path uses "localhost" which is guaranteed /etc/hosts-backed
-//     on POSIX — no real DNS query, fast and deterministic.
+//   - Happy path uses "localhost" — must pass the ctor's validation
+//     layer (Normalize strips brackets; Validate accepts RFC 1123
+//     hostnames); we do NOT call Start() so Acceptor's literal-only
+//     check is not exercised.
 //   - Negative paths use grammar-violating inputs (empty, underscore,
 //     legacy-numeric-dotted) that `IsValidHostOrIpLiteral` rejects
-//     BEFORE getaddrinfo is called — also no DNS, also fast.
-//   - Constructor-only (no Start()) to avoid port-allocation costs AND
-//     to keep the test focused on what the fix actually changed
-//     (pre-ctor resolution).
+//     inside `ConfigLoader::Validate`, which PrepareConfig runs during
+//     member-init. No DNS, fast.
+//   - Constructor-only (no Start()) keeps the test focused on the
+//     validation contract (pre-Start resolution is step 8's concern).
 inline void TestHostnameBindResolvesAtCtor() {
     std::cout << "\n[TEST] DualStack: HttpServer ctor resolves hostname bind..."
               << std::endl;
@@ -615,11 +626,10 @@ inline void TestHostnameBindResolvesAtCtor() {
         bool ok = true;
         std::string details;
 
-        // Happy path: "localhost" → /etc/hosts returns 127.0.0.1 or ::1.
-        // Ctor must complete without throwing. Pre-fix, this path
-        // threw at `ValidateHost` (or Acceptor's literal check) during
-        // member-init; post-fix, `ResolveBindHost` returns the literal
-        // and NetServer constructs normally.
+        // Happy path: "localhost" — valid RFC 1123 hostname accepted
+        // by `IsValidHostOrIpLiteral`. PrepareConfig (Normalize +
+        // Validate) lets it through to NetServer's ctor; we construct
+        // successfully without calling Start().
         bool localhost_ok = false;
         try {
             HttpServer server("localhost", 0);
@@ -631,9 +641,8 @@ inline void TestHostnameBindResolvesAtCtor() {
         details += "localhost_ctor=" +
                    std::string(localhost_ok ? "ok" : "FAILED") + " ";
 
-        // Control 1: IP literal fast path unchanged — `inet_pton` in
-        // `ResolveBindHost` returns the input directly, skipping
-        // getaddrinfo.
+        // Control 1: IP literal fast path — PrepareConfig treats
+        // IPv4 literals as valid, NetServer/Acceptor bind happily.
         bool ipv4_ok = false;
         try {
             HttpServer server("127.0.0.1", 0);
@@ -645,10 +654,10 @@ inline void TestHostnameBindResolvesAtCtor() {
         details += "ipv4_ctor=" +
                    std::string(ipv4_ok ? "ok" : "FAILED") + " ";
 
-        // Control 2: legacy numeric-dotted form still fail-closed.
-        // `IsValidHostOrIpLiteral` rejects BEFORE getaddrinfo, so no
-        // DNS query and no risk of glibc inet_aton reinterpretation
-        // as `0127.0.0.1` → `87.0.0.1`.
+        // Control 2: legacy numeric-dotted form still fail-closed via
+        // `IsValidHostOrIpLiteral` inside Validate. Never hits the
+        // resolver — no risk of glibc inet_aton reinterpreting
+        // `0127.0.0.1` → `87.0.0.1`.
         bool got_legacy_reject = false;
         try {
             HttpServer server("0127.0.0.1", 0);
@@ -693,6 +702,208 @@ inline void TestHostnameBindResolvesAtCtor() {
     }
 }
 
+// ---------- Step 3 — HttpServer live_config_ + Stop stopping_ ----------
+
+// GetLiveConfigSnapshot returns a fully-committed snapshot of the
+// config the server was constructed with (after PrepareConfig's
+// Normalize + Validate). Exercises the §11 v0.28 `mutable reload_mtx_`
+// contract indirectly — the snapshot is safe to take on a const
+// HttpServer even though the lock isn't visibly const.
+inline void TestGetLiveConfigSnapshotReturnsInitialConfig() {
+    std::cout << "\n[TEST] DualStack: HttpServer GetLiveConfigSnapshot..."
+              << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host = "127.0.0.1";
+        cfg.bind_port = 0;
+        cfg.idle_timeout_sec = 42;
+        cfg.request_timeout_sec = 7;
+        cfg.max_body_size = 1 << 20;
+        cfg.dns.resolve_timeout_ms = 1234;
+
+        HttpServer server(cfg);
+
+        // Must compile AND work on a const reference.
+        const HttpServer& cref = server;
+        ServerConfig snap = cref.GetLiveConfigSnapshot();
+
+        bool ok = true;
+        std::string err;
+        if (snap.bind_host != "127.0.0.1") {
+            ok = false; err += "bind_host='" + snap.bind_host + "'; ";
+        }
+        if (snap.idle_timeout_sec != 42) {
+            ok = false; err += "idle != 42; ";
+        }
+        if (snap.request_timeout_sec != 7) {
+            ok = false; err += "req != 7; ";
+        }
+        if (snap.dns.resolve_timeout_ms != 1234) {
+            ok = false; err += "dns.resolve_timeout_ms != 1234; ";
+        }
+
+        // Second snapshot produces the same content (serialisation
+        // does not corrupt the live state).
+        ServerConfig snap2 = server.GetLiveConfigSnapshot();
+        if (snap2.bind_host != snap.bind_host ||
+            snap2.idle_timeout_sec != snap.idle_timeout_sec) {
+            ok = false; err += "snap2 diverged; ";
+        }
+
+        Record("DualStack: HttpServer GetLiveConfigSnapshot", ok, err);
+    } catch (const std::exception& e) {
+        Record("DualStack: HttpServer GetLiveConfigSnapshot",
+                false, e.what());
+    }
+}
+
+// NetServer three-phase lifecycle sanity: after Start() runs, the
+// listen socket is bound and `GetBoundPort()` returns a real
+// kernel-assigned port. §5.4a: ctor is config-only; Phase B
+// (StartListening) runs inside Start() between the DNS batch and
+// dispatcher bootstrap.
+inline void TestNetServerStartListeningBinds() {
+    std::cout << "\n[TEST] DualStack: NetServer StartListening binds..."
+              << std::endl;
+    try {
+        HttpServer server("127.0.0.1", 0);
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+        bool ok = (port > 0 && port <= 65535);
+        std::string err;
+        if (!ok) err = "GetBoundPort=" + std::to_string(port);
+        Record("DualStack: NetServer StartListening binds", ok, err);
+    } catch (const std::exception& e) {
+        Record("DualStack: NetServer StartListening binds",
+                false, e.what());
+    }
+}
+
+// Step 8: bind_resolved_ is populated after Start() commits, reflects
+// the ephemeral-port refresh, and is absent pre-Start.
+inline void TestBindResolvedPresentAfterStart() {
+    std::cout << "\n[TEST] DualStack: bind_resolved_ populated post-Start..."
+              << std::endl;
+    try {
+        HttpServer server("127.0.0.1", 0);
+
+        // Pre-Start: absent.
+        bool pre_empty = !server.GetBindResolved().has_value();
+
+        TestServerRunner<HttpServer> runner(server);
+        auto post = server.GetBindResolved();
+        int actual_port = runner.GetPort();
+
+        bool ok = pre_empty && post.has_value() &&
+                  !post->error &&
+                  post->port == actual_port &&
+                  post->addr.Port() == actual_port &&
+                  !post->addr.Ip().empty();
+        std::string err;
+        if (!ok) {
+            err = "pre_empty=" + std::to_string(pre_empty) +
+                  " has=" + std::to_string(post.has_value());
+            if (post) {
+                err += " err=" + std::to_string(post->error) +
+                       " port=" + std::to_string(post->port) +
+                       " addr.port=" + std::to_string(post->addr.Port()) +
+                       " ip='" + post->addr.Ip() + "'" +
+                       " actual=" + std::to_string(actual_port);
+            }
+        }
+        Record("DualStack: bind_resolved_ populated post-Start", ok, err);
+    } catch (const std::exception& e) {
+        Record("DualStack: bind_resolved_ populated post-Start",
+                false, e.what());
+    }
+}
+
+// Step 8 Phase-A gate: if stopping_ is set before Start() runs DNS,
+// Start returns cleanly without opening a listen socket. We can't
+// manipulate stopping_ directly from tests (no setter), but we can
+// exercise the equivalent effect by calling Stop() before Start():
+// Stop sets stopping_ as its first line, then Start should abort at
+// the Phase-A gate. bind_resolved_ stays absent; GetBoundPort stays 0.
+inline void TestStartupAbortsWhenStopCalledFirst() {
+    std::cout << "\n[TEST] DualStack: Start aborts if Stop ran first..."
+              << std::endl;
+    try {
+        HttpServer server("127.0.0.1", 0);
+        server.Stop();   // sets stopping_ = true
+        // Start on the same thread; must NOT throw and must NOT open
+        // a listener. The Phase-A gate observes stopping_=true and
+        // returns; Phase-B therefore never runs.
+        server.Start();  // returns quickly
+        bool ok = !server.GetBindResolved().has_value() &&
+                  server.GetBoundPort() == 0;
+        Record("DualStack: Start aborts if Stop ran first", ok,
+                ok ? "" :
+                "bind_resolved_has=" + std::to_string(server.GetBindResolved().has_value()) +
+                " bound_port=" + std::to_string(server.GetBoundPort()));
+    } catch (const std::exception& e) {
+        Record("DualStack: Start aborts if Stop ran first",
+                false, e.what());
+    }
+}
+
+// Step 9 full: PoolPartition stores its connect endpoint via an atomic
+// shared_ptr target that step 11's reload will swap. This test exercises
+// the atomic-load path end-to-end: an IP-literal upstream is configured,
+// the pool partition is constructed through the production UpstreamManager
+// path, and a proxy request reaches the upstream via the resolved
+// endpoint. We use an in-process echo server as the "upstream" to avoid
+// external DNS.
+inline void TestPoolPartitionResolvedEndpointAtomic() {
+    std::cout << "\n[TEST] DualStack: PoolPartition resolved_endpoint_ atomic..."
+              << std::endl;
+    try {
+        // Upstream echo server.
+        HttpServer upstream("127.0.0.1", 0);
+        upstream.Get("/ping",
+            [](const HttpRequest&, HttpResponse& r) {
+                r.Status(200).Text("pong");
+            });
+        TestServerRunner<HttpServer> upstream_runner(upstream);
+        int upstream_port = upstream_runner.GetPort();
+
+        // Gateway pointing at the upstream by IP literal.
+        ServerConfig cfg;
+        cfg.bind_host = "127.0.0.1";
+        cfg.bind_port = 0;
+        UpstreamConfig uc;
+        uc.name = "echo";
+        uc.host = "127.0.0.1";
+        uc.port = upstream_port;
+        uc.proxy.route_prefix = "/api";
+        uc.proxy.strip_prefix = true;  // /api/ping → /ping at upstream
+        cfg.upstreams.push_back(uc);
+        HttpServer gateway(cfg);
+        gateway.Proxy("/api/*", "echo");
+
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        // Drive a request through: gateway→upstream should succeed,
+        // proving CreateNewConnection's atomic_load on resolved_endpoint_
+        // returned a valid endpoint.
+        const std::string resp = TestHttpClient::HttpGet(gw_port, "/api/ping");
+        const bool status_ok = resp.find("200 OK") != std::string::npos;
+        const bool body_ok   = resp.find("pong")   != std::string::npos;
+        const bool ok = status_ok && body_ok;
+        std::string err;
+        if (!ok) {
+            err = "status_line_ok=" + std::to_string(status_ok) +
+                  " body_ok=" + std::to_string(body_ok) +
+                  " response_size=" + std::to_string(resp.size());
+        }
+        Record("DualStack: PoolPartition resolved_endpoint_ atomic",
+                ok, err);
+    } catch (const std::exception& e) {
+        Record("DualStack: PoolPartition resolved_endpoint_ atomic",
+                false, e.what());
+    }
+}
+
 // ---------- Test registrar ----------
 
 inline void RunAllTests() {
@@ -706,6 +917,17 @@ inline void RunAllTests() {
     TestInetAddrIpIsHeaderSafe();
     TestTlsConnectionStripsTrailingDotInSni();
     TestHostnameBindResolvesAtCtor();
+
+    // Step 3 — NetServer three-phase + HttpServer state
+    TestGetLiveConfigSnapshotReturnsInitialConfig();
+    TestNetServerStartListeningBinds();
+
+    // Step 8 — HttpServer::Start DNS orchestration
+    TestBindResolvedPresentAfterStart();
+    TestStartupAbortsWhenStopCalledFirst();
+
+    // Step 9 full — PoolPartition resolved-endpoint split
+    TestPoolPartitionResolvedEndpointAtomic();
 }
 
 }  // namespace DualStackTests

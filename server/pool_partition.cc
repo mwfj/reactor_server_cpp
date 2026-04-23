@@ -38,6 +38,7 @@ PoolPartition::PoolPartition(
     std::shared_ptr<Dispatcher> dispatcher,
     const std::string& upstream_host, int upstream_port,
     const std::string& sni_hostname,
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> resolved_endpoint,
     const UpstreamPoolConfig& config,
     std::shared_ptr<TlsClientContext> tls_ctx,
     std::atomic<int64_t>& outstanding_conns,
@@ -54,11 +55,28 @@ PoolPartition::PoolPartition(
     , manager_shutting_down_(manager_shutting_down)
     , drain_mtx_(drain_mtx)
     , drain_cv_(drain_cv)
+    , resolved_endpoint_(std::move(resolved_endpoint))
     , partition_max_connections_(static_cast<size_t>(config.max_connections))
 {
-    logging::Get()->debug("PoolPartition created for {}:{} on dispatcher {}",
-                          upstream_host_, upstream_port_,
-                          dispatcher_->dispatcher_index());
+    // Programmer error guard: partition needs a resolved endpoint to
+    // connect. Production builds get one from HttpServer::Start's DNS
+    // batch; legacy-literal builds get one from
+    // UpstreamManager::BuildResolvedFromLiterals. A null here means a
+    // caller is constructing PoolPartition directly with the old
+    // no-endpoint signature — fail fast with a clear message.
+    if (!resolved_endpoint_) {
+        throw std::invalid_argument(
+            "PoolPartition: resolved_endpoint must not be null "
+            "(use UpstreamManager's 2-arg legacy ctor for literal-only "
+            "setups; direct PoolPartition construction requires a "
+            "ResolvedEndpoint).");
+    }
+    logging::Get()->debug(
+        "PoolPartition created for {}:{} (resolved={}:{}) on dispatcher {}",
+        upstream_host_, upstream_port_,
+        resolved_endpoint_->addr.Ip(),
+        resolved_endpoint_->addr.Port(),
+        dispatcher_->dispatcher_index());
 }
 
 // Null out all callbacks on a connection's transport to prevent
@@ -642,26 +660,28 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
     // Review-round IPv6-outbound fix. PARSE FIRST so we can both (a) pick
     // the correct socket family (AF_INET vs AF_INET6) for CreateClientSocket
     // and (b) fail fast on an invalid upstream literal without leaking an
-    // fd. Previously this path hand-rolled a sockaddr_in and called
-    // inet_addr() — IPv4-only — so an upstream configured with "::1" or
-    // any other IPv6 literal would connect() on an IPv4 socket with an
-    // IPv6 sockaddr and fail immediately, defeating the v0.45 IPv6
-    // groundwork for outbound connections.
-    //
-    // Bracketed IPv6 (e.g. "[::1]") still fails here — InetAddr's literal
-    // ctor rejects brackets; ConfigLoader::Normalize (§5.6, step 6) is
-    // responsible for stripping them. Hostnames also fail here — step 9
-    // replaces this block with an atomic_load on resolved_endpoint_ which
-    // will carry a pre-resolved InetAddr via the DNS pipeline. Both
-    // shortcomings are documented in the design (§5.5), and this fix is
-    // the minimum needed to unblock IPv6-literal upstreams today.
-    InetAddr upstream_addr(upstream_host_, upstream_port_);
+    // §5.5 step 9 full: acquire-load the resolved endpoint. Pairs with
+    // step 11's release-store in `UpstreamManager::UpdateResolvedEndpoints`
+    // so subsequent connects after a reload observe the new endpoint.
+    // shared_ptr refcount pins the endpoint alive for the lifetime of
+    // this call even if the reload swaps the slot concurrently.
+    auto endpoint = std::atomic_load_explicit(
+        &resolved_endpoint_, std::memory_order_acquire);
+    if (!endpoint) {
+        // Should be impossible after the ctor guard, but defensive: a
+        // null pointer during the swap window would otherwise crash.
+        logging::Get()->error(
+            "PoolPartition::CreateNewConnection: resolved_endpoint_ is "
+            "null for {}:{}", upstream_host_, upstream_port_);
+        error_cb(CHECKOUT_CONNECT_FAILED);
+        return;
+    }
+    const InetAddr& upstream_addr = endpoint->addr;
     if (!upstream_addr.is_valid()) {
         logging::Get()->error(
-            "Invalid upstream host '{}': must be a bare IPv4 or IPv6 literal "
-            "(hostnames and bracketed IPv6 forms are not yet wired into the "
-            "outbound pool path; pending resolved_endpoint_ split in §5.5 step 9)",
-            upstream_host_);
+            "PoolPartition::CreateNewConnection: resolved endpoint for "
+            "'{}' is invalid (family={}, port={})", upstream_host_,
+            static_cast<int>(upstream_addr.family()), upstream_addr.Port());
         error_cb(CHECKOUT_CONNECT_FAILED);
         return;
     }
