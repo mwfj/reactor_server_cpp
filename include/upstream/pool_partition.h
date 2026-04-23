@@ -134,6 +134,18 @@ public:
     }
     size_t WaitQueueSize() const { return wait_queue_.size(); }
 
+    // Test-only: the effective SNI string the partition forwards to
+    // `TlsConnection` when it originates TLS to the upstream. Empty
+    // means "no SNI sent" (TlsConnection skips
+    // `SSL_set_tlsext_host_name` + `SSL_set1_host`). Exposed so the
+    // §5.10 effective-SNI rule — hostname-fallback ON, IP-literal-
+    // fallback OFF — can be pinned by unit tests without spinning up
+    // a real TLS handshake. Safe to call from any thread because
+    // `sni_hostname_` is ctor-initialised and never mutated.
+    const std::string& sni_hostname_for_testing() const {
+        return sni_hostname_;
+    }
+
 private:
     std::shared_ptr<Dispatcher> dispatcher_;
     std::string upstream_host_;     // Original operator host (hostname OR literal). LOGGING ONLY — connect reads resolved_endpoint_.

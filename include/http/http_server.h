@@ -161,10 +161,14 @@ public:
     // size limits, timeouts) may diverge from the runtime subsystem
     // state after any SIGHUP. Callers that need reload-coherent state
     // must read from the subsystem managers directly (e.g.
-    // `RateLimitManager::snapshot()`). `main.cc::ReloadConfig` uses
-    // this for the startup-time subset that is known not to drift
-    // (auth top-level block, DNS config) and falls back to its own
-    // tracking for the rest.
+    // `RateLimitManager::snapshot()`).
+    //
+    // Phase-1 callers: the only production consumer right now is the
+    // test pin (`TestGetLiveConfigSnapshotReturnsInitialConfig`); the
+    // accessor is also wired for step-14 `/stats` observability and
+    // step-11 reload-coherent reads. `main.cc::ReloadConfig` tracks
+    // its own `current_config` reference rather than round-tripping
+    // through this getter.
     //
     // Acquires `reload_mtx_` defensively so a future step 11 that
     // writes `live_config_` under the mutex cannot race this reader.

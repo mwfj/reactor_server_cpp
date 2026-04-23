@@ -142,15 +142,32 @@ UpstreamManager::UpstreamManager(
         std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>
             resolved_endpoint = it->second;
 
-        // Effective SNI (§5.10 interim). Explicit sni_hostname wins;
-        // otherwise fall back to `upstream.host` so a hostname upstream
-        // matches its cert SAN. Full §5.10 matrix (IP-literal + verify_peer
-        // + empty SNI = reject) is a subsequent refinement — the current
-        // behaviour matches the pre-step-9 design and does not regress
-        // any existing TLS test.
-        const std::string& effective_sni =
-            !upstream.tls.sni_hostname.empty() ? upstream.tls.sni_hostname
-                                               : upstream.host;
+        // Effective SNI (§5.10). The rule has three tiers:
+        //   1. Explicit `tls.sni_hostname` wins (operator intent).
+        //   2. Hostname `upstream.host` falls back — it is a verifiable
+        //      identity and matches cert CN/SAN for the common
+        //      "hostname upstream + TLS" shape. (The validator at
+        //      `ConfigLoader::Validate` allows `verify_peer=true` with
+        //      an empty sni_hostname in this case because of this
+        //      fallback.)
+        //   3. IP-literal `upstream.host` does NOT fall back — we
+        //      pass an empty SNI so the TlsConnection ctor skips
+        //      `SSL_set_tlsext_host_name` + `SSL_set1_host` entirely.
+        //      Many backends reject or misroute literal-IP SNI
+        //      (RFC 6066 §3 warns against sending an IP); supported
+        //      deployments that ran with `sni_hostname=""` +
+        //      `verify_peer=false` were silently sending NO SNI before
+        //      this refactor, and falling back to the IP here would
+        //      change their on-the-wire ClientHello and break
+        //      handshakes for no gain. The validator still rejects
+        //      IP + empty sni + verify_peer=true (nothing verifiable).
+        std::string effective_sni;
+        if (!upstream.tls.sni_hostname.empty()) {
+            effective_sni = upstream.tls.sni_hostname;
+        } else if (!NET_DNS_NAMESPACE::DnsResolver::IsIpLiteral(upstream.host)) {
+            effective_sni = upstream.host;
+        }
+        // else: IP-literal + empty sni_hostname → effective_sni stays empty.
 
         pools_[upstream.name] = std::make_unique<UpstreamHostPool>(
             upstream.name, upstream.host, upstream.port,
