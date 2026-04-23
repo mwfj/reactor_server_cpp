@@ -1032,6 +1032,84 @@ namespace ConfigTests {
         }
     }
 
+    // §5.10: `verify_peer=true` with empty `sni_hostname` is legal
+    // ONLY when `upstream.host` is a hostname (UpstreamManager falls
+    // back to it as the effective SNI for cert CN/SAN verification).
+    // IP-literal upstreams still require an explicit sni_hostname —
+    // there's nothing to fall back to. Pins the v0.51 validator fix
+    // that closed the dead-code branch on implicit SNI fallback for
+    // hostname upstreams.
+    void TestValidateVerifyPeerSniRequirement() {
+        std::cout << "\n[TEST] Config: Validate verify_peer+sni semantics..."
+                  << std::endl;
+        try {
+            bool pass = true;
+            std::string err;
+
+            auto validates = [&](const std::string& host,
+                                  bool verify_peer,
+                                  const std::string& sni,
+                                  bool tls_enabled = true) {
+                ServerConfig cfg = ConfigLoader::Default();
+                cfg.upstreams.clear();
+                UpstreamConfig u;
+                u.name = "api";
+                u.host = host;
+                u.port = 443;
+                u.tls.enabled = tls_enabled;
+                u.tls.verify_peer = verify_peer;
+                u.tls.sni_hostname = sni;
+                cfg.upstreams.push_back(u);
+                try { ConfigLoader::Validate(cfg); return true; }
+                catch (const std::invalid_argument&) { return false; }
+            };
+
+            // Accept: hostname + verify_peer + empty SNI (new behavior)
+            if (!validates("api.example.com", true, "")) {
+                pass = false;
+                err += "hostname+verify_peer+empty-sni rejected; ";
+            }
+            // Accept: hostname + verify_peer + explicit SNI (unchanged)
+            if (!validates("api.example.com", true, "cert.example.com")) {
+                pass = false;
+                err += "hostname+verify_peer+explicit-sni rejected; ";
+            }
+            // Accept: hostname + no-verify + empty SNI (unchanged)
+            if (!validates("api.example.com", false, "")) {
+                pass = false;
+                err += "hostname+no-verify rejected; ";
+            }
+            // Accept: IPv4 literal + no-verify + empty SNI (unchanged)
+            if (!validates("10.0.0.1", false, "")) {
+                pass = false;
+                err += "ipv4+no-verify rejected; ";
+            }
+            // Accept: IPv4 literal + verify_peer + explicit SNI (unchanged)
+            if (!validates("10.0.0.1", true, "api.example.com")) {
+                pass = false;
+                err += "ipv4+verify_peer+explicit-sni rejected; ";
+            }
+            // Reject: IPv4 literal + verify_peer + empty SNI (unchanged)
+            if (validates("10.0.0.1", true, "")) {
+                pass = false;
+                err += "ipv4+verify_peer+empty-sni accepted (should reject); ";
+            }
+            // Reject: IPv6 literal + verify_peer + empty SNI
+            if (validates("::1", true, "")) {
+                pass = false;
+                err += "ipv6+verify_peer+empty-sni accepted (should reject); ";
+            }
+
+            TestFramework::RecordTest(
+                "Config: Validate verify_peer+sni semantics",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "Config: Validate verify_peer+sni semantics",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // Run all config tests
     void RunAllTests() {
         std::cout << "\n" << std::string(60, '=') << std::endl;
@@ -1062,6 +1140,7 @@ namespace ConfigTests {
         TestValidateAcceptsHostnameAndIpv6Upstream();
         TestValidateDnsRules();
         TestDnsJsonRoundTrip();
+        TestValidateVerifyPeerSniRequirement();
     }
 
 } // namespace ConfigTests

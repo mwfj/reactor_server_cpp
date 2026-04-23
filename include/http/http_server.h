@@ -153,13 +153,23 @@ public:
     // Return a snapshot of server runtime statistics.
     ServerStats GetStats() const;
 
-    // Return a thread-safe snapshot of the live config (the ServerConfig
-    // as actually applied to the running server, including any reload-
-    // committed subsystem edits like auth.* / dns.* / rate_limit.*).
-    // Serialized with in-flight `Reload` via `reload_mtx_` so the caller
-    // never observes a half-committed state. Used by `main.cc::ReloadConfig`
-    // post-reload to sync its own `current_config` against the live
-    // server-owned subtrees (§5.6 v0.24 P2 round-23).
+    // Return a thread-safe snapshot of the boot-time config.
+    //
+    // Phase-1 scope: returns `live_config_`, which is written once by
+    // the ctor and NOT updated by `Reload()`. This means reload-visible
+    // subtrees (rate_limit zones, per-upstream circuit_breaker fields,
+    // size limits, timeouts) may diverge from the runtime subsystem
+    // state after any SIGHUP. Callers that need reload-coherent state
+    // must read from the subsystem managers directly (e.g.
+    // `RateLimitManager::snapshot()`). `main.cc::ReloadConfig` uses
+    // this for the startup-time subset that is known not to drift
+    // (auth top-level block, DNS config) and falls back to its own
+    // tracking for the rest.
+    //
+    // Acquires `reload_mtx_` defensively so a future step 11 that
+    // writes `live_config_` under the mutex cannot race this reader.
+    // Step 11 (deferred) will make the docstring promise stronger —
+    // at that point this becomes a fully reload-coherent snapshot.
     ServerConfig GetLiveConfigSnapshot() const;
 
     // Return a copy of the resolved bind endpoint, or std::nullopt if
@@ -225,12 +235,22 @@ private:
     // preserves the pre-existing manual destruction order enforced
     // by `~HttpServer() → Stop()`.
     //
-    // `live_config_` is the canonical snapshot: PrepareConfig
-    // (Normalize + Validate) runs on the incoming config at ctor time
-    // and the result becomes `live_config_`. Reload mutates this under
-    // `reload_mtx_`; every read path (timer cadence, /stats config
-    // section, GetLiveConfigSnapshot, upstream + CB + rate-limit +
-    // auth apply) pulls from this single field.
+    // `live_config_` holds the Normalize+Validate result from ctor time.
+    //
+    // Phase-1 scope: initialized ONCE in the ctor member-init list and
+    // NOT mutated afterwards. `Reload()` applies reload-safe edits
+    // directly to subsystem managers (rate_limit / circuit_breaker) +
+    // the shadow fields (`upstream_configs_`, `rate_limit_config_`,
+    // size-limit atomics, timeout atomics) rather than mutating this
+    // snapshot. Consequently `live_config_` reflects BOOT-time state
+    // and diverges from the runtime subsystem state after any Reload.
+    //
+    // Step 11 (deferred) will add a `reload_mtx_`-guarded write here
+    // paired with the synchronous upstream-endpoint atomic-swap so
+    // `GetLiveConfigSnapshot()` can return a reload-coherent view and
+    // subsystem-manager reads can consolidate on a single field.
+    // Until then, reload-visible state lives in the subsystem managers
+    // and the shadow fields — see §15.1.0 handoff for the full list.
     ServerConfig live_config_;
 
     // Serialises (a) Reload-vs-Reload; (b) `GetLiveConfigSnapshot() const`

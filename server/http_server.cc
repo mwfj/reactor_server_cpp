@@ -4268,6 +4268,27 @@ bool HttpServer::Reload(ServerConfig new_config) {
         upstream_configs_ = new_config.upstreams;
     }
 
+    // Phase-1 deferral reminder (§15.1.0 step 11). Reload does NOT
+    // re-resolve hostnames: if `upstream.host` is a hostname whose DNS
+    // record changed since startup, the pool keeps connecting to the
+    // cached resolved IP until the server is restarted. Surface this
+    // to operators once per reload so a DNS flip followed by SIGHUP
+    // doesn't silently miss the intended refresh. Suppressed when
+    // every upstream uses an IP literal — there is no DNS to re-run.
+    bool any_hostname_upstream = false;
+    for (const auto& u : new_config.upstreams) {
+        if (!NET_DNS_NAMESPACE::DnsResolver::IsIpLiteral(u.host)) {
+            any_hostname_upstream = true;
+            break;
+        }
+    }
+    if (any_hostname_upstream) {
+        logging::Get()->warn(
+            "Reload: hostname upstreams are not re-resolved in Phase 1 "
+            "(§15.1.0 step 11 deferred). IP refresh after a DNS change "
+            "requires a server restart.");
+    }
+
     return true;
 }
 

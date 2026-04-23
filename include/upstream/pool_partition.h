@@ -142,13 +142,27 @@ private:
     UpstreamPoolConfig config_;
     std::shared_ptr<TlsClientContext> tls_ctx_;
 
-    // §5.5 step 9 full: source of truth for outbound connect.
-    // Mutated only via `std::atomic_store_explicit(release)` from the
-    // reload path (step 11); read via `std::atomic_load_explicit(acquire)`
-    // inside `CreateNewConnection`. shared_ptr refcount guarantees an
-    // in-flight connect started with the OLD endpoint keeps that
-    // endpoint alive until the connection completes, even if a reload
-    // swaps the pointer concurrently.
+    // §5.5 step 9: source of truth for outbound connect.
+    //
+    // Phase-1 scope: the writer is the ctor ONLY. Publication to
+    // `CreateNewConnection`'s acquire-load is guaranteed by the
+    // happens-before edge from object construction to any dispatcher-
+    // thread task that reads `this` — the acquire-load is therefore
+    // redundant for correctness today but is already in place so the
+    // step-11 release-store lands as a one-line addition.
+    //
+    // Phase-2 (step 11 deferred): `UpstreamManager::UpdateResolvedEndpoints`
+    // will be the paired writer, calling `std::atomic_store_explicit`
+    // with release ordering on each partition. The release/acquire
+    // pair is what makes the "next NEW CONNECTION uses new endpoint"
+    // contract absolute. shared_ptr refcount pins the old endpoint
+    // alive for any in-flight connect started with it.
+    //
+    // C++17 note: `std::atomic_load_explicit(shared_ptr*)` is the
+    // standard-compliant form. C++20 deprecates the free-function
+    // overloads in favor of `std::atomic<std::shared_ptr<T>>`; a
+    // migration when this project moves to C++20 is tracked alongside
+    // the step-11 publisher.
     std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> resolved_endpoint_;
 
     // Manager-owned drain coordination — partitions signal when empty

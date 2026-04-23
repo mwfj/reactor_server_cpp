@@ -191,8 +191,23 @@ public:
     static bool IsIpLiteral(const std::string& s);
     static bool ParseHostPort(const std::string& s,
                               std::string* host, int* port);
+    // Render an RFC 3986 §3.2.2 authority from a BARE host (no
+    // surrounding brackets). IPv6 literals are bracketed automatically.
+    // A defensive bracket-strip handles a pre-bracketed IPv6 input
+    // gracefully so a caller cannot accidentally produce double
+    // brackets — see implementation. Pass `omit_port=true` to elide
+    // the `:port` suffix (e.g., for default-port rendering).
     static std::string FormatAuthority(const std::string& host_bare, int port,
                                        bool omit_port = false);
+
+    // Strip surrounding IPv6 brackets and validate the result against
+    // `IsValidHostOrIpLiteral`. Returns false on malformed bracketing,
+    // embedded NUL, or any input that fails the bare host grammar.
+    //
+    // A single trailing dot on hostnames is PRESERVED (absolute-FQDN
+    // marker for getaddrinfo search-domain suppression) — callers that
+    // need a dotless form must pair this with `StripTrailingDot`.
+    // TLS/HTTP authority sinks do exactly that; DNS sinks keep the dot.
     static bool NormalizeHostToBare(const std::string& in, std::string* out);
 
     // Strips ONE trailing '.' if present; returns input otherwise unchanged.

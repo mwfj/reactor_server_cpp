@@ -142,6 +142,71 @@ inline void TestIsValidHostOrIpLiteralRejectsLegacyNumericForms() {
     }
 }
 
+// §1.2.7 Phase-1 non-goal pin at the resolver boundary. config_test.h
+// has TestIsValidRejectsScopeId covering Validate + IsValid* +
+// NormalizeHostToBare; this test exercises the same scope-id inputs
+// through ParseHostPort as well so a future regression that loosens
+// ParseIpv6Literal (e.g. letting BSD inet_pton's %<zone> path through)
+// can't slip past the resolver's own unit tests.
+inline void TestIpv6LiteralRejectsScopeId() {
+    std::cout << "\n[TEST] DnsResolver: IPv6 literal rejects scope-id..."
+              << std::endl;
+    try {
+        bool ok = true;
+        std::string err;
+
+        // Each input is exercised through FIVE entry points: IsIpLiteral,
+        // IsValidHostOrIpLiteral (bare), NormalizeHostToBare (bare),
+        // NormalizeHostToBare (bracketed), ParseHostPort (bracketed with
+        // port). The last two are the most likely regression sites
+        // because bracketed IPv6 goes through a separate validator that
+        // must also reject scope-id.
+        auto must_reject = [&](const std::string& in) {
+            if (DnsResolver::IsIpLiteral(in)) {
+                ok = false; err += "IsIpLiteral accepted '" + in + "'; ";
+            }
+            if (DnsResolver::IsValidHostOrIpLiteral(in)) {
+                ok = false; err += "IsValidHostOrIpLiteral accepted '" + in + "'; ";
+            }
+            std::string bare;
+            if (DnsResolver::NormalizeHostToBare(in, &bare)) {
+                ok = false; err += "NormalizeHostToBare (bare) accepted '" + in + "'; ";
+            }
+            const std::string bracketed = "[" + in + "]";
+            if (DnsResolver::NormalizeHostToBare(bracketed, &bare)) {
+                ok = false; err += "NormalizeHostToBare (bracketed) accepted '" +
+                                   bracketed + "'; ";
+            }
+            // ParseHostPort with bracketed-IPv6 authority form.
+            std::string h;
+            int p = 0;
+            if (DnsResolver::ParseHostPort(bracketed + ":443", &h, &p)) {
+                ok = false; err += "ParseHostPort accepted '" + bracketed +
+                                   ":443'; ";
+            }
+        };
+
+        must_reject("fe80::1%eth0");    // textual zone (BSD)
+        must_reject("fe80::1%5");       // numeric zone (BSD)
+        must_reject("fe80::ab%lo0");    // loopback zone name
+        must_reject("::1%0");           // any zone-id suffix
+        must_reject("fe80::1%");        // empty zone-id — still has '%'
+
+        // Controls: valid IPv6 literals (no scope-id) still accept.
+        if (!DnsResolver::IsIpLiteral("::1")) {
+            ok = false; err += "'::1' rejected; ";
+        }
+        if (!DnsResolver::IsIpLiteral("fe80::1")) {
+            ok = false; err += "'fe80::1' rejected; ";
+        }
+
+        Record("DnsResolver: IPv6 literal rejects scope-id", ok, err);
+    } catch (const std::exception& e) {
+        Record("DnsResolver: IPv6 literal rejects scope-id",
+                false, e.what());
+    }
+}
+
 inline void TestFormatAuthority() {
     std::cout << "\n[TEST] DnsResolver: FormatAuthority..." << std::endl;
     try {
@@ -153,6 +218,13 @@ inline void TestFormatAuthority() {
         // omit_port variant for SNI-like callers.
         ok = ok && DnsResolver::FormatAuthority("example.com", 443, true) == "example.com";
         ok = ok && DnsResolver::FormatAuthority("::1", 443, true) == "[::1]";
+        // Defensive bracket-strip (§5.5.1 footgun guard): a caller that
+        // accidentally passes a bracketed IPv6 literal must not get a
+        // double-bracketed output. The strip applies only to exactly
+        // one matched leading-`[` + trailing-`]` pair.
+        ok = ok && DnsResolver::FormatAuthority("[::1]", 8080) == "[::1]:8080";
+        ok = ok && DnsResolver::FormatAuthority("[::1]", 443, true) == "[::1]";
+        ok = ok && DnsResolver::FormatAuthority("[2001:db8::1]", 80) == "[2001:db8::1]:80";
         Record("DnsResolver: FormatAuthority", ok);
     } catch (const std::exception& e) {
         Record("DnsResolver: FormatAuthority", false, e.what());
@@ -1933,6 +2005,7 @@ inline void RunAllTests() {
     TestNonSaturatedMixedTimeoutQueueExpires();
     TestMixedTimeoutSaturationTriggersFullSweep();
     TestIsValidHostOrIpLiteralRejectsLegacyNumericForms();
+    TestIpv6LiteralRejectsScopeId();
     TestParseHostPortRejectsMalformedPort();
     TestResolveAsyncRejectsInvalidHostBeforeQueue();
     TestParseHostPortValidatesHostToken();

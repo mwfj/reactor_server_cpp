@@ -364,10 +364,24 @@ bool DnsResolver::ParseHostPort(const std::string& s,
 
 std::string DnsResolver::FormatAuthority(const std::string& host_bare, int port,
                                           bool omit_port) {
-    const bool is_v6 = (host_bare.find(':') != std::string::npos);
+    // Defensive bracket strip: the documented contract is that
+    // `host_bare` is the bare form (no surrounding brackets), but a
+    // future caller passing an already-bracketed IPv6 literal
+    // (e.g. "[::1]") would otherwise double-bracket to "[[::1]]:80".
+    // Strip exactly one matched leading "[" + trailing "]" pair so
+    // the output is always single-bracketed. Bare inputs (hostnames /
+    // IPv4 / bare IPv6) are untouched by this strip.
+    const std::string* input = &host_bare;
+    std::string stripped;
+    if (host_bare.size() >= 2 && host_bare.front() == '[' &&
+        host_bare.back() == ']') {
+        stripped = host_bare.substr(1, host_bare.size() - 2);
+        input = &stripped;
+    }
+    const bool is_v6 = (input->find(':') != std::string::npos);
     std::string out;
-    if (is_v6) out = "[" + host_bare + "]";
-    else       out = host_bare;
+    if (is_v6) out = "[" + *input + "]";
+    else       out = *input;
     if (!omit_port) out += ":" + std::to_string(port);
     return out;
 }

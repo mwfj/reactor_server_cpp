@@ -1981,15 +1981,30 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                         "'): tls.min_version must be '1.2' or '1.3', got '" +
                         u.tls.min_version + "'");
                 }
-                // When verify_peer is true, sni_hostname must be set so
-                // SSL_set1_host() can verify the certificate's CN/SAN.
-                // Without it, only CA trust is checked — any trusted cert passes.
+                // §5.10 effective-SNI matrix: when verify_peer is true and
+                // sni_hostname is empty, we need SOMETHING verifiable
+                // against the cert's CN/SAN. An IP-literal upstream host
+                // cannot be verified against a hostname SAN, so an
+                // explicit `sni_hostname` is still mandatory there. For
+                // hostname upstreams the host itself IS the verifiable
+                // identity — UpstreamManager falls back to
+                // `upstream.host` as the effective SNI (§5.10,
+                // implemented in server/upstream_manager.cc), so leaving
+                // sni_hostname empty is safe and ergonomic for the
+                // common "hostname upstream + TLS + verify_peer" shape.
                 if (u.tls.verify_peer && u.tls.sni_hostname.empty()) {
-                    throw std::invalid_argument(
-                        idx + " ('" + u.name +
-                        "'): tls.sni_hostname is required when verify_peer is true "
-                        "(upstream host is an IPv4 address, which cannot be verified "
-                        "against certificate CN/SAN)");
+                    if (NET_DNS_NAMESPACE::DnsResolver::IsIpLiteral(u.host)) {
+                        throw std::invalid_argument(
+                            idx + " ('" + u.name +
+                            "'): tls.sni_hostname is required when "
+                            "verify_peer is true and host is an IP "
+                            "literal — certificate CN/SAN cannot be "
+                            "verified against an IP address. Set "
+                            "sni_hostname to the expected hostname for "
+                            "cert validation.");
+                    }
+                    // Hostname host + verify_peer=true + empty sni: accept.
+                    // Effective SNI falls back to upstream.host (§5.10).
                 }
                 // CA file validation — only when TLS + verify_peer is enabled.
                 // When verify_peer=false, the runtime skips CA loading, so a
