@@ -11,4 +11,4 @@ server_runner
 .vscode
 *.dSYM
 *.plist
-logs/compile_commands.json
+compile_commands.json
