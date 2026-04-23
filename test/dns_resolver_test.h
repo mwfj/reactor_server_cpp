@@ -1949,6 +1949,162 @@ inline void TestResolveManyDispatchDeadlineExpiresInternalItems() {
     }
 }
 
+// ---------- v0.53 P2: batch deadline clamps per-item deadline ----------
+
+// `ResolveMany` with `overall_timeout < req.timeout` must clamp each
+// WorkItem's internal deadline to `batch_deadline`. Without this,
+// items stay in state_->queue / state_->in_flight AFTER the caller
+// receives "resolve timeout exceeded" results, orphaning queue slots
+// and causing follow-up batches to hit "resolver saturated" on a
+// tight cap.
+//
+// Setup: resolver cap=2, one wedged warmup holding the only worker,
+// batch of 2 entries with per-entry timeout=5000ms BUT overall
+// batch timeout=60ms. Post-batch, submit a probe that needs a queue
+// slot — pre-fix, the two queued items carry `dispatch_time + 5000ms`
+// internal deadlines and keep the queue full; the probe is rejected
+// with "resolver saturated". Post-fix, the internal deadlines are
+// clamped to `batch_deadline` (≈60ms), the items evict on the
+// queue-time sweep, and the probe is admitted.
+inline void TestResolveManyBatchDeadlineClampsItemDeadline() {
+    std::cout << "\n[TEST] DnsResolver: ResolveMany batch deadline clamps item deadline..."
+              << std::endl;
+    try {
+        struct Gate {
+            std::mutex m;
+            std::condition_variable cv;
+            bool release = false;
+            int  calls = 0;
+        };
+        auto gate = std::make_shared<Gate>();
+
+        // cap=2 workers; one gets wedged below, leaving exactly one
+        // queue slot for post-batch probing.
+        DnsResolver resolver(MakeFastConfig(2));
+        resolver.SetMaxQueuedItemsForTesting(2);   // very tight cap
+
+        resolver.SetResolverForTesting([gate](const ResolveRequest& req) {
+            {
+                std::lock_guard<std::mutex> lk(gate->m);
+                ++gate->calls;
+            }
+            gate->cv.notify_all();
+            std::unique_lock<std::mutex> lk(gate->m);
+            gate->cv.wait(lk, [&] { return gate->release; });
+            ResolvedEndpoint r;
+            r.host = req.host; r.port = req.port; r.tag = req.tag;
+            r.addr = InetAddr("10.0.0.1", req.port);
+            return r;
+        });
+
+        // Wedge both workers so the next batch lands entirely in
+        // state_->queue. The 5000ms-timeout wedges keep their slots
+        // occupied for the duration of the test regardless of how
+        // the clamp behaves.
+        auto wedge_a = resolver.ResolveAsync(
+            MakeReq("wedge-a", 80, std::chrono::milliseconds(5000)));
+        auto wedge_b = resolver.ResolveAsync(
+            MakeReq("wedge-b", 80, std::chrono::milliseconds(5000)));
+        {
+            std::unique_lock<std::mutex> lk(gate->m);
+            gate->cv.wait_for(lk, std::chrono::milliseconds(200),
+                [&] { return gate->calls >= 2; });
+        }
+
+        // Batch with LONG per-entry timeouts (5s each) but a SHORT
+        // overall timeout (60ms). The caller-visible wait for each
+        // entry must terminate at batch_deadline ≈ 60ms, and the
+        // internal WorkItem deadline MUST also be clamped to
+        // batch_deadline so the items evict from the queue.
+        std::vector<ResolveRequest> batch;
+        batch.push_back(MakeReq("batch-a", 80,
+            std::chrono::milliseconds(5000)));
+        batch.push_back(MakeReq("batch-b", 80,
+            std::chrono::milliseconds(5000)));
+
+        const auto t_batch = std::chrono::steady_clock::now();
+        auto results = resolver.ResolveMany(
+            std::move(batch), std::chrono::milliseconds(60));
+        const auto batch_elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_batch).count();
+
+        bool ok = results.size() == 2;
+        int timeouts = 0;
+        for (const auto& r : results) {
+            if (r.error && r.error_code == EAI_AGAIN &&
+                r.error_message.find("timeout") != std::string::npos) {
+                ++timeouts;
+            }
+        }
+        ok = ok && timeouts == 2;
+        // Caller-visible wait is bounded by the batch ceiling plus
+        // scheduler slack.
+        ok = ok && batch_elapsed_ms < 250;
+
+        // Settling window. The reaper runs on a separate thread and
+        // may fire a few ms past the deadline even in the clamped
+        // case. 50ms is comfortably past batch_deadline (60ms) +
+        // typical scheduler slack and well short of the UNclamped
+        // 5000ms per-entry timeouts the pre-fix code would have
+        // enforced.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // Post-batch probe: must be admitted (NOT rejected with
+        // "resolver saturated"). Cap=2 with two wedged workers means
+        // the only way for a new item to get admitted is if the two
+        // batch items have been evicted from state_->queue. Pre-fix:
+        // they carry 5000ms deadlines, stay in queue, cap is already
+        // 2, probe rejects. Post-fix: clamp + reaper sweep evict
+        // them, queue has room, probe is admitted and eventually
+        // times out on its own short deadline.
+        const auto t_probe = std::chrono::steady_clock::now();
+        auto probe = resolver.ResolveAsync(
+            MakeReq("post-batch-probe", 80,
+                std::chrono::milliseconds(50)));
+        const bool probe_ready =
+            probe.wait_for(std::chrono::milliseconds(250))
+                == std::future_status::ready;
+        const auto probe_elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_probe).count();
+
+        ResolvedEndpoint probe_res;
+        if (probe_ready) probe_res = probe.get();
+
+        ok = ok && probe_ready;
+        ok = ok && probe_res.error;
+        ok = ok && probe_res.error_code == EAI_AGAIN;
+        // The regression's observable fingerprint is the saturation
+        // marker — any other EAI_AGAIN reason (queue-time, etc.) is
+        // acceptable.
+        ok = ok && probe_res.error_message.find("saturated")
+                    == std::string::npos;
+        ok = ok && probe_elapsed_ms < 250;
+
+        // Cleanup: release the wedged workers so the resolver tears
+        // down cleanly.
+        {
+            std::lock_guard<std::mutex> lk(gate->m);
+            gate->release = true;
+        }
+        gate->cv.notify_all();
+        (void)wedge_a.wait_for(std::chrono::milliseconds(500));
+        (void)wedge_b.wait_for(std::chrono::milliseconds(500));
+
+        Record("DnsResolver: ResolveMany batch deadline clamps item deadline",
+                ok,
+                "batch_elapsed=" + std::to_string(batch_elapsed_ms) +
+                " timeouts=" + std::to_string(timeouts) +
+                " probe_ready=" + std::to_string(probe_ready) +
+                " probe_elapsed=" + std::to_string(probe_elapsed_ms) +
+                " probe_msg=" + probe_res.error_message);
+    } catch (const std::exception& e) {
+        Record("DnsResolver: ResolveMany batch deadline clamps item deadline",
+                false, e.what());
+    }
+}
+
 // ---------- Queue-time deadline short-circuit ----------
 
 inline void TestQueueTimeDeadlineShortCircuits() {
@@ -2014,6 +2170,7 @@ inline void RunAllTests() {
     TestResolveAsyncRejectsOutOfRangePort();
     TestDeadlineCapturedBeforeLazyPoolSpawn();
     TestResolveManyDispatchDeadlineExpiresInternalItems();
+    TestResolveManyBatchDeadlineClampsItemDeadline();
     TestQueueTimeDeadlineShortCircuits();
 }
 

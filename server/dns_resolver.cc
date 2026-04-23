@@ -1144,7 +1144,22 @@ DnsResolver::ResolveMany(std::vector<ResolveRequest> requests,
         // causing `EAI_AGAIN "resolver saturated"` or worker starvation
         // for the next batch. Sharing one deadline between caller wait
         // and internal item expiry converges the two views.
-        const auto item_deadline = dispatch_time + req.timeout;
+        //
+        // v0.53 P2 fix: ALSO clamp to `batch_deadline`. When
+        // `overall_timeout < req.timeout` (e.g. one-arg
+        // `ResolveMany(requests)` whose `config_.overall_timeout_ms`
+        // is tighter than `config_.resolve_timeout_ms`, or a caller
+        // passing a sub-per-entry batch ceiling), the unclamped
+        // per-request deadline would keep the WorkItem alive in
+        // state_->queue / state_->in_flight AFTER the caller has
+        // received its "resolve timeout exceeded" result — same
+        // orphaned-work class as the original P2 fix above, but
+        // triggered by the OVERALL ceiling rather than by re-anchoring
+        // on submission `now()`. Clamping here makes the caller-
+        // visible expiry and the internal eviction converge at the
+        // same instant under any (overall, per-request) combination.
+        const auto item_deadline =
+            std::min(dispatch_time + req.timeout, batch_deadline);
         per_entry_deadlines.push_back(item_deadline);
         snapshot.push_back(req);
         // Bypass public ResolveAsync (which would re-anchor the deadline

@@ -161,11 +161,32 @@ UpstreamManager::UpstreamManager(
         //      change their on-the-wire ClientHello and break
         //      handshakes for no gain. The validator still rejects
         //      IP + empty sni + verify_peer=true (nothing verifiable).
+        //
+        // v0.53 P2 fix: `upstream.host` may still be bracketed (`[::1]`)
+        // on the direct-construction path — the legacy 2-arg ctor's
+        // `BuildResolvedFromLiterals` accepts bracketed IPv6 via
+        // `NormalizeHostToBare` but does NOT rewrite `upstream.host`,
+        // and the 3-arg ctor doesn't touch it either. Production
+        // config flows already strip brackets via
+        // `ConfigLoader::Normalize`, but direct-ctor callers (tests,
+        // embedders) would otherwise reach this site with `[::1]` in
+        // hand, fail the `IsIpLiteral` check (which validates bare
+        // forms only), and wrongly ship `[::1]` as SNI. Normalize
+        // here so both paths converge on the bare form; on malformed
+        // input (never reached in practice — both ctors grammar-
+        // validated upstream) fall back to the raw string so the
+        // downstream check behaves identically.
+        std::string host_for_sni;
+        if (!NET_DNS_NAMESPACE::DnsResolver::NormalizeHostToBare(
+                upstream.host, &host_for_sni)) {
+            host_for_sni = upstream.host;
+        }
+
         std::string effective_sni;
         if (!upstream.tls.sni_hostname.empty()) {
             effective_sni = upstream.tls.sni_hostname;
-        } else if (!NET_DNS_NAMESPACE::DnsResolver::IsIpLiteral(upstream.host)) {
-            effective_sni = upstream.host;
+        } else if (!NET_DNS_NAMESPACE::DnsResolver::IsIpLiteral(host_for_sni)) {
+            effective_sni = host_for_sni;
         }
         // else: IP-literal + empty sni_hostname → effective_sni stays empty.
 
