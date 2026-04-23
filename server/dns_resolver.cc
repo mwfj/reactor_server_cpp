@@ -77,24 +77,62 @@ namespace {
 // Static helpers — local to this TU
 // ---------------------------------------------------------------------------
 
-// Try inet_pton against AF_INET then AF_INET6. True on any match.
-bool ParseLiteral(const std::string& s) {
-    if (s.empty()) return false;
-    unsigned char buf[sizeof(struct in6_addr)];
-    if (::inet_pton(AF_INET,  s.c_str(), buf) == 1) return true;
-    if (::inet_pton(AF_INET6, s.c_str(), buf) == 1) return true;
-    return false;
+// Strict IPv4 dotted-quad pre-filter: exactly four dot-separated
+// segments, each 1-3 ASCII digits, each value <= 255, and NO leading
+// zero unless the octet is literally "0". Applied BEFORE inet_pton so
+// the accept / reject decision is identical across glibc (strict) and
+// BSD libc (lenient on leading zeros). Without this, macOS
+// `inet_pton(AF_INET, "0127.0.0.1")` returns 1 while glibc returns 0,
+// and the "reject legacy numeric-dotted forms" contract documented in
+// IsValidHostnameLabeled (no letter or hyphen → reject) never gets a
+// chance to run because ParseLiteral short-circuits first.
+bool IsStrictIpv4Literal(const std::string& s) {
+    if (s.empty() || s.size() > 15) return false;  // "255.255.255.255"
+    int dots = 0;
+    std::size_t seg_start = 0;
+    for (std::size_t i = 0; i <= s.size(); ++i) {
+        const bool at_boundary = (i == s.size() || s[i] == '.');
+        if (at_boundary) {
+            const std::size_t len = i - seg_start;
+            if (len < 1 || len > 3) return false;
+            // Reject leading zero unless the segment is exactly "0".
+            if (len > 1 && s[seg_start] == '0') return false;
+            int value = 0;
+            for (std::size_t k = seg_start; k < i; ++k) {
+                const unsigned char c = static_cast<unsigned char>(s[k]);
+                if (!std::isdigit(c)) return false;
+                value = value * 10 + (c - '0');
+            }
+            if (value > 255) return false;
+            if (i == s.size()) break;
+            ++dots;
+            seg_start = i + 1;
+        }
+    }
+    return dots == 3;
 }
 
-// RFC 3986 §3.2.2 IP-literal grammar: brackets are reserved for IPv6
-// (and IPvFuture — not supported here). IPv4 literals MUST appear
-// unbracketed. Review-round fix: ParseHostPort and NormalizeHostToBare
-// use THIS helper for the bracketed branch rather than the permissive
-// ParseLiteral (which also accepted bracketed IPv4 like "[127.0.0.1]").
+// Accept an IPv6 literal. BSD `inet_pton(AF_INET6, ...)` accepts
+// `%<zone>` suffixes per RFC 4007 (fe80::1%eth0 / fe80::1%5) and stores
+// the scope_id in sin6_scope_id; glibc rejects them. Phase 1 of the
+// IPv6 design explicitly rejects scope-id forms (§1.2.7) because they
+// leak into `X-Forwarded-For` / ACL / rate-limit pipelines that cannot
+// parse zone-id. Pre-filter `%` out before inet_pton so macOS and
+// Linux agree.
 bool ParseIpv6Literal(const std::string& s) {
     if (s.empty()) return false;
+    if (s.find('%') != std::string::npos) return false;   // §1.2.7
     unsigned char buf[sizeof(struct in6_addr)];
     return ::inet_pton(AF_INET6, s.c_str(), buf) == 1;
+}
+
+// Accept an IPv4 OR IPv6 literal. Strict cross-platform: uses
+// `IsStrictIpv4Literal` for the v4 gate and `ParseIpv6Literal`
+// (which rejects scope-id) for the v6 gate.
+bool ParseLiteral(const std::string& s) {
+    if (s.empty()) return false;
+    if (IsStrictIpv4Literal(s)) return true;
+    return ParseIpv6Literal(s);
 }
 
 // RFC 3986 §3.2.3 port = *DIGIT, capped by implementations at 16 bits.
