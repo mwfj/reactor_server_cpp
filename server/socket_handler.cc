@@ -33,9 +33,6 @@ int SocketHandler::CreateSocket(sa_family_t family) {
     // that need IPv6 pass AF_INET6 explicitly. SOCK_CLOEXEC atomically
     // avoids the fd-leaks-into-fork-exec race on Linux; macOS uses
     // fcntl(F_SETFD) in SetNonBlocking.
-    //
-    // v0.45 step 4: static (no access to member family_). Caller records
-    // the family by wrapping the returned fd in `SocketHandler(fd, family)`.
 #if defined(__linux__)
     int listenfd = ::socket(family, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
 #else
