@@ -375,8 +375,15 @@ static bool ReloadConfig(const std::string& config_path,
         for (const auto& u : current_config.upstreams) {
             live_names.insert(u.name);
         }
+        // Live scope sourced from the running AuthManager, NOT
+        // `current_config.auth.issuers` (which carries staged-but-
+        // deferred topology after `current_config = new_config`
+        // below). See AuthManager::LiveIssuerNames for the rationale.
+        std::unordered_set<std::string> live_issuer_names =
+            server.LiveAuthIssuerNames();
         try {
-            ConfigLoader::ValidateHotReloadable(new_config, live_names);
+            ConfigLoader::ValidateHotReloadable(
+                new_config, live_names, live_issuer_names);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Config reload rejected: {}", e.what());
             reopen_existing_logs();

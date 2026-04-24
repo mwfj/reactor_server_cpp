@@ -83,7 +83,11 @@ CIRCUIT_BREAKER_SRCS = $(SERVER_DIR)/circuit_breaker_window.cc $(SERVER_DIR)/cir
 # Note: JWT decode + signature verification is delegated to vendored jwt-cpp
 # (third_party/jwt-cpp/, header-only). See design spec §12.1 and r4/r5 revision
 # history for the library-adoption rationale.
-AUTH_SRCS = $(SERVER_DIR)/token_hasher.cc $(SERVER_DIR)/auth_policy_matcher.cc $(SERVER_DIR)/auth_claims.cc
+AUTH_SRCS = $(SERVER_DIR)/token_hasher.cc $(SERVER_DIR)/auth_policy_matcher.cc $(SERVER_DIR)/auth_claims.cc \
+            $(SERVER_DIR)/jwks_cache.cc $(SERVER_DIR)/auth_upstream_http_client.cc $(SERVER_DIR)/issuer.cc \
+            $(SERVER_DIR)/jwks_fetcher.cc $(SERVER_DIR)/oidc_discovery.cc $(SERVER_DIR)/jwt_verifier.cc \
+            $(SERVER_DIR)/auth_error_responses.cc $(SERVER_DIR)/auth_manager.cc $(SERVER_DIR)/auth_middleware.cc \
+            $(SERVER_DIR)/auth_url_util.cc
 
 # CLI layer sources
 CLI_SRCS = $(SERVER_DIR)/cli_parser.cc $(SERVER_DIR)/signal_handler.cc $(SERVER_DIR)/pid_file.cc $(SERVER_DIR)/daemonizer.cc
@@ -156,9 +160,9 @@ CIRCUIT_BREAKER_HEADERS = $(LIB_DIR)/circuit_breaker/circuit_breaker_state.h $(L
 # Auth headers. The vendored jwt-cpp headers are pulled into the dependency
 # graph so a bump-jwt-cpp PR correctly invalidates the whole build.
 JWT_CPP_DIR = $(THIRD_PARTY_DIR)/jwt-cpp/include/jwt-cpp
-AUTH_HEADERS = $(LIB_DIR)/auth/auth_context.h $(LIB_DIR)/auth/auth_config.h $(LIB_DIR)/auth/token_hasher.h $(LIB_DIR)/auth/auth_policy_matcher.h $(LIB_DIR)/auth/auth_claims.h $(JWT_CPP_DIR)/jwt.h $(JWT_CPP_DIR)/base.h $(JWT_CPP_DIR)/traits/nlohmann-json/defaults.h $(JWT_CPP_DIR)/traits/nlohmann-json/traits.h
+AUTH_HEADERS = $(LIB_DIR)/auth/auth_context.h $(LIB_DIR)/auth/auth_config.h $(LIB_DIR)/auth/token_hasher.h $(LIB_DIR)/auth/auth_policy_matcher.h $(LIB_DIR)/auth/auth_claims.h $(LIB_DIR)/auth/auth_result.h $(LIB_DIR)/auth/auth_url_util.h $(LIB_DIR)/auth/jwks_cache.h $(LIB_DIR)/auth/upstream_http_client.h $(LIB_DIR)/auth/issuer.h $(LIB_DIR)/auth/jwks_fetcher.h $(LIB_DIR)/auth/oidc_discovery.h $(LIB_DIR)/auth/jwt_verifier.h $(LIB_DIR)/auth/auth_error_responses.h $(LIB_DIR)/auth/auth_manager.h $(LIB_DIR)/auth/auth_middleware.h $(JWT_CPP_DIR)/jwt.h $(JWT_CPP_DIR)/base.h $(JWT_CPP_DIR)/traits/nlohmann-json/defaults.h $(JWT_CPP_DIR)/traits/nlohmann-json/traits.h
 CLI_HEADERS = $(LIB_DIR)/cli/cli_parser.h $(LIB_DIR)/cli/signal_handler.h $(LIB_DIR)/cli/pid_file.h $(LIB_DIR)/cli/version.h $(LIB_DIR)/cli/daemonizer.h
-TEST_HEADERS = $(TEST_DIR)/test_framework.h $(TEST_DIR)/http_test_client.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h $(TEST_DIR)/route_test.h $(TEST_DIR)/upstream_pool_test.h $(TEST_DIR)/proxy_test.h $(TEST_DIR)/rate_limit_test.h $(TEST_DIR)/kqueue_test.h $(TEST_DIR)/circuit_breaker_test.h $(TEST_DIR)/circuit_breaker_components_test.h $(TEST_DIR)/circuit_breaker_integration_test.h $(TEST_DIR)/circuit_breaker_retry_budget_test.h $(TEST_DIR)/circuit_breaker_wait_queue_drain_test.h $(TEST_DIR)/circuit_breaker_observability_test.h $(TEST_DIR)/circuit_breaker_reload_test.h $(TEST_DIR)/auth_foundation_test.h $(TEST_DIR)/dns_resolver_test.h $(TEST_DIR)/dual_stack_test.h
+TEST_HEADERS = $(TEST_DIR)/test_framework.h $(TEST_DIR)/http_test_client.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h $(TEST_DIR)/route_test.h $(TEST_DIR)/upstream_pool_test.h $(TEST_DIR)/proxy_test.h $(TEST_DIR)/rate_limit_test.h $(TEST_DIR)/kqueue_test.h $(TEST_DIR)/circuit_breaker_test.h $(TEST_DIR)/circuit_breaker_components_test.h $(TEST_DIR)/circuit_breaker_integration_test.h $(TEST_DIR)/circuit_breaker_retry_budget_test.h $(TEST_DIR)/circuit_breaker_wait_queue_drain_test.h $(TEST_DIR)/circuit_breaker_observability_test.h $(TEST_DIR)/circuit_breaker_reload_test.h $(TEST_DIR)/auth_foundation_test.h $(TEST_DIR)/jwt_verifier_test.h $(TEST_DIR)/jwks_cache_test.h $(TEST_DIR)/oidc_discovery_test.h $(TEST_DIR)/header_rewriter_auth_test.h $(TEST_DIR)/auth_manager_test.h $(TEST_DIR)/auth_integration_test.h $(TEST_DIR)/auth_failure_mode_test.h $(TEST_DIR)/auth_reload_test.h $(TEST_DIR)/auth_multi_issuer_test.h $(TEST_DIR)/auth_websocket_upgrade_test.h $(TEST_DIR)/auth_race_test.h $(TEST_DIR)/dns_resolver_test.h $(TEST_DIR)/dual_stack_test.h
 
 # All headers combined
 HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(DNS_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(FOUNDATION_HEADERS) $(HTTP_HEADERS) $(HTTP2_HEADERS) $(WS_HEADERS) $(TLS_HEADERS) $(UPSTREAM_HEADERS) $(RATE_LIMIT_HEADERS) $(CIRCUIT_BREAKER_HEADERS) $(AUTH_HEADERS) $(CLI_HEADERS) $(TEST_HEADERS)
@@ -263,6 +267,50 @@ test_auth: $(TARGET)
 	@echo "Running auth foundation tests only..."
 	./$(TARGET) auth
 
+test_jwt: $(TARGET)
+	@echo "Running JWT verifier unit tests only..."
+	./$(TARGET) jwt
+
+test_jwks: $(TARGET)
+	@echo "Running JWKS cache unit tests only..."
+	./$(TARGET) jwks
+
+test_oidc: $(TARGET)
+	@echo "Running OIDC discovery unit tests only..."
+	./$(TARGET) oidc
+
+test_hrauth: $(TARGET)
+	@echo "Running header rewriter auth overlay tests only..."
+	./$(TARGET) hrauth
+
+test_auth_mgr: $(TARGET)
+	@echo "Running AuthManager unit tests only..."
+	./$(TARGET) auth_mgr
+
+test_auth2: $(TARGET)
+	@echo "Running auth integration tests (Phase 2) only..."
+	./$(TARGET) auth2
+
+test_auth_fail: $(TARGET)
+	@echo "Running auth failure mode tests only..."
+	./$(TARGET) auth_fail
+
+test_auth_reload: $(TARGET)
+	@echo "Running auth reload tests only..."
+	./$(TARGET) auth_reload
+
+test_auth_multi: $(TARGET)
+	@echo "Running auth multi-issuer tests only..."
+	./$(TARGET) auth_multi
+
+test_auth_ws: $(TARGET)
+	@echo "Running auth WebSocket upgrade tests only..."
+	./$(TARGET) auth_ws
+
+test_auth_race: $(TARGET)
+	@echo "Running auth race condition tests only..."
+	./$(TARGET) auth_race
+
 # Display help information
 help:
 	@echo "Reactor Server C++ - Makefile Help"
@@ -343,4 +391,4 @@ help:
 # Build only the production server binary
 server: $(SERVER_TARGET)
 
-.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth help
+.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race help

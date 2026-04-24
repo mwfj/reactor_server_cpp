@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all tests (570 tests across 24 suites)
+make test               # Build and run all tests (799 tests across 35 suites, all pass)
 ./test_runner                   # Run all tests directly (after building)
 
 # Individual test suites
@@ -22,7 +22,18 @@ make test               # Build and run all tests (570 tests across 24 suites)
 ./test_runner proxy             # Proxy engine tests (or: ./test_runner -P)
 ./test_runner rate_limit        # Rate limit tests (or: ./test_runner -L)
 ./test_runner circuit_breaker   # Circuit breaker tests (or: ./test_runner -B)
-./test_runner auth              # OAuth Phase 1 foundation tests (or: ./test_runner -A)
+./test_runner auth              # OAuth foundation tests — Phase 1a utils (or: ./test_runner -A)
+./test_runner jwt               # JWT verifier unit tests (or: ./test_runner -J)
+./test_runner jwks              # JWKS cache unit tests (or: ./test_runner -j)
+./test_runner oidc              # OIDC discovery unit tests (or: ./test_runner -O)
+./test_runner hrauth            # HeaderRewriter auth-overlay tests (or: ./test_runner -W)
+./test_runner auth_mgr          # AuthManager unit tests (or: ./test_runner -M)
+./test_runner auth2             # Auth integration tests — Phase 2 (or: ./test_runner -V)
+./test_runner auth_fail         # Auth failure-mode tests (or: ./test_runner -F)
+./test_runner auth_reload       # Auth reload tests (or: ./test_runner -X)
+./test_runner auth_multi        # Auth multi-issuer tests (or: ./test_runner -I)
+./test_runner auth_ws           # Auth WebSocket-upgrade tests (or: ./test_runner -G)
+./test_runner auth_race         # Auth race-condition tests (or: ./test_runner -Q)
 ./test_runner kqueue            # macOS kqueue platform tests (or: ./test_runner -K)
 ./test_runner help              # Show all options
 
@@ -40,8 +51,21 @@ make test_upstream      # Build and run upstream pool tests
 make test_proxy         # Build and run proxy engine tests
 make test_rate_limit    # Build and run rate limit tests
 make test_circuit_breaker # Build and run circuit breaker tests
-make test_auth          # Build and run OAuth Phase 1 foundation tests
+make test_auth          # Build and run OAuth foundation tests (41)
+make test_jwt           # Build and run JWT verifier unit tests (21)
+make test_jwks          # Build and run JWKS cache unit tests (20)
+make test_oidc          # Build and run OIDC discovery unit tests (14)
+make test_hrauth        # Build and run HeaderRewriter auth-overlay tests (18)
+make test_auth_mgr      # Build and run AuthManager unit tests (20)
+make test_auth2         # Build and run auth integration tests (20)
+make test_auth_fail     # Build and run auth failure-mode tests (15)
+make test_auth_reload   # Build and run auth reload tests (14)
+make test_auth_multi    # Build and run auth multi-issuer tests (8)
+make test_auth_ws       # Build and run auth WebSocket-upgrade tests (6)
+make test_auth_race     # Build and run auth race-condition tests (10)
 ```
+
+At current head, `./test_runner` reports **799 / 799 passing** (100 %). Three new backpressure integration tests were added alongside the kqueue EV_EOF coalescing fix — see `.claude/documents/bug-fixes/KQUEUE_EOF_COALESCING_RACE.md` for background.
 
 ## Test Suites
 
@@ -68,7 +92,18 @@ make test_auth          # Build and run OAuth Phase 1 foundation tests
 | Circuit Breaker (wait-queue drain) | 2 | ephemeral | `test/circuit_breaker_wait_queue_drain_test.h` | (bundled with `circuit_breaker`) |
 | Circuit Breaker (observability) | 3 | ephemeral | `test/circuit_breaker_observability_test.h` | (bundled with `circuit_breaker`) |
 | Circuit Breaker (reload) | 7 | ephemeral | `test/circuit_breaker_reload_test.h` | (bundled with `circuit_breaker`) |
-| Auth Foundation (Phase 1) | 41 | N/A | `test/auth_foundation_test.h` | `./test_runner auth` |
+| Auth Foundation (Phase 1a utilities) | 41 | N/A | `test/auth_foundation_test.h` | `./test_runner auth` |
+| JWT Verifier (Phase 2 unit) | 21 | N/A | `test/jwt_verifier_test.h` | `./test_runner jwt` |
+| JWKS Cache (Phase 2 unit) | 20 | N/A | `test/jwks_cache_test.h` | `./test_runner jwks` |
+| OIDC Discovery (Phase 2 unit) | 14 | N/A | `test/oidc_discovery_test.h` | `./test_runner oidc` |
+| HeaderRewriter Auth Overlay | 18 | N/A | `test/header_rewriter_auth_test.h` | `./test_runner hrauth` |
+| AuthManager (Phase 2 unit) | 20 | N/A | `test/auth_manager_test.h` | `./test_runner auth_mgr` |
+| Auth Integration (HTTP end-to-end) | 20 | ephemeral | `test/auth_integration_test.h` | `./test_runner auth2` |
+| Auth Failure Modes | 15 | ephemeral | `test/auth_failure_mode_test.h` | `./test_runner auth_fail` |
+| Auth Reload | 14 | ephemeral | `test/auth_reload_test.h` | `./test_runner auth_reload` |
+| Auth Multi-Issuer | 8 | ephemeral | `test/auth_multi_issuer_test.h` | `./test_runner auth_multi` |
+| Auth WebSocket Upgrade | 6 | ephemeral | `test/auth_websocket_upgrade_test.h` | `./test_runner auth_ws` |
+| Auth Race Conditions | 10 | ephemeral | `test/auth_race_test.h` | `./test_runner auth_race` |
 | Kqueue | 7 | ephemeral | `test/kqueue_test.h` | `./test_runner kqueue` (macOS only, skipped on Linux) |
 
 ### Basic Tests
@@ -171,6 +206,23 @@ Uses a real `HttpServer` instance as the upstream backend with ephemeral ports. 
 **Edge cases (3 tests):** Empty client_ip skip, capacity=1, very high rate (1e6) without integer overflow.
 
 Total: 46 tests. Uses ephemeral ports via `TestServerRunner<HttpServer>` for integration paths.
+
+### OAuth 2.0 Auth Tests
+
+Auth coverage is split across 12 suites (41 Phase 1a foundation + 166 Phase 1b/2 — 207 tests total):
+
+- **Foundation** (41) — token hashing, claim extraction, policy matcher, config schema / validation / reload-safety. Pure utilities; no server needed.
+- **JWT Verifier** (21) — jwt-cpp wrapping, algorithm allowlist, signature / exp / nbf / aud / iss failures, `alg:none` rejection, leeway handling.
+- **JWKS Cache** (20) — installs + lookups, TTL expiry, kid miss, stale-on-error, coalesced refresh CAS, hard-cap trimming, snapshot stats.
+- **OIDC Discovery** (14) — `.well-known/openid-configuration` parsing, retry-on-failure with shared-pointer cancel token, malformed-JSON containment, `Cancel()` idempotency.
+- **HeaderRewriter Auth Overlay** (18) — strip-then-inject ordering, `claims_to_headers`, `preserve_authorization`, `raw_jwt_header` opt-in, client-spoof defense on `X-Auth-Undetermined`, reserved-name enforcement.
+- **AuthManager unit** (20) — policy matching, bearer extraction, reload-safe snapshots, generation counter, issuer topology stability.
+- **Integration** (20) — end-to-end through `HttpServer` + `AuthManager` middleware with fake IdP: ALLOW / 401 / 403 / 503 paths, multi-issuer routing, `on_undetermined: allow`.
+- **Failure modes** (15) — IdP unreachable, JWKS fetch timeout, kid miss with stale-served fallback, malformed token containment.
+- **Reload** (14) — live-reloadable field propagation, restart-required topology warns, in-flight-request snapshot consistency across reload.
+- **Multi-issuer** (8) — `PeekIssuer` routing, allowlist enforcement, cross-issuer claim rejection.
+- **WebSocket upgrade** (6) — auth enforcement through the HTTP/1.1 upgrade handshake.
+- **Race conditions** (10) — concurrent kid-miss refreshes, reload-while-verifying, issuer destruction with in-flight OIDC retry.
 
 ### Kqueue Tests (macOS only)
 - EVFILT_TIMER idle timeout verification

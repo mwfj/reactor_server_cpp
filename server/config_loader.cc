@@ -1,5 +1,7 @@
 #include "config/config_loader.h"
 #include "auth/auth_config.h"
+#include "auth/auth_url_util.h"        // AUTH_NAMESPACE::HasHttpsScheme
+#include "auth/jws_algorithms.h"
 #include "http2/http2_constants.h"
 #include "http/route_trie.h"         // ParsePattern, ValidatePattern for proxy route_prefix
 #include "log/logger.h"
@@ -84,7 +86,7 @@ static int ParseStrictInt(const nlohmann::json& j, const std::string& key,
 // Header-name allow-list helper for auth.forward.
 //
 // auth.forward injects HTTP request headers into the forwarded upstream
-// request via HeaderRewriter (Phase 2 wiring). If an operator misconfigures
+// request via HeaderRewriter. If an operator misconfigures
 // the output names to reserved categories, the resulting request would be
 // either malformed, ambiguous, or spoofable:
 //
@@ -183,6 +185,14 @@ static bool IsReservedAuthForwardHeader(const std::string& lower) {
         // per-name flag off) because these names carry proxy-chain /
         // hop semantics that must not be repurposed for identity.
         "via", "x-forwarded-for", "x-forwarded-proto",
+        // Gateway-owned: HeaderRewriter emits the undetermined sentinel
+        // here and unconditionally erases client copies on every
+        // outbound rewrite (server/header_rewriter.cc lines ~97 +
+        // ~172-283). An operator mapping subject_header / raw_jwt_header
+        // / a claims_to_headers target to this name would validate
+        // cleanly but see the configured value silently dropped at
+        // runtime — reject at load instead.
+        "x-auth-undetermined",
     };
     return kReserved.count(lower) > 0;
 }
@@ -223,10 +233,10 @@ static void ParseAuthPolicy(const nlohmann::json& j, AUTH_NAMESPACE::AuthPolicy&
     if (!j.is_object()) {
         throw std::invalid_argument(context + " must be a JSON object");
     }
-    // Defensive reset: callers today pass fresh AuthPolicy locals, but the
-    // reload path (future Phase 3) can easily re-parse into an existing
-    // object, in which case the *_vec fields would otherwise accumulate
-    // entries across reloads. Clear up front — the only state preserved
+    // Defensive reset: callers today pass fresh AuthPolicy locals, but a
+    // reload path can easily re-parse into an existing object, in which case
+    // the *_vec fields would otherwise accumulate entries across reloads.
+    // Clear up front — the only state preserved
     // across ParseAuthPolicy is what this function explicitly rewrites.
     out.applies_to.clear();
     out.issuers.clear();
@@ -478,9 +488,9 @@ static void ParseAuthConfig(const nlohmann::json& j, AUTH_NAMESPACE::AuthConfig&
     }
 }
 
-// PR #20 streaming-response validation bounds. Anonymous namespace keeps
-// these file-private without colliding with the `static`-qualified helpers
-// above; both patterns coexist in this file.
+// Streaming-response validation bounds. Anonymous namespace keeps these
+// file-private without colliding with the `static`-qualified helpers above;
+// both patterns coexist in this file.
 namespace {
 
 constexpr uint32_t kMinRelayBufferLimitBytes = 16 * 1024;
@@ -1375,7 +1385,8 @@ static void ValidateDnsHotReloadable(const ServerConfig& config) {
 
 void ConfigLoader::ValidateHotReloadable(
         const ServerConfig& config,
-        const std::unordered_set<std::string>& live_upstream_names) {
+        const std::unordered_set<std::string>& live_upstream_names,
+        const std::unordered_set<std::string>& live_issuer_names) {
     // Mirrors the circuit_breaker validation block in Validate().
     // Kept in lock-step with that block — any rule added there for a
     // hot-reloadable field must be added here too, or the SIGHUP
@@ -1479,6 +1490,126 @@ void ConfigLoader::ValidateHotReloadable(
                 idx + " ('" + u.name +
                 "'): circuit_breaker.retry_budget_min_concurrency must be >= 0");
         }
+    }
+
+    // Auth hot-reloadable field validation. Mirrors the per-issuer range and
+    // format checks in Validate(), but scoped to fields that AuthManager::Reload
+    // and Issuer::ApplyReload actually write into live state. Topology-restart
+    // fields (issuer_url, mode, upstream, discovery) are excluded — they are
+    // rejected by Issuer::ApplyReload before touching live state.
+    //
+    // Scoping: only validate issuers that EXIST in the running AuthManager.
+    // A new/renamed issuer has no live peer to apply to and will be rejected
+    // as restart-required by AuthManager::Reload; failing the whole hot-
+    // reload on a typo in such a staged-only issuer would block unrelated
+    // live-safe edits (e.g. rate_limit tuning, CB thresholds). The full
+    // startup Validate catches those typos when the operator restarts.
+    // Empty live set means "no live auth runtime" — no apply path can
+    // touch these fields, skip the block entirely (same pattern as the
+    // live_upstream_names-scoped CB loop above). The `count(name) == 0`
+    // test naturally skips every entry when the set is empty.
+    //
+    // EXCEPTION: `mode == "introspection"` is rejected UNCONDITIONALLY for
+    // every issuer in the staged config, live or not. Per design §5.3 /
+    // §18.5, introspection mode is deferred to Phase 3. Scoping the reject
+    // to live-only would mean a staged-only new issuer with
+    // mode=introspection passes SIGHUP validation silently (it's "restart-
+    // required topology" from the reload path's POV), the operator sees
+    // "reload OK", and the next server restart fails startup Validate.
+    // That's exactly the "valid on SIGHUP, fails on restart" asymmetry the
+    // hot-reload validator exists to prevent.
+    for (const auto& [name, ic] : config.auth.issuers) {
+        if (ic.mode == "introspection") {
+            throw std::invalid_argument(
+                "auth.issuers." + name +
+                ".mode=\"introspection\" is deferred to Phase 3. "
+                "Use mode=\"jwt\" with a JWKS-backed issuer in v1.");
+        }
+    }
+    for (const auto& [name, ic] : config.auth.issuers) {
+        if (live_issuer_names.count(name) == 0) {
+            continue;
+        }
+        const std::string ctx = "auth.issuers." + name;
+        if (ic.leeway_sec < 0) {
+            throw std::invalid_argument(ctx + ".leeway_sec must be >= 0");
+        }
+        if (ic.jwks_cache_sec <= 0) {
+            throw std::invalid_argument(ctx + ".jwks_cache_sec must be > 0");
+        }
+        if (ic.jwks_refresh_timeout_sec <= 0) {
+            throw std::invalid_argument(
+                ctx + ".jwks_refresh_timeout_sec must be > 0");
+        }
+        if (ic.discovery_retry_sec <= 0) {
+            throw std::invalid_argument(
+                ctx + ".discovery_retry_sec must be > 0");
+        }
+        // algorithms must be non-empty for jwt mode AND must match the
+        // v1 asymmetric allowlist. Mirrors Validate() so hot-reload and
+        // startup reject the same set — without this a SIGHUP flipping
+        // algorithms to HS256/none/PS256 would install an empty runtime
+        // allowlist that returns UNDETERMINED for every subsequent token.
+        if (ic.mode == "jwt" && ic.algorithms.empty()) {
+            throw std::invalid_argument(
+                ctx + ".algorithms must contain at least one entry for "
+                "mode=\"jwt\" (supported: RS256/RS384/RS512/ES256/ES384)");
+        }
+        for (const auto& a : ic.algorithms) {
+            if (!AUTH_NAMESPACE::IsSupportedJwsAlg(a)) {
+                throw std::invalid_argument(
+                    ctx + ".algorithms contains unsupported value '" + a +
+                    "' (v1 supports only RS256/RS384/RS512/ES256/ES384; "
+                    "HS*/none/PS*/auto are deferred per design spec §15)");
+            }
+        }
+        // mode=introspection is rejected unconditionally in the pre-pass
+        // above — no per-issuer check needed here.
+    }
+
+    // Auth.forward and top-level policy structural validation. These
+    // hard-reject here — matching startup — but ONLY when the staged
+    // auth config is actually going to be published live this cycle.
+    // If the staged auth won't land (no live AuthManager runtime, or
+    // the staged issuer topology diverges from live so AuthManager::
+    // Reload will skip), the staged forward/policies never reach
+    // Commit — running the validators anyway would block unrelated
+    // live-safe edits (log level, rate_limit, etc.) on a reload whose
+    // auth portion is already being deferred.
+    //
+    // auth_will_publish mirrors the preconditions AuthManager::Reload
+    // uses to decide whether to publish:
+    //   * `live_issuer_names.empty()` → no live auth runtime (manager
+    //     absent or never had issuers) → Reload can't commit. Skip.
+    //   * Staged issuer name set != live set → topology change; Reload
+    //     rejects with "restart required" and preserves live state.
+    //     Skip so staged forward/policies that will never apply don't
+    //     abort the reload.
+    //
+    // Note on issuer-reference scope: staged policies referencing
+    // staged-only issuers are NOT rejected here — handled by whole-
+    // policy defer in the merge (design §11.2 step 4 / §18.5). The
+    // helpers below only check that referenced issuer names exist in
+    // the STAGED config (typo-rejection). Empty-issuer / empty-
+    // applies_to / duplicate-name / reserved-header are live-safe
+    // shape checks that apply equally to startup and reload — but
+    // only matter on the reload path when auth actually publishes.
+    bool auth_will_publish = !live_issuer_names.empty();
+    if (auth_will_publish &&
+        config.auth.issuers.size() != live_issuer_names.size()) {
+        auth_will_publish = false;
+    }
+    if (auth_will_publish) {
+        for (const auto& [name, _] : config.auth.issuers) {
+            if (live_issuer_names.count(name) == 0) {
+                auth_will_publish = false;
+                break;
+            }
+        }
+    }
+    if (auth_will_publish) {
+        ValidateAuthForward(config);
+        ValidateTopLevelPolicies(config);
     }
 
     // DNS hot-reloadable subset. Invariant: every reloadable
@@ -2044,10 +2175,6 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
     // shape.
     // -------------------------------------------------------------------
     {
-        // Supported asymmetric algorithm allowlist — v1.
-        const std::unordered_set<std::string> kAllowedAlgs = {
-            "RS256", "RS384", "RS512", "ES256", "ES384"
-        };
         // Collect upstream names to validate `issuer.upstream` references.
         std::unordered_set<std::string> upstream_names;
         for (const auto& u : config.upstreams) upstream_names.insert(u.name);
@@ -2063,32 +2190,43 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 throw std::invalid_argument(ctx + ".issuer_url is required");
             }
             // TLS-mandatory to IdP (design spec §9 item 4). Plaintext rejected.
-            if (ic.issuer_url.rfind("https://", 0) != 0) {
+            // Case-insensitive scheme per RFC 3986 §3.1.
+            if (!AUTH_NAMESPACE::HasHttpsScheme(ic.issuer_url)) {
                 throw std::invalid_argument(
                     ctx + ".issuer_url must start with https:// (plaintext "
                     "IdP traffic is rejected for security)");
             }
-            // Mode whitelist; `auto` is deferred per spec §15.
+            // Mode whitelist. `auto` is deferred per spec §15. And until
+            // Phase 3 lands the introspection dispatch in AuthManager,
+            // accepting `mode="introspection"` would silently route opaque
+            // tokens into the JWT verifier which then rejects them as
+            // malformed — a fail-undetermined loop operators can't debug.
+            // Reject at config load (both startup and SIGHUP) so the
+            // config error is immediate and actionable.
             if (ic.mode != "jwt" && ic.mode != "introspection") {
                 throw std::invalid_argument(
                     ctx + ".mode must be one of: \"jwt\", \"introspection\"");
             }
-            // Algorithm allowlist — reject HS*/none/PS*/unknown. Phase 1 is
-            // asymmetric-only; HS* needs symmetric-secret provisioning
-            // (deferred, spec §15).
+            if (ic.mode == "introspection") {
+                throw std::invalid_argument(
+                    ctx + ".mode=\"introspection\" is deferred to Phase 3. "
+                    "Use mode=\"jwt\" with a JWKS-backed issuer in v1 "
+                    "(see design spec §14 Phase 3 — introspection).");
+            }
+            // Algorithm allowlist — reject HS*/none/PS*/unknown.
+            // HS* requires symmetric-secret provisioning (deferred, spec §15).
             for (const auto& a : ic.algorithms) {
-                if (kAllowedAlgs.count(a) == 0) {
+                if (!AUTH_NAMESPACE::IsSupportedJwsAlg(a)) {
                     throw std::invalid_argument(
                         ctx + ".algorithms contains unsupported value '" + a +
                         "' (v1 supports only RS256/RS384/RS512/ES256/ES384; "
                         "HS*/none/PS*/auto are deferred per design spec §15)");
                 }
             }
-            // Referenced upstream is mandatory. An issuer without a bound
-            // UpstreamHostPool has no way to talk to the IdP in Phase 2 —
-            // JWKS refresh, OIDC discovery, and RFC 7662 introspection all
-            // route through UpstreamManager. Reject at config load so the
-            // misconfig surfaces here instead of at first request.
+            // Referenced upstream is mandatory — JWKS refresh, OIDC
+            // discovery, and RFC 7662 introspection all route through
+            // UpstreamManager. Reject at config load so the misconfig
+            // surfaces here instead of at first request.
             //
             // This is a STRUCTURAL check (is the field set at all?) and so
             // fires unconditionally — independent of the cross-reference
@@ -2144,9 +2282,8 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             }
 
             // Mode-specific required fields (design spec §5.3).
-            // jwt mode requires at least one algorithm (the allowlist the
-            // Phase-2 verifier will build `allow_algorithm(key)` calls over)
-            // and a key source — either OIDC discovery OR a static jwks_uri.
+            // jwt mode requires at least one algorithm and a key source —
+            // either OIDC discovery OR a static jwks_uri.
             // introspection mode requires the endpoint (the POST target).
             if (ic.mode == "jwt") {
                 if (ic.algorithms.empty()) {
@@ -2174,8 +2311,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 // staged with `mode="introspection"` + endpoint but no
                 // credentials would load successfully and fail every
                 // introspection call at request time. Reject at load
-                // instead, so the misconfig surfaces before enforcement
-                // lands in Phase 2.
+                // instead, so the misconfig surfaces early.
                 const auto& is = ic.introspection;
                 if (is.client_id.empty()) {
                     throw std::invalid_argument(
@@ -2257,18 +2393,19 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             //
             // Both checks are conditional — if the field is empty, mode
             // validation above has already either required it (and would
-            // have thrown) or made it discovery-supplied (and the discovered
-            // URL gets validated at fetch time in Phase 2). We only need
-            // to validate the static value here.
+            // have thrown) or made it discovery-supplied (discovered URLs
+            // are validated at fetch time). We only need to validate the
+            // static value here.
+            // Case-insensitive scheme per RFC 3986 §3.1.
             if (!ic.jwks_uri.empty() &&
-                ic.jwks_uri.rfind("https://", 0) != 0) {
+                !AUTH_NAMESPACE::HasHttpsScheme(ic.jwks_uri)) {
                 throw std::invalid_argument(
                     ctx + ".jwks_uri must start with https:// — plaintext "
                     "JWKS allows MITM key substitution and would compromise "
                     "token verification (design spec §9 item 4)");
             }
             if (!ic.introspection.endpoint.empty() &&
-                ic.introspection.endpoint.rfind("https://", 0) != 0) {
+                !AUTH_NAMESPACE::HasHttpsScheme(ic.introspection.endpoint)) {
                 throw std::invalid_argument(
                     ctx + ".introspection.endpoint must start with https:// "
                     "— plaintext introspection would leak bearer tokens and "
@@ -2292,102 +2429,25 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             }
         }
 
-        // Top-level policy validation.
-        for (size_t i = 0; i < config.auth.policies.size(); ++i) {
-            const auto& p = config.auth.policies[i];
-            const std::string ctx =
-                "auth.policies[" + std::to_string(i) + "]";
-            // Per AuthPolicy contract (auth_config.h): top-level policies
-            // require a non-empty `name`. Inline policies (proxy.auth) are
-            // anonymous because they're identified by their parent
-            // upstream's name, but top-level entries have no surrounding
-            // context — without a name, log lines and metrics for a deny
-            // / 401 / collision can only point to the array index, which
-            // is unstable across config edits and useless once the config
-            // file is reordered. Reject empty/whitespace-only names so
-            // every operator-visible log line for a top-level policy
-            // names something stable.
-            bool name_blank = p.name.empty();
-            if (!name_blank) {
-                name_blank = true;
-                for (char c : p.name) {
-                    if (!std::isspace(static_cast<unsigned char>(c))) {
-                        name_blank = false;
-                        break;
-                    }
-                }
-            }
-            if (name_blank) {
-                throw std::invalid_argument(
-                    ctx + ".name is required for top-level policies "
-                    "(inline proxy.auth policies inherit identity from "
-                    "their parent upstream; top-level entries have none "
-                    "and operator-visible logs/metrics need a stable "
-                    "identifier — array index is unstable across edits)");
-            }
-            if (p.on_undetermined != "deny" && p.on_undetermined != "allow") {
-                throw std::invalid_argument(
-                    ctx + ".on_undetermined must be \"deny\" or \"allow\"");
-            }
-            for (const auto& issuer_name : p.issuers) {
-                if (config.auth.issuers.count(issuer_name) == 0) {
-                    throw std::invalid_argument(
-                        ctx + ".issuers references unknown issuer '" +
-                        issuer_name + "'");
-                }
-            }
-            // applies_to is the prefix list that drives runtime matching;
-            // an enabled policy without it never matches any path → silent
-            // dead policy → routes the operator INTENDED to protect are
-            // left wide open at runtime. Reject loudly. Disabled policies
-            // are allowed to have empty applies_to (mid-construction state
-            // during the rollout — operator may be filling fields in
-            // increments before flipping enabled).
-            if (p.enabled && p.applies_to.empty()) {
-                throw std::invalid_argument(
-                    ctx + " is enabled but has no applies_to prefixes — "
-                    "the policy would never match any path. Add at least "
-                    "one prefix to applies_to, or set enabled=false until "
-                    "the prefix list is ready.");
-            }
+        // Top-level policy structural validation (name uniqueness, on_
+        // undetermined, issuer xref, enabled-shape). Delegated so the
+        // SIGHUP path can run the same checks and hard-reject before
+        // Commit publishes the snapshot.
+        ValidateTopLevelPolicies(config);
 
-            // applies_to entries are consumed ONLY by AUTH_NAMESPACE::FindPolicyForPath
-            // which does literal byte-prefix matching (design spec §3.2).
-            // No route_trie is involved in this path — the string is taken
-            // verbatim as the prefix to compare against each request's URL
-            // path bytes. So applies_to values can legitimately contain
-            // any printable characters, including ':' and '*' that would
-            // look like route-trie pattern syntax (e.g. a docs system with
-            // `/docs/:faq` as a LITERAL URL, or `/assets/*latest` where
-            // `*latest` is a literal filename prefix).
-            //
-            // We deliberately do NOT run ROUTE_TRIE::ParsePattern here:
-            // there's no second matcher that interprets the pattern, so
-            // there's no mismatch risk (unlike inline `proxy.auth`, where
-            // the trie AND the auth matcher both consume the same
-            // route_prefix and disagree on semantics — that case still
-            // rejects patterned prefixes).
-            //
-            // If an operator writes `/api/:version/` here EXPECTING trie
-            // semantics, they'll get literal matching only. That's an
-            // operator-education problem, not a validator problem; the
-            // matcher's behavior is unambiguous and trying to guess
-            // intent would incorrectly reject legitimate literal URLs.
-        }
+        // applies_to on top-level `auth.policies[]` entries is consumed
+        // ONLY by the literal-byte-prefix matcher (design §3.2). Values
+        // like `/assets/*latest` or `/docs/:faq` are valid LITERAL URLs
+        // — unlike inline `proxy.auth.route_prefix`, there's no second
+        // matcher (route_trie) reinterpreting them, so no mismatch risk.
+        // No ROUTE_TRIE::ParsePattern check here.
 
-        // Inline proxy.auth validation + exact-prefix collision detection.
-        // Per spec §3.2 / §5.2: a prefix that appears in both an inline
-        // proxy.auth and a top-level auth.policies[].applies_to is a
-        // hard-reject config error (ambiguity, not resolved at runtime).
-        // Same rule applies across ALL prefix sources: two inline proxies
-        // with the same route_prefix, one top-level policy with the same
-        // prefix declared twice in its applies_to, or two top-level
-        // policies sharing any prefix.
-        //
-        // Unified `all_prefixes` map catches every collision shape. Keyed
-        // by prefix string; value is a human-readable owner description.
-        std::unordered_map<std::string, std::string> all_prefixes;
-
+        // Inline proxy.auth structural validation. Exact-prefix
+        // collision detection (across inline + top-level applies_to) is
+        // delegated to ValidateAuthPrefixCollisions below — keeping it
+        // separate lets the SIGHUP reload path call only the collision
+        // check against the full new_config when its `Validate` runs on
+        // a stripped-upstreams copy.
         for (const auto& u : config.upstreams) {
             const auto& p = u.proxy.auth;
             const std::string ctx = "upstreams['" + u.name + "'].proxy.auth";
@@ -2491,172 +2551,219 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 }
             }
 
-            // ---- Collision detection: ENABLED-only ----
-            //
-            // Per spec §3.2, only enabled inline policies participate in
-            // the runtime longest-prefix matcher. Disabled policies are
-            // inert at request time, so they shouldn't collide with each
-            // other or with top-level policies. (This matches the prior
-            // reviewer round's guidance that the "enable a disabled
-            // policy and discover a collision later" flow is a deliberate
-            // UX trade-off, not a bug — and confirms the gate is the
-            // right place to draw the structural-vs-collision line.)
-            if (!p.enabled) continue;
-
-            const std::string owner =
-                "inline proxy.auth on upstream '" + u.name + "'";
-            auto ins = all_prefixes.emplace(u.proxy.route_prefix, owner);
-            if (!ins.second) {
-                throw std::invalid_argument(
-                    "auth policy prefix '" + u.proxy.route_prefix +
-                    "' declared by both " + ins.first->second + " and " +
-                    owner + " — exact-prefix collisions must be resolved at "
-                    "config time (design spec §3.2)");
-            }
         }
-        // Top-level policies: catches (a) top-level vs inline, (b) two
-        // top-level policies sharing a prefix, (c) one top-level policy
-        // listing the same prefix twice in its applies_to. This is the
-        // guarantee the `auth_policy_matcher::ValidatePolicyList` helper
-        // was designed to enforce — ConfigLoader::Validate is the correct
-        // place to call it because collisions must be a load-time error,
-        // not a silent runtime first-wins.
-        //
-        // SYMMETRY with inline policies: only ENABLED top-level policies
-        // participate in the runtime longest-prefix matcher (per spec §3.2),
-        // so only they should drive collision detection. We already skip
-        // disabled inline proxy.auth above — applying the same rule to
-        // top-level keeps the two paths consistent and lets operators
-        // pre-stage disabled top-level policies during the rollout
-        // without spurious collision errors. (Without this, an operator
-        // who staged two top-level policies with identical applies_to
-        // — both disabled, intentionally inert — would see Validate
-        // reject the config even though the runtime would never match
-        // either of them.)
-        for (size_t i = 0; i < config.auth.policies.size(); ++i) {
-            const auto& p = config.auth.policies[i];
-            if (!p.enabled) continue;  // Symmetry with inline path
-            const std::string policy_owner =
-                p.name.empty()
-                    ? ("auth.policies[" + std::to_string(i) + "]")
-                    : ("auth.policies['" + p.name + "']");
-            for (const auto& pref : p.applies_to) {
-                auto ins = all_prefixes.emplace(pref, policy_owner);
-                if (!ins.second) {
-                    throw std::invalid_argument(
-                        "auth policy prefix '" + pref + "' declared by both " +
-                        ins.first->second + " and " + policy_owner +
-                        " — exact-prefix collisions must be resolved at "
-                        "config time (design spec §3.2)");
-                }
-            }
-        }
+        // Exact-prefix collision detection (inline ↔ top-level + within
+        // each set). Single call covers all four collision shapes per
+        // spec §3.2 / §5.2; same helper is invoked by HttpServer::Reload
+        // on the SIGHUP path so the strict reload gate is symmetric.
+        ValidateAuthPrefixCollisions(config);
 
-        // Forward config: reject header-name collisions among the fixed
-        // output slots and the claims_to_headers map. Design §5.3.
-        // Run unconditionally — the default AuthForwardConfig has three
-        // distinct non-empty header names that trivially pass the set
-        // insertion, and an operator who writes the defaults back
-        // explicitly in JSON gets the same (correct) treatment.
-        {
-            std::unordered_set<std::string> output_headers;
-            auto add_header = [&output_headers](const std::string& name,
-                                                const std::string& which) {
-                if (name.empty()) return;
-                // Validate the ORIGINAL case-preserved name against RFC
-                // 7230 §3.2.6 tchar. An invalid name would pass through
-                // HttpRequestSerializer verbatim and produce malformed
-                // HTTP on every forwarded request. Check first — a
-                // malformed name CAN'T meaningfully be reserved or
-                // non-reserved, so field-name validity is more
-                // fundamental than the reserved/duplicate checks below.
-                if (!IsValidHttpFieldName(name)) {
-                    throw std::invalid_argument(
-                        "auth.forward." + which + " '" + name +
-                        "' contains characters not valid in an HTTP field "
-                        "name (RFC 7230 §3.2.6 `token`: A-Z a-z 0-9 and "
-                        "!#$%&'*+-.^_`|~). Spaces, slashes, colons, and "
-                        "other punctuation are forbidden.");
-                }
-                std::string lower;
-                lower.reserve(name.size());
-                for (char c : name) {
-                    lower.push_back(static_cast<char>(
-                        std::tolower(static_cast<unsigned char>(c))));
-                }
-                // Reserved-name check FIRST (security): hop-by-hop / pseudo /
-                // framing-critical / Authorization names would corrupt or
-                // spoof the forwarded request. See IsReservedAuthForwardHeader
-                // for the full categorization. Reject before the duplicate
-                // check so the operator sees the more-actionable error.
-                if (IsReservedAuthForwardHeader(lower)) {
-                    throw std::invalid_argument(
-                        "auth.forward." + which + " '" + name +
-                        "' is a reserved/hop-by-hop/pseudo/framing header "
-                        "name and must not be used as an auth-forward output "
-                        "(would corrupt or spoof the upstream request); pick "
-                        "an X-prefixed name like 'X-Auth-Subject' instead");
-                }
-                if (!output_headers.insert(lower).second) {
-                    throw std::invalid_argument(
-                        "auth.forward." + which + " '" + name +
-                        "' collides with another output header name "
-                        "(case-insensitive)");
-                }
-            };
-            add_header(config.auth.forward.subject_header, "subject_header");
-            add_header(config.auth.forward.issuer_header, "issuer_header");
-            add_header(config.auth.forward.scopes_header, "scopes_header");
-            add_header(config.auth.forward.raw_jwt_header, "raw_jwt_header");
-            for (const auto& [claim, header] :
-                 config.auth.forward.claims_to_headers) {
-                add_header(header, "claims_to_headers[" + claim + "]");
-            }
-        }
+        // Forward-header structural validation (reserved / tchar /
+        // collision). Delegated so the SIGHUP path can call the same
+        // helper and reject before Commit publishes the snapshot.
+        ValidateAuthForward(config);
 
-        // ----- Final gate: enforcement-not-yet-wired master rejection -----
+        // Auth enforcement gate. Checks catch two mis-configuration shapes:
         //
-        // This PR (Phase 1, Steps 1–2) lands the auth config schema, the
-        // pure utilities (token_hasher / jwt_decode-via-jwt-cpp /
-        // auth_policy_matcher / auth_claims), and the data-structure plumbing
-        // (HttpRequest::auth, ProxyConfig::auth, ServerConfig::auth) — but
-        // request-time enforcement (AuthManager + middleware + JwtVerifier
-        // wiring) is scheduled for follow-up PRs per design spec §14
-        // (Phase 1 Steps 3–7 / Phase 2). Until that lands, a config that
-        // toggles auth ON would silently behave as unauthenticated — i.e.
-        // an operator who deploys `auth.enabled=true` thinking their proxy
-        // is now protected would be wrong. That's an authentication-bypass
-        // misconfiguration vector.
+        //   1. `auth.enabled=true` with no `issuers` — impossible to
+        //      verify ANY token. Reject with a clear message.
+        //   2. `proxy.auth.enabled=true` whose `issuers` list contains a
+        //      name absent from top-level `auth.issuers` — the policy is
+        //      unattachable. The issuer cross-ref already fires earlier
+        //      in this function; this is a belt-and-suspenders check
+        //      for the per-proxy flag specifically.
         //
-        // To prevent silent unenforced-policy acceptance, the validator
-        // hard-rejects ANY config that flips an auth enable flag on. The
-        // schema (issuers, policies, forward) may stay populated for
-        // forward-compatibility — operators can prepare their config in
-        // advance of the enforcement PR — but the master switches must
-        // remain false until enforcement is wired.
-        //
-        // Same fail-closed discipline used for HS256 / alg:none / mode:auto
-        // throughout this design: features that are not safely usable yet
-        // must reject loudly at config load, not silently accept.
-        if (config.auth.enabled) {
+        // Schema with enabled=false + issuers populated remains a valid
+        // "preparing for reload" shape — operators can deploy config
+        // without enforcement active, then flip on with SIGHUP.
+        if (config.auth.enabled && config.auth.issuers.empty()) {
             throw std::invalid_argument(
-                "auth.enabled=true rejected: request-time enforcement "
-                "(AuthManager + middleware) is not yet wired in this build. "
-                "Schedule: design spec §14 Phase 2 / follow-up PR. To prevent "
-                "silent unenforced-policy acceptance, the validator hard-"
-                "rejects this flag until enforcement lands. Set "
-                "auth.enabled=false for now; auth.issuers / policies / "
-                "forward may remain populated for upgrade.");
+                "auth.enabled=true rejected: auth.issuers is empty — a "
+                "gateway-wide auth gate with no issuers is unverifiable. "
+                "Populate auth.issuers[...] before enabling, or leave "
+                "auth.enabled=false.");
         }
         for (const auto& u : config.upstreams) {
-            if (u.proxy.auth.enabled) {
+            if (!u.proxy.auth.enabled) continue;
+            if (u.proxy.auth.issuers.empty()) {
                 throw std::invalid_argument(
                     "upstreams['" + u.name +
-                    "'].proxy.auth.enabled=true rejected: request-time "
-                    "enforcement is not yet wired in this build (design spec "
-                    "§14 Phase 2). Set proxy.auth.enabled=false for now; the "
-                    "auth block (issuers reference, required_scopes, etc.) "
-                    "may remain populated for upgrade.");
+                    "'].proxy.auth.enabled=true rejected: issuers list "
+                    "is empty — an inline proxy auth gate needs at least "
+                    "one configured issuer from auth.issuers.");
+            }
+        }
+    }
+}
+
+void ConfigLoader::ValidateAuthForward(const ServerConfig& config) {
+    std::unordered_set<std::string> output_headers;
+    auto add_header = [&output_headers](const std::string& name,
+                                         const std::string& which) {
+        if (name.empty()) return;
+        // Validate the ORIGINAL case-preserved name against RFC 7230
+        // §3.2.6 tchar. An invalid name would pass through
+        // HttpRequestSerializer verbatim and produce malformed HTTP on
+        // every forwarded request. Check first — a malformed name CAN'T
+        // meaningfully be reserved or non-reserved, so field-name
+        // validity is more fundamental than the reserved/duplicate
+        // checks below.
+        if (!IsValidHttpFieldName(name)) {
+            throw std::invalid_argument(
+                "auth.forward." + which + " '" + name +
+                "' contains characters not valid in an HTTP field "
+                "name (RFC 7230 §3.2.6 `token`: A-Z a-z 0-9 and "
+                "!#$%&'*+-.^_`|~). Spaces, slashes, colons, and "
+                "other punctuation are forbidden.");
+        }
+        std::string lower;
+        lower.reserve(name.size());
+        for (char c : name) {
+            lower.push_back(static_cast<char>(
+                std::tolower(static_cast<unsigned char>(c))));
+        }
+        // Reserved-name check FIRST (security): hop-by-hop / pseudo /
+        // framing-critical / Authorization / gateway-owned names would
+        // corrupt or spoof the forwarded request. See
+        // IsReservedAuthForwardHeader for the full categorization.
+        // Reject before the duplicate check so the operator sees the
+        // more-actionable error.
+        if (IsReservedAuthForwardHeader(lower)) {
+            throw std::invalid_argument(
+                "auth.forward." + which + " '" + name +
+                "' is a reserved/hop-by-hop/pseudo/framing header "
+                "name and must not be used as an auth-forward output "
+                "(would corrupt or spoof the upstream request); pick "
+                "an X-prefixed name like 'X-Auth-Subject' instead");
+        }
+        if (!output_headers.insert(lower).second) {
+            throw std::invalid_argument(
+                "auth.forward." + which + " '" + name +
+                "' collides with another output header name "
+                "(case-insensitive)");
+        }
+    };
+    add_header(config.auth.forward.subject_header, "subject_header");
+    add_header(config.auth.forward.issuer_header, "issuer_header");
+    add_header(config.auth.forward.scopes_header, "scopes_header");
+    add_header(config.auth.forward.raw_jwt_header, "raw_jwt_header");
+    for (const auto& [claim, header] :
+         config.auth.forward.claims_to_headers) {
+        add_header(header, "claims_to_headers[" + claim + "]");
+    }
+}
+
+void ConfigLoader::ValidateTopLevelPolicies(const ServerConfig& config) {
+    std::unordered_set<std::string> top_level_policy_names;
+    top_level_policy_names.reserve(config.auth.policies.size());
+    for (size_t i = 0; i < config.auth.policies.size(); ++i) {
+        const auto& p = config.auth.policies[i];
+        const std::string ctx =
+            "auth.policies[" + std::to_string(i) + "]";
+        bool name_blank = p.name.empty();
+        if (!name_blank) {
+            name_blank = true;
+            for (char c : p.name) {
+                if (!std::isspace(static_cast<unsigned char>(c))) {
+                    name_blank = false;
+                    break;
+                }
+            }
+        }
+        if (name_blank) {
+            throw std::invalid_argument(
+                ctx + ".name is required for top-level policies "
+                "(inline proxy.auth policies inherit identity from "
+                "their parent upstream; top-level entries have none "
+                "and operator-visible logs/metrics need a stable "
+                "identifier — array index is unstable across edits)");
+        }
+        if (!top_level_policy_names.insert(p.name).second) {
+            throw std::invalid_argument(
+                ctx + ".name '" + p.name + "' is duplicated by another "
+                "top-level policy. Top-level policy names MUST be "
+                "unique — the reload merge uses `name` as identity, "
+                "so a collision would silently bind two live policies "
+                "to the same staged entry on the next SIGHUP.");
+        }
+        if (p.on_undetermined != "deny" && p.on_undetermined != "allow") {
+            throw std::invalid_argument(
+                ctx + ".on_undetermined must be \"deny\" or \"allow\"");
+        }
+        for (const auto& issuer_name : p.issuers) {
+            if (config.auth.issuers.count(issuer_name) == 0) {
+                throw std::invalid_argument(
+                    ctx + ".issuers references unknown issuer '" +
+                    issuer_name + "'");
+            }
+        }
+        if (p.enabled && p.issuers.empty()) {
+            const std::string policy_owner =
+                p.name.empty()
+                    ? ctx
+                    : ("auth.policies['" + p.name + "']");
+            throw std::invalid_argument(
+                policy_owner + ".enabled=true rejected: issuers list is "
+                "empty — a top-level auth policy gate needs at least one "
+                "configured issuer from auth.issuers. Populate "
+                "issuers[...] before enabling, or set enabled=false "
+                "until the issuer list is ready.");
+        }
+        if (p.enabled && p.applies_to.empty()) {
+            throw std::invalid_argument(
+                ctx + " is enabled but has no applies_to prefixes — "
+                "the policy would never match any path. Add at least "
+                "one prefix to applies_to, or set enabled=false until "
+                "the prefix list is ready.");
+        }
+    }
+}
+
+void ConfigLoader::ValidateAuthPrefixCollisions(
+    const ServerConfig& config,
+    const std::unordered_set<std::string>& live_upstream_names) {
+    // Unified prefix → owner map. Catches every collision shape per
+    // spec §3.2 / §5.2: inline-vs-inline, inline-vs-top-level, top-level-
+    // vs-top-level, and a top-level policy listing the same prefix twice
+    // in its own applies_to. Disabled policies don't participate (they
+    // don't drive the runtime matcher).
+    std::unordered_map<std::string, std::string> all_prefixes;
+
+    const bool scope_to_live = !live_upstream_names.empty();
+    for (const auto& u : config.upstreams) {
+        const auto& p = u.proxy.auth;
+        if (!p.enabled) continue;
+        // Reload path: staged inline prefixes on not-yet-live upstreams
+        // are deferred to restart by ValidateProxyAuth + applied-policy
+        // rebuild, so they must NOT drive collision rejection here.
+        if (scope_to_live &&
+            live_upstream_names.count(u.name) == 0) continue;
+        const std::string owner =
+            "inline proxy.auth on upstream '" + u.name + "'";
+        auto ins = all_prefixes.emplace(u.proxy.route_prefix, owner);
+        if (!ins.second) {
+            throw std::invalid_argument(
+                "auth policy prefix '" + u.proxy.route_prefix +
+                "' declared by both " + ins.first->second + " and " +
+                owner + " — exact-prefix collisions must be resolved at "
+                "config time (design spec §3.2)");
+        }
+    }
+    for (size_t i = 0; i < config.auth.policies.size(); ++i) {
+        const auto& p = config.auth.policies[i];
+        if (!p.enabled) continue;
+        const std::string policy_owner =
+            p.name.empty()
+                ? ("auth.policies[" + std::to_string(i) + "]")
+                : ("auth.policies['" + p.name + "']");
+        for (const auto& pref : p.applies_to) {
+            auto ins = all_prefixes.emplace(pref, policy_owner);
+            if (!ins.second) {
+                throw std::invalid_argument(
+                    "auth policy prefix '" + pref + "' declared by both " +
+                    ins.first->second + " and " + policy_owner +
+                    " — exact-prefix collisions must be resolved at "
+                    "config time (design spec §3.2)");
             }
         }
     }
@@ -2664,7 +2771,8 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
 
 void ConfigLoader::ValidateProxyAuth(
     const ServerConfig& config,
-    const std::unordered_set<std::string>& live_upstream_names) {
+    const std::unordered_set<std::string>& live_upstream_names,
+    std::optional<std::unordered_set<std::string>> live_issuer_names) {
     // Same per-upstream checks that Validate() runs inline, extracted so
     // the reload path can invoke them against the REAL upstreams[] list
     // even when Validate() is called on a stripped validation_copy.
@@ -2686,7 +2794,31 @@ void ConfigLoader::ValidateProxyAuth(
         for (const auto& u : config.upstreams) {
             upstream_names.insert(u.name);
         }
+        // Scope semantics:
+        //   * nullopt  → startup: check every staged issuer.
+        //   * present  → reload: scope to the set. An empty set means
+        //                "reload with no live auth runtime" — no staged
+        //                auth can land live this cycle, so skip every
+        //                issuer.upstream xref. Rejecting here would
+        //                abort an otherwise-safe reload on a server
+        //                that booted with empty auth and is now staging
+        //                a new issuer (restart-required, but the reload
+        //                itself might carry unrelated live-safe edits
+        //                like rate-limit or log-level tuning).
+        const bool skip_all_issuer_xrefs =
+            live_issuer_names.has_value() && live_issuer_names->empty();
         for (const auto& [name, ic] : config.auth.issuers) {
+            if (skip_all_issuer_xrefs) continue;
+            if (live_issuer_names.has_value() &&
+                live_issuer_names->count(name) == 0) {
+                // On the reload path with some live issuers present,
+                // skip staged-only issuers: they're restart-only
+                // topology and AuthManager::Reload will reject the
+                // delta anyway — validating their `upstream` field
+                // would abort live-safe edits shipped alongside the
+                // staged issuer add.
+                continue;
+            }
             if (ic.upstream.empty()) {
                 // Structural "must be non-empty" check — identical to the
                 // one in Validate(). Duplicated because structural checks
@@ -2778,19 +2910,16 @@ void ConfigLoader::ValidateProxyAuth(
             }
         }
 
-        // Enforcement-not-yet-wired gate (the security-critical case
-        // the reviewer specifically flagged as bypassed by the reload
-        // strip). Same message as the in-Validate gate — operators
-        // should see the same wording regardless of which entry point
-        // (startup Validate / reload ValidateProxyAuth) surfaces it.
-        if (p.enabled) {
+        // Per-proxy gate: reject "enabled with nothing to do" configs.
+        // Parallel check to the top-level Validate gate (enabled + empty
+        // issuers). Message wording is distinct so operators can tell which
+        // entry point fired.
+        if (p.enabled && p.issuers.empty()) {
             throw std::invalid_argument(
                 "upstreams['" + u.name +
-                "'].proxy.auth.enabled=true rejected: request-time "
-                "enforcement is not yet wired in this build (design spec "
-                "§14 Phase 2). Set proxy.auth.enabled=false for now; the "
-                "auth block (issuers reference, required_scopes, etc.) "
-                "may remain populated for upgrade.");
+                "'].proxy.auth.enabled=true rejected: issuers list is "
+                "empty — an inline proxy auth gate needs at least one "
+                "configured issuer from auth.issuers.");
         }
     }
 }

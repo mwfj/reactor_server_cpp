@@ -6,10 +6,12 @@
 #include "upstream/upstream_lease.h"
 #include "upstream/header_rewriter.h"
 #include "upstream/retry_policy.h"
+#include "auth/auth_context.h"           // AuthContext (stored by value)
 #include "config/server_config.h"        // ProxyConfig (stored by value)
 #include "circuit_breaker/retry_budget.h" // RetryBudget::InFlightGuard (member-by-value)
 #include "http/http_callbacks.h"
 #include "http/http_response.h"
+#include <optional>
 // <string>, <map>, <unordered_map>, <memory>, <functional>, <chrono> provided by common.h
 
 // Forward declarations
@@ -20,6 +22,10 @@ class Dispatcher;
 namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerSlice;
 }  // RetryBudget already defined via retry_budget.h
+
+namespace AUTH_NAMESPACE {
+class AuthManager;
+}  // namespace AUTH_NAMESPACE
 
 class ProxyTransaction : public std::enable_shared_from_this<ProxyTransaction>,
                          public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink {
@@ -59,7 +65,12 @@ public:
                      int upstream_port,
                      const std::string& sni_hostname,
                      const std::string& upstream_path_override,
-                     const std::string& static_prefix);
+                     const std::string& static_prefix,
+                     // Non-owning. Nullable. When non-null, Start() takes
+                     // a stack-local ForwardConfig() snapshot and passes
+                     // it (+ the captured auth_ctx_) to
+                     // HeaderRewriter::RewriteRequest.
+                     AUTH_NAMESPACE::AuthManager* auth_manager = nullptr);
     ~ProxyTransaction();
 
     // Non-copyable, non-movable
@@ -144,8 +155,15 @@ private:
     std::map<std::string, std::string> rewritten_headers_;
     std::string serialized_request_;
 
+    // Captured by value at construction from client_request.auth so the
+    // overlay snapshot outlives any retry cycle. HttpRequest is invalidated
+    // by parser_.Reset() right after the async handler returns — no
+    // references kept. Empty when no policy matched inbound.
+    std::optional<AUTH_NAMESPACE::AuthContext> auth_ctx_;
+
     // Dependencies
     UpstreamManager* upstream_manager_;   // non-owning, outlives the transaction
+    AUTH_NAMESPACE::AuthManager* auth_manager_ = nullptr;  // non-owning, nullable
     Dispatcher* dispatcher_;              // non-owning, outlives the transaction (for EnQueueDelayed)
     ProxyConfig config_;                  // stored by value — decoupled from ProxyHandler lifetime
     HeaderRewriter header_rewriter_;      // stored by value — small (4 bools config)

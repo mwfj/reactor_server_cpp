@@ -27,16 +27,6 @@ struct AuthContext {
     // if a future request-dump helper accidentally serializes AuthContext.
     std::string raw_token;
     bool undetermined = false;                            // True when on_undetermined="allow" path forwarded
-
-    void Clear() {
-        issuer.clear();
-        subject.clear();
-        scopes.clear();
-        claims.clear();
-        policy_name.clear();
-        raw_token.clear();
-        undetermined = false;
-    }
 };
 
 }  // namespace AUTH_NAMESPACE

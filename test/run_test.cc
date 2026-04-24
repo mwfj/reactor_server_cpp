@@ -24,6 +24,17 @@
 #include "circuit_breaker_observability_test.h"
 #include "circuit_breaker_reload_test.h"
 #include "auth_foundation_test.h"
+#include "jwt_verifier_test.h"
+#include "jwks_cache_test.h"
+#include "oidc_discovery_test.h"
+#include "header_rewriter_auth_test.h"
+#include "auth_manager_test.h"
+#include "auth_integration_test.h"
+#include "auth_failure_mode_test.h"
+#include "auth_reload_test.h"
+#include "auth_multi_issuer_test.h"
+#include "auth_websocket_upgrade_test.h"
+#include "auth_race_test.h"
 #include "dns_resolver_test.h"
 #include "dual_stack_test.h"
 #include "test_framework.h"
@@ -124,6 +135,39 @@ void RunAllTest(){
     // Run auth foundation tests (minimal — pins r3/r5 security invariants)
     AuthFoundationTests::RunAllTests();
 
+    // Run JWT verifier unit tests (stateless, no server)
+    JwtVerifierTests::RunAllTests();
+
+    // Run JWKS cache unit tests
+    JwksCacheTests::RunAllTests();
+
+    // Run OIDC discovery unit tests (no live IdP)
+    OidcDiscoveryTests::RunAllTests();
+
+    // Run header rewriter auth overlay tests
+    HeaderRewriterAuthTests::RunAllTests();
+
+    // Run AuthManager unit tests (no server)
+    AuthManagerTests::RunAllTests();
+
+    // Run auth integration tests (HttpServer + AuthManager middleware)
+    AuthIntegrationTests::RunAllTests();
+
+    // Run auth failure mode tests (UNDETERMINED path, stale JWKS)
+    AuthFailureModeTests::RunAllTests();
+
+    // Run auth reload tests (Reload API — topology, reloadable fields)
+    AuthReloadTests::RunAllTests();
+
+    // Run auth multi-issuer tests (PeekIssuer routing, allowlist enforcement)
+    AuthMultiIssuerTests::RunAllTests();
+
+    // Run auth WebSocket upgrade tests
+    AuthWebSocketUpgradeTests::RunAllTests();
+
+    // Run auth race condition tests
+    AuthRaceTests::RunAllTests();
+
     // Run DnsResolver tests (lazy pool, static helpers, detach-not-join)
     DnsResolverTests::RunAllTests();
 
@@ -152,9 +196,20 @@ void PrintUsage(const char* program_name) {
     std::cout << "  proxy,    -P    Run proxy engine tests only" << std::endl;
     std::cout << "  rate_limit, -L  Run rate limit tests only" << std::endl;
     std::cout << "  circuit_breaker, -B  Run circuit-breaker tests only" << std::endl;
-    std::cout << "  auth,     -A    Run auth foundation tests only" << std::endl;
-    std::cout << "  help,     -h    Show this help message" << std::endl;
-    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route + kqueue + upstream + proxy + rate_limit + circuit_breaker + auth)" << std::endl;
+    std::cout << "  auth,        -A    Run auth foundation tests only" << std::endl;
+    std::cout << "  jwt,         -J    Run JWT verifier unit tests only" << std::endl;
+    std::cout << "  jwks,        -j    Run JWKS cache unit tests only" << std::endl;
+    std::cout << "  oidc,        -O    Run OIDC discovery unit tests only" << std::endl;
+    std::cout << "  hrauth,      -W    Run header rewriter auth overlay tests only" << std::endl;
+    std::cout << "  auth_mgr,    -M    Run AuthManager unit tests only" << std::endl;
+    std::cout << "  auth2,       -V    Run auth integration tests (Phase 2) only" << std::endl;
+    std::cout << "  auth_fail,   -F    Run auth failure mode tests only" << std::endl;
+    std::cout << "  auth_reload, -X    Run auth reload tests only" << std::endl;
+    std::cout << "  auth_multi,  -I    Run auth multi-issuer tests only" << std::endl;
+    std::cout << "  auth_ws,     -G    Run auth WebSocket upgrade tests only" << std::endl;
+    std::cout << "  auth_race,   -Q    Run auth race condition tests only" << std::endl;
+    std::cout << "  help,        -h    Show this help message" << std::endl;
+    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route + kqueue + upstream + proxy + rate_limit + circuit_breaker + auth + auth-phase2)" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -224,6 +279,39 @@ int main(int argc, char* argv[]) {
         // Run auth foundation tests (token_hasher + base64url env auto-detect + scope extractors)
         }else if(mode == "auth" || mode == "-A"){
             AuthFoundationTests::RunAllTests();
+        // Run JWT verifier unit tests
+        }else if(mode == "jwt" || mode == "-J"){
+            JwtVerifierTests::RunAllTests();
+        // Run JWKS cache unit tests
+        }else if(mode == "jwks" || mode == "-j"){
+            JwksCacheTests::RunAllTests();
+        // Run OIDC discovery unit tests
+        }else if(mode == "oidc" || mode == "-O"){
+            OidcDiscoveryTests::RunAllTests();
+        // Run header rewriter auth overlay tests
+        }else if(mode == "hrauth" || mode == "-W"){
+            HeaderRewriterAuthTests::RunAllTests();
+        // Run AuthManager unit tests
+        }else if(mode == "auth_mgr" || mode == "-M"){
+            AuthManagerTests::RunAllTests();
+        // Run auth integration tests (Phase 2)
+        }else if(mode == "auth2" || mode == "-V"){
+            AuthIntegrationTests::RunAllTests();
+        // Run auth failure mode tests
+        }else if(mode == "auth_fail" || mode == "-F"){
+            AuthFailureModeTests::RunAllTests();
+        // Run auth reload tests
+        }else if(mode == "auth_reload" || mode == "-X"){
+            AuthReloadTests::RunAllTests();
+        // Run auth multi-issuer tests
+        }else if(mode == "auth_multi" || mode == "-I"){
+            AuthMultiIssuerTests::RunAllTests();
+        // Run auth WebSocket upgrade tests
+        }else if(mode == "auth_ws" || mode == "-G"){
+            AuthWebSocketUpgradeTests::RunAllTests();
+        // Run auth race condition tests
+        }else if(mode == "auth_race" || mode == "-Q"){
+            AuthRaceTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

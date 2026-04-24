@@ -29,6 +29,10 @@ namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerManager;
 }
 
+namespace AUTH_NAMESPACE {
+class AuthManager;
+}
+
 class HttpServer {
 public:
     // Snapshot of server runtime statistics. All values are approximate
@@ -213,6 +217,12 @@ public:
         }
         return upstream_manager_.get();
     }
+
+    // Forwarder to `AuthManager::LiveIssuerNames` — see that docstring
+    // for the "live runtime vs staged config" rationale and the
+    // reload-driver-thread contract. Returns empty when auth is not
+    // configured. Out-of-line because AuthManager is forward-declared.
+    std::unordered_set<std::string> LiveAuthIssuerNames() const;
 
 public:
     // Thread-local pointer to the active ResourcePusher for the sync request
@@ -446,6 +456,14 @@ private:
     // Rate limiting
     RateLimitConfig rate_limit_config_;
     std::unique_ptr<RateLimitManager> rate_limit_manager_;
+
+    // Auth — cached config from construction (used to build the manager
+    // in MarkServerReady and to supply the canonical auth source for
+    // reload). AuthManager is declared AFTER circuit_breaker_manager_ so
+    // destruction runs: proxy_handlers_ (hold AuthManager*) → auth_manager_
+    // → circuit_breaker_manager_ → upstream_manager_.
+    AUTH_NAMESPACE::AuthConfig auth_config_;
+    std::unique_ptr<AUTH_NAMESPACE::AuthManager> auth_manager_;
 
     // Proxy handlers keyed by (upstream_service_name + normalized prefix).
     // shared_ptr (not unique_ptr) so that route lambdas capture shared

@@ -1,7 +1,18 @@
 #pragma once
 
 #include "common.h"
+#include <optional>
 // <string>, <map>, <vector>, <utility> provided by common.h
+
+// Forward declarations — the auth overlay is OPTIONAL per-call. Keeping
+// the header rewriter in its own translation unit free of auth-specific
+// types means non-auth builds (e.g. older test harnesses, future
+// standalone reuse) keep compiling without the auth library being
+// linked in. The overlay parameters default to nullptr.
+namespace AUTH_NAMESPACE {
+struct AuthForwardConfig;
+struct AuthContext;
+}  // namespace AUTH_NAMESPACE
 
 class HeaderRewriter {
 public:
@@ -32,7 +43,20 @@ public:
         bool upstream_tls,
         const std::string& upstream_host,
         int upstream_port,
-        const std::string& sni_hostname = "") const;
+        const std::string& sni_hostname = "",
+        // Per-call auth overlay. When both `auth_forward` and `auth_ctx`
+        // are non-null, operator-configured identity headers are stripped
+        // from inbound (when strip_inbound_identity_headers=true) and
+        // injected from the validated AuthContext. §6.4 documents the
+        // exact strip-then-inject ordering. When `auth_ctx` is empty
+        // (i.e. the request had no matching auth policy or verification
+        // returned UNDETERMINED→allow), only the strip and
+        // X-Auth-Undetermined paths run — no identity headers are emitted.
+        //
+        // The overlay is NEVER stored in RewriterConfig (§3.4 snapshot
+        // discipline). Callers pass fresh stack-local values per request.
+        const AUTH_NAMESPACE::AuthForwardConfig* auth_forward = nullptr,
+        const std::optional<AUTH_NAMESPACE::AuthContext>* auth_ctx = nullptr) const;
 
     // Rewrite response headers from upstream before relaying to client.
     // Strips hop-by-hop headers from the upstream response.

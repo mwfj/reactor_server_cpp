@@ -11,7 +11,8 @@ ProxyHandler::ProxyHandler(
     const std::string& upstream_host,
     int upstream_port,
     const std::string& sni_hostname,
-    UpstreamManager* upstream_manager)
+    UpstreamManager* upstream_manager,
+    AUTH_NAMESPACE::AuthManager* auth_manager)
     : service_name_(service_name),
       config_(config),
       upstream_tls_(upstream_tls),
@@ -19,6 +20,7 @@ ProxyHandler::ProxyHandler(
       upstream_port_(upstream_port),
       sni_hostname_(sni_hostname),
       upstream_manager_(upstream_manager),
+      auth_manager_(auth_manager),
       header_rewriter_(HeaderRewriter::Config{
           config.header_rewrite.set_x_forwarded_for,
           config.header_rewrite.set_x_forwarded_proto,
@@ -158,7 +160,8 @@ void ProxyHandler::Handle(
         upstream_port_,
         sni_hostname_,
         upstream_path_override,
-        static_prefix_);
+        static_prefix_,
+        auth_manager_);
 
     // Install a cancel hook on the framework's per-request async cancel
     // slot so client disconnects / safety-cap timeouts / HTTP/2 stream

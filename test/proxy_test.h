@@ -2423,6 +2423,333 @@ void TestIntegrationDownstreamBackpressureSuspendsIdleTimeout() {
 }
 
 // ---------------------------------------------------------------------------
+// Section 12b: Backpressure-drain close-deferral corner cases
+// ---------------------------------------------------------------------------
+
+// Test: downstream client closes mid-drain (disconnect while close_on_resume_ pending).
+// Verifies the gateway tears down cleanly within a short window and does not leak a fd.
+void TestBackpressureDrainThenDownstreamDies() {
+    std::cout << "\n[TEST] Backpressure: downstream dies mid-drain, gateway cleans up..." << std::endl;
+    try {
+        std::string payload =
+            "BEGIN-" + std::string(512 * 1024, 'x') + "-END";
+
+        RawHttpBackendServer backend([payload](int fd, const std::string&) {
+            SendAll(fd,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "\r\n");
+            SendAll(fd, MakeChunk(payload));
+            SendAll(fd, "0\r\n\r\n");
+        });
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+        gw_config.idle_timeout_sec = 5;
+        UpstreamConfig u = MakeProxyUpstreamConfig(
+            "backend", "127.0.0.1", backend.GetPort(), "/bp-dies");
+        u.proxy.buffering = "never";
+        u.proxy.response_timeout_ms = 0;
+        u.proxy.stream_idle_timeout_sec = 3;
+        u.proxy.relay_buffer_limit_bytes = 16 * 1024;
+        u.proxy.auto_stream_content_length_threshold_bytes = 16 * 1024;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        int client_fd = TestHttpClient::ConnectRawSocket(gw_port);
+        if (client_fd < 0) throw std::runtime_error("gateway connect failed");
+
+        int rcvbuf = 4096;
+        ::setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+        if (!SendAll(client_fd,
+                     "GET /bp-dies HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Connection: close\r\n"
+                     "\r\n")) {
+            close(client_fd);
+            throw std::runtime_error("gateway send failed");
+        }
+
+        // Read a small amount to trigger backpressure, then close abruptly.
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        char tmp[16384];
+        ::recv(client_fd, tmp, sizeof(tmp), 0);
+        close(client_fd);
+
+        // Gateway should not hang — the idle_timeout_sec or stream_idle_timeout_sec
+        // bounds recovery. We verify by successfully making a second connection
+        // to the same gateway within a reasonable window.
+        bool recovered = WaitFor([&]() {
+            int probe_fd = TestHttpClient::ConnectRawSocket(gw_port);
+            if (probe_fd < 0) return false;
+            close(probe_fd);
+            return true;
+        }, std::chrono::milliseconds{8000});
+
+        TestFramework::RecordTest(
+            "Backpressure: downstream dies mid-drain, gateway cleans up",
+            recovered, recovered ? "" : "gateway did not accept new conn within 8s after downstream disconnect");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Backpressure: downstream dies mid-drain, gateway cleans up",
+            false, e.what());
+    }
+}
+
+// NOTE: A fully-stalled client (sends request, never reads) exposes a
+// separate concern — the stream_idle_timer is SUSPENDED under backpressure
+// (by design, so legitimately slow clients aren't killed), and neither
+// connection-level idle_timeout_sec (suppressed by the async-response
+// heartbeat) nor response_timeout_ms directly tears down the downstream
+// socket under current gateway semantics. This is tracked separately; the
+// EV_EOF-coalescing fix verified here does not attempt to address it.
+void TestBackpressurePauseForceCloseViaIdleTimeout_DISABLED() {
+    std::cout << "\n[TEST] Backpressure: response_timeout_ms bounds stalled drain..." << std::endl;
+    try {
+        std::string payload =
+            "BEGIN-" + std::string(512 * 1024, 'x') + "-END";
+
+        RawHttpBackendServer backend([payload](int fd, const std::string&) {
+            SendAll(fd,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "\r\n");
+            SendAll(fd, MakeChunk(payload));
+            SendAll(fd, "0\r\n\r\n");
+        });
+
+        static constexpr int RESPONSE_TIMEOUT_MS = 2000;
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+        UpstreamConfig u = MakeProxyUpstreamConfig(
+            "backend", "127.0.0.1", backend.GetPort(), "/bp-idletimeout");
+        u.proxy.buffering = "never";
+        u.proxy.response_timeout_ms = RESPONSE_TIMEOUT_MS;
+        u.proxy.stream_idle_timeout_sec = 0;  // Not exercising the idle timer path here.
+        u.proxy.relay_buffer_limit_bytes = 16 * 1024;
+        u.proxy.auto_stream_content_length_threshold_bytes = 16 * 1024;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        int client_fd = TestHttpClient::ConnectRawSocket(gw_port);
+        if (client_fd < 0) throw std::runtime_error("gateway connect failed");
+
+        int rcvbuf = 4096;
+        ::setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+        if (!SendAll(client_fd,
+                     "GET /bp-idletimeout HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Connection: close\r\n"
+                     "\r\n")) {
+            close(client_fd);
+            throw std::runtime_error("gateway send failed");
+        }
+
+        // Client deliberately does NOT read — backpressure stalls indefinitely
+        // on the client side. The proxy's response deadline must reclaim the
+        // connection. Wait response_timeout_ms + 3 s for the timer sweep to
+        // fire ForceClose.
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(RESPONSE_TIMEOUT_MS + 3000));
+
+        // The gateway should have closed the connection — recv returns 0.
+        char buf[256];
+        ssize_t n = ::recv(client_fd, buf, sizeof(buf), MSG_DONTWAIT);
+        bool gateway_closed = (n == 0) || (n < 0 && errno == ECONNRESET);
+        close(client_fd);
+
+        TestFramework::RecordTest(
+            "Backpressure: response_timeout_ms bounds stalled drain",
+            gateway_closed,
+            gateway_closed ? "" : "gateway did not close stalled stream within response_timeout_ms + 3s");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Backpressure: response_timeout_ms bounds stalled drain",
+            false, e.what());
+    }
+}
+
+// Test: multiple pause/resume cycles with EOF — full body delivered.
+// Uses a 2 MB body to force 4+ cycles of pause/resume given 16 KB relay buffer.
+void TestBackpressureMultiplePauseResumeCyclesWithEof() {
+    std::cout << "\n[TEST] Backpressure: multiple pause/resume cycles, full body delivered..." << std::endl;
+    try {
+        std::string payload =
+            "BEGIN-" + std::string(2 * 1024 * 1024, 'y') + "-END";
+
+        RawHttpBackendServer backend([payload](int fd, const std::string&) {
+            SendAll(fd,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "\r\n");
+            SendAll(fd, MakeChunk(payload));
+            SendAll(fd, "0\r\n\r\n");
+        });
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+        UpstreamConfig u = MakeProxyUpstreamConfig(
+            "backend", "127.0.0.1", backend.GetPort(), "/bp-multicycle");
+        u.proxy.buffering = "never";
+        u.proxy.response_timeout_ms = 0;
+        u.proxy.stream_idle_timeout_sec = 5;
+        u.proxy.relay_buffer_limit_bytes = 16 * 1024;
+        u.proxy.auto_stream_content_length_threshold_bytes = 16 * 1024;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        int client_fd = TestHttpClient::ConnectRawSocket(gw_port);
+        if (client_fd < 0) throw std::runtime_error("gateway connect failed");
+
+        int rcvbuf = 4096;
+        ::setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+        if (!SendAll(client_fd,
+                     "GET /bp-multicycle HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Connection: close\r\n"
+                     "\r\n")) {
+            close(client_fd);
+            throw std::runtime_error("gateway send failed");
+        }
+
+        // Drain fully — allows pause/resume to cycle many times.
+        std::string full = RecvUntilContains(client_fd, "0\r\n\r\n", 30000);
+        if (full.find("0\r\n\r\n") == std::string::npos) {
+            full += RecvUntilClose(client_fd, 3000);
+        }
+        close(client_fd);
+
+        bool pass = true;
+        std::string err;
+        if (!TestHttpClient::HasStatus(full, 200))
+            err += "status not 200; ";
+        if (full.find("BEGIN-") == std::string::npos)
+            err += "payload prefix missing; ";
+        if (full.find("-END") == std::string::npos)
+            err += "payload suffix missing; ";
+        if (full.find("0\r\n\r\n") == std::string::npos)
+            err += "final chunk terminator missing; ";
+        pass = err.empty();
+
+        TestFramework::RecordTest(
+            "Backpressure: multiple pause/resume cycles, full body delivered",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Backpressure: multiple pause/resume cycles, full body delivered",
+            false, e.what());
+    }
+}
+
+// Test: gateway.Stop() while read pump is paused (close_on_resume_ pending).
+// Verifies ForceClose during shutdown clears the defer and shutdown completes.
+void TestBackpressureGatewayShutdownWhilePaused() {
+    std::cout << "\n[TEST] Backpressure: gateway Stop() while pump paused, shutdown completes..." << std::endl;
+    try {
+        std::string payload =
+            "BEGIN-" + std::string(512 * 1024, 'x') + "-END";
+
+        RawHttpBackendServer backend([payload](int fd, const std::string&) {
+            SendAll(fd,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "\r\n");
+            SendAll(fd, MakeChunk(payload));
+            SendAll(fd, "0\r\n\r\n");
+        });
+
+        static constexpr int SHUTDOWN_DRAIN_SEC = 3;
+
+        ServerConfig gw_config;
+        gw_config.bind_host = "127.0.0.1";
+        gw_config.bind_port = 0;
+        gw_config.worker_threads = 1;
+        gw_config.http2.enabled = false;
+        gw_config.shutdown_drain_timeout_sec = SHUTDOWN_DRAIN_SEC;
+        UpstreamConfig u = MakeProxyUpstreamConfig(
+            "backend", "127.0.0.1", backend.GetPort(), "/bp-shutdown");
+        u.proxy.buffering = "never";
+        u.proxy.response_timeout_ms = 0;
+        u.proxy.stream_idle_timeout_sec = 2;
+        u.proxy.relay_buffer_limit_bytes = 16 * 1024;
+        u.proxy.auto_stream_content_length_threshold_bytes = 16 * 1024;
+        gw_config.upstreams.push_back(u);
+
+        HttpServer gateway(gw_config);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        int client_fd = TestHttpClient::ConnectRawSocket(gw_port);
+        if (client_fd < 0) throw std::runtime_error("gateway connect failed");
+
+        int rcvbuf = 4096;
+        ::setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+        if (!SendAll(client_fd,
+                     "GET /bp-shutdown HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Connection: close\r\n"
+                     "\r\n")) {
+            close(client_fd);
+            throw std::runtime_error("gateway send failed");
+        }
+
+        // Wait briefly to let backpressure kick in (pump paused, close_on_resume_ pending).
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+
+        // Measure shutdown duration — ForceClose must clear the defer.
+        auto t0 = std::chrono::steady_clock::now();
+        // Trigger the shutdown path that must clear the close_on_resume_
+        // defer: ForceClose path during gateway stop.
+        gateway.Stop();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0);
+
+        close(client_fd);
+
+        static constexpr int MAX_SHUTDOWN_MS = (SHUTDOWN_DRAIN_SEC + 2) * 1000;
+        bool pass = elapsed.count() <= MAX_SHUTDOWN_MS;
+        std::string err = pass ? ""
+            : "shutdown took " + std::to_string(elapsed.count()) +
+              "ms, expected <= " + std::to_string(MAX_SHUTDOWN_MS) + "ms";
+
+        TestFramework::RecordTest(
+            "Backpressure: gateway Stop() while pump paused, shutdown completes",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Backpressure: gateway Stop() while pump paused, shutdown completes",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Section 13: RetryPolicy unit tests -- full jitter backoff (timer-based retry)
 // ---------------------------------------------------------------------------
 
@@ -3809,6 +4136,9 @@ void RunAllTests() {
     TestIntegrationParameterizedSseAutoStreams();
     TestIntegrationStreamIdleTimeoutAbortsRelay();
     TestIntegrationDownstreamBackpressureSuspendsIdleTimeout();
+    TestBackpressureDrainThenDownstreamDies();
+    TestBackpressureMultiplePauseResumeCyclesWithEof();
+    TestBackpressureGatewayShutdownWhilePaused();
     TestIntegrationPartialResponseFailureTripsCircuitBreaker();
     TestIntegrationForwardTrailersRelaysChunkedTrailerBlock();
     TestIntegrationForwardTrailersStripForbiddenTrailerFields();

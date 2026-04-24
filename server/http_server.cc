@@ -7,6 +7,8 @@
 #include "http2/http2_constants.h"
 #include "upstream/upstream_manager.h"
 #include "upstream/proxy_handler.h"
+#include "auth/auth_manager.h"
+#include "auth/auth_middleware.h"
 #include "circuit_breaker/circuit_breaker_manager.h"
 #include "circuit_breaker/circuit_breaker_host.h"
 #include "circuit_breaker/circuit_breaker_slice.h"
@@ -264,6 +266,232 @@ static std::string LowerHeaderName(const std::string& name) {
     return lower;
 }
 
+struct TopLevelAuthPolicyMergeResult {
+    std::vector<AUTH_NAMESPACE::AuthPolicy> policies;
+    bool topology_changed = false;
+};
+
+// Preserve the LIVE top-level auth policy topology across SIGHUP. Top-level
+// policy fields (enabled / applies_to / issuers / required_scopes /
+// required_audience / on_undetermined / realm) are live-reloadable per
+// design §11.2 step 4 — BY IDENTITY, using stable `name` (required +
+// uniqueness enforced by the top-level-policy validator).
+//
+// The hazardous case is a policy edit whose staged `issuers[]` references
+// an issuer that isn't in the LIVE AuthManager::issuers_ map (issuer add
+// is restart-required). Operators typically edit staged peer fields
+// (`required_audience`, `required_scopes`, `on_undetermined`, `realm`,
+// `applies_to`, `enabled`) TO MATCH the new issuer in the same reload.
+// A partial-apply that took the staged peers while pinning issuers to
+// the live list would apply new-issuer-tuned rules to old-issuer traffic
+// → 401/403 on previously-working tokens. Design §11.2 step 4 / §18.5
+// mandate **whole-policy defer** for that case: preserve the ENTIRE
+// live policy for that identity, not just the issuers list.
+//
+// Rules (per design §11.2 step 4):
+//   - Edit (name matches live): if staged.issuers[] ⊆ live_issuer_names,
+//     commit staged wholesale (all reloadable fields take effect). If
+//     ANY staged issuer is non-live, preserve the ENTIRE live policy
+//     and flag topology_changed.
+//   - Removed (live name absent in staged): drop from the live matcher.
+//     Removal is the operator's explicit intent and is live-reloadable
+//     per the design; no topology_changed flag.
+//     EXCEPTION (prefix-scoped): if the same reload has a DEFERRED add
+//     (enabled, issuers-non-live) whose applies_to shares SOME prefixes
+//     with the removed live policy, preserve a TRIMMED copy of the live
+//     policy covering only the overlapping prefixes (+ topology_changed).
+//     Non-overlapping prefixes still drop — operator's explicit removal
+//     of unrelated coverage takes effect. Example: live A has
+//     applies_to=["/admin/", "/internal/"]; deferred replacement covers
+//     only /admin/ ⇒ preserve A' with applies_to=["/admin/"] and drop
+//     /internal/ coverage. Rationale: whole-policy preserve would keep
+//     unrelated coverage alive on prefixes the operator asked to
+//     unprotect.
+//   - Renamed: surfaces here as live-removal of the old name + add of
+//     the new name. Under the prefix-scoped preserve, the live matcher
+//     keeps old-name coverage whenever the add's issuers aren't live
+//     yet AND both policies share a prefix; when the add CAN go live,
+//     the old name drops and the new name commits — net matcher swap
+//     with unchanged coverage.
+//   - Added (staged name absent in live): if staged.issuers[] ⊆
+//     live_issuer_names, commit live (append to merged vector). If any
+//     staged issuer is non-live, defer the SINGLE policy add (don't
+//     enter merged vector) and flag topology_changed. Per-add gating —
+//     unrelated adds whose issuers are all live still apply immediately.
+//
+// Live vector ORDER is preserved for matched identities; new live-safe
+// adds append at the end. Longest-prefix matching is the sole runtime
+// tie-breaker (design §3.2), so vector order only affects inert cases.
+static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopology(
+        const std::vector<AUTH_NAMESPACE::AuthPolicy>& live_policies,
+        const std::vector<AUTH_NAMESPACE::AuthPolicy>& staged_policies,
+        const std::unordered_set<std::string>& live_issuer_names) {
+    TopLevelAuthPolicyMergeResult out;
+    out.policies.reserve(live_policies.size());
+
+    auto issuers_all_live = [&](const AUTH_NAMESPACE::AuthPolicy& p) {
+        // Fail-closed when there is no live auth runtime but the policy
+        // names issuers: the policy can't match anything safely, so
+        // whole-policy defer (matches "never fail open" — rules file).
+        // Empty staged issuers are fine — a policy with no issuer refs
+        // matches nothing anyway; no identity-check is meaningful.
+        if (p.issuers.empty()) return true;
+        if (live_issuer_names.empty()) return false;
+        for (const auto& iss : p.issuers) {
+            if (live_issuer_names.count(iss) == 0) return false;
+        }
+        return true;
+    };
+
+    // Index staged by name for O(1) lookup. Duplicate names are rejected
+    // at ConfigLoader::Validate time (uniqueness is load-bearing for this
+    // merge — without it a collision would silently bind two live
+    // policies to the same staged entry).
+    std::unordered_map<std::string, const AUTH_NAMESPACE::AuthPolicy*>
+        staged_by_name;
+    staged_by_name.reserve(staged_policies.size());
+    for (const auto& p : staged_policies) {
+        staged_by_name.emplace(p.name, &p);
+    }
+
+    // Index live policies by name so the staged walks below don't need
+    // O(N*M) lookups against live_policies.
+    std::unordered_set<std::string> live_names;
+    live_names.reserve(live_policies.size());
+    for (const auto& live : live_policies) live_names.insert(live.name);
+
+    // Pre-pass: collect applies_to prefixes from DEFERRED ENABLED adds.
+    // A deferred add = staged policy whose name is absent from live AND
+    // whose issuers reference a non-live issuer. These prefixes are the
+    // ones where a concurrent REMOVE of a live policy would leave an
+    // auth-coverage gap — the operator's replacement can't go live this
+    // cycle, so dropping the old entry on the same prefix would silently
+    // unprotect it until restart.
+    //
+    // Disabled deferred adds don't participate — they never enter the
+    // matcher, so no preserve is needed to avoid a gap.
+    //
+    // Scope is PER-PREFIX (not blanket): an unrelated removed policy on
+    // a different prefix still drops as intended by the operator. This
+    // also prevents shadowing: a new live-commitable add on the same
+    // prefix as a removed policy can't be overshadowed by the old
+    // preserved entry, because the removed entry only preserves when a
+    // DEFERRED add shares its prefix (and the new live add committed
+    // this cycle is in the output ahead of any preserve).
+    std::unordered_set<std::string> deferred_add_prefixes;
+    for (const auto& p : staged_policies) {
+        if (live_names.count(p.name) != 0) continue;  // edit, handled later
+        if (!p.enabled) continue;                      // inert, no matcher role
+        if (issuers_all_live(p)) continue;             // live-committable add
+        for (const auto& pref : p.applies_to) {
+            deferred_add_prefixes.insert(pref);
+        }
+    }
+
+    auto overlap_with_deferred =
+        [&](const AUTH_NAMESPACE::AuthPolicy& live_p) {
+            std::vector<std::string> out_prefixes;
+            if (deferred_add_prefixes.empty()) return out_prefixes;
+            out_prefixes.reserve(live_p.applies_to.size());
+            for (const auto& pref : live_p.applies_to) {
+                if (deferred_add_prefixes.count(pref)) {
+                    out_prefixes.push_back(pref);
+                }
+            }
+            return out_prefixes;
+        };
+
+    // EDIT pass.
+    for (const auto& live : live_policies) {
+        auto it = staged_by_name.find(live.name);
+        if (it == staged_by_name.end()) {
+            // Staged removed or renamed this policy. Default: drop
+            // (live-reloadable removal per design §11.2 step 4). BUT if
+            // the SAME reload has a DEFERRED ADD covering SOME of this
+            // policy's prefixes, treat those specific prefixes as a
+            // migration-in-progress and preserve a TRIMMED copy of the
+            // live policy that only covers the overlapping prefixes.
+            // Non-overlapping prefixes (the operator's explicit removals
+            // of unrelated coverage) actually drop. Whole-policy preserve
+            // would keep unrelated coverage alive — e.g. live A has
+            // applies_to=["/admin/", "/internal/"] and deferred staged
+            // replacement covers only /admin/ ⇒ /internal/ must drop
+            // because that's what the operator asked for.
+            auto preserved_prefixes = overlap_with_deferred(live);
+            if (!preserved_prefixes.empty()) {
+                out.topology_changed = true;
+                AUTH_NAMESPACE::AuthPolicy trimmed = live;
+                trimmed.applies_to = std::move(preserved_prefixes);
+                out.policies.push_back(std::move(trimmed));
+            }
+            continue;
+        }
+        const auto& staged = *it->second;
+        if (!issuers_all_live(staged)) {
+            // Issuer-refs point at non-live issuers. Two sub-cases:
+            //
+            // A) staged.enabled=true — whole-policy defer (design §11.2
+            //    step 4 / §18.5). Applying staged peer fields
+            //    (required_audience, required_scopes, etc.) against
+            //    traffic still flowing through the OLD live issuer
+            //    would 401/403 previously-working tokens. Preserve the
+            //    entire live policy for this identity.
+            //
+            // B) staged.enabled=false — the operator asked to DISABLE
+            //    the policy. A disabled policy doesn't enforce, so the
+            //    non-live-issuer-ref concern doesn't apply: there's no
+            //    traffic this policy will validate until the operator
+            //    re-enables post-restart. Preserving the live enabled
+            //    entry here would ignore the disable request — the
+            //    policy would keep enforcing on the existing prefix
+            //    until restart, silently overriding the operator's
+            //    explicit intent. Commit the staged disable live.
+            if (staged.enabled) {
+                out.topology_changed = true;
+                out.policies.push_back(live);
+                continue;
+            }
+            // fall through to the live-commit path below: publishing a
+            // disabled policy is a no-op for the matcher (disabled
+            // entries are filtered out by BuildAppliedPolicyList), so
+            // this is equivalent to removing the live coverage for
+            // this identity — which IS what the operator asked for.
+        }
+        AUTH_NAMESPACE::AuthPolicy merged = staged;
+        merged.name = live.name;
+        out.policies.push_back(std::move(merged));
+    }
+
+    // ADDS (staged name absent in live). Per-add gating: live-safe adds
+    // commit immediately; adds whose issuers reference a non-live issuer
+    // defer per-policy. Runs regardless of whether the EDIT pass already
+    // flagged topology_changed — per-add deferral is independent.
+    for (const auto& p : staged_policies) {
+        if (live_names.count(p.name) != 0) continue;
+        if (!issuers_all_live(p)) {
+            out.topology_changed = true;
+            continue;
+        }
+        out.policies.push_back(p);
+    }
+
+    return out;
+}
+
+static AUTH_NAMESPACE::AuthConfig BuildLiveAppliedAuthConfig(
+        const AUTH_NAMESPACE::AuthConfig& live_auth,
+        const AUTH_NAMESPACE::AuthConfig& staged_auth,
+        std::vector<AUTH_NAMESPACE::AuthPolicy> live_top_level_policies) {
+    AUTH_NAMESPACE::AuthConfig applied = live_auth;
+    applied.enabled = staged_auth.enabled;
+    applied.issuers = staged_auth.issuers;
+    applied.forward = staged_auth.forward;
+    applied.policies = std::move(live_top_level_policies);
+    // Process-local HMAC key material is startup-only.
+    applied.hmac_cache_key_env = live_auth.hmac_cache_key_env;
+    return applied;
+}
+
 static HttpResponse MergeAsyncResponseHeaders(
     const HttpResponse& final_resp,
     const std::vector<std::pair<std::string, std::string>>& mw_headers) {
@@ -444,6 +672,11 @@ bool HttpServer::HasPendingH1Output() {
         if (conn->IsShutdownExempt()) return true;
     }
     return false;
+}
+
+std::unordered_set<std::string> HttpServer::LiveAuthIssuerNames() const {
+    if (!auth_manager_) return {};
+    return auth_manager_->LiveIssuerNames();
 }
 
 void HttpServer::MarkServerReady() {
@@ -684,6 +917,86 @@ void HttpServer::MarkServerReady() {
                                       "upstream timeouts", min_upstream_sec);
             }
         }
+    }
+
+    // AuthManager — build AFTER upstream_manager_ (issuers reference
+    // upstream pool names; the manager must be live for Issuer::Start to
+    // resolve them) and BEFORE proxy route registration (ProxyHandler
+    // ctor captures a non-owning auth_manager_ pointer). Skipped when
+    // auth.enabled=false — downstream code handles null gracefully.
+    //
+    // Middleware install ordering (§3.4, §20 risk #5):
+    //   `PrependMiddleware` pushes to FRONT. Rate-limit was prepended
+    //   earlier at the top of MarkServerReady, producing [rate_limit, ...].
+    //   Prepending auth NOW — i.e. SECOND — makes auth the new front:
+    //   [auth, rate_limit, ...]. Per-user rate-limit keys (future phase)
+    //   can then key on the validated `sub`.
+    // Construct AuthManager UNCONDITIONALLY at boot, even when
+    // auth_config_ is entirely empty (no issuers, no policies,
+    // enabled=false). InvokeMiddleware gates on master_enabled_ (set
+    // from auth_config_.enabled) and returns pass-through when false;
+    // empty issuer/policy maps make that gate trivially skip, so the
+    // runtime cost is a handful of atomic loads per request.
+    //
+    // Why always: the middleware is only installable during
+    // MarkServerReady (router_ is not safe for concurrent mutation
+    // post-Start). If we skipped construction when all auth fields
+    // were default, a later SIGHUP that adds `auth.enabled=true`
+    // couldn't retroactively wire the middleware — the flip would log
+    // success but every route would stay unauthenticated until a full
+    // restart. Always-construct makes `auth.enabled: false → true`
+    // genuinely live-reloadable per the documented contract.
+    //
+    // Issuer add/remove is still topology-restart: `AuthManager::Reload`
+    // rejects issuer-set deltas and warns "restart required." That's
+    // unchanged — this fix only closes the "no AuthManager at boot"
+    // silent-no-op gap.
+    try {
+        auth_manager_ = std::make_unique<AUTH_NAMESPACE::AuthManager>(
+            auth_config_, upstream_manager_.get(), dispatchers);
+    } catch (const std::exception& e) {
+        if (auth_config_.enabled) {
+            logging::Get()->error(
+                "AuthManager init failed: {} — stopping server",
+                e.what());
+            net_server_.Stop();
+            throw;
+        }
+        logging::Get()->warn(
+            "AuthManager (disabled) init failed: {} — auth stays off",
+            e.what());
+        auth_manager_.reset();
+    }
+
+    if (auth_manager_) {
+        // Register inline proxy.auth policies + top-level auth.policies
+        // BEFORE Start() — RegisterPolicy rejects post-Start calls.
+        for (const auto& u : upstream_configs_) {
+            if (!u.proxy.auth.enabled) continue;
+            if (u.proxy.route_prefix.empty()) continue;
+            auth_manager_->RegisterPolicy({u.proxy.route_prefix},
+                                            u.proxy.auth);
+        }
+        for (const auto& p : auth_config_.policies) {
+            if (!p.enabled) continue;
+            auth_manager_->RegisterPolicy(p.applies_to, p);
+        }
+
+        // Start discovery / static-fetch asynchronously; non-blocking.
+        auth_manager_->Start();
+
+        // Install the auth middleware UNCONDITIONALLY. InvokeMiddleware
+        // checks AuthManager::master_enabled_ and returns pass-through
+        // when false, so installing at boot time is the cleanest way to
+        // make `auth.enabled: false → true` live-reloadable (otherwise a
+        // SIGHUP can never retroactively add a middleware).
+        router_.PrependMiddleware(
+            AUTH_NAMESPACE::MakeMiddleware(auth_manager_.get()));
+
+        logging::Get()->info(
+            "AuthManager installed enabled={} issuers={} policies={}",
+            auth_config_.enabled, auth_config_.issuers.size(),
+            auth_config_.policies.size());
     }
 
     // Process deferred Proxy() calls + auto-register proxy routes from
@@ -996,6 +1309,11 @@ HttpServer::HttpServer(ServerConfig config)
 
     // Store rate limit config for MarkServerReady()
     rate_limit_config_ = config.rate_limit;
+
+    // Store auth config for MarkServerReady (AuthManager is constructed
+    // there, alongside UpstreamManager — the manager needs the pool
+    // already wired so issuer `upstream` references resolve).
+    auth_config_ = config.auth;
 }
 
 size_t HttpServer::ComputeInputCap() const {
@@ -1227,7 +1545,8 @@ void HttpServer::Proxy(const std::string& route_pattern,
         found->host,
         found->port,
         found->tls.sni_hostname,
-        upstream_manager_.get());
+        upstream_manager_.get(),
+        auth_manager_.get());
 
     // Determine methods to register. HEAD is included so the proxy sends
     // HEAD upstream (not GET via fallback, which downloads the full body).
@@ -1669,7 +1988,8 @@ void HttpServer::RegisterProxyRoutes() {
             upstream.host,
             upstream.port,
             upstream.tls.sni_hostname,
-            upstream_manager_.get());
+            upstream_manager_.get(),
+            auth_manager_.get());
 
         // Same HEAD policy as Proxy() — HEAD included for correct upstream semantics
         static const std::vector<std::string> DEFAULT_PROXY_METHODS =
@@ -2055,6 +2375,14 @@ void HttpServer::Stop() {
     // between the WS snapshot and the H2 drain snapshot. Without this, a WS
     // accepted in the gap would miss the 1001 "Going Away" close frame.
     net_server_.StopAccepting();
+
+    // Cancel in-flight auth discovery / JWKS fetches before teardown. Each
+    // Issuer bumps its generation token so late-arriving completions drop
+    // cleanly. Idempotent — safe to call multiple times (~HttpServer
+    // destructor also calls ~AuthManager → Stop()). §20 risk #4.
+    if (auth_manager_) {
+        auth_manager_->Stop();
+    }
 
     // NOTE: upstream_manager_->InitiateShutdown() is NOT called here.
     // It is deferred to pre_stop_drain_cb (after H2/WS/H1 protocol drain)
@@ -3963,10 +4291,50 @@ bool HttpServer::Reload(ServerConfig new_config) {
         for (const auto& u : upstream_configs_) {
             live_names.insert(u.name);
         }
+        // Build live_issuer_names once — reused by ValidateProxyAuth
+        // (to scope `auth.issuers.*.upstream` xrefs to live issuers
+        // only) and by ValidateHotReloadable below.
+        //
+        // Source of truth MUST be the running AuthManager, NOT
+        // `auth_config_.issuers`. BuildLiveAppliedAuthConfig below
+        // overwrites `auth_config_.issuers` with the STAGED issuer
+        // topology even when that topology was just rejected by
+        // AuthManager::Reload as restart-required. On the next
+        // in-process HttpServer::Reload call, reading from
+        // `auth_config_` would therefore treat staged-only issuers as
+        // live — the same bug `main.cc::ReloadConfig` fixed by
+        // switching to `LiveAuthIssuerNames()`. LiveIssuerNames reads
+        // from the runtime `issuers_` map, which is topology-stable
+        // post-Start.
+        std::unordered_set<std::string> live_issuer_names;
+        if (auth_manager_) {
+            live_issuer_names = auth_manager_->LiveIssuerNames();
+        }
         try {
-            ConfigLoader::ValidateProxyAuth(new_config, live_names);
+            ConfigLoader::ValidateProxyAuth(new_config, live_names,
+                                             live_issuer_names);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Reload() rejected invalid inline auth: {}",
+                                  e.what());
+            return false;
+        }
+        // Exact-prefix collision detection, scoped to LIVE upstreams.
+        // The validation_copy.upstreams.clear() above hides inline
+        // proxy.auth prefixes from `Validate(reload_copy=true)`, so
+        // without an explicit call here a SIGHUP could introduce an
+        // inline policy sharing a prefix with an existing top-level
+        // policy and the collision would only be a warn at
+        // AppliedPolicyList rebuild time. But the check MUST be scoped
+        // to `live_names` — inline entries on new/renamed upstreams are
+        // deferred to restart by ValidateProxyAuth and the applied-
+        // policy rebuild, so an unlivable collision against one of
+        // those would spuriously block unrelated live-safe edits in the
+        // same reload.
+        try {
+            ConfigLoader::ValidateAuthPrefixCollisions(new_config,
+                                                        live_names);
+        } catch (const std::invalid_argument& e) {
+            logging::Get()->error("Reload() rejected auth prefix collision: {}",
                                   e.what());
             return false;
         }
@@ -3979,14 +4347,18 @@ bool HttpServer::Reload(ServerConfig new_config) {
         // so validating CB blocks for new/renamed entries would
         // block otherwise-safe reloads. `upstream_configs_` is the
         // post-Start snapshot of running upstreams.
-        {
-            try {
-                ConfigLoader::ValidateHotReloadable(new_config, live_names);
-            } catch (const std::invalid_argument& e) {
-                logging::Get()->error("Reload() rejected invalid config: {}",
-                                      e.what());
-                return false;
-            }
+        try {
+            // Scope auth-issuer validation to the running AuthManager's
+            // issuer set (live_issuer_names built above) so a typo in an
+            // ADDED/RENAMED issuer (rejected as restart-required anyway
+            // by AuthManager::Reload) doesn't abort unrelated live-safe
+            // edits.
+            ConfigLoader::ValidateHotReloadable(
+                new_config, live_names, live_issuer_names);
+        } catch (const std::invalid_argument& e) {
+            logging::Get()->error("Reload() rejected invalid config: {}",
+                                  e.what());
+            return false;
         }
     }
 
@@ -4185,6 +4557,55 @@ bool HttpServer::Reload(ServerConfig new_config) {
         circuit_breaker_manager_->Reload(new_config.upstreams);
     }
 
+    // Auth reload. Two passes:
+    //   1. AuthManager::Reload applies reloadable issuer fields + forward
+    //      config under its own mutex. Topology-restart fields (add /
+    //      remove issuer, change issuer_url / upstream / mode / discovery)
+    //      are rejected with a reason — we log and skip the policy rebuild
+    //      in that case to keep live state consistent with the rejected
+    //      staged config.
+    //   2. CommitPolicyAndEnforcement rebuilds the applied policy
+    //      list from live upstreams + new top-level policies and
+    //      atomic-swaps. Always called on success so inline proxy.auth
+    //      edits take effect live (matching the ProxyConfig::operator==
+    //      exclusion of `auth`).
+    // Same proxy.auth equality discipline documented in §11.1 —
+    // circuit-breaker precedent.
+    bool auth_reload_ok = false;
+    TopLevelAuthPolicyMergeResult top_level_policy_merge;
+    if (auth_manager_) {
+        std::string auth_err;
+        if (!auth_manager_->Reload(new_config.auth, auth_err)) {
+            logging::Get()->warn(
+                "Auth reload skipped: {} (live state preserved)", auth_err);
+        } else {
+            auth_reload_ok = true;
+            // Build the live issuer name set once — the merge uses it to
+            // detect staged policies that reference non-live issuers (a
+            // restart-required delta; the merge preserves live issuers
+            // list and flags topology_changed for the operator warn).
+            std::unordered_set<std::string> live_issuer_names;
+            live_issuer_names.reserve(auth_config_.issuers.size());
+            for (const auto& [name, _] : auth_config_.issuers) {
+                live_issuer_names.insert(name);
+            }
+            top_level_policy_merge =
+                MergeTopLevelAuthPoliciesPreservingLiveTopology(
+                    auth_config_.policies, new_config.auth.policies,
+                    live_issuer_names);
+            auth_config_ = BuildLiveAppliedAuthConfig(
+                auth_config_, new_config.auth,
+                top_level_policy_merge.policies);
+            // NOTE: the policy-list rebuild is INTENTIONALLY deferred until
+            // after the upstream topology check below. Calling it here with
+            // `new_config.upstreams` would commit staged `proxy.route_prefix`
+            // values to the auth matcher while the router still serves the
+            // old routes — requests to the still-live old prefixes would lose
+            // authentication coverage. The rebuild runs once upstream_configs_
+            // reflects the reality that will actually be served this run.
+        }
+    }
+
     // Upstream topology changes (host/port/pool/proxy/tls) require a
     // restart — pools are built once in Start() and cannot be rebuilt
     // at runtime without a full drain cycle. The equality operator on
@@ -4227,22 +4648,87 @@ bool HttpServer::Reload(ServerConfig new_config) {
     };
     const auto old_map = by_name(upstream_configs_);
     const auto new_map = by_name(new_config.upstreams);
-    bool topology_match = old_map.size() == new_map.size();
-    if (topology_match) {
-        for (const auto& entry : old_map) {
-            auto it = new_map.find(entry.first);
-            if (it == new_map.end() || *entry.second != *it->second) {
-                topology_match = false;
-                break;
-            }
+
+    // Per-upstream merge: each LIVE upstream is evaluated independently
+    // against its staged counterpart. `UpstreamConfig::operator==` is
+    // defined to exclude live-reloadable fields (circuit_breaker and
+    // proxy.auth reloadable subset), so `==` means "restart-only fields
+    // match" — in that case we adopt the staged entry wholesale to pick
+    // up the reloadable edits. When restart-only fields differ, or the
+    // upstream is removed in staged, we keep the live entry (any
+    // reloadable edits bundled into the divergent staged copy are
+    // deferred to restart along with the topology change). New staged
+    // upstreams that don't exist live are also restart-required — they
+    // don't enter upstream_configs_ this cycle.
+    //
+    // Why per-upstream rather than all-or-nothing: the prior behavior
+    // rolled BACK reloadable edits on UNCHANGED upstreams whenever ANY
+    // other upstream had a restart-only divergence. That silently lost
+    // unrelated live-safe proxy.auth edits (design §11.2 step 4 — per-
+    // upstream deferral, not blanket rollback).
+    bool any_diverged = false;
+    std::vector<UpstreamConfig> merged;
+    merged.reserve(upstream_configs_.size());
+    for (const auto& live : upstream_configs_) {
+        auto it = new_map.find(live.name);
+        if (it == new_map.end()) {
+            // Removed in staged — restart-required; keep live.
+            any_diverged = true;
+            merged.push_back(live);
+            continue;
+        }
+        if (*it->second == live) {
+            // Restart-only fields match → reloadable-field delta only.
+            // Adopt staged so the new CB / proxy.auth reloadable fields
+            // carry into upstream_configs_ for the policy rebuild below.
+            merged.push_back(*it->second);
+        } else {
+            // Restart-only divergence on THIS upstream — keep live.
+            any_diverged = true;
+            merged.push_back(live);
         }
     }
-    if (!topology_match) {
+    // New upstreams (in staged, not live) are restart-required and
+    // skipped. Flag topology divergence so the operator sees the warn.
+    if (new_map.size() != old_map.size()) any_diverged = true;
+
+    if (any_diverged) {
         logging::Get()->warn("Reload: upstream topology changes require a "
-                             "restart to take effect (circuit-breaker "
-                             "field edits, if any, were applied live)");
-    } else {
-        upstream_configs_ = new_config.upstreams;
+                             "restart to take effect on the affected "
+                             "upstream(s); unchanged upstreams' live-"
+                             "reloadable fields (circuit_breaker, "
+                             "proxy.auth reloadable subset) were applied");
+    }
+    upstream_configs_ = std::move(merged);
+
+    if (auth_reload_ok && top_level_policy_merge.topology_changed) {
+        logging::Get()->warn(
+            "Reload: top-level auth policy topology changes require a "
+            "restart to take effect (preserving live applies_to/name set)");
+    }
+
+    // Rebuild the applied auth policy list from the LIVE upstream set.
+    // When topology matched, upstream_configs_ now carries the new
+    // proxy.auth fields (reload-safe) and route_prefix (unchanged). When
+    // topology diverged, upstream_configs_ still holds the live values
+    // — inline proxy.auth edits on mismatched topology are carried
+    // alongside the staged prefix and would only re-apply on restart.
+    // Top-level auth.policies[] contributes the live-applied subset:
+    // reloadable fields on stable identities take effect, while staged
+    // name/applies_to topology remains deferred until restart.
+    // Final atomic cutover: policy rebuild + master_enabled_ release-store
+    // under the same lock inside AuthManager::CommitPolicyAndEnforcement.
+    // This runs AFTER the upstream topology check so `upstream_configs_`
+    // reflects the prefixes the router will actually serve, and it closes
+    // the `false → true` reload window that a separate master-enabled
+    // flip in AuthManager::Reload would have left open. See design doc
+    // §11.2 step 4 + §18.5.
+    if (auth_reload_ok) {
+        auth_manager_->CommitPolicyAndEnforcement(
+            upstream_configs_,
+            auth_config_.policies,
+            new_config.auth.forward,
+            new_config.auth.enabled);
     }
 
     // Reload does NOT re-resolve hostnames: if `upstream.host` is a hostname whose DNS

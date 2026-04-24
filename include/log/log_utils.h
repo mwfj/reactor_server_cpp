@@ -22,6 +22,24 @@ inline std::string SanitizePath(const std::string& path) {
     return path;
 }
 
+// Sanitize a claim value or identity string for logging: strip CR, LF, and
+// other ASCII control characters that could enable log injection attacks.
+// Applies defense-in-depth to sub, issuer, kid, and policy_name fields that
+// originate from JWT claims or operator config (both are attacker-reachable).
+inline std::string SanitizeLogValue(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (unsigned char c : value) {
+        if (c < 0x20 || c == 0x7f) {
+            // Replace control characters with a visible marker.
+            out.push_back('?');
+        } else {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    return out;
+}
+
 // Extract the directory component from a file path.
 // "logs/reactor.log" -> "logs"
 // "reactor.log" -> "" (empty = current directory)

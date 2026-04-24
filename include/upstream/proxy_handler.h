@@ -10,6 +10,7 @@
 // Forward declarations
 class UpstreamManager;
 struct HttpRequest;
+namespace AUTH_NAMESPACE { class AuthManager; }
 
 class ProxyHandler {
 public:
@@ -19,7 +20,14 @@ public:
                  const std::string& upstream_host,
                  int upstream_port,
                  const std::string& sni_hostname,
-                 UpstreamManager* upstream_manager);
+                 UpstreamManager* upstream_manager,
+                 // Non-owning, nullable. When non-null, ProxyTransaction
+                 // calls `auth_manager->ForwardConfig()` at the start of
+                 // every outbound hop (§4.7), takes a stack-local
+                 // shared_ptr snapshot, and passes the snapshot through
+                 // to HeaderRewriter::RewriteRequest. Null disables the
+                 // auth overlay entirely (e.g. when auth.enabled=false).
+                 AUTH_NAMESPACE::AuthManager* auth_manager = nullptr);
     ~ProxyHandler();
 
     // Non-copyable, non-movable: routes capture a raw handler_ptr.
@@ -46,6 +54,11 @@ private:
     int upstream_port_;
     std::string sni_hostname_;  // Preferred Host value for TLS backends behind IPs
     UpstreamManager* upstream_manager_;
+    // Non-owning. Lifetime guarantee: HttpServer destructs AuthManager
+    // AFTER ProxyHandler (§3.4 ownership tree), so a live ProxyHandler
+    // never observes a dangling manager pointer. Null when the server has
+    // auth disabled or hasn't wired the manager yet.
+    AUTH_NAMESPACE::AuthManager* auth_manager_ = nullptr;
     HeaderRewriter header_rewriter_;
     RetryPolicy retry_policy_;
     std::string static_prefix_;        // Precomputed from route_prefix for strip_prefix

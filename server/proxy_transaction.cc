@@ -2,6 +2,7 @@
 #include "upstream/upstream_manager.h"
 #include "upstream/upstream_connection.h"
 #include "upstream/http_request_serializer.h"
+#include "auth/auth_manager.h"
 #include "circuit_breaker/circuit_breaker_manager.h"
 #include "circuit_breaker/circuit_breaker_host.h"
 #include "circuit_breaker/circuit_breaker_slice.h"
@@ -204,7 +205,8 @@ ProxyTransaction::ProxyTransaction(
     int upstream_port,
     const std::string& sni_hostname,
     const std::string& upstream_path_override,
-    const std::string& static_prefix)
+    const std::string& static_prefix,
+    AUTH_NAMESPACE::AuthManager* auth_manager)
     : service_name_(service_name),
       method_(client_request.method),
       path_(client_request.path),
@@ -223,7 +225,13 @@ ProxyTransaction::ProxyTransaction(
       sni_hostname_(sni_hostname),
       upstream_path_override_(upstream_path_override),
       static_prefix_(static_prefix),
+      // Copy the AuthContext by value — HttpRequest is invalidated after
+      // the async handler returns (parser_.Reset()). The overlay at
+      // outbound-hop time must consult the validated identity captured
+      // here, not a dangling reference.
+      auth_ctx_(client_request.auth),
       upstream_manager_(upstream_manager),
+      auth_manager_(auth_manager),
       dispatcher_(upstream_manager && client_request.dispatcher_index >= 0
                   ? upstream_manager->GetDispatcherForIndex(
                         static_cast<size_t>(client_request.dispatcher_index))
@@ -271,11 +279,32 @@ void ProxyTransaction::Start() {
     sse_stream_ = false;
     ClearPendingRetryable5xxResponse();
 
-    // Compute rewritten headers (strip hop-by-hop, add X-Forwarded-For, etc.)
+    // Take a stack-local ForwardConfig() snapshot, but ONLY when
+    // enforcement is live. The IsEnforcing() gate is at the CALLER
+    // (design §4.7 / §6.1 / §14 step 21): `ForwardConfig()` returns
+    // the stored snapshot unconditionally even when IsEnforcing()=false
+    // (AuthManager may exist in a "disabled but constructed" state so
+    // SIGHUP can flip `auth.enabled: false → true` without a restart).
+    // Unconditional snapshotting would let a staged
+    // `forward.preserve_authorization=false` strip `Authorization`,
+    // or let any identity-inject / undetermined-header-strip fire on
+    // proxy hops whose auth is OFF — leaking overlay semantics onto
+    // routes the operator has not yet opted into. The `shared_ptr`
+    // keeps the snapshot alive for the duration of RewriteRequest even
+    // if a concurrent Reload swaps the AuthManager's internal pointer.
+    std::shared_ptr<const AUTH_NAMESPACE::AuthForwardConfig> fwd_snap;
+    if (auth_manager_ && auth_manager_->IsEnforcing()) {
+        fwd_snap = auth_manager_->ForwardConfig();
+    }
+
+    // Compute rewritten headers (strip hop-by-hop, add X-Forwarded-For, etc.,
+    // apply auth overlay when AuthManager + AuthContext are present).
     rewritten_headers_ = header_rewriter_.RewriteRequest(
         client_headers_, client_ip_, client_tls_,
         upstream_tls_,
-        upstream_host_, upstream_port_, sni_hostname_);
+        upstream_host_, upstream_port_, sni_hostname_,
+        fwd_snap ? fwd_snap.get() : nullptr,
+        &auth_ctx_);
 
     // Compute upstream path with strip_prefix support.
     // Prefer upstream_path_override_ (extracted from catch-all route param by
@@ -768,6 +797,11 @@ void ProxyTransaction::OnUpstreamData(
             return;
         }
         int upstream_fd = conn ? conn->fd() : -1;
+        logging::Get()->warn("ProxyTransaction upstream EOF with incomplete response "
+                             "client_fd={} service={} upstream_fd={} "
+                             "body_complete_={} codec_paused={} paused_bytes={}",
+                             client_fd_, service_name_, upstream_fd,
+                             body_complete_, codec_.IsPaused(), paused_parse_bytes_.size());
         logging::Get()->warn("ProxyTransaction upstream disconnect (EOF) "
                              "client_fd={} service={} upstream_fd={} "
                              "state={} attempt={}",

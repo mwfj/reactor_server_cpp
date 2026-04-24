@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config/server_config.h"
+#include <optional>
 #include <string>
 #include <stdexcept>
 #include <unordered_set>
@@ -101,9 +102,17 @@ public:
     //
     // Throws std::invalid_argument with a message identifying the
     // offending upstream and field.
+    // `live_upstream_names` scopes per-upstream CB validation to running
+    // pools. `live_issuer_names` scopes the auth-issuer range/allowlist
+    // checks to issuers that actually exist in the running AuthManager —
+    // a typo in an ADDED or RENAMED issuer would be rejected by
+    // AuthManager::Reload as restart-required anyway, so failing the whole
+    // hot-reload on it would block unrelated live-safe edits. Empty set is
+    // safe: "no live issuers" skips the per-issuer loop entirely.
     static void ValidateHotReloadable(
         const ServerConfig& config,
-        const std::unordered_set<std::string>& live_upstream_names);
+        const std::unordered_set<std::string>& live_upstream_names,
+        const std::unordered_set<std::string>& live_issuer_names = {});
 
     // Validate inline per-proxy auth blocks (structural checks +
     // enforcement-not-yet-wired gate). Runs the SAME per-upstream auth
@@ -162,11 +171,101 @@ public:
     // is safe to call a second time with the same config (all checks
     // are pure / side-effect-free / deterministic).
     //
+    // `live_issuer_names` scopes the `auth.issuers.*.upstream` cross-
+    // reference checks. The parameter's TYPE distinguishes startup from
+    // reload semantics:
+    //
+    //   * `std::nullopt` — startup: no live-runtime concept, check
+    //     every staged issuer's `upstream` field. This is the default
+    //     for legacy test callers and any future in-process code path
+    //     that validates a fresh config before AuthManager exists.
+    //
+    //   * `std::optional<set>` present — reload: scope to the set.
+    //     Staged-only issuers (names not in the set) are SKIPPED
+    //     because `AuthManager::Reload` will reject their topology
+    //     change anyway; validating their `upstream` field here would
+    //     abort unrelated live-safe reloads that ship alongside a
+    //     staged issuer add.
+    //       Present-but-empty (`std::optional<set>({})`) = "reload with
+    //       NO live auth runtime" → skip every issuer.upstream check,
+    //       because no staged auth can land live this cycle. Without
+    //       this distinction, a boot-with-empty-auth server's first
+    //       reload would reject any staged-but-bad issuer ref and
+    //       block unrelated edits.
+    //
     // Throws std::invalid_argument with an `upstreams['name'].proxy.auth...`
     // message on failure.
     static void ValidateProxyAuth(
         const ServerConfig& config,
-        const std::unordered_set<std::string>& live_upstream_names);
+        const std::unordered_set<std::string>& live_upstream_names,
+        std::optional<std::unordered_set<std::string>> live_issuer_names
+            = std::nullopt);
+
+    // Structural validation for `auth.forward.*` output header names:
+    //   * RFC 7230 §3.2.6 tchar validity (rejects spaces / punctuation /
+    //     pseudo-header colons)
+    //   * Reserved-name rejection (hop-by-hop, framing-critical,
+    //     HeaderRewriter-owned, gateway-owned sentinels — see
+    //     IsReservedAuthForwardHeader)
+    //   * Case-insensitive duplicate detection across the 4 fixed slots
+    //     (subject/issuer/scopes/raw_jwt) plus every claims_to_headers target.
+    //
+    // Shared entry point so startup `Validate` and `ValidateHotReloadable`
+    // apply the same rules — without this, a SIGHUP that introduces a
+    // bad forward-header name would only log a warn at the outer
+    // ReloadConfig catch-all and then commit the snapshot to live state,
+    // while startup with the identical config would reject outright.
+    //
+    // Throws std::invalid_argument on failure.
+    static void ValidateAuthForward(const ServerConfig& config);
+
+    // Structural validation for top-level `auth.policies[]` entries:
+    //   * `name` non-empty / not-whitespace-only + unique across policies
+    //   * `on_undetermined` ∈ {"deny", "allow"}
+    //   * each `issuers[]` name present in `config.auth.issuers`
+    //   * enabled && applies_to empty → reject
+    //   * enabled && issuers empty → reject
+    //
+    // Shared between startup `Validate` and `ValidateHotReloadable` for
+    // the same reason as `ValidateAuthForward`: malformed live policy
+    // edits must hard-reject before CommitPolicyAndEnforcement publishes
+    // them, not just warn via the outer reload catch-all.
+    //
+    // Throws std::invalid_argument on failure.
+    static void ValidateTopLevelPolicies(const ServerConfig& config);
+
+    // Exact-prefix collision detection across inline `proxy.auth` and
+    // top-level `auth.policies[].applies_to`. Per design §3.2 / §5.2,
+    // a prefix that appears in two different policy owners is a
+    // hard-reject config error (ambiguity unresolved at runtime).
+    //
+    // Extracted as its own entry point so the reload path can run it
+    // against the live-applyable subset without being blocked by staged
+    // inline prefixes that won't actually be installed this cycle.
+    //
+    // Scope of inline `proxy.auth` participation:
+    //   * Empty `live_upstream_names` (default): every enabled inline
+    //     entry participates — matches startup semantics where all
+    //     upstreams are about to go live.
+    //   * Non-empty set: only enabled inline entries whose upstream
+    //     `name` is in the set participate. Staged inline prefixes on
+    //     new/renamed upstreams are SKIPPED — those entries are
+    //     restart-required per `ValidateProxyAuth` and the applied-
+    //     policy rebuild both, so a collision against them would
+    //     spuriously block unrelated live-safe edits.
+    //
+    // Top-level policies participate regardless of scope — they are
+    // fully live-reloadable by identity.
+    //
+    // Only ENABLED policies participate (parallel to the in-Validate
+    // path — disabled staged policies don't drive the matcher and
+    // shouldn't reject).
+    //
+    // Throws std::invalid_argument with an "auth policy prefix '...'
+    // declared by both <owner-a> and <owner-b>" message on collision.
+    static void ValidateAuthPrefixCollisions(
+        const ServerConfig& config,
+        const std::unordered_set<std::string>& live_upstream_names = {});
 
     // Return a ServerConfig with all default values.
     static ServerConfig Default();
