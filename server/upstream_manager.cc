@@ -39,9 +39,53 @@ static void SuppressSigpipe() {
     }
 }
 
+// Build a literal-only `ResolvedMap` from the upstream configs. Used
+// by the 2-arg legacy ctor so unit tests and embedders that pass
+// IP-literal hosts keep working without going through DnsResolver.
+// Throws invalid_argument on the first non-literal host — callers with
+// hostnames must produce the map via `DnsResolver::ResolveMany` and
+// call the 3-arg ctor directly.
+static NET_DNS_NAMESPACE::ResolvedMap BuildResolvedFromLiterals(
+    const std::vector<UpstreamConfig>& upstreams)
+{
+    NET_DNS_NAMESPACE::ResolvedMap out;
+    out.reserve(upstreams.size());
+    for (const auto& u : upstreams) {
+        std::string bare;
+        if (!NET_DNS_NAMESPACE::DnsResolver::NormalizeHostToBare(u.host, &bare)) {
+            throw std::invalid_argument(
+                "UpstreamManager legacy ctor: upstream '" + u.name +
+                "' host '" + u.host + "' is malformed (unbalanced "
+                "brackets or invalid grammar).");
+        }
+        InetAddr addr(bare, u.port);
+        if (!addr.is_valid()) {
+            throw std::invalid_argument(
+                "UpstreamManager legacy ctor: upstream '" + u.name +
+                "' host '" + u.host + "' is not a literal IPv4/IPv6 "
+                "address. Use the 3-arg ctor with a resolved map "
+                "(from DnsResolver::ResolveMany) for hostnames.");
+        }
+        auto ep = std::make_shared<NET_DNS_NAMESPACE::ResolvedEndpoint>();
+        ep->addr        = addr;
+        ep->host        = bare;
+        ep->port        = u.port;
+        ep->resolved_at = std::chrono::steady_clock::now();
+        out.emplace(u.name, std::move(ep));
+    }
+    return out;
+}
+
 UpstreamManager::UpstreamManager(
     const std::vector<UpstreamConfig>& upstreams,
     const std::vector<std::shared_ptr<Dispatcher>>& dispatchers)
+    : UpstreamManager(upstreams, dispatchers,
+                      BuildResolvedFromLiterals(upstreams)) {}
+
+UpstreamManager::UpstreamManager(
+    const std::vector<UpstreamConfig>& upstreams,
+    const std::vector<std::shared_ptr<Dispatcher>>& dispatchers,
+    NET_DNS_NAMESPACE::ResolvedMap resolved)
     : dispatchers_(dispatchers)
 {
     // Check if any upstream uses TLS — suppress SIGPIPE if so.
@@ -82,10 +126,60 @@ UpstreamManager::UpstreamManager(
             }
         }
 
-        // Create the host pool
+        // Pass the ORIGINAL operator host (possibly a
+        // hostname) as the pool's host — it's used for logging and as
+        // the effective-SNI fallback. The connect-bound endpoint is
+        // carried separately via `resolved_endpoint` so the string and
+        // the socket address are never coupled by a bridge that
+        // rewrites one in terms of the other.
+        auto it = resolved.find(upstream.name);
+        if (it == resolved.end() || !it->second) {
+            throw std::invalid_argument(
+                "UpstreamManager: no resolved endpoint for upstream '" +
+                upstream.name + "'. HttpServer::Start should have "
+                "produced one via the DNS batch.");
+        }
+        std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>
+            resolved_endpoint = it->second;
+
+        // Effective SNI (§5.10). The rule has three tiers:
+        //   1. Explicit `tls.sni_hostname` wins (operator intent).
+        //   2. Hostname `upstream.host` falls back — it is a verifiable
+        //      identity and matches cert CN/SAN for the common
+        //      "hostname upstream + TLS" shape. (The validator at
+        //      `ConfigLoader::Validate` allows `verify_peer=true` with
+        //      an empty sni_hostname in this case because of this
+        //      fallback.)
+        //   3. IP-literal `upstream.host` does NOT fall back — we
+        //      pass an empty SNI so the TlsConnection ctor skips
+        //      `SSL_set_tlsext_host_name` + `SSL_set1_host` entirely.
+        //      Many backends reject or misroute literal-IP SNI
+        //      (RFC 6066 §3 warns against sending an IP); supported
+        //      deployments that ran with `sni_hostname=""` +
+        //      `verify_peer=false` were silently sending NO SNI before
+        //      this refactor, and falling back to the IP here would
+        //      change their on-the-wire ClientHello and break
+        //      handshakes for no gain. The validator still rejects
+        //      IP + empty sni + verify_peer=true (nothing verifiable).
+
+        std::string host_for_sni;
+        if (!NET_DNS_NAMESPACE::DnsResolver::NormalizeHostToBare(
+                upstream.host, &host_for_sni)) {
+            host_for_sni = upstream.host;
+        }
+
+        std::string effective_sni;
+        if (!upstream.tls.sni_hostname.empty()) {
+            effective_sni = upstream.tls.sni_hostname;
+        } else if (!NET_DNS_NAMESPACE::DnsResolver::IsIpLiteral(host_for_sni)) {
+            effective_sni = host_for_sni;
+        }
+        // else: IP-literal + empty sni_hostname → effective_sni stays empty.
+
         pools_[upstream.name] = std::make_unique<UpstreamHostPool>(
             upstream.name, upstream.host, upstream.port,
-            upstream.tls.sni_hostname,
+            effective_sni,
+            resolved_endpoint,
             upstream.pool, dispatchers, tls_ctx,
             outstanding_conns_, shutting_down_, drain_mtx_, drain_cv_);
     }

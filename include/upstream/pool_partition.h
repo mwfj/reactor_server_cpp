@@ -6,6 +6,7 @@
 #include "upstream/upstream_lease.h"
 #include "upstream/upstream_callbacks.h"
 #include "config/server_config.h"
+#include "net/dns_resolver.h"    // ResolvedEndpoint — held via atomic shared_ptr
 #include <condition_variable>
 // <memory>, <functional>, <deque>, <vector>, <chrono>, <atomic>, <mutex> provided by common.h
 
@@ -34,6 +35,7 @@ public:
     PoolPartition(std::shared_ptr<Dispatcher> dispatcher,
                   const std::string& upstream_host, int upstream_port,
                   const std::string& sni_hostname,
+                  std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> resolved_endpoint,
                   const UpstreamPoolConfig& config,
                   std::shared_ptr<TlsClientContext> tls_ctx,
                   std::atomic<int64_t>& outstanding_conns,
@@ -123,13 +125,31 @@ public:
     }
     size_t WaitQueueSize() const { return wait_queue_.size(); }
 
+    // Test-only: the effective SNI string the partition forwards to
+    // `TlsConnection` when it originates TLS to the upstream. Empty
+    // means "no SNI sent" (TlsConnection skips
+    // `SSL_set_tlsext_host_name` + `SSL_set1_host`). hostname-fallback ON, IP-literal-
+    // fallback OFF — can be pinned by unit tests without spinning up
+    // a real TLS handshake. Safe to call from any thread because
+    // `sni_hostname_` is ctor-initialised and never mutated.
+    const std::string& sni_hostname_for_testing() const {
+        return sni_hostname_;
+    }
+
 private:
     std::shared_ptr<Dispatcher> dispatcher_;
-    std::string upstream_host_;
-    int upstream_port_;
-    std::string sni_hostname_;  // Empty = use upstream_host_ for SNI
+    std::string upstream_host_;     // Original operator host (hostname OR literal). LOGGING ONLY — connect reads resolved_endpoint_.
+    int upstream_port_;              // Original operator port. Logs / fallback SNI port.
+    std::string sni_hostname_;       // Empty = use upstream_host_ for SNI (§5.10)
     UpstreamPoolConfig config_;
     std::shared_ptr<TlsClientContext> tls_ctx_;
+
+    // C++17 note: `std::atomic_load_explicit(shared_ptr*)` is the
+    // standard-compliant form. C++20 deprecates the free-function
+    // overloads in favor of `std::atomic<std::shared_ptr<T>>`; a
+    // migration when this project moves to C++20 is tracked alongside
+    // the step-11 publisher.
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> resolved_endpoint_;
 
     // Manager-owned drain coordination — partitions signal when empty
     std::atomic<int64_t>& outstanding_conns_;

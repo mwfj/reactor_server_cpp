@@ -3,9 +3,12 @@
 #include "log/log_utils.h"
 
 
-SocketHandler::SocketHandler() : fd_(CreateSocket()), port_(0) {}
-SocketHandler::SocketHandler(int fd) : fd_(fd), port_(0) {}
-SocketHandler::SocketHandler(int fd, const std::string& ip, int port) : fd_(fd), ip_addr_(ip), port_(port) {}
+// Default ctor — preserves AF_INET behaviour for the single legacy call
+// site. IPv6 callers use `SocketHandler(CreateSocket(AF_INET6), AF_INET6)`.
+SocketHandler::SocketHandler() : fd_(CreateSocket(AF_INET)), port_(0), family_(AF_INET) {}
+SocketHandler::SocketHandler(int fd) : fd_(fd), port_(0), family_(AF_UNSPEC) {}
+SocketHandler::SocketHandler(int fd, sa_family_t family) : fd_(fd), port_(0), family_(family) {}
+SocketHandler::SocketHandler(int fd, const std::string& ip, int port) : fd_(fd), ip_addr_(ip), port_(port), family_(AF_UNSPEC) {}
 SocketHandler::~SocketHandler() { Close(); }
 
 bool SocketHandler::SetTcpNoDelay(bool _flag){
@@ -25,15 +28,20 @@ bool SocketHandler::SetKeepAlive(bool _flag){
     return ::setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &optVal, sizeof(optVal)) == 0;
 }
 
-int SocketHandler::CreateSocket() {
+int SocketHandler::CreateSocket(sa_family_t family) {
+    // §5.3 dual-family. AF_INET preserves the existing default; callers
+    // that need IPv6 pass AF_INET6 explicitly. SOCK_CLOEXEC atomically
+    // avoids the fd-leaks-into-fork-exec race on Linux; macOS uses
+    // fcntl(F_SETFD) in SetNonBlocking.
 #if defined(__linux__)
-    int listenfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+    int listenfd = ::socket(family, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
 #else
-    int listenfd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    int listenfd = ::socket(family, SOCK_STREAM, IPPROTO_TCP);
 #endif
     if (listenfd == -1) {
         int saved_errno = errno;
-        logging::Get()->error("Failed to create socket: {}", std::strerror(saved_errno));
+        logging::Get()->error("Failed to create socket (family={}): {}",
+                              (int)family, std::strerror(saved_errno));
         throw std::runtime_error(
             std::string("Failed to create socket: ") + std::strerror(saved_errno));
     }
@@ -46,16 +54,20 @@ int SocketHandler::CreateSocket() {
     return listenfd;
 }
 
-int SocketHandler::CreateClientSocket() {
+int SocketHandler::CreateClientSocket(sa_family_t family) {
+    // §5.3 dual-family outbound. AF_INET default so every existing call
+    // compiles unchanged; PoolPartition / upstream paths will pass
+    // AF_INET6 when the resolved endpoint's family() == kIPv6.
 #if defined(__linux__)
-    int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int fd = ::socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd == -1) {
         int saved_errno = errno;
-        logging::Get()->error("Failed to create client socket: {}", logging::SafeStrerror(saved_errno));
+        logging::Get()->error("Failed to create client socket (family={}): {}",
+                              (int)family, logging::SafeStrerror(saved_errno));
         return -1;
     }
 #else
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    int fd = ::socket(family, SOCK_STREAM, 0);
     if (fd == -1) {
         int saved_errno = errno;
         logging::Get()->error("Failed to create client socket: {}", logging::SafeStrerror(saved_errno));
@@ -87,7 +99,7 @@ int SocketHandler::CreateClientSocket() {
 }
 
 void SocketHandler::Bind(const InetAddr& _servAddr){
-    if(::bind(fd_, _servAddr.Addr(), sizeof(sockaddr_in)) < 0){
+    if(::bind(fd_, _servAddr.Addr(), _servAddr.Len()) < 0){
         int saved_errno = errno;  // Save errno before any other calls
         Close();
         logging::Get()->error("Bind failed: {} (errno={})", logging::SafeStrerror(saved_errno), saved_errno);
@@ -103,7 +115,11 @@ void SocketHandler::Listen(int _maxLen){
     }
 }
 int SocketHandler::Accept(InetAddr& _clientAddr){
-    sockaddr_in acceptAddr;
+    // v0.45 round-42 step 1: sockaddr_storage (128 B) so IPv6 peers are
+    // not truncated to 16 B. Fulfils the §5.3 "Accept via storage"
+    // invariant — InetAddr::SetAddr(sockaddr*, socklen_t) branches on
+    // the real family.
+    sockaddr_storage acceptAddr;
     socklen_t len = sizeof(acceptAddr);
 #if defined(__linux__)
     // Linux: use accept4 with SOCK_NONBLOCK|SOCK_CLOEXEC for atomic setup
@@ -159,7 +175,7 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
         }
     }
 #endif
-    _clientAddr.SetAddr(acceptAddr);
+    _clientAddr.SetAddr(reinterpret_cast<const sockaddr*>(&acceptAddr), len);
     return clientfd;
 }
 
@@ -239,15 +255,19 @@ void SocketHandler::SetNonBlocking(int fd) {
 
 int SocketHandler::GetBoundPort() const {
     if (fd_ == -1) return 0;
-    // IPv4 only — matches the project's current AF_INET-only stack.
-    // If IPv6 is added (sockaddr_in6 is 28 bytes vs sockaddr_in's 16),
-    // this must change to sockaddr_storage to avoid buffer overflow.
-    struct sockaddr_in addr;
+    // Dual-family per §5.3: use sockaddr_storage so an AF_INET6 listener
+    // returns the real sin6_port rather than truncating into
+    // sockaddr_in's 16 bytes. Branch on ss_family to read the correct
+    // port field.
+    struct sockaddr_storage addr;
     socklen_t len = sizeof(addr);
     if (getsockname(fd_, reinterpret_cast<struct sockaddr*>(&addr), &len) < 0) {
         int saved_errno = errno;
         logging::Get()->warn("getsockname failed: {}", logging::SafeStrerror(saved_errno));
         return 0;
     }
-    return ntohs(addr.sin_port);
+    if (addr.ss_family == AF_INET6) {
+        return ntohs(reinterpret_cast<const sockaddr_in6*>(&addr)->sin6_port);
+    }
+    return ntohs(reinterpret_cast<const sockaddr_in*>(&addr)->sin_port);
 }

@@ -50,6 +50,12 @@ public:
     std::string GetCipherName() const;
     std::string GetProtocolVersion() const;
 
+    // Test-only accessor — returns the underlying OpenSSL SSL*. Used by
+    // DualStack tests to introspect SNI / verify-name post-ctor without
+    // running a handshake. Production code must not rely on this; the
+    // ownership model (non-copyable / non-movable) is deliberate.
+    SSL* GetSslForTesting() const { return ssl_; }
+
     // Get the ALPN-negotiated protocol (e.g., "h2", "http/1.1").
     // Returns empty string if no ALPN was negotiated or handshake not complete.
     std::string GetAlpnProtocol() const;

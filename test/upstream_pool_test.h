@@ -21,6 +21,7 @@
 #include "upstream/upstream_manager.h"
 #include "upstream/upstream_host_pool.h"
 #include "upstream/pool_partition.h"
+#include "net/dns_resolver.h"
 #include "socket_handler.h"
 #include "connection_handler.h"
 #include "dispatcher.h"
@@ -1369,9 +1370,20 @@ void TestUpstreamHostPoolPartitionCount() {
         std::mutex drain_mtx;
         std::condition_variable drain_cv;
 
+        // §5.5 step 9 full: UpstreamHostPool now requires a resolved
+        // endpoint alongside the host/port strings. Synthesise one from
+        // the literal host since this test constructs the pool directly
+        // (bypassing UpstreamManager's map-based plumbing).
+        auto resolved = std::make_shared<NET_DNS_NAMESPACE::ResolvedEndpoint>();
+        resolved->addr = InetAddr(ucfg.host, ucfg.port);
+        resolved->host = ucfg.host;
+        resolved->port = ucfg.port;
+        resolved->resolved_at = std::chrono::steady_clock::now();
+
         UpstreamHostPool pool(
             ucfg.name, ucfg.host, ucfg.port,
             ucfg.tls.sni_hostname,
+            resolved,
             ucfg.pool, {d0, d1}, nullptr,
             outstanding, mgr_shutdown, drain_mtx, drain_cv);
 
@@ -1419,9 +1431,17 @@ void TestUpstreamHostPoolAccessors() {
         std::mutex drain_mtx;
         std::condition_variable drain_cv;
 
+        // §5.5 step 9 full: synthesize resolved endpoint from literal.
+        auto resolved = std::make_shared<NET_DNS_NAMESPACE::ResolvedEndpoint>();
+        resolved->addr = InetAddr(ucfg.host, ucfg.port);
+        resolved->host = ucfg.host;
+        resolved->port = ucfg.port;
+        resolved->resolved_at = std::chrono::steady_clock::now();
+
         UpstreamHostPool pool(
             ucfg.name, ucfg.host, ucfg.port,
             ucfg.tls.sni_hostname,
+            resolved,
             ucfg.pool, {dispatcher}, nullptr,
             outstanding, mgr_shutdown, drain_mtx, drain_cv);
 
@@ -1969,6 +1989,134 @@ void TestMultiDispatcherConcurrency() {
     }
 }
 
+// §5.10 effective-SNI rule: an IP-literal upstream with an empty
+// `tls.sni_hostname` must NOT fall back to `upstream.host` as the SNI
+// — many backends reject or misroute literal-IP SNI (RFC 6066 §3).
+// The partition's stored `sni_hostname_` must therefore be empty so
+// `TlsConnection` skips `SSL_set_tlsext_host_name` entirely. Hostname
+// upstreams with empty `sni_hostname` DO fall back (common shape) so
+// cert CN/SAN has something to match against.
+//
+// Test pins both cases via PoolPartition::sni_hostname_for_testing().
+// No real TLS handshake — this is a unit-level effective-SNI
+// derivation test driven by UpstreamManager's construction.
+void TestUpstreamManagerEffectiveSni() {
+    std::cout << "\n[TEST] UpstreamPool: effective SNI derivation (IP vs hostname)..."
+              << std::endl;
+    try {
+        bool pass = true;
+        std::string err;
+
+        auto dispatcher = std::make_shared<Dispatcher>(true, 5);
+        std::thread dt = StartDispatcher(dispatcher);
+
+        // Case 1: IP-literal upstream + empty sni_hostname →
+        // partition.sni_hostname_ is empty (no SNI sent). TLS is
+        // disabled so the pool doesn't require a real TLS context.
+        UpstreamConfig u_ip = MakeUpstreamConfig("ip_svc", "127.0.0.1", 9901);
+        u_ip.tls.enabled = false;
+        u_ip.tls.sni_hostname = "";
+
+        // Case 2: hostname upstream + empty sni_hostname → partition
+        // .sni_hostname_ falls back to upstream.host. 2-arg ctor
+        // won't take a hostname (BuildResolvedFromLiterals throws),
+        // so synthesise a ResolvedMap and use the 3-arg ctor.
+        UpstreamConfig u_host = MakeUpstreamConfig(
+            "host_svc", "api.example.com", 9902);
+        u_host.tls.enabled = false;
+        u_host.tls.sni_hostname = "";
+
+        // Case 3: explicit sni_hostname wins on any host kind.
+        UpstreamConfig u_explicit = MakeUpstreamConfig(
+            "explicit_svc", "127.0.0.1", 9903);
+        u_explicit.tls.enabled = false;
+        u_explicit.tls.sni_hostname = "api.example.com";
+
+        // Case 4 (v0.53 P2): bracketed IPv6 host reaches the 3-arg ctor
+        // via direct construction (production flow strips brackets in
+        // ConfigLoader::Normalize; tests / embedders bypass that).
+        // UpstreamManager must normalize before the IsIpLiteral check
+        // so `[::1]` is recognised as a literal and effective_sni is
+        // left empty (NO SNI sent, matching §5.10 IP-literal rule).
+        UpstreamConfig u_bracketed = MakeUpstreamConfig(
+            "bracketed_svc", "[::1]", 9904);
+        u_bracketed.tls.enabled = false;
+        u_bracketed.tls.sni_hostname = "";
+
+        NET_DNS_NAMESPACE::ResolvedMap resolved;
+        auto make_ep = [](const std::string& host, int port) {
+            auto ep = std::make_shared<NET_DNS_NAMESPACE::ResolvedEndpoint>();
+            // For hostnames (or bracketed inputs we don't want to
+            // parse twice here) synthesize a plausible bound loopback
+            // address so the endpoint is valid enough for the
+            // partition's ctor null-guard. No real connection
+            // attempts are made in this test.
+            std::string bare;
+            if (NET_DNS_NAMESPACE::DnsResolver::NormalizeHostToBare(host, &bare)
+                && NET_DNS_NAMESPACE::DnsResolver::IsIpLiteral(bare)) {
+                ep->addr = InetAddr(bare, port);
+            } else {
+                ep->addr = InetAddr("127.0.0.1", port);
+            }
+            ep->host = host;
+            ep->port = port;
+            ep->resolved_at = std::chrono::steady_clock::now();
+            return ep;
+        };
+        resolved["ip_svc"]        = make_ep(u_ip.host, u_ip.port);
+        resolved["host_svc"]      = make_ep(u_host.host, u_host.port);
+        resolved["explicit_svc"]  = make_ep(u_explicit.host, u_explicit.port);
+        resolved["bracketed_svc"] = make_ep(u_bracketed.host, u_bracketed.port);
+
+        UpstreamManager mgr({u_ip, u_host, u_explicit, u_bracketed},
+                             {dispatcher}, resolved);
+        DispatcherThreadGuard dtg{dispatcher, dt};
+
+        PoolPartition* p_ip        = mgr.GetPoolPartition("ip_svc", 0);
+        PoolPartition* p_host      = mgr.GetPoolPartition("host_svc", 0);
+        PoolPartition* p_explicit  = mgr.GetPoolPartition("explicit_svc", 0);
+        PoolPartition* p_bracketed = mgr.GetPoolPartition("bracketed_svc", 0);
+
+        if (!p_ip || !p_host || !p_explicit || !p_bracketed) {
+            pass = false; err += "partition lookup null; ";
+        } else {
+            // IP-literal + empty sni → effective SNI is empty.
+            if (!p_ip->sni_hostname_for_testing().empty()) {
+                pass = false;
+                err += "ip_svc SNI not empty: '" +
+                       p_ip->sni_hostname_for_testing() + "'; ";
+            }
+            // Hostname + empty sni → fallback to upstream.host.
+            if (p_host->sni_hostname_for_testing() != "api.example.com") {
+                pass = false;
+                err += "host_svc SNI not host: '" +
+                       p_host->sni_hostname_for_testing() + "'; ";
+            }
+            // Explicit sni wins on IP literal.
+            if (p_explicit->sni_hostname_for_testing() != "api.example.com") {
+                pass = false;
+                err += "explicit_svc SNI not explicit: '" +
+                       p_explicit->sni_hostname_for_testing() + "'; ";
+            }
+            // Bracketed IPv6 + empty sni → recognised as IP literal,
+            // effective SNI is empty (NO SNI sent).
+            if (!p_bracketed->sni_hostname_for_testing().empty()) {
+                pass = false;
+                err += "bracketed_svc SNI not empty: '" +
+                       p_bracketed->sni_hostname_for_testing() + "'; ";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "UpstreamPool: effective SNI derivation (IP vs hostname)",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "UpstreamPool: effective SNI derivation (IP vs hostname)",
+            false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RunAllTests
 // ---------------------------------------------------------------------------
@@ -2037,6 +2185,9 @@ void RunAllTests() {
 
     // Section 12: Multi-dispatcher concurrency
     TestMultiDispatcherConcurrency();
+
+    // Section 13: §5.10 effective-SNI derivation
+    TestUpstreamManagerEffectiveSni();
 }
 
 } // namespace UpstreamPoolTests

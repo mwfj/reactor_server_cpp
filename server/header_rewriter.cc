@@ -3,6 +3,7 @@
 #include "auth/auth_config.h"
 #include "auth/auth_context.h"
 #include "log/logger.h"
+#include "net/dns_resolver.h"   // DnsResolver::FormatAuthority (§5.5.1)
 #include <unordered_set>
 
 HeaderRewriter::HeaderRewriter(const Config& config)
@@ -283,18 +284,18 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
     // the client omitted it (HTTP/1.0) — an HTTP/1.1 request without Host
     // is invalid and many backends reject it with 400.
     if (config_.rewrite_host || output.find("host") == output.end()) {
-        const std::string& host_value =
+        const std::string& host_src =
             (upstream_tls && !sni_hostname.empty())
                 ? sni_hostname
                 : upstream_host;
-        bool omit_port = (!upstream_tls && upstream_port == 80) ||
-                         (upstream_tls && upstream_port == 443);
-        if (omit_port) {
-            output["host"] = host_value;
-        } else {
-            output["host"] = host_value + ":"
-                           + std::to_string(upstream_port);
-        }
+
+        const std::string host_value =
+            NET_DNS_NAMESPACE::DnsResolver::StripTrailingDot(host_src);
+        const bool omit_port = (!upstream_tls && upstream_port == 80) ||
+                               (upstream_tls && upstream_port == 443);
+
+        output["host"] = NET_DNS_NAMESPACE::DnsResolver::FormatAuthority(
+            host_value, upstream_port, omit_port);
     }
 
     // Auth overlay step 5: inject validated identity. Only runs when

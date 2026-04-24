@@ -3,6 +3,7 @@
 #include "common.h"
 #include "upstream/pool_partition.h"
 #include "config/server_config.h"
+#include "net/dns_resolver.h"    // ResolvedEndpoint threaded through to partitions
 // <memory>, <vector>, <string> provided by common.h
 
 class TlsClientContext;
@@ -12,6 +13,7 @@ public:
     UpstreamHostPool(const std::string& service_name,
                      const std::string& host, int port,
                      const std::string& sni_hostname,
+                     std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> resolved_endpoint,
                      const UpstreamPoolConfig& config,
                      const std::vector<std::shared_ptr<Dispatcher>>& dispatchers,
                      std::shared_ptr<TlsClientContext> tls_ctx,

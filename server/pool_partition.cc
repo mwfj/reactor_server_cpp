@@ -38,6 +38,7 @@ PoolPartition::PoolPartition(
     std::shared_ptr<Dispatcher> dispatcher,
     const std::string& upstream_host, int upstream_port,
     const std::string& sni_hostname,
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> resolved_endpoint,
     const UpstreamPoolConfig& config,
     std::shared_ptr<TlsClientContext> tls_ctx,
     std::atomic<int64_t>& outstanding_conns,
@@ -54,11 +55,28 @@ PoolPartition::PoolPartition(
     , manager_shutting_down_(manager_shutting_down)
     , drain_mtx_(drain_mtx)
     , drain_cv_(drain_cv)
+    , resolved_endpoint_(std::move(resolved_endpoint))
     , partition_max_connections_(static_cast<size_t>(config.max_connections))
 {
-    logging::Get()->debug("PoolPartition created for {}:{} on dispatcher {}",
-                          upstream_host_, upstream_port_,
-                          dispatcher_->dispatcher_index());
+    // Programmer error guard: partition needs a resolved endpoint to
+    // connect. Production builds get one from HttpServer::Start's DNS
+    // batch; legacy-literal builds get one from
+    // UpstreamManager::BuildResolvedFromLiterals. A null here means a
+    // caller is constructing PoolPartition directly with the old
+    // no-endpoint signature — fail fast with a clear message.
+    if (!resolved_endpoint_) {
+        throw std::invalid_argument(
+            "PoolPartition: resolved_endpoint must not be null "
+            "(use UpstreamManager's 2-arg legacy ctor for literal-only "
+            "setups; direct PoolPartition construction requires a "
+            "ResolvedEndpoint).");
+    }
+    logging::Get()->debug(
+        "PoolPartition created for {}:{} (resolved={}:{}) on dispatcher {}",
+        upstream_host_, upstream_port_,
+        resolved_endpoint_->addr.Ip(),
+        resolved_endpoint_->addr.Port(),
+        dispatcher_->dispatcher_index());
 }
 
 // Null out all callbacks on a connection's transport to prevent
@@ -639,11 +657,39 @@ void PoolPartition::ForceCloseActive() {
 
 void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
                                          ErrorCallback error_cb) {
-    // Create outbound socket
-    int fd = SocketHandler::CreateClientSocket();
+
+    auto endpoint = std::atomic_load_explicit(
+        &resolved_endpoint_, std::memory_order_acquire);
+    if (!endpoint) {
+        // Should be impossible after the ctor guard, but defensive: a
+        // null pointer during the swap window would otherwise crash.
+        logging::Get()->error(
+            "PoolPartition::CreateNewConnection: resolved_endpoint_ is "
+            "null for {}:{}", upstream_host_, upstream_port_);
+        error_cb(CHECKOUT_CONNECT_FAILED);
+        return;
+    }
+    const InetAddr& upstream_addr = endpoint->addr;
+    if (!upstream_addr.is_valid()) {
+        logging::Get()->error(
+            "PoolPartition::CreateNewConnection: resolved endpoint for "
+            "'{}' is invalid (family={}, port={})", upstream_host_,
+            static_cast<int>(upstream_addr.family()), upstream_addr.Port());
+        error_cb(CHECKOUT_CONNECT_FAILED);
+        return;
+    }
+
+    const sa_family_t family =
+        (upstream_addr.family() == InetAddr::Family::kIPv6) ? AF_INET6 : AF_INET;
+
+    // Create outbound socket AFTER parsing — matches the parsed family so
+    // connect() does not immediately fail with EAFNOSUPPORT on an IPv6
+    // upstream. Order also means we never allocate an fd we might have
+    // to close on parse failure.
+    int fd = SocketHandler::CreateClientSocket(family);
     if (fd < 0) {
-        logging::Get()->error("Failed to create client socket for {}:{}",
-                              upstream_host_, upstream_port_);
+        logging::Get()->error("Failed to create client socket for {}:{} (family={})",
+                              upstream_host_, upstream_port_, (int)family);
         error_cb(CHECKOUT_CONNECT_FAILED);
         return;
     }
@@ -651,21 +697,7 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
     // Initiate non-blocking connect on the raw fd BEFORE wrapping in
     // ConnectionHandler. This avoids creating a temporary SocketHandler
     // that would close the fd in its destructor.
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(upstream_port_);
-    sa.sin_addr.s_addr = inet_addr(upstream_host_.c_str());
-    if (sa.sin_addr.s_addr == INADDR_NONE) {
-        logging::Get()->error("Invalid upstream host '{}': must be an IPv4 address",
-                              upstream_host_);
-        ::close(fd);
-        error_cb(CHECKOUT_CONNECT_FAILED);
-        return;
-    }
-
-    int connect_result = ::connect(fd, reinterpret_cast<struct sockaddr*>(&sa),
-                                    sizeof(sa));
+    int connect_result = ::connect(fd, upstream_addr.Addr(), upstream_addr.Len());
     if (connect_result < 0 && errno != EINPROGRESS && errno != EINTR) {
         int saved_errno = errno;
         logging::Get()->warn("connect() failed for {}:{}: {} (errno={})",
@@ -676,8 +708,10 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
         return;
     }
 
-    // Build socket handler and connection handler
-    auto sock = std::make_unique<SocketHandler>(fd);
+    // Build socket handler and connection handler. Thread the resolved
+    // family into SocketHandler so later observability / debug paths
+    // (e.g. GetBoundPort's getsockname) branch on ss_family correctly.
+    auto sock = std::make_unique<SocketHandler>(fd, family);
     auto conn_handler = std::make_shared<ConnectionHandler>(
         dispatcher_, std::move(sock));
 

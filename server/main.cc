@@ -57,6 +57,16 @@ static int LoadConfig(ServerConfig& config, const CliOptions& options,
         std::cerr << "Error loading configuration: " << e.what() << "\n";
         return EXIT_ERROR;
     }
+    // Normalize canonicalizes host strings (strips IPv6 brackets,
+    // strips one trailing dot from sni_hostname) BEFORE Validate runs,
+    // so the validators see bare-form strings. Structural failures
+    // (unbalanced brackets, malformed sni) are hard errors at startup.
+    try {
+        ConfigLoader::Normalize(config);
+    } catch (const std::invalid_argument& e) {
+        std::cerr << "Configuration error: " << e.what() << "\n";
+        return EXIT_ERROR;
+    }
     try {
         ConfigLoader::Validate(config);
     } catch (const std::invalid_argument& e) {
@@ -244,6 +254,22 @@ static bool ReloadConfig(const std::string& config_path,
                               config_path, e.what());
         reopen_existing_logs();  // still reopen for logrotate
         return false;
+    }
+
+    // Normalize canonicalizes host strings before any validator runs.
+    // bind_host / upstreams[].host / tls.sni_hostname are restart-only —
+    // per §5.6, structural failures here must warn-downgrade so they
+    // don't block live-safe edits (log rotation, rate-limit tuning,
+    // auth) in the same SIGHUP. HttpServer::Reload self-normalizes as
+    // well (defense-in-depth for in-process callers); the call here
+    // keeps main.cc's preflight validator on bare-form strings so its
+    // error messages stay consistent with startup's `LoadConfig` path.
+    try {
+        ConfigLoader::Normalize(new_config);
+    } catch (const std::invalid_argument& e) {
+        logging::Get()->warn(
+            "Reload: host normalization failed for restart-only field(s); "
+            "live-safe edits in this SIGHUP will still apply: {}", e.what());
     }
 
     // Daemon-specific validation: only check reload-relevant paths.

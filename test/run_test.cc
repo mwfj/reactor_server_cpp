@@ -35,6 +35,8 @@
 #include "auth_multi_issuer_test.h"
 #include "auth_websocket_upgrade_test.h"
 #include "auth_race_test.h"
+#include "dns_resolver_test.h"
+#include "dual_stack_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -165,6 +167,12 @@ void RunAllTest(){
 
     // Run auth race condition tests
     AuthRaceTests::RunAllTests();
+
+    // Run DnsResolver tests (lazy pool, static helpers, detach-not-join)
+    DnsResolverTests::RunAllTests();
+
+    // Run dual-stack integration tests (IPv6 bind, hostname rejection, …)
+    DualStackTests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;
 }

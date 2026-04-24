@@ -6,6 +6,7 @@
 #include "http2/http2_connection_handler.h"
 #include "http2/protocol_detector.h"
 #include "config/server_config.h"
+#include "net/dns_resolver.h"
 #include "tls/tls_context.h"
 #include "rate_limit/rate_limiter.h"
 
@@ -14,8 +15,10 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+#include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 // Forward declarations for upstream pool and proxy
@@ -50,11 +53,17 @@ public:
         int worker_threads = 0;  // resolved from auto mode
     };
 
-    // Construct with explicit host/port
+    // Construct with explicit host/port. Delegates to the config ctor,
+    // so the input goes through the same Normalize + Validate pipeline —
+    // hostnames and bare IPv6 literals are accepted symmetrically.
     HttpServer(const std::string& ip, int port);
 
-    // Construct with config
-    explicit HttpServer(const ServerConfig& config);
+    // Construct with config. Takes `config` by value so the body can
+    // run Normalize + Validate on the copy without mutating the caller's
+    // struct. Source-compatible with `const ServerConfig&` callers (the
+    // copy happens at call site). Throws std::invalid_argument on
+    // malformed host input or semantic validation failures.
+    explicit HttpServer(ServerConfig config);
 
     ~HttpServer();
 
@@ -135,10 +144,50 @@ public:
     // Restart-required fields (bind_host, bind_port, tls.*, worker_threads,
     // http2.enabled) are silently ignored — the caller logs them.
     // Returns false if the config was rejected (validation failure, not ready).
-    bool Reload(const ServerConfig& new_config);
+    //
+    // Takes `new_config` by value so Reload can self-normalize its copy
+    // without mutating the caller's struct. In-process callers that
+    // construct a ServerConfig and call Reload() directly get the same
+    // Normalize + Validate pipeline as the SIGHUP-driven path in main.cc.
+    // Structural malformation (bad brackets, malformed trailing-dot sni)
+    // in a restart-only host field is warn-downgraded so live-safe edits
+    // in the same reload aren't blocked.
+    bool Reload(ServerConfig new_config);
 
     // Return a snapshot of server runtime statistics.
     ServerStats GetStats() const;
+
+    // Return a thread-safe snapshot of the boot-time config.
+    //
+    // Phase-1 scope: returns `live_config_`, which is written once by
+    // the ctor and NOT updated by `Reload()`. This means reload-visible
+    // subtrees (rate_limit zones, per-upstream circuit_breaker fields,
+    // size limits, timeouts) may diverge from the runtime subsystem
+    // state after any SIGHUP. Callers that need reload-coherent state
+    // must read from the subsystem managers directly (e.g.
+    // `RateLimitManager::snapshot()`).
+    //
+    // Phase-1 callers: the only production consumer right now is the
+    // test pin (`TestGetLiveConfigSnapshotReturnsInitialConfig`); the
+    // accessor is also wired for step-14 `/stats` observability and
+    // step-11 reload-coherent reads. `main.cc::ReloadConfig` tracks
+    // its own `current_config` reference rather than round-tripping
+    // through this getter.
+    //
+    // Acquires `reload_mtx_` defensively so a future step 11 that
+    // writes `live_config_` under the mutex cannot race this reader.
+    // Step 11 (deferred) will make the docstring promise stronger —
+    // at that point this becomes a fully reload-coherent snapshot.
+    ServerConfig GetLiveConfigSnapshot() const;
+
+    // Return a copy of the resolved bind endpoint, or std::nullopt if
+    // Start() has not completed successfully (ctor-only or gate-aborted).
+    // Populated in Start()'s two-phase commit (§5.4a v0.44 round-43 P2)
+    // AFTER both shutdown gates pass. Step 14 renders /stats.bind from
+    // this; tests use it to observe post-DNS resolved endpoint + the
+    // ephemeral-port refresh. Safe to read post-Start because writes
+    // happen before server_ready_ publishes on startup.
+    std::optional<NET_DNS_NAMESPACE::ResolvedEndpoint> GetBindResolved() const;
 
     // Called after init completes but before the blocking event loop.
     // Used by daemon mode to signal readiness to the parent process.
@@ -191,6 +240,50 @@ public:
     static thread_local HTTP_CALLBACKS_NAMESPACE::ResourcePusher* current_sync_pusher_;
 
 private:
+    // `live_config_` is initialized first because every other member's ctor reads it from the
+    // initializer list (v0.48 step-3 addition; full member-order
+    // rearrangement — moving `net_server_` to last per §11 — is
+    // deferred to a focused state-consolidation pass so this step
+    // does not also carry destruction-order risk). Current layout
+    // preserves the pre-existing manual destruction order enforced
+    // by `~HttpServer() → Stop()`.
+    // `live_config_` holds the Normalize+Validate result from ctor time.
+    ServerConfig live_config_;
+
+    // Serialises (a) Reload-vs-Reload; (b) `GetLiveConfigSnapshot() const`
+    // vs in-flight Reload; (c) Stop's post-drain teardown barrier vs
+    // in-flight Reload (§11 v0.45 round-44 P1 narrowing). `mutable` per
+    // v0.28 ("serialization, not state"). NOT acquired on Stop's
+    // pre-drain accept-close path — that stays lock-free.
+    mutable std::mutex reload_mtx_;
+
+    // Per-server DNS resolver. Ctor is cheap (allocates `PoolState` only;
+    // lazy worker spawn on first non-literal ResolveAsync). Owned via
+    // unique_ptr so the destruction order is deterministic.
+    std::unique_ptr<NET_DNS_NAMESPACE::DnsResolver> dns_resolver_;
+
+    // Lock-free signal channel from Stop() to in-progress Start()/Reload()
+    // Stop() stores true with release ordering as
+    // the FIRST executable line; Start/Reload load with acquire at each
+    // phase boundary. Separate from `reload_mtx_` so a Stop signal can
+    // reach a Start blocked in DNS without waiting on the mutex.
+    std::atomic<bool> stopping_{false};
+
+    // Populated by Start()'s two-phase commit:
+    // post-Phase-A DNS batch + post-Phase-B StartListening + ephemeral
+    // port refresh. Absent when Start() has not run successfully (ctor-
+    // only state, or aborted via Phase-A / Phase-B stopping_ gate). 
+    // Writer is Start() on the main startup thread; readers run after server_ready_=true,
+    // so no additional synchronization is required — `server_ready_`
+    // doubles as the publication barrier for these members.
+    std::optional<NET_DNS_NAMESPACE::ResolvedEndpoint> bind_resolved_;
+
+    // Same two-phase commit as bind_resolved_. Map keyed by
+    // upstream.name. Consumed by `MarkServerReady` when constructing
+    // `UpstreamManager` via the 3-arg ctor. Empty when Start() aborted
+    // or no upstreams are configured.
+    NET_DNS_NAMESPACE::ResolvedMap upstream_resolved_;
+
     NetServer net_server_;
     HttpRouter router_;
     std::map<int, std::shared_ptr<HttpConnectionHandler>> http_connections_;

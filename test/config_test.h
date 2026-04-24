@@ -3,6 +3,7 @@
 #include "test_framework.h"
 #include "config/server_config.h"
 #include "config/config_loader.h"
+#include "net/dns_resolver.h"
 
 #include <fstream>
 #include <cstdlib>
@@ -616,6 +617,499 @@ namespace ConfigTests {
         }
     }
 
+    // ───────────────────────────────────────────────────────────────────
+    // Step 6 (ConfigLoader Normalize + DNS) tests — §15.1 row 6
+    // ───────────────────────────────────────────────────────────────────
+
+    // Pins the Phase 1 non-goal §1.2.7: scope-id-qualified IPv6 literals
+    // (fe80::1%eth0 / fe80::1%5) MUST be rejected by the validation
+    // chain. If this ever starts passing, the XFF / rate-limit / ACL
+    // assumptions documented in DEVELOPMENT_RULES.md break silently —
+    // the test fails loudly so a reintroduction has to be deliberate.
+    void TestIsValidRejectsScopeId() {
+        std::cout << "\n[TEST] Config: IsValid* / Validate reject scope-id IPv6..."
+                  << std::endl;
+        try {
+            bool pass = true;
+            std::string err;
+
+            auto check = [&](const std::string& in) {
+                using NET_DNS_NAMESPACE::DnsResolver;
+                if (DnsResolver::IsValidHostOrIpLiteral(in)) {
+                    pass = false;
+                    err += "IsValidHostOrIpLiteral accepted '" + in + "'; ";
+                }
+                std::string bare;
+                if (DnsResolver::NormalizeHostToBare(in, &bare)) {
+                    pass = false;
+                    err += "NormalizeHostToBare accepted '" + in +
+                           "' (→ '" + bare + "'); ";
+                }
+                // Bracketed form also rejects — strict RFC 3986 §3.2.2.
+                const std::string bracketed = "[" + in + "]";
+                if (DnsResolver::NormalizeHostToBare(bracketed, &bare)) {
+                    pass = false;
+                    err += "NormalizeHostToBare accepted '" + bracketed +
+                           "' (→ '" + bare + "'); ";
+                }
+
+                // End-to-end: full Validate pipeline must reject bind_host
+                // carrying the scope-id. This pins the full validation
+                // chain, not just the leaf helper.
+                ServerConfig cfg = ConfigLoader::Default();
+                cfg.bind_host = in;
+                bool validated = true;
+                try {
+                    ConfigLoader::Validate(cfg);
+                } catch (const std::invalid_argument&) {
+                    validated = false;
+                }
+                if (validated) {
+                    pass = false;
+                    err += "Validate accepted bind_host='" + in + "'; ";
+                }
+
+                // Same for upstream host.
+                cfg = ConfigLoader::Default();
+                cfg.upstreams.clear();
+                UpstreamConfig u;
+                u.name = "api";
+                u.host = in;
+                u.port = 8080;
+                cfg.upstreams.push_back(u);
+                validated = true;
+                try {
+                    ConfigLoader::Validate(cfg);
+                } catch (const std::invalid_argument&) {
+                    validated = false;
+                }
+                if (validated) {
+                    pass = false;
+                    err += "Validate accepted upstream.host='" + in + "'; ";
+                }
+            };
+
+            check("fe80::1%eth0");
+            check("fe80::1%5");
+            check("fe80::ab%lo0");
+            check("::1%0");
+
+            TestFramework::RecordTest(
+                "Config: IsValid* / Validate reject scope-id IPv6",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "Config: IsValid* / Validate reject scope-id IPv6",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // Normalize strips surrounding IPv6 brackets from bind_host and
+    // upstreams[].host; preserves a single trailing dot on hostnames
+    // (absolute-FQDN marker for getaddrinfo search-domain suppression).
+    void TestNormalizeBracketStripAndTrailingDot() {
+        std::cout << "\n[TEST] Config: Normalize strips brackets + preserves FQDN dot..."
+                  << std::endl;
+        try {
+            bool pass = true;
+            std::string err;
+
+            ServerConfig cfg = ConfigLoader::Default();
+            cfg.bind_host = "[::1]";
+            UpstreamConfig u;
+            u.name = "api";
+            u.host = "[fe80::1]";
+            u.port = 443;
+            cfg.upstreams.push_back(u);
+            UpstreamConfig u2;
+            u2.name = "svc";
+            u2.host = "backend.ns.svc.cluster.local.";
+            u2.port = 8080;
+            cfg.upstreams.push_back(u2);
+
+            ConfigLoader::Normalize(cfg);
+
+            if (cfg.bind_host != "::1") {
+                pass = false; err += "bind_host='" + cfg.bind_host + "'; ";
+            }
+            if (cfg.upstreams[0].host != "fe80::1") {
+                pass = false; err += "up0.host='" + cfg.upstreams[0].host + "'; ";
+            }
+            if (cfg.upstreams[1].host != "backend.ns.svc.cluster.local.") {
+                pass = false;
+                err += "trailing-dot stripped: up1.host='" + cfg.upstreams[1].host + "'; ";
+            }
+
+            // Idempotent — second call must be a no-op.
+            ServerConfig cfg2 = cfg;
+            ConfigLoader::Normalize(cfg2);
+            if (cfg2.bind_host != cfg.bind_host ||
+                cfg2.upstreams[0].host != cfg.upstreams[0].host ||
+                cfg2.upstreams[1].host != cfg.upstreams[1].host) {
+                pass = false; err += "not idempotent; ";
+            }
+
+            TestFramework::RecordTest(
+                "Config: Normalize strips brackets + preserves FQDN dot",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "Config: Normalize strips brackets + preserves FQDN dot",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // Normalize strips ONE trailing dot from tls.sni_hostname. Rejects
+    // malformed inputs (".", "api.com..", "....") because the post-strip
+    // result must be a usable SNI value.
+    void TestNormalizeTlsSniTrailingDot() {
+        std::cout << "\n[TEST] Config: Normalize strips sni trailing dot, rejects malformed..."
+                  << std::endl;
+        try {
+            bool pass = true;
+            std::string err;
+
+            // Happy path: one trailing dot stripped.
+            {
+                ServerConfig cfg = ConfigLoader::Default();
+                UpstreamConfig u;
+                u.name = "api";
+                u.host = "10.0.0.1";
+                u.port = 443;
+                u.tls.enabled = true;
+                u.tls.sni_hostname = "api.example.com.";
+                cfg.upstreams.push_back(u);
+                ConfigLoader::Normalize(cfg);
+                if (cfg.upstreams[0].tls.sni_hostname != "api.example.com") {
+                    pass = false;
+                    err += "sni='" + cfg.upstreams[0].tls.sni_hostname + "'; ";
+                }
+            }
+
+            // Reject ".": strips to empty.
+            {
+                ServerConfig cfg = ConfigLoader::Default();
+                UpstreamConfig u;
+                u.name = "api"; u.host = "10.0.0.1"; u.port = 443;
+                u.tls.enabled = true;
+                u.tls.sni_hostname = ".";
+                cfg.upstreams.push_back(u);
+                bool threw = false;
+                try { ConfigLoader::Normalize(cfg); }
+                catch (const std::invalid_argument&) { threw = true; }
+                if (!threw) { pass = false; err += "'.' accepted; "; }
+            }
+
+            // Reject "api.com..": post-strip still has trailing dot.
+            {
+                ServerConfig cfg = ConfigLoader::Default();
+                UpstreamConfig u;
+                u.name = "api"; u.host = "10.0.0.1"; u.port = 443;
+                u.tls.enabled = true;
+                u.tls.sni_hostname = "api.com..";
+                cfg.upstreams.push_back(u);
+                bool threw = false;
+                try { ConfigLoader::Normalize(cfg); }
+                catch (const std::invalid_argument&) { threw = true; }
+                if (!threw) { pass = false; err += "'api.com..' accepted; "; }
+            }
+
+            // Empty sni_hostname is untouched (absence is legal — fallback
+            // to host-derived SNI happens elsewhere).
+            {
+                ServerConfig cfg = ConfigLoader::Default();
+                UpstreamConfig u;
+                u.name = "api"; u.host = "10.0.0.1"; u.port = 443;
+                u.tls.enabled = true;
+                // sni_hostname left empty by default
+                cfg.upstreams.push_back(u);
+                ConfigLoader::Normalize(cfg);
+                if (!cfg.upstreams[0].tls.sni_hostname.empty()) {
+                    pass = false; err += "empty sni mutated; ";
+                }
+            }
+
+            TestFramework::RecordTest(
+                "Config: Normalize strips sni trailing dot, rejects malformed",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "Config: Normalize strips sni trailing dot, rejects malformed",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // Validate accepts hostnames and bare IPv6 literals for
+    // upstreams[].host, replacing the previous strict IPv4-only check.
+    // Bracketed forms must fail Validate (they should have been stripped
+    // by Normalize first).
+    void TestValidateAcceptsHostnameAndIpv6Upstream() {
+        std::cout << "\n[TEST] Config: Validate accepts hostname + IPv6 upstream host..."
+                  << std::endl;
+        try {
+            bool pass = true;
+            std::string err;
+
+            auto validates = [&](const std::string& h) {
+                ServerConfig cfg = ConfigLoader::Default();
+                cfg.upstreams.clear();
+                UpstreamConfig u;
+                u.name = "api"; u.host = h; u.port = 8080;
+                cfg.upstreams.push_back(u);
+                try { ConfigLoader::Validate(cfg); return true; }
+                catch (const std::invalid_argument&) { return false; }
+            };
+
+            // Accept: IPv4, bare IPv6, RFC 1123 hostname, absolute FQDN.
+            for (const std::string& h : {
+                std::string("10.0.0.1"),
+                std::string("::1"),
+                std::string("fe80::abcd"),
+                std::string("api.example.com"),
+                std::string("backend.ns.svc.cluster.local."),
+            }) {
+                if (!validates(h)) {
+                    pass = false; err += "rejected valid '" + h + "'; ";
+                }
+            }
+
+            // Reject: legacy numeric-dotted, underscore, bracketed form
+            // (Normalize should have stripped brackets before Validate
+            // ran; if Validate is called directly on bracketed input it
+            // must reject).
+            for (const std::string& h : {
+                std::string("0127.0.0.1"),   // glibc inet_aton hazard
+                std::string("bad_host"),     // underscore
+                std::string("[::1]"),         // brackets not stripped
+                std::string(""),              // empty
+            }) {
+                if (validates(h)) {
+                    pass = false; err += "accepted invalid '" + h + "'; ";
+                }
+            }
+
+            TestFramework::RecordTest(
+                "Config: Validate accepts hostname + IPv6 upstream host",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "Config: Validate accepts hostname + IPv6 upstream host",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // DNS validation: resolver_max_inflight is restart-only and must
+    // reject <= 0 at Validate time (defense-in-depth for
+    // DnsResolver::EnsurePoolStarted's workers_.reserve call).
+    // resolve_timeout_ms / overall_timeout_ms are reloadable; both
+    // must reject <= 0 at both Validate and ValidateHotReloadable.
+    void TestValidateDnsRules() {
+        std::cout << "\n[TEST] Config: Validate DNS rules..." << std::endl;
+        try {
+            bool pass = true;
+            std::string err;
+
+            auto validate_throws = [](ServerConfig cfg) {
+                try { ConfigLoader::Validate(cfg); return false; }
+                catch (const std::invalid_argument&) { return true; }
+            };
+            auto hot_throws = [](ServerConfig cfg) {
+                try {
+                    ConfigLoader::ValidateHotReloadable(cfg, {});
+                    return false;
+                } catch (const std::invalid_argument&) { return true; }
+            };
+
+            // resolver_max_inflight <= 0 rejected.
+            {
+                ServerConfig cfg = ConfigLoader::Default();
+                cfg.dns.resolver_max_inflight = 0;
+                if (!validate_throws(cfg)) { pass = false; err += "rmi=0 accepted; "; }
+                cfg.dns.resolver_max_inflight = -1;
+                if (!validate_throws(cfg)) { pass = false; err += "rmi=-1 accepted; "; }
+            }
+
+            // resolve_timeout_ms <= 0 rejected — Validate AND hot-reload.
+            {
+                ServerConfig cfg = ConfigLoader::Default();
+                cfg.dns.resolve_timeout_ms = 0;
+                if (!validate_throws(cfg)) { pass = false; err += "rt=0 validate; "; }
+                if (!hot_throws(cfg)) { pass = false; err += "rt=0 hot; "; }
+            }
+
+            // overall_timeout_ms <= 0 rejected.
+            {
+                ServerConfig cfg = ConfigLoader::Default();
+                cfg.dns.overall_timeout_ms = -1;
+                if (!validate_throws(cfg)) { pass = false; err += "ot=-1 validate; "; }
+                if (!hot_throws(cfg)) { pass = false; err += "ot=-1 hot; "; }
+            }
+
+            // overall < resolve rejected.
+            {
+                ServerConfig cfg = ConfigLoader::Default();
+                cfg.dns.resolve_timeout_ms = 5000;
+                cfg.dns.overall_timeout_ms = 1000;
+                if (!validate_throws(cfg)) { pass = false; err += "ot<rt validate; "; }
+                if (!hot_throws(cfg)) { pass = false; err += "ot<rt hot; "; }
+            }
+
+            // Defaults pass.
+            {
+                ServerConfig cfg = ConfigLoader::Default();
+                try {
+                    ConfigLoader::Validate(cfg);
+                    ConfigLoader::ValidateHotReloadable(cfg, {});
+                } catch (const std::invalid_argument& e) {
+                    pass = false; err += "defaults rejected: ";
+                    err += e.what(); err += "; ";
+                }
+            }
+
+            TestFramework::RecordTest(
+                "Config: Validate DNS rules",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "Config: Validate DNS rules",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // JSON round-trip preserves the dns block. Covers the new
+    // LoadFromString parse + ToJson emit paths.
+    void TestDnsJsonRoundTrip() {
+        std::cout << "\n[TEST] Config: dns JSON round-trip..." << std::endl;
+        try {
+            bool pass = true;
+            std::string err;
+
+            const std::string json = R"({
+                "dns": {
+                    "lookup_family": "v6_preferred",
+                    "resolve_timeout_ms": 2500,
+                    "overall_timeout_ms": 12000,
+                    "stale_on_error": false,
+                    "resolver_max_inflight": 16
+                }
+            })";
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            if (cfg.dns.lookup_family !=
+                NET_DNS_NAMESPACE::LookupFamily::kV6Preferred) {
+                pass = false; err += "lookup_family not v6_preferred; ";
+            }
+            if (cfg.dns.resolve_timeout_ms != 2500) {
+                pass = false; err += "resolve_timeout_ms != 2500; ";
+            }
+            if (cfg.dns.overall_timeout_ms != 12000) {
+                pass = false; err += "overall_timeout_ms != 12000; ";
+            }
+            if (cfg.dns.stale_on_error != false) {
+                pass = false; err += "stale_on_error != false; ";
+            }
+            if (cfg.dns.resolver_max_inflight != 16) {
+                pass = false; err += "resolver_max_inflight != 16; ";
+            }
+
+            // Round-trip via ToJson → LoadFromString preserves values.
+            const std::string round = ConfigLoader::ToJson(cfg);
+            ServerConfig cfg2 = ConfigLoader::LoadFromString(round);
+            if (cfg2.dns.lookup_family != cfg.dns.lookup_family ||
+                cfg2.dns.resolve_timeout_ms != cfg.dns.resolve_timeout_ms ||
+                cfg2.dns.overall_timeout_ms != cfg.dns.overall_timeout_ms ||
+                cfg2.dns.stale_on_error != cfg.dns.stale_on_error ||
+                cfg2.dns.resolver_max_inflight != cfg.dns.resolver_max_inflight) {
+                pass = false; err += "round-trip drift; ";
+            }
+
+            TestFramework::RecordTest(
+                "Config: dns JSON round-trip",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "Config: dns JSON round-trip",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // §5.10: `verify_peer=true` with empty `sni_hostname` is legal
+    // ONLY when `upstream.host` is a hostname (UpstreamManager falls
+    // back to it as the effective SNI for cert CN/SAN verification).
+    // IP-literal upstreams still require an explicit sni_hostname —
+    // there's nothing to fall back to. Pins the v0.51 validator fix
+    // that closed the dead-code branch on implicit SNI fallback for
+    // hostname upstreams.
+    void TestValidateVerifyPeerSniRequirement() {
+        std::cout << "\n[TEST] Config: Validate verify_peer+sni semantics..."
+                  << std::endl;
+        try {
+            bool pass = true;
+            std::string err;
+
+            auto validates = [&](const std::string& host,
+                                  bool verify_peer,
+                                  const std::string& sni,
+                                  bool tls_enabled = true) {
+                ServerConfig cfg = ConfigLoader::Default();
+                cfg.upstreams.clear();
+                UpstreamConfig u;
+                u.name = "api";
+                u.host = host;
+                u.port = 443;
+                u.tls.enabled = tls_enabled;
+                u.tls.verify_peer = verify_peer;
+                u.tls.sni_hostname = sni;
+                cfg.upstreams.push_back(u);
+                try { ConfigLoader::Validate(cfg); return true; }
+                catch (const std::invalid_argument&) { return false; }
+            };
+
+            // Accept: hostname + verify_peer + empty SNI (new behavior)
+            if (!validates("api.example.com", true, "")) {
+                pass = false;
+                err += "hostname+verify_peer+empty-sni rejected; ";
+            }
+            // Accept: hostname + verify_peer + explicit SNI (unchanged)
+            if (!validates("api.example.com", true, "cert.example.com")) {
+                pass = false;
+                err += "hostname+verify_peer+explicit-sni rejected; ";
+            }
+            // Accept: hostname + no-verify + empty SNI (unchanged)
+            if (!validates("api.example.com", false, "")) {
+                pass = false;
+                err += "hostname+no-verify rejected; ";
+            }
+            // Accept: IPv4 literal + no-verify + empty SNI (unchanged)
+            if (!validates("10.0.0.1", false, "")) {
+                pass = false;
+                err += "ipv4+no-verify rejected; ";
+            }
+            // Accept: IPv4 literal + verify_peer + explicit SNI (unchanged)
+            if (!validates("10.0.0.1", true, "api.example.com")) {
+                pass = false;
+                err += "ipv4+verify_peer+explicit-sni rejected; ";
+            }
+            // Reject: IPv4 literal + verify_peer + empty SNI (unchanged)
+            if (validates("10.0.0.1", true, "")) {
+                pass = false;
+                err += "ipv4+verify_peer+empty-sni accepted (should reject); ";
+            }
+            // Reject: IPv6 literal + verify_peer + empty SNI
+            if (validates("::1", true, "")) {
+                pass = false;
+                err += "ipv6+verify_peer+empty-sni accepted (should reject); ";
+            }
+
+            TestFramework::RecordTest(
+                "Config: Validate verify_peer+sni semantics",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "Config: Validate verify_peer+sni semantics",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     // Run all config tests
     void RunAllTests() {
         std::cout << "\n" << std::string(60, '=') << std::endl;
@@ -638,6 +1132,15 @@ namespace ConfigTests {
         TestCircuitBreakerJsonRoundTrip();
         TestCircuitBreakerValidation();
         TestCircuitBreakerEquality();
+
+        // Step 6 — ConfigLoader Normalize + DNS + hostname acceptance
+        TestIsValidRejectsScopeId();
+        TestNormalizeBracketStripAndTrailingDot();
+        TestNormalizeTlsSniTrailingDot();
+        TestValidateAcceptsHostnameAndIpv6Upstream();
+        TestValidateDnsRules();
+        TestDnsJsonRoundTrip();
+        TestValidateVerifyPeerSniRequirement();
     }
 
 } // namespace ConfigTests

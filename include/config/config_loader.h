@@ -22,8 +22,33 @@ public:
     //   REACTOR_TLS_ENABLED, REACTOR_TLS_CERT, REACTOR_TLS_KEY,
     //   REACTOR_LOG_LEVEL, REACTOR_LOG_FILE,
     //   REACTOR_MAX_CONNECTIONS, REACTOR_IDLE_TIMEOUT,
-    //   REACTOR_WORKER_THREADS, REACTOR_REQUEST_TIMEOUT
+    //   REACTOR_WORKER_THREADS, REACTOR_REQUEST_TIMEOUT,
+    //   REACTOR_DNS_LOOKUP_FAMILY, REACTOR_DNS_RESOLVE_TIMEOUT_MS,
+    //   REACTOR_DNS_OVERALL_TIMEOUT_MS, REACTOR_DNS_STALE_ON_ERROR
     static void ApplyEnvOverrides(ServerConfig& config);
+
+    // Canonicalize host strings on the config in place (§5.6).
+    //
+    //   • bind_host: strips surrounding IPv6 brackets ("[::1]" → "::1")
+    //     via DnsResolver::NormalizeHostToBare. Preserves a single
+    //     trailing dot on hostnames (absolute-FQDN marker that tells
+    //     getaddrinfo to skip /etc/resolv.conf search-domain expansion).
+    //   • upstreams[].host: same treatment as bind_host.
+    //   • upstreams[].tls.sni_hostname: strips ONE trailing '.' if
+    //     present. SNI is NEVER used for DNS — only for
+    //     SSL_set_tlsext_host_name / SSL_set1_host / Host-rewrite on
+    //     TLS upstreams. Those consumers want the dotless form.
+    //     Rejects malformed inputs like "." / "api.com.." / "....".
+    //
+    // Idempotent: calling Normalize on an already-normalized config is
+    // a no-op.
+    //
+    // Does NOT validate semantic correctness (hostname grammar,
+    // IP-literal parsing) — that stays in Validate. Does NOT touch DNS.
+    //
+    // Throws std::invalid_argument on structural failure (unbalanced
+    // brackets, NUL bytes, whitespace, malformed trailing-dot sni).
+    static void Normalize(ServerConfig& config);
 
     // Validate the configuration.
     // Throws std::invalid_argument if validation fails.
