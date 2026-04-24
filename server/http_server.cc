@@ -288,7 +288,7 @@ struct TopLevelAuthPolicyMergeResult {
 // mandate **whole-policy defer** for that case: preserve the ENTIRE
 // live policy for that identity, not just the issuers list.
 //
-// Rules (per design §11.2 step 4):
+// Rules:
 //   - Edit (name matches live): if staged.issuers[] ⊆ live_issuer_names,
 //     commit staged wholesale (all reloadable fields take effect). If
 //     ANY staged issuer is non-live, preserve the ENTIRE live policy
