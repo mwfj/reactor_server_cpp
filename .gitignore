@@ -4,11 +4,14 @@
 AGENTS.md
 CLAUDE.md
 
+# Execution files
 *.o
 test_runner
 server_runner
 
+# Ide Settings
 .vscode
+.cache
 *.dSYM
 *.plist
 compile_commands.json
