@@ -22,8 +22,7 @@ static void SigpipeGuardAcquire() {
 
 static constexpr int STOP_BARRIER_TIMEOUT_SEC = 5;
 
-NetServer::NetServer(const std::string& _ip, const size_t _port,
-                     int timer_interval,
+NetServer::NetServer(int timer_interval,
                      std::chrono::seconds connection_timeout,
                      int worker_threads)
     : conn_dispatcher_(std::make_shared<Dispatcher>()),
@@ -38,21 +37,52 @@ NetServer::NetServer(const std::string& _ip, const size_t _port,
     // Only override SIG_DFL — if the embedder has installed their own
     // handler, leave it alone to avoid breaking their signal handling.
     SigpipeGuardAcquire();
+
     conn_dispatcher_->Init();
-    conn_dispatcher_->SetTimeOutTriggerCB(std::bind(&NetServer::Timeout, this, std::placeholders::_1));
-    acceptor_ = std::unique_ptr<Acceptor>(new Acceptor(conn_dispatcher_, _ip, _port));
-    acceptor_->SetNewConnCb(std::bind(&NetServer::HandleNewConnection, this, std::placeholders::_1));
+    conn_dispatcher_->SetTimeOutTriggerCB(
+        std::bind(&NetServer::Timeout, this, std::placeholders::_1));
+
     // Route thread pool errors through spdlog so they reach the log file
     // in daemon mode (where stderr is /dev/null).
     sock_workers_.SetErrorLogger([](const std::string& msg) {
         logging::Get()->error("{}", msg);
     });
+    // Init allocates worker bookkeeping but does NOT spawn threads —
+    // those start in `Start()` (Phase 3) so the ctor-only partial
+    // state has no live threads. Without this ordering, `Stop()` in
+    // the ctor-only state would have to drain a half-idle pool.
     if (worker_threads > 0) {
         sock_workers_.Init(worker_threads);
     } else {
         sock_workers_.Init();
     }
-    sock_workers_.Start();
+}
+
+void NetServer::StartListening(const InetAddr& resolved) {
+    if (acceptor_) {
+        throw std::runtime_error(
+            "NetServer::StartListening called twice — listen socket is "
+            "already open on " + resolved.Ip() + ":" +
+            std::to_string(resolved.Port()));
+    }
+    // Acceptor ctor parses the literal internally, creates the dual-
+    // family listen socket, applies IPV6_V6ONLY on v6, and binds+listens.
+    // It synchronously calls UpdateChannelInLoop() on conn_dispatcher_,
+    // which is already Init()-complete from Phase 1. Bind/listen failures
+    // or IPV6_V6ONLY setsockopt failures throw runtime_error from
+    // Acceptor; the exception unwinds cleanly with acceptor_ remaining
+    // null (ctor-only state preserved).
+    //
+    // Using the string-form ctor until step 9 adds an InetAddr-taking
+    // overload on Acceptor. `InetAddr::Ip()` is the bare literal
+    // (no brackets), which the string ctor parses back via its own
+    // InetAddr construction inside acceptor.cc — a no-op round-trip for
+    // IP literals.
+    acceptor_ = std::unique_ptr<Acceptor>(
+        new Acceptor(conn_dispatcher_, resolved.Ip(),
+                     static_cast<size_t>(resolved.Port())));
+    acceptor_->SetNewConnCb(
+        std::bind(&NetServer::HandleNewConnection, this, std::placeholders::_1));
 }
 
 NetServer::~NetServer(){
@@ -68,7 +98,18 @@ NetServer::~NetServer(){
 
 // start event loop
 void NetServer::Start(){
+    if (!acceptor_) {
+        throw std::runtime_error(
+            "NetServer::Start called before StartListening — no listen "
+            "socket. Call StartListening(InetAddr) first (§5.4a three-"
+            "phase lifecycle).");
+    }
     start_called_.store(true, std::memory_order_release);
+
+    // ThreadPool::Start() is idempotent — re-calling it is
+    // safe if a caller constructed + StartListening'd + Start'd, was
+    // Stopped, and then somehow re-entered (not supported, but harmless).
+    sock_workers_.Start();
 
     auto cleanup_partial_startup = [this]() {
         for (auto& d : socket_dispatchers_)

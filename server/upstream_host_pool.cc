@@ -6,6 +6,7 @@ UpstreamHostPool::UpstreamHostPool(
     const std::string& service_name,
     const std::string& host, int port,
     const std::string& sni_hostname,
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> resolved_endpoint,
     const UpstreamPoolConfig& config,
     const std::vector<std::shared_ptr<Dispatcher>>& dispatchers,
     std::shared_ptr<TlsClientContext> tls_ctx,
@@ -19,6 +20,11 @@ UpstreamHostPool::UpstreamHostPool(
     , config_(config)
     , dispatchers_(dispatchers)
 {
+    if (!resolved_endpoint) {
+        throw std::invalid_argument(
+            "UpstreamHostPool '" + service_name +
+            "': resolved_endpoint must not be null");
+    }
     // Create one partition per dispatcher
     size_t num_dispatchers = dispatchers.size();
     partitions_.reserve(num_dispatchers);
@@ -74,15 +80,23 @@ UpstreamHostPool::UpstreamHostPool(
         size_t per_partition_idle = idle_floor + (i < idle_remainder ? 1 : 0);
         partition_config.max_idle_connections = static_cast<int>(per_partition_idle);
 
+        // All partitions share the same `resolved_endpoint` shared_ptr
+        // at construction. By-value capture here hands each partition an already-refcount-held pointer so
+        // destruction order within the pool doesn't matter.
         partitions_.push_back(std::make_unique<PoolPartition>(
-            dispatchers[i], host, port, sni_hostname, partition_config, tls_ctx,
+            dispatchers[i], host, port, sni_hostname, resolved_endpoint,
+            partition_config, tls_ctx,
             outstanding_conns, manager_shutting_down, drain_mtx, drain_cv));
     }
 
 
-    logging::Get()->info("UpstreamHostPool '{}' created for {}:{} with {} "
-                         "partitions (max_conn={}, max_idle={})",
-                         service_name_, host_, port_, num_dispatchers,
+    logging::Get()->info("UpstreamHostPool '{}' created for {}:{} "
+                         "(resolved={}:{}) with {} partitions "
+                         "(max_conn={}, max_idle={})",
+                         service_name_, host_, port_,
+                         resolved_endpoint->addr.Ip(),
+                         resolved_endpoint->addr.Port(),
+                         num_dispatchers,
                          config.max_connections, config.max_idle_connections);
 }
 

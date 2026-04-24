@@ -211,6 +211,112 @@ void TestParseAllLongOptions() {
     }
 }
 
+// Step-10 tests — CLI `--host` hostname + IPv6 acceptance (§5.8)
+
+// IPv6 literal (bracketed) — normalized inline to bare form so the
+// downstream ConfigLoader::Validate path sees "::1" not "[::1]".
+void TestParseHostIpv6Bracketed() {
+    std::cout << "\n[TEST] CliParser: --host accepts bracketed IPv6..." << std::endl;
+    try {
+        const char* args[] = { "reactor_server", "start", "-H", "[::1]" };
+        int argc = 4;
+        auto opts = CliParser::Parse(argc, const_cast<char**>(args));
+
+        bool pass = (opts.host == "::1");
+        std::string err;
+        if (!pass) err = "host='" + opts.host + "'";
+        TestFramework::RecordTest(
+            "CliParser: --host accepts bracketed IPv6",
+            pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CliParser: --host accepts bracketed IPv6",
+            false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// IPv6 literal (bare) — passes through unchanged.
+void TestParseHostIpv6Bare() {
+    std::cout << "\n[TEST] CliParser: --host accepts bare IPv6..." << std::endl;
+    try {
+        const char* args[] = { "reactor_server", "start", "--host", "fe80::1" };
+        int argc = 4;
+        auto opts = CliParser::Parse(argc, const_cast<char**>(args));
+
+        bool pass = (opts.host == "fe80::1");
+        std::string err;
+        if (!pass) err = "host='" + opts.host + "'";
+        TestFramework::RecordTest(
+            "CliParser: --host accepts bare IPv6",
+            pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CliParser: --host accepts bare IPv6",
+            false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// RFC 1123 hostname — accepted at CLI parse time; DNS resolution
+// still happens later (HttpServer ctor or Start, depending on step).
+void TestParseHostHostname() {
+    std::cout << "\n[TEST] CliParser: --host accepts hostname..." << std::endl;
+    try {
+        const char* args[] = {
+            "reactor_server", "start", "-H", "backend.example.com" };
+        int argc = 4;
+        auto opts = CliParser::Parse(argc, const_cast<char**>(args));
+
+        bool pass = (opts.host == "backend.example.com");
+        std::string err;
+        if (!pass) err = "host='" + opts.host + "'";
+        TestFramework::RecordTest(
+            "CliParser: --host accepts hostname",
+            pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CliParser: --host accepts hostname",
+            false, e.what(), CLI_CATEGORY);
+    }
+}
+
+// Invalid grammar rejected at parse time — legacy numeric-dotted
+// (glibc inet_aton hazard), underscore, scope-id, malformed brackets.
+void TestParseHostRejectsInvalid() {
+    std::cout << "\n[TEST] CliParser: --host rejects invalid..." << std::endl;
+    try {
+        bool pass = true;
+        std::string err;
+
+        auto expect_reject = [&](const char* val, const char* label) {
+            const char* args[] = { "reactor_server", "start", "-H", val };
+            int argc = 4;
+            bool got_throw = false;
+            try {
+                CliParser::Parse(argc, const_cast<char**>(args));
+            } catch (const std::runtime_error&) {
+                got_throw = true;
+            }
+            if (!got_throw) {
+                pass = false;
+                err += std::string(label) + " accepted; ";
+            }
+        };
+
+        expect_reject("0127.0.0.1",      "legacy numeric");
+        expect_reject("bad_host",        "underscore");
+        expect_reject("fe80::1%eth0",    "scope-id");
+        expect_reject("[::1",            "unbalanced bracket");
+
+        TestFramework::RecordTest(
+            "CliParser: --host rejects invalid",
+            pass, err, CLI_CATEGORY);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "CliParser: --host rejects invalid",
+            false, e.what(), CLI_CATEGORY);
+    }
+}
+
 // Test 5: Port number exceeding 65535 must throw.
 void TestParseInvalidPort() {
     std::cout << "\n[TEST] CliParser: Port 99999 throws..." << std::endl;
@@ -3522,6 +3628,11 @@ void RunAllTests() {
     TestParseConfigPath();
     TestParseAllShortOptions();
     TestParseAllLongOptions();
+    // Step 10 — CLI --host hostname + IPv6 acceptance
+    TestParseHostIpv6Bracketed();
+    TestParseHostIpv6Bare();
+    TestParseHostHostname();
+    TestParseHostRejectsInvalid();
     TestParseInvalidPort();
     TestParseInvalidPortNegative();
     TestParseInvalidPortNonNumeric();

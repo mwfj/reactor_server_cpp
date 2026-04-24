@@ -70,13 +70,50 @@ private:
 
 public:
     NetServer() = delete;
-    NetServer(const std::string& _ip, const size_t _port,
-              int timer_interval = 60,
-              std::chrono::seconds connection_timeout = std::chrono::seconds(300),
-              int worker_threads = 0);  // 0 = use hardware_concurrency default
-    ~NetServer(); 
 
+    // Construct + Init the conn_dispatcher_ member + install
+    // the timeout-trigger callback. Does NOT construct Acceptor, does
+    // NOT build or start socket dispatchers, does NOT start the worker
+    // pool. `conn_dispatcher_` MUST be Init()-complete here because
+    // `Acceptor::Acceptor()` (called in Phase 2) synchronously invokes
+    // `event_dispatcher_->UpdateChannelInLoop()` to register the listen
+    // channel; without an initialised dispatcher that call would fail.
+    //
+    // Callers then:
+    //   1. Configure TLS / max-connections / callbacks as needed.
+    //   2. Call `StartListening(InetAddr)` to open the listen socket.
+    //   3. Call `Start()` to spin up dispatchers + workers + run the
+    //      event loop.
+    //
+    // `Stop()` / `~NetServer` tolerate three partial-construction
+    // states — ctor-only (no Acceptor, no dispatchers), StartListening-
+    // but-not-Start (Acceptor bound, dispatchers not yet built), and
+    // full startup. §5.4a of HOSTNAME_RESOLUTION_AND_IPV6_DESIGN.md.
+    NetServer(int timer_interval,
+              std::chrono::seconds connection_timeout,
+              int worker_threads = 0);   // 0 = hardware_concurrency
+    ~NetServer();
+
+    // PHASE 2 — open the listen socket on a resolved address. Uses the
+    // Phase-1 conn_dispatcher_ to construct `Acceptor` (which binds +
+    // listens + registers its read channel via `UpdateChannelInLoop`).
+    // Throws `std::runtime_error` on bind / listen / IPV6_V6ONLY
+    // setsockopt failure (fail-closed per §5.4). Must be called exactly
+    // once, before `Start()`. After `StartListening` returns the listen
+    // fd is open but no dispatchers or workers are running yet.
+    void StartListening(const InetAddr& resolved);
+
+    // PHASE 3 — unchanged behaviour: build + start socket dispatchers,
+    // start the worker pool, wait for dispatchers to become running,
+    // fire the ready_callback, then `RunEventLoop()` on conn_dispatcher_.
     void Start();
+
+    // Tolerant stop. Safe in all three partial-construction states:
+    //   (1) ctor-only — no listener, no dispatchers. Effectively a
+    //       no-op except for setting stop_requested_.
+    //   (2) StartListening-but-not-Start — closes the listen socket,
+    //       skips dispatcher iteration.
+    //   (3) Full startup — normal drain path.
     void Stop();
 
     // Close the listening socket and stop accepting new connections.
@@ -165,7 +202,12 @@ public:
     void SetReadyCallback(std::function<void()> cb) { ready_callback_ = std::move(cb); }
 
     // Returns the actual port the server is listening on.
-    // Resolves ephemeral port 0. Available after the constructor completes
-    // (bind happens during construction). IPv4 only.
+    // Resolves ephemeral port 0. Available after `StartListening()` has
+    // succeeded; returns 0 in the ctor-only state.
     int GetBoundPort() const { return acceptor_ ? acceptor_->GetBoundPort() : 0; }
+
+    // True once `StartListening()` has opened the listen socket.
+    // False in the ctor-only partial state. Used by Stop() and by
+    // `HttpServer::Start()` to gate Phase C on Phase B.
+    bool IsListening() const { return acceptor_ != nullptr; }
 };

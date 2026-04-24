@@ -6,6 +6,7 @@
 #include <cstdint>
 
 #include "auth/auth_config.h"
+#include "net/dns_resolver.h"
 
 struct TlsConfig {
     bool enabled = false;
@@ -315,4 +316,5 @@ struct ServerConfig {
     std::vector<UpstreamConfig> upstreams;
     RateLimitConfig rate_limit;
     AUTH_NAMESPACE::AuthConfig auth;
+    NET_DNS_NAMESPACE::DnsConfig dns;
 };

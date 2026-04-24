@@ -2,6 +2,7 @@
 #include "http/http_status.h"
 #include "http/push_helper.h"
 #include "config/config_loader.h"
+#include "net/dns_resolver.h"            // IsValidHostOrIpLiteral grammar
 #include "ws/websocket_frame.h"
 #include "http2/http2_constants.h"
 #include "upstream/upstream_manager.h"
@@ -12,6 +13,7 @@
 #include "upstream/pool_partition.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
+#include <netdb.h>                        // getaddrinfo (bind-host resolve)
 #include <algorithm>
 #include <set>
 #include <unordered_set>
@@ -504,8 +506,13 @@ void HttpServer::MarkServerReady() {
     // error instead of silently starting without upstream pools.
     if (!upstream_configs_.empty()) {
         try {
+            // use the 3-arg production ctor with the
+            // resolved-endpoint map built by HttpServer::Start's DNS
+            // batch. UpstreamManager uses each resolved IP as the
+            // pool's connect host and preserves the original
+            // `upstream.host` for effective-SNI derivation.
             upstream_manager_ = std::make_unique<UpstreamManager>(
-                upstream_configs_, dispatchers);
+                upstream_configs_, dispatchers, upstream_resolved_);
         } catch (...) {
             logging::Get()->error("Upstream pool init failed, stopping server");
             net_server_.Stop();
@@ -878,61 +885,60 @@ void HttpServer::WireNetServerCallbacks() {
         });
 }
 
-// Validate host is a strict dotted-quad IPv4 address. Uses inet_pton (not
-// inet_addr) to reject legacy shorthand forms like "1" or octal "0127.0.0.1".
-static const std::string& ValidateHost(const std::string& host) {
-    if (host.empty()) {
-        throw std::invalid_argument("bind host must not be empty");
-    }
-    struct in_addr addr{};
-    if (inet_pton(AF_INET, host.c_str(), &addr) != 1) {
-        throw std::invalid_argument(
-            "Invalid bind host: '" + host +
-            "' (must be a dotted-quad IPv4 address, e.g. '0.0.0.0' or '127.0.0.1')");
-    }
-    return host;
+// Normalize + validate a ServerConfig in place before any member
+// depends on its fields. Runs via the initializer list so a throw
+// unwinds before any other member is constructed (no half-initialized
+// state). This is the single source of truth for config ingestion at
+// the HttpServer boundary — both the (ServerConfig) ctor and the
+// (ip, port) delegating ctor funnel through here.
+//
+// Returns a reference to the mutated config so call sites can chain
+// `PrepareConfig(cfg).bind_host` in the initializer list.
+static ServerConfig& PrepareConfig(ServerConfig& cfg) {
+    ConfigLoader::Normalize(cfg);   // structural — brackets, trailing-dot sni
+    ConfigLoader::Validate(cfg);    // semantic — grammar, ranges, cross-refs
+    return cfg;
 }
 
-// Validate port before member construction — must run in the initializer
-// list, before net_server_ tries to bind/listen on the (possibly invalid) port.
-static size_t ValidatePort(int port) {
+// Build a minimal ServerConfig from (ip, port) for the delegating ctor.
+// Only bind_host / bind_port are set; everything else takes ServerConfig
+// defaults. PrepareConfig (invoked by the config ctor) runs Normalize +
+// Validate on the result.
+static ServerConfig BuildMinimalBindConfig(const std::string& ip, int port) {
+    ServerConfig cfg;
+    cfg.bind_host = ip;
     if (port < 0 || port > 65535) {
         throw std::invalid_argument(
             "Invalid port: " + std::to_string(port) + " (must be 0-65535)");
     }
-    return static_cast<size_t>(port);
+    cfg.bind_port = port;
+    return cfg;
 }
 
+// Builds a minimal ServerConfig
+// and forwards to the config ctor so both paths share Normalize +
+// Validate exactly. Hostnames / bare IPv6 literals / bracketed IPv6
+// literals all flow through the same pipeline.
 HttpServer::HttpServer(const std::string& ip, int port)
-    : net_server_(ValidateHost(ip), ValidatePort(port),
-                  ComputeTimerInterval(ServerConfig{}.idle_timeout_sec,
-                                       ServerConfig{}.request_timeout_sec),
-                  std::chrono::seconds(ServerConfig{}.idle_timeout_sec),
-                  ServerConfig{}.worker_threads)
-{
-    WireNetServerCallbacks();
-    resolved_worker_threads_ = net_server_.GetWorkerCount();
-    net_server_.SetReadyCallback([this]() { MarkServerReady(); });
-    // Apply the same defaults as the config constructor — must match ServerConfig defaults.
-    net_server_.SetMaxConnections(ServerConfig{}.max_connections);
-    net_server_.SetMaxInputSize(ComputeInputCap());
-}
+    : HttpServer(BuildMinimalBindConfig(ip, port)) {}
 
-// Validate config before construction — throws on invalid values
-static const ServerConfig& ValidateConfig(const ServerConfig& config) {
-    ConfigLoader::Validate(config);
-    return config;
-}
-
-HttpServer::HttpServer(const ServerConfig& config)
-    : net_server_(ValidateConfig(config).bind_host, static_cast<size_t>(config.bind_port),
-                  ComputeTimerInterval(config.idle_timeout_sec,
+HttpServer::HttpServer(ServerConfig config)
+    : live_config_(PrepareConfig(config)),
+      dns_resolver_(std::make_unique<NET_DNS_NAMESPACE::DnsResolver>(config.dns)),
+      net_server_(ComputeTimerInterval(config.idle_timeout_sec,
                                        config.request_timeout_sec),
                   // Pass idle_timeout_sec directly — 0 means disabled.
                   // ConnectionHandler::IsTimeOut handles duration==0 by skipping idle check.
                   std::chrono::seconds(config.idle_timeout_sec),
                   config.worker_threads)
 {
+    // Ctor body is pure configuration wiring — no listen socket, no
+    // DNS, no dispatchers. `Start()` owns Phase A (DNS batch), Phase B
+    // (StartListening on the resolved address), and Phase C (dispatcher
+    // bootstrap) per §5.4a. This lets a SIGTERM arriving between ctor
+    // completion and Start() produce a clean shutdown with no listener
+    // open, and allows hostname bind to flow through the async
+    // DnsResolver instead of synchronous getaddrinfo at ctor time.
     WireNetServerCallbacks();
     resolved_worker_threads_ = net_server_.GetWorkerCount();
     net_server_.SetReadyCallback([this]() { MarkServerReady(); });
@@ -1889,6 +1895,111 @@ void HttpServer::Start() {
     // thread. Without this flag, a late Post() on the caller thread
     // could race with MarkServerReady's RegisterProxyRoutes inserts.
     startup_begun_.store(true, std::memory_order_release);
+
+    // DNS resolution (off the reactor; no threads running) ──
+    // §5.4a. Batch contains one entry per configured upstream plus a
+    // `bind` entry for bind_host. For literal hosts (IP addresses)
+    // DnsResolver short-circuits without spawning worker threads, so
+    // literal-only deployments pay zero DNS cost here.
+    //
+    // The `tag` field distinguishes bind from upstream in the result
+    // pass below. Upstream tags are prefixed "upstream:<name>".
+    std::vector<NET_DNS_NAMESPACE::ResolveRequest> batch;
+    {
+        NET_DNS_NAMESPACE::ResolveRequest bind_req;
+        bind_req.host    = live_config_.bind_host;
+        bind_req.port    = live_config_.bind_port;
+        bind_req.family  = live_config_.dns.lookup_family;
+        bind_req.timeout = std::chrono::milliseconds(
+            live_config_.dns.resolve_timeout_ms);
+        bind_req.tag     = "bind";
+        batch.push_back(std::move(bind_req));
+    }
+    for (const auto& u : live_config_.upstreams) {
+        NET_DNS_NAMESPACE::ResolveRequest r;
+        r.host    = u.host;
+        r.port    = u.port;
+        r.family  = live_config_.dns.lookup_family;
+        r.timeout = std::chrono::milliseconds(
+            live_config_.dns.resolve_timeout_ms);
+        r.tag     = "upstream:" + u.name;
+        batch.push_back(std::move(r));
+    }
+
+    auto results = dns_resolver_->ResolveMany(
+        std::move(batch),
+        std::chrono::milliseconds(live_config_.dns.overall_timeout_ms));
+
+    // Bind resolution failure is fatal — the server cannot start without
+    // a valid bind address. Upstream failures are fatal too (the operator
+    // explicitly configured the upstream; silently starting with a dead
+    // pool would produce confusing runtime errors). Step 11's reload path
+    // applies stale_on_error; startup is always strict.
+    for (const auto& r : results) {
+        if (r.error) {
+            throw std::runtime_error(
+                "DNS resolution failed for " + r.tag + " (" + r.host + "): " +
+                r.error_message);
+        }
+    }
+
+    // TWO-PHASE COMMIT for resolved state. Populate LOCALS here; the members `bind_resolved_` /
+    // `upstream_resolved_` are assigned only after both shutdown gates
+    // pass. On any gate-triggered abort, the locals drop on scope exit
+    // and the members stay default-constructed, so GetBindResolved() /
+    // MarkServerReady see an empty map / absent bind — the server
+    // behaves as if Start() had never committed.
+    InetAddr bind_resolved_addr;
+    std::optional<NET_DNS_NAMESPACE::ResolvedEndpoint> local_bind;
+    NET_DNS_NAMESPACE::ResolvedMap local_upstream;
+    for (auto& r : results) {
+        if (r.tag == "bind") {
+            bind_resolved_addr = r.addr;
+            local_bind = r;
+        } else if (r.tag.rfind("upstream:", 0) == 0) {
+            local_upstream.emplace(
+                r.tag.substr(std::string("upstream:").size()),
+                std::make_shared<const NET_DNS_NAMESPACE::ResolvedEndpoint>(r));
+        }
+    }
+
+    // If Stop() landed while ResolveMany was blocking (can block for up to
+    // dns.overall_timeout_ms), abort cleanly here BEFORE opening any
+    // listen socket. Release-acquire semantics: pairs with Stop's
+    // release-store on `stopping_` (§11 invariant).
+    if (stopping_.load(std::memory_order_acquire)) {
+        logging::Get()->info(
+            "Startup aborted after DNS resolution (stop requested); "
+            "no listen socket opened");
+        return;
+    }
+
+    net_server_.StartListening(bind_resolved_addr);
+
+    // When bind_port was 0 at resolve time, ResolvedEndpoint.port == 0. The kernel
+    // assigned a real port inside bind(2). Sync the LOCAL copy so
+    // /stats.bind (populated below at the commit point) reports the
+    // actual listening port. `InetAddr::SetPort` writes sin_port /
+    // sin6_port in place; the already-valid addr/family bytes from
+    // getaddrinfo are preserved.
+    if (local_bind) {
+        const uint16_t bound_port =
+            static_cast<uint16_t>(net_server_.GetBoundPort());
+        local_bind->addr.SetPort(bound_port);
+        local_bind->port = bound_port;
+    }
+
+    if (stopping_.load(std::memory_order_acquire)) {
+        logging::Get()->info(
+            "Startup aborted after listen socket opened (stop requested); "
+            "closing listener via NetServer state-2 tolerance");
+        net_server_.Stop();
+        return;
+    }
+
+    bind_resolved_     = std::move(local_bind);
+    upstream_resolved_ = std::move(local_upstream);
+
     net_server_.Start();
 }
 
@@ -1903,7 +2014,34 @@ int HttpServer::GetBoundPort() const {
     return net_server_.GetBoundPort();
 }
 
+ServerConfig HttpServer::GetLiveConfigSnapshot() const {
+    // `reload_mtx_` is mutable so `const` callers can lock.
+    // Takes a full copy under the mutex so the caller sees a coherent
+    // snapshot even while a Reload is mutating the live state.
+    std::lock_guard<std::mutex> lock(reload_mtx_);
+    return live_config_;
+}
+
+std::optional<NET_DNS_NAMESPACE::ResolvedEndpoint>
+HttpServer::GetBindResolved() const {
+    // No lock: `bind_resolved_` is assigned once in Start() before
+    // server_ready_ flips true. Readers that care about the "startup
+    // complete" contract check IsReady() first; readers that just want
+    // "has Start() reached the commit point" take the std::optional
+    // check as the answer (absent = not yet / aborted).
+    return bind_resolved_;
+}
+
 void HttpServer::Stop() {
+    // First executable line: publish shutdown intent with release
+    // ordering (§11 v0.41 invariant). Start()/Reload() poll this at
+    // phase boundaries with acquire ordering so they can abort cleanly
+    // even while wedged in DNS. MUST happen before the listener close
+    // and BEFORE any later lock acquisition — if Stop ever acquires
+    // reload_mtx_ (post-drain teardown barrier in step 11), this store
+    // must still run first so a mutex-waiting Stop still signals shutdown.
+    stopping_.store(true, std::memory_order_release);
+
     logging::Get()->info("HttpServer stopping");
 
     // Prevent Reload() from mutating dead state after Stop().
@@ -3723,12 +3861,28 @@ HttpServer::ConnectionSnapshot HttpServer::SnapshotConnections() {
     return snap;
 }
 
-bool HttpServer::Reload(const ServerConfig& new_config) {
+bool HttpServer::Reload(ServerConfig new_config) {
     // Gate on server readiness — socket_dispatchers_ is built during Start()
     // and must not be walked until construction is complete.
     if (!server_ready_.load(std::memory_order_acquire)) {
         logging::Get()->warn("Reload() called before server is ready, ignored");
         return false;
+    }
+
+    // Self-normalize — in-process callers that build a ServerConfig
+    // and call Reload() directly get the same canonicalization as the
+    // SIGHUP path in main.cc. Warn-downgrade on malformed host fields:
+    // bind_host / upstreams[].host are restart-only, so a malformed value
+    // must not block live-safe edits (DNS timeouts, rate-limit tweaks,
+    // auth) in the same reload. The downgraded warn leaves the original
+    // string in place; the subsequent Validate step then catches the
+    // semantic issue on the restart-only warn path.
+    try {
+        ConfigLoader::Normalize(new_config);
+    } catch (const std::invalid_argument& e) {
+        logging::Get()->warn(
+            "Reload: host normalization failed for restart-only field(s); "
+            "live-safe edits in this reload will still apply: {}", e.what());
     }
 
     // Validate reload-safe fields only — restart-only fields (bind_host,
@@ -4089,6 +4243,26 @@ bool HttpServer::Reload(const ServerConfig& new_config) {
                              "field edits, if any, were applied live)");
     } else {
         upstream_configs_ = new_config.upstreams;
+    }
+
+    // Reload does NOT re-resolve hostnames: if `upstream.host` is a hostname whose DNS
+    // record changed since startup, the pool keeps connecting to the
+    // cached resolved IP until the server is restarted. Surface this
+    // to operators once per reload so a DNS flip followed by SIGHUP
+    // doesn't silently miss the intended refresh. Suppressed when
+    // every upstream uses an IP literal — there is no DNS to re-run.
+    bool any_hostname_upstream = false;
+    for (const auto& u : new_config.upstreams) {
+        if (!NET_DNS_NAMESPACE::DnsResolver::IsIpLiteral(u.host)) {
+            any_hostname_upstream = true;
+            break;
+        }
+    }
+    if (any_hostname_upstream) {
+        logging::Get()->warn(
+            "Reload: hostname upstreams are not re-resolved in Phase 1 "
+            "(§15.1.0 step 11 deferred). IP refresh after a DNS change "
+            "requires a server restart.");
     }
 
     return true;
