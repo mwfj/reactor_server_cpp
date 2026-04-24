@@ -16,17 +16,17 @@ class CircuitBreakerManager;
 
 class UpstreamManager {
 public:
-    // PRODUCTION ctor (§5.4a v0.8): resolved endpoints are provided by
+    // PRODUCTION ctor: resolved endpoints are provided by
     // the caller — `HttpServer::MarkServerReady` passes
     // `HttpServer::upstream_resolved_`, which `HttpServer::Start`
     // populated via the DNS batch. The partitions use the resolved IP
     // for connect; hostnames stay in upstream.host for logging /
-    // effective-SNI derivation (§5.10, formalised in step 9 full).
+    // effective-SNI derivation
     UpstreamManager(const std::vector<UpstreamConfig>& upstreams,
                     const std::vector<std::shared_ptr<Dispatcher>>& dispatchers,
                     NET_DNS_NAMESPACE::ResolvedMap resolved);
 
-    // LEGACY ctor (§5.4a v0.8): for unit tests and embedders that
+    // LEGACY ctor: for unit tests and embedders that
     // don't route through DnsResolver. Auto-fills the resolved map by
     // parsing each `config.host` as a bare IP literal (after
     // Normalize-style bracket stripping). Throws invalid_argument on

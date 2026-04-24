@@ -40,7 +40,7 @@ LookupFamily ParseLookupFamily(const std::string& s);
 const char* LookupFamilyName(LookupFamily f);
 
 // ---------------------------------------------------------------------------
-// DnsConfig — reloadable subset lives alongside ServerConfig (§6.1)
+// DnsConfig — reloadable subset lives alongside ServerConfig
 // ---------------------------------------------------------------------------
 //
 // Declared here so the DnsResolver API depends on the config struct
@@ -92,15 +92,13 @@ struct ResolvedEndpoint {
     std::string                           error_message;
 };
 //
-// v0.41 round-40 P2. ResolvedEndpoint carries NO `authority` field.
+// ResolvedEndpoint carries NO `authority` field.
 // Callers that need the RFC 3986 authority form compute it on demand
 // via DnsResolver::FormatAuthority(addr.Ip(), addr.Port()). Matches the
 // upstream pattern and avoids stale-cache bugs after port mutation
-// (e.g. ephemeral-port refresh in §5.4a).
 
 // Canonical map type for "upstream name → resolved endpoint". Shared
-// between HttpServer::upstream_resolved_, UpstreamManager's production
-// ctor, and UpdateResolvedEndpoints (v0.44 round-43 P1' consistency fix).
+// between HttpServer::upstream_resolved_, UpstreamManager's production ctor, and UpdateResolvedEndpoints
 using ResolvedMap = std::unordered_map<
     std::string, std::shared_ptr<const ResolvedEndpoint>>;
 
@@ -114,7 +112,7 @@ using ResolvedMap = std::unordered_map<
 // creates `resolver_max_inflight` pthread workers with 256 KB stacks.
 // Literal-only servers never trigger pool spawn — zero thread cost.
 //
-// Detach-not-join teardown (§5.2.4): ~DnsResolver sets shutdown, wakes
+// Detach-not-join teardown: ~DnsResolver sets shutdown, wakes
 // queued futures with shutdown-error results, detaches every worker.
 // Wedged workers (uncancellable getaddrinfo) leak 256 KB stack until
 // process exit — accepted cost for teardown-latency safety.
@@ -124,7 +122,7 @@ using ResolvedMap = std::unordered_map<
 // that don't own a DnsResolver instance.
 class DnsResolver {
 public:
-    // Absolute queue limit (§5.2.2). NOT proportional to resolver_max_inflight
+    // Absolute queue limit. NOT proportional to resolver_max_inflight
     // — realistic batches never approach 10 000; this is a pathological-
     // case safety fence only. Exceeding returns synchronous EAI_AGAIN
     // "resolver saturated" without enqueueing.
@@ -148,16 +146,6 @@ public:
     // enforce a batch ceiling. Never throws — per-entry errors surface
     // via ResolvedEndpoint::error. Order of returned vector matches
     // order of `requests`.
-    //
-    // P2 fix (round-hostname-5): per-entry deadlines are measured from
-    // BATCH DISPATCH TIME, not from when the wait loop reaches each
-    // entry. An earlier implementation reset the budget per-entry at
-    // wait time, which silently stretched later entries' effective
-    // deadlines by the cumulative wait of earlier ones.
-    //
-    // Zero `ResolveRequest.timeout` falls back to
-    // DnsConfig.resolve_timeout_ms at dispatch time (§5.2 P1).
-
     // One-arg form — uses DnsConfig.overall_timeout_ms as the batch
     // ceiling. P1 fix: operator-configured overall timeout propagates
     // automatically; callers no longer need to re-read config.
@@ -170,13 +158,12 @@ public:
         std::vector<ResolveRequest> requests,
         std::chrono::milliseconds overall_timeout);
 
-    // Per-instance test seam — replaces the getaddrinfo body. Ownership
-    // rule (§5.2.3): the callable MUST own every piece of state it
+    // Per-instance test seam — replaces the getaddrinfo body.
+    // Ownership rule: the callable MUST own every piece of state it
     // references because it may outlive the resolver under detach-not-
     // join teardown. Capture by value or shared_ptr; raw references to
     // fixture state are FORBIDDEN.
-    void SetResolverForTesting(
-        std::function<ResolvedEndpoint(const ResolveRequest&)> fn);
+    void SetResolverForTesting(std::function<ResolvedEndpoint(const ResolveRequest&)> fn);
 
     // Test-only override for the queue cap. Production always uses
     // `kMaxQueuedItems` (10 000) — realistic deployments never approach
@@ -191,6 +178,7 @@ public:
     static bool IsIpLiteral(const std::string& s);
     static bool ParseHostPort(const std::string& s,
                               std::string* host, int* port);
+
     // Render an RFC 3986 §3.2.2 authority from a BARE host (no
     // surrounding brackets). IPv6 literals are bracketed automatically.
     // A defensive bracket-strip handles a pre-bracketed IPv6 input
@@ -238,7 +226,7 @@ private:
     // the same lock to avoid a data race.
     std::size_t                max_queued_items_ = kMaxQueuedItems;
 
-    // Lazy pool spawn (§5.2.9). Called from ResolveAsync on the first
+    // Lazy pool spawn. Called from ResolveAsync on the first
     // non-literal request. Throws std::runtime_error on pthread_create
     // failure AFTER cleaning up any workers already spawned (detach).
     void EnsurePoolStarted();

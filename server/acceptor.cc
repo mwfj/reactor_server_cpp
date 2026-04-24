@@ -10,13 +10,8 @@ Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _
     event_dispatcher_(_dispatcher),
     servsock_(nullptr)
 {
-    // v0.45 step 4 (§5.4 IPv6 bind path). Parse the bind literal first,
-    // pick the socket family from its parsed kind, then create a socket
-    // of THAT family. For hostnames (Phase 1 doesn't resolve in this
-    // ctor — that's deferred to HttpServer::Start → DNS → NetServer::
-    // StartListening(InetAddr)), the string-based ctor is a legacy
-    // entry point kept for CLI / tests that pass an IP literal; it
-    // fails closed if the literal is malformed.
+    // Parse the bind literal first, pick the socket family from its parsed kind, then create a socket
+    // of THAT family. 
     InetAddr addr(_ip, _port);
     if (!addr.is_valid()) {
         throw std::runtime_error(
@@ -33,14 +28,10 @@ Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _
     int listen_fd = SocketHandler::CreateSocket(family);
     servsock_.reset(new SocketHandler(listen_fd, family));
 
-    // v0.45 step 4 (§5.4): RFC 3493 §5.3 IPv6 bind. For an AF_INET6
-    // listener, enable IPV6_V6ONLY so the socket does NOT accept
+    // For an AF_INET6 listener, enable IPV6_V6ONLY so the socket does NOT accept
     // v4-mapped peers. This is fail-closed: the §1.3 IP-based rate-limit
     // / ACL contract depends on peer addresses being EITHER v4 or v6 —
-    // NOT v4-mapped-in-v6. If the platform refuses the setsockopt we
-    // refuse to start rather than silently fall back to dual-mapped
-    // semantics (matches DEVELOPMENT_RULES.md "never fail open on
-    // security-relevant setsockopt").
+    // NOT v4-mapped-in-v6.
     if (family == AF_INET6) {
         int on = 1;
         if (::setsockopt(servsock_->fd(), IPPROTO_IPV6, IPV6_V6ONLY,

@@ -71,7 +71,7 @@ private:
 public:
     NetServer() = delete;
 
-    // PHASE 1 — construct + Init the conn_dispatcher_ member + install
+    // Construct + Init the conn_dispatcher_ member + install
     // the timeout-trigger callback. Does NOT construct Acceptor, does
     // NOT build or start socket dispatchers, does NOT start the worker
     // pool. `conn_dispatcher_` MUST be Init()-complete here because

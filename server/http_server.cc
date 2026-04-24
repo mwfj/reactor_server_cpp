@@ -506,7 +506,7 @@ void HttpServer::MarkServerReady() {
     // error instead of silently starting without upstream pools.
     if (!upstream_configs_.empty()) {
         try {
-            // §5.4a step 8: use the 3-arg production ctor with the
+            // use the 3-arg production ctor with the
             // resolved-endpoint map built by HttpServer::Start's DNS
             // batch. UpstreamManager uses each resolved IP as the
             // pool's connect host and preserves the original
@@ -890,12 +890,10 @@ void HttpServer::WireNetServerCallbacks() {
 // unwinds before any other member is constructed (no half-initialized
 // state). This is the single source of truth for config ingestion at
 // the HttpServer boundary — both the (ServerConfig) ctor and the
-// (ip, port) delegating ctor funnel through here. §5.6 / §5.6a.
+// (ip, port) delegating ctor funnel through here.
 //
 // Returns a reference to the mutated config so call sites can chain
-// `PrepareConfig(cfg).bind_host` in the initializer list. Step 3 will
-// replace this with a `live_config_` member and matching initializer
-// sequence per §11's declaration-order rules.
+// `PrepareConfig(cfg).bind_host` in the initializer list.
 static ServerConfig& PrepareConfig(ServerConfig& cfg) {
     ConfigLoader::Normalize(cfg);   // structural — brackets, trailing-dot sni
     ConfigLoader::Validate(cfg);    // semantic — grammar, ranges, cross-refs
@@ -917,7 +915,7 @@ static ServerConfig BuildMinimalBindConfig(const std::string& ip, int port) {
     return cfg;
 }
 
-// Delegating constructor (§5.6a v0.8). Builds a minimal ServerConfig
+// Builds a minimal ServerConfig
 // and forwards to the config ctor so both paths share Normalize +
 // Validate exactly. Hostnames / bare IPv6 literals / bracketed IPv6
 // literals all flow through the same pipeline.
@@ -1898,7 +1896,7 @@ void HttpServer::Start() {
     // could race with MarkServerReady's RegisterProxyRoutes inserts.
     startup_begun_.store(true, std::memory_order_release);
 
-    // ── Phase A: DNS resolution (off the reactor; no threads running) ──
+    // DNS resolution (off the reactor; no threads running) ──
     // §5.4a. Batch contains one entry per configured upstream plus a
     // `bind` entry for bind_host. For literal hosts (IP addresses)
     // DnsResolver short-circuits without spawning worker threads, so
@@ -1945,8 +1943,7 @@ void HttpServer::Start() {
         }
     }
 
-    // §5.4a v0.44 round-43 P2: TWO-PHASE COMMIT for resolved state.
-    // Populate LOCALS here; the members `bind_resolved_` /
+    // TWO-PHASE COMMIT for resolved state. Populate LOCALS here; the members `bind_resolved_` /
     // `upstream_resolved_` are assigned only after both shutdown gates
     // pass. On any gate-triggered abort, the locals drop on scope exit
     // and the members stay default-constructed, so GetBindResolved() /
@@ -1966,8 +1963,7 @@ void HttpServer::Start() {
         }
     }
 
-    // §5.4a v0.41 round-40 P1: Phase-A shutdown gate. If Stop() landed
-    // while ResolveMany was blocking (can block for up to
+    // If Stop() landed while ResolveMany was blocking (can block for up to
     // dns.overall_timeout_ms), abort cleanly here BEFORE opening any
     // listen socket. Release-acquire semantics: pairs with Stop's
     // release-store on `stopping_` (§11 invariant).
@@ -1978,15 +1974,9 @@ void HttpServer::Start() {
         return;
     }
 
-    // ── Phase B: open the listen socket on the resolved bind address ──
-    // StartListening throws on V6ONLY enforcement failure, bind failure,
-    // or listen failure. No dispatcher threads are running yet, so an
-    // exception unwind leaves NetServer in the ctor-only state — Stop()
-    // from the unwind is a no-op.
     net_server_.StartListening(bind_resolved_addr);
 
-    // §5.4a v0.44 round-43 P2: ephemeral-port refresh. When bind_port
-    // was 0 at resolve time, ResolvedEndpoint.port == 0. The kernel
+    // When bind_port was 0 at resolve time, ResolvedEndpoint.port == 0. The kernel
     // assigned a real port inside bind(2). Sync the LOCAL copy so
     // /stats.bind (populated below at the commit point) reports the
     // actual listening port. `InetAddr::SetPort` writes sin_port /
@@ -1999,10 +1989,6 @@ void HttpServer::Start() {
         local_bind->port = bound_port;
     }
 
-    // §5.4a v0.41 round-40 P1: Phase-B shutdown gate (defense-in-depth).
-    // If Stop() landed between Phase A and here, the listen fd is open
-    // but dispatchers have not started. Close it via NetServer's
-    // state-2 tolerance (listener-only Stop; skips dispatcher iter).
     if (stopping_.load(std::memory_order_acquire)) {
         logging::Get()->info(
             "Startup aborted after listen socket opened (stop requested); "
@@ -2011,18 +1997,9 @@ void HttpServer::Start() {
         return;
     }
 
-    // §5.4a v0.44 round-43 P2: COMMIT POINT. All gates passed; move the
-    // locals into the members. From this line forward, GetBindResolved()
-    // returns the bind endpoint, and MarkServerReady (running after
-    // Phase C's ready callback) observes the populated upstream map.
-    // Any abort path above returned without reaching this point.
     bind_resolved_     = std::move(local_bind);
     upstream_resolved_ = std::move(local_upstream);
 
-    // ── Phase C: dispatcher bootstrap (existing NetServer::Start) ──
-    // Spawns socket dispatchers, starts the worker pool, fires the
-    // ready callback (which calls MarkServerReady on the dispatcher
-    // thread), then RunEventLoop() on conn_dispatcher_.
     net_server_.Start();
 }
 
@@ -2038,7 +2015,7 @@ int HttpServer::GetBoundPort() const {
 }
 
 ServerConfig HttpServer::GetLiveConfigSnapshot() const {
-    // §11 v0.28: `reload_mtx_` is mutable so `const` callers can lock.
+    // `reload_mtx_` is mutable so `const` callers can lock.
     // Takes a full copy under the mutex so the caller sees a coherent
     // snapshot even while a Reload is mutating the live state.
     std::lock_guard<std::mutex> lock(reload_mtx_);
@@ -3892,7 +3869,7 @@ bool HttpServer::Reload(ServerConfig new_config) {
         return false;
     }
 
-    // Self-normalize (§5.6) — in-process callers that build a ServerConfig
+    // Self-normalize — in-process callers that build a ServerConfig
     // and call Reload() directly get the same canonicalization as the
     // SIGHUP path in main.cc. Warn-downgrade on malformed host fields:
     // bind_host / upstreams[].host are restart-only, so a malformed value
@@ -4268,8 +4245,7 @@ bool HttpServer::Reload(ServerConfig new_config) {
         upstream_configs_ = new_config.upstreams;
     }
 
-    // Phase-1 deferral reminder (§15.1.0 step 11). Reload does NOT
-    // re-resolve hostnames: if `upstream.host` is a hostname whose DNS
+    // Reload does NOT re-resolve hostnames: if `upstream.host` is a hostname whose DNS
     // record changed since startup, the pool keeps connecting to the
     // cached resolved IP until the server is restarted. Surface this
     // to operators once per reload so a DNS flip followed by SIGHUP

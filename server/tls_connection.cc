@@ -35,22 +35,6 @@ TlsConnection::TlsConnection(TlsClientContext& ctx, int fd, const std::string& s
 
     // Set SNI hostname for virtual hosting — server uses this to select certificate
     if (!sni_hostname.empty()) {
-        // Review-round fix (§5.10 / §5.5.1 symmetric trailing-dot strip).
-        // Operators commonly add a trailing dot to `tls.sni_hostname` for
-        // absolute-FQDN semantics at the DNS layer. But RFC 6066 §3 SNI
-        // and X.509 SAN `dNSName` entries are dotless — passing
-        // `api.example.com.` into `SSL_set_tlsext_host_name` makes the
-        // server either miss the correct SNI vhost (many implementations
-        // do byte-level match on the ServerName) or return a cert whose
-        // SAN is `api.example.com`, which `SSL_set1_host` then rejects
-        // as a hostname-verification failure. The Host-header path in
-        // HeaderRewriter already strips in v0.46; applying the same
-        // strip here keeps the three consumers (Host, SNI, verify-name)
-        // in lockstep. `StripTrailingDot` is idempotent for dotless
-        // inputs — safe to call unconditionally. Design v0.37 moves
-        // this strip into `ConfigLoader::Normalize` (step 6, not landed
-        // yet); until then, per-consumer strips at the point of use are
-        // the parallel-safe approach.
         const std::string effective_sni =
             NET_DNS_NAMESPACE::DnsResolver::StripTrailingDot(sni_hostname);
         if (SSL_set_tlsext_host_name(ssl_, effective_sni.c_str()) != 1) {

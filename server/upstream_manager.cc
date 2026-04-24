@@ -126,7 +126,7 @@ UpstreamManager::UpstreamManager(
             }
         }
 
-        // §5.5 step 9 full: pass the ORIGINAL operator host (possibly a
+        // Pass the ORIGINAL operator host (possibly a
         // hostname) as the pool's host — it's used for logging and as
         // the effective-SNI fallback. The connect-bound endpoint is
         // carried separately via `resolved_endpoint` so the string and
@@ -161,21 +161,7 @@ UpstreamManager::UpstreamManager(
         //      change their on-the-wire ClientHello and break
         //      handshakes for no gain. The validator still rejects
         //      IP + empty sni + verify_peer=true (nothing verifiable).
-        //
-        // v0.53 P2 fix: `upstream.host` may still be bracketed (`[::1]`)
-        // on the direct-construction path — the legacy 2-arg ctor's
-        // `BuildResolvedFromLiterals` accepts bracketed IPv6 via
-        // `NormalizeHostToBare` but does NOT rewrite `upstream.host`,
-        // and the 3-arg ctor doesn't touch it either. Production
-        // config flows already strip brackets via
-        // `ConfigLoader::Normalize`, but direct-ctor callers (tests,
-        // embedders) would otherwise reach this site with `[::1]` in
-        // hand, fail the `IsIpLiteral` check (which validates bare
-        // forms only), and wrongly ship `[::1]` as SNI. Normalize
-        // here so both paths converge on the bare form; on malformed
-        // input (never reached in practice — both ctors grammar-
-        // validated upstream) fall back to the raw string so the
-        // downstream check behaves identically.
+
         std::string host_for_sni;
         if (!NET_DNS_NAMESPACE::DnsResolver::NormalizeHostToBare(
                 upstream.host, &host_for_sni)) {

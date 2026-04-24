@@ -337,14 +337,7 @@ bool DnsResolver::ParseHostPort(const std::string& s,
         // must fail-closed on a missing host rather than emit an empty
         // string that downstream validators may or may not catch.
         if (host->empty()) return false;
-        // Review-round fix: validate the host token against the full
-        // host grammar (IPv4 literal, bare IPv6 literal, or RFC 1123
-        // hostname) before declaring parse success. Previously the
-        // bare branch returned any substring-before-colon verbatim,
-        // letting inputs like "host..bad:80" or "0127.0.0.1:80" succeed
-        // despite being rejected by this branch's own validator. Fail-
-        // closed at the authority boundary — callers get a single
-        // consistent notion of "valid authority host".
+
         if (!IsValidHostOrIpLiteral(*host)) return false;
         const std::string port_str = s.substr(colon + 1);
         int p = 0;
@@ -417,17 +410,7 @@ bool DnsResolver::NormalizeHostToBare(const std::string& in, std::string* out) {
 // ---------------------------------------------------------------------------
 
 DnsResolver::DnsResolver(const DnsConfig& config) : config_(config) {
-    // Review-round fix: reject non-positive resolver_max_inflight at
-    // construction. A zero value means EnsurePoolStarted would run its
-    // spawn loop for 0 iterations and succeed WITHOUT creating any
-    // workers; every hostname ResolveAsync thereafter would append to
-    // state_->queue with nothing to pop, so promises would never
-    // complete and DNS resolution would hang permanently. A negative
-    // value is even worse: the static_cast<size_t>(-1) in
-    // workers_.reserve() yields SIZE_MAX and either throws bad_alloc
-    // or attempts to spawn ~2^63 threads.
-    //
-    // ConfigLoader::Validate (step 6, §5.6) is where this is supposed
+    // ConfigLoader::Validate is where this is supposed
     // to be caught in the server's config-loading path. This guard is
     // defense-in-depth for DIRECT DnsResolver construction (tests,
     // future embedders) that bypasses ServerConfig — so the error
@@ -445,10 +428,10 @@ DnsResolver::DnsResolver(const DnsConfig& config) : config_(config) {
 
 DnsResolver::~DnsResolver() {
     // Drain queued AND in-flight items under the mutex and wake their
-    // futures with a shutdown-error result. Review-round P1: in-flight
-    // items were previously NOT reachable from the dtor — the §5.2.4
-    // contract narrowing said they relied on their own future.wait_for
-    // bound. With the shared_ptr<WorkItem> + `done` flag machinery
+    // futures with a shutdown-error result. in-flight
+    // items were previously NOT reachable from the dtor — contract narrowing said 
+    // they relied on their own future.wait_for bound. 
+    // With the shared_ptr<WorkItem> + `done` flag machinery
     // introduced for the reaper (so it can expire in-flight items at
     // deadline), the dtor can safely set_value on in-flight items too:
     // workers that later return from getaddrinfo see done=true and skip
@@ -488,7 +471,7 @@ DnsResolver::~DnsResolver() {
 
     // Detach every worker — NEVER join. Joining a wedged getaddrinfo
     // would hang HttpServer::Stop indefinitely. Wedged workers leak
-    // 256 KB stack until process exit (accepted §5.2.4 cost).
+    // 256 KB stack until process exit.
     for (pthread_t tid : workers_) {
         pthread_detach(tid);
     }
@@ -538,7 +521,7 @@ void DnsResolver::EnsurePoolStarted() {
                 workers_.push_back(tid);
             }
 
-            // Review-round fix: spawn the timeout reaper AFTER workers.
+            // spawn the timeout reaper AFTER workers.
             // One reaper per pool. Same heap-allocated shared_ptr pattern
             // as workers; reaper_ is reset to 0 on spawn failure so the
             // partial-failure cleanup below doesn't try to detach a
@@ -603,7 +586,7 @@ void* DnsResolver::WorkerTrampoline(void* raw) {
         std::list<std::shared_ptr<WorkItem>>::iterator in_flight_it;
         std::function<ResolvedEndpoint(const ResolveRequest&)> body;
 
-        // Phase 1 (under mtx): pop from queue, splice to in_flight,
+        // pop from queue, splice to in_flight,
         // record the iterator so we can erase on completion. Copy the
         // seam out of PoolState so concurrent SetResolverForTesting
         // cannot mutate our reference mid-call. Do the queue-time
@@ -622,11 +605,6 @@ void* DnsResolver::WorkerTrampoline(void* raw) {
             item = std::move(state->queue.front());
             state->queue.pop_front();
 
-            // Review-round P1: move the popped item into the in_flight
-            // list so the reaper can expire it at deadline even while
-            // the worker is blocked in DoBlockingResolve. Worker holds
-            // `item` (shared_ptr) to survive the reaper's erase of
-            // `in_flight_it` if the race goes the reaper's way.
             state->in_flight.push_back(item);
             in_flight_it = std::prev(state->in_flight.end());
 
@@ -744,8 +722,7 @@ void* DnsResolver::TimeoutReaperTrampoline(void* raw) {
         // shared_ptr<WorkItem> elements).
         const auto now = std::chrono::steady_clock::now();
         auto write = state->queue.begin();
-        for (auto read = state->queue.begin();
-             read != state->queue.end(); ++read) {
+        for (auto read = state->queue.begin(); read != state->queue.end(); ++read) {
             auto& sp = *read;
             if (sp && sp->deadline <= now) {
                 if (!sp->done) {
@@ -892,40 +869,16 @@ ResolvedEndpoint DnsResolver::MakeTimeoutResult(const ResolveRequest& req,
 
 std::future<ResolvedEndpoint>
 DnsResolver::ResolveAsync(ResolveRequest req) {
-    // Review-round P2 fix: family sentinel falls back to DnsConfig.
-    // lookup_family. Substitute BEFORE computing the deadline and before
-    // the literal short-circuit inside ResolveAsyncImpl, so the
-    // family-constraint branch inside MakeReadyLiteralResult
-    // (kV4Only + IPv6 literal → reject, and the symmetric case) fires
-    // against the CONFIGURED policy, not against the kUnset sentinel
-    // (which those branches would silently ignore, accepting literals
-    // that the operator-configured v4_only / v6_only policy intended to
-    // reject).
+
     if (req.family == LookupFamily::kUnset) {
         req.family = config_.lookup_family;
     }
 
-    // P1 fix: zero-timeout sentinel falls back to DnsConfig.resolve_timeout_ms.
-    // Substitute BEFORE deadline computation so the WorkItem deadline
-    // consistently reflects the effective timeout regardless of caller
-    // pattern.
     if (req.timeout.count() == 0) {
         req.timeout = std::chrono::milliseconds(config_.resolve_timeout_ms);
     }
 
-    // Review-round fix (start timeout accounting at submission time):
-    // Capture `submission_time` BEFORE `EnsurePoolStarted()` (which runs
-    // inside ResolveAsyncImpl) so the per-request budget reflects the
-    // caller-visible `req.timeout` as measured from the call into
-    // `ResolveAsync`. Without this, the cold-start pool spawn
-    // (pthread_create × resolver_max_inflight + reaper; ~50-200 μs each
-    // on Linux, up to ~50 ms for large resolver_max_inflight on busy
-    // hosts) would silently eat into the caller's budget on the very
-    // first hostname request. Only matters for the queue-path item's
-    // deadline; literal/error paths return ready futures and don't
-    // consume the budget.
-    const auto item_deadline =
-        std::chrono::steady_clock::now() + req.timeout;
+    const auto item_deadline = std::chrono::steady_clock::now() + req.timeout;
     return ResolveAsyncImpl(std::move(req), item_deadline);
 }
 
@@ -933,17 +886,7 @@ std::future<ResolvedEndpoint>
 DnsResolver::ResolveAsyncImpl(
     ResolveRequest req,
     std::chrono::steady_clock::time_point item_deadline) {
-    // Review-round fix: fail-closed host validation BEFORE any pool
-    // interaction. This is the runtime gate; without it, legacy numeric-
-    // dotted forms like "0127.0.0.1" or "1.2.3" (already rejected by
-    // IsValidHostOrIpLiteral / ConfigLoader) could still reach
-    // getaddrinfo via a caller that skipped pre-validation and be
-    // reinterpreted by glibc / BSD NSS via inet_aton's classful / octal
-    // parsing. Obviously-malformed hosts would also consume a queue slot
-    // before failing at the worker. Keeping the runtime path in lockstep
-    // with the validator closes both holes: invalid hosts produce a
-    // ready error future, pool is untouched, kMaxQueuedItems is
-    // preserved for genuine work.
+
     if (!IsValidHostOrIpLiteral(req.host)) {
         std::promise<ResolvedEndpoint> p;
         auto fut = p.get_future();
@@ -956,15 +899,6 @@ DnsResolver::ResolveAsyncImpl(
         return fut;
     }
 
-    // Review-round fix (port range validation at resolver boundary):
-    // `InetAddr` silently truncates `port` via `static_cast<uint16_t>`,
-    // so a literal caller that constructs a ResolveRequest with
-    // port = -1 / 70000 / INT_MAX would otherwise resolve to an
-    // unintended endpoint (e.g. -1 → 65535, 70000 → 4464). `ParseHostPort`
-    // already rejects the same inputs from the parser path; the runtime
-    // gate must match so the public API is self-consistent and
-    // fail-closed. Accept [0, 65535]; port 0 is legitimate (ephemeral
-    // binds, ResolveRequest default).
     if (req.port < 0 || req.port > 65535) {
         std::promise<ResolvedEndpoint> p;
         auto fut = p.get_future();
@@ -998,9 +932,7 @@ DnsResolver::ResolveAsyncImpl(
 
     auto item = std::make_shared<WorkItem>();
     item->req      = std::move(req);
-    // Review-round fix (ResolveMany's dispatch deadline propagates into
-    // queued work): `item_deadline` is pinned by the caller. For single-
-    // shot `ResolveAsync` this is submission_time + req.timeout (the
+    //For singleshot `ResolveAsync` this is submission_time + req.timeout (the
     // single-caller budget contract). For `ResolveMany` this is
     // dispatch_time + req.timeout so that caller-visible expiry (the
     // wait loop's `per_entry_deadlines[i]`) and internal item eviction
@@ -1014,21 +946,6 @@ DnsResolver::ResolveAsyncImpl(
     {
         std::lock_guard<std::mutex> lk(state_->mtx);
 
-        // Full-queue expiry sweep on EVERY submission — see review-round
-        // evolution notes below. Items are now `shared_ptr<WorkItem>`
-        // for shared ownership with in-flight items (worker retains
-        // its own shared_ptr while the reaper may erase the list entry);
-        // iteration accesses fields via `(*read)->field`.
-        //
-        // Review-round evolution history:
-        //   round 1 — front-only sweep (cheap, monotone-deadline only)
-        //   round 2 — + full sweep gated on saturation (caught the
-        //             mixed-deadline case, but only at cap)
-        //   round 3 — full sweep unconditionally
-        //   round 4 — shared_ptr<WorkItem> + `done` flag so the reaper
-        //             can also safely expire in-flight items racing
-        //             the worker (this version).
-        //
         // Always-sweep fixes both the drift problem (expired slots
         // accumulating toward kMaxQueuedItems) AND the per-request
         // deadline contract. Cost O(N) per submission; for realistic
@@ -1069,24 +986,13 @@ DnsResolver::ResolveAsyncImpl(
         }
         state_->queue.push_back(std::move(item));
     }
-    // Review-round fix: notify_all (was notify_one). Wakes BOTH a
-    // worker (to pick up the new item) AND the timeout reaper (so it
-    // can re-compute earliest-deadline if this new item has a shorter
-    // deadline than whatever the reaper was previously waiting on).
-    // At cap=32 this is 33 wakeups per submission instead of 1; the
-    // extra scheduler cost (~100 µs of wakeup overhead per submission
-    // at realistic rates) is absorbed cheaply and is required to close
-    // the API-contract hole where a direct ResolveAsync caller could
-    // wait indefinitely for a future to become ready when traffic
-    // stopped behind a wedged worker.
+
     state_->cv.notify_all();
     return fut;
 }
 
 std::vector<ResolvedEndpoint>
 DnsResolver::ResolveMany(std::vector<ResolveRequest> requests) {
-    // P1 fix: one-arg form uses the operator-configured batch ceiling
-    // from DnsConfig, so callers do not have to re-read config.
     return ResolveMany(std::move(requests),
                         std::chrono::milliseconds(config_.overall_timeout_ms));
 }
@@ -1113,51 +1019,17 @@ DnsResolver::ResolveMany(std::vector<ResolveRequest> requests,
     per_entry_deadlines.reserve(requests.size());
 
     for (auto& req : requests) {
-        // Review-round P2 fix: family sentinel → config (same pattern
-        // as timeout below). Substitute in snapshot so error messages
-        // and test assertions see the effective family the resolver
-        // actually ran against.
+
+        
         if (req.family == LookupFamily::kUnset) {
             req.family = config_.lookup_family;
         }
-        // P1 fix: sentinel substitution done HERE (before snapshotting
-        // and before the enqueue path would otherwise substitute).
-        // Guarantees that `per_entry_deadlines[i]` and
-        // `snapshot[i].timeout` both reflect the effective value,
-        // keeping log messages and test assertions aligned with the
-        // deadline we actually enforced.
+
+        
         if (req.timeout.count() == 0) {
             req.timeout = std::chrono::milliseconds(config_.resolve_timeout_ms);
         }
-        // Review-round P2 fix: pin the per-item deadline on
-        // `dispatch_time`, not on each item's own `now()` at submission.
-        // The single `item_deadline` here is used BOTH for the batch
-        // wait loop (`per_entry_deadlines[i]`) AND as the WorkItem's
-        // internal deadline via ResolveAsyncImpl. Without this, the
-        // public `ResolveAsync` path re-anchors each WorkItem at
-        // per-submission `now()`, so later entries in a large batch
-        // (or the first batch on a cold resolver with non-trivial
-        // `EnsurePoolStarted` burst) can remain in state_->queue /
-        // state_->in_flight AFTER ResolveMany has already returned a
-        // "resolve timeout exceeded" result for them — orphaned work
-        // that consumes queue slots / worker capacity on the resolver,
-        // causing `EAI_AGAIN "resolver saturated"` or worker starvation
-        // for the next batch. Sharing one deadline between caller wait
-        // and internal item expiry converges the two views.
-        //
-        // v0.53 P2 fix: ALSO clamp to `batch_deadline`. When
-        // `overall_timeout < req.timeout` (e.g. one-arg
-        // `ResolveMany(requests)` whose `config_.overall_timeout_ms`
-        // is tighter than `config_.resolve_timeout_ms`, or a caller
-        // passing a sub-per-entry batch ceiling), the unclamped
-        // per-request deadline would keep the WorkItem alive in
-        // state_->queue / state_->in_flight AFTER the caller has
-        // received its "resolve timeout exceeded" result — same
-        // orphaned-work class as the original P2 fix above, but
-        // triggered by the OVERALL ceiling rather than by re-anchoring
-        // on submission `now()`. Clamping here makes the caller-
-        // visible expiry and the internal eviction converge at the
-        // same instant under any (overall, per-request) combination.
+
         const auto item_deadline =
             std::min(dispatch_time + req.timeout, batch_deadline);
         per_entry_deadlines.push_back(item_deadline);

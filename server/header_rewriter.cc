@@ -136,31 +136,12 @@ std::map<std::string, std::string> HeaderRewriter::RewriteRequest(
             (upstream_tls && !sni_hostname.empty())
                 ? sni_hostname
                 : upstream_host;
-        // Review-round fix (§5.5.1 v0.36 P2): strip a single trailing dot
-        // from the absolute-FQDN form before emitting the Host header.
-        // An operator who configured `backend.example.com.` (absolute
-        // FQDN — commonly used to suppress /etc/resolv.conf search-domain
-        // expansion) would otherwise see `Host: backend.example.com.` on
-        // the wire. Many vhost backends do byte-level authority matching,
-        // so `foo.example.com.` and `foo.example.com` route to different
-        // (or missing) vhosts. StripTrailingDot is idempotent for inputs
-        // without a trailing dot (hostname / IPv4 / IPv6 literal) — safe
-        // to call unconditionally. §5.5.1 v0.37 puts the strip on the
-        // sni_hostname override path into Normalize (step 6 — not landed
-        // yet), so gating here covers BOTH source branches without
-        // double-stripping.
+
         const std::string host_value =
             NET_DNS_NAMESPACE::DnsResolver::StripTrailingDot(host_src);
         const bool omit_port = (!upstream_tls && upstream_port == 80) ||
                                (upstream_tls && upstream_port == 443);
-        // Review-round fix (§5.5.1 step-7 preview): emit the Host header
-        // via DnsResolver::FormatAuthority so IPv6 literals get RFC 3986
-        // §3.2.2 bracketing. Previous path built `host_value + ":" + port`
-        // verbatim, producing `::1:8080` for IPv6 upstreams — invalid
-        // authority that many backends reject or misroute. FormatAuthority
-        // produces identical output for hostnames / IPv4 literals (byte-
-        // for-byte) and `[::1]:8080` / `[::1]` for IPv6. Handles the same
-        // omit_port well-known-port rule the previous code had.
+
         output["host"] = NET_DNS_NAMESPACE::DnsResolver::FormatAuthority(
             host_value, upstream_port, omit_port);
     }

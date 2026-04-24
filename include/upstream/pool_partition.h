@@ -32,15 +32,6 @@ public:
     // circuit-open response a fresh requester would get.
     static constexpr int CHECKOUT_CIRCUIT_OPEN    = -6;
 
-    // §5.5 step 9 full: `upstream_host` is the ORIGINAL operator string
-    // (hostname or IP literal), kept for logging / observability only.
-    // `resolved_endpoint` carries the connect-bound `InetAddr` produced by
-    // HttpServer::Start's DNS batch (or synthesised from a literal by
-    // UpstreamManager's legacy ctor). `CreateNewConnection` reads it via
-    // `std::atomic_load_explicit(...memory_order_acquire)`; step 11's
-    // Reload path swaps it with `std::atomic_store_explicit(release)` so
-    // the "next NEW CONNECTION uses new endpoint" contract holds
-    // release-acquire without a mutex.
     PoolPartition(std::shared_ptr<Dispatcher> dispatcher,
                   const std::string& upstream_host, int upstream_port,
                   const std::string& sni_hostname,
@@ -137,8 +128,7 @@ public:
     // Test-only: the effective SNI string the partition forwards to
     // `TlsConnection` when it originates TLS to the upstream. Empty
     // means "no SNI sent" (TlsConnection skips
-    // `SSL_set_tlsext_host_name` + `SSL_set1_host`). Exposed so the
-    // §5.10 effective-SNI rule — hostname-fallback ON, IP-literal-
+    // `SSL_set_tlsext_host_name` + `SSL_set1_host`). hostname-fallback ON, IP-literal-
     // fallback OFF — can be pinned by unit tests without spinning up
     // a real TLS handshake. Safe to call from any thread because
     // `sni_hostname_` is ctor-initialised and never mutated.
@@ -154,22 +144,6 @@ private:
     UpstreamPoolConfig config_;
     std::shared_ptr<TlsClientContext> tls_ctx_;
 
-    // §5.5 step 9: source of truth for outbound connect.
-    //
-    // Phase-1 scope: the writer is the ctor ONLY. Publication to
-    // `CreateNewConnection`'s acquire-load is guaranteed by the
-    // happens-before edge from object construction to any dispatcher-
-    // thread task that reads `this` — the acquire-load is therefore
-    // redundant for correctness today but is already in place so the
-    // step-11 release-store lands as a one-line addition.
-    //
-    // Phase-2 (step 11 deferred): `UpstreamManager::UpdateResolvedEndpoints`
-    // will be the paired writer, calling `std::atomic_store_explicit`
-    // with release ordering on each partition. The release/acquire
-    // pair is what makes the "next NEW CONNECTION uses new endpoint"
-    // contract absolute. shared_ptr refcount pins the old endpoint
-    // alive for any in-flight connect started with it.
-    //
     // C++17 note: `std::atomic_load_explicit(shared_ptr*)` is the
     // standard-compliant form. C++20 deprecates the free-function
     // overloads in favor of `std::atomic<std::shared_ptr<T>>`; a

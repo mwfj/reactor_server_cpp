@@ -920,7 +920,7 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
         ParseAuthConfig(j["auth"], config.auth);
     }
 
-    // DNS section (§6.1) — DnsConfig defaults are fine if the section is
+    // DNS section — DnsConfig defaults are fine if the section is
     // absent. resolver_max_inflight is restart-only (pool is persistent);
     // the other fields are hot-reloadable via ValidateDnsHotReloadable.
     if (j.contains("dns")) {
@@ -1125,7 +1125,7 @@ void ConfigLoader::ApplyEnvOverrides(ServerConfig& config) {
     val = std::getenv("REACTOR_RATE_LIMIT_STATUS_CODE");
     if (val) config.rate_limit.status_code = EnvToInt(val, "REACTOR_RATE_LIMIT_STATUS_CODE");
 
-    // DNS env overrides (§6.3). resolver_max_inflight is restart-only;
+    // DNS env overrides. resolver_max_inflight is restart-only;
     // no env override for it by design — operators edit the JSON.
     val = std::getenv("REACTOR_DNS_LOOKUP_FAMILY");
     if (val) {
@@ -1481,22 +1481,19 @@ void ConfigLoader::ValidateHotReloadable(
         }
     }
 
-    // DNS hot-reloadable subset (§6.4). Invariant: every reloadable
+    // DNS hot-reloadable subset. Invariant: every reloadable
     // field must be covered by a hard-reject helper here so nothing
     // slips through the warn-downgrade in Validate.
     ValidateDnsHotReloadable(config);
 
-    // Rate-limit hot-reloadable subset (§6.4). Step 6b (v0.49).
+    // Rate-limit hot-reloadable subset.
     // RateLimitManager::Reload applies every edit live, so bad values
     // must be rejected before the reload path commits them.
     ValidateRateLimitHotReloadable(config);
 }
 
 void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
-    // Review-round fix (P1 hostname bind): relax bind_host to accept any
-    // of (a) IPv4 literal, (b) bare IPv6 literal (no brackets — that
-    // lands with step 6's ConfigLoader::Normalize), (c) RFC 1123
-    // hostname. HttpServer's ctor-time `ResolveBindHost` handles the
+    // HttpServer's ctor-time `ResolveBindHost` handles the
     // actual resolution of hostnames to literals before NetServer /
     // Acceptor bind. Legacy numeric-dotted forms ("0127.0.0.1", "1.2.3")
     // are still rejected by the `IsValidHostOrIpLiteral` grammar — the
@@ -1554,7 +1551,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             " (must be >= 0, 0 = disabled)");
     }
 
-    // DNS validation (§5.6 + §6.4). resolver_max_inflight is restart-
+    // DNS validation. resolver_max_inflight is restart-
     // only — validated here so every load path (JSON, env, CLI, in-
     // process tests) trips the same guard. `EnsurePoolStarted` feeds
     // the value directly into `workers_.reserve(...)` and the spawn
@@ -1981,15 +1978,14 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                         "'): tls.min_version must be '1.2' or '1.3', got '" +
                         u.tls.min_version + "'");
                 }
-                // §5.10 effective-SNI matrix: when verify_peer is true and
+                //  effective-SNI matrix: when verify_peer is true and
                 // sni_hostname is empty, we need SOMETHING verifiable
                 // against the cert's CN/SAN. An IP-literal upstream host
                 // cannot be verified against a hostname SAN, so an
                 // explicit `sni_hostname` is still mandatory there. For
                 // hostname upstreams the host itself IS the verifiable
                 // identity — UpstreamManager falls back to
-                // `upstream.host` as the effective SNI (§5.10,
-                // implemented in server/upstream_manager.cc), so leaving
+                // `upstream.host` as the effective SNI, so leaving
                 // sni_hostname empty is safe and ergonomic for the
                 // common "hostname upstream + TLS + verify_peer" shape.
                 if (u.tls.verify_peer && u.tls.sni_hostname.empty()) {

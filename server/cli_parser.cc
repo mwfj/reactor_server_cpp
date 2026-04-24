@@ -195,9 +195,7 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
                 if (optarg[0] == '\0') {
                     throw std::runtime_error("--host requires a non-empty address");
                 }
-                // §5.8: CLI value is normalized inline at parse time —
-                // bracketed IPv6 → bare, RFC 1123 hostname grammar
-                // enforced. Uses the same DnsResolver helpers as
+                // Uses the same DnsResolver helpers as
                 // ConfigLoader::Normalize so CLI + JSON + env agree on
                 // what a valid host looks like. Invalid grammar throws
                 // here; the ValidateHotReloadable / Validate pipeline

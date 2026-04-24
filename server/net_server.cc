@@ -38,7 +38,6 @@ NetServer::NetServer(int timer_interval,
     // handler, leave it alone to avoid breaking their signal handling.
     SigpipeGuardAcquire();
 
-    // Phase 1 — minimal reactor wiring. No listener, no workers running.
     conn_dispatcher_->Init();
     conn_dispatcher_->SetTimeOutTriggerCB(
         std::bind(&NetServer::Timeout, this, std::placeholders::_1));
@@ -107,9 +106,7 @@ void NetServer::Start(){
     }
     start_called_.store(true, std::memory_order_release);
 
-    // Phase-3 workers: spawn the pool threads now (moved from ctor per
-    // §5.4a v0.21 correction so the ctor-only state has zero live
-    // threads). ThreadPool::Start() is idempotent — re-calling it is
+    // ThreadPool::Start() is idempotent — re-calling it is
     // safe if a caller constructed + StartListening'd + Start'd, was
     // Stopped, and then somehow re-entered (not supported, but harmless).
     sock_workers_.Start();

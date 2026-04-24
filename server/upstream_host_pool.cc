@@ -23,7 +23,7 @@ UpstreamHostPool::UpstreamHostPool(
     if (!resolved_endpoint) {
         throw std::invalid_argument(
             "UpstreamHostPool '" + service_name +
-            "': resolved_endpoint must not be null (see §5.5 step 9)");
+            "': resolved_endpoint must not be null");
     }
     // Create one partition per dispatcher
     size_t num_dispatchers = dispatchers.size();
@@ -81,9 +81,7 @@ UpstreamHostPool::UpstreamHostPool(
         partition_config.max_idle_connections = static_cast<int>(per_partition_idle);
 
         // All partitions share the same `resolved_endpoint` shared_ptr
-        // at construction. Step 11's reload swap replaces each partition's
-        // own copy independently — not the host-pool's. By-value capture
-        // here hands each partition an already-refcount-held pointer so
+        // at construction. By-value capture here hands each partition an already-refcount-held pointer so
         // destruction order within the pool doesn't matter.
         partitions_.push_back(std::make_unique<PoolPartition>(
             dispatchers[i], host, port, sni_hostname, resolved_endpoint,

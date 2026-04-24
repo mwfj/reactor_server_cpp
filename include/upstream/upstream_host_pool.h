@@ -10,11 +10,6 @@ class TlsClientContext;
 
 class UpstreamHostPool {
 public:
-    // §5.5 step 9 full: `host` / `port` are the original operator-facing
-    // values used for logging + effective-SNI fallback. `resolved_endpoint`
-    // is the connect-bound endpoint produced by HttpServer::Start's DNS
-    // batch — shared with every partition so a single atomic swap in step
-    // 11 updates the whole host pool's connect target at once.
     UpstreamHostPool(const std::string& service_name,
                      const std::string& host, int port,
                      const std::string& sni_hostname,

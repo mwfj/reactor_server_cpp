@@ -657,14 +657,7 @@ void PoolPartition::ForceCloseActive() {
 
 void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
                                          ErrorCallback error_cb) {
-    // Review-round IPv6-outbound fix. PARSE FIRST so we can both (a) pick
-    // the correct socket family (AF_INET vs AF_INET6) for CreateClientSocket
-    // and (b) fail fast on an invalid upstream literal without leaking an
-    // §5.5 step 9 full: acquire-load the resolved endpoint. Pairs with
-    // step 11's release-store in `UpstreamManager::UpdateResolvedEndpoints`
-    // so subsequent connects after a reload observe the new endpoint.
-    // shared_ptr refcount pins the endpoint alive for the lifetime of
-    // this call even if the reload swaps the slot concurrently.
+
     auto endpoint = std::atomic_load_explicit(
         &resolved_endpoint_, std::memory_order_acquire);
     if (!endpoint) {

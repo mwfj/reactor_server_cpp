@@ -230,31 +230,14 @@ public:
     static thread_local HTTP_CALLBACKS_NAMESPACE::ResourcePusher* current_sync_pusher_;
 
 private:
-    // §11 canonical declaration order — `live_config_` is initialized
-    // first because every other member's ctor reads it from the
+    // `live_config_` is initialized first because every other member's ctor reads it from the
     // initializer list (v0.48 step-3 addition; full member-order
     // rearrangement — moving `net_server_` to last per §11 — is
     // deferred to a focused state-consolidation pass so this step
     // does not also carry destruction-order risk). Current layout
     // preserves the pre-existing manual destruction order enforced
     // by `~HttpServer() → Stop()`.
-    //
     // `live_config_` holds the Normalize+Validate result from ctor time.
-    //
-    // Phase-1 scope: initialized ONCE in the ctor member-init list and
-    // NOT mutated afterwards. `Reload()` applies reload-safe edits
-    // directly to subsystem managers (rate_limit / circuit_breaker) +
-    // the shadow fields (`upstream_configs_`, `rate_limit_config_`,
-    // size-limit atomics, timeout atomics) rather than mutating this
-    // snapshot. Consequently `live_config_` reflects BOOT-time state
-    // and diverges from the runtime subsystem state after any Reload.
-    //
-    // Step 11 (deferred) will add a `reload_mtx_`-guarded write here
-    // paired with the synchronous upstream-endpoint atomic-swap so
-    // `GetLiveConfigSnapshot()` can return a reload-coherent view and
-    // subsystem-manager reads can consolidate on a single field.
-    // Until then, reload-visible state lives in the subsystem managers
-    // and the shadow fields — see §15.1.0 handoff for the full list.
     ServerConfig live_config_;
 
     // Serialises (a) Reload-vs-Reload; (b) `GetLiveConfigSnapshot() const`
@@ -266,24 +249,21 @@ private:
 
     // Per-server DNS resolver. Ctor is cheap (allocates `PoolState` only;
     // lazy worker spawn on first non-literal ResolveAsync). Owned via
-    // unique_ptr so the destruction order is deterministic. Step 8
-    // uses this from `HttpServer::Start()` for the DNS batch; step 11
-    // reuses it for reload re-resolution.
+    // unique_ptr so the destruction order is deterministic.
     std::unique_ptr<NET_DNS_NAMESPACE::DnsResolver> dns_resolver_;
 
     // Lock-free signal channel from Stop() to in-progress Start()/Reload()
-    // (§5.4a / §11 v0.41). Stop() stores true with release ordering as
+    // Stop() stores true with release ordering as
     // the FIRST executable line; Start/Reload load with acquire at each
     // phase boundary. Separate from `reload_mtx_` so a Stop signal can
     // reach a Start blocked in DNS without waiting on the mutex.
     std::atomic<bool> stopping_{false};
 
-    // Populated by Start()'s two-phase commit (§5.4a v0.44 round-43 P2):
+    // Populated by Start()'s two-phase commit:
     // post-Phase-A DNS batch + post-Phase-B StartListening + ephemeral
     // port refresh. Absent when Start() has not run successfully (ctor-
-    // only state, or aborted via Phase-A / Phase-B stopping_ gate). Read
-    // by `/stats.bind` (step 14) and test accessors. Writer is Start()
-    // on the main startup thread; readers run after server_ready_=true,
+    // only state, or aborted via Phase-A / Phase-B stopping_ gate). 
+    // Writer is Start() on the main startup thread; readers run after server_ready_=true,
     // so no additional synchronization is required — `server_ready_`
     // doubles as the publication barrier for these members.
     std::optional<NET_DNS_NAMESPACE::ResolvedEndpoint> bind_resolved_;
