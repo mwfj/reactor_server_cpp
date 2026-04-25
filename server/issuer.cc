@@ -1,5 +1,6 @@
 #include "auth/issuer.h"
 
+#include "auth/introspection_cache.h"
 #include "auth/jwks_cache.h"
 #include "auth/jwks_fetcher.h"
 #include "auth/jws_algorithms.h"
@@ -9,6 +10,8 @@
 #include "dispatcher.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
+
+#include <cstdlib>
 
 namespace AUTH_NAMESPACE {
 
@@ -66,10 +69,11 @@ std::shared_ptr<IssuerSnapshot> BuildMutableSnapshotFromConfig(
     snap->jwks_refresh_timeout_sec = cfg.jwks_refresh_timeout_sec;
     snap->discovery_retry_sec = cfg.discovery_retry_sec;
     snap->introspection = cfg.introspection;
-    // Populate static override if the operator provided one — OIDC
-    // discovery overwrites this when it succeeds.
+    // Populate static overrides if the operator provided them — OIDC
+    // discovery overwrites these when it succeeds.
     if (!cfg.discovery) {
         snap->jwks_uri = cfg.jwks_uri;
+        snap->introspection_endpoint = cfg.introspection.endpoint;
     }
     return snap;
 }
@@ -86,13 +90,16 @@ Issuer::Issuer(const IssuerConfig& config,
       mode_(config.mode),
       upstream_(config.upstream),
       discovery_(config.discovery),
+      client_id_(config.introspection.client_id),
+      client_secret_env_(config.introspection.client_secret_env),
+      shards_(config.introspection.shards),
       snapshot_(BuildMutableSnapshotFromConfig(config)),
       jwks_cache_(std::make_shared<JwksCache>(config.name,
                                                 config.jwks_cache_sec)),
       upstream_http_client_(std::move(http_client)),
       upstream_manager_(upstream_manager),
       dispatchers_(std::move(dispatchers)) {
-    (void)hmac_key;  // Reserved for introspection cache wiring.
+    (void)hmac_key;  // Reserved for introspection cache key derivation.
     // Construct the helper objects now so dependencies are stable; Start
     // kicks off the async work on the caller's chosen dispatcher. Both
     // helpers hold shared ownership of upstream_http_client_.
@@ -117,10 +124,9 @@ Issuer::~Issuer() {
 void Issuer::Start() {
     if (!upstream_manager_ ||
         !upstream_manager_->HasUpstream(upstream_)) {
-        // Fail-closed per §20 risk #2 (validator-vs-manager drift):
-        // if the operator referenced an upstream that is absent at
-        // runtime, mark not-ready and log — the verifier will drop back
-        // to UNDETERMINED for this issuer until the state is repaired.
+        // Fail-closed: an operator-referenced upstream that is absent at
+        // runtime keeps the issuer not-ready. The verifier returns
+        // UNDETERMINED for this issuer until the state is repaired.
         logging::Get()->error(
             "Issuer start failed — upstream '{}' unknown to UpstreamManager "
             "issuer={}", upstream_, name_);
@@ -129,8 +135,54 @@ void Issuer::Start() {
     }
 
     auto snap = LoadSnapshot();
+
+    // Introspection-mode setup: load client_secret from env and build the
+    // per-issuer cache. Fail-closed when the env var is unset/empty —
+    // every request returns UNDETERMINED until the operator fixes the env
+    // and restarts.
+    if (mode_ == "introspection") {
+        const char* secret = nullptr;
+        if (!client_secret_env_.empty()) {
+            secret = std::getenv(client_secret_env_.c_str());
+        }
+        if (!secret || secret[0] == '\0') {
+            logging::Get()->error(
+                "auth_introspection_client_secret_missing issuer={} env={}",
+                name_, client_secret_env_);
+            ready_.store(false, std::memory_order_release);
+            return;
+        }
+        client_secret_.assign(secret);
+
+        try {
+            introspection_cache_ = std::make_unique<IntrospectionCache>(
+                name_,
+                static_cast<size_t>(snap->introspection.max_entries),
+                static_cast<size_t>(snap->introspection.shards));
+        } catch (const std::exception& ex) {
+            logging::Get()->error(
+                "Issuer introspection cache construction failed issuer={} "
+                "err={}", name_, ex.what());
+            ready_.store(false, std::memory_order_release);
+            return;
+        }
+    }
+
     const size_t disp_idx = PickDispatcherForFetch(0);
     const uint64_t gen = generation_->load(std::memory_order_acquire);
+
+    if (mode_ == "introspection" && !discovery_) {
+        if (snap->introspection_endpoint.empty()) {
+            logging::Get()->warn(
+                "Issuer start skipped: introspection mode discovery=false "
+                "with empty endpoint issuer={}", name_);
+            return;
+        }
+        logging::Get()->info(
+            "Issuer start (static introspection endpoint) issuer={}", name_);
+        ready_.store(true, std::memory_order_release);
+        return;
+    }
 
     if (!discovery_ && !snap->jwks_uri.empty()) {
         // Static override path: mark ready and schedule the initial fetch.
@@ -150,7 +202,10 @@ void Issuer::Start() {
 }
 
 void Issuer::Stop() {
-    // Bump the generation so in-flight completions drop as stale.
+    // Bump the generation so in-flight completions drop as stale, and
+    // raise the stopping flag so late callbacks bail before touching
+    // teardown-bound state.
+    stopping_.store(true, std::memory_order_release);
     generation_->fetch_add(1, std::memory_order_release);
     ready_.store(false, std::memory_order_release);
     if (oidc_discovery_) oidc_discovery_->Cancel();
@@ -202,6 +257,38 @@ bool Issuer::ValidateReload(const IssuerConfig& new_config,
             return false;
         }
     }
+
+    // Restart-required introspection fields. Only consulted in introspection
+    // mode; JWT-mode issuers ignore them entirely.
+    if (mode_ == "introspection") {
+        if (!discovery_) {
+            std::shared_ptr<const IssuerSnapshot> snap;
+            {
+                std::lock_guard<std::mutex> lk(snapshot_mtx_);
+                snap = snapshot_;
+            }
+            if (snap && new_config.introspection.endpoint !=
+                            snap->introspection_endpoint) {
+                err_out = "introspection.endpoint changed on static "
+                          "(discovery=false) issuer — restart required";
+                return false;
+            }
+        }
+        if (new_config.introspection.client_id != client_id_) {
+            err_out = "introspection.client_id changed — restart required";
+            return false;
+        }
+        if (new_config.introspection.client_secret_env != client_secret_env_) {
+            err_out = "introspection.client_secret_env changed "
+                      "— restart required";
+            return false;
+        }
+        if (new_config.introspection.shards != shards_) {
+            err_out = "introspection.shards changed — restart required "
+                      "(full rehash not supported live)";
+            return false;
+        }
+    }
     return ValidateReloadableFields(new_config, mode_, err_out);
 }
 
@@ -228,6 +315,9 @@ bool Issuer::ApplyReload(const IssuerConfig& new_config, std::string& err_out) {
     }
     if (jwks_cache_) {
         jwks_cache_->SetTtlSec(new_config.jwks_cache_sec);
+    }
+    if (mode_ == "introspection" && introspection_cache_) {
+        introspection_cache_->ApplyReload(new_config.introspection);
     }
     const uint64_t new_gen =
         generation_->fetch_add(1, std::memory_order_release) + 1;
@@ -356,6 +446,29 @@ void Issuer::KickOffOidcDiscovery(size_t dispatcher_index, uint64_t generation) 
             {
                 std::lock_guard<std::mutex> lk(self->snapshot_mtx_);
                 self->InstallJwksUriLocked(jwks_uri, introspection_endpoint);
+            }
+            // Mode-gated readiness. Each branch decides ready_ from the
+            // field its mode actually consults; the other endpoint is
+            // advisory.
+            if (self->mode_ == "introspection") {
+                if (introspection_endpoint.empty()) {
+                    logging::Get()->warn(
+                        "Issuer not-ready: introspection mode but discovery "
+                        "produced no usable HTTPS introspection_endpoint "
+                        "issuer={}", self->name_);
+                    self->ready_.store(false, std::memory_order_release);
+                    return;
+                }
+                self->ready_.store(true, std::memory_order_release);
+                return;
+            }
+            // JWT mode: jwks_uri is the authoritative readiness gate.
+            // OIDC discovery's own retry loop guarantees we only land
+            // here with a non-empty jwks_uri, but the explicit check is
+            // cheap defense in depth.
+            if (jwks_uri.empty()) {
+                self->ready_.store(false, std::memory_order_release);
+                return;
             }
             self->ready_.store(true, std::memory_order_release);
             self->ScheduleInitialFetch(/*dispatcher_index=*/0);

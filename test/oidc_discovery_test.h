@@ -306,6 +306,44 @@ static bool TestGenerationParameterTypeCheck() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 15: ExtractEndpoints rejects a non-HTTPS introspection_endpoint
+//          while still surfacing a valid jwks_uri. The jwks_uri must still
+//          load (JWT-mode discovery succeeds), but introspection_endpoint
+//          is cleared and `reason` carries the explicit signal so callers
+//          can distinguish missing-from-doc vs rejected-by-scheme.
+// ---------------------------------------------------------------------------
+static bool TestDiscoveryRejectsNonHttpsIntrospectionEndpoint() {
+    const std::string expected_issuer = "https://idp.example.com";
+    const std::string body = R"({
+        "issuer": "https://idp.example.com",
+        "jwks_uri": "https://idp.example.com/jwks.json",
+        "introspection_endpoint": "http://idp.example.com/introspect"
+    })";
+
+    std::string jwks_uri;
+    std::string intro_endpoint;
+    std::string reason;
+    AUTH_NAMESPACE::OidcDiscovery::ExtractEndpointsForTest(
+        body, expected_issuer, jwks_uri, intro_endpoint, reason);
+
+    bool jwks_ok = jwks_uri == "https://idp.example.com/jwks.json";
+    bool intro_cleared = intro_endpoint.empty();
+    bool reason_correct = reason == "introspection_endpoint_not_https";
+    bool ok = jwks_ok && intro_cleared && reason_correct;
+
+    std::string detail;
+    if (!ok) {
+        detail = "jwks_uri='" + jwks_uri +
+                 "' intro_endpoint='" + intro_endpoint +
+                 "' reason='" + reason + "'";
+    }
+    TestFramework::RecordTest(
+        "OidcDiscovery: rejects non-https introspection_endpoint",
+        ok, detail);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // RunAllTests
 // ---------------------------------------------------------------------------
 static void RunAllTests() {
@@ -323,6 +361,7 @@ static void RunAllTests() {
     TestCallbackNotInvokedWithNullClient();
     TestConcurrentConstructionDestruction();
     TestGenerationParameterTypeCheck();
+    TestDiscoveryRejectsNonHttpsIntrospectionEndpoint();
 }
 
 }  // namespace OidcDiscoveryTests

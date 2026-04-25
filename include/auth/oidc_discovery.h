@@ -61,6 +61,17 @@ class OidcDiscovery {
         return ready_ && ready_->load(std::memory_order_acquire);
     }
 
+    // Pure-function endpoint extractor exposed for unit tests. Not used by
+    // production callers — `Start()`'s response handler invokes the same
+    // logic internally. See the implementation comment for the full
+    // contract (issuer-claim gate, https-on-jwks_uri, https-on-introspection).
+    static void ExtractEndpointsForTest(
+        const std::string& body,
+        const std::string& expected_issuer,
+        std::string& out_jwks_uri,
+        std::string& out_introspection_endpoint,
+        std::string& reason);
+
  private:
     // Fwd-declared so header stays pure-data. CycleState owns the recursive
     // retry closure (`run`). OidcDiscovery holds the sole strong reference.

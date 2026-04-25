@@ -46,9 +46,12 @@ ParsedHttpsUri BuildDiscoveryEndpoint(const std::string& issuer_url) {
 
 // Extract (jwks_uri, introspection_endpoint) from the discovery JSON
 // body, gated on the document's `issuer` field matching the configured
-// issuer URL. Returns non-empty jwks_uri on success; introspection_endpoint
-// may legitimately be empty (not all IdPs advertise it). On JSON or
-// schema failure, returns empty jwks_uri and sets `reason`.
+// issuer URL. Returns non-empty jwks_uri on success; out_introspection_endpoint
+// is HTTPS-gated — a non-HTTPS scheme (or any URL where the scheme isn't
+// `https`) is cleared and `reason` is set to "introspection_endpoint_not_https".
+// Both endpoints may legitimately be empty (not every IdP advertises
+// introspection). On JSON or schema failure, returns empty jwks_uri and
+// sets `reason`.
 //
 // `expected_issuer` MUST be the `issuer_url` from the operator's config.
 // Per OIDC Connect Discovery 1.0 §4.3, the discovery response's
@@ -91,7 +94,18 @@ void ExtractEndpoints(const std::string& body,
         out_jwks_uri = jwks_it->get<std::string>();
         auto intro_it = j.find("introspection_endpoint");
         if (intro_it != j.end() && intro_it->is_string()) {
-            out_introspection_endpoint = intro_it->get<std::string>();
+            const auto candidate = intro_it->get<std::string>();
+            // A non-HTTPS introspection_endpoint would leak the IdP
+            // client_secret (RFC 7662 §2.1 sends it as Basic credentials)
+            // AND every bearer token introspected. Clear and surface the
+            // reason; jwks_uri stays valid so JWT-mode discovery still
+            // succeeds when the IdP only mis-advertises introspection.
+            if (HasHttpsScheme(candidate)) {
+                out_introspection_endpoint = candidate;
+            } else {
+                out_introspection_endpoint.clear();
+                reason = "introspection_endpoint_not_https";
+            }
         }
         // Enforce https on jwks_uri to match the TLS-mandatory IdP policy.
         // Case-insensitive scheme per RFC 3986 §3.1 — compliant IdPs may
@@ -117,6 +131,16 @@ void ExtractEndpoints(const std::string& body,
 }
 
 }  // namespace
+
+void OidcDiscovery::ExtractEndpointsForTest(
+        const std::string& body,
+        const std::string& expected_issuer,
+        std::string& out_jwks_uri,
+        std::string& out_introspection_endpoint,
+        std::string& reason) {
+    ExtractEndpoints(body, expected_issuer, out_jwks_uri,
+                      out_introspection_endpoint, reason);
+}
 
 OidcDiscovery::OidcDiscovery(std::string issuer_name,
                               std::string issuer_url,

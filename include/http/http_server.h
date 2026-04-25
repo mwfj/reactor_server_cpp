@@ -79,6 +79,13 @@ public:
     void WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler);
     void Use(HttpRouter::Middleware middleware);
 
+    // Install an async middleware on the router. Mirrors the gating
+    // semantics of Use() / Get() / etc. (rejected post-Start via
+    // RejectIfServerLive). Public surface for tests and embedders that
+    // want to drive the async chain explicitly; the production wiring
+    // installs through MarkServerReady directly.
+    void PrependAsyncMiddleware(HttpRouter::AsyncMiddleware middleware);
+
     // Route registration — asynchronous handlers.
     //
     // The handler receives the request plus a protocol-agnostic completion
@@ -444,7 +451,7 @@ private:
     std::unique_ptr<UpstreamManager> upstream_manager_;
 
     // Circuit breaker — declared AFTER upstream_manager_ so destruction
-    // order is breaker-FIRST, pool-SECOND (design §3.1). On shutdown the
+    // order is breaker-FIRST, pool-SECOND. On shutdown the
     // breaker's slices may still be consulted by in-flight
     // ProxyTransactions until they drain; destroying the breaker first
     // (before the pool) is safe because UpstreamManager's outstanding
