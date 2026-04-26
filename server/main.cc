@@ -150,6 +150,83 @@ MakeHealthHandler(HttpServer* server) {
     };
 }
 
+// Append a JSON-escaped string literal value (without surrounding quotes).
+// Issuer names come from the config file so they may contain arbitrary
+// printable bytes; escape backslash, quote, and control chars for safety.
+static void AppendJsonEscaped(std::string& out, const std::string& s) {
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+}
+
+// Render the optional `,"auth":{...}` JSON fragment. Emits nothing when
+// the snapshot is absent (auth never constructed). Aggregate
+// `introspection.*` counters are always emitted when auth exists; the
+// per-issuer `introspection.cache_entries` field is emitted only for
+// issuers that own a cache (introspection-mode).
+static void AppendAuthSnapshot(
+        std::string& out,
+        const std::optional<AUTH_NAMESPACE::AuthManager::SnapshotView>& snap) {
+    if (!snap) return;
+    // Sized for the longest field block: per-issuer "jwks" object with six
+    // %llu values plus surrounding key text fits in well under 256 bytes.
+    char num[256];
+    out += R"(,"auth":{"introspection":{)";
+    std::snprintf(num, sizeof(num),
+        R"("ok":%llu,"fail":%llu,"cache_hit":%llu,"cache_miss":%llu,)"
+        R"("cache_negative_hit":%llu,"stale_served":%llu)",
+        static_cast<unsigned long long>(snap->introspection_ok),
+        static_cast<unsigned long long>(snap->introspection_fail),
+        static_cast<unsigned long long>(snap->introspection_cache_hit),
+        static_cast<unsigned long long>(snap->introspection_cache_miss),
+        static_cast<unsigned long long>(snap->introspection_cache_negative_hit),
+        static_cast<unsigned long long>(snap->introspection_stale_served));
+    out += num;
+    out += "},\"issuers\":{";
+    bool first = true;
+    for (const auto& [name, view] : snap->issuers) {
+        if (!first) out += ',';
+        first = false;
+        out += '"';
+        AppendJsonEscaped(out, name);
+        out += R"(":{"mode":")";
+        AppendJsonEscaped(out, view.mode);
+        std::snprintf(num, sizeof(num),
+            R"(","ready":%s,"jwks":{"key_count":%zu,"refresh_ok":%llu,)"
+            R"("refresh_fail":%llu,"stale_served":%llu})",
+            view.ready ? "true" : "false",
+            view.jwks_key_count,
+            static_cast<unsigned long long>(view.jwks_refresh_ok),
+            static_cast<unsigned long long>(view.jwks_refresh_fail),
+            static_cast<unsigned long long>(view.jwks_stale_served));
+        out += num;
+        if (view.mode == "introspection") {
+            std::snprintf(num, sizeof(num),
+                R"(,"introspection":{"cache_entries":%zu})",
+                view.introspection_cache_entries);
+            out += num;
+        }
+        out += '}';
+    }
+    out += "}}";
+}
+
 // ── Stats endpoint handler ──────────────────────────────────────
 static std::function<void(const HttpRequest&, HttpResponse&)>
 MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
@@ -175,7 +252,7 @@ MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
             R"("requests":{"total":%lld,"active":%lld},)"
             R"("config":{"bind_host":"%s","bind_port":%d,"worker_threads":%d,)"
             R"("max_connections":%d,"idle_timeout_sec":%d,"request_timeout_sec":%d,)"
-            R"("tls_enabled":%s,"http2_enabled":%s}})",
+            R"("tls_enabled":%s,"http2_enabled":%s})",
             static_cast<long long>(stats.uptime_seconds),
             static_cast<long long>(stats.active_connections),
             static_cast<long long>(stats.active_http1_connections),
@@ -194,7 +271,10 @@ MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
             res.Status(HttpStatus::INTERNAL_SERVER_ERROR).Json(R"({"error":"stats buffer overflow"})");
             return;
         }
-        res.Status(HttpStatus::OK).Json(buf);
+        std::string body(buf);
+        AppendAuthSnapshot(body, server->GetAuthSnapshot());
+        body += '}';
+        res.Status(HttpStatus::OK).Json(body);
     };
 }
 

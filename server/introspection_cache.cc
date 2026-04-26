@@ -125,7 +125,8 @@ IntrospectionCache::LookupResult IntrospectionCache::Lookup(
     }
     Entry* e = it->second.get();
     if (now >= e->ttl_expiry) {
-        // Expired — leave the entry in place; LRU eviction will reap it.
+        // Expired — leave in place; LookupStale serves it within grace, and
+        // LRU eviction reaps it when the shard fills.
         miss_.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
@@ -157,7 +158,7 @@ IntrospectionCache::LookupResult IntrospectionCache::LookupStale(
     }
     const auto grace = std::chrono::seconds(
         stale_grace_sec_.load(std::memory_order_relaxed));
-    if (now <= e->ttl_expiry || now > e->ttl_expiry + grace) return {};
+    if (now < e->ttl_expiry || now > e->ttl_expiry + grace) return {};
 
     LookupResult r;
     r.state = LookupState::Stale;

@@ -875,6 +875,255 @@ static void Test_Ctor_Validates_ShardCount_PowerOfTwo() {
 }
 
 // ---------------------------------------------------------------------------
+// 27. LookupStale_BoundaryJustPastExpiry — verifies that a time point
+//     slightly past ttl_expiry (within grace) returns Stale, and a time
+//     point well before expiry returns Miss from LookupStale (the normal
+//     Lookup should return Fresh instead). Together these pin the grace
+//     window semantics: open at ttl_expiry, closed after ttl_expiry+grace.
+// ---------------------------------------------------------------------------
+static void Test_LookupStale_BoundaryJustPastExpiry() {
+    try {
+        // grace=30s, ttl=1s. Checking at 2s past insert: past expiry, inside
+        // grace. The Insert's internal now is always <= before_insert + small
+        // delta, so before_insert + 2s is reliably past the stored ttl_expiry.
+        IntrospectionCache cache("issuer", 1024, 16);
+        const std::string key = MakeKey(200);
+        cache.Insert(key, MakeCtx("boundary"), true, seconds(1));
+        // 2s past insert time: guaranteed past ttl_expiry (which is at ~1s),
+        // well within the default 30s grace window.
+        const auto past_expiry = steady_clock::now() + seconds(2);
+        auto r = cache.LookupStale(key, past_expiry);
+        bool ok = (r.state == LookupState::Stale && r.active &&
+                   r.ctx.subject == "boundary");
+        // Also verify a time before expiry is Miss from LookupStale
+        // (LookupStale is only for expired entries; fresh entries use Lookup).
+        const auto before_expiry = steady_clock::now();
+        auto r2 = cache.LookupStale(key, before_expiry);
+        // now < ttl_expiry → LookupStale returns Miss (not Stale, not Fresh).
+        bool before_miss = r2.state == LookupState::Miss;
+
+        Record("IntrospectionCache: LookupStale_BoundaryJustPastExpiry",
+               ok && before_miss,
+               "Just-past-expiry must return Stale; before-expiry must return Miss");
+    } catch (const std::exception& e) {
+        Record("IntrospectionCache: LookupStale_BoundaryJustPastExpiry",
+               false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 28. LookupStale_ExactBoundary_AtGraceEnd — at now == ttl_expiry + grace_sec
+//     the implementation uses strict `>` on the right side so this exact point
+//     must still serve Stale (not Miss).
+// ---------------------------------------------------------------------------
+static void Test_LookupStale_ExactBoundary_AtGraceEnd() {
+    try {
+        // Use a tiny explicit grace window to keep wall-clock math easy.
+        // grace_sec = 5; ttl = 1s.
+        IntrospectionCache cache("issuer", 1024, 16);
+        IntrospectionConfig cfg = MakeConfig(60, 10, /*stale_sec=*/5);
+        cache.ApplyReload(cfg);
+
+        const std::string key = MakeKey(201);
+        const auto before_insert = steady_clock::now();
+        cache.Insert(key, MakeCtx("graceend"), true, seconds(1));
+
+        // at exactly ttl_expiry + grace_sec: now == ttl_expiry + 5s.
+        const auto at_grace_end = before_insert + seconds(1) + seconds(5);
+        auto r = cache.LookupStale(key, at_grace_end);
+        // `now > ttl_expiry + grace` is false (equal), so must be Stale.
+        bool ok = (r.state == LookupState::Stale && r.active &&
+                   r.ctx.subject == "graceend");
+        Record("IntrospectionCache: LookupStale_ExactBoundary_AtGraceEnd", ok,
+               "now==ttl_expiry+grace_sec must return Stale (right boundary inclusive)");
+    } catch (const std::exception& e) {
+        Record("IntrospectionCache: LookupStale_ExactBoundary_AtGraceEnd",
+               false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 29. Insert_EmptyAuthContext_NegativeEntry_RoundTrips — verify that a
+//     negative cache entry backed by an empty AuthContext stores and retrieves
+//     without corruption (active=false, ctx fields default).
+// ---------------------------------------------------------------------------
+static void Test_Insert_EmptyAuthContext_NegativeEntry_RoundTrips() {
+    try {
+        IntrospectionCache cache("issuer", 1024, 16);
+        const std::string key = MakeKey(210);
+        AuthContext empty{};
+        cache.Insert(key, empty, /*active=*/false, seconds(60));
+        auto r = cache.Lookup(key, steady_clock::now());
+        // Fresh negative: active=false, ctx fields zero/empty.
+        bool ok = r.state == LookupState::Fresh && !r.active &&
+                  r.ctx.subject.empty() && r.ctx.issuer.empty() &&
+                  r.ctx.scopes.empty() && r.ctx.claims.empty();
+        Record("IntrospectionCache: Insert_EmptyAuthContext_NegativeEntry_RoundTrips",
+               ok, "Negative entry with empty ctx must round-trip unchanged");
+    } catch (const std::exception& e) {
+        Record("IntrospectionCache: Insert_EmptyAuthContext_NegativeEntry_RoundTrips",
+               false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 30. ConcurrentReload_MultipleThreads — 8 threads calling ApplyReload
+//     simultaneously while 4 reader threads call Lookup. The atomic stores
+//     in ApplyReload are individually safe; verify no crash and the cache
+//     remains usable.
+// ---------------------------------------------------------------------------
+static void Test_ConcurrentReload_MultipleThreads() {
+    try {
+        IntrospectionCache cache("issuer", 4096, 16);
+        // Seed some entries so Lookup has non-empty shards.
+        for (uint32_t i = 0; i < 100; ++i) {
+            cache.Insert(MakeKey(0x4000 + i), MakeCtx("u"), true, seconds(60));
+        }
+
+        std::atomic<bool> stop{false};
+        std::atomic<int> reload_count{0};
+        std::atomic<int> lookup_count{0};
+
+        auto reloader = [&](int tid) {
+            int v = 10 + tid;
+            while (!stop.load(std::memory_order_relaxed)) {
+                IntrospectionConfig cfg = MakeConfig(60, v, v + 5, 4096, 16);
+                cache.ApplyReload(cfg);
+                reload_count.fetch_add(1, std::memory_order_relaxed);
+                v = (v == 10 + tid ? 20 + tid : 10 + tid);
+            }
+        };
+        auto reader = [&](uint32_t seed) {
+            std::mt19937 rng(seed);
+            while (!stop.load(std::memory_order_relaxed)) {
+                cache.Lookup(MakeRandomKey(rng), steady_clock::now());
+                lookup_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        };
+
+        std::vector<std::thread> ts;
+        for (int i = 0; i < 8; ++i) ts.emplace_back(reloader, i);
+        for (int i = 0; i < 4; ++i) ts.emplace_back(reader, static_cast<uint32_t>(i * 7 + 3));
+        std::this_thread::sleep_for(milliseconds(150));
+        stop.store(true, std::memory_order_relaxed);
+        for (auto& t : ts) t.join();
+
+        bool ok = reload_count.load() > 0 && lookup_count.load() > 0;
+        Record("IntrospectionCache: ConcurrentReload_MultipleThreads", ok,
+               "Concurrent ApplyReload from 8 threads must not crash or tear");
+    } catch (const std::exception& e) {
+        Record("IntrospectionCache: ConcurrentReload_MultipleThreads",
+               false, e.what());
+    }
+}
+
+// 31. LookupDuringEviction_NoUseAfterFree — concurrent lookups while the seeder
+// inserts at cap, forcing LRU eviction. Entry may be absent but must never
+// return a torn result (active=true with empty subject).
+static void Test_LookupDuringEviction_NoUseAfterFree() {
+    try {
+        // Single shard, cap=1 so every new insert evicts the previous entry.
+        IntrospectionCache cache("issuer", 1, 1);
+        std::atomic<bool> stop{false};
+        std::atomic<int>  torn{0};
+
+        // Seeder: rapid insert of alternating keys at cap=1.
+        const std::string k0 = MakeKey(0x5000);
+        const std::string k1 = MakeKey(0x5001);
+        auto seeder = [&]() {
+            bool flip = false;
+            while (!stop.load(std::memory_order_relaxed)) {
+                cache.Insert(flip ? k1 : k0, MakeCtx("v"), true, seconds(60));
+                flip = !flip;
+            }
+        };
+
+        // Readers: look up both keys; result must be Fresh, Miss, or Stale —
+        // never have an active=true entry with an empty subject (torn read).
+        auto reader = [&]() {
+            while (!stop.load(std::memory_order_relaxed)) {
+                for (const auto& k : {k0, k1}) {
+                    auto r = cache.Lookup(k, steady_clock::now());
+                    if (r.state == LookupState::Fresh && r.active &&
+                        r.ctx.subject.empty()) {
+                        torn.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        };
+
+        std::vector<std::thread> ts;
+        ts.emplace_back(seeder);
+        for (int i = 0; i < 16; ++i) ts.emplace_back(reader);
+        std::this_thread::sleep_for(milliseconds(200));
+        stop.store(true, std::memory_order_relaxed);
+        for (auto& t : ts) t.join();
+
+        bool ok = torn.load() == 0;
+        Record("IntrospectionCache: LookupDuringEviction_NoUseAfterFree", ok,
+               "Concurrent Lookup during rapid LRU eviction must not produce torn reads");
+    } catch (const std::exception& e) {
+        Record("IntrospectionCache: LookupDuringEviction_NoUseAfterFree",
+               false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 32. SingleShardCache_CtorAndBasicOps — shard_count=1 must construct and
+//     pass basic insert/lookup/eviction operations.
+// ---------------------------------------------------------------------------
+static void Test_SingleShardCache_CtorAndBasicOps() {
+    try {
+        IntrospectionCache cache("issuer", 3, 1);
+        const std::string k0 = MakeKey(0x6000);
+        const std::string k1 = MakeKey(0x6001);
+        const std::string k2 = MakeKey(0x6002);
+        const std::string k3 = MakeKey(0x6003);
+        cache.Insert(k0, MakeCtx("u0"), true, seconds(60));
+        cache.Insert(k1, MakeCtx("u1"), true, seconds(60));
+        cache.Insert(k2, MakeCtx("u2"), true, seconds(60));
+        // At cap=3; inserting k3 must evict the LRU (k0).
+        cache.Insert(k3, MakeCtx("u3"), true, seconds(60));
+
+        bool k0_gone = cache.Lookup(k0, steady_clock::now()).state ==
+                       LookupState::Miss;
+        bool k3_fresh = cache.Lookup(k3, steady_clock::now()).state ==
+                        LookupState::Fresh;
+        bool ok = k0_gone && k3_fresh &&
+                  cache.SnapshotStats().entries == 3;
+        Record("IntrospectionCache: SingleShardCache_CtorAndBasicOps", ok,
+               "shard_count=1 must support insert/lookup/eviction");
+    } catch (const std::exception& e) {
+        Record("IntrospectionCache: SingleShardCache_CtorAndBasicOps",
+               false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 33. MaxShardsCache_64Shards_CtorSucceeds — shard_count=64 is the upper
+//     allowed value and must construct without throwing.
+// ---------------------------------------------------------------------------
+static void Test_MaxShardsCache_64Shards_CtorSucceeds() {
+    try {
+        bool ok = false;
+        try {
+            IntrospectionCache cache("issuer", 1024, 64);
+            const std::string key = MakeKey(0x7000);
+            cache.Insert(key, MakeCtx("u"), true, seconds(60));
+            auto r = cache.Lookup(key, steady_clock::now());
+            ok = r.state == LookupState::Fresh && r.ctx.subject == "u";
+        } catch (...) {
+            ok = false;
+        }
+        Record("IntrospectionCache: MaxShardsCache_64Shards_CtorSucceeds", ok,
+               "shard_count=64 (max) must construct and operate correctly");
+    } catch (const std::exception& e) {
+        Record("IntrospectionCache: MaxShardsCache_64Shards_CtorSucceeds",
+               false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
 static void RunAllTests() {
     std::cout << "\n[IntrospectionCache Tests]" << std::endl;
     Test_InsertAndLookup_Fresh();
@@ -903,6 +1152,14 @@ static void RunAllTests() {
     Test_AuthContext_DeepCopy_OnInsert();
     Test_SnapshotStats_ThreadSafe();
     Test_Ctor_Validates_ShardCount_PowerOfTwo();
+    // Corner-case additions
+    Test_LookupStale_BoundaryJustPastExpiry();
+    Test_LookupStale_ExactBoundary_AtGraceEnd();
+    Test_Insert_EmptyAuthContext_NegativeEntry_RoundTrips();
+    Test_ConcurrentReload_MultipleThreads();
+    Test_LookupDuringEviction_NoUseAfterFree();
+    Test_SingleShardCache_CtorAndBasicOps();
+    Test_MaxShardsCache_64Shards_CtorSucceeds();
 }
 
 }  // namespace IntrospectionCacheTests

@@ -30,14 +30,14 @@ struct IssuerSnapshot {
     int jwks_cache_sec = 300;
     int jwks_refresh_timeout_sec = 5;
     int discovery_retry_sec = 30;
-    // Phase 3 introspection settings stored here so the snapshot is
-    // complete; JWT-mode Phase 2 ignores them.
+    // Introspection settings carried on the snapshot for reload-safe access;
+    // ignored when mode != "introspection".
     IntrospectionConfig introspection;
     // Populated by OIDC discovery once it succeeds, OR copied from the
     // static `jwks_uri` override when discovery=false. Consumed by
     // JwksFetcher to locate the JWKS endpoint path.
     std::string jwks_uri;
-    // Populated by OIDC discovery; used by Phase 3 introspection only.
+    // Populated by OIDC discovery; consumed by introspection mode only.
     std::string introspection_endpoint;
 };
 
@@ -54,6 +54,9 @@ struct IssuerSnapshotView {
     uint64_t jwks_stale_served = 0;
     size_t jwks_key_count = 0;
     std::chrono::system_clock::time_point last_jwks_refresh{};
+    // Approximate per-shard sum from IntrospectionCache. Zero for JWT-mode
+    // issuers (no cache constructed).
+    size_t introspection_cache_entries = 0;
 };
 
 // ---------------------------------------------------------------------------

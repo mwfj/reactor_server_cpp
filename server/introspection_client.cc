@@ -3,13 +3,12 @@
 #include "auth/auth_claims.h"
 #include "auth/auth_url_util.h"
 #include "auth/issuer.h"
+#include "base64.h"
 #include "cli/version.h"
+#include "log/log_utils.h"
 #include "log/logger.h"
 
 #include <nlohmann/json.hpp>
-#include <openssl/bio.h>
-#include <openssl/buffer.h>
-#include <openssl/evp.h>
 
 #include <cstdio>
 #include <exception>
@@ -23,39 +22,6 @@ namespace {
 // typically <2 KB; anything larger is almost certainly a misconfigured IdP
 // or a pathological response. Surfaces as `body_too_large` on overflow.
 constexpr size_t kIntrospectionMaxBodyBytes = 64 * 1024;
-
-// OpenSSL base64 encoder (no newline) for the Authorization: Basic header.
-// Returns "" on any allocation / encode failure; the caller treats an empty
-// header as a configuration fault and routes to UNDETERMINED.
-std::string Base64EncodeNoNewline(const std::string& in) {
-    if (in.empty()) return std::string();
-    BIO* b64 = BIO_new(BIO_f_base64());
-    if (!b64) return std::string();
-    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-    BIO* mem = BIO_new(BIO_s_mem());
-    if (!mem) {
-        BIO_free(b64);
-        return std::string();
-    }
-    BIO* chain = BIO_push(b64, mem);
-    int wrote = BIO_write(chain, in.data(), static_cast<int>(in.size()));
-    if (wrote < 0 || static_cast<size_t>(wrote) != in.size()) {
-        BIO_free_all(chain);
-        return std::string();
-    }
-    if (BIO_flush(chain) <= 0) {
-        BIO_free_all(chain);
-        return std::string();
-    }
-    BUF_MEM* bptr = nullptr;
-    BIO_get_mem_ptr(chain, &bptr);
-    std::string out;
-    if (bptr && bptr->length > 0) {
-        out.assign(bptr->data, bptr->length);
-    }
-    BIO_free_all(chain);
-    return out;
-}
 
 // Read int64 from json["exp"] without throwing. Returns 0 on absent or
 // non-integer / non-convertible field.
@@ -160,7 +126,7 @@ std::string IntrospectionClient::BuildAuthorizationHeaderBasic(
     credentials.append(client_id);
     credentials.push_back(':');
     credentials.append(client_secret);
-    std::string b64 = Base64EncodeNoNewline(credentials);
+    std::string b64 = base64_util::EncodeNoNewline(credentials);
     if (b64.empty()) {
         return std::string();
     }
@@ -346,6 +312,14 @@ IntrospectionClient::Result IntrospectionClient::TranslateError(
             logging::Get()->warn(
                 "introspection upstream_disconnect issuer={}", issuer_name);
             result.vr = VerifyResult::Undetermined("introspection_upstream_disconnect");
+            return result;
+        }
+        if (err == "dispatcher_out_of_range") {
+            logging::Get()->error(
+                "introspection_dispatcher_out_of_range issuer={} — "
+                "wiring fault: dispatcher index outside configured count",
+                logging::SanitizeLogValue(issuer_name));
+            result.vr = VerifyResult::Undetermined("introspection_dispatcher_out_of_range");
             return result;
         }
         if (err == "no_upstream_manager" || err == "pool_unknown") {
@@ -538,16 +512,19 @@ void IntrospectionClient::Verify(
             if (live_issuer->generation() != generation) {
                 Result r;
                 r.vr = VerifyResult::Undetermined("reload_in_flight");
+                // info — outer auth_manager callback emits the canonical warn for these.
                 logging::Get()->info(
                     "introspection drop reload_in_flight issuer={} captured_gen={} live_gen={}",
                     issuer_name, generation, live_issuer->generation());
                 deliver_inner(std::move(r));
                 return;
             }
-            // Issuer::stopping() is not currently exposed; the generation
-            // bump on Stop() is the canonical signal and is already
-            // checked above. Once Issuer adds an explicit stopping()
-            // accessor, gate on it here as a defence-in-depth check.
+            if (live_issuer->stopping()) {
+                Result r;
+                r.vr = VerifyResult::Undetermined("issuer_stopping");
+                deliver_inner(std::move(r));
+                return;
+            }
 
             if (resp.error.empty() && resp.status_code == 200) {
                 Result r = ParseResponseSafe(resp, policy_copy, claim_keys_copy,

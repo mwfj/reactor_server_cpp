@@ -1387,8 +1387,9 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             }
 
             // Sync fast-path: DENY → reject (default 403); PASS → fall
-            // through to ContinueWsUpgradeAfterAuth.
-            if (state->sync_result() ==
+            // through to ContinueWsUpgradeAfterAuth. `state` is null on
+            // empty-chain implicit PASS.
+            if (state && state->sync_result() ==
                     HttpRouter::AsyncMiddlewareResult::DENY) {
                 if (mw_response.GetStatusCode() == HttpStatus::OK &&
                     mw_response.GetBody().empty()) {

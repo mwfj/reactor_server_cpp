@@ -34,10 +34,14 @@
 #include "auth/auth_config.h"
 #include "auth/auth_context.h"
 #include "auth/auth_result.h"
+#include "auth/introspection_cache.h"
+#include "auth/issuer.h"
 #include "http/http_request.h"
 #include "http/http_response.h"
+#include "http/http_router.h"
 #include "log/logger.h"
 
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -606,6 +610,218 @@ static bool TestForwardConfigConcurrentReload() {
 }
 
 // ---------------------------------------------------------------------------
+// Async-middleware helpers (introspection-mode dispatch)
+// ---------------------------------------------------------------------------
+
+// Build an introspection-mode IssuerConfig that Issuer::Start can mark
+// ready without any live network access (discovery=false + static endpoint).
+static AUTH_NAMESPACE::IssuerConfig MakeIntrospectionIssuerForAsync(
+        const std::string& name = "intro-test",
+        const std::string& url  = "https://idp.example.com",
+        const std::string& endpoint =
+            "https://idp.example.com/oauth2/introspect",
+        const std::string& secret_env = "GW_INTRO_TEST_SECRET") {
+    AUTH_NAMESPACE::IssuerConfig ic;
+    ic.name        = name;
+    ic.issuer_url  = url;
+    ic.discovery   = false;
+    ic.upstream    = "";
+    ic.mode        = "introspection";
+    ic.algorithms  = {"RS256"};
+    ic.leeway_sec  = 30;
+    ic.jwks_cache_sec = 300;
+    ic.introspection.endpoint = endpoint;
+    ic.introspection.client_id = "gw-test-client";
+    ic.introspection.client_secret_env = secret_env;
+    ic.introspection.shards = 16;
+    ic.introspection.timeout_sec = 3;
+    ic.introspection.cache_sec = 60;
+    ic.introspection.negative_cache_sec = 10;
+    ic.introspection.stale_grace_sec = 30;
+    ic.introspection.max_entries = 1024;
+    return ic;
+}
+
+// Set the env var so Issuer::Start can resolve the client secret. RAII
+// guard restores the prior value on destruction so concurrent tests don't
+// observe each other's mutations.
+struct ScopedEnv {
+    std::string name;
+    std::optional<std::string> prior;
+    ScopedEnv(const std::string& n, const std::string& v) : name(n) {
+        if (const char* p = std::getenv(n.c_str())) prior.emplace(p);
+        ::setenv(n.c_str(), v.c_str(), 1);
+    }
+    ~ScopedEnv() {
+        if (prior) ::setenv(name.c_str(), prior->c_str(), 1);
+        else ::unsetenv(name.c_str());
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Test 21: Introspection-mode pass-through — sync InvokeMiddleware passes
+// the request through (returns true) without stamping auth, and the async
+// adapter handles the issuer-not-ready branch (no UpstreamManager wired in
+// the unit-test harness, so the introspection cache is never constructed
+// and Issuer::IsReady stays false). Full cache-hit / negative-hit fast-path
+// coverage lives in the integration suite where a mock IdP + UpstreamManager
+// are available.
+// ---------------------------------------------------------------------------
+static bool TestIntrospectionMode_PassesThroughSyncToAsync() {
+    ScopedEnv env_guard("GW_INTRO_TEST_SECRET",
+                         "intro-test-secret-value-for-this-test");
+
+    AUTH_NAMESPACE::AuthConfig cfg = MakeEmptyConfig(/*enabled=*/true);
+    cfg.hmac_cache_key_env = "";  // Force generated random key.
+    auto ic = MakeIntrospectionIssuerForAsync();
+    cfg.issuers[ic.name] = ic;
+
+    auto mgr = MakeManager(cfg);
+    AUTH_NAMESPACE::AuthPolicy p_deny = MakePolicy(
+        "intro-policy-deny", {"/api/intro/"}, {ic.name}, /*enabled=*/true,
+        /*on_undetermined=*/"deny");
+    AUTH_NAMESPACE::AuthPolicy p_allow = MakePolicy(
+        "intro-policy-allow", {"/api/allow/"}, {ic.name}, /*enabled=*/true,
+        /*on_undetermined=*/"allow");
+    mgr->RegisterPolicy(p_deny.applies_to, p_deny);
+    mgr->RegisterPolicy(p_allow.applies_to, p_allow);
+    mgr->Start();
+
+    auto* issuer = mgr->GetIssuer(ic.name);
+    if (!issuer) {
+        TestFramework::RecordTest(
+            "AuthManager: introspection-mode issuer constructed",
+            false, "GetIssuer returned nullptr");
+        return false;
+    }
+
+    bool sub_pass = true;
+
+    // Sub-test A: sync InvokeMiddleware on an introspection-mode policy
+    // returns true (pass-through to the async chain) WITHOUT stamping
+    // req.auth. The mode check fires before the JWT verify branch.
+    {
+        HttpRequest req = MakeRequest("/api/intro/items", "any.opaque.token");
+        HttpResponse resp;
+        bool cont = mgr->InvokeMiddleware(req, resp);
+        if (!cont || req.auth.has_value()) {
+            sub_pass = false;
+        }
+    }
+
+    // Sub-test B: async path with on_undetermined=deny on a not-ready
+    // issuer must produce a 503 + DENY (synchronously — the not-ready
+    // branch never reaches the deferred POST).
+    {
+        HttpRequest req = MakeRequest("/api/intro/items", "tok.B");
+        HttpResponse resp;
+        auto state = std::make_shared<HttpRouter::AsyncPendingState>();
+        mgr->InvokeAsyncMiddleware(req, resp, state);
+        bool synced = state->completed_sync();
+        bool is_deny = state->sync_result()
+            == HttpRouter::AsyncMiddlewareResult::DENY;
+        bool service_unavailable = resp.GetStatusCode() == 503;
+        if (!synced || !is_deny || !service_unavailable) {
+            sub_pass = false;
+        }
+    }
+
+    // Sub-test C: async path with on_undetermined=allow on a not-ready
+    // issuer must stamp an advisory AuthContext and PASS synchronously.
+    {
+        HttpRequest req = MakeRequest("/api/allow/items", "tok.C");
+        HttpResponse resp;
+        auto state = std::make_shared<HttpRouter::AsyncPendingState>();
+        mgr->InvokeAsyncMiddleware(req, resp, state);
+        bool synced = state->completed_sync();
+        bool is_pass = state->sync_result()
+            == HttpRouter::AsyncMiddlewareResult::PASS;
+        bool advisory = req.auth.has_value() && req.auth->undetermined
+            && req.auth->policy_name == "intro-policy-allow"
+            && req.auth->issuer == ic.name;
+        if (!synced || !is_pass || !advisory) {
+            sub_pass = false;
+        }
+    }
+
+    // Sub-test D: missing bearer on the async path produces a 401 DENY.
+    {
+        HttpRequest req = MakeRequest("/api/intro/items", "");
+        HttpResponse resp;
+        auto state = std::make_shared<HttpRouter::AsyncPendingState>();
+        mgr->InvokeAsyncMiddleware(req, resp, state);
+        bool synced = state->completed_sync();
+        bool is_deny = state->sync_result()
+            == HttpRouter::AsyncMiddlewareResult::DENY;
+        bool unauthorized = resp.GetStatusCode() == 401;
+        if (!synced || !is_deny || !unauthorized) {
+            sub_pass = false;
+        }
+    }
+
+    TestFramework::RecordTest(
+        "AuthManager: introspection-mode passes through sync-to-async",
+        sub_pass, "");
+    return sub_pass;
+}
+
+// ---------------------------------------------------------------------------
+// Test 22: Master-disabled — InvokeAsyncMiddleware completes synchronously
+// with PASS regardless of policy match.
+// ---------------------------------------------------------------------------
+static bool TestMasterDisabled_AsyncMiddleware_SyncPasses() {
+    AUTH_NAMESPACE::AuthConfig cfg = MakeEmptyConfig(/*enabled=*/false);
+    auto mgr = MakeManager(cfg);
+    AUTH_NAMESPACE::AuthPolicy p = MakePolicy("p", {"/api/"});
+    mgr->RegisterPolicy(p.applies_to, p);
+    mgr->Start();
+
+    HttpRequest req = MakeRequest("/api/anything", "any.token");
+    HttpResponse resp;
+    auto state = std::make_shared<HttpRouter::AsyncPendingState>();
+    mgr->InvokeAsyncMiddleware(req, resp, state);
+
+    bool synced = state->completed_sync();
+    bool is_pass = state->sync_result()
+        == HttpRouter::AsyncMiddlewareResult::PASS;
+    bool ok = synced && is_pass;
+    TestFramework::RecordTest(
+        "AuthManager: master-disabled async middleware sync PASS",
+        ok,
+        ok ? "" : "expected sync PASS, synced=" + std::to_string(synced) +
+                  " is_pass=" + std::to_string(is_pass));
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 23: No-policy-match — InvokeAsyncMiddleware completes synchronously
+// with PASS when the request path doesn't match any registered policy.
+// ---------------------------------------------------------------------------
+static bool TestNoPolicyMatch_AsyncMiddleware_SyncPasses() {
+    AUTH_NAMESPACE::AuthConfig cfg = MakeEmptyConfig(/*enabled=*/true);
+    auto mgr = MakeManager(cfg);
+    AUTH_NAMESPACE::AuthPolicy p = MakePolicy("p", {"/protected/"});
+    mgr->RegisterPolicy(p.applies_to, p);
+    mgr->Start();
+
+    HttpRequest req = MakeRequest("/public/health", "");
+    HttpResponse resp;
+    auto state = std::make_shared<HttpRouter::AsyncPendingState>();
+    mgr->InvokeAsyncMiddleware(req, resp, state);
+
+    bool synced = state->completed_sync();
+    bool is_pass = state->sync_result()
+        == HttpRouter::AsyncMiddlewareResult::PASS;
+    bool no_auth = !req.auth.has_value();
+    bool ok = synced && is_pass && no_auth;
+    TestFramework::RecordTest(
+        "AuthManager: no-policy-match async middleware sync PASS",
+        ok,
+        ok ? "" : "expected sync PASS without auth stamp");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // RunAllTests
 // ---------------------------------------------------------------------------
 static void RunAllTests() {
@@ -629,6 +845,9 @@ static void RunAllTests() {
     TestRebuildPolicyList();
     TestLongestPrefixWins();
     TestForwardConfigConcurrentReload();
+    TestIntrospectionMode_PassesThroughSyncToAsync();
+    TestMasterDisabled_AsyncMiddleware_SyncPasses();
+    TestNoPolicyMatch_AsyncMiddleware_SyncPasses();
 }
 
 }  // namespace AuthManagerTests

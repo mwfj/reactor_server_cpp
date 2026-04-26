@@ -22,17 +22,18 @@ HttpRouter::Middleware MakeMiddleware(AuthManager* mgr) {
     };
 }
 
-HttpRouter::AsyncMiddleware MakeAsyncMiddleware(AuthManager* /*mgr*/) {
-    // No-op pass-through: always completes synchronously with PASS. The
-    // shared_ptr<AsyncPendingState> argument is constructed in
-    // HttpRouter::RunAsyncMiddleware before the call, so it is never
-    // null on entry. Setting sync_result=PASS + MarkCompletedSync makes
-    // the callsite's uniform fast-path read fall through to
-    // DispatchHandler unchanged.
-    return [](const HttpRequest&, HttpResponse&,
-              std::shared_ptr<HttpRouter::AsyncPendingState> state) {
-        state->SetSyncResult(HttpRouter::AsyncMiddlewareResult::PASS);
-        state->MarkCompletedSync();
+HttpRouter::AsyncMiddleware MakeAsyncMiddleware(AuthManager* mgr) {
+    if (!mgr) {
+        // No manager — every request passes through synchronously.
+        return [](const HttpRequest&, HttpResponse&,
+                  std::shared_ptr<HttpRouter::AsyncPendingState> state) {
+            state->SetSyncResult(HttpRouter::AsyncMiddlewareResult::PASS);
+            state->MarkCompletedSync();
+        };
+    }
+    return [mgr](const HttpRequest& req, HttpResponse& resp,
+                  std::shared_ptr<HttpRouter::AsyncPendingState> state) {
+        mgr->InvokeAsyncMiddleware(req, resp, std::move(state));
     };
 }
 

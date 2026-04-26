@@ -39,6 +39,8 @@
 #include "dual_stack_test.h"
 #include "router_async_middleware_test.h"
 #include "introspection_cache_test.h"
+#include "introspection_client_test.h"
+#include "auth_introspection_integration_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -182,6 +184,12 @@ void RunAllTest(){
     // Run introspection cache unit tests
     IntrospectionCacheTests::RunAllTests();
 
+    // Run introspection client static-helper + AsyncPendingState unit tests
+    IntrospectionClientTests::RunAllTests();
+
+    // Run introspection integration tests (async middleware + mock IdP)
+    AuthIntrospectionIntegrationTests::RunAllTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -218,6 +226,8 @@ void PrintUsage(const char* program_name) {
     std::cout << "  auth_race,   -Q    Run auth race condition tests only" << std::endl;
     std::cout << "  router_async,-N    Run router async-middleware tests (P3-0)" << std::endl;
     std::cout << "  introspection_cache, -Y  Run introspection cache unit tests only" << std::endl;
+    std::cout << "  intro_client, -y   Run introspection client static-helper + AsyncPendingState tests" << std::endl;
+    std::cout << "  auth_intro,  -Z    Run introspection integration tests only" << std::endl;
     std::cout << "  help,        -h    Show this help message" << std::endl;
     std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route + kqueue + upstream + proxy + rate_limit + circuit_breaker + auth + auth-phase2)" << std::endl;
 }
@@ -328,6 +338,12 @@ int main(int argc, char* argv[]) {
         // Run introspection cache unit tests
         }else if(mode == "introspection_cache" || mode == "-Y"){
             IntrospectionCacheTests::RunAllTests();
+        // Run introspection client static-helper + AsyncPendingState unit tests
+        }else if(mode == "intro_client" || mode == "-y"){
+            IntrospectionClientTests::RunAllTests();
+        // Run introspection integration tests
+        }else if(mode == "auth_intro" || mode == "-Z"){
+            AuthIntrospectionIntegrationTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

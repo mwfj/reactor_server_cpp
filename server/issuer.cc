@@ -46,9 +46,8 @@ bool ValidateReloadableFields(const IssuerConfig& cfg,
     }
     for (const auto& a : cfg.algorithms) {
         if (!IsSupportedJwsAlg(a)) {
-            err_out = "algorithm '" + a + "' is not supported (v1: "
-                      "RS256/RS384/RS512/ES256/ES384). HS256/none/PS* are "
-                      "rejected per spec §5.3.";
+            err_out = "algorithm '" + a + "' is not supported — "
+                      "only RS256/RS384/RS512/ES256/ES384 are supported in v1.";
             return false;
         }
     }
@@ -148,7 +147,8 @@ void Issuer::Start() {
         if (!secret || secret[0] == '\0') {
             logging::Get()->error(
                 "auth_introspection_client_secret_missing issuer={} env={}",
-                name_, client_secret_env_);
+                logging::SanitizeLogValue(name_),
+                logging::SanitizeLogValue(client_secret_env_));
             ready_.store(false, std::memory_order_release);
             return;
         }
@@ -166,6 +166,11 @@ void Issuer::Start() {
             ready_.store(false, std::memory_order_release);
             return;
         }
+        // Apply initial config TTL fields (cache_sec, negative_cache_sec,
+        // stale_grace_sec) to the newly-constructed cache.  The constructor
+        // accepts only structural parameters (max_entries, shards); TTL fields
+        // keep their in-class defaults until ApplyReload is called.
+        introspection_cache_->ApplyReload(snap->introspection);
     }
 
     const size_t disp_idx = PickDispatcherForFetch(0);
@@ -404,6 +409,10 @@ IssuerSnapshotView Issuer::BuildView() const {
         view.jwks_stale_served = static_cast<uint64_t>(stats.stale_served);
         view.jwks_key_count = stats.key_count;
         view.last_jwks_refresh = stats.last_refresh;
+    }
+    if (introspection_cache_) {
+        view.introspection_cache_entries =
+            introspection_cache_->SnapshotStats().entries;
     }
     return view;
 }

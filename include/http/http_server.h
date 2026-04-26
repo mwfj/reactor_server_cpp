@@ -9,6 +9,7 @@
 #include "net/dns_resolver.h"
 #include "tls/tls_context.h"
 #include "rate_limit/rate_limiter.h"
+#include "auth/auth_manager.h"
 
 #include <atomic>
 #include <map>
@@ -29,9 +30,6 @@ namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerManager;
 }
 
-namespace AUTH_NAMESPACE {
-class AuthManager;
-}
 
 class HttpServer {
 public:
@@ -230,6 +228,12 @@ public:
     // reload-driver-thread contract. Returns empty when auth is not
     // configured. Out-of-line because AuthManager is forward-declared.
     std::unordered_set<std::string> LiveAuthIssuerNames() const;
+
+    // Reload-safe snapshot of auth runtime counters and per-issuer views
+    // for /stats. Returns nullopt when auth was never constructed (no
+    // upstream-pool wiring failure path). Safe from any dispatcher.
+    std::optional<AUTH_NAMESPACE::AuthManager::SnapshotView>
+    GetAuthSnapshot() const;
 
 public:
     // Thread-local pointer to the active ResourcePusher for the sync request

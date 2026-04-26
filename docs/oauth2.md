@@ -17,7 +17,7 @@ Full design and security rationale live in [`.claude/documents/design/OAUTH2_TOK
 - **401 / 403 / 503 taxonomy** with RFC 6750 `WWW-Authenticate` headers, `Retry-After` on 503, and an `on_undetermined: deny|allow` switch for degraded-IdP scenarios.
 - **Outbound identity injection**. On ALLOW the gateway strips any inbound copies of identity headers and emits the ones you configure (`X-Auth-Subject`, scopes, whitelisted claims, optionally the raw JWT).
 - **Hot reload**. Issuer cache TTLs, algorithms, audiences, required scopes, and the forward-header overlay are all live-reloadable; topology (adding a new issuer) still needs a restart.
-- **Introspection mode (RFC 7662)** is scaffolded in the config schema but the enforcement path is **Phase 3 deferred** — the validator rejects `mode: "introspection"` at startup for now.
+- **Introspection mode (RFC 7662)** for opaque tokens — POST to the IdP's introspection endpoint, with a per-issuer sharded LRU cache, positive/negative TTLs, stale-on-error, and the same outbound-overlay semantics as JWT mode. See [Introspection mode](#introspection-mode-rfc-7662) below.
 
 What it does **not** do: authorization-code flow, token revocation, refresh, session cookies, CSRF — those belong to a BFF service behind the gateway.
 
@@ -92,9 +92,9 @@ Each issuer has a `mode` field.
 | Mode | Status | What it does |
 |---|---|---|
 | `jwt` (default) | Available | Verify the JWT signature locally using JWKS keys. No per-request network call to the IdP (beyond the cached JWKS fetch). |
-| `introspection` | Deferred to Phase 3 | POST to the IdP's `/introspect` endpoint per token. Rejected at config load for now. |
+| `introspection` | Available | POST to the IdP's introspection endpoint per token (RFC 7662). Cached per-issuer with sharded LRU + positive/negative TTLs. See [Introspection mode](#introspection-mode-rfc-7662) below. |
 
-If your IdP issues opaque tokens (e.g. some Keycloak deployments), you'll want introspection mode. For now, stick to JWT — the scaffolding is in place so a future release can turn it on without a config migration.
+If your IdP issues opaque tokens (e.g. some Keycloak / Auth0 / OpenAI deployments), use introspection mode. If your tokens are JWTs you can verify locally, JWT mode is cheaper and avoids the per-token round-trip.
 
 ---
 
@@ -330,7 +330,6 @@ Top-level policies always require a `name` (so `/stats` and logs stay stable acr
 These are tracked in §16 of the design spec:
 
 - **HS256 / symmetric keys not supported.** If you need them, the validator needs extending — scope decision for a future release.
-- **Introspection mode deferred.** Opaque-token IdPs aren't usable yet.
 - **`alg: none` explicitly rejected** regardless of allowlist.
 - **No token revocation hook.** A compromised token is valid until `exp`. Keep `leeway_sec` small and TTLs short.
 - **`on_undetermined: allow` is a knowingly-lax degraded mode.** It exists for rollout / observability; don't run it long-term.

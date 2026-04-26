@@ -156,6 +156,8 @@ public:
 
     // Prepend an async middleware at the front of the async chain. Async
     // middlewares run after the sync chain. Last prepend runs first.
+    // Only one async middleware may be registered at a time; registering
+    // a second one is a soft error (logged, ignored).
     void PrependAsyncMiddleware(AsyncMiddleware middleware);
 
     bool HasAsyncMiddleware() const { return !async_middlewares_.empty(); }

@@ -111,6 +111,19 @@ struct AuthForwardConfig {
     bool strip_inbound_identity_headers = true;            // Drop inbound X-Auth-* to prevent spoofing
     bool preserve_authorization = true;                    // Forward original Authorization header
 
+    // Derived from claims_to_headers; populated by PopulateDerived() before
+    // the snapshot is wrapped in shared_ptr<const>. Avoids a per-request
+    // rebuild on the hot verify path. Excluded from equality (derived).
+    std::vector<std::string> claim_keys;
+
+    void PopulateDerived() {
+        claim_keys.clear();
+        claim_keys.reserve(claims_to_headers.size());
+        for (const auto& kv : claims_to_headers) {
+            claim_keys.push_back(kv.first);
+        }
+    }
+
     bool operator==(const AuthForwardConfig& o) const {
         return subject_header == o.subject_header &&
                issuer_header == o.issuer_header &&

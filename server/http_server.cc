@@ -679,6 +679,12 @@ std::unordered_set<std::string> HttpServer::LiveAuthIssuerNames() const {
     return auth_manager_->LiveIssuerNames();
 }
 
+std::optional<AUTH_NAMESPACE::AuthManager::SnapshotView>
+HttpServer::GetAuthSnapshot() const {
+    if (!auth_manager_) return std::nullopt;
+    return auth_manager_->SnapshotAll();
+}
+
 void HttpServer::MarkServerReady() {
     // Bypass RejectIfServerLive for the internal registration pass below.
     // MarkServerReady runs on the dispatcher thread and is the ONLY
@@ -985,17 +991,21 @@ void HttpServer::MarkServerReady() {
         // Start discovery / static-fetch asynchronously; non-blocking.
         auth_manager_->Start();
 
-        // Install the auth middleware UNCONDITIONALLY. InvokeMiddleware
-        // checks AuthManager::master_enabled_ and returns pass-through
-        // when false, so installing at boot time is the cleanest way to
-        // make `auth.enabled: false → true` live-reloadable (otherwise a
-        // SIGHUP can never retroactively add a middleware).
-        router_.PrependMiddleware(
-            AUTH_NAMESPACE::MakeMiddleware(auth_manager_.get()));
-
-        // Async middleware runs after the sync chain.
+        // Install the async-auth middleware FIRST so the async chain is
+        // ordered before any future async middleware is prepended. The
+        // sync-auth middleware is installed LAST so that "last prepend
+        // runs first" places sync auth at the head of the sync chain
+        // (sync auth → rate_limit). Net per-request order is:
+        //   sync auth (JWT) → sync rate_limit → async auth (introspection)
+        //   → DispatchHandler.
+        // Both InvokeMiddleware and InvokeAsyncMiddleware check
+        // master_enabled_ inline so installing at boot keeps
+        // `auth.enabled: false → true` live-reloadable (a SIGHUP cannot
+        // retroactively add middleware after MarkServerReady returns).
         router_.PrependAsyncMiddleware(
             AUTH_NAMESPACE::MakeAsyncMiddleware(auth_manager_.get()));
+        router_.PrependMiddleware(
+            AUTH_NAMESPACE::MakeMiddleware(auth_manager_.get()));
 
         logging::Get()->info(
             "AuthManager installed enabled={} issuers={} policies={}",
@@ -3344,7 +3354,9 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
             }
 
             // Sync fast-path. Guard stays armed through scope exit.
-            if (state->sync_result() ==
+            // `state` is null when no async middleware was registered
+            // (implicit PASS); only inspect sync_result when state exists.
+            if (state && state->sync_result() ==
                     HttpRouter::AsyncMiddlewareResult::DENY) {
                 if (!server_ready_.load(std::memory_order_acquire)) {
                     response.Header("Connection", "close");
@@ -4312,7 +4324,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 return;
             }
 
-            if (state->sync_result() ==
+            // `state` is null on empty-chain implicit PASS.
+            if (state && state->sync_result() ==
                     HttpRouter::AsyncMiddlewareResult::DENY) {
                 return;
             }

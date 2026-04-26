@@ -493,6 +493,12 @@ void HttpRouter::PrependMiddleware(Middleware middleware) {
 }
 
 void HttpRouter::PrependAsyncMiddleware(AsyncMiddleware middleware) {
+    if (!async_middlewares_.empty()) {
+        logging::Get()->error(
+            "PrependAsyncMiddleware: chain already has an async middleware; "
+            "registering more than one is not yet supported");
+        return;
+    }
     async_middlewares_.insert(
         async_middlewares_.begin(), std::move(middleware));
 }
@@ -500,18 +506,19 @@ void HttpRouter::PrependAsyncMiddleware(AsyncMiddleware middleware) {
 bool HttpRouter::RunAsyncMiddleware(
     const HttpRequest& request, HttpResponse& response,
     std::shared_ptr<AsyncPendingState>& out_state) {
-    // out_state is never null on return — callsites uniformly read
-    // sync_result(), with or without registered middleware.
-    out_state = std::make_shared<AsyncPendingState>();
-
+    // Empty chain: implicit sync PASS. Leave out_state null so callers skip
+    // the heap allocation on the hot path; sync DENY is impossible without
+    // middleware actually running.
     if (async_middlewares_.empty()) {
-        out_state->SetSyncResult(AsyncMiddlewareResult::PASS);
-        out_state->MarkCompletedSync();
+        out_state.reset();
         return true;
     }
 
-    // TODO: per-middleware state if/when multiple async middlewares are
-    // registered. The current iteration shares one state across the chain.
+    out_state = std::make_shared<AsyncPendingState>();
+
+    // TODO: per-middleware state when multiple async middlewares are supported.
+    // See PrependAsyncMiddleware for the registration gate.
+    // The current iteration shares one state across the chain.
     for (const auto& mw : async_middlewares_) {
         mw(request, response, out_state);
         if (!out_state->completed_sync()) {

@@ -100,7 +100,7 @@ APP_SRCS = $(TEST_DIR)/test_framework.cc $(TEST_DIR)/run_test.cc
 MAIN_SRC = $(SERVER_DIR)/main.cc
 
 # TimeStamp Code
-UTIL_SRCS = $(UTIL_DIR)/timestamp.cc
+UTIL_SRCS = $(UTIL_DIR)/timestamp.cc $(UTIL_DIR)/base64.cc
 
 # llhttp C sources
 LLHTTP_SRC = $(THIRD_PARTY_DIR)/llhttp/llhttp.c $(THIRD_PARTY_DIR)/llhttp/api.c $(THIRD_PARTY_DIR)/llhttp/http.c
@@ -149,7 +149,7 @@ NETWORK_HEADERS = $(LIB_DIR)/socket_handler.h $(LIB_DIR)/acceptor.h $(LIB_DIR)/c
 DNS_HEADERS = $(LIB_DIR)/net/dns_resolver.h
 SERVER_HEADERS = $(LIB_DIR)/net_server.h $(LIB_DIR)/buffer.h
 THREAD_POOL_HEADERS = $(THREAD_POOL_DIR)/include/threadpool.h $(THREAD_POOL_DIR)/include/threadtask.h
-UTIL_HEADERS = $(UTIL_DIR)/timestamp.h
+UTIL_HEADERS = $(UTIL_DIR)/timestamp.h $(UTIL_DIR)/base64.h
 FOUNDATION_HEADERS = $(LIB_DIR)/log/logger.h $(LIB_DIR)/log/log_utils.h $(LIB_DIR)/config/server_config.h $(LIB_DIR)/config/config_loader.h
 HTTP_HEADERS = $(LIB_DIR)/http/http_callbacks.h $(LIB_DIR)/http/http_connection_handler.h $(LIB_DIR)/http/http_parser.h $(LIB_DIR)/http/http_request.h $(LIB_DIR)/http/http_response.h $(LIB_DIR)/http/http_router.h $(LIB_DIR)/http/http_server.h $(LIB_DIR)/http/route_trie.h $(LIB_DIR)/http/route_trie_impl.h
 HTTP2_HEADERS = $(LIB_DIR)/http2/http2_callbacks.h $(LIB_DIR)/http2/http2_connection_handler.h $(LIB_DIR)/http2/http2_constants.h $(LIB_DIR)/http2/http2_session.h $(LIB_DIR)/http2/http2_stream.h $(LIB_DIR)/http2/protocol_detector.h
@@ -163,7 +163,7 @@ CIRCUIT_BREAKER_HEADERS = $(LIB_DIR)/circuit_breaker/circuit_breaker_state.h $(L
 JWT_CPP_DIR = $(THIRD_PARTY_DIR)/jwt-cpp/include/jwt-cpp
 AUTH_HEADERS = $(LIB_DIR)/auth/auth_context.h $(LIB_DIR)/auth/auth_config.h $(LIB_DIR)/auth/token_hasher.h $(LIB_DIR)/auth/auth_policy_matcher.h $(LIB_DIR)/auth/auth_claims.h $(LIB_DIR)/auth/auth_result.h $(LIB_DIR)/auth/auth_url_util.h $(LIB_DIR)/auth/jwks_cache.h $(LIB_DIR)/auth/upstream_http_client.h $(LIB_DIR)/auth/issuer.h $(LIB_DIR)/auth/jwks_fetcher.h $(LIB_DIR)/auth/oidc_discovery.h $(LIB_DIR)/auth/jwt_verifier.h $(LIB_DIR)/auth/auth_error_responses.h $(LIB_DIR)/auth/auth_manager.h $(LIB_DIR)/auth/auth_middleware.h $(LIB_DIR)/auth/introspection_cache.h $(LIB_DIR)/auth/introspection_client.h $(JWT_CPP_DIR)/jwt.h $(JWT_CPP_DIR)/base.h $(JWT_CPP_DIR)/traits/nlohmann-json/defaults.h $(JWT_CPP_DIR)/traits/nlohmann-json/traits.h
 CLI_HEADERS = $(LIB_DIR)/cli/cli_parser.h $(LIB_DIR)/cli/signal_handler.h $(LIB_DIR)/cli/pid_file.h $(LIB_DIR)/cli/version.h $(LIB_DIR)/cli/daemonizer.h
-TEST_HEADERS = $(TEST_DIR)/test_framework.h $(TEST_DIR)/http_test_client.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h $(TEST_DIR)/route_test.h $(TEST_DIR)/upstream_pool_test.h $(TEST_DIR)/proxy_test.h $(TEST_DIR)/rate_limit_test.h $(TEST_DIR)/kqueue_test.h $(TEST_DIR)/circuit_breaker_test.h $(TEST_DIR)/circuit_breaker_components_test.h $(TEST_DIR)/circuit_breaker_integration_test.h $(TEST_DIR)/circuit_breaker_retry_budget_test.h $(TEST_DIR)/circuit_breaker_wait_queue_drain_test.h $(TEST_DIR)/circuit_breaker_observability_test.h $(TEST_DIR)/circuit_breaker_reload_test.h $(TEST_DIR)/auth_foundation_test.h $(TEST_DIR)/jwt_verifier_test.h $(TEST_DIR)/jwks_cache_test.h $(TEST_DIR)/oidc_discovery_test.h $(TEST_DIR)/header_rewriter_auth_test.h $(TEST_DIR)/auth_manager_test.h $(TEST_DIR)/auth_integration_test.h $(TEST_DIR)/auth_failure_mode_test.h $(TEST_DIR)/auth_reload_test.h $(TEST_DIR)/auth_multi_issuer_test.h $(TEST_DIR)/auth_websocket_upgrade_test.h $(TEST_DIR)/auth_race_test.h $(TEST_DIR)/dns_resolver_test.h $(TEST_DIR)/dual_stack_test.h $(TEST_DIR)/router_async_middleware_test.h $(TEST_DIR)/introspection_cache_test.h $(TEST_DIR)/mock_introspection_server.h
+TEST_HEADERS = $(TEST_DIR)/test_framework.h $(TEST_DIR)/http_test_client.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h $(TEST_DIR)/route_test.h $(TEST_DIR)/upstream_pool_test.h $(TEST_DIR)/proxy_test.h $(TEST_DIR)/rate_limit_test.h $(TEST_DIR)/kqueue_test.h $(TEST_DIR)/circuit_breaker_test.h $(TEST_DIR)/circuit_breaker_components_test.h $(TEST_DIR)/circuit_breaker_integration_test.h $(TEST_DIR)/circuit_breaker_retry_budget_test.h $(TEST_DIR)/circuit_breaker_wait_queue_drain_test.h $(TEST_DIR)/circuit_breaker_observability_test.h $(TEST_DIR)/circuit_breaker_reload_test.h $(TEST_DIR)/auth_foundation_test.h $(TEST_DIR)/jwt_verifier_test.h $(TEST_DIR)/jwks_cache_test.h $(TEST_DIR)/oidc_discovery_test.h $(TEST_DIR)/header_rewriter_auth_test.h $(TEST_DIR)/auth_manager_test.h $(TEST_DIR)/auth_integration_test.h $(TEST_DIR)/auth_failure_mode_test.h $(TEST_DIR)/auth_reload_test.h $(TEST_DIR)/auth_multi_issuer_test.h $(TEST_DIR)/auth_websocket_upgrade_test.h $(TEST_DIR)/auth_race_test.h $(TEST_DIR)/dns_resolver_test.h $(TEST_DIR)/dual_stack_test.h $(TEST_DIR)/router_async_middleware_test.h $(TEST_DIR)/introspection_cache_test.h $(TEST_DIR)/mock_introspection_server.h $(TEST_DIR)/auth_introspection_integration_test.h
 
 # All headers combined
 HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(DNS_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(FOUNDATION_HEADERS) $(HTTP_HEADERS) $(HTTP2_HEADERS) $(WS_HEADERS) $(TLS_HEADERS) $(UPSTREAM_HEADERS) $(RATE_LIMIT_HEADERS) $(CIRCUIT_BREAKER_HEADERS) $(AUTH_HEADERS) $(CLI_HEADERS) $(TEST_HEADERS)
@@ -322,6 +322,11 @@ test_introspection_cache: $(TARGET)
 	@echo "Running introspection cache unit tests only..."
 	./$(TARGET) introspection_cache
 
+# Introspection integration tests (async middleware + mock IdP)
+test_auth_intro: $(TARGET)
+	@echo "Running introspection integration tests only..."
+	./$(TARGET) auth_intro
+
 # Display help information
 help:
 	@echo "Reactor Server C++ - Makefile Help"
@@ -402,4 +407,4 @@ help:
 # Build only the production server binary
 server: $(SERVER_TARGET)
 
-.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache help
+.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache test_auth_intro help

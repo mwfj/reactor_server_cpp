@@ -958,12 +958,7 @@ void TestConfigLoaderRejectsPlaintextIdpEndpoints() {
         })", "jwks_uri must start with https://");
         if (!err.empty()) throw std::runtime_error("plaintext jwks_uri case: " + err);
 
-        // Case 2: plaintext introspection.endpoint.
-        // Case 2: mode=introspection itself is deferred to Phase 3; the
-        // config-loader rejects it BEFORE drilling into introspection.*
-        // field validation. The plaintext-endpoint check will be
-        // re-exercised when Phase 3 lifts the mode rejection — this test
-        // currently asserts the outer rejection fires.
+        // Case 2: plaintext introspection.endpoint must be rejected.
         err = validate_expect_failure(R"({
             "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
             "auth": {
@@ -980,8 +975,8 @@ void TestConfigLoaderRejectsPlaintextIdpEndpoints() {
                     }
                 }
             }
-        })", "mode=\"introspection\" is deferred to Phase 3");
-        if (!err.empty()) throw std::runtime_error("introspection mode case: " + err);
+        })", "introspection.endpoint must start with https://");
+        if (!err.empty()) throw std::runtime_error("plaintext introspection.endpoint: " + err);
 
         TestFramework::RecordTest(
             "AuthFoundation: ConfigLoader rejects plaintext IdP endpoints",
@@ -2215,24 +2210,37 @@ void TestConfigLoaderRejectsEnabledPolicyWithoutIssuers() {
 }
 
 // -----------------------------------------------------------------------------
-// ConfigLoader::Validate — introspection mode is Phase-3-deferred. Until
-// Phase 3 lands the mode-dispatch in AuthManager, accepting `mode="introspection"`
-// would silently route opaque tokens into the JWT verifier which rejects
-// them as malformed — a fail-undetermined loop operators can't debug. The
-// config loader hard-rejects the mode at BOTH startup validation and
-// ValidateHotReloadable. When Phase 3 lifts this rejection, the original
-// per-field validator tests (auth_style / timeout_sec / cache_sec /
-// shards / max_entries / negative_cache_sec / stale_grace_sec) should be
-// re-expanded — the validation logic for each still lives in config_loader.cc
-// and will execute once the outer mode gate is relaxed.
+// ConfigLoader::Validate — introspection mode is now accepted with valid
+// configuration. Each of the per-knob validators (endpoint scheme,
+// credentials, auth_style, shards, numeric ranges) must reject malformed
+// values with a clear field-named message. This test exercises every rule
+// from the introspection block at startup; the matching reload-path
+// coverage lives in TestValidateHotReloadableIntrospectionFields below.
 // -----------------------------------------------------------------------------
 void TestConfigLoaderValidatesIntrospectionKnobs() {
     std::cout << "\n[TEST] ConfigLoader validates introspection knobs..." << std::endl;
-    auto validate_expect_failure = [&](const std::string& json,
+    auto build_json = [](const std::string& introspection_block) -> std::string {
+        return std::string(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": )") + introspection_block + R"(
+                    }
+                }
+            }
+        })";
+    };
+
+    auto validate_expect_failure = [&](const std::string& introspection_block,
                                         const std::string& expected_phrase)
         -> std::string {
         try {
-            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ServerConfig cfg = ConfigLoader::LoadFromString(build_json(introspection_block));
             ConfigLoader::Validate(cfg);
             return "expected throw containing '" + expected_phrase +
                    "' but accepted";
@@ -2248,28 +2256,212 @@ void TestConfigLoaderValidatesIntrospectionKnobs() {
         }
     };
 
+    auto validate_expect_success = [&](const std::string& introspection_block,
+                                        const std::string& case_label)
+        -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(build_json(introspection_block));
+            ConfigLoader::Validate(cfg);
+            return "";
+        } catch (const std::exception& e) {
+            return case_label + ": valid config rejected: " + e.what();
+        }
+    };
+
     try {
-        std::string err = validate_expect_failure(R"({
-            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
-            "auth": {
-                "enabled": false,
-                "issuers": {
-                    "ours": {
-                        "issuer_url": "https://issuer.example",
-                        "upstream": "x",
-                        "mode": "introspection",
-                        "introspection": {
-                            "endpoint": "https://issuer.example/introspect",
-                            "client_id": "c",
-                            "client_secret_env": "E",
-                            "auth_style": "weird",
-                            "timeout_sec": -1
+        // Positive: a fully populated valid introspection block must pass.
+        std::string err = validate_expect_success(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "auth_style": "basic",
+            "timeout_sec": 3,
+            "cache_sec": 60,
+            "negative_cache_sec": 10,
+            "stale_grace_sec": 30,
+            "max_entries": 100000,
+            "shards": 16
+        })", "valid full block");
+        if (!err.empty()) throw std::runtime_error(err);
+
+        // Positive: auth_style="body" also accepted.
+        err = validate_expect_success(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "auth_style": "body"
+        })", "auth_style=body");
+        if (!err.empty()) throw std::runtime_error(err);
+
+        // Positive: discovery=true allows empty endpoint (OIDC fills runtime).
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+                "auth": {
+                    "enabled": false,
+                    "issuers": {
+                        "ours": {
+                            "issuer_url": "https://issuer.example",
+                            "upstream": "x",
+                            "mode": "introspection",
+                            "discovery": true,
+                            "introspection": {
+                                "client_id": "c",
+                                "client_secret_env": "E"
+                            }
                         }
                     }
                 }
+            })");
+            ConfigLoader::Validate(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(std::string("discovery=true + empty endpoint should pass: ") + e.what());
+        }
+
+        // Positive: 0 disables negative caching / stale-serving (semantic-preserving).
+        err = validate_expect_success(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "negative_cache_sec": 0,
+            "stale_grace_sec": 0
+        })", "0 disables negative_cache / stale_grace");
+        if (!err.empty()) throw std::runtime_error(err);
+
+        // Negative: discovery=false + empty endpoint → reject.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+                "auth": {
+                    "enabled": false,
+                    "issuers": {
+                        "ours": {
+                            "issuer_url": "https://issuer.example",
+                            "upstream": "x",
+                            "mode": "introspection",
+                            "discovery": false,
+                            "introspection": {
+                                "client_id": "c",
+                                "client_secret_env": "E"
+                            }
+                        }
+                    }
+                }
+            })");
+            ConfigLoader::Validate(cfg);
+            throw std::runtime_error("discovery=false + empty endpoint accepted but should reject");
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find("introspection.endpoint is required") == std::string::npos) {
+                throw std::runtime_error(
+                    std::string("discovery=false + empty endpoint: missing phrase; got: ") + e.what());
             }
-        })", "mode=\"introspection\" is deferred to Phase 3");
-        if (!err.empty()) throw std::runtime_error("introspection rejected: " + err);
+        }
+
+        // Negative: plaintext endpoint.
+        err = validate_expect_failure(R"({
+            "endpoint": "http://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E"
+        })", "introspection.endpoint must start with https://");
+        if (!err.empty()) throw std::runtime_error("plaintext endpoint: " + err);
+
+        // Negative: empty client_id.
+        err = validate_expect_failure(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "",
+            "client_secret_env": "E"
+        })", "introspection.client_id is required");
+        if (!err.empty()) throw std::runtime_error("empty client_id: " + err);
+
+        // Negative: empty client_secret_env.
+        err = validate_expect_failure(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": ""
+        })", "introspection.client_secret_env is required");
+        if (!err.empty()) throw std::runtime_error("empty client_secret_env: " + err);
+
+        // Negative: invalid auth_style.
+        err = validate_expect_failure(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "auth_style": "weird"
+        })", "introspection.auth_style must be \"basic\" or \"body\"");
+        if (!err.empty()) throw std::runtime_error("bad auth_style: " + err);
+
+        // Negative: shards not a power of two.
+        err = validate_expect_failure(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "shards": 5
+        })", "introspection.shards must be a power of two in [1, 64]");
+        if (!err.empty()) throw std::runtime_error("non-power-of-two shards: " + err);
+
+        // Negative: shards = 0.
+        err = validate_expect_failure(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "shards": 0
+        })", "introspection.shards must be a power of two in [1, 64]");
+        if (!err.empty()) throw std::runtime_error("shards=0: " + err);
+
+        // Negative: shards > 64.
+        err = validate_expect_failure(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "shards": 128
+        })", "introspection.shards must be a power of two in [1, 64]");
+        if (!err.empty()) throw std::runtime_error("shards=128: " + err);
+
+        // Negative: timeout_sec <= 0.
+        err = validate_expect_failure(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "timeout_sec": 0
+        })", "introspection.timeout_sec must be > 0");
+        if (!err.empty()) throw std::runtime_error("timeout_sec=0: " + err);
+
+        // Negative: cache_sec <= 0.
+        err = validate_expect_failure(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "cache_sec": 0
+        })", "introspection.cache_sec must be > 0");
+        if (!err.empty()) throw std::runtime_error("cache_sec=0: " + err);
+
+        // Negative: max_entries <= 0.
+        err = validate_expect_failure(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "max_entries": 0
+        })", "introspection.max_entries must be > 0");
+        if (!err.empty()) throw std::runtime_error("max_entries=0: " + err);
+
+        // Negative: negative_cache_sec < 0.
+        err = validate_expect_failure(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "negative_cache_sec": -1
+        })", "introspection.negative_cache_sec must be >= 0");
+        if (!err.empty()) throw std::runtime_error("negative_cache_sec=-1: " + err);
+
+        // Negative: stale_grace_sec < 0.
+        err = validate_expect_failure(R"({
+            "endpoint": "https://issuer.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "stale_grace_sec": -1
+        })", "introspection.stale_grace_sec must be >= 0");
+        if (!err.empty()) throw std::runtime_error("stale_grace_sec=-1: " + err);
 
         TestFramework::RecordTest(
             "AuthFoundation: ConfigLoader validates introspection knobs",
@@ -2282,82 +2474,164 @@ void TestConfigLoaderValidatesIntrospectionKnobs() {
 }
 
 // -----------------------------------------------------------------------------
-// ConfigLoader::ValidateHotReloadable — `mode=introspection` is rejected
-// UNCONDITIONALLY on the SIGHUP path, including for staged-only issuers that
-// are not yet in the live AuthManager. Design §5.3 / §18.5: the check must
-// survive the master-gate lift and run even when live_issuer_names is empty
-// or does not contain the offender. Without this, a staged-only introspection
-// issuer would slip past SIGHUP validation, get deferred as "restart-only
-// topology change", and then fail the next startup Validate — the exact
-// "valid on SIGHUP, fails on restart" asymmetry this validator exists to
-// prevent.
+// ConfigLoader::ValidateHotReloadable — introspection-block rules fire
+// only for issuers in the live AuthManager set, mirroring the pattern used
+// for leeway_sec / jwks_cache_sec / algorithms. A staged-only introspection
+// issuer is NOT validated here (AuthManager::Reload defers it as
+// restart-required topology). The startup Validate path runs on the next
+// restart and catches typos there.
+//
+// For LIVE introspection issuers, this test exercises every rule the
+// helper enforces — both live-reloadable subset (auth_style, cache_sec,
+// timeout_sec, max_entries, negative_cache_sec, stale_grace_sec) and the
+// restart-required subset (endpoint, client_id, client_secret_env, shards).
+// The restart-required subset is preserved by Issuer::ValidateReload at
+// apply time; the loader still hard-rejects malformed values so the
+// operator sees the typo on SIGHUP rather than the next restart.
 // -----------------------------------------------------------------------------
-void TestValidateHotReloadableRejectsIntrospectionUnconditionally() {
-    std::cout << "\n[TEST] ValidateHotReloadable rejects introspection unconditionally..."
+void TestValidateHotReloadableIntrospectionFields() {
+    std::cout << "\n[TEST] ValidateHotReloadable validates introspection fields..."
               << std::endl;
-    try {
-        // Parse-only load — LoadFromString does not call Validate, so the
-        // mode=introspection config survives into the ServerConfig struct
-        // and reaches ValidateHotReloadable directly.
-        ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+
+    auto build_cfg_with_block = [](const std::string& block) -> ServerConfig {
+        std::string json = std::string(R"({
             "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
             "auth": {
                 "enabled": false,
                 "issuers": {
-                    "staged-idp": {
-                        "issuer_url": "https://staged.example",
+                    "live-idp": {
+                        "issuer_url": "https://live.example",
                         "upstream": "x",
                         "mode": "introspection",
-                        "introspection": {
-                            "endpoint": "https://staged.example/introspect",
-                            "client_id": "c",
-                            "client_secret_env": "E"
-                        }
+                        "introspection": )") + block + R"(
                     }
                 }
             }
-        })");
+        })";
+        return ConfigLoader::LoadFromString(json);
+    };
 
-        auto expect_throw = [&](const std::unordered_set<std::string>& live_upstreams,
-                                 const std::unordered_set<std::string>& live_issuers,
-                                 const std::string& case_label) {
-            try {
-                ConfigLoader::ValidateHotReloadable(cfg, live_upstreams,
-                                                    live_issuers);
+    auto expect_reload_throw = [&](const ServerConfig& cfg,
+                                    const std::unordered_set<std::string>& live_upstreams,
+                                    const std::unordered_set<std::string>& live_issuers,
+                                    const std::string& expected_phrase,
+                                    const std::string& case_label) {
+        try {
+            ConfigLoader::ValidateHotReloadable(cfg, live_upstreams,
+                                                 live_issuers);
+            throw std::runtime_error(
+                case_label + ": ValidateHotReloadable accepted invalid input");
+        } catch (const std::invalid_argument& e) {
+            std::string msg = e.what();
+            if (msg.find(expected_phrase) == std::string::npos) {
                 throw std::runtime_error(
-                    case_label + ": ValidateHotReloadable accepted "
-                    "mode=introspection but should have rejected it");
-            } catch (const std::invalid_argument& e) {
-                std::string msg = e.what();
-                if (msg.find("mode=\"introspection\" is deferred to Phase 3")
-                    == std::string::npos) {
-                    throw std::runtime_error(
-                        case_label + ": threw but message missing Phase-3 "
-                        "deferral phrase; got: " + msg);
-                }
+                    case_label + ": threw but missing '" + expected_phrase +
+                    "'; got: " + msg);
             }
-        };
+        }
+    };
 
-        // Case 1: staged-only issuer, empty live_issuer_names. The mode
-        // gate must fire even though the live-scope filter would otherwise
-        // skip this issuer.
-        expect_throw({"x"}, /*live_issuers=*/{}, "staged-only issuer");
+    auto expect_reload_pass = [&](const ServerConfig& cfg,
+                                   const std::unordered_set<std::string>& live_upstreams,
+                                   const std::unordered_set<std::string>& live_issuers,
+                                   const std::string& case_label) {
+        try {
+            ConfigLoader::ValidateHotReloadable(cfg, live_upstreams,
+                                                 live_issuers);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                case_label + ": expected acceptance, got: " + e.what());
+        }
+    };
 
-        // Case 2: live_issuer_names doesn't contain the offender (it's an
-        // unrelated issuer name). Same expectation — the mode check runs
-        // before / outside the live-scope filter.
-        expect_throw({"x"}, /*live_issuers=*/{"other-idp"},
-                     "offender absent from live set");
+    try {
+        // Positive: valid live-issuer config passes.
+        ServerConfig good_cfg = build_cfg_with_block(R"({
+            "endpoint": "https://live.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "auth_style": "basic"
+        })");
+        expect_reload_pass(good_cfg, {"x"}, {"live-idp"}, "valid live config");
 
-        // Case 3: issuer IS live. Check still fires — startup-symmetric.
-        expect_throw({"x"}, /*live_issuers=*/{"staged-idp"}, "live issuer");
+        // Positive: staged-only issuer skipped — even with bogus auth_style,
+        // ValidateHotReloadable does not run the introspection check when
+        // live_issuer_names is empty (no apply path for this issuer).
+        ServerConfig staged_only_bad = build_cfg_with_block(R"({
+            "endpoint": "https://live.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "auth_style": "garbage"
+        })");
+        expect_reload_pass(staged_only_bad, {"x"}, /*live_issuers=*/{},
+                            "staged-only issuer skipped");
+
+        // Negative: live-reloadable field — invalid auth_style.
+        expect_reload_throw(staged_only_bad, {"x"}, {"live-idp"},
+                             "introspection.auth_style must be \"basic\" or \"body\"",
+                             "live: bad auth_style");
+
+        // Negative: live-reloadable field — cache_sec=0.
+        ServerConfig bad_cache = build_cfg_with_block(R"({
+            "endpoint": "https://live.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "cache_sec": 0
+        })");
+        expect_reload_throw(bad_cache, {"x"}, {"live-idp"},
+                             "introspection.cache_sec must be > 0",
+                             "live: cache_sec=0");
+
+        // Negative: live-reloadable field — negative negative_cache_sec.
+        ServerConfig bad_negcache = build_cfg_with_block(R"({
+            "endpoint": "https://live.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "negative_cache_sec": -1
+        })");
+        expect_reload_throw(bad_negcache, {"x"}, {"live-idp"},
+                             "introspection.negative_cache_sec must be >= 0",
+                             "live: negative_cache_sec=-1");
+
+        // Negative: restart-required field — invalid shards (live path
+        // hard-rejects so the operator sees the misconfig on SIGHUP).
+        ServerConfig bad_shards = build_cfg_with_block(R"({
+            "endpoint": "https://live.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "shards": 5
+        })");
+        expect_reload_throw(bad_shards, {"x"}, {"live-idp"},
+                             "introspection.shards must be a power of two in [1, 64]",
+                             "live: non-power-of-two shards");
+
+        // Negative: restart-required field — empty client_id.
+        ServerConfig bad_id = build_cfg_with_block(R"({
+            "endpoint": "https://live.example/introspect",
+            "client_id": "",
+            "client_secret_env": "E"
+        })");
+        expect_reload_throw(bad_id, {"x"}, {"live-idp"},
+                             "introspection.client_id is required",
+                             "live: empty client_id");
+
+        // Positive: 0 disables negative caching / stale-serving on reload.
+        ServerConfig zero_disables = build_cfg_with_block(R"({
+            "endpoint": "https://live.example/introspect",
+            "client_id": "c",
+            "client_secret_env": "E",
+            "negative_cache_sec": 0,
+            "stale_grace_sec": 0
+        })");
+        expect_reload_pass(zero_disables, {"x"}, {"live-idp"},
+                            "0 disables negative_cache / stale_grace on reload");
 
         TestFramework::RecordTest(
-            "AuthFoundation: ValidateHotReloadable rejects introspection unconditionally",
+            "AuthFoundation: ValidateHotReloadable validates introspection fields",
             true, "", TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "AuthFoundation: ValidateHotReloadable rejects introspection unconditionally",
+            "AuthFoundation: ValidateHotReloadable validates introspection fields",
             false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
@@ -3431,12 +3705,7 @@ void TestConfigLoaderRequiresIntrospectionCredentials() {
     };
 
     try {
-        // Phase 3 deferral: introspection mode is rejected at the outer
-        // mode gate before the per-field credential validators run. When
-        // Phase 3 lifts the rejection, restore the original missing-
-        // client_id / missing-client_secret_env / positive-credentials
-        // sub-cases — the validation logic for those fields still lives
-        // in ParseIssuerConfig and will fire.
+        // Missing client_id — must reject with the per-field message.
         std::string err = validate_expect_failure(R"({
             "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
             "auth": {
@@ -3453,8 +3722,55 @@ void TestConfigLoaderRequiresIntrospectionCredentials() {
                     }
                 }
             }
-        })", "mode=\"introspection\" is deferred to Phase 3");
-        if (!err.empty()) throw std::runtime_error("introspection mode: " + err);
+        })", "introspection.client_id is required");
+        if (!err.empty()) throw std::runtime_error("missing client_id: " + err);
+
+        // Missing client_secret_env.
+        err = validate_expect_failure(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://issuer.example",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://issuer.example/introspect",
+                            "client_id": "c"
+                        }
+                    }
+                }
+            }
+        })", "introspection.client_secret_env is required");
+        if (!err.empty()) throw std::runtime_error("missing client_secret_env: " + err);
+
+        // POSITIVE: introspection-mode issuer with both credentials passes.
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+                "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+                "auth": {
+                    "enabled": false,
+                    "issuers": {
+                        "ours": {
+                            "issuer_url": "https://issuer.example",
+                            "upstream": "x",
+                            "mode": "introspection",
+                            "introspection": {
+                                "endpoint": "https://issuer.example/introspect",
+                                "client_id": "c",
+                                "client_secret_env": "E"
+                            }
+                        }
+                    }
+                }
+            })");
+            ConfigLoader::Validate(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("introspection with full credentials should pass but threw: ")
+                + e.what());
+        }
 
         // POSITIVE: jwt-mode issuer without credentials still valid.
         // (credentials are REQUIRED only for mode="introspection")
@@ -3486,6 +3802,149 @@ void TestConfigLoaderRequiresIntrospectionCredentials() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "AuthFoundation: ConfigLoader requires introspection credentials",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ConfigLoader::Validate — a policy listing multiple introspection-mode
+// issuers triggers a soft warn but does NOT reject. Each cache miss may
+// fan out one RFC 7662 POST per issuer until one accepts the token; the
+// loader logs a warning so an accidental fanout surfaces in operator
+// logs without blocking deployment. Single-issuer and mixed jwt+intro
+// policies remain silent.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderWarnsOnMultiIntrospectionPolicy() {
+    std::cout << "\n[TEST] ConfigLoader warns on multi-introspection policy..."
+              << std::endl;
+    try {
+        // A policy with two introspection issuers must validate but emit
+        // a warning. We assert non-rejection here; log capture is left to
+        // integration tests (the loader writes via spdlog; foundation
+        // tests do not redirect the global sink).
+        ServerConfig cfg = ConfigLoader::LoadFromString(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "idp_a": {
+                        "issuer_url": "https://a.example",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://a.example/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E"
+                        }
+                    },
+                    "idp_b": {
+                        "issuer_url": "https://b.example",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://b.example/introspect",
+                            "client_id": "c2",
+                            "client_secret_env": "E2"
+                        }
+                    }
+                },
+                "policies": [{
+                    "name": "p_multi",
+                    "enabled": true,
+                    "applies_to": ["/api"],
+                    "issuers": ["idp_a", "idp_b"]
+                }]
+            }
+        })");
+        try {
+            ConfigLoader::Validate(cfg);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("multi-introspection policy must NOT reject; got: ")
+                + e.what());
+        }
+
+        // A single-introspection policy must also pass (and is the
+        // recommended shape — no warn would fire here, but we don't
+        // assert log absence).
+        ServerConfig cfg_single = ConfigLoader::LoadFromString(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "idp_a": {
+                        "issuer_url": "https://a.example",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://a.example/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E"
+                        }
+                    }
+                },
+                "policies": [{
+                    "name": "p_single",
+                    "enabled": true,
+                    "applies_to": ["/api"],
+                    "issuers": ["idp_a"]
+                }]
+            }
+        })");
+        try {
+            ConfigLoader::Validate(cfg_single);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("single-introspection policy must pass; got: ")
+                + e.what());
+        }
+
+        // Mixed jwt + introspection policy passes (only one introspection
+        // issuer in the list, so no fanout warning is appropriate).
+        ServerConfig cfg_mixed = ConfigLoader::LoadFromString(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":80}],
+            "auth": {
+                "enabled": false,
+                "issuers": {
+                    "jwt_idp": {
+                        "issuer_url": "https://jwt.example",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "algorithms": ["RS256"]
+                    },
+                    "intro_idp": {
+                        "issuer_url": "https://intro.example",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://intro.example/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E"
+                        }
+                    }
+                },
+                "policies": [{
+                    "name": "p_mixed",
+                    "enabled": true,
+                    "applies_to": ["/api"],
+                    "issuers": ["jwt_idp", "intro_idp"]
+                }]
+            }
+        })");
+        try {
+            ConfigLoader::Validate(cfg_mixed);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("mixed jwt+intro policy must pass; got: ")
+                + e.what());
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader warns on multi-introspection policy",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader warns on multi-introspection policy",
             false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
@@ -4345,7 +4804,7 @@ inline void RunAllTests() {
     TestConfigLoaderRejectsEnabledPolicyWithoutAppliesTo();
     TestConfigLoaderRejectsEnabledPolicyWithoutIssuers();
     TestConfigLoaderValidatesIntrospectionKnobs();
-    TestValidateHotReloadableRejectsIntrospectionUnconditionally();
+    TestValidateHotReloadableIntrospectionFields();
     TestConfigLoaderRejectsPatternedInlineAuthPrefix();
     TestConfigLoaderRequiresIssuerUpstream();
     TestConfigLoaderValidatesHeaderNameTchar();
@@ -4356,6 +4815,7 @@ inline void RunAllTests() {
     TestLoadHmacKeyFromEnvPreservesMiddlePadding();
     TestParseStrictIntRejectsNull();
     TestConfigLoaderRequiresIntrospectionCredentials();
+    TestConfigLoaderWarnsOnMultiIntrospectionPolicy();
     TestConfigLoaderStrictUpstreamIntegers();
     TestValidateProxyAuthLiveScoping();
     TestConfigLoaderStrictCircuitBreakerIntegers();
