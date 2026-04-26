@@ -4,7 +4,6 @@ The gateway ships with built-in OAuth 2.0 bearer-token validation. Point it at o
 
 This is a **resource-server** validator. The gateway does not run the authorization-code dance, issue tokens, or host a login page. It expects clients (or an upstream BFF) to present an already-minted bearer token in `Authorization: Bearer <jwt>`.
 
-Full design and security rationale live in [`.claude/documents/design/OAUTH2_TOKEN_VALIDATION_DESIGN.md`](../.claude/documents/design/OAUTH2_TOKEN_VALIDATION_DESIGN.md). This document is the operator's guide.
 
 ---
 
@@ -341,5 +340,3 @@ These are tracked in §16 of the design spec:
 
 - [`docs/configuration.md`](configuration.md) — full `auth.*` field reference and validation rules.
 - [`docs/architecture.md`](architecture.md) — where the auth middleware fits in the layered design.
-- [`.claude/documents/design/OAUTH2_TOKEN_VALIDATION_DESIGN.md`](../.claude/documents/design/OAUTH2_TOKEN_VALIDATION_DESIGN.md) — design rationale, data flow, threat model.
-- [`.claude/documents/features/OAUTH_TOKEN_VALIDATION.md`](../.claude/documents/features/OAUTH_TOKEN_VALIDATION.md) — internal component reference.
