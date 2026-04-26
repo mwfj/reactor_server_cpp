@@ -139,7 +139,7 @@ void Issuer::Start() {
     // per-issuer cache. Fail-closed when the env var is unset/empty —
     // every request returns UNDETERMINED until the operator fixes the env
     // and restarts.
-    if (mode_ == "introspection") {
+    if (mode_ == kModeIntrospection) {
         const char* secret = nullptr;
         if (!client_secret_env_.empty()) {
             secret = std::getenv(client_secret_env_.c_str());
@@ -176,7 +176,7 @@ void Issuer::Start() {
     const size_t disp_idx = PickDispatcherForFetch(0);
     const uint64_t gen = generation_->load(std::memory_order_acquire);
 
-    if (mode_ == "introspection" && !discovery_) {
+    if (mode_ == kModeIntrospection && !discovery_) {
         if (snap->introspection_endpoint.empty()) {
             logging::Get()->warn(
                 "Issuer start skipped: introspection mode discovery=false "
@@ -265,7 +265,7 @@ bool Issuer::ValidateReload(const IssuerConfig& new_config,
 
     // Restart-required introspection fields. Only consulted in introspection
     // mode; JWT-mode issuers ignore them entirely.
-    if (mode_ == "introspection") {
+    if (mode_ == kModeIntrospection) {
         if (!discovery_) {
             std::shared_ptr<const IssuerSnapshot> snap;
             {
@@ -321,7 +321,7 @@ bool Issuer::ApplyReload(const IssuerConfig& new_config, std::string& err_out) {
     if (jwks_cache_) {
         jwks_cache_->SetTtlSec(new_config.jwks_cache_sec);
     }
-    if (mode_ == "introspection" && introspection_cache_) {
+    if (mode_ == kModeIntrospection && introspection_cache_) {
         introspection_cache_->ApplyReload(new_config.introspection);
     }
     const uint64_t new_gen =
@@ -459,7 +459,7 @@ void Issuer::KickOffOidcDiscovery(size_t dispatcher_index, uint64_t generation) 
             // Mode-gated readiness. Each branch decides ready_ from the
             // field its mode actually consults; the other endpoint is
             // advisory.
-            if (self->mode_ == "introspection") {
+            if (self->mode_ == kModeIntrospection) {
                 if (introspection_endpoint.empty()) {
                     logging::Get()->warn(
                         "Issuer not-ready: introspection mode but discovery "

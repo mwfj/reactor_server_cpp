@@ -333,6 +333,10 @@ These are tracked in §16 of the design spec:
 - **No token revocation hook.** A compromised token is valid until `exp`. Keep `leeway_sec` small and TTLs short.
 - **`on_undetermined: allow` is a knowingly-lax degraded mode.** It exists for rollout / observability; don't run it long-term.
 - **JWKS cache is per-issuer, process-local.** Multiple gateway instances each fetch independently; if that's a problem for your IdP's rate limits, front it with a shared cache.
+- **`client_secret` rotation is restart-required.** The introspection client_secret is read from the env var named by `client_secret_env` ONCE at issuer start. Changing the env var value at runtime (e.g. via `setenv`) and SIGHUPing does NOT re-read it; the running process keeps the old secret. The validator only rejects a CHANGE TO THE ENV-VAR NAME on reload — it has no visibility into the value. Plan rotations as a process restart.
+- **`negative_cache_sec: 0` disables negative caching.** Every `active: false` IdP response then re-hits the IdP on the next request for the same token. For high-throughput attack patterns (token-fuzzing) this can DoS your IdP via the gateway. Keep `negative_cache_sec >= 5` in production.
+- **Bearer token size cap is 8 KiB.** Tokens longer than 8192 bytes are rejected with 401 / `invalid_request` before any verification work runs. JWT mode and introspection mode share this cap; it is not currently a config knob. If you need bigger tokens (e.g. unusual SAML-style assertions), open an issue.
+- **Async-route + introspection cache miss returns 503 + Retry-After.** The async-route dispatch path (proxy routes, `RouteAsync`-registered handlers) can only run synchronously-completing async middleware in this release. Cache hits / negative hits / sync DENY all work normally. A first request to a new-to-cache token under introspection mode gets a 503; the next request hits the populated cache and succeeds. JWT mode is unaffected. Sync routes (`Get`, `Post`, etc.) support the full deferred-suspend path.
 
 ---
 

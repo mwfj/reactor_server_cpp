@@ -5,6 +5,13 @@
 
 namespace AUTH_NAMESPACE {
 
+// Mode discriminator string values for IssuerConfig::mode. Bare-string
+// comparisons to "jwt" / "introspection" appear in many sites (issuer.cc,
+// auth_manager.cc, config_loader.cc); centralise here so a typo at one site
+// fails to compile rather than silently misbehaving.
+inline constexpr const char* kModeJwt = "jwt";
+inline constexpr const char* kModeIntrospection = "introspection";
+
 // ---------------------------------------------------------------------------
 // Introspection-mode config (RFC 7662 token introspection).
 // ---------------------------------------------------------------------------

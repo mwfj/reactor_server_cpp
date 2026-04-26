@@ -2963,6 +2963,51 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     return;  // Sync send path below runs auto-send
                 }
 
+                // Run async middleware (e.g. OAuth introspection) BEFORE the
+                // async handler so proxy routes registered via RouteAsync
+                // are protected. The async-handler state machine below is
+                // tightly coupled to the dispatch frame and can't host a
+                // suspend/resume trampoline without a substantial refactor;
+                // here we only support the SYNCHRONOUS-completion path.
+                // Cache-hit / negative-hit / sync-DENY all pass through
+                // immediately — only a cache miss that would actually fire
+                // a network POST gets rejected with 503 + Retry-After. The
+                // operator sees a clean failure (and a one-shot increment
+                // of the introspection_undetermined counter) instead of a
+                // silent auth bypass. Subsequent requests that hit the
+                // populated cache succeed normally.
+                {
+                    std::shared_ptr<HttpRouter::AsyncPendingState> mw_state;
+                    bool mw_sync_complete = router_.RunAsyncMiddleware(
+                        request, response, mw_state);
+                    if (!mw_sync_complete) {
+                        // Best-effort cancel so the in-flight POST doesn't
+                        // produce a useless network round-trip. The state's
+                        // resume callback was never armed, so the deferred
+                        // completion is a no-op when it fires.
+                        if (mw_state) mw_state->TripCancel();
+                        response = HttpResponse();
+                        response.Status(503)
+                                .Header("Retry-After", "1")
+                                .Header("Cache-Control", "no-store")
+                                .Text("authentication unavailable on async route — retry");
+                        if (!server_ready_.load(std::memory_order_acquire)) {
+                            response.Header("Connection", "close");
+                        }
+                        return;
+                    }
+                    if (mw_state &&
+                        mw_state->sync_result() ==
+                            HttpRouter::AsyncMiddlewareResult::DENY) {
+                        // Sync DENY path — response was populated by the
+                        // middleware (401 / 403 / 503 builder).
+                        if (!server_ready_.load(std::memory_order_acquire)) {
+                            response.Header("Connection", "close");
+                        }
+                        return;
+                    }
+                }
+
                 // BeginAsyncResponse must see the ORIGINAL request so
                 // deferred_was_head_ captures the real client method —
                 // CompleteAsyncResponse uses it to strip the body at send
@@ -3980,6 +4025,33 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     HttpRouter::FillDefaultRejectionResponse(response);
                     return;
                 }
+
+                // See H1 path above for the rationale on this sync-only
+                // gate. Cache hits / negative hits / sync-DENY all work;
+                // a cache miss that would actually fire a network POST
+                // gets a clean 503 + Retry-After instead of a silent auth
+                // bypass. Subsequent requests that hit the populated cache
+                // succeed normally.
+                {
+                    std::shared_ptr<HttpRouter::AsyncPendingState> mw_state;
+                    bool mw_sync_complete = router_.RunAsyncMiddleware(
+                        request, response, mw_state);
+                    if (!mw_sync_complete) {
+                        if (mw_state) mw_state->TripCancel();
+                        response = HttpResponse();
+                        response.Status(503)
+                                .Header("Retry-After", "1")
+                                .Header("Cache-Control", "no-store")
+                                .Text("authentication unavailable on async route — retry");
+                        return;
+                    }
+                    if (mw_state &&
+                        mw_state->sync_result() ==
+                            HttpRouter::AsyncMiddlewareResult::DENY) {
+                        return;
+                    }
+                }
+
                 response.Defer();
 
                 auto mw_headers = response.GetHeaders();

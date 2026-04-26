@@ -14,6 +14,7 @@ struct AuthContext {
     std::string issuer;                                   // Validated `iss` claim
     std::string subject;                                  // Validated `sub` claim
     std::vector<std::string> scopes;                      // From `scope` (space-sep) or `scp` (array)
+    std::vector<std::string> audiences;                   // Validated `aud` (string-or-array, see RFC 7519 §4.1.3)
     std::map<std::string, std::string> claims;            // Operator-selected claims (claims_to_headers source)
     std::string policy_name;                              // Matched policy's name (observability)
 

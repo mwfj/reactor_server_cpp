@@ -1590,26 +1590,20 @@ void ConfigLoader::ValidateHotReloadable(
         }
     }
 
-    // Auth hot-reloadable field validation. Mirrors the per-issuer range and
-    // format checks in Validate(), but scoped to fields that AuthManager::Reload
-    // and Issuer::ApplyReload actually write into live state. Topology-restart
-    // fields (issuer_url, mode, upstream, discovery) are excluded — they are
-    // rejected by Issuer::ApplyReload before touching live state.
+    // Auth hot-reloadable field validation. Two-pass scoping so structural
+    // input validation (range / format / allowlist) fires for EVERY staged
+    // issuer regardless of live state, while live-state-dependent checks
+    // (none in this block today, but reserved for future cross-state checks)
+    // can stay live-scoped.
     //
-    // Scoping: only validate issuers that EXIST in the running AuthManager.
-    // A new/renamed issuer has no live peer to apply to and will be rejected
-    // as restart-required by AuthManager::Reload; failing the whole hot-
-    // reload on a typo in such a staged-only issuer would block unrelated
-    // live-safe edits (e.g. rate_limit tuning, CB thresholds). The full
-    // startup Validate catches those typos when the operator restarts.
-    // Empty live set means "no live auth runtime" — no apply path can
-    // touch these fields, skip the block entirely (same pattern as the
-    // live_upstream_names-scoped CB loop above). The `count(name) == 0`
-    // test naturally skips every entry when the set is empty.
+    // Why structural-checks-for-all: a staged-only issuer with
+    // `auth_style: "garbage"` or `shards: 5` (non-power-of-two) that passes
+    // SIGHUP only to fail at the next restart's Validate() is the exact
+    // "valid on SIGHUP, fails on restart" asymmetry the original gate was
+    // added to prevent. The operator should see the typo immediately. Live-
+    // safe edits in the same SIGHUP are still blocked (acceptable trade-off
+    // — operator fixes the typo and re-SIGHUPs).
     for (const auto& [name, ic] : config.auth.issuers) {
-        if (live_issuer_names.count(name) == 0) {
-            continue;
-        }
         const std::string ctx = "auth.issuers." + name;
         if (ic.leeway_sec < 0) {
             throw std::invalid_argument(ctx + ".leeway_sec must be >= 0");
@@ -1643,16 +1637,16 @@ void ConfigLoader::ValidateHotReloadable(
                     "HS*/none/PS*/auto are deferred per design spec §15)");
             }
         }
-        // Introspection-block input validation runs for both live-reloadable
-        // fields (cache_sec / negative_cache_sec / stale_grace_sec /
-        // max_entries / timeout_sec / auth_style) and restart-required
-        // fields (endpoint / client_id / client_secret_env / shards). The
-        // restart-required subset is preserved by Issuer::ValidateReload at
-        // apply time; we still reject malformed values here so the operator
-        // sees the typo on SIGHUP rather than at the next restart.
-        if (ic.mode == "introspection") {
+        // Introspection-block input validation runs for ALL staged issuers
+        // — structural correctness is independent of whether the issuer is
+        // live or staged-only. Restart-required fields (endpoint,
+        // client_id, client_secret_env, shards) are rejected at apply time
+        // by Issuer::ValidateReload; we still reject malformed values here
+        // so the operator sees the typo on SIGHUP rather than at restart.
+        if (ic.mode == AUTH_NAMESPACE::kModeIntrospection) {
             ValidateIntrospectionFields(ic.introspection, ctx, ic.discovery);
         }
+        (void)live_issuer_names;  // reserved for future live-state checks
     }
 
     // Auth.forward and top-level policy structural validation. These
@@ -2285,7 +2279,8 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     "IdP traffic is rejected for security)");
             }
             // Mode whitelist. `auto` mode is not supported.
-            if (ic.mode != "jwt" && ic.mode != "introspection") {
+            if (ic.mode != AUTH_NAMESPACE::kModeJwt &&
+                ic.mode != AUTH_NAMESPACE::kModeIntrospection) {
                 throw std::invalid_argument(
                     ctx + ".mode must be one of: \"jwt\", \"introspection\"");
             }
@@ -2373,7 +2368,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                         ctx + ": mode=\"jwt\" with discovery=false requires "
                         "a non-empty jwks_uri (static JWKS location)");
                 }
-            } else if (ic.mode == "introspection") {
+            } else if (ic.mode == AUTH_NAMESPACE::kModeIntrospection) {
                 ValidateIntrospectionFields(ic.introspection, ctx,
                                              ic.discovery);
             }
@@ -2423,7 +2418,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     "{}: mode=\"jwt\" but introspection.endpoint is set — "
                     "introspection config will be ignored", ctx);
             }
-            if (ic.mode == "introspection" && !ic.jwks_uri.empty()) {
+            if (ic.mode == AUTH_NAMESPACE::kModeIntrospection && !ic.jwks_uri.empty()) {
                 logging::Get()->warn(
                     "{}: mode=\"introspection\" but jwks_uri is set — "
                     "JWKS config will be ignored", ctx);
@@ -2449,7 +2444,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             for (const auto& iss_name : p.issuers) {
                 auto it = config.auth.issuers.find(iss_name);
                 if (it != config.auth.issuers.end() &&
-                    it->second.mode == "introspection") {
+                    it->second.mode == AUTH_NAMESPACE::kModeIntrospection) {
                     ++introspection_count;
                 }
             }

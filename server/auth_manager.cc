@@ -1,8 +1,10 @@
 #include "auth/auth_manager.h"
 
+#include "auth/auth_claims.h"
 #include "auth/auth_error_responses.h"
 #include "auth/introspection_cache.h"
 #include "auth/introspection_client.h"
+#include "auth/issuer.h"
 #include "auth/jwt_verifier.h"
 #include "auth/token_hasher.h"
 #include "auth/upstream_http_client.h"
@@ -18,6 +20,61 @@ namespace AUTH_NAMESPACE {
 namespace {
 
 static constexpr const char* kOnUndeterminedAllow = "allow";
+
+// Re-run policy + issuer claim checks against an already-populated
+// AuthContext. Used by:
+//   - cache hit / stale-hit paths in InvokeAsyncIntrospection (no body
+//     available; required_claim presence falls back to ctx.claims —
+//     string-typed required claims work, array/object-typed are skipped
+//     because PopulateFromPayload only flattens scalars into ctx.claims).
+//   - IntrospectionClient post-parse path (body available — the live
+//     POST result still goes through this same helper for symmetry,
+//     after PopulateFromPayload has copied required_claim names into
+//     ctx.claims via the augmented claim_keys list).
+//
+// Audience: policy.required_audience overrides; otherwise issuer
+// snap.audiences fallback (any-match). Empty on both sides → accept.
+//
+// Required claims: presence-only check against ctx.claims keys (matches
+// JWT-mode semantics — JwtVerifier checks payload.contains(c)). Cache
+// hits can only verify presence for scalar-typed claims; document the
+// limitation in docs/oauth2.md.
+//
+// Required scopes: HasRequiredScopes(ctx.scopes, policy.required_scopes).
+//
+// Returns Allow on pass; Deny401 on audience/required-claim fail; Deny403
+// on scope fail. Never throws — pure data access against ctx fields.
+VerifyResult RunPolicyAndIssuerClaimChecks(
+        const AuthPolicy& policy,
+        const IssuerSnapshot& snap,
+        const AuthContext& ctx) {
+    if (!policy.required_audience.empty()) {
+        if (!MatchesAudienceFromCtx(ctx, policy.required_audience)) {
+            return VerifyResult::InvalidToken("audience mismatch",
+                                                "audience_mismatch");
+        }
+    } else if (!snap.audiences.empty()) {
+        bool any_ok = false;
+        for (const auto& a : snap.audiences) {
+            if (MatchesAudienceFromCtx(ctx, a)) { any_ok = true; break; }
+        }
+        if (!any_ok) {
+            return VerifyResult::InvalidToken("audience mismatch",
+                                                "audience_mismatch");
+        }
+    }
+    for (const auto& c : snap.required_claims) {
+        if (ctx.claims.find(c) == ctx.claims.end()) {
+            return VerifyResult::InvalidToken("missing required claim",
+                                                "missing_required_claim");
+        }
+    }
+    if (!HasRequiredScopes(ctx.scopes, policy.required_scopes)) {
+        return VerifyResult::InsufficientScope("insufficient scope",
+                                                "insufficient_scope");
+    }
+    return VerifyResult::Allow();
+}
 
 // Build inline policies from live+new upstream lists: each inline
 // `proxy.auth` block with `enabled=true` implicitly registers a policy
@@ -423,7 +480,7 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
     // Introspection-mode policies are owned by the async adapter
     // (InvokeAsyncMiddleware). Pass through so the request reaches the
     // async chain; bearer extraction and issuer selection are re-run there.
-    if (chosen->mode() == "introspection") {
+    if (chosen->mode() == kModeIntrospection) {
         return true;
     }
 
@@ -677,7 +734,7 @@ void AuthManager::InvokeAsyncMiddleware(
     for (const auto& issuer_name : policy.issuers) {
         auto it = issuers_.find(issuer_name);
         if (it != issuers_.end() && it->second
-                && it->second->mode() == "introspection") {
+                && it->second->mode() == kModeIntrospection) {
             any_introspection = true;
             break;
         }
@@ -727,7 +784,7 @@ void AuthManager::InvokeAsyncMiddleware(
     }
 
     // JWT-mode policies were handled by the sync chain — pass through.
-    if (chosen->mode() != "introspection") {
+    if (chosen->mode() != kModeIntrospection) {
         sync_pass();
         return;
     }
@@ -831,6 +888,39 @@ void AuthManager::InvokeAsyncIntrospection(
 
     if (hit.state == IntrospectionCache::LookupState::Fresh && hit.active) {
         introspection_cache_hit_.fetch_add(1, std::memory_order_relaxed);
+        // Re-run the per-request policy + issuer claim checks against the
+        // cached ctx. The cache stores the IdP verdict (active=true) only;
+        // the gateway's policy verdict is per-(token, route) and MUST be
+        // recomputed on every hit so a positive entry cached under a
+        // permissive policy can't grant access on a stricter policy.
+        VerifyResult vr = RunPolicyAndIssuerClaimChecks(policy, snap, hit.ctx);
+        if (vr.outcome == VerifyOutcome::DENY_401) {
+            total_denied_.fetch_add(1, std::memory_order_relaxed);
+            logging::Get()->info(
+                "auth_deny route={} issuer={} reason={} policy={} cache=hit",
+                logging::SanitizePath(req.path),
+                logging::SanitizeLogValue(issuer_name),
+                vr.log_reason,
+                logging::SanitizeLogValue(policy.name));
+            resp = MakeUnauthorized(realm, vr.error_code, vr.error_description);
+            state->SetSyncResult(AsyncMiddlewareResult::DENY);
+            state->MarkCompletedSync();
+            return;
+        }
+        if (vr.outcome == VerifyOutcome::DENY_403) {
+            total_denied_.fetch_add(1, std::memory_order_relaxed);
+            logging::Get()->info(
+                "auth_deny route={} issuer={} reason={} policy={} cache=hit",
+                logging::SanitizePath(req.path),
+                logging::SanitizeLogValue(issuer_name),
+                vr.log_reason,
+                logging::SanitizeLogValue(policy.name));
+            resp = MakeForbidden(realm, vr.error_description,
+                                  policy.required_scopes);
+            state->SetSyncResult(AsyncMiddlewareResult::DENY);
+            state->MarkCompletedSync();
+            return;
+        }
         StampAuthContext(req, std::move(hit.ctx), issuer_name, policy.name,
                           raw_jwt_header, token);
         total_allowed_.fetch_add(1, std::memory_order_relaxed);
@@ -861,28 +951,15 @@ void AuthManager::InvokeAsyncIntrospection(
         return;
     }
 
-    // Stale-grace check before firing a POST. Positive entries inside
-    // [ttl, ttl + stale_grace_sec] are served as ALLOW so a sick IdP
-    // doesn't take live traffic down with it.
-    auto stale_hit = cache->LookupStale(key, now);
-    if (stale_hit.state == IntrospectionCache::LookupState::Stale
-            && stale_hit.active) {
-        introspection_stale_served_.fetch_add(1, std::memory_order_relaxed);
-        StampAuthContext(req, std::move(stale_hit.ctx), issuer_name,
-                          policy.name, raw_jwt_header, token);
-        total_allowed_.fetch_add(1, std::memory_order_relaxed);
-        if (auto lg = logging::Get();
-                lg->should_log(spdlog::level::debug)) {
-            lg->debug("auth_allow route={} issuer={} policy={} cache=stale",
-                      logging::SanitizePath(req.path),
-                      logging::SanitizeLogValue(issuer_name),
-                      logging::SanitizeLogValue(policy.name));
-        }
-        state->SetSyncResult(AsyncMiddlewareResult::PASS);
-        state->MarkCompletedSync();
-        return;
-    }
-
+    // Stale-serve is NOT short-circuited pre-POST: an unconditional pre-POST
+    // serve would widen revocation latency by up to stale_grace_sec even
+    // when the IdP is healthy. Instead, every cache miss fires the live
+    // POST; the upstream's circuit breaker short-circuits to UNDETERMINED
+    // when the IdP is sick (returns `error=circuit_open` without an HTTP
+    // round-trip), and the resume closure's UNDETERMINED branch falls back
+    // to LookupStale below. Net behavior matches the design intent ("skip
+    // the POST when known-degraded; serve fresh otherwise") without giving
+    // the auth subsystem direct visibility into CircuitBreakerManager.
     introspection_cache_miss_.fetch_add(1, std::memory_order_relaxed);
 
     // Snapshot every field the deferred completion may read INTO BY-VALUE
@@ -897,13 +974,28 @@ void AuthManager::InvokeAsyncIntrospection(
     const auto required_scopes = policy.required_scopes;
     const uint64_t gen = issuer->generation();
     AuthPolicy policy_copy = policy;
-    // Copy the pre-built claim_keys snapshot. Capturing fwd_snap by value
-    // would suffice but a small vector copy keeps the closure shape uniform
-    // (claim_keys passed by value into Verify).
+    // Copy the pre-built claim_keys snapshot, then UNION-IN every issuer
+    // required_claim name so PopulateFromPayload copies them into ctx.claims
+    // — making cache-hit RunPolicyAndIssuerClaimChecks able to verify
+    // presence without re-parsing the body. Linear de-dup: required_claims
+    // is typically <5 entries.
     std::vector<std::string> claim_keys;
     if (fwd_snap) {
         claim_keys = fwd_snap->claim_keys;
     }
+    for (const auto& rc : snap.required_claims) {
+        bool present = false;
+        for (const auto& k : claim_keys) {
+            if (k == rc) { present = true; break; }
+        }
+        if (!present) claim_keys.push_back(rc);
+    }
+    // Capture issuer-level audiences + required_claims into the closure so
+    // the post-parse re-check can enforce them (introspection_client.cc only
+    // checks policy.required_audience and policy.required_scopes; issuer
+    // fallback + required_claims are policy concerns layered here).
+    const std::vector<std::string> snap_audiences = snap.audiences;
+    const std::vector<std::string> snap_required_claims = snap.required_claims;
     if (req.dispatcher_index < 0) {
         logging::Get()->error(
             "InvokeAsyncIntrospection: req.dispatcher_index unset "
@@ -940,6 +1032,7 @@ void AuthManager::InvokeAsyncIntrospection(
     auto* total_deny_ptr = &total_denied_;
     auto* intro_ok_ptr = &introspection_ok_;
     auto* intro_fail_ptr = &introspection_fail_;
+    auto* intro_stale_ptr = &introspection_stale_served_;
 
     introspection_client_->Verify(
         weak_issuer, snap.introspection_endpoint,
@@ -950,7 +1043,8 @@ void AuthManager::InvokeAsyncIntrospection(
          sanitized_req_path, policy_name, on_undet, required_scopes,
          raw_jwt_header, retry_after_sec, token,
          total_undet_ptr, total_allow_ptr, total_deny_ptr,
-         intro_ok_ptr, intro_fail_ptr]
+         intro_ok_ptr, intro_fail_ptr, intro_stale_ptr,
+         policy_copy, snap_audiences, snap_required_claims]
         (IntrospectionClient::Result result) {
             AsyncMiddlewarePayload payload;
 
@@ -1054,6 +1148,47 @@ void AuthManager::InvokeAsyncIntrospection(
                             std::chrono::seconds{
                                 snap_now->introspection.negative_cache_sec});
                     }
+                } else if (result.vr.outcome == VerifyOutcome::UNDETERMINED) {
+                    // Live POST failed (timeout, circuit_open, 5xx, etc.) —
+                    // last-resort stale-serve from a positive entry within
+                    // grace, before producing the policy's UNDETERMINED
+                    // response. NEVER stale-serves negative entries
+                    // (LookupStale enforces that invariant). Re-run policy
+                    // checks against the stale ctx so cross-policy reuse
+                    // stays correct.
+                    auto stale = cache->LookupStale(
+                        key, std::chrono::steady_clock::now());
+                    if (stale.state == IntrospectionCache::LookupState::Stale
+                            && stale.active) {
+                        IssuerSnapshot snap_for_check;
+                        snap_for_check.audiences = snap_audiences;
+                        snap_for_check.required_claims = snap_required_claims;
+                        VerifyResult vr_stale = RunPolicyAndIssuerClaimChecks(
+                            policy_copy, snap_for_check, stale.ctx);
+                        if (vr_stale.outcome == VerifyOutcome::ALLOW) {
+                            result.vr = VerifyResult::Allow();
+                            result.ctx = std::move(stale.ctx);
+                            intro_stale_ptr->fetch_add(
+                                1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            }
+
+            // Layer issuer-level audience fallback + required_claims on top
+            // of IntrospectionClient's policy-only check. Cache write above
+            // already used the un-overridden ctx so cross-policy reuse stays
+            // intact — the override only affects THIS request's response.
+            // Skips stale-promoted ctx (already policy-checked above).
+            if (result.idp_active &&
+                result.vr.outcome == VerifyOutcome::ALLOW) {
+                IssuerSnapshot snap_for_check;
+                snap_for_check.audiences = snap_audiences;
+                snap_for_check.required_claims = snap_required_claims;
+                VerifyResult vr_full = RunPolicyAndIssuerClaimChecks(
+                    policy_copy, snap_for_check, result.ctx);
+                if (vr_full.outcome != VerifyOutcome::ALLOW) {
+                    result.vr = std::move(vr_full);
                 }
             }
 
@@ -1174,6 +1309,19 @@ void AuthManager::InvokeIntrospectionUncached(
     if (fwd_snap) {
         claim_keys = fwd_snap->claim_keys;
     }
+    // Augment with required_claim names so PopulateFromPayload copies them
+    // into ctx.claims (mirrors the InvokeAsyncIntrospection path — required
+    // for parity even though this entry has no cache lookup, since the cb
+    // runs the same RunPolicyAndIssuerClaimChecks layered re-check below).
+    for (const auto& rc : snap.required_claims) {
+        bool present = false;
+        for (const auto& k : claim_keys) {
+            if (k == rc) { present = true; break; }
+        }
+        if (!present) claim_keys.push_back(rc);
+    }
+    const std::vector<std::string> snap_audiences = snap.audiences;
+    const std::vector<std::string> snap_required_claims = snap.required_claims;
     if (req.dispatcher_index < 0) {
         logging::Get()->error(
             "InvokeIntrospectionUncached: req.dispatcher_index unset "
@@ -1213,7 +1361,8 @@ void AuthManager::InvokeIntrospectionUncached(
          sanitized_req_path, policy_name, on_undet, required_scopes,
          raw_jwt_header, retry_after_sec, token,
          total_undet_ptr, total_allow_ptr, total_deny_ptr,
-         intro_ok_ptr, intro_fail_ptr]
+         intro_ok_ptr, intro_fail_ptr,
+         policy_copy, snap_audiences, snap_required_claims]
         (IntrospectionClient::Result result) {
             AsyncMiddlewarePayload payload;
             auto build_undetermined = [&](std::string log_reason) {
@@ -1282,6 +1431,20 @@ void AuthManager::InvokeIntrospectionUncached(
 
             // No cache insert in the uncached path — that's the whole
             // point of falling here when TokenHasher::Hash failed.
+
+            // Layer issuer-level audience fallback + required_claims on top
+            // of IntrospectionClient's policy-only check.
+            if (result.idp_active &&
+                result.vr.outcome == VerifyOutcome::ALLOW) {
+                IssuerSnapshot snap_for_check;
+                snap_for_check.audiences = snap_audiences;
+                snap_for_check.required_claims = snap_required_claims;
+                VerifyResult vr_full = RunPolicyAndIssuerClaimChecks(
+                    policy_copy, snap_for_check, result.ctx);
+                if (vr_full.outcome != VerifyOutcome::ALLOW) {
+                    result.vr = std::move(vr_full);
+                }
+            }
 
             switch (result.vr.outcome) {
               case VerifyOutcome::ALLOW: {

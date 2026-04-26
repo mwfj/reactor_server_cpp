@@ -817,9 +817,14 @@ static bool TestTimeoutUndeterminedOrStaleServe() {
     // Wait for cache_sec=2 to expire (make the entry stale).
     std::this_thread::sleep_for(std::chrono::milliseconds(2500));
 
-    // Sub-test C: IdP is slow (delay > timer cadence 2 s); the expired positive
-    // entry is within stale_grace_sec=30 → stale-serve path fires → 200
-    // synchronously without waiting for the IdP.
+    // Sub-test C: IdP is slow (delay > timer cadence 2 s); the expired
+    // positive entry is within stale_grace_sec=30. The live POST fires
+    // first (no pre-POST short-circuit — that would widen revocation
+    // latency on a healthy IdP), times out around the cadence tick, and
+    // the resume closure's UNDETERMINED branch falls back to stale-serve
+    // → 200. Total elapsed includes the timeout window plus the stale
+    // fallback, but the response is still 200 (not 503) because the
+    // stale entry is positive and within grace.
     {
         MockIntrospectionServerNS::ResponseScript slow_script2;
         slow_script2.body = R"({"active":true})";
@@ -827,12 +832,13 @@ static bool TestTimeoutUndeterminedOrStaleServe() {
         mock.EnqueueResponse(slow_script2);
 
         auto start = std::chrono::steady_clock::now();
-        // on_undetermined=allow; stale-serve returns 200 before the IdP responds.
-        auto resp = SendHttp(runner.GetPort(), "/allow-path", "stale-token", "", 3500);
+        // on_undetermined=allow; stale-serve fires after the live POST
+        // times out, still returning 200.
+        auto resp = SendHttp(runner.GetPort(), "/allow-path", "stale-token", "", 5000);
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count();
-        // Stale-serve is synchronous — must complete well within 1 s.
-        if (elapsed > 2000) return false;
+        // Bounded by the timeout deadline + a small fallback overhead.
+        if (elapsed > 4000) return false;
         // Stale entry is positive, within stale_grace_sec → 200.
         if (ExtractStatus(resp) != 200) return false;
     }

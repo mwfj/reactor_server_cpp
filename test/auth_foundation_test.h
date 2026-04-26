@@ -2554,19 +2554,19 @@ void TestValidateHotReloadableIntrospectionFields() {
         })");
         expect_reload_pass(good_cfg, {"x"}, {"live-idp"}, "valid live config");
 
-        // Positive: staged-only issuer skipped — even with bogus auth_style,
-        // ValidateHotReloadable does not run the introspection check when
-        // live_issuer_names is empty (no apply path for this issuer).
+        // Negative: structural input validation now fires for ALL staged
+        // issuers regardless of live state — closes the prior asymmetry
+        // where a typo passed SIGHUP and surfaced only at next restart.
+        // Same payload tested in both the staged-only and live cases.
         ServerConfig staged_only_bad = build_cfg_with_block(R"({
             "endpoint": "https://live.example/introspect",
             "client_id": "c",
             "client_secret_env": "E",
             "auth_style": "garbage"
         })");
-        expect_reload_pass(staged_only_bad, {"x"}, /*live_issuers=*/{},
-                            "staged-only issuer skipped");
-
-        // Negative: live-reloadable field — invalid auth_style.
+        expect_reload_throw(staged_only_bad, {"x"}, /*live_issuers=*/{},
+                             "introspection.auth_style must be \"basic\" or \"body\"",
+                             "staged-only: bad auth_style rejected at SIGHUP");
         expect_reload_throw(staged_only_bad, {"x"}, {"live-idp"},
                              "introspection.auth_style must be \"basic\" or \"body\"",
                              "live: bad auth_style");

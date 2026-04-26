@@ -391,8 +391,18 @@ void IntrospectionClient::Verify(
         uint64_t generation,
         DoneCallback cb,
         std::shared_ptr<std::atomic<bool>> cancel_token) {
+    // Programmer-error guard: the AsyncPendingState always-Complete contract
+    // depends on cb invoking state->Complete; a null cb would orphan the
+    // suspended request until the heartbeat safety-cap fires. Fail loudly
+    // here so the misuse surfaces in tests / staging rather than as a leak.
+    if (!cb) {
+        logging::Get()->error(
+            "IntrospectionClient::Verify called with null DoneCallback "
+            "— suspended request would orphan; rejecting at entry");
+        return;
+    }
     auto deliver = [&](Result r) {
-        if (cb) cb(std::move(r));
+        cb(std::move(r));
     };
 
     if (!client_) {

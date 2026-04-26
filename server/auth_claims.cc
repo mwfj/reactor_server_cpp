@@ -90,6 +90,7 @@ bool PopulateFromPayload(const nlohmann::json& payload,
     ctx.issuer.clear();
     ctx.subject.clear();
     ctx.scopes.clear();
+    ctx.audiences.clear();
     ctx.claims.clear();
 
     if (!payload.is_object()) return false;
@@ -123,6 +124,23 @@ bool PopulateFromPayload(const nlohmann::json& payload,
         ctx.subject = payload["sub"].get<std::string>();
     }
     ctx.scopes = ExtractScopes(payload);
+
+    // Extract `aud` (string OR array per RFC 7519 §4.1.3 / RFC 7662 §2.2)
+    // into ctx.audiences so cache-hit policy checks can re-evaluate against
+    // the validated audience list without a second body parse. Bare-string
+    // aud becomes a 1-element vector; array aud copies string elements only
+    // (non-string entries silently dropped — same defensive shape as
+    // claim extraction below).
+    if (payload.contains("aud")) {
+        const auto& a = payload["aud"];
+        if (a.is_string()) {
+            ctx.audiences.push_back(a.get<std::string>());
+        } else if (a.is_array()) {
+            for (const auto& e : a) {
+                if (e.is_string()) ctx.audiences.push_back(e.get<std::string>());
+            }
+        }
+    }
 
     // Copy only operator-requested claims into ctx.claims, to keep the
     // context object small and to limit the data that flows into logs.
@@ -185,6 +203,14 @@ bool MatchesAudience(const nlohmann::json& payload,
         for (const auto& v : aud) {
             if (v.is_string() && v.get<std::string>() == required) return true;
         }
+    }
+    return false;
+}
+
+bool MatchesAudienceFromCtx(const AuthContext& ctx, const std::string& required) {
+    if (required.empty()) return true;
+    for (const auto& a : ctx.audiences) {
+        if (a == required) return true;
     }
     return false;
 }
