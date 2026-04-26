@@ -158,12 +158,14 @@ OidcDiscovery::OidcDiscovery(std::string issuer_name,
                               std::string issuer_url,
                               std::shared_ptr<UpstreamHttpClient> client,
                               std::string upstream_pool_name,
-                              int retry_sec)
+                              int retry_sec,
+                              bool requires_jwks_uri)
     : issuer_name_(std::move(issuer_name)),
       issuer_url_(std::move(issuer_url)),
       client_(std::move(client)),
       upstream_pool_name_(std::move(upstream_pool_name)),
       retry_sec_(retry_sec > 0 ? retry_sec : 30),
+      requires_jwks_uri_(requires_jwks_uri),
       ready_(std::make_shared<std::atomic<bool>>(false)),
       cancel_token_(std::make_shared<std::atomic<bool>>(false)) {
     logging::Get()->debug(
@@ -234,10 +236,11 @@ void OidcDiscovery::Start(size_t dispatcher_index,
     // Issuer::Start / reload.
     cycle_state_ = std::make_shared<CycleState>();
     std::weak_ptr<CycleState> weak_state = cycle_state_;
+    const bool requires_jwks_uri = requires_jwks_uri_;
     cycle_state_->run =
         [weak_state, issuer_name, issuer_url, pool_name, client_copy,
          dispatcher, retry_sec, generation, on_ready_cb, token,
-         ready_flag](size_t disp_index) {
+         ready_flag, requires_jwks_uri](size_t disp_index) {
             if (token->load(std::memory_order_acquire)) {
                 return;
             }
@@ -254,7 +257,8 @@ void OidcDiscovery::Start(size_t dispatcher_index,
             client_copy->Issue(
                 pool_name, disp_index, std::move(req),
                 [weak_state, issuer_name, issuer_url, dispatcher, retry_sec,
-                 generation, on_ready_cb, token, ready_flag, disp_index](
+                 generation, on_ready_cb, token, ready_flag, disp_index,
+                 requires_jwks_uri](
                         UpstreamHttpClient::Response resp) {
                     if (token->load(std::memory_order_acquire)) {
                         return;
@@ -287,18 +291,28 @@ void OidcDiscovery::Start(size_t dispatcher_index,
                     std::string reason;
                     ExtractEndpoints(resp.body, issuer_url,
                                      jwks_uri, intro_endpoint, reason);
-                    // Accept the response when EITHER endpoint is
-                    // populated. The mode-gate inside Issuer::
-                    // OnDiscoveryReady decides which is authoritative
-                    // (jwks_uri for JWT mode, introspection_endpoint for
-                    // introspection mode). Rejecting here on missing
-                    // jwks_uri permanently fails introspection-only
-                    // metadata that legitimately omits it.
-                    if (jwks_uri.empty() && intro_endpoint.empty()) {
+                    // Mode-aware acceptance:
+                    //   * JWT-mode issuers (`requires_jwks_uri`=true)
+                    //     MUST receive a usable jwks_uri before discovery
+                    //     is considered complete. A response with only
+                    //     introspection_endpoint can't satisfy a JWT issuer
+                    //     and we schedule_retry so a transient or later-
+                    //     fixed JWKS metadata response can land.
+                    //   * Introspection-mode issuers
+                    //     (`requires_jwks_uri`=false) accept introspection-
+                    //     only metadata on its own; jwks_uri is unused.
+                    //   * Either way, an empty body / fully-malformed
+                    //     response (both endpoints empty) is a hard fail.
+                    const bool both_empty = jwks_uri.empty() && intro_endpoint.empty();
+                    const bool jwt_needs_jwks_but_missing =
+                        requires_jwks_uri && jwks_uri.empty();
+                    if (both_empty || jwt_needs_jwks_but_missing) {
                         logging::Get()->warn(
                             "OIDC discovery parse failed issuer={} reason={} "
                             "retry_in={}s",
-                            issuer_name, reason, retry_sec);
+                            issuer_name,
+                            both_empty ? reason : "jwt_mode_missing_jwks_uri",
+                            retry_sec);
                         schedule_retry();
                         return;
                     }

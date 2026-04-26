@@ -106,9 +106,15 @@ Issuer::Issuer(const IssuerConfig& config,
         config.name, upstream_http_client_, jwks_cache_, upstream_,
         /*owner_generation=*/generation_);
     if (discovery_) {
+        // JWT-mode issuers REQUIRE a usable jwks_uri from discovery —
+        // otherwise the verifier has no keys. Introspection-mode issuers
+        // don't use jwks_uri at all and accept introspection-only metadata.
+        // The flag flows through to OidcDiscovery's accept gate so JWT
+        // issuers keep retrying when transient metadata omits jwks_uri.
+        const bool requires_jwks_uri = (mode_ != kModeIntrospection);
         oidc_discovery_ = std::make_unique<OidcDiscovery>(
             config.name, issuer_url_, upstream_http_client_, upstream_,
-            config.discovery_retry_sec);
+            config.discovery_retry_sec, requires_jwks_uri);
     }
     logging::Get()->debug(
         "Issuer constructed name={} issuer_url={} mode={} upstream={} "

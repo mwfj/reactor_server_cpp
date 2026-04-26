@@ -54,23 +54,32 @@ void AsyncPendingState::ArmResume(
 }
 
 void AsyncPendingState::TripCancel() {
-    if (bookkeeping_done_.exchange(true, std::memory_order_acq_rel)) return;
+    cancelled_.store(true, std::memory_order_release);
 
-    // Decrement under mu_ so the read of active_counter_ is synchronized
-    // with the unlock that ended ArmResume's critical section. On the
-    // pre-ArmResume path active_counter_ is null — skip the fetch_sub
-    // (the original stack RequestGuard is still armed and will fire on
-    // scope exit).
+    // Bookkeeping is gated independently from cancel-cb firing. Two cases:
+    //
+    //   (a) active_counter_ was wired by ArmResume before us — claim the
+    //       bookkeeping one-shot and decrement now. A subsequent
+    //       DecrementOnce from the resume path no-ops.
+    //   (b) ArmResume hasn't run yet — leave bookkeeping_done_ unset so
+    //       the eventual DecrementOnce (when resume_cb fires post-ArmResume)
+    //       can claim the slot and decrement. The dispatch caller releases
+    //       the original RequestGuard right after ArmResume, so without
+    //       this deferral the counter would leak: TripCancel would have
+    //       claimed bookkeeping_done_=true with no counter wired, the
+    //       guard would release without decrementing, and DecrementOnce
+    //       would no-op.
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (active_counter_) {
+        if (active_counter_ &&
+            !bookkeeping_done_.exchange(true, std::memory_order_acq_rel)) {
             active_counter_->fetch_sub(1, std::memory_order_relaxed);
         }
     }
-    cancelled_.store(true, std::memory_order_release);
 
-    // Fire cancel_cb_ exactly once — move out under the lock first so a
-    // throwing cancel hook cannot be re-entered.
+    // Cancel callback fires exactly once via its own dedicated one-shot.
+    // Move it out under the lock to keep a throwing hook from re-entering.
+    if (cancel_fired_.exchange(true, std::memory_order_acq_rel)) return;
     std::function<void()> local;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -784,17 +793,22 @@ void HttpRouter::PopulateRouteParams(const HttpRequest& request) {
     // the route trie BEFORE middleware; the new RunMiddleware →
     // RunAsyncMiddleware → DispatchHandler split lost that ordering.
     //
-    // Critically, this function MUST NOT clear request.params before the
-    // sync-trie lookup. The H1/H2 async-route dispatch sites call
-    // GetAsyncHandler() — which populates request.params from the async
-    // trie — BEFORE invoking RunMiddleware. Clearing here would wipe the
-    // async-route's :param captures (proxy strip_prefix path, async
-    // RouteAsync :id, etc.) and break the user handler.
+    // SHORT-CIRCUIT when params are already populated: the H1/H2 async-
+    // route dispatch sites call GetAsyncHandler() (which populates
+    // request.params from the async trie) BEFORE invoking RunMiddleware.
+    // If the same path also matches a sync route (e.g. async `/api/*rest`
+    // catch-all + sync `/api/users` literal), overwriting from the sync
+    // trie would wipe the async-route's :param captures and break the
+    // proxy strip_prefix / user-handler captures. Per-route shape conflicts
+    // are pre-screened by HasAsyncRouteConflict / HasSyncRouteConflict
+    // at registration; co-existing routes with different shapes hit this
+    // exact case at dispatch time.
     //
-    // DispatchHandler later clears + re-populates from the sync trie
-    // exclusively, so this best-effort populate is safe to overlap with
-    // an already-populated set: a sync-trie match overwrites; a miss is
-    // a no-op.
+    // The sync-only path always reaches this function with empty params
+    // (default-constructed HttpRequest, or cleared upstream by HCH between
+    // pipelined requests), so the guard short-circuits only for the
+    // already-populated async-route case.
+    if (!request.params.empty()) return;
     auto it = method_tries_.find(request.method);
     if (it == method_tries_.end()) return;
     std::unordered_map<std::string, std::string> params;

@@ -24,11 +24,19 @@ class UpstreamHttpClient;
 // ---------------------------------------------------------------------------
 class OidcDiscovery {
  public:
+    // `requires_jwks_uri`: when true (JWT-mode issuers), the discovery
+    // loop schedules a retry on metadata that omits or fails to validate
+    // jwks_uri (even when introspection_endpoint is present). When false
+    // (introspection-mode issuers), introspection-only metadata is
+    // accepted on its own. Mismatch with the issuer's actual mode would
+    // either retry forever (false-positive jwks requirement) or accept
+    // incomplete metadata (false-negative jwks requirement).
     OidcDiscovery(std::string issuer_name,
                    std::string issuer_url,
                    std::shared_ptr<UpstreamHttpClient> client,
                    std::string upstream_pool_name,
-                   int retry_sec);
+                   int retry_sec,
+                   bool requires_jwks_uri);
     ~OidcDiscovery();
 
     OidcDiscovery(const OidcDiscovery&) = delete;
@@ -82,6 +90,7 @@ class OidcDiscovery {
     std::shared_ptr<UpstreamHttpClient> client_;
     std::string upstream_pool_name_;
     int retry_sec_;
+    bool requires_jwks_uri_;
     // Both flags are held as shared_ptr<atomic<bool>> so that delayed-retry
     // closures can safely access them after ~OidcDiscovery runs. Raw pointer
     // captures (e.g. `&ready_`) would be UAF if the object is destroyed while

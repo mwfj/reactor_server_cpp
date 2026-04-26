@@ -85,8 +85,14 @@ private:
     std::function<void()> cancel_cb_;
     std::shared_ptr<std::atomic<int64_t>> active_counter_;
 
-    // Bookkeeping (lock-free one-shot).
+    // Bookkeeping (lock-free one-shot). bookkeeping_done_ guards the
+    // active_requests_ decrement; cancel_fired_ guards the cancel_cb_
+    // invocation. They are separate one-shots because TripCancel may
+    // legitimately run BEFORE ArmResume wires active_counter_, in which
+    // case the cancel_cb_ must still fire exactly once but bookkeeping
+    // must wait for a later DecrementOnce to do the decrement.
     std::atomic<bool> bookkeeping_done_{false};
+    std::atomic<bool> cancel_fired_{false};
     std::atomic<bool> cancelled_{false};
 };
 
