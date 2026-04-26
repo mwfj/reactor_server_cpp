@@ -774,8 +774,31 @@ void AuthManager::InvokeAsyncMiddleware(
             return;
         }
     } else if (!policy.issuers.empty()) {
-        auto it = issuers_.find(policy.issuers.front());
-        if (it != issuers_.end()) chosen = it->second.get();
+        // Opaque token (no peekable `iss`) — must be an introspection
+        // candidate. Prefer the FIRST introspection-mode issuer in
+        // policy.issuers order; falling back to policy.issuers.front()
+        // would route opaque tokens to a JWT-mode issuer in mixed-mode
+        // policies (which then deny because the JWT path can't decode
+        // them). The sync chain already returned PASS for this request
+        // because the JWT path treats undecodable tokens as not-its-job;
+        // the async chain MUST pick an introspection issuer so the IdP
+        // gets the chance to validate.
+        for (const auto& issuer_name : policy.issuers) {
+            auto it = issuers_.find(issuer_name);
+            if (it == issuers_.end() || !it->second) continue;
+            if (it->second->mode() == kModeIntrospection) {
+                chosen = it->second.get();
+                break;
+            }
+        }
+        // No introspection issuer in the policy — fall back to the first
+        // entry. The mode-gate below converts this to a sync_pass (JWT
+        // path owns the verdict on mixed-mode policies with no
+        // introspection issuer eligible).
+        if (!chosen) {
+            auto it = issuers_.find(policy.issuers.front());
+            if (it != issuers_.end()) chosen = it->second.get();
+        }
     }
     if (!chosen) {
         // Shouldn't happen under a validated policy, but stay self-contained.

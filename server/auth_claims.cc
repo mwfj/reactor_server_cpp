@@ -6,6 +6,16 @@ namespace AUTH_NAMESPACE {
 
 namespace {
 
+// Sentinel value written into ctx.claims when a claim is non-scalar
+// (array / object). Lets RunPolicyAndIssuerClaimChecks's presence test
+// (`ctx.claims.find(c) != end`) match JWT-mode `payload.contains(c)`
+// semantics — a `groups: ["admin"]` claim is "present" for required_claims
+// even though the value isn't a scalar that can be flattened into a
+// header. Operators who need the value (not just presence) must list the
+// claim under `forward.claims_to_headers`, where the HeaderRewriter is
+// responsible for the array→header serialization choice.
+constexpr const char* kNonScalarSentinel = "<present>";
+
 std::vector<std::string> SplitWhitespace(const std::string& s) {
     // operator>>(istream&, string&) skips leading whitespace and reads a
     // non-empty run of non-whitespace characters — it cannot produce an
@@ -172,8 +182,15 @@ bool PopulateFromPayload(const nlohmann::json& payload,
             ctx.claims[key] = std::to_string(v.get<double>());
         } else if (v.is_boolean()) {
             ctx.claims[key] = v.get<bool>() ? "true" : "false";
+        } else if (!v.is_null()) {
+            // Non-scalar (array / object): record presence with a sentinel
+            // so RunPolicyAndIssuerClaimChecks's
+            // ctx.claims.find(c) presence test matches JWT mode's
+            // payload.contains(c) semantics. Common case is a `groups`
+            // claim shaped as an array. Loses type / value, but
+            // required_claims is a presence-only check by design.
+            ctx.claims[key] = kNonScalarSentinel;
         }
-        // Arrays/objects: skip — see comment above.
     }
     return true;
 }

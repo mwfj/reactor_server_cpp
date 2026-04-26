@@ -2981,11 +2981,22 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     bool mw_sync_complete = router_.RunAsyncMiddleware(
                         request, response, mw_state);
                     if (!mw_sync_complete) {
-                        // Best-effort cancel so the in-flight POST doesn't
-                        // produce a useless network round-trip. The state's
-                        // resume callback was never armed, so the deferred
-                        // completion is a no-op when it fires.
-                        if (mw_state) mw_state->TripCancel();
+                        // FIXME: tier-2 follow-up — wire the async-handler
+                        // dispatch through the same ArmResume trampoline
+                        // sync routes use, so cache-miss requests resume
+                        // into the user handler instead of being 503'd.
+                        //
+                        // Cache-warmup-friendly fallback: do NOT TripCancel
+                        // the in-flight introspection POST. Letting it
+                        // complete populates the IntrospectionCache so the
+                        // next request for the same token gets a hit. The
+                        // mw_state's resume_cb was never armed, so when
+                        // Complete fires it just stores the payload in
+                        // result_slot_ and returns; the state's shared_ptr
+                        // ref count drops with the closure and the slot is
+                        // destroyed unused. Counter-pollution in payload's
+                        // finalizer is a non-issue because the finalizer
+                        // never runs.
                         response = HttpResponse();
                         response.Status(503)
                                 .Header("Retry-After", "1")
@@ -4033,11 +4044,14 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 // bypass. Subsequent requests that hit the populated cache
                 // succeed normally.
                 {
+                    // FIXME: tier-2 follow-up — see H1 path above for
+                    // the same gap. Cache-miss requests are 503'd; the
+                    // in-flight POST is allowed to complete so the
+                    // cache populates for subsequent requests.
                     std::shared_ptr<HttpRouter::AsyncPendingState> mw_state;
                     bool mw_sync_complete = router_.RunAsyncMiddleware(
                         request, response, mw_state);
                     if (!mw_sync_complete) {
-                        if (mw_state) mw_state->TripCancel();
                         response = HttpResponse();
                         response.Status(503)
                                 .Header("Retry-After", "1")

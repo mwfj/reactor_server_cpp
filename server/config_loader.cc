@@ -1646,7 +1646,6 @@ void ConfigLoader::ValidateHotReloadable(
         if (ic.mode == AUTH_NAMESPACE::kModeIntrospection) {
             ValidateIntrospectionFields(ic.introspection, ctx, ic.discovery);
         }
-        (void)live_issuer_names;  // reserved for future live-state checks
     }
 
     // Auth.forward and top-level policy structural validation. These

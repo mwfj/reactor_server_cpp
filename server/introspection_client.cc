@@ -121,11 +121,20 @@ std::string IntrospectionClient::UrlEncode(const std::string& in) {
 std::string IntrospectionClient::BuildAuthorizationHeaderBasic(
         const std::string& client_id,
         const std::string& client_secret) {
+    // RFC 6749 §2.3.1: client_id and client_secret MUST be
+    // application/x-www-form-urlencoded BEFORE concatenation with `:` and
+    // base64-encoding. Without this, credentials containing reserved
+    // characters (`:`, `%`, `&`, `=`, `+`, etc.) would be sent as bytes
+    // that the IdP cannot recover the original credentials from. The form-
+    // encoding is reversible by the IdP (which percent-decodes after
+    // base64-decoding and splitting on `:`).
+    const std::string encoded_id     = UrlEncode(client_id);
+    const std::string encoded_secret = UrlEncode(client_secret);
     std::string credentials;
-    credentials.reserve(client_id.size() + 1 + client_secret.size());
-    credentials.append(client_id);
+    credentials.reserve(encoded_id.size() + 1 + encoded_secret.size());
+    credentials.append(encoded_id);
     credentials.push_back(':');
-    credentials.append(client_secret);
+    credentials.append(encoded_secret);
     std::string b64 = base64_util::EncodeNoNewline(credentials);
     if (b64.empty()) {
         return std::string();

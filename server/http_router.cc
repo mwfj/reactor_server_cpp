@@ -516,9 +516,14 @@ bool HttpRouter::RunAsyncMiddleware(
 
     out_state = std::make_shared<AsyncPendingState>();
 
-    // TODO: per-middleware state when multiple async middlewares are supported.
-    // See PrependAsyncMiddleware for the registration gate.
-    // The current iteration shares one state across the chain.
+    // FIXME: when multi-middleware support lands (today PrependAsyncMiddleware
+    // hard-rejects N>1 to enforce single-registration), each middleware must
+    // either get its own AsyncPendingState OR the loop must reset
+    // completed_sync/sync_result between iterations. Reusing the same state
+    // would silently overwrite the prior middleware's verdict on the next
+    // SetSyncResult call. The single-middleware contract makes today's reuse
+    // safe; the comment + greppable FIXME ensures future contributors fix
+    // the reuse before lifting the registration gate.
     for (const auto& mw : async_middlewares_) {
         mw(request, response, out_state);
         if (!out_state->completed_sync()) {
