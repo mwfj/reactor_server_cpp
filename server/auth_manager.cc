@@ -454,10 +454,26 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
             return false;
         }
     } else if (!policy.issuers.empty()) {
-        // No `iss` peek — fall back to the first allowed issuer; jwt-cpp's
-        // `with_issuer` will still enforce the claim match.
-        auto it = issuers_.find(policy.issuers.front());
-        if (it != issuers_.end()) chosen = it->second.get();
+        // No `iss` peek (opaque token, malformed JWT, etc.). For mixed-mode
+        // policies, prefer the first introspection-mode issuer so the
+        // sync chain passes through to the async chain (which validates
+        // opaque tokens against the IdP). Falling back to issuers.front()
+        // when front() is JWT-mode would cause JwtVerifier to reject the
+        // opaque token as malformed before the async chain ever runs.
+        for (const auto& issuer_name : policy.issuers) {
+            auto it = issuers_.find(issuer_name);
+            if (it == issuers_.end() || !it->second) continue;
+            if (it->second->mode() == kModeIntrospection) {
+                chosen = it->second.get();
+                break;
+            }
+        }
+        if (!chosen) {
+            // No introspection issuer in this policy — pure JWT-mode; fall
+            // back to front() and let jwt-cpp's `with_issuer` enforce.
+            auto it = issuers_.find(policy.issuers.front());
+            if (it != issuers_.end()) chosen = it->second.get();
+        }
     }
     if (!chosen) {
         // No issuer available (rare — policy was validated at load).
@@ -1081,11 +1097,17 @@ void AuthManager::InvokeAsyncIntrospection(
                     payload.result = AsyncMiddlewareResult::PASS;
                     payload.finalizer =
                         [issuer_name, policy_name, sanitized_req_path,
-                         log_reason, total_undet_ptr, intro_fail_ptr]
+                         log_reason, total_undet_ptr]
                         (const HttpRequest& r, HttpResponse&) {
+                        // intro_fail_ptr is incremented at the cache-
+                        // insert site for outcomes from a real IdP
+                        // roundtrip; drop-guard UNDETERMINED paths
+                        // (issuer_unavailable / reload_in_flight /
+                        // issuer_stopping) bypass the cache site by
+                        // design and intentionally do NOT count as
+                        // introspection_fail — those are issuer-state
+                        // failures, not IdP failures.
                         total_undet_ptr->fetch_add(
-                            1, std::memory_order_relaxed);
-                        intro_fail_ptr->fetch_add(
                             1, std::memory_order_relaxed);
                         logging::Get()->warn(
                             "auth_undetermined route={} issuer={} reason={} policy={}",
@@ -1104,11 +1126,9 @@ void AuthManager::InvokeAsyncIntrospection(
                     payload.finalizer =
                         [realm_local, retry_after_sec, issuer_name,
                          policy_name, sanitized_req_path, log_reason,
-                         total_undet_ptr, intro_fail_ptr]
+                         total_undet_ptr]
                         (const HttpRequest&, HttpResponse& rs) {
                         total_undet_ptr->fetch_add(
-                            1, std::memory_order_relaxed);
-                        intro_fail_ptr->fetch_add(
                             1, std::memory_order_relaxed);
                         logging::Get()->warn(
                             "auth_undetermined route={} issuer={} reason={} policy={}",
@@ -1215,6 +1235,28 @@ void AuthManager::InvokeAsyncIntrospection(
                 }
             }
 
+            // IdP-outcome counters fire HERE — AFTER the issuer-level
+            // re-check so the final result.vr.outcome is what gets
+            // counted. Critically, this fires REGARDLESS of whether the
+            // resume_cb is later armed; async-route warmup paths (which
+            // 503 the client and never run the finalizer) still increment
+            // intro_ok / intro_fail correctly. total_allowed_ /
+            // total_denied_ stay in the finalizer because those track
+            // CLIENT-VISIBLE verdicts (warmup is 503, not allow/deny).
+            //
+            // Semantics: intro_ok = final ALLOW; intro_fail = everything
+            // else (active:false → DENY_401, policy-scoped DENY_401/403,
+            // UNDETERMINED, malformed, 4xx/5xx, timeouts, circuit-open).
+            // Drop guards (issuer_unavailable / reload_in_flight /
+            // issuer_stopping) skip this site by their early return and
+            // intentionally do NOT count as intro_fail — those are
+            // issuer-state failures, not IdP failures.
+            if (result.vr.outcome == VerifyOutcome::ALLOW) {
+                intro_ok_ptr->fetch_add(1, std::memory_order_relaxed);
+            } else {
+                intro_fail_ptr->fetch_add(1, std::memory_order_relaxed);
+            }
+
             switch (result.vr.outcome) {
               case VerifyOutcome::ALLOW: {
                   payload.result = AsyncMiddlewareResult::PASS;
@@ -1222,8 +1264,10 @@ void AuthManager::InvokeAsyncIntrospection(
                   payload.finalizer =
                       [ctx = std::move(ctx), issuer_name, policy_name,
                        sanitized_req_path, raw_jwt_header, token,
-                       total_allow_ptr, intro_ok_ptr]
+                       total_allow_ptr]
                       (const HttpRequest& r, HttpResponse&) {
+                      // intro_ok_ptr already incremented at the post-
+                      // re-check site above so warmup paths still count.
                       AuthContext local_ctx = ctx;
                       local_ctx.policy_name = policy_name;
                       if (local_ctx.issuer.empty())
@@ -1233,8 +1277,6 @@ void AuthManager::InvokeAsyncIntrospection(
                       }
                       r.auth.emplace(std::move(local_ctx));
                       total_allow_ptr->fetch_add(
-                          1, std::memory_order_relaxed);
-                      intro_ok_ptr->fetch_add(
                           1, std::memory_order_relaxed);
                       if (auto lg = logging::Get();
                               lg->should_log(spdlog::level::debug)) {
@@ -1256,12 +1298,12 @@ void AuthManager::InvokeAsyncIntrospection(
                        desc = result.vr.error_description,
                        log_reason = result.vr.log_reason, issuer_name,
                        sanitized_req_path, policy_name,
-                       total_deny_ptr, intro_fail_ptr]
+                       total_deny_ptr]
                       (const HttpRequest&, HttpResponse& rs) {
+                      // intro_ok_ptr / intro_fail_ptr already incremented
+                      // at the cache-insert site above based on idp_active.
                       rs = MakeUnauthorized(realm_local, ec, desc);
                       total_deny_ptr->fetch_add(
-                          1, std::memory_order_relaxed);
-                      intro_fail_ptr->fetch_add(
                           1, std::memory_order_relaxed);
                       logging::Get()->info(
                           "auth_deny route={} issuer={} reason={} policy={}",
@@ -1279,12 +1321,12 @@ void AuthManager::InvokeAsyncIntrospection(
                        scopes = required_scopes, sanitized_req_path,
                        issuer_name, policy_name,
                        log_reason = result.vr.log_reason,
-                       total_deny_ptr, intro_fail_ptr]
+                       total_deny_ptr]
                       (const HttpRequest&, HttpResponse& rs) {
+                      // intro_ok_ptr already incremented at the cache-
+                      // insert site above (DENY_403 implies idp_active).
                       rs = MakeForbidden(realm_local, desc, scopes);
                       total_deny_ptr->fetch_add(
-                          1, std::memory_order_relaxed);
-                      intro_fail_ptr->fetch_add(
                           1, std::memory_order_relaxed);
                       logging::Get()->info(
                           "auth_deny route={} issuer={} reason={} policy={}",
@@ -1393,11 +1435,17 @@ void AuthManager::InvokeIntrospectionUncached(
                     payload.result = AsyncMiddlewareResult::PASS;
                     payload.finalizer =
                         [issuer_name, policy_name, sanitized_req_path,
-                         log_reason, total_undet_ptr, intro_fail_ptr]
+                         log_reason, total_undet_ptr]
                         (const HttpRequest& r, HttpResponse&) {
+                        // intro_fail_ptr is incremented at the cache-
+                        // insert site for outcomes from a real IdP
+                        // roundtrip; drop-guard UNDETERMINED paths
+                        // (issuer_unavailable / reload_in_flight /
+                        // issuer_stopping) bypass the cache site by
+                        // design and intentionally do NOT count as
+                        // introspection_fail — those are issuer-state
+                        // failures, not IdP failures.
                         total_undet_ptr->fetch_add(
-                            1, std::memory_order_relaxed);
-                        intro_fail_ptr->fetch_add(
                             1, std::memory_order_relaxed);
                         logging::Get()->warn(
                             "auth_undetermined route={} issuer={} reason={} policy={}",
@@ -1416,11 +1464,9 @@ void AuthManager::InvokeIntrospectionUncached(
                     payload.finalizer =
                         [realm_local, retry_after_sec, issuer_name,
                          policy_name, sanitized_req_path, log_reason,
-                         total_undet_ptr, intro_fail_ptr]
+                         total_undet_ptr]
                         (const HttpRequest&, HttpResponse& rs) {
                         total_undet_ptr->fetch_add(
-                            1, std::memory_order_relaxed);
-                        intro_fail_ptr->fetch_add(
                             1, std::memory_order_relaxed);
                         logging::Get()->warn(
                             "auth_undetermined route={} issuer={} reason={} policy={}",
@@ -1469,6 +1515,15 @@ void AuthManager::InvokeIntrospectionUncached(
                 }
             }
 
+            // IdP-outcome counters fire AFTER the layered re-check so the
+            // final outcome is what gets counted. Same warmup-friendly
+            // semantics as InvokeAsyncIntrospection above.
+            if (result.vr.outcome == VerifyOutcome::ALLOW) {
+                intro_ok_ptr->fetch_add(1, std::memory_order_relaxed);
+            } else {
+                intro_fail_ptr->fetch_add(1, std::memory_order_relaxed);
+            }
+
             switch (result.vr.outcome) {
               case VerifyOutcome::ALLOW: {
                   payload.result = AsyncMiddlewareResult::PASS;
@@ -1476,8 +1531,10 @@ void AuthManager::InvokeIntrospectionUncached(
                   payload.finalizer =
                       [ctx = std::move(ctx), issuer_name, policy_name,
                        sanitized_req_path, raw_jwt_header, token,
-                       total_allow_ptr, intro_ok_ptr]
+                       total_allow_ptr]
                       (const HttpRequest& r, HttpResponse&) {
+                      // intro_ok_ptr already counted at the cache-site
+                      // block above for parity with the cached path.
                       AuthContext local_ctx = ctx;
                       local_ctx.policy_name = policy_name;
                       if (local_ctx.issuer.empty())
@@ -1487,8 +1544,6 @@ void AuthManager::InvokeIntrospectionUncached(
                       }
                       r.auth.emplace(std::move(local_ctx));
                       total_allow_ptr->fetch_add(
-                          1, std::memory_order_relaxed);
-                      intro_ok_ptr->fetch_add(
                           1, std::memory_order_relaxed);
                       if (auto lg = logging::Get();
                               lg->should_log(spdlog::level::debug)) {
@@ -1510,12 +1565,10 @@ void AuthManager::InvokeIntrospectionUncached(
                        desc = result.vr.error_description,
                        log_reason = result.vr.log_reason, issuer_name,
                        sanitized_req_path, policy_name,
-                       total_deny_ptr, intro_fail_ptr]
+                       total_deny_ptr]
                       (const HttpRequest&, HttpResponse& rs) {
                       rs = MakeUnauthorized(realm_local, ec, desc);
                       total_deny_ptr->fetch_add(
-                          1, std::memory_order_relaxed);
-                      intro_fail_ptr->fetch_add(
                           1, std::memory_order_relaxed);
                       logging::Get()->info(
                           "auth_deny route={} issuer={} reason={} policy={}",
@@ -1533,12 +1586,10 @@ void AuthManager::InvokeIntrospectionUncached(
                        scopes = required_scopes, sanitized_req_path,
                        issuer_name, policy_name,
                        log_reason = result.vr.log_reason,
-                       total_deny_ptr, intro_fail_ptr]
+                       total_deny_ptr]
                       (const HttpRequest&, HttpResponse& rs) {
                       rs = MakeForbidden(realm_local, desc, scopes);
                       total_deny_ptr->fetch_add(
-                          1, std::memory_order_relaxed);
-                      intro_fail_ptr->fetch_add(
                           1, std::memory_order_relaxed);
                       logging::Get()->info(
                           "auth_deny route={} issuer={} reason={} policy={}",

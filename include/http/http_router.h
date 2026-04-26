@@ -191,6 +191,15 @@ public:
     AsyncHandler GetAsyncHandler(const HttpRequest& request,
                                  bool* head_fallback_out = nullptr) const;
 
+    // Populate request.params from the sync route trie BEFORE middleware
+    // runs, so param-aware middleware (e.g. authorize on /users/:id) sees
+    // captured values. Idempotent: DispatchHandler re-clears and
+    // re-populates before invoking the user handler. Called from inside
+    // RunMiddleware; exposed for callers that want to seed params for
+    // their own non-RunMiddleware paths (e.g. WS upgrades that consult
+    // params before the handshake).
+    void PopulateRouteParams(const HttpRequest& request);
+
     // Run middleware chain only (for WebSocket upgrades that need auth/CORS/etc.)
     // Returns true if all middleware passed, false if any short-circuited.
     bool RunMiddleware(const HttpRequest& request, HttpResponse& response);

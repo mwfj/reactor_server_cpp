@@ -777,7 +777,35 @@ bool HttpRouter::DispatchHandler(const HttpRequest& request, HttpResponse& respo
     return false;
 }
 
+void HttpRouter::PopulateRouteParams(const HttpRequest& request) {
+    // Restores the pre-phased-dispatch contract that middleware sees the
+    // route's :param values in request.params (e.g. /users/:id middleware
+    // can authorize on the captured `id`). The legacy Dispatch path called
+    // the route trie BEFORE middleware; the new RunMiddleware →
+    // RunAsyncMiddleware → DispatchHandler split lost that ordering.
+    //
+    // Critically, this function MUST NOT clear request.params before the
+    // sync-trie lookup. The H1/H2 async-route dispatch sites call
+    // GetAsyncHandler() — which populates request.params from the async
+    // trie — BEFORE invoking RunMiddleware. Clearing here would wipe the
+    // async-route's :param captures (proxy strip_prefix path, async
+    // RouteAsync :id, etc.) and break the user handler.
+    //
+    // DispatchHandler later clears + re-populates from the sync trie
+    // exclusively, so this best-effort populate is safe to overlap with
+    // an already-populated set: a sync-trie match overwrites; a miss is
+    // a no-op.
+    auto it = method_tries_.find(request.method);
+    if (it == method_tries_.end()) return;
+    std::unordered_map<std::string, std::string> params;
+    auto result = it->second.Search(request.path, params);
+    if (result.handler) {
+        request.params = std::move(params);
+    }
+}
+
 bool HttpRouter::RunMiddleware(const HttpRequest& request, HttpResponse& response) {
+    PopulateRouteParams(request);
     for (const auto& mw : middlewares_) {
         if (!mw(request, response)) {
             return false;

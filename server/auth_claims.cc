@@ -6,15 +6,14 @@ namespace AUTH_NAMESPACE {
 
 namespace {
 
-// Sentinel value written into ctx.claims when a claim is non-scalar
-// (array / object). Lets RunPolicyAndIssuerClaimChecks's presence test
-// (`ctx.claims.find(c) != end`) match JWT-mode `payload.contains(c)`
-// semantics — a `groups: ["admin"]` claim is "present" for required_claims
-// even though the value isn't a scalar that can be flattened into a
-// header. Operators who need the value (not just presence) must list the
-// claim under `forward.claims_to_headers`, where the HeaderRewriter is
-// responsible for the array→header serialization choice.
-constexpr const char* kNonScalarSentinel = "<present>";
+// Local alias for the public sentinel constant declared in auth_claims.h.
+// HeaderRewriter::ApplyIdentityInject MUST compare-and-skip this value
+// when iterating claims_to_headers so it is never emitted to upstream
+// services as a literal header value. Operators who need the value of
+// an array/object claim (not just presence) must list the claim under
+// forward.claims_to_headers AND wait for HeaderRewriter to grow native
+// array→header flattening — until then, the value is dropped silently.
+constexpr const char* kNonScalarSentinel = kNonScalarClaimSentinel;
 
 std::vector<std::string> SplitWhitespace(const std::string& s) {
     // operator>>(istream&, string&) skips leading whitespace and reads a

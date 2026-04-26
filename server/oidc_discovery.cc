@@ -86,12 +86,25 @@ void ExtractEndpoints(const std::string& body,
             reason = "issuer_mismatch";
             return;
         }
+        // jwks_uri is OPTIONAL at the extraction layer. Introspection-
+        // only OAuth metadata (mode=introspection issuers, opaque-token
+        // deployments) does not advertise a JWKS endpoint and would
+        // permanently fail if we rejected here. The Issuer::OnDiscoveryReady
+        // callback mode-gates which endpoint is the authoritative readiness
+        // signal (jwks_uri for JWT mode, introspection_endpoint for
+        // introspection mode); upstream callers that need both should check
+        // their own out fields.
         auto jwks_it = j.find("jwks_uri");
-        if (jwks_it == j.end() || !jwks_it->is_string()) {
-            reason = "missing_jwks_uri";
-            return;
+        if (jwks_it != j.end() && jwks_it->is_string()) {
+            out_jwks_uri = jwks_it->get<std::string>();
+            // Enforce https on jwks_uri when present.
+            if (!HasHttpsScheme(out_jwks_uri)) {
+                reason = "jwks_uri_not_https";
+                out_jwks_uri.clear();
+                // Don't return — an introspection-mode issuer might still
+                // be served by the introspection_endpoint below.
+            }
         }
-        out_jwks_uri = jwks_it->get<std::string>();
         auto intro_it = j.find("introspection_endpoint");
         if (intro_it != j.end() && intro_it->is_string()) {
             const auto candidate = intro_it->get<std::string>();
@@ -104,16 +117,15 @@ void ExtractEndpoints(const std::string& body,
                 out_introspection_endpoint = candidate;
             } else {
                 out_introspection_endpoint.clear();
-                reason = "introspection_endpoint_not_https";
+                if (reason.empty()) reason = "introspection_endpoint_not_https";
             }
         }
-        // Enforce https on jwks_uri to match the TLS-mandatory IdP policy.
-        // Case-insensitive scheme per RFC 3986 §3.1 — compliant IdPs may
-        // return `HTTPS://…` and shouldn't be rejected as plaintext.
-        if (!HasHttpsScheme(out_jwks_uri)) {
-            reason = "jwks_uri_not_https";
-            out_jwks_uri.clear();
-            return;
+        if (out_jwks_uri.empty() && out_introspection_endpoint.empty()
+                && reason.empty()) {
+            // Neither endpoint advertised AND no per-field error already
+            // set — preserve the original "nothing usable" signal so the
+            // discovery loop can retry.
+            reason = "missing_endpoints";
         }
     } catch (const nlohmann::json::exception& ex) {
         reason = "json_exception";
@@ -275,7 +287,14 @@ void OidcDiscovery::Start(size_t dispatcher_index,
                     std::string reason;
                     ExtractEndpoints(resp.body, issuer_url,
                                      jwks_uri, intro_endpoint, reason);
-                    if (jwks_uri.empty()) {
+                    // Accept the response when EITHER endpoint is
+                    // populated. The mode-gate inside Issuer::
+                    // OnDiscoveryReady decides which is authoritative
+                    // (jwks_uri for JWT mode, introspection_endpoint for
+                    // introspection mode). Rejecting here on missing
+                    // jwks_uri permanently fails introspection-only
+                    // metadata that legitimately omits it.
+                    if (jwks_uri.empty() && intro_endpoint.empty()) {
                         logging::Get()->warn(
                             "OIDC discovery parse failed issuer={} reason={} "
                             "retry_in={}s",

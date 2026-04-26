@@ -185,24 +185,44 @@ static void Test_BuildAuthorizationHeaderBasic_Standard() {
     }
 }
 
-// When client_id itself contains a colon, the credentials string becomes
-// "id:with:colon:secret" which is valid per RFC 7617 (the server splits on
-// the FIRST colon). The function should not crash or return empty.
+// RFC 6749 §2.3.1: client_id and client_secret MUST be
+// application/x-www-form-urlencoded BEFORE concatenation with `:` and
+// base64 encoding. A client_id containing `:` therefore becomes
+// "id%3Awith%3Acolon" → joined as "id%3Awith%3Acolon:secret" → base64'd.
+// This test pins the exact wire-format so a future regression that
+// re-introduces the raw-concat path is caught.
 static void Test_BuildAuthorizationHeaderBasic_ClientIdWithColon() {
     try {
         std::string hdr =
             IntrospectionClient::BuildAuthorizationHeaderBasic(
                 "id:with:colon", "secret");
-        // Must start with "Basic " and be non-empty past that.
-        bool ok = hdr.size() > 6 && hdr.substr(0, 6) == "Basic ";
-        // The credentials are NOT URL-encoded before Base64 per RFC 7617,
-        // so the colon passes through into the base64 payload. Document the
-        // actual behavior here for future maintainers.
+        // "id%3Awith%3Acolon:secret" base64 = "aWQlM0F3aXRoJTNBY29sb246c2VjcmV0"
+        const std::string expected =
+            "Basic aWQlM0F3aXRoJTNBY29sb246c2VjcmV0";
+        bool ok = (hdr == expected);
         Record("IntrospectionClient: BuildAuthorizationHeaderBasic_ClientIdWithColon",
                ok,
-               "client_id with ':' must not cause empty or crash (behavior is raw join)");
+               "client_id with ':' must percent-encode `:` as %3A before base64 (RFC 6749 §2.3.1)");
     } catch (const std::exception& e) {
         Record("IntrospectionClient: BuildAuthorizationHeaderBasic_ClientIdWithColon",
+               false, e.what());
+    }
+}
+
+// Reserved char in the secret too — colon, percent, ampersand, plus.
+// Pins the encoded form so a regression to raw-concat is caught.
+static void Test_BuildAuthorizationHeaderBasic_SecretWithReservedChars() {
+    try {
+        std::string hdr =
+            IntrospectionClient::BuildAuthorizationHeaderBasic("client", "p:s");
+        // "client:p%3As" base64 = "Y2xpZW50OnAlM0Fz"
+        const std::string expected = "Basic Y2xpZW50OnAlM0Fz";
+        bool ok = (hdr == expected);
+        Record("IntrospectionClient: BuildAuthorizationHeaderBasic_SecretWithReservedChars",
+               ok,
+               "client_secret reserved chars must percent-encode (RFC 6749 §2.3.1)");
+    } catch (const std::exception& e) {
+        Record("IntrospectionClient: BuildAuthorizationHeaderBasic_SecretWithReservedChars",
                false, e.what());
     }
 }
@@ -716,6 +736,7 @@ static void RunAllTests() {
     // BuildAuthorizationHeaderBasic
     Test_BuildAuthorizationHeaderBasic_Standard();
     Test_BuildAuthorizationHeaderBasic_ClientIdWithColon();
+    Test_BuildAuthorizationHeaderBasic_SecretWithReservedChars();
     Test_BuildAuthorizationHeaderBasic_EmptyCredentials();
 
     // ParseResponseSafe

@@ -1,6 +1,7 @@
 #include "upstream/header_rewriter.h"
 
 #include "auth/auth_config.h"
+#include "auth/auth_claims.h"
 #include "auth/auth_context.h"
 #include "log/logger.h"
 #include "net/dns_resolver.h"   // DnsResolver::FormatAuthority (§5.5.1)
@@ -181,6 +182,14 @@ void ApplyIdentityInject(
     for (const auto& [claim_name, header_name] : fwd.claims_to_headers) {
         auto it = ctx.claims.find(claim_name);
         if (it == ctx.claims.end()) continue;
+        // Skip the presence sentinel — PopulateFromPayload writes it for
+        // non-scalar (array/object) claims so required_claims presence
+        // checks match JWT-mode semantics. Emitting "<present>" verbatim
+        // to upstreams would be a regression vs the prior behavior of
+        // dropping non-scalar claims. Operators who need the actual
+        // value must wait for native array→header flattening in a future
+        // HeaderRewriter feature.
+        if (it->second == AUTH_NAMESPACE::kNonScalarClaimSentinel) continue;
         try_set(header_name, it->second);
     }
     // Only emit the raw token header when the operator asked for it AND
