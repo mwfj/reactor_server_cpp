@@ -332,6 +332,14 @@ bool Issuer::ApplyReload(const IssuerConfig& new_config, std::string& err_out) {
     if (jwks_cache_) {
         jwks_cache_->SetTtlSec(new_config.jwks_cache_sec);
     }
+    // Bump generation_ BEFORE clearing/touching the introspection cache.
+    // In-flight introspection completions captured the pre-reload `gen`
+    // and check `gen != issuer_strong->generation()` BEFORE writing into
+    // the cache; bumping first guarantees they take the
+    // `reload_in_flight` drop-guard path and never insert a stale entry
+    // (populated with the OLD claim_keys) AFTER our Clear() runs.
+    const uint64_t new_gen =
+        generation_->fetch_add(1, std::memory_order_release) + 1;
     if (mode_ == kModeIntrospection && introspection_cache_) {
         introspection_cache_->ApplyReload(new_config.introspection);
         // Existing positive entries were populated using the prior
@@ -348,8 +356,6 @@ bool Issuer::ApplyReload(const IssuerConfig& new_config, std::string& err_out) {
                 "(required_claims changed) issuer={}", name_);
         }
     }
-    const uint64_t new_gen =
-        generation_->fetch_add(1, std::memory_order_release) + 1;
     // If discovery is still in its retry cycle (pre-first-success), the
     // existing oidc_discovery_->Start callback captured the OLD generation.
     // Bumping generation_ without re-arming discovery wedges the issuer:

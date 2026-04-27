@@ -351,11 +351,26 @@ void AuthManager::CommitPolicyAndEnforcement(
     // forward.claim_keys changed — done AFTER the snapshot swap so any
     // concurrent cache-miss POST observes the new claim_keys via the
     // augmented `claim_keys` list InvokeAsyncIntrospection threads through.
-    // Lock-free walk: issuers_ is topology-stable post-construction
-    // (Reload preserves the existing map; topology changes are restart-
-    // required), and IntrospectionCache::Clear takes per-shard locks
-    // internally.
+    //
+    // Two-pass over issuers_ to fence in-flight completions:
+    //   Pass A — bump every issuer's generation_ BEFORE clearing any
+    //            cache. In-flight introspection completions captured the
+    //            OLD claim_keys at dispatch time and check `gen !=
+    //            issuer->generation()` BEFORE writing into the cache;
+    //            the bump forces them onto the `reload_in_flight` drop-
+    //            guard so they can never insert a stale entry after our
+    //            Clear() below.
+    //   Pass B — Clear() each cache. Subsequent live POSTs repopulate
+    //            using the new claim_keys via the InvokeAsyncIntrospection
+    //            augmented list.
+    // issuers_ is topology-stable post-construction (Reload preserves the
+    // existing map; topology changes are restart-required), and
+    // IntrospectionCache::Clear takes per-shard locks internally.
     if (claim_keys_changed) {
+        for (auto& [name, issuer_ptr] : issuers_) {
+            if (!issuer_ptr) continue;
+            (void)issuer_ptr->BumpGenerationForClaimKeyReload();
+        }
         for (auto& [name, issuer_ptr] : issuers_) {
             if (!issuer_ptr) continue;
             if (auto* cache = issuer_ptr->introspection_cache()) {
@@ -363,8 +378,9 @@ void AuthManager::CommitPolicyAndEnforcement(
             }
         }
         logging::Get()->info(
-            "AuthManager commit: introspection caches cleared "
-            "(forward.claim_keys changed) issuers={}", issuers_.size());
+            "AuthManager commit: introspection caches cleared and "
+            "generations bumped (forward.claim_keys changed) issuers={}",
+            issuers_.size());
     }
     logging::Get()->info(
         "AuthManager commit: policies={} enforcing={}",

@@ -1383,6 +1383,22 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
 
                 state->ArmResume(std::move(resume_cb), nullptr);
 
+                // Preserve any bytes already received AFTER the upgrade
+                // request (a client that pipelines the first WS frame
+                // with the GET / Upgrade request leaves them in `buf`
+                // past `consumed`). Without this stash, those bytes are
+                // dropped when HandleCompleteRequest returns — OnRawData
+                // only routes LATER-arriving bytes through
+                // StashDeferredBytes, and the post-101 deferred-buf
+                // flush would fire empty, costing the client its first
+                // frame.
+                if (remaining > consumed) {
+                    StashDeferredBytes(
+                        std::string(buf + consumed, remaining - consumed));
+                }
+                buf += remaining;
+                remaining = 0;
+
                 return false;  // upgrade suspended; peer is awaiting 101/reject
             }
 
@@ -1826,6 +1842,18 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
             ws_conn_->SetMaxMessageSize(max_ws_message_size_);
             conn_->SetMaxInputSize(max_ws_message_size_);
         }
+        // Install user-registered WebSocket handlers (OnMessage / OnClose
+        // / etc.) BEFORE CompleteAsyncResponse fires the deferred-buf
+        // flush. CompleteAsyncResponse routes deferred_pending_buf_
+        // through OnRawData → HandleUpgradedData → ws_conn_->OnRawData,
+        // which parses any frames the client pipelined with the upgrade
+        // (or sent during the suspend window) and dispatches them via
+        // OnMessage. Calling upgrade_callback AFTER the flush would mean
+        // those early frames are parsed against a still-null OnMessage
+        // handler and silently dropped.
+        if (callbacks_.upgrade_callback) {
+            callbacks_.upgrade_callback(shared_from_this(), req);
+        }
         upgrade_resp.ClearDeferred();
         CompleteAsyncResponse(std::move(upgrade_resp));
         if (conn_->IsClosing()) {
@@ -1834,12 +1862,11 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
                 conn_->fd());
             return false;
         }
-        if (callbacks_.upgrade_callback) {
-            callbacks_.upgrade_callback(shared_from_this(), req);
-        }
         // Trailing bytes (if any) were stashed via OnRawData during the
-        // suspend window and have already been flushed by
-        // CompleteAsyncResponse → OnRawData → HandleUpgradedData.
+        // suspend window AND by the WS-suspend site in HandleCompleteRequest
+        // for bytes already in `buf` past `consumed` at suspend time. Both
+        // sources are flushed by CompleteAsyncResponse →
+        // OnRawData → HandleUpgradedData above, so no work needed here.
         // trailing_buf/_len are nullptr/0 by contract on this path.
         (void)trailing_buf;
         (void)trailing_len;

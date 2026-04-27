@@ -135,6 +135,18 @@ class Issuer : public std::enable_shared_from_this<Issuer> {
         return generation_->load(std::memory_order_acquire);
     }
 
+    // Bump generation_ without touching snapshot_ / config / discovery
+    // state. Called from AuthManager::CommitPolicyAndEnforcement when
+    // forward.claim_keys changed: in-flight introspection completions
+    // captured the OLD claim_keys list (and a `gen` taken at dispatch
+    // time), so we bump generation BEFORE the manager clears the cache,
+    // forcing those completions through the `reload_in_flight` drop-
+    // guard so they cannot insert a stale entry after the clear runs.
+    // Returns the new generation for logging.
+    uint64_t BumpGenerationForClaimKeyReload() noexcept {
+        return generation_->fetch_add(1, std::memory_order_release) + 1;
+    }
+
     // True after Stop() has begun. Late completions check this to drop
     // results that would otherwise race with shutdown teardown.
     bool stopping() const noexcept {
