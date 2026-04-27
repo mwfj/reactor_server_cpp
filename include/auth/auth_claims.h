@@ -54,4 +54,10 @@ bool HasRequiredScopes(const std::vector<std::string>& have,
 bool MatchesAudience(const nlohmann::json& payload,
                      const std::string& required);
 
+// Cache-hit-friendly audience match against an already-populated AuthContext.
+// `ctx.audiences` was extracted from the JWT/introspection-response `aud`
+// field by PopulateFromPayload. Empty `required` is always accepted.
+bool MatchesAudienceFromCtx(const AuthContext& ctx,
+                            const std::string& required);
+
 }  // namespace AUTH_NAMESPACE

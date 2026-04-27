@@ -4,6 +4,136 @@
 #include "log/log_utils.h"
 // <algorithm> provided by common.h (via http_request.h)
 
+// AsyncPendingState invariants:
+//   - resume_cb_ fires exactly once, always OUTSIDE mu_.
+//   - active_counter_ is decremented exactly once via bookkeeping_done_
+//     (TripCancel and DecrementOnce share the exchange).
+//   - cancel_cb_ fires exactly once when TripCancel wins the exchange
+//     (move-and-clear, exception-safe).
+
+void AsyncPendingState::Complete(AsyncMiddlewarePayload payload) {
+    std::function<void(AsyncMiddlewarePayload)> cb_to_fire;
+    AsyncMiddlewarePayload payload_to_fire;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (completed_) return;            // one-shot
+        completed_ = true;
+        if (resume_armed_) {
+            cb_to_fire = resume_cb_;       // copy under lock
+            payload_to_fire = std::move(payload);
+        } else {
+            result_slot_ = std::move(payload);
+            completion_pending_ = true;
+        }
+    }
+    if (cb_to_fire) {
+        cb_to_fire(std::move(payload_to_fire));
+    }
+}
+
+void AsyncPendingState::ArmResume(
+    std::function<void(AsyncMiddlewarePayload)> resume_cb,
+    std::shared_ptr<std::atomic<int64_t>> active_counter) {
+    std::function<void(AsyncMiddlewarePayload)> cb_to_fire;
+    AsyncMiddlewarePayload payload_to_fire;
+    std::shared_ptr<std::atomic<int64_t>> consume_now;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (resume_armed_) return;         // one-shot
+        resume_cb_ = std::move(resume_cb);
+        active_counter_ = std::move(active_counter);
+        resume_armed_ = true;
+        // Consume an owed decrement deferred by an earlier TripCancel that
+        // ran before active_counter_ was wired. Without this hand-off,
+        // a cancel that purges the queued upstream work (silently, no
+        // completion callback) leaves bookkeeping unclaimed and
+        // active_requests_ leaks — DecrementOnce never runs because the
+        // resume closure never fires.
+        if (decrement_owed_ && active_counter_ &&
+            !bookkeeping_done_.exchange(true, std::memory_order_acq_rel)) {
+            consume_now = active_counter_;
+            decrement_owed_ = false;
+        }
+        if (completion_pending_) {
+            cb_to_fire = resume_cb_;       // copy under lock
+            payload_to_fire = std::move(result_slot_);
+            completion_pending_ = false;
+        }
+    }
+    if (consume_now) {
+        consume_now->fetch_sub(1, std::memory_order_relaxed);
+    }
+    if (cb_to_fire) {
+        cb_to_fire(std::move(payload_to_fire));
+    }
+}
+
+void AsyncPendingState::TripCancel() {
+    cancelled_.store(true, std::memory_order_release);
+
+    // Bookkeeping is gated independently from cancel-cb firing. Two cases:
+    //
+    //   (a) active_counter_ was wired by ArmResume before us — claim the
+    //       bookkeeping one-shot and decrement now. A subsequent
+    //       DecrementOnce from the resume path no-ops.
+    //   (b) ArmResume hasn't run yet — leave bookkeeping_done_ unset so
+    //       the eventual DecrementOnce (when resume_cb fires post-ArmResume)
+    //       can claim the slot and decrement. The dispatch caller releases
+    //       the original RequestGuard right after ArmResume, so without
+    //       this deferral the counter would leak: TripCancel would have
+    //       claimed bookkeeping_done_=true with no counter wired, the
+    //       guard would release without decrementing, and DecrementOnce
+    //       would no-op.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (active_counter_ &&
+            !bookkeeping_done_.exchange(true, std::memory_order_acq_rel)) {
+            active_counter_->fetch_sub(1, std::memory_order_relaxed);
+        } else if (!active_counter_) {
+            // Case (b) deferral: ArmResume hasn't wired active_counter_ yet.
+            // Mark the decrement as owed so ArmResume consumes it on
+            // wire-in. Without this, a cancel that subsequently purges
+            // the queued upstream work without a completion callback
+            // leaves bookkeeping_done_ unset forever and active_requests_
+            // never decrements (the resume closure never runs to call
+            // DecrementOnce).
+            decrement_owed_ = true;
+        }
+    }
+
+    // Cancel callback fires exactly once via its own dedicated one-shot.
+    // Move it out under the lock to keep a throwing hook from re-entering.
+    if (cancel_fired_.exchange(true, std::memory_order_acq_rel)) return;
+    std::function<void()> local;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        local = std::move(cancel_cb_);
+    }
+    if (local) {
+        try { local(); }
+        catch (const std::exception& e) {
+            logging::Get()->error("Async cancel hook threw: {}", e.what());
+        }
+    }
+}
+
+void AsyncPendingState::DecrementOnce() {
+    if (bookkeeping_done_.exchange(true, std::memory_order_acq_rel)) return;
+    std::shared_ptr<std::atomic<int64_t>> counter;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        counter = active_counter_;
+    }
+    if (counter) {
+        counter->fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
+void AsyncPendingState::SetCancelCb(std::function<void()> cb) {
+    std::lock_guard<std::mutex> lk(mu_);
+    cancel_cb_ = std::move(cb);
+}
+
 // Reduce a route pattern to its structural shape for conflict detection.
 // Param/catch-all names AND regex constraints are stripped, so two
 // patterns that produce the same key match RouteTrie's insert-time
@@ -395,7 +525,69 @@ void HttpRouter::PrependMiddleware(Middleware middleware) {
     middlewares_.insert(middlewares_.begin(), std::move(middleware));
 }
 
+void HttpRouter::PrependAsyncMiddleware(AsyncMiddleware middleware) {
+    if (!async_middlewares_.empty()) {
+        logging::Get()->error(
+            "PrependAsyncMiddleware: chain already has an async middleware; "
+            "registering more than one is not yet supported");
+        return;
+    }
+    async_middlewares_.insert(
+        async_middlewares_.begin(), std::move(middleware));
+}
+
+bool HttpRouter::RunAsyncMiddleware(
+    const HttpRequest& request, HttpResponse& response,
+    std::shared_ptr<AsyncPendingState>& out_state) {
+    // Empty chain: implicit sync PASS. Leave out_state null so callers skip
+    // the heap allocation on the hot path; sync DENY is impossible without
+    // middleware actually running.
+    if (async_middlewares_.empty()) {
+        out_state.reset();
+        return true;
+    }
+
+    out_state = std::make_shared<AsyncPendingState>();
+
+    // FIXME: when multi-middleware support lands (today PrependAsyncMiddleware
+    // hard-rejects N>1 to enforce single-registration), each middleware must
+    // either get its own AsyncPendingState OR the loop must reset
+    // completed_sync/sync_result between iterations. Reusing the same state
+    // would silently overwrite the prior middleware's verdict on the next
+    // SetSyncResult call. The single-middleware contract makes today's reuse
+    // safe; the comment + greppable FIXME ensures future contributors fix
+    // the reuse before lifting the registration gate.
+    for (const auto& mw : async_middlewares_) {
+        mw(request, response, out_state);
+        if (!out_state->completed_sync()) {
+            return false;
+        }
+        if (out_state->sync_result() == AsyncMiddlewareResult::DENY) {
+            return true;
+        }
+    }
+    return true;
+}
+
 bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
+    // Compat shim for sync-only callers. If async middleware is
+    // registered, those callers cannot honor the suspend contract — we
+    // warn and skip the async chain rather than execute it synchronously.
+    if (!RunMiddleware(request, response)) {
+        FillDefaultRejectionResponse(response);
+        return true;
+    }
+    if (!async_middlewares_.empty()) {
+        logging::Get()->warn(
+            "HttpRouter::Dispatch called with async middleware registered; "
+            "skipping async chain. The phased dispatch (RunMiddleware → "
+            "RunAsyncMiddleware → DispatchHandler) must be used by callers "
+            "that wire the suspend trampoline.");
+    }
+    return DispatchHandler(request, response);
+}
+
+bool HttpRouter::DispatchHandler(const HttpRequest& request, HttpResponse& response) {
     // Clear params from any previous dispatch on this request object.
     request.params.clear();
 
@@ -403,6 +595,10 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     // request.params is populated during middleware execution. This allows
     // middleware to authorize or rate-limit based on route parameters
     // (e.g., /users/:id → middleware reads request.params["id"]).
+    //
+    // Note: middleware ALREADY ran before this method (see Dispatch
+    // compat shim and the H1/H2 phased callsites). DispatchHandler is
+    // strictly the "find route + invoke handler" step.
     const Handler* matched_handler = nullptr;
     std::string matched_pattern;
     bool head_fallback = false;
@@ -477,15 +673,9 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
         }
     }
 
-    // Run middleware chain — params are already populated for matched routes.
-    for (const auto& mw : middlewares_) {
-        if (!mw(request, response)) {
-            FillDefaultRejectionResponse(response);
-            logging::Get()->debug("Middleware rejected request: {} {}",
-                                  request.method, logging::SanitizePath(request.path));
-            return true;
-        }
-    }
+    // Middleware ran in the caller (Dispatch compat shim or the H1/H2
+    // phased dispatch site). DispatchHandler is the route-lookup +
+    // handler-invocation step only.
 
     // Dispatch to matched handler
     if (matched_handler) {
@@ -620,7 +810,56 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     return false;
 }
 
+void HttpRouter::PopulateRouteParams(const HttpRequest& request) {
+    // Restores the pre-phased-dispatch contract that middleware sees the
+    // route's :param values in request.params (e.g. /users/:id middleware
+    // can authorize on the captured `id`). The legacy Dispatch path called
+    // the route trie BEFORE middleware; the new RunMiddleware →
+    // RunAsyncMiddleware → DispatchHandler split lost that ordering.
+    //
+    // SHORT-CIRCUIT when params are already populated: the H1/H2 async-
+    // route dispatch sites call GetAsyncHandler() (which populates
+    // request.params from the async trie) BEFORE invoking RunMiddleware.
+    // If the same path also matches a sync route (e.g. async `/api/*rest`
+    // catch-all + sync `/api/users` literal), overwriting from the sync
+    // trie would wipe the async-route's :param captures and break the
+    // proxy strip_prefix / user-handler captures. Per-route shape conflicts
+    // are pre-screened by HasAsyncRouteConflict / HasSyncRouteConflict
+    // at registration; co-existing routes with different shapes hit this
+    // exact case at dispatch time.
+    //
+    // The sync-only path always reaches this function with empty params
+    // (default-constructed HttpRequest, or cleared upstream by HCH between
+    // pipelined requests), so the guard short-circuits only for the
+    // already-populated async-route case.
+    if (!request.params.empty()) return;
+    auto it = method_tries_.find(request.method);
+    if (it != method_tries_.end()) {
+        std::unordered_map<std::string, std::string> params;
+        auto result = it->second.Search(request.path, params);
+        if (result.handler) {
+            request.params = std::move(params);
+            return;
+        }
+    }
+    // Mirror DispatchHandler's HEAD→GET fallback (RFC 7231 §4.3.2): for HEAD
+    // requests with no explicit HEAD handler, middleware that authorizes on
+    // request.params (e.g. /users/:id) must see the same captures the
+    // GET-fallback handler would receive at dispatch.
+    if (request.method == "HEAD") {
+        auto get_it = method_tries_.find("GET");
+        if (get_it != method_tries_.end()) {
+            std::unordered_map<std::string, std::string> params;
+            auto result = get_it->second.Search(request.path, params);
+            if (result.handler) {
+                request.params = std::move(params);
+            }
+        }
+    }
+}
+
 bool HttpRouter::RunMiddleware(const HttpRequest& request, HttpResponse& response) {
+    PopulateRouteParams(request);
     for (const auto& mw : middlewares_) {
         if (!mw(request, response)) {
             return false;

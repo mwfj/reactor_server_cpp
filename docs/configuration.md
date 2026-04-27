@@ -499,9 +499,7 @@ Use `logging::SanitizePath(path)` to strip query parameters and fragments from U
 
 ## Authentication (OAuth 2.0 Token Validation)
 
-> **Status — Available (Phase 1b + Phase 2 shipped).** JWT verification, per-route policy enforcement, multi-issuer routing, JWKS caching, OIDC discovery, and the `auth.forward` outbound-header overlay are all wired and tested. For a practical operator walkthrough including failure modes, header injection semantics, and troubleshooting, see [`docs/oauth2.md`](oauth2.md). This section is the **field reference** — defaults, validation rules, and reload semantics for every key under `auth.*` and `proxy.auth.*`.
->
-> **Phase 3 — introspection mode** (RFC 7662 opaque-token validation via a POST to the IdP) is scaffolded in the schema (the `introspection` block parses and validates) but the enforcement path is **not yet implemented**. `mode: "introspection"` is rejected at startup with a clear error; JWT mode is the only runtime-accepted mode.
+> **Status — Available.** JWT verification (local signature), introspection (RFC 7662 POST to the IdP), per-route policy enforcement, multi-issuer routing, JWKS caching, OIDC discovery, the `auth.forward` outbound-header overlay, the per-issuer introspection cache (sharded LRU, HMAC-keyed) and async middleware dispatch are all wired and tested. For a practical operator walkthrough including failure modes, header injection semantics, and troubleshooting, see [`docs/oauth2.md`](oauth2.md). This section is the **field reference** — defaults, validation rules, and reload semantics for every key under `auth.*` and `proxy.auth.*`.
 
 ### Top-Level `auth` Block
 
@@ -613,7 +611,7 @@ All `auth.*` and `proxy.auth.*` keys, with defaults and whether they are live-re
 | `discovery` | `false` | no (topology) | When `true`, fetch `.well-known/openid-configuration`. When `false`, `jwks_uri` must be provided. |
 | `jwks_uri` | `""` | no (topology) | Required if `discovery=false`. Must be `https://`. Ignored when `discovery=true`. |
 | `upstream` | required | no (topology) | Name of the `upstreams[]` entry used to reach the IdP. |
-| `mode` | `"jwt"` | no (topology) | `"jwt"` (local signature verification) or `"introspection"` (Phase 3 — rejected at load). |
+| `mode` | `"jwt"` | no (topology) | `"jwt"` (local signature verification) or `"introspection"` (RFC 7662 POST to IdP). |
 | `audiences` | `[]` | yes | Accepted `aud` claim values. Empty list means any audience — not recommended. |
 | `algorithms` | `["RS256"]` | yes | Allowlist: `RS256`, `RS384`, `RS512`, `ES256`, `ES384`. `HS*` and `none` are not supported. |
 | `leeway_sec` | `30` | yes | Clock-skew tolerance for `exp` / `nbf`. |

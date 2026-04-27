@@ -4,7 +4,6 @@ The gateway ships with built-in OAuth 2.0 bearer-token validation. Point it at o
 
 This is a **resource-server** validator. The gateway does not run the authorization-code dance, issue tokens, or host a login page. It expects clients (or an upstream BFF) to present an already-minted bearer token in `Authorization: Bearer <jwt>`.
 
-Full design and security rationale live in [`.claude/documents/design/OAUTH2_TOKEN_VALIDATION_DESIGN.md`](../.claude/documents/design/OAUTH2_TOKEN_VALIDATION_DESIGN.md). This document is the operator's guide.
 
 ---
 
@@ -17,7 +16,7 @@ Full design and security rationale live in [`.claude/documents/design/OAUTH2_TOK
 - **401 / 403 / 503 taxonomy** with RFC 6750 `WWW-Authenticate` headers, `Retry-After` on 503, and an `on_undetermined: deny|allow` switch for degraded-IdP scenarios.
 - **Outbound identity injection**. On ALLOW the gateway strips any inbound copies of identity headers and emits the ones you configure (`X-Auth-Subject`, scopes, whitelisted claims, optionally the raw JWT).
 - **Hot reload**. Issuer cache TTLs, algorithms, audiences, required scopes, and the forward-header overlay are all live-reloadable; topology (adding a new issuer) still needs a restart.
-- **Introspection mode (RFC 7662)** is scaffolded in the config schema but the enforcement path is **Phase 3 deferred** — the validator rejects `mode: "introspection"` at startup for now.
+- **Introspection mode (RFC 7662)** for opaque tokens — POST to the IdP's introspection endpoint, with a per-issuer sharded LRU cache, positive/negative TTLs, stale-on-error, and the same outbound-overlay semantics as JWT mode. See [Introspection mode](#introspection-mode-rfc-7662) below.
 
 What it does **not** do: authorization-code flow, token revocation, refresh, session cookies, CSRF — those belong to a BFF service behind the gateway.
 
@@ -92,9 +91,9 @@ Each issuer has a `mode` field.
 | Mode | Status | What it does |
 |---|---|---|
 | `jwt` (default) | Available | Verify the JWT signature locally using JWKS keys. No per-request network call to the IdP (beyond the cached JWKS fetch). |
-| `introspection` | Deferred to Phase 3 | POST to the IdP's `/introspect` endpoint per token. Rejected at config load for now. |
+| `introspection` | Available | POST to the IdP's introspection endpoint per token (RFC 7662). Cached per-issuer with sharded LRU + positive/negative TTLs. See [Introspection mode](#introspection-mode-rfc-7662) below. |
 
-If your IdP issues opaque tokens (e.g. some Keycloak deployments), you'll want introspection mode. For now, stick to JWT — the scaffolding is in place so a future release can turn it on without a config migration.
+If your IdP issues opaque tokens (e.g. some Keycloak / Auth0 / OpenAI deployments), use introspection mode. If your tokens are JWTs you can verify locally, JWT mode is cheaper and avoids the per-token round-trip.
 
 ---
 
@@ -330,11 +329,19 @@ Top-level policies always require a `name` (so `/stats` and logs stay stable acr
 These are tracked in §16 of the design spec:
 
 - **HS256 / symmetric keys not supported.** If you need them, the validator needs extending — scope decision for a future release.
-- **Introspection mode deferred.** Opaque-token IdPs aren't usable yet.
 - **`alg: none` explicitly rejected** regardless of allowlist.
 - **No token revocation hook.** A compromised token is valid until `exp`. Keep `leeway_sec` small and TTLs short.
 - **`on_undetermined: allow` is a knowingly-lax degraded mode.** It exists for rollout / observability; don't run it long-term.
 - **JWKS cache is per-issuer, process-local.** Multiple gateway instances each fetch independently; if that's a problem for your IdP's rate limits, front it with a shared cache.
+- **`client_secret` rotation is restart-required.** The introspection client_secret is read from the env var named by `client_secret_env` ONCE at issuer start. Changing the env var value at runtime (e.g. via `setenv`) and SIGHUPing does NOT re-read it; the running process keeps the old secret. The validator only rejects a CHANGE TO THE ENV-VAR NAME on reload — it has no visibility into the value. Plan rotations as a process restart.
+- **`negative_cache_sec: 0` disables negative caching.** Every `active: false` IdP response then re-hits the IdP on the next request for the same token. For high-throughput attack patterns (token-fuzzing) this can DoS your IdP via the gateway. Keep `negative_cache_sec >= 5` in production.
+- **Bearer token size cap is 8 KiB.** Tokens longer than 8192 bytes are rejected with 401 / `invalid_request` before any verification work runs. JWT mode and introspection mode share this cap; it is not currently a config knob. If you need bigger tokens (e.g. unusual SAML-style assertions), open an issue.
+- **Multi-introspection-issuer policies probe only ONE issuer per request.** When `policy.issuers` lists multiple `mode: introspection` issuers (e.g. multi-tenant federation), the gateway picks the FIRST introspection issuer in the list and runs the cache lookup + live POST against it only. A token owned by the second issuer's IdP gets denied even though the policy allows it. The config loader emits a warn when it sees this configuration. Workaround: split the route into per-tenant policies with a single introspection issuer each. Serial fan-out across all eligible issuers is a follow-up.
+- **Async-route + introspection cache miss returns 503 + Retry-After.** The async-route dispatch path (proxy routes, `RouteAsync`-registered handlers) can only run synchronously-completing async middleware in this release. Cache hits / negative hits / sync DENY all work normally. A first request to a new-to-cache token under introspection mode gets a 503; the in-flight POST is allowed to complete and populate the cache, so the next request for the same token succeeds. JWT mode is unaffected. Sync routes (`Get`, `Post`, etc.) support the full deferred-suspend path. **Implication:** clients that respect `Retry-After: 1` re-converge after one round-trip on the warm cache; clients that don't will see a 503 on every first-use. **Workaround for high-cardinality opaque-token populations:** prefer JWT-mode issuers when possible; for introspection-only deployments behind a proxy, pre-warm the cache via a startup script that issues a representative request for each known active token. **Tier-2 follow-up:** wire the async-route handler dispatch through the same ArmResume trampoline sync routes use, so cache-miss requests resume into the user handler with the real IdP verdict instead of being 503'd. This is tracked as a `FIXME` marker on the H1 + H2 async-route 503 sites in `server/http_server.cc`.
+
+## Wire-format changes from previous releases
+
+- **Basic introspection credentials are now percent-encoded before Base64.** Per RFC 6749 §2.3.1, `client_id` and `client_secret` MUST be `application/x-www-form-urlencoded` before the `id:secret` join + base64 step. Earlier builds concatenated raw bytes, which only worked for credentials limited to unreserved characters. Operators whose `client_id` or `client_secret` contains reserved characters (`:`, `%`, `&`, `=`, `+`, etc.) should re-test against their IdP after upgrading — RFC-compliant IdPs will now decode the credentials correctly, but a non-compliant IdP that previously accepted the raw bytes may reject the new (correct) form. If your IdP rejects the new form, the bug is in the IdP — file a ticket with them.
 
 ---
 
@@ -342,5 +349,3 @@ These are tracked in §16 of the design spec:
 
 - [`docs/configuration.md`](configuration.md) — full `auth.*` field reference and validation rules.
 - [`docs/architecture.md`](architecture.md) — where the auth middleware fits in the layered design.
-- [`.claude/documents/design/OAUTH2_TOKEN_VALIDATION_DESIGN.md`](../.claude/documents/design/OAUTH2_TOKEN_VALIDATION_DESIGN.md) — design rationale, data flow, threat model.
-- [`.claude/documents/features/OAUTH_TOKEN_VALIDATION.md`](../.claude/documents/features/OAUTH_TOKEN_VALIDATION.md) — internal component reference.

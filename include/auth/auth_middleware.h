@@ -13,4 +13,11 @@ namespace AUTH_NAMESPACE {
 // Returns an empty (no-op / always-pass) middleware when `mgr` is null.
 HttpRouter::Middleware MakeMiddleware(AuthManager* mgr);
 
+// Construct an async middleware closure bound to `mgr` for installation
+// via HttpRouter::PrependAsyncMiddleware. The body completes
+// synchronously with PASS until introspection-mode dispatch is wired,
+// adding only the cost of one shared_ptr allocation per request inside
+// RunAsyncMiddleware. Safe to install at server startup unconditionally.
+HttpRouter::AsyncMiddleware MakeAsyncMiddleware(AuthManager* mgr);
+
 }  // namespace AUTH_NAMESPACE

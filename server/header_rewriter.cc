@@ -181,6 +181,10 @@ void ApplyIdentityInject(
     for (const auto& [claim_name, header_name] : fwd.claims_to_headers) {
         auto it = ctx.claims.find(claim_name);
         if (it == ctx.claims.end()) continue;
+        // ctx.claims holds ONLY scalar claim values — non-scalar
+        // (array/object) claims are tracked in ctx.non_scalar_claims for
+        // required-claim presence checks but emit no outbound header here.
+        // Native array→header flattening is a future HeaderRewriter feature.
         try_set(header_name, it->second);
     }
     // Only emit the raw token header when the operator asked for it AND

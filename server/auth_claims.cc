@@ -90,7 +90,9 @@ bool PopulateFromPayload(const nlohmann::json& payload,
     ctx.issuer.clear();
     ctx.subject.clear();
     ctx.scopes.clear();
+    ctx.audiences.clear();
     ctx.claims.clear();
+    ctx.non_scalar_claims.clear();
 
     if (!payload.is_object()) return false;
 
@@ -124,6 +126,23 @@ bool PopulateFromPayload(const nlohmann::json& payload,
     }
     ctx.scopes = ExtractScopes(payload);
 
+    // Extract `aud` (string OR array per RFC 7519 §4.1.3 / RFC 7662 §2.2)
+    // into ctx.audiences so cache-hit policy checks can re-evaluate against
+    // the validated audience list without a second body parse. Bare-string
+    // aud becomes a 1-element vector; array aud copies string elements only
+    // (non-string entries silently dropped — same defensive shape as
+    // claim extraction below).
+    if (payload.contains("aud")) {
+        const auto& a = payload["aud"];
+        if (a.is_string()) {
+            ctx.audiences.push_back(a.get<std::string>());
+        } else if (a.is_array()) {
+            for (const auto& e : a) {
+                if (e.is_string()) ctx.audiences.push_back(e.get<std::string>());
+            }
+        }
+    }
+
     // Copy only operator-requested claims into ctx.claims, to keep the
     // context object small and to limit the data that flows into logs.
     //
@@ -154,8 +173,16 @@ bool PopulateFromPayload(const nlohmann::json& payload,
             ctx.claims[key] = std::to_string(v.get<double>());
         } else if (v.is_boolean()) {
             ctx.claims[key] = v.get<bool>() ? "true" : "false";
+        } else if (!v.is_null()) {
+            // Non-scalar (array / object): record presence in a separate
+            // set so RunPolicyAndIssuerClaimChecks can match JWT mode's
+            // payload.contains(c) semantics for required_claims without
+            // colliding with any literal string a token might legitimately
+            // carry. Common case: a `groups` claim shaped as an array.
+            // Loses type/value here — operators who need the actual value
+            // must wait for HeaderRewriter array→header flattening.
+            ctx.non_scalar_claims.insert(key);
         }
-        // Arrays/objects: skip — see comment above.
     }
     return true;
 }
@@ -185,6 +212,14 @@ bool MatchesAudience(const nlohmann::json& payload,
         for (const auto& v : aud) {
             if (v.is_string() && v.get<std::string>() == required) return true;
         }
+    }
+    return false;
+}
+
+bool MatchesAudienceFromCtx(const AuthContext& ctx, const std::string& required) {
+    if (required.empty()) return true;
+    for (const auto& a : ctx.audiences) {
+        if (a == required) return true;
     }
     return false;
 }

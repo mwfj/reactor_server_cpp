@@ -1383,6 +1383,104 @@ static void ValidateDnsHotReloadable(const ServerConfig& config) {
     // stale_on_error is a bool — no range check needed.
 }
 
+// Per-issuer introspection-block validation. Called from both `Validate`
+// (startup) and `ValidateHotReloadable` (reload) so both paths reject the
+// same set of malformed inputs. `discovery_enabled` is the issuer's
+// `discovery` flag — when true and `endpoint` is empty, OIDC discovery
+// fills the endpoint at runtime, so we accept the empty value at load.
+//
+// `ctx` is the per-issuer prefix (e.g. "auth.issuers.ours") used in error
+// messages so the operator sees which issuer owns the bad field.
+//
+// Throws std::invalid_argument with a field-named message on the first
+// failure. Order matches the operator's mental model of severity:
+// scheme/credentials first (auth correctness), then format (auth_style /
+// shards), then numeric ranges.
+static void ValidateIntrospectionFields(
+        const AUTH_NAMESPACE::IntrospectionConfig& is,
+        const std::string& ctx,
+        bool discovery_enabled) {
+    // endpoint: required https unless discovery=true (OIDC fills at runtime).
+    if (is.endpoint.empty()) {
+        if (!discovery_enabled) {
+            throw std::invalid_argument(
+                ctx + ".introspection.endpoint is required for "
+                "mode=\"introspection\" when discovery=false (set "
+                "discovery=true to let OIDC populate it at runtime, or "
+                "configure the endpoint URL explicitly)");
+        }
+    } else if (!AUTH_NAMESPACE::HasHttpsScheme(is.endpoint)) {
+        throw std::invalid_argument(
+            ctx + ".introspection.endpoint must start with https:// "
+            "— plaintext introspection would leak bearer tokens and "
+            "client credentials over the wire");
+    }
+    // Credentials: both auth_style values need client_id + secret env name.
+    // Inline `client_secret` is rejected separately at parse time.
+    if (is.client_id.empty()) {
+        throw std::invalid_argument(
+            ctx + ".introspection.client_id is required for "
+            "mode=\"introspection\" (both 'basic' and 'body' "
+            "auth_style values need it per RFC 7662)");
+    }
+    if (is.client_secret_env.empty()) {
+        throw std::invalid_argument(
+            ctx + ".introspection.client_secret_env is required "
+            "for mode=\"introspection\" — the secret must be sourced "
+            "from an environment variable (inline client_secret is "
+            "rejected separately as a secret-in-config anti-pattern)");
+    }
+    // auth_style — RFC 7662 doesn't standardize the credential delivery
+    // channel; we support "basic" (Authorization header) and "body"
+    // (urlencoded form). Anything else would silently fall back at
+    // request time, which is worse than a load-time reject.
+    if (is.auth_style != "basic" && is.auth_style != "body") {
+        throw std::invalid_argument(
+            ctx + ".introspection.auth_style must be \"basic\" "
+            "or \"body\" (got \"" + is.auth_style + "\")");
+    }
+    // shards: power-of-two in [1, 64]. The cache uses `hash & (shards - 1)`
+    // for shard selection; non-powers-of-two would map keys non-uniformly.
+    // Cap at 64 to bound per-issuer mutex count.
+    if (is.shards < 1 || is.shards > 64 ||
+        (is.shards & (is.shards - 1)) != 0) {
+        throw std::invalid_argument(
+            ctx + ".introspection.shards must be a power of two in [1, 64] "
+            "(got " + std::to_string(is.shards) + ")");
+    }
+    // Numeric ranges. Strict-positive for fields where 0 makes no sense.
+    // Non-negative for fields where 0 means "feature off" — negative
+    // caching and stale-grace both have meaningful 0-disables-feature
+    // semantics that must be preserved.
+    if (is.timeout_sec <= 0) {
+        throw std::invalid_argument(
+            ctx + ".introspection.timeout_sec must be > 0 (got " +
+            std::to_string(is.timeout_sec) + ")");
+    }
+    if (is.cache_sec <= 0) {
+        throw std::invalid_argument(
+            ctx + ".introspection.cache_sec must be > 0 (got " +
+            std::to_string(is.cache_sec) + ")");
+    }
+    if (is.max_entries <= 0) {
+        throw std::invalid_argument(
+            ctx + ".introspection.max_entries must be > 0 (got " +
+            std::to_string(is.max_entries) + ")");
+    }
+    if (is.negative_cache_sec < 0) {
+        throw std::invalid_argument(
+            ctx + ".introspection.negative_cache_sec must be >= 0 "
+            "(0 = disable negative caching) (got " +
+            std::to_string(is.negative_cache_sec) + ")");
+    }
+    if (is.stale_grace_sec < 0) {
+        throw std::invalid_argument(
+            ctx + ".introspection.stale_grace_sec must be >= 0 "
+            "(0 = disable stale serving) (got " +
+            std::to_string(is.stale_grace_sec) + ")");
+    }
+}
+
 void ConfigLoader::ValidateHotReloadable(
         const ServerConfig& config,
         const std::unordered_set<std::string>& live_upstream_names,
@@ -1492,44 +1590,20 @@ void ConfigLoader::ValidateHotReloadable(
         }
     }
 
-    // Auth hot-reloadable field validation. Mirrors the per-issuer range and
-    // format checks in Validate(), but scoped to fields that AuthManager::Reload
-    // and Issuer::ApplyReload actually write into live state. Topology-restart
-    // fields (issuer_url, mode, upstream, discovery) are excluded — they are
-    // rejected by Issuer::ApplyReload before touching live state.
+    // Auth hot-reloadable field validation. Two-pass scoping so structural
+    // input validation (range / format / allowlist) fires for EVERY staged
+    // issuer regardless of live state, while live-state-dependent checks
+    // (none in this block today, but reserved for future cross-state checks)
+    // can stay live-scoped.
     //
-    // Scoping: only validate issuers that EXIST in the running AuthManager.
-    // A new/renamed issuer has no live peer to apply to and will be rejected
-    // as restart-required by AuthManager::Reload; failing the whole hot-
-    // reload on a typo in such a staged-only issuer would block unrelated
-    // live-safe edits (e.g. rate_limit tuning, CB thresholds). The full
-    // startup Validate catches those typos when the operator restarts.
-    // Empty live set means "no live auth runtime" — no apply path can
-    // touch these fields, skip the block entirely (same pattern as the
-    // live_upstream_names-scoped CB loop above). The `count(name) == 0`
-    // test naturally skips every entry when the set is empty.
-    //
-    // EXCEPTION: `mode == "introspection"` is rejected UNCONDITIONALLY for
-    // every issuer in the staged config, live or not. Per design §5.3 /
-    // §18.5, introspection mode is deferred to Phase 3. Scoping the reject
-    // to live-only would mean a staged-only new issuer with
-    // mode=introspection passes SIGHUP validation silently (it's "restart-
-    // required topology" from the reload path's POV), the operator sees
-    // "reload OK", and the next server restart fails startup Validate.
-    // That's exactly the "valid on SIGHUP, fails on restart" asymmetry the
-    // hot-reload validator exists to prevent.
+    // Why structural-checks-for-all: a staged-only issuer with
+    // `auth_style: "garbage"` or `shards: 5` (non-power-of-two) that passes
+    // SIGHUP only to fail at the next restart's Validate() is the exact
+    // "valid on SIGHUP, fails on restart" asymmetry the original gate was
+    // added to prevent. The operator should see the typo immediately. Live-
+    // safe edits in the same SIGHUP are still blocked (acceptable trade-off
+    // — operator fixes the typo and re-SIGHUPs).
     for (const auto& [name, ic] : config.auth.issuers) {
-        if (ic.mode == "introspection") {
-            throw std::invalid_argument(
-                "auth.issuers." + name +
-                ".mode=\"introspection\" is deferred to Phase 3. "
-                "Use mode=\"jwt\" with a JWKS-backed issuer in v1.");
-        }
-    }
-    for (const auto& [name, ic] : config.auth.issuers) {
-        if (live_issuer_names.count(name) == 0) {
-            continue;
-        }
         const std::string ctx = "auth.issuers." + name;
         if (ic.leeway_sec < 0) {
             throw std::invalid_argument(ctx + ".leeway_sec must be >= 0");
@@ -1563,8 +1637,15 @@ void ConfigLoader::ValidateHotReloadable(
                     "HS*/none/PS*/auto are deferred per design spec §15)");
             }
         }
-        // mode=introspection is rejected unconditionally in the pre-pass
-        // above — no per-issuer check needed here.
+        // Introspection-block input validation runs for ALL staged issuers
+        // — structural correctness is independent of whether the issuer is
+        // live or staged-only. Restart-required fields (endpoint,
+        // client_id, client_secret_env, shards) are rejected at apply time
+        // by Issuer::ValidateReload; we still reject malformed values here
+        // so the operator sees the typo on SIGHUP rather than at restart.
+        if (ic.mode == AUTH_NAMESPACE::kModeIntrospection) {
+            ValidateIntrospectionFields(ic.introspection, ctx, ic.discovery);
+        }
     }
 
     // Auth.forward and top-level policy structural validation. These
@@ -2196,22 +2277,11 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     ctx + ".issuer_url must start with https:// (plaintext "
                     "IdP traffic is rejected for security)");
             }
-            // Mode whitelist. `auto` is deferred per spec §15. And until
-            // Phase 3 lands the introspection dispatch in AuthManager,
-            // accepting `mode="introspection"` would silently route opaque
-            // tokens into the JWT verifier which then rejects them as
-            // malformed — a fail-undetermined loop operators can't debug.
-            // Reject at config load (both startup and SIGHUP) so the
-            // config error is immediate and actionable.
-            if (ic.mode != "jwt" && ic.mode != "introspection") {
+            // Mode whitelist. `auto` mode is not supported.
+            if (ic.mode != AUTH_NAMESPACE::kModeJwt &&
+                ic.mode != AUTH_NAMESPACE::kModeIntrospection) {
                 throw std::invalid_argument(
                     ctx + ".mode must be one of: \"jwt\", \"introspection\"");
-            }
-            if (ic.mode == "introspection") {
-                throw std::invalid_argument(
-                    ctx + ".mode=\"introspection\" is deferred to Phase 3. "
-                    "Use mode=\"jwt\" with a JWKS-backed issuer in v1 "
-                    "(see design spec §14 Phase 3 — introspection).");
             }
             // Algorithm allowlist — reject HS*/none/PS*/unknown.
             // HS* requires symmetric-secret provisioning (deferred, spec §15).
@@ -2297,84 +2367,9 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                         ctx + ": mode=\"jwt\" with discovery=false requires "
                         "a non-empty jwks_uri (static JWKS location)");
                 }
-            } else if (ic.mode == "introspection") {
-                if (ic.introspection.endpoint.empty()) {
-                    throw std::invalid_argument(
-                        ctx + ".introspection.endpoint is required for "
-                        "mode=\"introspection\"");
-                }
-                // Credentials: both supported auth_style values ("basic",
-                // "body") require client_id + client secret to be part of
-                // the RFC 7662 request. Inline client_secret is already
-                // rejected (env-var sourcing is mandatory — see
-                // ParseIssuerConfig). Without these checks, an issuer
-                // staged with `mode="introspection"` + endpoint but no
-                // credentials would load successfully and fail every
-                // introspection call at request time. Reject at load
-                // instead, so the misconfig surfaces early.
-                const auto& is = ic.introspection;
-                if (is.client_id.empty()) {
-                    throw std::invalid_argument(
-                        ctx + ".introspection.client_id is required for "
-                        "mode=\"introspection\" (both 'basic' and 'body' "
-                        "auth_style values need it per RFC 7662)");
-                }
-                if (is.client_secret_env.empty()) {
-                    throw std::invalid_argument(
-                        ctx + ".introspection.client_secret_env is required "
-                        "for mode=\"introspection\" — the secret must be "
-                        "sourced from an environment variable (inline "
-                        "client_secret is rejected separately as a secret-"
-                        "in-config anti-pattern)");
-                }
-                // auth_style — RFC 7662 doesn't standardize the credential
-                // delivery channel; we support two: "basic" (Authorization
-                // header) and "body" (urlencoded form). Anything else
-                // would silently choose one at request time, which is
-                // worse than a load-time reject.
-                if (is.auth_style != "basic" && is.auth_style != "body") {
-                    throw std::invalid_argument(
-                        ctx + ".introspection.auth_style must be \"basic\" "
-                        "or \"body\" (got \"" + is.auth_style + "\")");
-                }
-                // Numeric ranges. Strict-positive for fields where 0 makes
-                // no sense (a 0-second timeout cannot complete an HTTP
-                // request; a 0-entry cache is a contradiction; a 0-shard
-                // map cannot be indexed). Non-negative for fields where 0
-                // means "feature off" — negative caching and stale-grace
-                // both have meaningful 0-disables-feature semantics.
-                if (is.timeout_sec <= 0) {
-                    throw std::invalid_argument(
-                        ctx + ".introspection.timeout_sec must be > 0 (got " +
-                        std::to_string(is.timeout_sec) + ")");
-                }
-                if (is.cache_sec <= 0) {
-                    throw std::invalid_argument(
-                        ctx + ".introspection.cache_sec must be > 0 (got " +
-                        std::to_string(is.cache_sec) + ")");
-                }
-                if (is.negative_cache_sec < 0) {
-                    throw std::invalid_argument(
-                        ctx + ".introspection.negative_cache_sec must be >= 0 "
-                        "(0 = disable negative caching) (got " +
-                        std::to_string(is.negative_cache_sec) + ")");
-                }
-                if (is.stale_grace_sec < 0) {
-                    throw std::invalid_argument(
-                        ctx + ".introspection.stale_grace_sec must be >= 0 "
-                        "(0 = disable stale serving) (got " +
-                        std::to_string(is.stale_grace_sec) + ")");
-                }
-                if (is.max_entries <= 0) {
-                    throw std::invalid_argument(
-                        ctx + ".introspection.max_entries must be > 0 (got " +
-                        std::to_string(is.max_entries) + ")");
-                }
-                if (is.shards <= 0) {
-                    throw std::invalid_argument(
-                        ctx + ".introspection.shards must be > 0 (got " +
-                        std::to_string(is.shards) + ")");
-                }
+            } else if (ic.mode == AUTH_NAMESPACE::kModeIntrospection) {
+                ValidateIntrospectionFields(ic.introspection, ctx,
+                                             ic.discovery);
             }
 
             // TLS-mandatory on actual outbound IdP endpoints, not just on
@@ -2412,6 +2407,56 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     "client credentials over the wire (design spec §9 item 4)");
             }
 
+            // TLS-on-upstream check for introspection-mode issuers.
+            // UpstreamHttpClient routes the POST through the named
+            // upstream pool — which is what actually decides whether the
+            // socket is plaintext or TLS — NOT the URL scheme of
+            // `introspection.endpoint`. An https://-prefixed endpoint
+            // bound to a tls.enabled=false pool would silently send
+            // bearer tokens AND the gateway's client_secret in cleartext.
+            //
+            // Loopback exception: 127.0.0.0/8, ::1, and the literal
+            // string "localhost" are exempt because an attacker on the
+            // wire cannot reach a loopback-only socket; the threat model
+            // requires network access. This mirrors the broadly-accepted
+            // browser HTTPS-only-with-localhost-exemption pattern (W3C
+            // Secure Contexts §3.1) and lets in-process test fixtures
+            // (mock IdP on 127.0.0.1) keep running plaintext while
+            // production (non-loopback) deployments still get the hard
+            // reject. A WARN log surfaces the exempted misconfig so an
+            // operator who unintentionally lands here sees it.
+            if (ic.mode == AUTH_NAMESPACE::kModeIntrospection &&
+                !reload_copy && !ic.upstream.empty()) {
+                for (const auto& u : config.upstreams) {
+                    if (u.name != ic.upstream) continue;
+                    if (u.tls.enabled) break;
+                    const bool is_loopback =
+                        u.host == "127.0.0.1" ||
+                        u.host == "::1" ||
+                        u.host == "localhost" ||
+                        (u.host.size() > 4 && u.host.compare(0, 4, "127.") == 0);
+                    if (is_loopback) {
+                        logging::Get()->warn(
+                            "{}.upstream='{}' has tls.enabled=false but host "
+                            "is loopback ({}) — accepted under the loopback "
+                            "exemption (test/local-dev only); production "
+                            "introspection MUST use a TLS upstream",
+                            ctx, ic.upstream, u.host);
+                        break;
+                    }
+                    throw std::invalid_argument(
+                        ctx + ".upstream='" + ic.upstream +
+                        "' has tls.enabled=false — mode=\"introspection\" "
+                        "MUST route through a TLS upstream because the "
+                        "RFC 7662 POST carries the bearer token AND the "
+                        "gateway's client_secret. Set `upstreams[].tls."
+                        "enabled=true` on this pool, or move the IdP "
+                        "to a different TLS upstream and update "
+                        "auth.issuers." + name + ".upstream "
+                        "(loopback hosts are exempt for test/local-dev only)");
+                }
+            }
+
             // Mode/endpoint mismatch — warn per design spec §5.3. Not a
             // hard-reject because operators sometimes template both blocks
             // and select mode dynamically; emitting a warn ensures the
@@ -2422,7 +2467,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     "{}: mode=\"jwt\" but introspection.endpoint is set — "
                     "introspection config will be ignored", ctx);
             }
-            if (ic.mode == "introspection" && !ic.jwks_uri.empty()) {
+            if (ic.mode == AUTH_NAMESPACE::kModeIntrospection && !ic.jwks_uri.empty()) {
                 logging::Get()->warn(
                     "{}: mode=\"introspection\" but jwks_uri is set — "
                     "JWKS config will be ignored", ctx);
@@ -2434,6 +2479,34 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
         // SIGHUP path can run the same checks and hard-reject before
         // Commit publishes the snapshot.
         ValidateTopLevelPolicies(config);
+
+        // Soft-warn on policies that mix multiple introspection-mode
+        // issuers. Each introspection issuer maintains its own per-policy
+        // RFC 7662 round-trip on cache miss, so a policy with N>1
+        // introspection issuers fans out N synchronous IdP calls per
+        // request (the verifier walks issuers in order until one accepts).
+        // Operators who do this on purpose are accepting the cost; we
+        // warn so an accidental misconfig surfaces in logs without
+        // failing the load.
+        for (const auto& p : config.auth.policies) {
+            int introspection_count = 0;
+            for (const auto& iss_name : p.issuers) {
+                auto it = config.auth.issuers.find(iss_name);
+                if (it != config.auth.issuers.end() &&
+                    it->second.mode == AUTH_NAMESPACE::kModeIntrospection) {
+                    ++introspection_count;
+                }
+            }
+            if (introspection_count > 1) {
+                logging::Get()->warn(
+                    "auth_policy_multi_introspection policy={} "
+                    "issuer_count={} — each cache miss may fan out one "
+                    "RFC 7662 POST per issuer until one accepts the "
+                    "token; consider scoping the policy to a single "
+                    "introspection issuer",
+                    p.name, introspection_count);
+            }
+        }
 
         // applies_to on top-level `auth.policies[]` entries is consumed
         // ONLY by the literal-byte-prefix matcher (design §3.2). Values

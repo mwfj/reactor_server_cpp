@@ -22,4 +22,19 @@ HttpRouter::Middleware MakeMiddleware(AuthManager* mgr) {
     };
 }
 
+HttpRouter::AsyncMiddleware MakeAsyncMiddleware(AuthManager* mgr) {
+    if (!mgr) {
+        // No manager — every request passes through synchronously.
+        return [](const HttpRequest&, HttpResponse&,
+                  std::shared_ptr<HttpRouter::AsyncPendingState> state) {
+            state->SetSyncResult(HttpRouter::AsyncMiddlewareResult::PASS);
+            state->MarkCompletedSync();
+        };
+    }
+    return [mgr](const HttpRequest& req, HttpResponse& resp,
+                  std::shared_ptr<HttpRouter::AsyncPendingState> state) {
+        mgr->InvokeAsyncMiddleware(req, resp, std::move(state));
+    };
+}
+
 }  // namespace AUTH_NAMESPACE

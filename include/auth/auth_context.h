@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include <optional>
+#include <set>
 // <string>, <vector>, <map>, <optional> via common.h
 
 namespace AUTH_NAMESPACE {
@@ -14,7 +15,18 @@ struct AuthContext {
     std::string issuer;                                   // Validated `iss` claim
     std::string subject;                                  // Validated `sub` claim
     std::vector<std::string> scopes;                      // From `scope` (space-sep) or `scp` (array)
-    std::map<std::string, std::string> claims;            // Operator-selected claims (claims_to_headers source)
+    std::vector<std::string> audiences;                   // Validated `aud` (string-or-array, see RFC 7519 §4.1.3)
+    std::map<std::string, std::string> claims;            // Operator-selected SCALAR claims (claims_to_headers source)
+    // Names of operator-requested claims that were present in the JWT/
+    // introspection payload but had a non-scalar (array/object) JSON shape.
+    // Tracked separately from `claims` so required-claim presence checks
+    // can match JWT-mode `payload.contains(c)` semantics WITHOUT abusing
+    // a magic string value inside `claims` (which would conflict with
+    // tokens that legitimately carry the literal sentinel as a claim
+    // value). HeaderRewriter never reads this set — array→header
+    // flattening is a future feature; non-scalar claim names emit no
+    // outbound header today.
+    std::set<std::string> non_scalar_claims;
     std::string policy_name;                              // Matched policy's name (observability)
 
     // SENSITIVE — raw bearer token. NEVER log this field. Never include it

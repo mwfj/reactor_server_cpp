@@ -9,6 +9,7 @@
 #include "net/dns_resolver.h"
 #include "tls/tls_context.h"
 #include "rate_limit/rate_limiter.h"
+#include "auth/auth_manager.h"
 
 #include <atomic>
 #include <map>
@@ -29,9 +30,6 @@ namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerManager;
 }
 
-namespace AUTH_NAMESPACE {
-class AuthManager;
-}
 
 class HttpServer {
 public:
@@ -78,6 +76,13 @@ public:
     void Route(const std::string& method, const std::string& path, HttpRouter::Handler handler);
     void WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler);
     void Use(HttpRouter::Middleware middleware);
+
+    // Install an async middleware on the router. Mirrors the gating
+    // semantics of Use() / Get() / etc. (rejected post-Start via
+    // RejectIfServerLive). Public surface for tests and embedders that
+    // want to drive the async chain explicitly; the production wiring
+    // installs through MarkServerReady directly.
+    void PrependAsyncMiddleware(HttpRouter::AsyncMiddleware middleware);
 
     // Route registration — asynchronous handlers.
     //
@@ -223,6 +228,12 @@ public:
     // reload-driver-thread contract. Returns empty when auth is not
     // configured. Out-of-line because AuthManager is forward-declared.
     std::unordered_set<std::string> LiveAuthIssuerNames() const;
+
+    // Reload-safe snapshot of auth runtime counters and per-issuer views
+    // for /stats. Returns nullopt when auth was never constructed (no
+    // upstream-pool wiring failure path). Safe from any dispatcher.
+    std::optional<AUTH_NAMESPACE::AuthManager::SnapshotView>
+    GetAuthSnapshot() const;
 
 public:
     // Thread-local pointer to the active ResourcePusher for the sync request
@@ -444,7 +455,7 @@ private:
     std::unique_ptr<UpstreamManager> upstream_manager_;
 
     // Circuit breaker — declared AFTER upstream_manager_ so destruction
-    // order is breaker-FIRST, pool-SECOND (design §3.1). On shutdown the
+    // order is breaker-FIRST, pool-SECOND. On shutdown the
     // breaker's slices may still be consulted by in-flight
     // ProxyTransactions until they drain; destroying the breaker first
     // (before the pool) is safe because UpstreamManager's outstanding

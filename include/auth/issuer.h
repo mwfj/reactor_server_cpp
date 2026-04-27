@@ -14,6 +14,7 @@ class JwksCache;
 class JwksFetcher;       // Defined in jwks_fetcher.h (Phase B)
 class OidcDiscovery;     // Defined in oidc_discovery.h (Phase B)
 class UpstreamHttpClient;
+class IntrospectionCache;
 
 // ---------------------------------------------------------------------------
 // Reloadable per-issuer snapshot. Held inside Issuer as
@@ -29,14 +30,14 @@ struct IssuerSnapshot {
     int jwks_cache_sec = 300;
     int jwks_refresh_timeout_sec = 5;
     int discovery_retry_sec = 30;
-    // Phase 3 introspection settings stored here so the snapshot is
-    // complete; JWT-mode Phase 2 ignores them.
+    // Introspection settings carried on the snapshot for reload-safe access;
+    // ignored when mode != "introspection".
     IntrospectionConfig introspection;
     // Populated by OIDC discovery once it succeeds, OR copied from the
     // static `jwks_uri` override when discovery=false. Consumed by
     // JwksFetcher to locate the JWKS endpoint path.
     std::string jwks_uri;
-    // Populated by OIDC discovery; used by Phase 3 introspection only.
+    // Populated by OIDC discovery; consumed by introspection mode only.
     std::string introspection_endpoint;
 };
 
@@ -53,6 +54,9 @@ struct IssuerSnapshotView {
     uint64_t jwks_stale_served = 0;
     size_t jwks_key_count = 0;
     std::chrono::system_clock::time_point last_jwks_refresh{};
+    // Approximate per-shard sum from IntrospectionCache. Zero for JWT-mode
+    // issuers (no cache constructed).
+    size_t introspection_cache_entries = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -131,7 +135,36 @@ class Issuer : public std::enable_shared_from_this<Issuer> {
         return generation_->load(std::memory_order_acquire);
     }
 
+    // Bump generation_ without touching snapshot_ / config / discovery
+    // state. Called from AuthManager::CommitPolicyAndEnforcement when
+    // forward.claim_keys changed: in-flight introspection completions
+    // captured the OLD claim_keys list (and a `gen` taken at dispatch
+    // time), so we bump generation BEFORE the manager clears the cache,
+    // forcing those completions through the `reload_in_flight` drop-
+    // guard so they cannot insert a stale entry after the clear runs.
+    // Returns the new generation for logging.
+    uint64_t BumpGenerationForClaimKeyReload() noexcept {
+        return generation_->fetch_add(1, std::memory_order_release) + 1;
+    }
+
+    // True after Stop() has begun. Late completions check this to drop
+    // results that would otherwise race with shutdown teardown.
+    bool stopping() const noexcept {
+        return stopping_.load(std::memory_order_acquire);
+    }
+
     JwksCache* jwks_cache() noexcept { return jwks_cache_.get(); }
+
+    // Returns nullptr for JWT-mode issuers (cache is constructed in Start()
+    // only when mode == "introspection").
+    IntrospectionCache* introspection_cache() noexcept {
+        return introspection_cache_.get();
+    }
+
+    // Loaded once at Start() from the configured env var. Empty for
+    // JWT-mode issuers and for introspection-mode issuers whose env var
+    // was unset/empty (in which case ready_ is false).
+    const std::string& client_secret() const noexcept { return client_secret_; }
 
     // Fill an observability view. Dispatcher-thread safe.
     IssuerSnapshotView BuildView() const;
@@ -143,12 +176,20 @@ class Issuer : public std::enable_shared_from_this<Issuer> {
     const std::string upstream_;
     const bool discovery_;
 
+    // Captured at construction so ValidateReload can compare incoming
+    // restart-required introspection fields against the original values.
+    // Never overwritten — a reload that would change them is rejected.
+    const std::string client_id_;
+    const std::string client_secret_env_;
+    const int shards_;
+
     // Atomic-swapped on Reload. Readers copy the shared_ptr onto the stack
     // and keep it alive for the duration of one verify call.
     std::shared_ptr<const IssuerSnapshot> snapshot_;
     mutable std::mutex snapshot_mtx_;
 
     std::atomic<bool> ready_{false};
+    std::atomic<bool> stopping_{false};
     // Generation bumped on Stop() and on every successful ApplyReload.
     // Heap-owned via shared_ptr so JwksFetcher / OidcDiscovery completion
     // callbacks can safely capture it by value — if the Issuer is destroyed
@@ -170,6 +211,14 @@ class Issuer : public std::enable_shared_from_this<Issuer> {
     std::unique_ptr<JwksFetcher> jwks_fetcher_;
     std::unique_ptr<OidcDiscovery> oidc_discovery_;
     std::shared_ptr<UpstreamHttpClient> upstream_http_client_;
+
+    // Constructed in Start() only when mode_ == "introspection". Held by
+    // unique_ptr so JWT-mode issuers pay zero memory cost.
+    std::unique_ptr<IntrospectionCache> introspection_cache_;
+    // Loaded once in Start() from getenv(client_secret_env_). Empty for
+    // JWT mode and for introspection mode with missing/empty env (in
+    // which case ready_ stays false — fail-closed).
+    std::string client_secret_;
 
     UpstreamManager* upstream_manager_;                    // non-owning
     std::vector<std::shared_ptr<Dispatcher>> dispatchers_;

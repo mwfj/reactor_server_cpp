@@ -23,6 +23,11 @@ public:
     void SetRequestCallback(RequestCallback callback);
     void SetRouteCheckCallback(RouteCheckCallback callback);
     void SetMiddlewareCallback(MiddlewareCallback callback);
+    // Install the async middleware callback for WS upgrades. Optional;
+    // when not installed the WS upgrade path skips the async phase and
+    // runs the sync path only.
+    void SetAsyncMiddlewareCallback(
+        HTTP_CALLBACKS_NAMESPACE::HttpConnAsyncMiddlewareCallback callback);
     void SetUpgradeCallback(UpgradeCallback callback);
     void SetRequestCountCallback(HTTP_CALLBACKS_NAMESPACE::HttpConnRequestCountCallback callback);
     void SetShutdownCheckCallback(HTTP_CALLBACKS_NAMESPACE::HttpConnShutdownCheckCallback callback);
@@ -212,6 +217,21 @@ private:
     // Returns true to continue pipelining loop, false to stop processing
     bool HandleCompleteRequest(const char*& buf, size_t& remaining, size_t consumed);
     void HandleIncompleteRequest();
+
+    // Continue the WS upgrade handshake after any middleware has
+    // resolved with PASS. Owns RFC 6455 handshake validation, 101 send,
+    // and WS state-machine init. Returns true if the upgrade completed
+    // or a rejection was sent (caller closes either way).
+    //
+    // `mw_response` carries headers stamped by the sync middleware. The
+    // sync path uses SendResponse directly; the async resume path uses
+    // CompleteAsyncResponse so deferred-response state unwinds correctly.
+    // Trailing bytes after the request are flushed by the caller.
+    bool ContinueWsUpgradeAfterAuth(const HttpRequest& req,
+                                    HttpResponse mw_response,
+                                    bool from_async_resume,
+                                    const char* trailing_buf,
+                                    size_t trailing_len);
 
     // Shared response normalization used by both the sync request loop and
     // the async deferred completion path. Scans Connection headers for a

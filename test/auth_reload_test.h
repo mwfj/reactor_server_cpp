@@ -1154,6 +1154,206 @@ static bool TestValidateProxyAuthSkipsOnEmptyLiveAuthRuntime() {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers for introspection-mode reload tests.
+// ---------------------------------------------------------------------------
+
+// Build an introspection-mode IssuerConfig with discovery=false. The static
+// endpoint flows into the live snapshot via BuildMutableSnapshotFromConfig,
+// which is what ValidateReload's restart-required guard compares against.
+// Bypasses ConfigLoader::Validate (which still rejects mode=introspection
+// at startup) — the AuthManager constructor accepts the IssuerConfig as-is,
+// matching what the production gate-lift path will look like.
+static AUTH_NAMESPACE::IssuerConfig MakeIntrospectionIssuer(
+        const std::string& name,
+        const std::string& url,
+        const std::string& endpoint =
+            "https://idp.example.com/introspect",
+        const std::string& client_id = "gw-client",
+        const std::string& client_secret_env = "GW_CLIENT_SECRET",
+        int shards = 16,
+        int timeout_sec = 3) {
+    AUTH_NAMESPACE::IssuerConfig ic;
+    ic.name        = name;
+    ic.issuer_url  = url;
+    ic.discovery   = false;
+    ic.upstream    = "";
+    ic.mode        = "introspection";
+    ic.algorithms  = {"RS256"};  // Required by ValidateReloadableFields
+                                   // even in introspection mode (mode-gated
+                                   // there only when mode=="jwt"); harmless
+                                   // here.
+    ic.leeway_sec  = 30;
+    ic.jwks_cache_sec = 300;
+    ic.introspection.endpoint = endpoint;
+    ic.introspection.client_id = client_id;
+    ic.introspection.client_secret_env = client_secret_env;
+    ic.introspection.shards = shards;
+    ic.introspection.timeout_sec = timeout_sec;
+    return ic;
+}
+
+static AUTH_NAMESPACE::AuthConfig MakeIntrospectionConfig(
+        const AUTH_NAMESPACE::IssuerConfig& ic) {
+    AUTH_NAMESPACE::AuthConfig cfg;
+    cfg.enabled = true;
+    cfg.issuers[ic.name] = ic;
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// Test: introspection.endpoint change on static (discovery=false) issuer
+// is rejected — ValidateReload preserves the live endpoint.
+// ---------------------------------------------------------------------------
+static bool TestIntrospectionEndpoint_RestartRequired_PreservesLive() {
+    auto ic0 = MakeIntrospectionIssuer(
+        "intro-iss-ep", "https://intro-ep.example.com");
+    auto cfg0 = MakeIntrospectionConfig(ic0);
+    auto mgr  = MakeManager(cfg0);
+
+    // Capture the live snapshot's endpoint before reload.
+    auto* live_iss = mgr->GetIssuer(ic0.name);
+    if (!live_iss) { mgr->Stop(); return false; }
+    auto snap_before = live_iss->LoadSnapshot();
+    const std::string before_ep = snap_before->introspection_endpoint;
+
+    // Reload with a different endpoint — must reject.
+    auto ic1 = ic0;
+    ic1.introspection.endpoint = "https://attacker.example.com/introspect";
+    auto cfg1 = MakeIntrospectionConfig(ic1);
+    std::string err;
+    bool reload_ok = mgr->Reload(cfg1, err);
+
+    auto snap_after = live_iss->LoadSnapshot();
+    mgr->Stop();
+
+    bool rejected = !reload_ok && err.find("introspection.endpoint") !=
+                                       std::string::npos;
+    bool preserved = snap_after->introspection_endpoint == before_ep;
+    return rejected && preserved;
+}
+
+// ---------------------------------------------------------------------------
+// Test: introspection.client_id change is rejected — ValidateReload
+// preserves the live client_id captured at construction.
+// ---------------------------------------------------------------------------
+static bool TestIntrospectionClientId_RestartRequired_PreservesLive() {
+    auto ic0 = MakeIntrospectionIssuer(
+        "intro-iss-cid", "https://intro-cid.example.com",
+        "https://intro-cid.example.com/introspect", "original-client",
+        "GW_CLIENT_SECRET", 16, 3);
+    auto cfg0 = MakeIntrospectionConfig(ic0);
+    auto mgr  = MakeManager(cfg0);
+
+    auto* live_iss = mgr->GetIssuer(ic0.name);
+    if (!live_iss) { mgr->Stop(); return false; }
+    auto snap_before = live_iss->LoadSnapshot();
+    const std::string before_cid = snap_before->introspection.client_id;
+
+    auto ic1 = ic0;
+    ic1.introspection.client_id = "rotated-client";
+    auto cfg1 = MakeIntrospectionConfig(ic1);
+    std::string err;
+    bool reload_ok = mgr->Reload(cfg1, err);
+
+    auto snap_after = live_iss->LoadSnapshot();
+    mgr->Stop();
+
+    bool rejected = !reload_ok && err.find("client_id") != std::string::npos;
+    bool preserved = snap_after->introspection.client_id == before_cid;
+    return rejected && preserved;
+}
+
+// ---------------------------------------------------------------------------
+// Test: introspection.client_secret_env change is rejected.
+// ---------------------------------------------------------------------------
+static bool TestIntrospectionClientSecretEnv_RestartRequired_PreservesLive() {
+    auto ic0 = MakeIntrospectionIssuer(
+        "intro-iss-env", "https://intro-env.example.com",
+        "https://intro-env.example.com/introspect", "gw-client",
+        "GW_SECRET_A", 16, 3);
+    auto cfg0 = MakeIntrospectionConfig(ic0);
+    auto mgr  = MakeManager(cfg0);
+
+    auto* live_iss = mgr->GetIssuer(ic0.name);
+    if (!live_iss) { mgr->Stop(); return false; }
+    auto snap_before = live_iss->LoadSnapshot();
+    const std::string before_env = snap_before->introspection.client_secret_env;
+
+    auto ic1 = ic0;
+    ic1.introspection.client_secret_env = "GW_SECRET_B";
+    auto cfg1 = MakeIntrospectionConfig(ic1);
+    std::string err;
+    bool reload_ok = mgr->Reload(cfg1, err);
+
+    auto snap_after = live_iss->LoadSnapshot();
+    mgr->Stop();
+
+    bool rejected = !reload_ok &&
+                    err.find("client_secret_env") != std::string::npos;
+    bool preserved = snap_after->introspection.client_secret_env == before_env;
+    return rejected && preserved;
+}
+
+// ---------------------------------------------------------------------------
+// Test: introspection.shards change is rejected — full rehash is not
+// supported live.
+// ---------------------------------------------------------------------------
+static bool TestIntrospectionShards_RestartRequired_PreservesLive() {
+    auto ic0 = MakeIntrospectionIssuer(
+        "intro-iss-shards", "https://intro-shards.example.com",
+        "https://intro-shards.example.com/introspect", "gw-client",
+        "GW_CLIENT_SECRET", 16, 3);
+    auto cfg0 = MakeIntrospectionConfig(ic0);
+    auto mgr  = MakeManager(cfg0);
+
+    auto* live_iss = mgr->GetIssuer(ic0.name);
+    if (!live_iss) { mgr->Stop(); return false; }
+    auto snap_before = live_iss->LoadSnapshot();
+    const int before_shards = snap_before->introspection.shards;
+
+    auto ic1 = ic0;
+    ic1.introspection.shards = 32;
+    auto cfg1 = MakeIntrospectionConfig(ic1);
+    std::string err;
+    bool reload_ok = mgr->Reload(cfg1, err);
+
+    auto snap_after = live_iss->LoadSnapshot();
+    mgr->Stop();
+
+    bool rejected = !reload_ok && err.find("shards") != std::string::npos;
+    bool preserved = snap_after->introspection.shards == before_shards;
+    return rejected && preserved;
+}
+
+// ---------------------------------------------------------------------------
+// Test: live-reloadable introspection.timeout_sec propagates into the
+// post-reload snapshot. Sanity check that the reloadable path works
+// end-to-end while the four restart-required guards above hold.
+// ---------------------------------------------------------------------------
+static bool TestIntrospectionReloadable_TimeoutSec_LivePropagation() {
+    auto ic0 = MakeIntrospectionIssuer(
+        "intro-iss-timeout", "https://intro-timeout.example.com",
+        "https://intro-timeout.example.com/introspect", "gw-client",
+        "GW_CLIENT_SECRET", 16, /*timeout_sec=*/3);
+    auto cfg0 = MakeIntrospectionConfig(ic0);
+    auto mgr  = MakeManager(cfg0);
+
+    auto* live_iss = mgr->GetIssuer(ic0.name);
+    if (!live_iss) { mgr->Stop(); return false; }
+
+    auto ic1 = ic0;
+    ic1.introspection.timeout_sec = 7;
+    auto cfg1 = MakeIntrospectionConfig(ic1);
+    std::string err;
+    bool reload_ok = mgr->Reload(cfg1, err);
+
+    auto snap_after = live_iss->LoadSnapshot();
+    mgr->Stop();
+
+    return reload_ok && snap_after->introspection.timeout_sec == 7;
+}
+
+// ---------------------------------------------------------------------------
 // Test runner
 // ---------------------------------------------------------------------------
 
@@ -1224,6 +1424,16 @@ static void RunAllTests() {
            TestValidateProxyAuthSkipsStagedOnlyIssuerUpstreamXref);
     RunOne("AuthReload: ValidateProxyAuth skips xref on empty live auth runtime",
            TestValidateProxyAuthSkipsOnEmptyLiveAuthRuntime);
+    RunOne("AuthReload: introspection.endpoint change rejected, live preserved",
+           TestIntrospectionEndpoint_RestartRequired_PreservesLive);
+    RunOne("AuthReload: introspection.client_id change rejected, live preserved",
+           TestIntrospectionClientId_RestartRequired_PreservesLive);
+    RunOne("AuthReload: introspection.client_secret_env change rejected, live preserved",
+           TestIntrospectionClientSecretEnv_RestartRequired_PreservesLive);
+    RunOne("AuthReload: introspection.shards change rejected, live preserved",
+           TestIntrospectionShards_RestartRequired_PreservesLive);
+    RunOne("AuthReload: introspection.timeout_sec is live-reloadable",
+           TestIntrospectionReloadable_TimeoutSec_LivePropagation);
 }
 
 }  // namespace AuthReloadTests

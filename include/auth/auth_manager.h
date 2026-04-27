@@ -6,7 +6,9 @@
 #include "auth/auth_policy_matcher.h"
 #include "auth/auth_result.h"
 #include "auth/issuer.h"
+#include "auth/token_hasher.h"
 #include "config/server_config.h"
+#include "http/http_router.h"
 #include <unordered_set>
 // <atomic>, <memory>, <mutex>, <unordered_map>, <vector> via common.h
 
@@ -18,6 +20,7 @@ class HttpResponse;
 namespace AUTH_NAMESPACE {
 
 class UpstreamHttpClient;
+class IntrospectionClient;
 
 // ---------------------------------------------------------------------------
 // Top-level owner of issuers, the applied-policy list, and the forward-
@@ -45,6 +48,14 @@ class AuthManager {
         uint64_t total_undetermined = 0;
         size_t policy_count = 0;
         uint64_t generation = 0;
+        // Aggregate introspection-mode counters across all issuers.
+        // All zero in JWT-only deployments.
+        uint64_t introspection_ok = 0;
+        uint64_t introspection_fail = 0;
+        uint64_t introspection_cache_hit = 0;
+        uint64_t introspection_cache_miss = 0;
+        uint64_t introspection_cache_negative_hit = 0;
+        uint64_t introspection_stale_served = 0;
     };
 
     AuthManager(const AuthConfig& config,
@@ -75,6 +86,17 @@ class AuthManager {
     // should continue (ALLOW or no policy match), false when a 401 /
     // 403 / 503 has been written to `resp`.
     bool InvokeMiddleware(const HttpRequest& req, HttpResponse& resp);
+
+    // Async middleware entry point. Drives the introspection-mode dispatch
+    // path. Sync fast-paths (cache hit / negative-hit / stale-serve / no
+    // policy / JWT-mode pass-through / DENY for missing/oversized bearer)
+    // call SetSyncResult+MarkCompletedSync inline. The deferred path fires
+    // a POST through IntrospectionClient and resolves via state->Complete.
+    void InvokeAsyncMiddleware(const HttpRequest& req, HttpResponse& resp,
+                                std::shared_ptr<HttpRouter::AsyncPendingState> state);
+
+    // Read-only accessor for tests + the async dispatch path.
+    const TokenHasher& hasher() const { return hasher_; }
 
     // Reload-safe forward-overlay snapshot. Caller must keep the
     // shared_ptr alive for the duration of one outbound hop and drop it
@@ -167,6 +189,46 @@ class AuthManager {
         const std::vector<UpstreamConfig>& upstreams,
         const std::vector<AuthPolicy>& top_level_policies);
 
+    // Introspection-mode dispatch: cache lookup with sync fast-paths
+    // (Fresh+active / Fresh+!active / Stale+active) and a deferred POST on
+    // miss. Always resolves `state` via SetSyncResult+MarkCompletedSync or
+    // Complete(payload). `fwd_snap` MUST be the same forward_ snapshot the
+    // caller paired with the policies_ snapshot used to select `policy` —
+    // a separate ForwardConfig() read here would race a concurrent
+    // CommitForwardAndPolicies() reload and inject headers/raw_token using
+    // a forward overlay that doesn't match the policy's reload generation.
+    void InvokeAsyncIntrospection(
+        const std::shared_ptr<Issuer>& issuer,
+        const IssuerSnapshot& snap,
+        const AuthPolicy& policy,
+        const std::string& token,
+        const HttpRequest& req,
+        HttpResponse& resp,
+        std::shared_ptr<HttpRouter::AsyncPendingState> state,
+        std::shared_ptr<const AuthForwardConfig> fwd_snap);
+
+    // Same as InvokeAsyncIntrospection but skips the cache entirely. Used
+    // when TokenHasher::Hash returns nullopt (rare HMAC failure) — caching
+    // a colliding key would cross-leak claim bundles between tokens.
+    void InvokeIntrospectionUncached(
+        const std::shared_ptr<Issuer>& issuer,
+        const IssuerSnapshot& snap,
+        const AuthPolicy& policy,
+        const std::string& token,
+        const HttpRequest& req,
+        HttpResponse& resp,
+        std::shared_ptr<HttpRouter::AsyncPendingState> state,
+        std::shared_ptr<const AuthForwardConfig> fwd_snap);
+
+    // Stamp a validated AuthContext onto req for the sync fast-paths
+    // (cache hit / stale-serve). Mirrors the JWT-mode mutation block.
+    static void StampAuthContext(const HttpRequest& req,
+                                  AuthContext ctx,
+                                  const std::string& issuer,
+                                  const std::string& policy,
+                                  const std::string& raw_jwt_header,
+                                  const std::string& token);
+
     std::unordered_map<std::string, std::shared_ptr<Issuer>> issuers_;
     std::shared_ptr<UpstreamHttpClient> upstream_http_client_;
 
@@ -191,6 +253,25 @@ class AuthManager {
     std::atomic<uint64_t> total_allowed_{0};
     std::atomic<uint64_t> total_denied_{0};
     std::atomic<uint64_t> total_undetermined_{0};
+
+    // Introspection-mode counters. Populated on the introspection dispatch
+    // paths; left at zero in JWT-only deployments. Surfaced under
+    // `auth.introspection.*` by SnapshotAll() / the /stats handler.
+    std::atomic<uint64_t> introspection_ok_{0};
+    std::atomic<uint64_t> introspection_fail_{0};
+    std::atomic<uint64_t> introspection_cache_hit_{0};
+    std::atomic<uint64_t> introspection_cache_miss_{0};
+    std::atomic<uint64_t> introspection_cache_negative_hit_{0};
+    std::atomic<uint64_t> introspection_stale_served_{0};
+    std::atomic<uint64_t> introspection_cache_entries_{0};
+
+    // Constructed from `hmac_key_` at Start(). Used by the introspection
+    // dispatch path to derive cache keys. ready() must be true post-Start.
+    TokenHasher hasher_{std::string(32, '\0')};
+
+    // Constructed at Start() once `upstream_http_client_` is wired. Owns
+    // the introspection POST plumbing for every issuer.
+    std::unique_ptr<IntrospectionClient> introspection_client_;
 
     std::mutex reload_mtx_;
 };

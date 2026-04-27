@@ -1,4 +1,5 @@
 #include "http/http_connection_handler.h"
+#include "http/http_router.h"   // AsyncPendingState / AsyncMiddlewarePayload
 #include "http/http_status.h"
 #include "http/trailer_policy.h"
 #include "http/streaming_response_sender_utils.h"
@@ -582,6 +583,11 @@ void HttpConnectionHandler::SetRouteCheckCallback(RouteCheckCallback callback) {
 
 void HttpConnectionHandler::SetMiddlewareCallback(MiddlewareCallback callback) {
     callbacks_.middleware_callback = std::move(callback);
+}
+
+void HttpConnectionHandler::SetAsyncMiddlewareCallback(
+    HTTP_CALLBACKS_NAMESPACE::HttpConnAsyncMiddlewareCallback callback) {
+    callbacks_.async_middleware_callback = std::move(callback);
 }
 
 void HttpConnectionHandler::SetUpgradeCallback(UpgradeCallback callback) {
@@ -1282,21 +1288,17 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         // (e.g., /ws/:room → req.params["room"]). The bool result is checked
         // AFTER handshake validation and middleware to avoid leaking route
         // existence through different error codes (404 vs 400/426).
-        bool ws_route_found = callbacks_.route_check_callback(req);
+        // (Currently unused outside ContinueWsUpgradeAfterAuth, but kept
+        // here to populate request.params before middleware runs so
+        // middleware that authorizes on route params keeps working.)
+        (void)callbacks_.route_check_callback(req);
 
-        // Run middleware — always, regardless of route match.
-        // request.params is populated for matched routes; empty for misses.
-        // Hoist mw_response so successful middleware headers can be merged
-        // into the 101 response (e.g., Set-Cookie, auth tokens).
+        // Sync middleware (rate-limit, sync auth). Default to 403 on
+        // reject if the middleware didn't set a status — avoids leaking
+        // 200 OK on a denied upgrade.
         HttpResponse mw_response;
         if (callbacks_.middleware_callback) {
             if (!callbacks_.middleware_callback(req, mw_response)) {
-                // Middleware rejected — default to 403 if status is still the
-                // HttpResponse default (200) and no body was set. The headers
-                // check was intentionally removed: middleware that stamps CORS
-                // or auth headers before rejecting should still produce 403,
-                // not leak a 200 OK on a denied WebSocket upgrade. Matches
-                // the async HTTP path (FillDefaultRejectionResponse).
                 if (mw_response.GetStatusCode() == HttpStatus::OK &&
                     mw_response.GetBody().empty()) {
                     mw_response.Status(HttpStatus::FORBIDDEN).Text("Forbidden");
@@ -1310,128 +1312,126 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             }
         }
 
-        // Validate WebSocket handshake per RFC 6455.
-        // Must happen BEFORE the route-miss check so that malformed upgrades
-        // always get 400/426 regardless of whether the route exists — prevents
-        // leaking route existence through different error codes.
-        std::string ws_error;
-        if (!WebSocketHandshake::Validate(req, ws_error)) {
-            logging::Get()->debug("WebSocket handshake rejected fd={}: {}",
-                                  conn_->fd(), ws_error);
-            int reject_code = 400;
-            // RFC 6455 §4.4: wrong version → 426 + Sec-WebSocket-Version
-            if (ws_error.find("version") != std::string::npos ||
-                ws_error.find("Version") != std::string::npos) {
-                reject_code = 426;
+        // Async middleware (optional). Pass mw_response so async sees
+        // any sync-stamped headers.
+        if (callbacks_.async_middleware_callback) {
+            std::shared_ptr<AsyncPendingState> state;
+            bool sync_complete = callbacks_.async_middleware_callback(
+                req, mw_response, state);
+            if (!sync_complete) {
+                // Suspend: install cancel hook, build resume closure,
+                // ArmResume. Resume re-enters ContinueWsUpgradeAfterAuth
+                // on PASS or sends the populated rejection on DENY.
+                // WS upgrade is not instrumented for active_requests_
+                // (request_count fired pre-upgrade), so DecrementOnce
+                // is a no-op via null active_counter.
+                mw_response.Defer();
+
+                auto req_copy  = std::make_shared<HttpRequest>(req);
+                auto resp_copy = std::make_shared<HttpResponse>(std::move(mw_response));
+                auto self      = shared_from_this();
+
+                self->BeginAsyncResponse(*req_copy);
+
+                self->SetAsyncAbortHook([state]() {
+                    state->TripCancel();
+                });
+
+                auto resume_cb =
+                    [self, req_copy, resp_copy, state]
+                    (HttpRouter::AsyncMiddlewarePayload payload) {
+                    auto do_bookkeeping = [state]() {
+                        state->DecrementOnce();
+                    };
+                    auto shared_payload =
+                        std::make_shared<HttpRouter::AsyncMiddlewarePayload>(
+                            std::move(payload));
+                    self->conn_->RunOnDispatcher(
+                        [self, req_copy, resp_copy, state,
+                         shared_payload, do_bookkeeping]() mutable {
+                        if (state->cancelled()) {
+                            do_bookkeeping();
+                            return;
+                        }
+                        if (!self->IsAsyncResponsePending()) {
+                            do_bookkeeping();
+                            return;
+                        }
+                        if (shared_payload->finalizer) {
+                            shared_payload->finalizer(*req_copy, *resp_copy);
+                        }
+                        if (shared_payload->result ==
+                                HttpRouter::AsyncMiddlewareResult::DENY) {
+                            resp_copy->Header("Connection", "close");
+                            resp_copy->ClearDeferred();
+                            self->CompleteAsyncResponse(std::move(*resp_copy));
+                            self->CloseConnection();
+                        } else {
+                            // Trailing bytes were buffered during the
+                            // suspend window and are flushed by
+                            // CompleteAsyncResponse → OnRawData →
+                            // HandleUpgradedData once upgraded_ is set.
+                            self->ContinueWsUpgradeAfterAuth(
+                                *req_copy, std::move(*resp_copy),
+                                /*from_async_resume=*/true,
+                                /*trailing_buf=*/nullptr,
+                                /*trailing_len=*/0);
+                        }
+                        do_bookkeeping();
+                    });
+                };
+
+                state->ArmResume(std::move(resume_cb), nullptr);
+
+                // Preserve any bytes already received AFTER the upgrade
+                // request (a client that pipelines the first WS frame
+                // with the GET / Upgrade request leaves them in `buf`
+                // past `consumed`). Without this stash, those bytes are
+                // dropped when HandleCompleteRequest returns — OnRawData
+                // only routes LATER-arriving bytes through
+                // StashDeferredBytes, and the post-101 deferred-buf
+                // flush would fire empty, costing the client its first
+                // frame.
+                if (remaining > consumed) {
+                    StashDeferredBytes(
+                        std::string(buf + consumed, remaining - consumed));
+                }
+                buf += remaining;
+                remaining = 0;
+
+                return false;  // upgrade suspended; peer is awaiting 101/reject
             }
-            HttpResponse reject = WebSocketHandshake::Reject(reject_code, ws_error);
-            if (reject_code == 426) {
-                reject.Header("Sec-WebSocket-Version", "13");
+
+            // Sync fast-path: DENY → reject (default 403); PASS → fall
+            // through to ContinueWsUpgradeAfterAuth. `state` is null on
+            // empty-chain implicit PASS.
+            if (state && state->sync_result() ==
+                    HttpRouter::AsyncMiddlewareResult::DENY) {
+                if (mw_response.GetStatusCode() == HttpStatus::OK &&
+                    mw_response.GetBody().empty()) {
+                    mw_response.Status(HttpStatus::FORBIDDEN).Text("Forbidden");
+                }
+                logging::Get()->debug(
+                    "WebSocket upgrade rejected by async middleware fd={} path={}",
+                    conn_->fd(), req.path);
+                mw_response.Header("Connection", "close");
+                SendResponse(mw_response);
+                CloseConnection();
+                return false;
             }
-            reject.Header("Connection", "close");
-            SendResponse(reject);
-            CloseConnection();
-            return false;
         }
 
-        // Now check route existence (after middleware and validation)
-        if (!ws_route_found) {
-            logging::Get()->debug("WebSocket route not found fd={} path={}",
-                                  conn_->fd(), logging::SanitizePath(req.path));
-            auto not_found = HttpResponse::NotFound();
-            not_found.Header("Connection", "close");
-            SendResponse(not_found);
-            CloseConnection();
-            return false;
-        }
-
-        // Request completed (as upgrade) — reset timeout tracking
-        request_in_progress_ = false;
-        conn_->ClearDeadline();
-        conn_->SetDeadlineTimeoutCb(nullptr);
-
-        // Route confirmed — send 101 Switching Protocols.
-        // Merge safe middleware headers (e.g., Set-Cookie, auth tokens).
-        // Skip headers that are mandatory parts of the 101 handshake response
-        // to avoid corruption.
-        HttpResponse upgrade_resp = WebSocketHandshake::Accept(req);
-        for (const auto& hdr : mw_response.GetHeaders()) {
-            std::string key = hdr.first;
-            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c); });
-            // Skip 101 mandatory headers, framing headers, and WS
-            // negotiation headers. This server doesn't implement WS
-            // extensions or subprotocol negotiation, so allowing
-            // middleware to inject Sec-WebSocket-Extensions (e.g.,
-            // permessage-deflate) would cause clients to send RSV1
-            // frames that the parser rejects as protocol errors.
-            if (key == "connection" || key == "upgrade" ||
-                key == "sec-websocket-accept" || key == "content-length" ||
-                key == "transfer-encoding" ||
-                key == "sec-websocket-extensions" ||
-                key == "sec-websocket-protocol") {
-                continue;
-            }
-            upgrade_resp.Header(hdr.first, hdr.second);
-        }
-        // Late shutdown gate: the early route_check ran before middleware/101.
-        // Must check BEFORE sending 101 — once 101 is on the wire, clients
-        // expect a WebSocket session. Sending 101 then closing the TCP
-        // connection without a WS close frame is a protocol violation.
-        if (callbacks_.shutdown_check_callback &&
-            callbacks_.shutdown_check_callback()) {
-            logging::Get()->debug("WS upgrade rejected: server shutting down fd={}",
-                                  conn_->fd());
-            HttpResponse shutdown_resp;
-            shutdown_resp.Status(HttpStatus::SERVICE_UNAVAILABLE).Text("Service Unavailable");
-            shutdown_resp.Header("Connection", "close");
-            SendResponse(shutdown_resp);
-            CloseConnection();
-            return false;
-        }
-
-        SendResponse(upgrade_resp);
-
-        // If the send failed (client disconnected), don't proceed with upgrade.
-        // SendRaw may have triggered CallCloseCb via EPIPE/ECONNRESET.
-        if (conn_->IsClosing()) {
-            logging::Get()->debug("WS upgrade: connection closed during 101 send fd={}",
-                                  conn_->fd());
-            return false;
-        }
-
-        // Mark as upgraded IMMEDIATELY after 101 is sent, before any
-        // code that could throw. This ensures the catch block correctly
-        // identifies post-101 exceptions and sends WS close 1011
-        // instead of raw HTTP 500 on an already-upgraded connection.
-        upgraded_ = true;
-
-        // Create WebSocket connection
-        ws_conn_ = std::make_unique<WebSocketConnection>(conn_);
-        if (max_ws_message_size_ > 0) {
-            ws_conn_->GetParser().SetMaxPayloadSize(max_ws_message_size_);
-            ws_conn_->SetMaxMessageSize(max_ws_message_size_);
-        }
-        // Switch input cap to the WS message size limit. The read loop
-        // stops at the cap (data stays in kernel buffer, nothing is
-        // discarded) and requeues, so no parser desync. This bounds
-        // per-cycle memory allocation against a fast peer while the
-        // WS parser enforces frame/message limits independently.
-        if (max_ws_message_size_ > 0) {
-            conn_->SetMaxInputSize(max_ws_message_size_);
-        }
-
-        // Wire WS callbacks (called exactly once, ws_conn_ guaranteed to exist)
-        if (callbacks_.upgrade_callback) {
-            callbacks_.upgrade_callback(shared_from_this(), req);
-        }
-
-        // Forward any trailing bytes after the HTTP headers as WebSocket data
-        buf += consumed;
-        remaining -= consumed;
-        if (remaining > 0 && ws_conn_) {
-            std::string trailing(buf, remaining);
-            ws_conn_->OnRawData(trailing);
-        }
+        // Handshake validation + 101 send.
+        bool result = ContinueWsUpgradeAfterAuth(
+            req, std::move(mw_response),
+            /*from_async_resume=*/false,
+            buf + consumed, remaining - consumed);
+        // ContinueWsUpgradeAfterAuth returns true on success (101 sent,
+        // ws_conn_ live, trailing bytes forwarded) and false on any
+        // rejection — both cases want HandleCompleteRequest to return
+        // false (the connection is now WS-mode or closing; either way
+        // do not attempt to parse a pipelined HTTP request).
+        (void)result;
         return false;
 
         } catch (const std::exception& e) {
@@ -1698,6 +1698,213 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
     }
 
     return true;  // Continue pipelining loop
+}
+
+// WebSocket-upgrade post-middleware path. Extracted from the inline
+// block in HandleCompleteRequest so the async-middleware resume path
+// can re-enter at the same point.
+//
+// Sync invocation path (from_async_resume=false): callers have the
+// trailing `buf` / `consumed` parameters in scope and pass them through
+// for the post-101 ws_conn_->OnRawData forward. The 101 response is
+// sent via SendResponse.
+//
+// Async-resume path (from_async_resume=true): no trailing `buf` is in
+// scope (the deferred completion fired from a different stack); any
+// bytes that arrived during the suspend window were buffered into
+// deferred_pending_buf_ via OnRawData and are flushed by
+// CompleteAsyncResponse after we transition to upgraded_ state. We
+// pass nullptr/0 for trailing — the deferred-buf flush handles them.
+//
+// Returns true on successful upgrade (101 sent, ws_conn_ live), false
+// on rejection (response sent, connection closed). Callers ignore the
+// return value: the WS upgrade decision is final and the parser is
+// either in WS mode or the connection is closing.
+bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
+    const HttpRequest& req,
+    HttpResponse mw_response,
+    bool from_async_resume,
+    const char* trailing_buf,
+    size_t trailing_len) {
+    // The probe at the top of HandleCompleteRequest's WS branch already
+    // populated request.params for pattern routes via route_check.
+
+    // Validate WebSocket handshake per RFC 6455.
+    // Must happen BEFORE the route-miss check so that malformed upgrades
+    // always get 400/426 regardless of whether the route exists —
+    // prevents leaking route existence through different error codes.
+    std::string ws_error;
+    if (!WebSocketHandshake::Validate(req, ws_error)) {
+        logging::Get()->debug("WebSocket handshake rejected fd={}: {}",
+                              conn_->fd(), ws_error);
+        int reject_code = 400;
+        if (ws_error.find("version") != std::string::npos ||
+            ws_error.find("Version") != std::string::npos) {
+            reject_code = 426;
+        }
+        HttpResponse reject = WebSocketHandshake::Reject(reject_code, ws_error);
+        if (reject_code == 426) {
+            reject.Header("Sec-WebSocket-Version", "13");
+        }
+        reject.Header("Connection", "close");
+        if (from_async_resume) {
+            reject.ClearDeferred();
+            CompleteAsyncResponse(std::move(reject));
+        } else {
+            SendResponse(reject);
+        }
+        CloseConnection();
+        return false;
+    }
+
+    // Route existence check (after middleware + handshake validation).
+    // The route_check_callback is the canonical source of truth for
+    // both sync and async-resume paths.
+    bool ws_route_found =
+        callbacks_.route_check_callback &&
+        callbacks_.route_check_callback(req);
+    if (!ws_route_found) {
+        logging::Get()->debug("WebSocket route not found fd={} path={}",
+                              conn_->fd(), logging::SanitizePath(req.path));
+        auto not_found = HttpResponse::NotFound();
+        not_found.Header("Connection", "close");
+        if (from_async_resume) {
+            not_found.ClearDeferred();
+            CompleteAsyncResponse(std::move(not_found));
+        } else {
+            SendResponse(not_found);
+        }
+        CloseConnection();
+        return false;
+    }
+
+    // Request completed (as upgrade) — reset timeout tracking
+    request_in_progress_ = false;
+    conn_->ClearDeadline();
+    conn_->SetDeadlineTimeoutCb(nullptr);
+
+    // Build the 101 response, merging safe middleware headers.
+    HttpResponse upgrade_resp = WebSocketHandshake::Accept(req);
+    for (const auto& hdr : mw_response.GetHeaders()) {
+        std::string key = hdr.first;
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        // Skip 101 mandatory headers, framing headers, and WS
+        // negotiation headers. This server doesn't implement WS
+        // extensions or subprotocol negotiation, so allowing middleware
+        // to inject Sec-WebSocket-Extensions (e.g. permessage-deflate)
+        // would cause clients to send RSV1 frames that the parser
+        // rejects as protocol errors.
+        if (key == "connection" || key == "upgrade" ||
+            key == "sec-websocket-accept" || key == "content-length" ||
+            key == "transfer-encoding" ||
+            key == "sec-websocket-extensions" ||
+            key == "sec-websocket-protocol") {
+            continue;
+        }
+        upgrade_resp.Header(hdr.first, hdr.second);
+    }
+
+    // Late shutdown gate: the early route_check ran before middleware/101.
+    // Must check BEFORE sending 101 — once 101 is on the wire, clients
+    // expect a WebSocket session. Sending 101 then closing the TCP
+    // connection without a WS close frame is a protocol violation.
+    if (callbacks_.shutdown_check_callback &&
+        callbacks_.shutdown_check_callback()) {
+        logging::Get()->debug("WS upgrade rejected: server shutting down fd={}",
+                              conn_->fd());
+        HttpResponse shutdown_resp;
+        shutdown_resp.Status(HttpStatus::SERVICE_UNAVAILABLE).Text("Service Unavailable");
+        shutdown_resp.Header("Connection", "close");
+        if (from_async_resume) {
+            shutdown_resp.ClearDeferred();
+            CompleteAsyncResponse(std::move(shutdown_resp));
+        } else {
+            SendResponse(shutdown_resp);
+        }
+        CloseConnection();
+        return false;
+    }
+
+    // For the async-resume path we must transition to upgraded_ + create
+    // ws_conn_ BEFORE CompleteAsyncResponse, so the deferred-buf flush
+    // (which OnRawData routes through HandleUpgradedData when upgraded_
+    // is set) reaches the WebSocket connection rather than the HTTP
+    // parser. The sync path keeps the historical ordering (101 first,
+    // then upgraded_ + ws_conn_) so the existing exception-handling
+    // contract (catch block sends WS 1011 if upgraded_ is true) is
+    // preserved unchanged.
+    if (from_async_resume) {
+        upgraded_ = true;
+        ws_conn_ = std::make_unique<WebSocketConnection>(conn_);
+        if (max_ws_message_size_ > 0) {
+            ws_conn_->GetParser().SetMaxPayloadSize(max_ws_message_size_);
+            ws_conn_->SetMaxMessageSize(max_ws_message_size_);
+            conn_->SetMaxInputSize(max_ws_message_size_);
+        }
+        // Install user-registered WebSocket handlers (OnMessage / OnClose
+        // / etc.) BEFORE CompleteAsyncResponse fires the deferred-buf
+        // flush. CompleteAsyncResponse routes deferred_pending_buf_
+        // through OnRawData → HandleUpgradedData → ws_conn_->OnRawData,
+        // which parses any frames the client pipelined with the upgrade
+        // (or sent during the suspend window) and dispatches them via
+        // OnMessage. Calling upgrade_callback AFTER the flush would mean
+        // those early frames are parsed against a still-null OnMessage
+        // handler and silently dropped.
+        if (callbacks_.upgrade_callback) {
+            callbacks_.upgrade_callback(shared_from_this(), req);
+        }
+        upgrade_resp.ClearDeferred();
+        CompleteAsyncResponse(std::move(upgrade_resp));
+        if (conn_->IsClosing()) {
+            logging::Get()->debug(
+                "WS upgrade: connection closed during 101 send fd={}",
+                conn_->fd());
+            return false;
+        }
+        // Trailing bytes (if any) were stashed via OnRawData during the
+        // suspend window AND by the WS-suspend site in HandleCompleteRequest
+        // for bytes already in `buf` past `consumed` at suspend time. Both
+        // sources are flushed by CompleteAsyncResponse →
+        // OnRawData → HandleUpgradedData above, so no work needed here.
+        // trailing_buf/_len are nullptr/0 by contract on this path.
+        (void)trailing_buf;
+        (void)trailing_len;
+        return true;
+    }
+
+    // ---- Sync path ----
+    SendResponse(upgrade_resp);
+
+    if (conn_->IsClosing()) {
+        logging::Get()->debug("WS upgrade: connection closed during 101 send fd={}",
+                              conn_->fd());
+        return false;
+    }
+
+    // Mark as upgraded IMMEDIATELY after 101 is sent, before any code
+    // that could throw. This ensures the catch block (in
+    // HandleCompleteRequest) correctly identifies post-101 exceptions
+    // and sends WS close 1011 instead of raw HTTP 500.
+    upgraded_ = true;
+
+    ws_conn_ = std::make_unique<WebSocketConnection>(conn_);
+    if (max_ws_message_size_ > 0) {
+        ws_conn_->GetParser().SetMaxPayloadSize(max_ws_message_size_);
+        ws_conn_->SetMaxMessageSize(max_ws_message_size_);
+        conn_->SetMaxInputSize(max_ws_message_size_);
+    }
+
+    if (callbacks_.upgrade_callback) {
+        callbacks_.upgrade_callback(shared_from_this(), req);
+    }
+
+    // Forward any trailing bytes after the HTTP headers as WS data.
+    if (trailing_len > 0 && trailing_buf && ws_conn_) {
+        std::string trailing(trailing_buf, trailing_len);
+        ws_conn_->OnRawData(trailing);
+    }
+    return true;
 }
 
 void HttpConnectionHandler::HandleIncompleteRequest() {

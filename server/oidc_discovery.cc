@@ -46,9 +46,12 @@ ParsedHttpsUri BuildDiscoveryEndpoint(const std::string& issuer_url) {
 
 // Extract (jwks_uri, introspection_endpoint) from the discovery JSON
 // body, gated on the document's `issuer` field matching the configured
-// issuer URL. Returns non-empty jwks_uri on success; introspection_endpoint
-// may legitimately be empty (not all IdPs advertise it). On JSON or
-// schema failure, returns empty jwks_uri and sets `reason`.
+// issuer URL. Returns non-empty jwks_uri on success; out_introspection_endpoint
+// is HTTPS-gated — a non-HTTPS scheme (or any URL where the scheme isn't
+// `https`) is cleared and `reason` is set to "introspection_endpoint_not_https".
+// Both endpoints may legitimately be empty (not every IdP advertises
+// introspection). On JSON or schema failure, returns empty jwks_uri and
+// sets `reason`.
 //
 // `expected_issuer` MUST be the `issuer_url` from the operator's config.
 // Per OIDC Connect Discovery 1.0 §4.3, the discovery response's
@@ -83,23 +86,46 @@ void ExtractEndpoints(const std::string& body,
             reason = "issuer_mismatch";
             return;
         }
+        // jwks_uri is OPTIONAL at the extraction layer. Introspection-
+        // only OAuth metadata (mode=introspection issuers, opaque-token
+        // deployments) does not advertise a JWKS endpoint and would
+        // permanently fail if we rejected here. The Issuer::OnDiscoveryReady
+        // callback mode-gates which endpoint is the authoritative readiness
+        // signal (jwks_uri for JWT mode, introspection_endpoint for
+        // introspection mode); upstream callers that need both should check
+        // their own out fields.
         auto jwks_it = j.find("jwks_uri");
-        if (jwks_it == j.end() || !jwks_it->is_string()) {
-            reason = "missing_jwks_uri";
-            return;
+        if (jwks_it != j.end() && jwks_it->is_string()) {
+            out_jwks_uri = jwks_it->get<std::string>();
+            // Enforce https on jwks_uri when present.
+            if (!HasHttpsScheme(out_jwks_uri)) {
+                reason = "jwks_uri_not_https";
+                out_jwks_uri.clear();
+                // Don't return — an introspection-mode issuer might still
+                // be served by the introspection_endpoint below.
+            }
         }
-        out_jwks_uri = jwks_it->get<std::string>();
         auto intro_it = j.find("introspection_endpoint");
         if (intro_it != j.end() && intro_it->is_string()) {
-            out_introspection_endpoint = intro_it->get<std::string>();
+            const auto candidate = intro_it->get<std::string>();
+            // A non-HTTPS introspection_endpoint would leak the IdP
+            // client_secret (RFC 7662 §2.1 sends it as Basic credentials)
+            // AND every bearer token introspected. Clear and surface the
+            // reason; jwks_uri stays valid so JWT-mode discovery still
+            // succeeds when the IdP only mis-advertises introspection.
+            if (HasHttpsScheme(candidate)) {
+                out_introspection_endpoint = candidate;
+            } else {
+                out_introspection_endpoint.clear();
+                if (reason.empty()) reason = "introspection_endpoint_not_https";
+            }
         }
-        // Enforce https on jwks_uri to match the TLS-mandatory IdP policy.
-        // Case-insensitive scheme per RFC 3986 §3.1 — compliant IdPs may
-        // return `HTTPS://…` and shouldn't be rejected as plaintext.
-        if (!HasHttpsScheme(out_jwks_uri)) {
-            reason = "jwks_uri_not_https";
-            out_jwks_uri.clear();
-            return;
+        if (out_jwks_uri.empty() && out_introspection_endpoint.empty()
+                && reason.empty()) {
+            // Neither endpoint advertised AND no per-field error already
+            // set — preserve the original "nothing usable" signal so the
+            // discovery loop can retry.
+            reason = "missing_endpoints";
         }
     } catch (const nlohmann::json::exception& ex) {
         reason = "json_exception";
@@ -118,16 +144,28 @@ void ExtractEndpoints(const std::string& body,
 
 }  // namespace
 
+void OidcDiscovery::ExtractEndpointsForTest(
+        const std::string& body,
+        const std::string& expected_issuer,
+        std::string& out_jwks_uri,
+        std::string& out_introspection_endpoint,
+        std::string& reason) {
+    ExtractEndpoints(body, expected_issuer, out_jwks_uri,
+                      out_introspection_endpoint, reason);
+}
+
 OidcDiscovery::OidcDiscovery(std::string issuer_name,
                               std::string issuer_url,
                               std::shared_ptr<UpstreamHttpClient> client,
                               std::string upstream_pool_name,
-                              int retry_sec)
+                              int retry_sec,
+                              bool requires_jwks_uri)
     : issuer_name_(std::move(issuer_name)),
       issuer_url_(std::move(issuer_url)),
       client_(std::move(client)),
       upstream_pool_name_(std::move(upstream_pool_name)),
       retry_sec_(retry_sec > 0 ? retry_sec : 30),
+      requires_jwks_uri_(requires_jwks_uri),
       ready_(std::make_shared<std::atomic<bool>>(false)),
       cancel_token_(std::make_shared<std::atomic<bool>>(false)) {
     logging::Get()->debug(
@@ -198,10 +236,11 @@ void OidcDiscovery::Start(size_t dispatcher_index,
     // Issuer::Start / reload.
     cycle_state_ = std::make_shared<CycleState>();
     std::weak_ptr<CycleState> weak_state = cycle_state_;
+    const bool requires_jwks_uri = requires_jwks_uri_;
     cycle_state_->run =
         [weak_state, issuer_name, issuer_url, pool_name, client_copy,
          dispatcher, retry_sec, generation, on_ready_cb, token,
-         ready_flag](size_t disp_index) {
+         ready_flag, requires_jwks_uri](size_t disp_index) {
             if (token->load(std::memory_order_acquire)) {
                 return;
             }
@@ -218,7 +257,8 @@ void OidcDiscovery::Start(size_t dispatcher_index,
             client_copy->Issue(
                 pool_name, disp_index, std::move(req),
                 [weak_state, issuer_name, issuer_url, dispatcher, retry_sec,
-                 generation, on_ready_cb, token, ready_flag, disp_index](
+                 generation, on_ready_cb, token, ready_flag, disp_index,
+                 requires_jwks_uri](
                         UpstreamHttpClient::Response resp) {
                     if (token->load(std::memory_order_acquire)) {
                         return;
@@ -251,11 +291,37 @@ void OidcDiscovery::Start(size_t dispatcher_index,
                     std::string reason;
                     ExtractEndpoints(resp.body, issuer_url,
                                      jwks_uri, intro_endpoint, reason);
-                    if (jwks_uri.empty()) {
+                    // Mode-aware acceptance:
+                    //   * JWT-mode issuers (`requires_jwks_uri`=true) MUST
+                    //     receive a usable jwks_uri; introspection-only
+                    //     metadata can't satisfy a JWT issuer.
+                    //   * Introspection-mode issuers
+                    //     (`requires_jwks_uri`=false) MUST receive a usable
+                    //     introspection_endpoint; a JWKS-only metadata
+                    //     response can't satisfy an introspection issuer
+                    //     (Issuer::KickOffOidcDiscovery would leave it
+                    //     not-ready and discovery would silently stop).
+                    //   * Either way, an empty body / fully-malformed
+                    //     response (both endpoints empty) is a hard fail.
+                    //   * Any of the above schedules a retry so a later-
+                    //     fixed metadata response can land.
+                    const bool both_empty = jwks_uri.empty() && intro_endpoint.empty();
+                    const bool jwt_needs_jwks_but_missing =
+                        requires_jwks_uri && jwks_uri.empty();
+                    const bool intro_needs_endpoint_but_missing =
+                        !requires_jwks_uri && intro_endpoint.empty();
+                    if (both_empty || jwt_needs_jwks_but_missing ||
+                            intro_needs_endpoint_but_missing) {
+                        const char* fail_reason = reason.c_str();
+                        if (!both_empty) {
+                            fail_reason = jwt_needs_jwks_but_missing
+                                ? "jwt_mode_missing_jwks_uri"
+                                : "introspection_mode_missing_endpoint";
+                        }
                         logging::Get()->warn(
                             "OIDC discovery parse failed issuer={} reason={} "
                             "retry_in={}s",
-                            issuer_name, reason, retry_sec);
+                            issuer_name, fail_reason, retry_sec);
                         schedule_retry();
                         return;
                     }

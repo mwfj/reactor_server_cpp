@@ -679,6 +679,12 @@ std::unordered_set<std::string> HttpServer::LiveAuthIssuerNames() const {
     return auth_manager_->LiveIssuerNames();
 }
 
+std::optional<AUTH_NAMESPACE::AuthManager::SnapshotView>
+HttpServer::GetAuthSnapshot() const {
+    if (!auth_manager_) return std::nullopt;
+    return auth_manager_->SnapshotAll();
+}
+
 void HttpServer::MarkServerReady() {
     // Bypass RejectIfServerLive for the internal registration pass below.
     // MarkServerReady runs on the dispatcher thread and is the ONLY
@@ -985,11 +991,19 @@ void HttpServer::MarkServerReady() {
         // Start discovery / static-fetch asynchronously; non-blocking.
         auth_manager_->Start();
 
-        // Install the auth middleware UNCONDITIONALLY. InvokeMiddleware
-        // checks AuthManager::master_enabled_ and returns pass-through
-        // when false, so installing at boot time is the cleanest way to
-        // make `auth.enabled: false → true` live-reloadable (otherwise a
-        // SIGHUP can never retroactively add a middleware).
+        // Install the async-auth middleware FIRST so the async chain is
+        // ordered before any future async middleware is prepended. The
+        // sync-auth middleware is installed LAST so that "last prepend
+        // runs first" places sync auth at the head of the sync chain
+        // (sync auth → rate_limit). Net per-request order is:
+        //   sync auth (JWT) → sync rate_limit → async auth (introspection)
+        //   → DispatchHandler.
+        // Both InvokeMiddleware and InvokeAsyncMiddleware check
+        // master_enabled_ inline so installing at boot keeps
+        // `auth.enabled: false → true` live-reloadable (a SIGHUP cannot
+        // retroactively add middleware after MarkServerReady returns).
+        router_.PrependAsyncMiddleware(
+            AUTH_NAMESPACE::MakeAsyncMiddleware(auth_manager_.get()));
         router_.PrependMiddleware(
             AUTH_NAMESPACE::MakeMiddleware(auth_manager_.get()));
 
@@ -1381,6 +1395,8 @@ void HttpServer::Delete(const std::string& path, HttpRouter::Handler handler) { 
 void HttpServer::Route(const std::string& method, const std::string& path, HttpRouter::Handler handler) { if (RejectIfServerLive("Route", path)) return; router_.Route(method, path, std::move(handler)); }
 void HttpServer::WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler) { if (RejectIfServerLive("WebSocket", path)) return; router_.WebSocket(path, std::move(handler)); }
 void HttpServer::Use(HttpRouter::Middleware middleware) { if (RejectIfServerLive("Use", "<middleware>")) return; router_.Use(std::move(middleware)); }
+
+void HttpServer::PrependAsyncMiddleware(HttpRouter::AsyncMiddleware middleware) { if (RejectIfServerLive("PrependAsyncMiddleware", "<async-middleware>")) return; router_.PrependAsyncMiddleware(std::move(middleware)); }
 
 void HttpServer::GetAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { if (RejectIfServerLive("GetAsync", path)) return; router_.RouteAsync("GET",    path, std::move(handler)); }
 void HttpServer::PostAsync(const std::string& path, HttpRouter::AsyncHandler handler)   { if (RejectIfServerLive("PostAsync", path)) return; router_.RouteAsync("POST",   path, std::move(handler)); }
@@ -2947,6 +2963,62 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     return;  // Sync send path below runs auto-send
                 }
 
+                // Run async middleware (e.g. OAuth introspection) BEFORE the
+                // async handler so proxy routes registered via RouteAsync
+                // are protected. The async-handler state machine below is
+                // tightly coupled to the dispatch frame and can't host a
+                // suspend/resume trampoline without a substantial refactor;
+                // here we only support the SYNCHRONOUS-completion path.
+                // Cache-hit / negative-hit / sync-DENY all pass through
+                // immediately — only a cache miss that would actually fire
+                // a network POST gets rejected with 503 + Retry-After. The
+                // operator sees a clean failure (and a one-shot increment
+                // of the introspection_undetermined counter) instead of a
+                // silent auth bypass. Subsequent requests that hit the
+                // populated cache succeed normally.
+                {
+                    std::shared_ptr<HttpRouter::AsyncPendingState> mw_state;
+                    bool mw_sync_complete = router_.RunAsyncMiddleware(
+                        request, response, mw_state);
+                    if (!mw_sync_complete) {
+                        // FIXME: tier-2 follow-up — wire the async-handler
+                        // dispatch through the same ArmResume trampoline
+                        // sync routes use, so cache-miss requests resume
+                        // into the user handler instead of being 503'd.
+                        //
+                        // Cache-warmup-friendly fallback: do NOT TripCancel
+                        // the in-flight introspection POST. Letting it
+                        // complete populates the IntrospectionCache so the
+                        // next request for the same token gets a hit. The
+                        // mw_state's resume_cb was never armed, so when
+                        // Complete fires it just stores the payload in
+                        // result_slot_ and returns; the state's shared_ptr
+                        // ref count drops with the closure and the slot is
+                        // destroyed unused. Counter-pollution in payload's
+                        // finalizer is a non-issue because the finalizer
+                        // never runs.
+                        response = HttpResponse();
+                        response.Status(503)
+                                .Header("Retry-After", "1")
+                                .Header("Cache-Control", "no-store")
+                                .Text("authentication unavailable on async route — retry");
+                        if (!server_ready_.load(std::memory_order_acquire)) {
+                            response.Header("Connection", "close");
+                        }
+                        return;
+                    }
+                    if (mw_state &&
+                        mw_state->sync_result() ==
+                            HttpRouter::AsyncMiddlewareResult::DENY) {
+                        // Sync DENY path — response was populated by the
+                        // middleware (401 / 403 / 503 builder).
+                        if (!server_ready_.load(std::memory_order_acquire)) {
+                            response.Header("Connection", "close");
+                        }
+                        return;
+                    }
+                }
+
                 // BeginAsyncResponse must see the ORIGINAL request so
                 // deferred_was_head_ captures the real client method —
                 // CompleteAsyncResponse uses it to strip the body at send
@@ -3252,7 +3324,103 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 return;
             }
 
-            if (!router_.Dispatch(request, response)) {
+            // Phased dispatch: sync middleware → async middleware →
+            // handler. RequestGuard stays armed through every path
+            // except the async-middleware suspend branch, which releases
+            // it after ArmResume so TripCancel/DecrementOnce can share
+            // ownership of the active_requests_ decrement.
+
+            if (!router_.RunMiddleware(request, response)) {
+                HttpRouter::FillDefaultRejectionResponse(response);
+                if (!server_ready_.load(std::memory_order_acquire)) {
+                    response.Header("Connection", "close");
+                }
+                return;
+            }
+
+            std::shared_ptr<HttpRouter::AsyncPendingState> state;
+            if (!router_.RunAsyncMiddleware(request, response, state)) {
+                // Suspend: flip Defer, capture deep copies (the
+                // connection's request slot is reused by the parser),
+                // wire cancel/resume, ArmResume, release guard.
+                response.Defer();
+                self->BeginAsyncResponse(request);
+
+                auto req_copy  = std::make_shared<HttpRequest>(request);
+                auto resp_copy = std::make_shared<HttpResponse>(std::move(response));
+                std::weak_ptr<HttpConnectionHandler> h1_weak = self;
+                auto active_counter_local = active_requests_;
+
+                self->SetAsyncAbortHook([state]() {
+                    state->TripCancel();
+                });
+
+                // Capture state by VALUE — RunOnDispatcher enqueues for
+                // a future tick. `this` (HttpServer) outlives the
+                // connection: RemoveConnection trips the abort hook
+                // before the resume can run.
+                auto resume_cb =
+                    [this, h1_weak, req_copy, resp_copy, state]
+                    (HttpRouter::AsyncMiddlewarePayload payload) {
+                    auto do_bookkeeping = [state]() {
+                        state->DecrementOnce();
+                    };
+                    auto h1 = h1_weak.lock();
+                    if (!h1) { do_bookkeeping(); return; }
+                    auto conn = h1->GetConnection();
+                    if (!conn) { do_bookkeeping(); return; }
+                    auto shared_payload =
+                        std::make_shared<HttpRouter::AsyncMiddlewarePayload>(
+                            std::move(payload));
+                    conn->RunOnDispatcher(
+                        [this, h1, req_copy, resp_copy, state,
+                         shared_payload, do_bookkeeping]() mutable {
+                        if (state->cancelled()) {
+                            do_bookkeeping();
+                            return;
+                        }
+                        if (!h1->IsAsyncResponsePending()) {
+                            do_bookkeeping();
+                            return;
+                        }
+                        if (shared_payload->finalizer) {
+                            shared_payload->finalizer(*req_copy, *resp_copy);
+                        }
+                        if (shared_payload->result ==
+                                HttpRouter::AsyncMiddlewareResult::PASS) {
+                            if (!router_.DispatchHandler(
+                                    *req_copy, *resp_copy)) {
+                                resp_copy->Status(HttpStatus::NOT_FOUND)
+                                          .Text("Not Found");
+                            }
+                            if (!server_ready_.load(
+                                    std::memory_order_acquire)) {
+                                resp_copy->Header("Connection", "close");
+                            }
+                        }
+                        resp_copy->ClearDeferred();
+                        h1->CompleteAsyncResponse(std::move(*resp_copy));
+                        do_bookkeeping();
+                    });
+                };
+
+                state->ArmResume(std::move(resume_cb), active_counter_local);
+                guard.release();
+                return;
+            }
+
+            // Sync fast-path. Guard stays armed through scope exit.
+            // `state` is null when no async middleware was registered
+            // (implicit PASS); only inspect sync_result when state exists.
+            if (state && state->sync_result() ==
+                    HttpRouter::AsyncMiddlewareResult::DENY) {
+                if (!server_ready_.load(std::memory_order_acquire)) {
+                    response.Header("Connection", "close");
+                }
+                return;
+            }
+
+            if (!router_.DispatchHandler(request, response)) {
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
             // During shutdown, signal the client to close the connection.
@@ -3270,6 +3438,14 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetMiddlewareCallback(
         [this](const HttpRequest& request, HttpResponse& response) -> bool {
             return router_.RunMiddleware(request, response);
+        }
+    );
+
+    // Bridge WS-upgrade dispatch into the async chain.
+    http_conn->SetAsyncMiddlewareCallback(
+        [this](const HttpRequest& request, HttpResponse& response,
+               std::shared_ptr<AsyncPendingState>& out_state) -> bool {
+            return router_.RunAsyncMiddleware(request, response, out_state);
         }
     );
 
@@ -3860,6 +4036,36 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     HttpRouter::FillDefaultRejectionResponse(response);
                     return;
                 }
+
+                // See H1 path above for the rationale on this sync-only
+                // gate. Cache hits / negative hits / sync-DENY all work;
+                // a cache miss that would actually fire a network POST
+                // gets a clean 503 + Retry-After instead of a silent auth
+                // bypass. Subsequent requests that hit the populated cache
+                // succeed normally.
+                {
+                    // FIXME: tier-2 follow-up — see H1 path above for
+                    // the same gap. Cache-miss requests are 503'd; the
+                    // in-flight POST is allowed to complete so the
+                    // cache populates for subsequent requests.
+                    std::shared_ptr<HttpRouter::AsyncPendingState> mw_state;
+                    bool mw_sync_complete = router_.RunAsyncMiddleware(
+                        request, response, mw_state);
+                    if (!mw_sync_complete) {
+                        response = HttpResponse();
+                        response.Status(503)
+                                .Header("Retry-After", "1")
+                                .Header("Cache-Control", "no-store")
+                                .Text("authentication unavailable on async route — retry");
+                        return;
+                    }
+                    if (mw_state &&
+                        mw_state->sync_result() ==
+                            HttpRouter::AsyncMiddlewareResult::DENY) {
+                        return;
+                    }
+                }
+
                 response.Defer();
 
                 auto mw_headers = response.GetHeaders();
@@ -4135,7 +4341,82 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 ~PusherSlotGuard() { HttpServer::current_sync_pusher_ = nullptr; }
             } pusher_slot_guard;
 
-            if (!router_.Dispatch(request, response)) {
+            // Phased dispatch — same shape as the H1 path. H2 uses
+            // stream-scoped abort hooks and SubmitStreamResponse on
+            // resume; ClearDeferred is unnecessary because the H2
+            // initial-dispatch gate (Http2Session::SubmitResponseIfFinished
+            // checks IsDeferred) doesn't apply to the resume submit.
+
+            if (!router_.RunMiddleware(request, response)) {
+                HttpRouter::FillDefaultRejectionResponse(response);
+                return;
+            }
+
+            std::shared_ptr<HttpRouter::AsyncPendingState> state;
+            if (!router_.RunAsyncMiddleware(request, response, state)) {
+                // Defer() is required on H2 too: without it, the H2
+                // dispatcher submits an immediate default response and
+                // closes the stream before resume runs.
+                response.Defer();
+
+                auto req_copy  = std::make_shared<HttpRequest>(request);
+                auto resp_copy = std::make_shared<HttpResponse>(std::move(response));
+                std::weak_ptr<Http2ConnectionHandler> h2_weak = self;
+                auto active_counter_local = active_requests_;
+
+                self->SetStreamAbortHook(stream_id, [state]() {
+                    state->TripCancel();
+                });
+
+                auto resume_cb =
+                    [this, h2_weak, stream_id, req_copy, resp_copy, state]
+                    (HttpRouter::AsyncMiddlewarePayload payload) {
+                    auto do_bookkeeping = [state]() {
+                        state->DecrementOnce();
+                    };
+                    auto h2 = h2_weak.lock();
+                    if (!h2) { do_bookkeeping(); return; }
+                    auto conn = h2->GetConnection();
+                    if (!conn) { do_bookkeeping(); return; }
+                    auto shared_payload =
+                        std::make_shared<HttpRouter::AsyncMiddlewarePayload>(
+                            std::move(payload));
+                    conn->RunOnDispatcher(
+                        [this, h2, stream_id, req_copy, resp_copy, state,
+                         shared_payload, do_bookkeeping]() mutable {
+                        if (state->cancelled()) {
+                            do_bookkeeping();
+                            return;
+                        }
+                        h2->EraseStreamAbortHook(stream_id);
+                        if (shared_payload->finalizer) {
+                            shared_payload->finalizer(*req_copy, *resp_copy);
+                        }
+                        if (shared_payload->result ==
+                                HttpRouter::AsyncMiddlewareResult::PASS) {
+                            if (!router_.DispatchHandler(
+                                    *req_copy, *resp_copy)) {
+                                resp_copy->Status(HttpStatus::NOT_FOUND)
+                                          .Text("Not Found");
+                            }
+                        }
+                        h2->SubmitStreamResponse(stream_id, *resp_copy);
+                        do_bookkeeping();
+                    });
+                };
+
+                state->ArmResume(std::move(resume_cb), active_counter_local);
+                guard.release();
+                return;
+            }
+
+            // `state` is null on empty-chain implicit PASS.
+            if (state && state->sync_result() ==
+                    HttpRouter::AsyncMiddlewareResult::DENY) {
+                return;
+            }
+
+            if (!router_.DispatchHandler(request, response)) {
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
         }
