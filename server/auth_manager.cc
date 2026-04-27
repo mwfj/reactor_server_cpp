@@ -353,23 +353,41 @@ void AuthManager::CommitPolicyAndEnforcement(
     // augmented `claim_keys` list InvokeAsyncIntrospection threads through.
     //
     // Two-pass over issuers_ to fence in-flight completions:
-    //   Pass A — bump every issuer's generation_ BEFORE clearing any
-    //            cache. In-flight introspection completions captured the
-    //            OLD claim_keys at dispatch time and check `gen !=
+    //   Pass A — bump generation_ ONLY for ready introspection-mode
+    //            issuers, BEFORE clearing any cache. In-flight
+    //            introspection completions captured the OLD claim_keys
+    //            at dispatch time and check `gen !=
     //            issuer->generation()` BEFORE writing into the cache;
     //            the bump forces them onto the `reload_in_flight` drop-
     //            guard so they can never insert a stale entry after our
     //            Clear() below.
-    //   Pass B — Clear() each cache. Subsequent live POSTs repopulate
-    //            using the new claim_keys via the InvokeAsyncIntrospection
-    //            augmented list.
+    //   Pass B — Clear() each issuer's introspection cache (the per-
+    //            issuer getter returns null for JWT-mode, so JWT-mode
+    //            issuers naturally skip).
+    //
+    // Why the ready+introspection gate on Pass A:
+    // The issuer's `generation_` is shared between the introspection
+    // completion gate (what we want to fence here) AND OidcDiscovery's
+    // on_ready_cb gate. A pre-ready issuer has a discovery callback
+    // in flight that captured the old generation; bumping unconditionally
+    // would orphan that callback (KickOffOidcDiscovery's gen-check would
+    // reject it forever, leaving the issuer not-ready until restart).
+    // Pre-ready issuers also can't have any cache entries — IsReady()
+    // gates request acceptance — so there are no in-flight introspection
+    // completions to fence anyway. JWT-mode issuers have no
+    // introspection cache and thus nothing to fence.
+    //
     // issuers_ is topology-stable post-construction (Reload preserves the
     // existing map; topology changes are restart-required), and
     // IntrospectionCache::Clear takes per-shard locks internally.
     if (claim_keys_changed) {
+        size_t fenced = 0;
         for (auto& [name, issuer_ptr] : issuers_) {
             if (!issuer_ptr) continue;
+            if (issuer_ptr->mode() != kModeIntrospection) continue;
+            if (!issuer_ptr->IsReady()) continue;
             (void)issuer_ptr->BumpGenerationForClaimKeyReload();
+            ++fenced;
         }
         for (auto& [name, issuer_ptr] : issuers_) {
             if (!issuer_ptr) continue;
@@ -378,9 +396,9 @@ void AuthManager::CommitPolicyAndEnforcement(
             }
         }
         logging::Get()->info(
-            "AuthManager commit: introspection caches cleared and "
-            "generations bumped (forward.claim_keys changed) issuers={}",
-            issuers_.size());
+            "AuthManager commit: introspection caches cleared "
+            "(forward.claim_keys changed) issuers={} generations_fenced={}",
+            issuers_.size(), fenced);
     }
     logging::Get()->info(
         "AuthManager commit: policies={} enforcing={}",

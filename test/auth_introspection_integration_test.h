@@ -219,7 +219,10 @@ static ServerConfig BuildServerConfig(
     cfg.worker_threads = 2;
     cfg.http2.enabled  = false;
 
-    // Upstream pool pointing at the mock IdP.
+    // Upstream pool pointing at the mock IdP. The introspection-mode
+    // TLS-on-upstream validator exempts loopback hosts so the plaintext
+    // mock IdP on 127.0.0.1 is accepted at config load — production
+    // (non-loopback) deployments still get the hard reject.
     UpstreamConfig upstream;
     upstream.name            = upstream_pool_name;
     upstream.host            = mock.host();
@@ -1034,7 +1037,9 @@ static bool TestMixedModePolicyJwtFirstIntrospectionFallback() {
     cfg.worker_threads = 2;
     cfg.http2.enabled  = false;
 
-    // Upstream for the mock IdP.
+    // Upstream for the mock IdP. Loopback exemption from the
+    // introspection-mode TLS-on-upstream validator (see BuildServerConfig
+    // header comment).
     UpstreamConfig up_intro;
     up_intro.name                    = "intro-pool";
     up_intro.host                    = mock.host();

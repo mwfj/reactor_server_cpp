@@ -989,6 +989,153 @@ void TestConfigLoaderRejectsPlaintextIdpEndpoints() {
 }
 
 // -----------------------------------------------------------------------------
+// ConfigLoader: introspection-mode upstream MUST have tls.enabled=true unless
+// the upstream host is loopback (127.x / ::1 / "localhost"). Production-shaped
+// hosts are rejected with the explicit "tls.enabled=false" message; loopback
+// is accepted under the W3C-Secure-Contexts-style local-dev exemption so test
+// fixtures with plaintext mock IdPs keep loading.
+// -----------------------------------------------------------------------------
+void TestConfigLoaderRejectsPlaintextIntrospectionUpstream() {
+    std::cout << "\n[TEST] ConfigLoader rejects plaintext introspection upstream (non-loopback)..." << std::endl;
+    auto validate = [](const std::string& json) -> std::string {
+        try {
+            ServerConfig cfg = ConfigLoader::LoadFromString(json);
+            ConfigLoader::Validate(cfg);
+            return "";
+        } catch (const std::invalid_argument& e) {
+            return std::string(e.what());
+        } catch (const std::exception& e) {
+            return std::string("unexpected exception type: ") + e.what();
+        }
+    };
+
+    try {
+        // Reject: non-loopback host with tls.enabled=false.
+        std::string err = validate(R"({
+            "upstreams": [{"name":"x","host":"idp.example.com","port":443}],
+            "auth": {
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://idp.example.com",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://idp.example.com/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E"
+                        }
+                    }
+                }
+            }
+        })");
+        if (err.find("tls.enabled=false") == std::string::npos) {
+            throw std::runtime_error(
+                "non-loopback plaintext upstream should reject with "
+                "'tls.enabled=false'; got: " + err);
+        }
+
+        // Accept: loopback host (127.0.0.1) with tls.enabled=false.
+        err = validate(R"({
+            "upstreams": [{"name":"x","host":"127.0.0.1","port":8080}],
+            "auth": {
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://idp.example.com",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://idp.example.com/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E"
+                        }
+                    }
+                }
+            }
+        })");
+        if (!err.empty()) {
+            throw std::runtime_error(
+                "loopback 127.0.0.1 should be exempt; got: " + err);
+        }
+
+        // Accept: explicit "localhost" string is also exempt.
+        err = validate(R"({
+            "upstreams": [{"name":"x","host":"localhost","port":8080}],
+            "auth": {
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://idp.example.com",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://idp.example.com/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E"
+                        }
+                    }
+                }
+            }
+        })");
+        if (!err.empty()) {
+            throw std::runtime_error(
+                "loopback 'localhost' should be exempt; got: " + err);
+        }
+
+        // Accept: non-loopback host with tls.enabled=true.
+        err = validate(R"({
+            "upstreams": [{"name":"x","host":"idp.example.com","port":443,
+                           "tls":{"enabled":true}}],
+            "auth": {
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://idp.example.com",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://idp.example.com/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E"
+                        }
+                    }
+                }
+            }
+        })");
+        if (!err.empty()) {
+            throw std::runtime_error(
+                "non-loopback with tls.enabled=true should pass; got: " + err);
+        }
+
+        // JWT-mode issuers are NOT subject to this check (only introspection).
+        err = validate(R"({
+            "upstreams": [{"name":"x","host":"idp.example.com","port":443}],
+            "auth": {
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://idp.example.com",
+                        "upstream": "x",
+                        "mode": "jwt",
+                        "discovery": true,
+                        "algorithms": ["RS256"]
+                    }
+                }
+            }
+        })");
+        if (!err.empty()) {
+            throw std::runtime_error(
+                "JWT-mode issuer should not trigger introspection-only "
+                "TLS-on-upstream check; got: " + err);
+        }
+
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects plaintext introspection upstream (non-loopback)",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: ConfigLoader rejects plaintext introspection upstream (non-loopback)",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // PopulateFromPayload — iss/sub now optional (review P1 #3).
 // RFC 7519 §4.1.1 / §4.1.2 mark both as OPTIONAL; RFC 7662 introspection
 // only requires `active`. Common scenarios where one or both are absent:
@@ -4840,6 +4987,7 @@ inline void RunAllTests() {
     TestConfigLoaderRejectsAuthEnabled();
     TestConfigLoaderRejectsProxyAuthEnabled();
     TestConfigLoaderRejectsPlaintextIdpEndpoints();
+    TestConfigLoaderRejectsPlaintextIntrospectionUpstream();
     TestPopulateFromPayloadOptionalIssSub();
     TestConfigLoaderUpstreamCrossRefReloadSafe();
     TestConfigLoaderRejectsOutOfRangeIntegers();

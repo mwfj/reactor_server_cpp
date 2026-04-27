@@ -2407,6 +2407,56 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     "client credentials over the wire (design spec §9 item 4)");
             }
 
+            // TLS-on-upstream check for introspection-mode issuers.
+            // UpstreamHttpClient routes the POST through the named
+            // upstream pool — which is what actually decides whether the
+            // socket is plaintext or TLS — NOT the URL scheme of
+            // `introspection.endpoint`. An https://-prefixed endpoint
+            // bound to a tls.enabled=false pool would silently send
+            // bearer tokens AND the gateway's client_secret in cleartext.
+            //
+            // Loopback exception: 127.0.0.0/8, ::1, and the literal
+            // string "localhost" are exempt because an attacker on the
+            // wire cannot reach a loopback-only socket; the threat model
+            // requires network access. This mirrors the broadly-accepted
+            // browser HTTPS-only-with-localhost-exemption pattern (W3C
+            // Secure Contexts §3.1) and lets in-process test fixtures
+            // (mock IdP on 127.0.0.1) keep running plaintext while
+            // production (non-loopback) deployments still get the hard
+            // reject. A WARN log surfaces the exempted misconfig so an
+            // operator who unintentionally lands here sees it.
+            if (ic.mode == AUTH_NAMESPACE::kModeIntrospection &&
+                !reload_copy && !ic.upstream.empty()) {
+                for (const auto& u : config.upstreams) {
+                    if (u.name != ic.upstream) continue;
+                    if (u.tls.enabled) break;
+                    const bool is_loopback =
+                        u.host == "127.0.0.1" ||
+                        u.host == "::1" ||
+                        u.host == "localhost" ||
+                        (u.host.size() > 4 && u.host.compare(0, 4, "127.") == 0);
+                    if (is_loopback) {
+                        logging::Get()->warn(
+                            "{}.upstream='{}' has tls.enabled=false but host "
+                            "is loopback ({}) — accepted under the loopback "
+                            "exemption (test/local-dev only); production "
+                            "introspection MUST use a TLS upstream",
+                            ctx, ic.upstream, u.host);
+                        break;
+                    }
+                    throw std::invalid_argument(
+                        ctx + ".upstream='" + ic.upstream +
+                        "' has tls.enabled=false — mode=\"introspection\" "
+                        "MUST route through a TLS upstream because the "
+                        "RFC 7662 POST carries the bearer token AND the "
+                        "gateway's client_secret. Set `upstreams[].tls."
+                        "enabled=true` on this pool, or move the IdP "
+                        "to a different TLS upstream and update "
+                        "auth.issuers." + name + ".upstream "
+                        "(loopback hosts are exempt for test/local-dev only)");
+                }
+            }
+
             // Mode/endpoint mismatch — warn per design spec §5.3. Not a
             // hard-reject because operators sometimes template both blocks
             // and select mode dynamically; emitting a warn ensures the
