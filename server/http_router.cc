@@ -36,17 +36,32 @@ void AsyncPendingState::ArmResume(
     std::shared_ptr<std::atomic<int64_t>> active_counter) {
     std::function<void(AsyncMiddlewarePayload)> cb_to_fire;
     AsyncMiddlewarePayload payload_to_fire;
+    std::shared_ptr<std::atomic<int64_t>> consume_now;
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (resume_armed_) return;         // one-shot
         resume_cb_ = std::move(resume_cb);
         active_counter_ = std::move(active_counter);
         resume_armed_ = true;
+        // Consume an owed decrement deferred by an earlier TripCancel that
+        // ran before active_counter_ was wired. Without this hand-off,
+        // a cancel that purges the queued upstream work (silently, no
+        // completion callback) leaves bookkeeping unclaimed and
+        // active_requests_ leaks — DecrementOnce never runs because the
+        // resume closure never fires.
+        if (decrement_owed_ && active_counter_ &&
+            !bookkeeping_done_.exchange(true, std::memory_order_acq_rel)) {
+            consume_now = active_counter_;
+            decrement_owed_ = false;
+        }
         if (completion_pending_) {
             cb_to_fire = resume_cb_;       // copy under lock
             payload_to_fire = std::move(result_slot_);
             completion_pending_ = false;
         }
+    }
+    if (consume_now) {
+        consume_now->fetch_sub(1, std::memory_order_relaxed);
     }
     if (cb_to_fire) {
         cb_to_fire(std::move(payload_to_fire));
@@ -74,6 +89,15 @@ void AsyncPendingState::TripCancel() {
         if (active_counter_ &&
             !bookkeeping_done_.exchange(true, std::memory_order_acq_rel)) {
             active_counter_->fetch_sub(1, std::memory_order_relaxed);
+        } else if (!active_counter_) {
+            // Case (b) deferral: ArmResume hasn't wired active_counter_ yet.
+            // Mark the decrement as owed so ArmResume consumes it on
+            // wire-in. Without this, a cancel that subsequently purges
+            // the queued upstream work without a completion callback
+            // leaves bookkeeping_done_ unset forever and active_requests_
+            // never decrements (the resume closure never runs to call
+            // DecrementOnce).
+            decrement_owed_ = true;
         }
     }
 

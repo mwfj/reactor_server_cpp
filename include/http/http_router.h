@@ -91,9 +91,19 @@ private:
     // legitimately run BEFORE ArmResume wires active_counter_, in which
     // case the cancel_cb_ must still fire exactly once but bookkeeping
     // must wait for a later DecrementOnce to do the decrement.
+    //
+    // decrement_owed_ records the case "TripCancel ran while
+    // active_counter_ was null". The eventual ArmResume consumes it: if
+    // set when ArmResume wires active_counter_, ArmResume claims the
+    // bookkeeping_done_ slot and decrements directly. Without this hand-
+    // off, the failure mode is: cancel propagates → queued upstream
+    // checkout is purged silently (no completion callback) → resume_cb
+    // never fires → DecrementOnce never runs → active_requests_ leaks
+    // until shutdown drain hangs.
     std::atomic<bool> bookkeeping_done_{false};
     std::atomic<bool> cancel_fired_{false};
     std::atomic<bool> cancelled_{false};
+    bool decrement_owed_ = false;  // protected by mu_
 };
 
 // Async middleware. `state` is constructed inside RunAsyncMiddleware and

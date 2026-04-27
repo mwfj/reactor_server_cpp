@@ -876,26 +876,56 @@ void AuthManager::InvokeAsyncMiddleware(
         }
     } else if (!policy.issuers.empty()) {
         // Opaque token (no peekable `iss`) — must be an introspection
-        // candidate. Prefer the FIRST introspection-mode issuer in
-        // policy.issuers order; falling back to policy.issuers.front()
-        // would route opaque tokens to a JWT-mode issuer in mixed-mode
-        // policies (which then deny because the JWT path can't decode
-        // them). The sync chain already returned PASS for this request
-        // because the JWT path treats undecodable tokens as not-its-job;
-        // the async chain MUST pick an introspection issuer so the IdP
-        // gets the chance to validate.
+        // candidate. Walk policy.issuers in order, prefer the FIRST
+        // introspection issuer that IS READY at dispatch time; if all
+        // ready introspection issuers exhaust, fall through to the
+        // not-ready branch below.
+        //
+        // Why ready-first vs literal first: in a multi-introspection
+        // policy where issuer A is unhealthy (discovery still retrying)
+        // but issuer B is up, the literal-first selection routes every
+        // request to A and produces UNDETERMINED — even though B could
+        // have served the token. Walking by IsReady at dispatch lets
+        // operators add a redundant introspection issuer for failover
+        // without losing the policy's first-issuer-preference for the
+        // healthy steady state.
+        //
+        // KNOWN LIMITATION (documented in docs/oauth2.md): runtime
+        // fan-out across the LIVE POST (issuer A says active=false for
+        // a B-owned opaque token, or A's POST times out) is not
+        // implemented. The first ready issuer's verdict is final for
+        // that request; subsequent requests for the same token re-
+        // evaluate after the negative cache TTL elapses
+        // (`introspection.negative_cache_sec`, default 10s) and may
+        // pick a different issuer if A then becomes not-ready. The
+        // multi-introspection warning at config validation captures
+        // the operator-visible cost.
         for (const auto& issuer_name : policy.issuers) {
             auto it = issuers_.find(issuer_name);
             if (it == issuers_.end() || !it->second) continue;
-            if (it->second->mode() == kModeIntrospection) {
-                chosen = it->second.get();
-                break;
+            if (it->second->mode() != kModeIntrospection) continue;
+            if (!it->second->IsReady()) continue;
+            chosen = it->second.get();
+            break;
+        }
+        // Fallback: if no introspection issuer is ready, take the first
+        // introspection issuer (ready or not) so the not-ready branch
+        // below runs with a meaningful issuer for the
+        // policy.on_undetermined / Retry-After computation.
+        if (!chosen) {
+            for (const auto& issuer_name : policy.issuers) {
+                auto it = issuers_.find(issuer_name);
+                if (it == issuers_.end() || !it->second) continue;
+                if (it->second->mode() == kModeIntrospection) {
+                    chosen = it->second.get();
+                    break;
+                }
             }
         }
-        // No introspection issuer in the policy — fall back to the first
-        // entry. The mode-gate below converts this to a sync_pass (JWT
-        // path owns the verdict on mixed-mode policies with no
-        // introspection issuer eligible).
+        // Still nothing — no introspection issuer in the policy. Fall
+        // back to the first entry. The mode-gate below converts this
+        // to a sync_pass (JWT path owns the verdict on mixed-mode
+        // policies with no introspection issuer eligible).
         if (!chosen) {
             auto it = issuers_.find(policy.issuers.front());
             if (it != issuers_.end()) chosen = it->second.get();

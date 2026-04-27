@@ -697,6 +697,43 @@ static void Test_AsyncPendingState_ArmResume_AfterTripCancel() {
     }
 }
 
+// Regression: TripCancel before ArmResume + cancel-purges-the-checkout
+// (no completion ever fires) used to leak the active_requests_
+// decrement. The fix: TripCancel records `decrement_owed_` when
+// active_counter_ is null at trip time; ArmResume consumes it on
+// wire-in. Without this, active_requests_ stays elevated and shutdown
+// drain hangs.
+static void Test_AsyncPendingState_TripCancelBeforeArmResume_DoesNotLeak() {
+    try {
+        auto counter = std::make_shared<std::atomic<int64_t>>(1);
+
+        AsyncPendingState state;
+        state.TripCancel();  // active_counter_ still null → owe decrement
+        // Counter has not yet decremented because no counter was wired.
+        bool pre_ok = counter->load() == 1;
+
+        // ArmResume wires the counter; the owed decrement consumes here.
+        state.ArmResume([](AsyncMiddlewarePayload) {}, counter);
+
+        // Counter must have decremented exactly once via the owed flag.
+        bool post_ok = counter->load() == 0;
+
+        // DecrementOnce should be a no-op now (bookkeeping_done_ is set).
+        state.DecrementOnce();
+        bool final_ok = counter->load() == 0;
+
+        bool ok = pre_ok && post_ok && final_ok;
+        Record("IntrospectionClient: AsyncPendingState_TripCancelBeforeArmResume_DoesNotLeak",
+               ok,
+               "TripCancel-then-ArmResume must decrement exactly once via "
+               "the owed-decrement hand-off (pre=" + std::to_string(counter->load()) +
+               ", post should be 0)");
+    } catch (const std::exception& e) {
+        Record("IntrospectionClient: AsyncPendingState_TripCancelBeforeArmResume_DoesNotLeak",
+               false, e.what());
+    }
+}
+
 // DecrementOnce and TripCancel share bookkeeping_done_; calling both must
 // decrement the counter exactly once.
 static void Test_AsyncPendingState_BookkeepingDoneExactlyOnce() {
@@ -762,6 +799,7 @@ static void RunAllTests() {
     Test_AsyncPendingState_CompleteBeforeArmResume_Replays();
     Test_AsyncPendingState_TripCancelAndComplete_Race();
     Test_AsyncPendingState_ArmResume_AfterTripCancel();
+    Test_AsyncPendingState_TripCancelBeforeArmResume_DoesNotLeak();
     Test_AsyncPendingState_BookkeepingDoneExactlyOnce();
 }
 
