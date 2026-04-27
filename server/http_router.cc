@@ -810,11 +810,27 @@ void HttpRouter::PopulateRouteParams(const HttpRequest& request) {
     // already-populated async-route case.
     if (!request.params.empty()) return;
     auto it = method_tries_.find(request.method);
-    if (it == method_tries_.end()) return;
-    std::unordered_map<std::string, std::string> params;
-    auto result = it->second.Search(request.path, params);
-    if (result.handler) {
-        request.params = std::move(params);
+    if (it != method_tries_.end()) {
+        std::unordered_map<std::string, std::string> params;
+        auto result = it->second.Search(request.path, params);
+        if (result.handler) {
+            request.params = std::move(params);
+            return;
+        }
+    }
+    // Mirror DispatchHandler's HEAD→GET fallback (RFC 7231 §4.3.2): for HEAD
+    // requests with no explicit HEAD handler, middleware that authorizes on
+    // request.params (e.g. /users/:id) must see the same captures the
+    // GET-fallback handler would receive at dispatch.
+    if (request.method == "HEAD") {
+        auto get_it = method_tries_.find("GET");
+        if (get_it != method_tries_.end()) {
+            std::unordered_map<std::string, std::string> params;
+            auto result = get_it->second.Search(request.path, params);
+            if (result.handler) {
+                request.params = std::move(params);
+            }
+        }
     }
 }
 

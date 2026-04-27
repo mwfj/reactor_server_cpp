@@ -38,13 +38,14 @@ namespace OidcDiscoveryTests {
 static std::unique_ptr<AUTH_NAMESPACE::OidcDiscovery> MakeDiscovery(
         const std::string& issuer_name = "test-issuer",
         const std::string& issuer_url  = "https://auth.example.com",
-        int retry_sec                  = 5) {
+        int retry_sec                  = 5,
+        bool requires_jwks_uri         = true) {
     // null client — Start() will log an error and return immediately without
     // crashing. IsReady() stays false.
     return std::make_unique<AUTH_NAMESPACE::OidcDiscovery>(
         issuer_name, issuer_url, /*client=*/nullptr,
         /*upstream_pool_name=*/"idp-pool", retry_sec,
-        /*requires_jwks_uri=*/true);
+        requires_jwks_uri);
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +346,128 @@ static bool TestDiscoveryRejectsNonHttpsIntrospectionEndpoint() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 16: Introspection-only metadata (no jwks_uri, valid HTTPS
+//          introspection_endpoint) parses cleanly. The accept-vs-retry
+//          gate is mode-aware in the live discovery loop: with
+//          requires_jwks_uri=false the same shape would be ACCEPTED
+//          (introspection-mode issuer); with requires_jwks_uri=true it
+//          would schedule a retry (JWT-mode issuer needs jwks_uri).
+//          This test covers the parser side; the gate decision is
+//          replicated locally so the rule stays close to the constants.
+// ---------------------------------------------------------------------------
+static bool TestIntrospectionOnlyMetadataParseAndGate() {
+    const std::string expected_issuer = "https://idp.example.com";
+    const std::string body = R"({
+        "issuer": "https://idp.example.com",
+        "introspection_endpoint": "https://idp.example.com/introspect"
+    })";
+
+    std::string jwks_uri;
+    std::string intro_endpoint;
+    std::string reason;
+    AUTH_NAMESPACE::OidcDiscovery::ExtractEndpointsForTest(
+        body, expected_issuer, jwks_uri, intro_endpoint, reason);
+
+    // Parser side: jwks_uri empty, intro_endpoint set, no parse-level error.
+    bool parse_ok = jwks_uri.empty() &&
+                    intro_endpoint == "https://idp.example.com/introspect";
+
+    // Gate logic (mirrors oidc_discovery.cc):
+    //   requires_jwks_uri=true  → REJECT (jwt_mode_missing_jwks_uri)
+    //   requires_jwks_uri=false → ACCEPT
+    auto would_accept = [&](bool requires_jwks_uri) {
+        const bool both_empty = jwks_uri.empty() && intro_endpoint.empty();
+        const bool jwt_needs_jwks_but_missing =
+            requires_jwks_uri && jwks_uri.empty();
+        const bool intro_needs_endpoint_but_missing =
+            !requires_jwks_uri && intro_endpoint.empty();
+        return !(both_empty || jwt_needs_jwks_but_missing ||
+                 intro_needs_endpoint_but_missing);
+    };
+
+    bool gate_ok = !would_accept(/*requires_jwks_uri=*/true) &&
+                   would_accept(/*requires_jwks_uri=*/false);
+
+    bool ok = parse_ok && gate_ok;
+    std::string detail;
+    if (!ok) {
+        detail = "parse_ok=" + std::to_string(parse_ok) +
+                 " gate_ok=" + std::to_string(gate_ok) +
+                 " jwks_uri='" + jwks_uri +
+                 "' intro_endpoint='" + intro_endpoint + "'";
+    }
+    TestFramework::RecordTest(
+        "OidcDiscovery: introspection-only metadata accepted when requires_jwks_uri=false",
+        ok, detail);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: JWKS-only metadata (no introspection_endpoint, valid HTTPS
+//          jwks_uri) — symmetric to Test 16. Introspection-mode issuer
+//          (requires_jwks_uri=false) MUST reject and retry; JWT-mode
+//          issuer (requires_jwks_uri=true) MUST accept.
+// ---------------------------------------------------------------------------
+static bool TestJwksOnlyMetadataParseAndGate() {
+    const std::string expected_issuer = "https://idp.example.com";
+    const std::string body = R"({
+        "issuer": "https://idp.example.com",
+        "jwks_uri": "https://idp.example.com/jwks.json"
+    })";
+
+    std::string jwks_uri;
+    std::string intro_endpoint;
+    std::string reason;
+    AUTH_NAMESPACE::OidcDiscovery::ExtractEndpointsForTest(
+        body, expected_issuer, jwks_uri, intro_endpoint, reason);
+
+    bool parse_ok = jwks_uri == "https://idp.example.com/jwks.json" &&
+                    intro_endpoint.empty();
+
+    auto would_accept = [&](bool requires_jwks_uri) {
+        const bool both_empty = jwks_uri.empty() && intro_endpoint.empty();
+        const bool jwt_needs_jwks_but_missing =
+            requires_jwks_uri && jwks_uri.empty();
+        const bool intro_needs_endpoint_but_missing =
+            !requires_jwks_uri && intro_endpoint.empty();
+        return !(both_empty || jwt_needs_jwks_but_missing ||
+                 intro_needs_endpoint_but_missing);
+    };
+
+    bool gate_ok = would_accept(/*requires_jwks_uri=*/true) &&
+                   !would_accept(/*requires_jwks_uri=*/false);
+
+    bool ok = parse_ok && gate_ok;
+    std::string detail;
+    if (!ok) {
+        detail = "parse_ok=" + std::to_string(parse_ok) +
+                 " gate_ok=" + std::to_string(gate_ok) +
+                 " jwks_uri='" + jwks_uri +
+                 "' intro_endpoint='" + intro_endpoint + "'";
+    }
+    TestFramework::RecordTest(
+        "OidcDiscovery: jwks-only metadata rejected when requires_jwks_uri=false",
+        ok, detail);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: Construction with requires_jwks_uri=false succeeds and
+//          IsReady() is initially false (no discovery has run yet).
+//          Smoke-test that the new constructor argument propagates without
+//          breaking the per-instance lifecycle.
+// ---------------------------------------------------------------------------
+static bool TestConstructorRequiresJwksUriFalse() {
+    auto d = MakeDiscovery("intro-issuer", "https://intro.example.com",
+                            /*retry_sec=*/5, /*requires_jwks_uri=*/false);
+    bool ok = !d->IsReady();
+    TestFramework::RecordTest(
+        "OidcDiscovery: requires_jwks_uri=false constructor smoke",
+        ok, ok ? "" : "IsReady should still be false");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // RunAllTests
 // ---------------------------------------------------------------------------
 static void RunAllTests() {
@@ -363,6 +486,9 @@ static void RunAllTests() {
     TestConcurrentConstructionDestruction();
     TestGenerationParameterTypeCheck();
     TestDiscoveryRejectsNonHttpsIntrospectionEndpoint();
+    TestIntrospectionOnlyMetadataParseAndGate();
+    TestJwksOnlyMetadataParseAndGate();
+    TestConstructorRequiresJwksUriFalse();
 }
 
 }  // namespace OidcDiscoveryTests

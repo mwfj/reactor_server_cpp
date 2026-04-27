@@ -192,7 +192,11 @@ class AuthManager {
     // Introspection-mode dispatch: cache lookup with sync fast-paths
     // (Fresh+active / Fresh+!active / Stale+active) and a deferred POST on
     // miss. Always resolves `state` via SetSyncResult+MarkCompletedSync or
-    // Complete(payload).
+    // Complete(payload). `fwd_snap` MUST be the same forward_ snapshot the
+    // caller paired with the policies_ snapshot used to select `policy` —
+    // a separate ForwardConfig() read here would race a concurrent
+    // CommitForwardAndPolicies() reload and inject headers/raw_token using
+    // a forward overlay that doesn't match the policy's reload generation.
     void InvokeAsyncIntrospection(
         const std::shared_ptr<Issuer>& issuer,
         const IssuerSnapshot& snap,
@@ -200,7 +204,8 @@ class AuthManager {
         const std::string& token,
         const HttpRequest& req,
         HttpResponse& resp,
-        std::shared_ptr<HttpRouter::AsyncPendingState> state);
+        std::shared_ptr<HttpRouter::AsyncPendingState> state,
+        std::shared_ptr<const AuthForwardConfig> fwd_snap);
 
     // Same as InvokeAsyncIntrospection but skips the cache entirely. Used
     // when TokenHasher::Hash returns nullopt (rare HMAC failure) — caching
@@ -212,7 +217,8 @@ class AuthManager {
         const std::string& token,
         const HttpRequest& req,
         HttpResponse& resp,
-        std::shared_ptr<HttpRouter::AsyncPendingState> state);
+        std::shared_ptr<HttpRouter::AsyncPendingState> state,
+        std::shared_ptr<const AuthForwardConfig> fwd_snap);
 
     // Stamp a validated AuthContext onto req for the sync fast-paths
     // (cache hit / stale-serve). Mirrors the JWT-mode mutation block.

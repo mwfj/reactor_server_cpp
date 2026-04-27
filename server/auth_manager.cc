@@ -21,6 +21,12 @@ namespace {
 
 static constexpr const char* kOnUndeterminedAllow = "allow";
 
+// Outbound 8 KiB cap on bearer-token bytes. Larger tokens are unconditionally
+// 401'd before any verification work — they are almost always either
+// malformed or attacker-shaped. Enforced symmetrically by the sync
+// (InvokeMiddleware) and async (InvokeAsyncMiddleware) entry points.
+constexpr size_t kMaxBearerTokenBytes = 8192;
+
 // Re-run policy + issuer claim checks against an already-populated
 // AuthContext. Used by:
 //   - cache hit / stale-hit paths in InvokeAsyncIntrospection (no body
@@ -427,6 +433,19 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
                                  "authorization required");
         return false;
     }
+    // 8 KiB DoS guard mirrors InvokeAsyncMiddleware. JWT-only requests and
+    // the sync PeekIssuer step (below) MUST also reject oversized tokens
+    // before any verification work — otherwise the cap is bypassable on
+    // pure JWT deployments.
+    if (token.size() > kMaxBearerTokenBytes) {
+        total_denied_.fetch_add(1, std::memory_order_relaxed);
+        logging::Get()->info(
+            "auth_deny reason=token_too_large route={} policy={}",
+            logging::SanitizePath(req.path), policy.name);
+        resp = MakeUnauthorized(realm, AuthErrorCode::InvalidRequest,
+                                 "token too large");
+        return false;
+    }
 
     // Pick the issuer: prefer `iss` peek, else the first policy issuer.
     Issuer* chosen = nullptr;
@@ -655,15 +674,6 @@ std::shared_ptr<const AppliedPolicyList> AuthManager::BuildAppliedPolicyList(
 // Async middleware path (introspection mode)
 // ---------------------------------------------------------------------------
 
-namespace {
-
-// Outbound 8 KiB cap on bearer-token bytes. Larger tokens are unconditionally
-// 401'd before any cache lookup or upstream POST — they are almost always
-// either malformed or attacker-shaped.
-constexpr size_t kMaxBearerTokenBytes = 8192;
-
-}  // namespace
-
 void AuthManager::StampAuthContext(const HttpRequest& req,
                                      AuthContext ctx,
                                      const std::string& issuer,
@@ -691,10 +701,17 @@ void AuthManager::InvokeAsyncMiddleware(
         return;
     }
 
+    // Capture both snapshots under one lock so a CommitForwardAndPolicies
+    // reload between policy selection and forward injection cannot mix a
+    // pre-reload policy with a post-reload forward overlay (which would
+    // inject headers/raw_token using config the operator hadn't yet
+    // associated with this policy).
     std::shared_ptr<const AppliedPolicyList> policies_snap;
+    std::shared_ptr<const AuthForwardConfig> fwd_snap;
     {
         std::lock_guard<std::mutex> lk(snapshot_mtx_);
         policies_snap = policies_;
+        fwd_snap = forward_;
     }
     if (!policies_snap || policies_snap->empty()) {
         sync_pass();
@@ -863,7 +880,8 @@ void AuthManager::InvokeAsyncMiddleware(
         return;
     }
     InvokeAsyncIntrospection(it->second, *snap_issuer, policy, token,
-                              req, resp, std::move(state));
+                              req, resp, std::move(state),
+                              std::move(fwd_snap));
 }
 
 namespace {
@@ -896,12 +914,14 @@ void AuthManager::InvokeAsyncIntrospection(
         const std::string& token,
         const HttpRequest& req,
         HttpResponse& resp,
-        std::shared_ptr<HttpRouter::AsyncPendingState> state) {
+        std::shared_ptr<HttpRouter::AsyncPendingState> state,
+        std::shared_ptr<const AuthForwardConfig> fwd_snap) {
     auto key_opt = hasher_.Hash(token);
     if (!key_opt) {
         // HMAC failure — extremely rare. Skip the cache; live POST.
         InvokeIntrospectionUncached(issuer, snap, policy, token,
-                                     req, resp, std::move(state));
+                                     req, resp, std::move(state),
+                                     std::move(fwd_snap));
         return;
     }
     const std::string key = *key_opt;
@@ -911,14 +931,14 @@ void AuthManager::InvokeAsyncIntrospection(
         // Issuer reports introspection mode but cache wasn't constructed.
         // Defence-in-depth: skip the cache layer rather than crash.
         InvokeIntrospectionUncached(issuer, snap, policy, token,
-                                     req, resp, std::move(state));
+                                     req, resp, std::move(state),
+                                     std::move(fwd_snap));
         return;
     }
 
     const std::string realm = policy.realm.empty()
         ? std::string("api") : policy.realm;
     const std::string issuer_name = issuer->name();
-    auto fwd_snap = ForwardConfig();
     const std::string raw_jwt_header =
         fwd_snap ? fwd_snap->raw_jwt_header : std::string{};
 
@@ -1353,7 +1373,8 @@ void AuthManager::InvokeIntrospectionUncached(
         const std::string& token,
         const HttpRequest& req,
         HttpResponse& resp,
-        std::shared_ptr<HttpRouter::AsyncPendingState> state) {
+        std::shared_ptr<HttpRouter::AsyncPendingState> state,
+        std::shared_ptr<const AuthForwardConfig> fwd_snap) {
     (void)resp;
     introspection_cache_miss_.fetch_add(1, std::memory_order_relaxed);
 
@@ -1367,7 +1388,6 @@ void AuthManager::InvokeIntrospectionUncached(
     const auto required_scopes = policy.required_scopes;
     const uint64_t gen = issuer->generation();
     AuthPolicy policy_copy = policy;
-    auto fwd_snap = ForwardConfig();
     const std::string raw_jwt_header =
         fwd_snap ? fwd_snap->raw_jwt_header : std::string{};
     std::vector<std::string> claim_keys;

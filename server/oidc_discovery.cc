@@ -292,27 +292,36 @@ void OidcDiscovery::Start(size_t dispatcher_index,
                     ExtractEndpoints(resp.body, issuer_url,
                                      jwks_uri, intro_endpoint, reason);
                     // Mode-aware acceptance:
-                    //   * JWT-mode issuers (`requires_jwks_uri`=true)
-                    //     MUST receive a usable jwks_uri before discovery
-                    //     is considered complete. A response with only
-                    //     introspection_endpoint can't satisfy a JWT issuer
-                    //     and we schedule_retry so a transient or later-
-                    //     fixed JWKS metadata response can land.
+                    //   * JWT-mode issuers (`requires_jwks_uri`=true) MUST
+                    //     receive a usable jwks_uri; introspection-only
+                    //     metadata can't satisfy a JWT issuer.
                     //   * Introspection-mode issuers
-                    //     (`requires_jwks_uri`=false) accept introspection-
-                    //     only metadata on its own; jwks_uri is unused.
+                    //     (`requires_jwks_uri`=false) MUST receive a usable
+                    //     introspection_endpoint; a JWKS-only metadata
+                    //     response can't satisfy an introspection issuer
+                    //     (Issuer::KickOffOidcDiscovery would leave it
+                    //     not-ready and discovery would silently stop).
                     //   * Either way, an empty body / fully-malformed
                     //     response (both endpoints empty) is a hard fail.
+                    //   * Any of the above schedules a retry so a later-
+                    //     fixed metadata response can land.
                     const bool both_empty = jwks_uri.empty() && intro_endpoint.empty();
                     const bool jwt_needs_jwks_but_missing =
                         requires_jwks_uri && jwks_uri.empty();
-                    if (both_empty || jwt_needs_jwks_but_missing) {
+                    const bool intro_needs_endpoint_but_missing =
+                        !requires_jwks_uri && intro_endpoint.empty();
+                    if (both_empty || jwt_needs_jwks_but_missing ||
+                            intro_needs_endpoint_but_missing) {
+                        const char* fail_reason = reason.c_str();
+                        if (!both_empty) {
+                            fail_reason = jwt_needs_jwks_but_missing
+                                ? "jwt_mode_missing_jwks_uri"
+                                : "introspection_mode_missing_endpoint";
+                        }
                         logging::Get()->warn(
                             "OIDC discovery parse failed issuer={} reason={} "
                             "retry_in={}s",
-                            issuer_name,
-                            both_empty ? reason : "jwt_mode_missing_jwks_uri",
-                            retry_sec);
+                            issuer_name, fail_reason, retry_sec);
                         schedule_retry();
                         return;
                     }
