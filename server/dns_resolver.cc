@@ -44,6 +44,13 @@ struct DnsResolver::PoolState {
     std::list<std::shared_ptr<WorkItem>>                  in_flight;
     std::atomic<bool>                                     shutting_down{false};
     std::function<ResolvedEndpoint(const ResolveRequest&)> test_seam;
+
+    // Resolver-internal counters for /stats observability. All use
+    // memory_order_relaxed — slightly stale snapshots are acceptable.
+    std::atomic<int64_t> total_resolutions{0};
+    std::atomic<int64_t> total_resolutions_failed{0};
+    std::atomic<int64_t> total_resolutions_timeout{0};
+    std::atomic<int64_t> eai_again{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -428,23 +435,24 @@ DnsResolver::DnsResolver(const DnsConfig& config) : config_(config) {
 
 DnsResolver::~DnsResolver() {
     // Drain queued AND in-flight items under the mutex and wake their
-    // futures with a shutdown-error result. in-flight
-    // items were previously NOT reachable from the dtor — contract narrowing said 
-    // they relied on their own future.wait_for bound. 
-    // With the shared_ptr<WorkItem> + `done` flag machinery
-    // introduced for the reaper (so it can expire in-flight items at
-    // deadline), the dtor can safely set_value on in-flight items too:
-    // workers that later return from getaddrinfo see done=true and skip
-    // their own set_value. Net effect: every caller's future becomes
-    // ready by the time ~DnsResolver returns, not just queued ones.
+    // futures with a shutdown-error result. The shared_ptr<WorkItem> +
+    // `done` flag pattern lets the dtor satisfy promises for in-flight
+    // items too: workers that later return from getaddrinfo see done=true
+    // and skip their own set_value. Net effect: every caller's future
+    // becomes ready by the time ~DnsResolver returns.
     {
         std::lock_guard<std::mutex> lk(state_->mtx);
         state_->shutting_down.store(true, std::memory_order_release);
-        // Queue drain.
+        // Queue drain. Bump counters to keep total_resolutions /
+        // total_resolutions_timeout consistent with the reaper /
+        // submission-sweep / worker paths — every promise we satisfy is a
+        // "completed (timeout)" resolution from the caller's perspective.
         while (!state_->queue.empty()) {
             auto& item = state_->queue.front();
             if (item && !item->done) {
                 item->done = true;
+                state_->total_resolutions.fetch_add(1, std::memory_order_relaxed);
+                state_->total_resolutions_timeout.fetch_add(1, std::memory_order_relaxed);
                 try {
                     item->promise.set_value(
                         MakeTimeoutResult(item->req, "resolver shutdown"));
@@ -460,6 +468,8 @@ DnsResolver::~DnsResolver() {
         for (auto& item : state_->in_flight) {
             if (item && !item->done) {
                 item->done = true;
+                state_->total_resolutions.fetch_add(1, std::memory_order_relaxed);
+                state_->total_resolutions_timeout.fetch_add(1, std::memory_order_relaxed);
                 try {
                     item->promise.set_value(
                         MakeTimeoutResult(item->req, "resolver shutdown"));
@@ -612,6 +622,8 @@ void* DnsResolver::WorkerTrampoline(void* raw) {
             if (item && !item->done &&
                 std::chrono::steady_clock::now() >= item->deadline) {
                 item->done = true;
+                state->total_resolutions.fetch_add(1, std::memory_order_relaxed);
+                state->total_resolutions_timeout.fetch_add(1, std::memory_order_relaxed);
                 try {
                     item->promise.set_value(MakeTimeoutResult(
                         item->req, "queue-time exceeded deadline"));
@@ -637,6 +649,11 @@ void* DnsResolver::WorkerTrampoline(void* raw) {
             std::lock_guard<std::mutex> lk(state->mtx);
             if (!item->done) {
                 item->done = true;
+                // Count every worker-completed resolve (success + non-timeout failure).
+                state->total_resolutions.fetch_add(1, std::memory_order_relaxed);
+                if (result.error) {
+                    state->total_resolutions_failed.fetch_add(1, std::memory_order_relaxed);
+                }
                 try {
                     item->promise.set_value(std::move(result));
                 } catch (const std::future_error&) {}
@@ -727,6 +744,8 @@ void* DnsResolver::TimeoutReaperTrampoline(void* raw) {
             if (sp && sp->deadline <= now) {
                 if (!sp->done) {
                     sp->done = true;
+                    state->total_resolutions.fetch_add(1, std::memory_order_relaxed);
+                    state->total_resolutions_timeout.fetch_add(1, std::memory_order_relaxed);
                     try {
                         sp->promise.set_value(MakeTimeoutResult(
                             sp->req, "queue-time exceeded deadline"));
@@ -753,6 +772,8 @@ void* DnsResolver::TimeoutReaperTrampoline(void* raw) {
             if (sp && sp->deadline <= now) {
                 if (!sp->done) {
                     sp->done = true;
+                    state->total_resolutions.fetch_add(1, std::memory_order_relaxed);
+                    state->total_resolutions_timeout.fetch_add(1, std::memory_order_relaxed);
                     try {
                         sp->promise.set_value(MakeTimeoutResult(
                             sp->req, "queue-time exceeded deadline"));
@@ -958,6 +979,8 @@ DnsResolver::ResolveAsyncImpl(
             if (sp && sp->deadline <= sweep_now) {
                 if (!sp->done) {
                     sp->done = true;
+                    state_->total_resolutions.fetch_add(1, std::memory_order_relaxed);
+                    state_->total_resolutions_timeout.fetch_add(1, std::memory_order_relaxed);
                     try {
                         sp->promise.set_value(MakeTimeoutResult(
                             sp->req, "queue-time exceeded deadline"));
@@ -978,6 +1001,7 @@ DnsResolver::ResolveAsyncImpl(
             // sweep above has already removed every expired item, so
             // this path fires only when the queue is genuinely
             // backlogged with live work.
+            state_->eai_again.fetch_add(1, std::memory_order_relaxed);
             std::promise<ResolvedEndpoint> p;
             auto saturated = p.get_future();
             p.set_value(MakeReadyErrorResult(
@@ -1083,6 +1107,111 @@ void DnsResolver::SetMaxQueuedItemsForTesting(std::size_t cap) {
     // contention is zero in practice.
     std::lock_guard<std::mutex> lk(state_->mtx);
     max_queued_items_ = cap;
+}
+
+ResolverSnapshot DnsResolver::Snapshot() const {
+    ResolverSnapshot s;
+    s.total_resolutions         = state_->total_resolutions.load(std::memory_order_relaxed);
+    s.total_resolutions_failed  = state_->total_resolutions_failed.load(std::memory_order_relaxed);
+    s.total_resolutions_timeout = state_->total_resolutions_timeout.load(std::memory_order_relaxed);
+    s.eai_again                 = state_->eai_again.load(std::memory_order_relaxed);
+    // queue_depth and in_flight are instantaneous counts; read under mtx
+    // for a consistent pair (both under the same lock acquisition).
+    {
+        std::lock_guard<std::mutex> lk(state_->mtx);
+        s.queue_depth = static_cast<int64_t>(state_->queue.size());
+        s.in_flight   = static_cast<int64_t>(state_->in_flight.size());
+    }
+    s.queued    = s.queue_depth;          // schema back-compat alias
+    s.completed = s.total_resolutions;    // schema back-compat alias
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// MergeResolvedForReload
+// ---------------------------------------------------------------------------
+//
+// Reload-time merge of a fresh DNS batch against the current live ResolvedMap.
+// See declaration in dns_resolver.h for full contract.
+ResolvedMap MergeResolvedForReload(const ResolvedMap& live,
+                                    const std::vector<ResolvedEndpoint>& batch,
+                                    bool stale_on_error,
+                                    std::atomic<uint64_t>* stale_counter)
+{
+    static constexpr std::string_view kUpstreamPrefix = "upstream:";
+
+    ResolvedMap merged;
+    merged.reserve(batch.size());
+
+    for (const auto& r : batch) {
+        // Extract service name from tag ("upstream:<name>").
+        if (r.tag.rfind(kUpstreamPrefix, 0) != 0) {
+            logging::Get()->warn("MergeResolvedForReload: unexpected tag '{}' "
+                                 "(expected 'upstream:...')", r.tag);
+            continue;
+        }
+        std::string service = r.tag.substr(kUpstreamPrefix.size());
+
+        if (!r.error) {
+            // Success — build a fresh shared_ptr and check for IP change.
+            auto new_ep = std::make_shared<const ResolvedEndpoint>(r);
+            auto live_it = live.find(service);
+            if (live_it != live.end() && live_it->second) {
+                const std::string& old_ip = live_it->second->addr.Ip();
+                const std::string& new_ip = new_ep->addr.Ip();
+                if (old_ip != new_ip) {
+                    logging::Get()->info(
+                        "Reload DNS endpoint changed upstream={} old={}:{} new={}:{}",
+                        service, old_ip, live_it->second->addr.Port(),
+                        new_ip, new_ep->addr.Port());
+                }
+            }
+            merged.emplace(service, std::move(new_ep));
+        } else if (stale_on_error) {
+            // Failure + stale-allowed: preserve the live entry.
+            auto live_it = live.find(service);
+            if (live_it != live.end() && live_it->second) {
+                auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() -
+                    live_it->second->resolved_at).count();
+                logging::Get()->warn(
+                    "Reload DNS resolve failed upstream={} — keeping prior IP "
+                    "{}:{} (resolved {}s ago)",
+                    service,
+                    live_it->second->addr.Ip(),
+                    live_it->second->addr.Port(),
+                    age);
+                merged.emplace(service, live_it->second);
+                // Count the stale fallback for /stats observability.
+                if (stale_counter) {
+                    stale_counter->fetch_add(1, std::memory_order_relaxed);
+                }
+            } else {
+                logging::Get()->warn(
+                    "Reload DNS resolve failed upstream={} and no prior IP "
+                    "available; entry omitted", service);
+            }
+        } else {
+            // Failure + stale NOT allowed: caller should have rejected already.
+            // Defensively preserve the live entry so the map isn't half-formed.
+            logging::Get()->error(
+                "MergeResolvedForReload: DNS failed for upstream='{}' with "
+                "stale_on_error=false — caller should have rejected before "
+                "reaching here; preserving live entry", service);
+            auto live_it = live.find(service);
+            if (live_it != live.end() && live_it->second) {
+                merged.emplace(service, live_it->second);
+            }
+        }
+    }
+
+    // Preserve live entries whose service name did not appear in the batch.
+    for (const auto& [name, ep] : live) {
+        if (merged.find(name) == merged.end()) {
+            merged.emplace(name, ep);
+        }
+    }
+    return merged;
 }
 
 }  // namespace NET_DNS_NAMESPACE

@@ -31,7 +31,8 @@ Layer 7: AuthManager, AuthMiddleware,       (inbound middleware stack)
          TokenBucket, CircuitBreakerManager
 Layer 6: UpstreamManager, UpstreamHostPool, (upstream connection pooling)
          PoolPartition, UpstreamConnection,
-         UpstreamLease, TlsClientContext
+         UpstreamLease, TlsClientContext,
+         DnsResolver                        (hostname resolution, reload-time re-resolve)
 Layer 5: HttpServer                          (application entry point)
 Layer 4: HttpRouter, WebSocketConnection    (routing, WS message API)
 Layer 3: HttpParser, WebSocketParser        (HTTP/1.1 protocol parsing)
@@ -44,7 +45,9 @@ Layer 1: ConnectionHandler, Channel,        (reactor core)
          Dispatcher, EventHandler
 ```
 
-Layers 1–2 are the transport. Layers 3–5 are the protocol. Layer 6 is the gateway (upstream connectivity). Layer 7 is the inbound traffic-management middleware (auth, rate limiting, circuit breaking). HTTP/1.x and HTTP/2 are parallel handlers at Layer 3, selected by `ProtocolDetector` at connection time. Both converge on the same `HttpRouter` at Layer 4. ConnectionHandler supports both inbound (server) and outbound (client) connections.
+Layers 1–2 are the transport. Layers 3–5 are the protocol. Layer 6 is the gateway (upstream connectivity + DNS resolution). Layer 7 is the inbound traffic-management middleware (auth, rate limiting, circuit breaking). HTTP/1.x and HTTP/2 are parallel handlers at Layer 3, selected by `ProtocolDetector` at connection time. Both converge on the same `HttpRouter` at Layer 4. ConnectionHandler supports both inbound (server) and outbound (client) connections.
+
+`DnsResolver` is owned by `HttpServer` and is used at two points: (1) bind-host resolution during `Start()`, and (2) upstream hostname re-resolution during each `Reload()`. IP-literal upstreams bypass `DnsResolver` entirely.
 
 **Middleware execution order on inbound requests**: auth → rate-limit → circuit-breaker (admission) → router dispatch. Authentication runs first so rate-limit and circuit-breaker counters don't consume quota on rejected traffic. See `HttpServer::MarkServerReady` for the exact install order; `HttpRouter::PrependMiddleware` pushes to the front of the chain, so the **last** prepend runs **first**.
 
@@ -177,6 +180,48 @@ The production server (`server_runner`) registers operational endpoints when sta
 
 Stats counters use `memory_order_relaxed` atomics — snapshots are approximate but never stale by more than one operation.
 
+### `/stats` JSON Schema
+
+The `/stats` response body is JSON. The top-level object contains legacy fields (uptime, connection counters, config echo) plus three sub-objects added in Phase 2:
+
+**`bind`** — resolved bind address (present only after a successful `Start()`):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `host` | string | Configured `bind_host` (after normalization) |
+| `resolved_ip` | string | IP address the server is listening on |
+| `resolved_authority` | string | `ip:port` authority string (IPv6 bracketed per RFC 3986) |
+| `resolved_family` | string | `"v4"` or `"v6"` |
+| `age_seconds` | int | Seconds since the address was last resolved (monotonic) |
+
+**`upstream`** — per-upstream resolved endpoint info (keyed by upstream name):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `host_bare` | string | Configured upstream hostname (post-normalization) |
+| `authority` | string | Configured `host:port` authority |
+| `resolved_ip` | string | Currently resolved IP address |
+| `resolved_authority` | string | `resolved_ip:port` authority string (IPv6 bracketed) |
+| `resolved_family` | string | `"v4"` or `"v6"` |
+| `age_seconds` | int | Seconds since current resolved endpoint was obtained |
+| `last_reresolve_age_seconds` | int/null | Seconds since the last SIGHUP-triggered re-resolve attempt; `null` if no reload has occurred |
+| `last_reresolve_error` | string/null | Error message from the last failed re-resolve; `null` on success or no attempt |
+| `effective_sni` | string | SNI hostname that would be sent for TLS connections (empty for IP upstreams without `sni_hostname`) |
+
+**`dns`** — resolver and reload counters:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `total_resolutions` | int | Total `getaddrinfo` calls completed (success + failure) |
+| `total_resolutions_failed` | int | Calls that returned an error |
+| `total_resolutions_timeout` | int | Calls that hit the per-hostname deadline |
+| `total_reload_stale_served` | int | Times a stale-on-error fallback preserved a prior IP during reload |
+| `queue_depth` | int | Current number of pending resolve requests |
+| `in_flight` | int | Current number of `getaddrinfo` calls in progress |
+| `eai_again` | int | Requests rejected because the worker pool was saturated |
+
+`age_seconds` fields use a monotonic clock — they represent how many seconds ago the value was recorded, not a wall-clock timestamp. `last_reresolve_error` may contain arbitrary text from the OS (e.g. `"Name or service not known"`) and is JSON-escaped by the server.
+
 ## Config Hot-Reload
 
 SIGHUP triggers config reload in daemon mode (foreground: triggers shutdown). Reload-safe fields are applied immediately to running connections:
@@ -188,12 +233,27 @@ SIGHUP triggers config reload in daemon mode (foreground: triggers shutdown). Re
 | `max_header_size`, `max_ws_message_size` | `http2.enabled` |
 | `log.level`, `log.file`, `log.max_*` | `upstreams` (pool rebuild needed) |
 | `http2.max_concurrent_streams`, etc. | `auth` topology (issuers, policy `applies_to`) |
-| `shutdown_drain_timeout_sec` | |
+| `shutdown_drain_timeout_sec` | `dns.lookup_family`, `dns.resolver_max_inflight` |
+| `dns.resolve_timeout_ms`, `dns.overall_timeout_ms`, `dns.stale_on_error` | |
 | `auth.enabled`, `auth.forward.*` | |
 | Per-issuer reloadable: `audiences`, `algorithms`, `leeway_sec`, `jwks_cache_sec`, `required_claims` | |
 | Per-policy reloadable: `enabled`, `required_scopes`, `required_audience`, `on_undetermined`, `realm` | |
 
 The reload path is transactional: log changes are applied first, then server limits. If server limits are rejected, log changes are rolled back. Log file pruning is deferred until the full reload commits.
+
+### DNS-Aware Reload
+
+On SIGHUP, `HttpServer::Reload` re-resolves all upstream hostnames before applying any other config change. The apply order is:
+
+1. **Auth validation** (`AuthManager::Reload` — returns `bool`) — only step that can hard-abort the reload. If the new auth config is invalid, no other step runs and the live server state is fully preserved.
+2. **DNS commit** — `UpstreamManager::UpdateResolvedEndpoints` performs a synchronous release-store on every `PoolPartition::resolved_endpoint_`. Returns only after all partitions have the new endpoint published. A best-effort async task then closes idle keepalive connections that still hold the old endpoint.
+3. **Rate limit, circuit breaker** — `void`-returning idempotent reloads.
+4. **Size limits, max connections, timeouts, timer cadence, HTTP/2 settings** — atomic stores and enqueued dispatcher tasks; cannot reject.
+5. **Auth policy publish** (`AuthManager::CommitPolicyAndEnforcement` — `void`) — runs last so the published policy table references the post-merge live upstream topology.
+
+Auth runs in two phases on purpose: the reject gate is first so an invalid auth config aborts before any irreversible mutation; the policy publish is last so it references the just-committed upstream topology.
+
+**Idle-keepalive contract:** any NEW connection after a reload uses the new resolved IP immediately (release/acquire sequenced-before). Idle connections in the pool keep serving the old IP until they close naturally or the async cleanup task closes them. In-flight connections (connect in progress) complete against the old IP via refcount on the captured endpoint.
 
 **Live reload to existing connections:** Size limits (`max_body_size`, `max_header_size`, `max_ws_message_size`) and `request_timeout_sec` are pushed to all existing HTTP/1, HTTP/2, and pending-detection connections via dispatcher-enqueued tasks. Already-armed deadlines are reconciled: enabling a timeout installs the 408 callback; disabling clears the deadline; changing re-arms from the request's start time.
 

@@ -33,6 +33,13 @@ public:
     // Shutdown all partitions (enqueues to each dispatcher)
     void InitiateShutdown();
 
+    // Reload-time endpoint swap. For each partition, release-stores the
+    // new endpoint and enqueues a best-effort idle-cleanup task if the
+    // endpoint changed. Synchronous on the caller's thread; does NOT
+    // wait for the async cleanup tasks.
+    void UpdateResolvedEndpoint(
+        std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> new_ep);
+
     const std::string& service_name() const { return service_name_; }
     const std::string& host() const { return host_; }
     int port() const { return port_; }

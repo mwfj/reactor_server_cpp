@@ -12,6 +12,7 @@
 #include "http/http_response.h"
 #include "http/http_status.h"
 #include "log/logger.h"
+#include "nlohmann/json.hpp"
 
 // <cstdio> provided by common.h (via http_server.h)
 #include <cstdlib>
@@ -151,20 +152,79 @@ MakeHealthHandler(HttpServer* server) {
 }
 
 // ── Stats endpoint handler ──────────────────────────────────────
+
+namespace {
+
+// Build the "bind" sub-object from GetBindResolved().
+// Returns a null JSON value when Start() has not run successfully.
+nlohmann::json BuildBindObject(HttpServer* server) {
+    auto ep_opt = server->GetBindResolved();
+    if (!ep_opt) return nullptr;
+    const auto& ep = *ep_opt;
+    nlohmann::json obj;
+    obj["host"]               = server->GetLiveConfigSnapshot().bind_host;
+    obj["resolved_ip"]        = ep.addr.Ip();
+    obj["resolved_authority"] = ep.addr.ToString();
+    obj["resolved_family"]    = (ep.addr.family() == InetAddr::Family::kIPv6)
+                                    ? "v6" : "v4";
+    obj["host_raw"]           = ep.host;
+    const auto now = std::chrono::steady_clock::now();
+    obj["age_seconds"] = std::chrono::duration_cast<std::chrono::seconds>(
+        now - ep.resolved_at).count();
+    if (ep.error) {
+        obj["error"] = true;
+        if (!ep.error_message.empty()) {
+            obj["error_message"] = ep.error_message;
+        }
+    }
+    return obj;
+}
+
+// Build the "upstream" object keyed by service name from GetUpstreamResolvedSnapshot().
+nlohmann::json BuildUpstreamObject(HttpServer* server) {
+    nlohmann::json result = nlohmann::json::object();
+    for (const auto& e : server->GetUpstreamResolvedSnapshot()) {
+        nlohmann::json obj;
+        obj["host_raw"]           = e.host_raw;
+        obj["resolved_authority"] = e.resolved_authority;
+        obj["age_seconds"]        = e.age_seconds;
+        if (e.last_reresolve_succeeded.has_value()) {
+            obj["last_reresolve_succeeded"] = *e.last_reresolve_succeeded;
+        }
+        if (e.last_reresolve_error.has_value()) {
+            obj["last_reresolve_error"] = *e.last_reresolve_error;
+        }
+        result[e.service_name] = std::move(obj);
+    }
+    return result;
+}
+
+// Build the "dns" sub-object from GetDnsStatsSnapshot().
+nlohmann::json BuildDnsObject(HttpServer* server) {
+    auto s = server->GetDnsStatsSnapshot();
+    nlohmann::json obj;
+    obj["total_resolutions"]         = s.resolver.total_resolutions;
+    obj["total_resolutions_failed"]  = s.resolver.total_resolutions_failed;
+    obj["total_resolutions_timeout"] = s.resolver.total_resolutions_timeout;
+    obj["eai_again"]                 = s.resolver.eai_again;
+    obj["queue_depth"]               = s.resolver.queue_depth;
+    obj["in_flight"]                 = s.resolver.in_flight;
+    obj["total_reload_stale_served"] = static_cast<uint64_t>(s.total_reload_stale_served);
+    return obj;
+}
+
+}  // namespace
+
 static std::function<void(const HttpRequest&, HttpResponse&)>
 MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
     // Capture config by value so /stats always reflects the startup-time
     // configuration for restart-required fields (bind_host, bind_port, etc.).
     // This avoids a data race: ReloadConfig() mutates the caller's ServerConfig
     // on the main thread while dispatcher threads serve /stats requests.
-    //
-    // Safety: bind_host is validated as a numeric IPv4 address by
-    // ConfigLoader::Validate() before reaching here, so no JSON escaping
-    // is needed for the %s substitution.
     return [server, config](const HttpRequest& /*req*/, HttpResponse& res) {
         auto stats = server->GetStats();
 
-        // Build JSON manually — avoid pulling in nlohmann/json for a simple response.
+        // Build legacy fields via snprintf for zero-overhead on the hot keys.
         // Config section shows only operational parameters — no file paths, no TLS details.
         static constexpr size_t STATS_BUF_SIZE = 1024;
         char buf[STATS_BUF_SIZE];
@@ -194,7 +254,21 @@ MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
             res.Status(HttpStatus::INTERNAL_SERVER_ERROR).Json(R"({"error":"stats buffer overflow"})");
             return;
         }
-        res.Status(HttpStatus::OK).Json(buf);
+
+        // Merge legacy JSON with bind/upstream/dns sub-objects via nlohmann.
+        // ParseUnchecked is safe here: buf was constructed by snprintf with
+        // known-safe format strings and no user-supplied free-form strings.
+        try {
+            nlohmann::json root = nlohmann::json::parse(buf);
+            root["bind"]     = BuildBindObject(server);
+            root["upstream"] = BuildUpstreamObject(server);
+            root["dns"]      = BuildDnsObject(server);
+            res.Status(HttpStatus::OK).Json(root.dump());
+        } catch (const std::exception& ex) {
+            logging::Get()->error("Stats JSON merge failed: {}", ex.what());
+            // Fall back to the snprintf output without the new sub-objects.
+            res.Status(HttpStatus::OK).Json(buf);
+        }
     };
 }
 

@@ -124,3 +124,24 @@ void UpstreamHostPool::InitiateShutdown() {
         partition->ScheduleInitiateShutdown();
     }
 }
+
+void UpstreamHostPool::UpdateResolvedEndpoint(
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> new_ep)
+{
+    if (!new_ep) return;
+    for (auto& part : partitions_) {
+        // Capture old before swapping for the endpoint-change check.
+        auto old_ep = part->LoadResolvedEndpoint();
+
+        // No-change short-circuit: skip the swap and the cleanup enqueue
+        // when IP+port are the same. Avoids closing healthy idle keepalives
+        // on a no-op reload.
+        if (old_ep && old_ep->addr.Ip() == new_ep->addr.Ip() &&
+                      old_ep->addr.Port() == new_ep->addr.Port()) {
+            continue;
+        }
+
+        part->StoreResolvedEndpoint(new_ep);
+        part->EnqueueIdleCleanupOnEndpointChange(old_ep);
+    }
+}

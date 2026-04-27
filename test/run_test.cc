@@ -208,6 +208,7 @@ void PrintUsage(const char* program_name) {
     std::cout << "  auth_multi,  -I    Run auth multi-issuer tests only" << std::endl;
     std::cout << "  auth_ws,     -G    Run auth WebSocket upgrade tests only" << std::endl;
     std::cout << "  auth_race,   -Q    Run auth race condition tests only" << std::endl;
+    std::cout << "  dual_stack,  -D    Run dual-stack DNS resolver tests only" << std::endl;
     std::cout << "  help,        -h    Show this help message" << std::endl;
     std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route + kqueue + upstream + proxy + rate_limit + circuit_breaker + auth + auth-phase2)" << std::endl;
 }
@@ -312,6 +313,12 @@ int main(int argc, char* argv[]) {
         // Run auth race condition tests
         }else if(mode == "auth_race" || mode == "-Q"){
             AuthRaceTests::RunAllTests();
+        // Run dual-stack DNS resolver tests
+        }else if(mode == "dual_stack" || mode == "-D"){
+            DualStackTests::RunAllTests();
+        // Run only TSAN-instrumented dual-stack stop/reload/destruction tests
+        }else if(mode == "dual_stack_tsan"){
+            DualStackTests::RunTSANTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

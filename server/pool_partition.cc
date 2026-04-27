@@ -51,11 +51,11 @@ PoolPartition::PoolPartition(
     , sni_hostname_(sni_hostname)
     , config_(config)
     , tls_ctx_(std::move(tls_ctx))
+    , resolved_endpoint_(std::move(resolved_endpoint))
     , outstanding_conns_(outstanding_conns)
     , manager_shutting_down_(manager_shutting_down)
     , drain_mtx_(drain_mtx)
     , drain_cv_(drain_cv)
-    , resolved_endpoint_(std::move(resolved_endpoint))
     , partition_max_connections_(static_cast<size_t>(config.max_connections))
 {
     // Programmer error guard: partition needs a resolved endpoint to
@@ -602,6 +602,47 @@ void PoolPartition::DrainWaitQueueOnTrip() {
     }
 }
 
+void PoolPartition::StoreResolvedEndpoint(
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> new_ep)
+{
+    std::atomic_store_explicit(&resolved_endpoint_,
+                                std::move(new_ep),
+                                std::memory_order_release);
+}
+
+void PoolPartition::EnqueueIdleCleanupOnEndpointChange(
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> old_ep)
+{
+    if (!old_ep) return;
+    if (shutting_down_) return;
+    if (!dispatcher_) return;
+    if (dispatcher_->was_stopped()) return;
+
+    auto guard = MakeInflightGuard();
+    std::weak_ptr<std::atomic<bool>> alive_weak = alive_;
+    dispatcher_->EnQueue(
+        [this, alive_weak, guard, old_ep = std::move(old_ep)]() mutable {
+            auto alive = alive_weak.lock();
+            if (!alive || !alive->load(std::memory_order_acquire)) return;
+            CloseIdleMatchingEndpointOnDispatcher(old_ep);
+        });
+}
+
+void PoolPartition::CloseIdleMatchingEndpointOnDispatcher(
+    const std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>& old_ep)
+{
+    auto it = idle_conns_.begin();
+    while (it != idle_conns_.end()) {
+        if ((*it)->captured_endpoint() == old_ep) {
+            auto owned = std::move(*it);
+            it = idle_conns_.erase(it);
+            DestroyConnection(std::move(owned));
+        } else {
+            ++it;
+        }
+    }
+}
+
 void PoolPartition::ForceCloseActive() {
     // Collect transports + borrower callbacks, then move to zombie, then
     // close transports, then notify borrowers. This ordering ensures:
@@ -732,9 +773,11 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
         return false;  // proceed with default close behavior
     });
 
-    // Create the upstream connection wrapper
+    // Create the upstream connection wrapper. Pass the endpoint that was
+    // current when this connect was initiated so the idle-cleanup task
+    // can identify connections associated with a superseded IP.
     auto upstream_conn = std::make_unique<UpstreamConnection>(
-        conn_handler, upstream_host_, upstream_port_);
+        conn_handler, upstream_host_, upstream_port_, endpoint);
     UpstreamConnection* raw_conn = upstream_conn.get();
 
     // Safety invariant for `this` captures: PoolPartition destruction only happens

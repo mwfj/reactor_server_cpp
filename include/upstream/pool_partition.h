@@ -116,6 +116,29 @@ public:
 
     bool IsShuttingDown() const { return shutting_down_; }
 
+    // Reload-time endpoint publication. Release-store; observable to any
+    // subsequent atomic_load_explicit(acquire) in CreateNewConnection.
+    // Callable from ANY thread (typically the reload thread holding
+    // HttpServer::reload_mtx_).
+    void StoreResolvedEndpoint(
+        std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> new_ep);
+
+    // Acquire-load of the current resolved endpoint. Used by
+    // UpstreamHostPool::UpdateResolvedEndpoint to read the old value
+    // before swapping so it can compare for no-change short-circuit.
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>
+    LoadResolvedEndpoint() const {
+        return std::atomic_load_explicit(&resolved_endpoint_,
+                                         std::memory_order_acquire);
+    }
+
+    // Best-effort: schedule a one-shot dispatcher-thread task that closes
+    // idle_conns_ entries whose captured_endpoint() matches old_ep. NO-OP
+    // if old_ep is null or the partition is shutting down. Does NOT block;
+    // cleanup runs via dispatcher_->EnQueue.
+    void EnqueueIdleCleanupOnEndpointChange(
+        std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> old_ep);
+
     // Stats (dispatcher-thread-only reads)
     size_t IdleCount() const { return idle_conns_.size(); }
     size_t ActiveCount() const { return active_conns_.size(); }
@@ -225,6 +248,10 @@ private:
     bool ValidateConnection(UpstreamConnection* conn);
     void ServiceWaitQueue();
     void PurgeExpiredWaitEntries();
+    // Dispatcher-thread-only: close idle connections that captured old_ep.
+    // Called from EnqueueIdleCleanupOnEndpointChange's enqueued task.
+    void CloseIdleMatchingEndpointOnDispatcher(
+        const std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>& old_ep);
     // Create new connections for queued waiters after a pool slot opens.
     // Loops while capacity is available and waiters remain. Checks alive_
     // after each callback (user callbacks may tear down the partition).
