@@ -256,8 +256,9 @@ MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
         }
 
         // Merge legacy JSON with bind/upstream/dns sub-objects via nlohmann.
-        // ParseUnchecked is safe here: buf was constructed by snprintf with
-        // known-safe format strings and no user-supplied free-form strings.
+        // nlohmann::json::parse the snprintf output so sub-objects can be
+        // attached with proper escaping; buf was constructed from known-safe
+        // format strings and no user-supplied free-form strings.
         try {
             nlohmann::json root = nlohmann::json::parse(buf);
             root["bind"]     = BuildBindObject(server);

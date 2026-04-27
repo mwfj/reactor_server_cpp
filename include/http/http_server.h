@@ -157,27 +157,20 @@ public:
     // Return a snapshot of server runtime statistics.
     ServerStats GetStats() const;
 
-    // Return a thread-safe snapshot of the boot-time config.
+    // Return a thread-safe snapshot of the live server config.
     //
-    // Phase-1 scope: returns `live_config_`, which is written once by
-    // the ctor and NOT updated by `Reload()`. This means reload-visible
-    // subtrees (rate_limit zones, per-upstream circuit_breaker fields,
-    // size limits, timeouts) may diverge from the runtime subsystem
-    // state after any SIGHUP. Callers that need reload-coherent state
-    // must read from the subsystem managers directly (e.g.
-    // `RateLimitManager::snapshot()`).
+    // `live_config_` is written by the constructor at startup and also
+    // updated by `Reload()` for live-reloadable fields:
+    //   - dns.resolve_timeout_ms, dns.overall_timeout_ms, dns.stale_on_error
+    //     (updated each successful Reload that passes the DNS gates)
+    //   - upstreams (mirrored from upstream_configs_ at end of Reload)
     //
-    // Phase-1 callers: the only production consumer right now is the
-    // test pin (`TestGetLiveConfigSnapshotReturnsInitialConfig`); the
-    // accessor is also wired for step-14 `/stats` observability and
-    // step-11 reload-coherent reads. `main.cc::ReloadConfig` tracks
-    // its own `current_config` reference rather than round-tripping
-    // through this getter.
+    // Fields NOT written by Reload (restart-only):
+    //   - dns.lookup_family, dns.resolver_max_inflight (worker pool sized
+    //     at construction, not resized on reload)
+    //   - bind_host, bind_port, worker_threads, tls.*, http2.enabled
     //
-    // Acquires `reload_mtx_` defensively so a future step 11 that
-    // writes `live_config_` under the mutex cannot race this reader.
-    // Step 11 (deferred) will make the docstring promise stronger —
-    // at that point this becomes a fully reload-coherent snapshot.
+    // Acquires `reload_mtx_` so reads are coherent with in-flight Reloads.
     ServerConfig GetLiveConfigSnapshot() const;
 
     // Return a copy of the resolved bind endpoint, or std::nullopt if

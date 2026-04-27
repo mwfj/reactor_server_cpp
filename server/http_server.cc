@@ -4200,6 +4200,11 @@ HttpServer::ConnectionSnapshot HttpServer::SnapshotConnections() {
 bool HttpServer::Reload(ServerConfig new_config) {
     // Serialise Reload-vs-Reload and provide a post-drain teardown barrier
     // for Stop(). Held for the full function scope.
+    // TODO: holding reload_mtx_ across ResolveMany blocks /stats handlers
+    // (GetLiveConfigSnapshot / GetUpstreamResolvedSnapshot) for up to
+    // dns.overall_timeout_ms during a reload. Consider splitting into a
+    // serialization mutex (held across the whole Reload) plus a brief
+    // snapshot mutex (held only across live_config_ writes/reads).
     std::lock_guard<std::mutex> reload_lock(reload_mtx_);
 
     // Gate 1: abort immediately if Stop() has already signalled shutdown.
@@ -4380,38 +4385,16 @@ bool HttpServer::Reload(ServerConfig new_config) {
         }
     }
 
-    // Auth pre-validate — the ONLY apply step with a rejecting bool
-    // contract. Must run FIRST so an invalid auth config aborts the
-    // reload while the rollback set is still empty. On false the entire
-    // reload is hard-aborted: no DNS commit, no rate_limit, no CB, no
-    // size-limits.
+    // Declared at function scope: assigned inside the DNS block after Gate 3
+    // and used again at the end of Reload for the topology-change warn and
+    // CommitPolicyAndEnforcement. Default-initialised (topology_changed=false)
+    // so the no-auth-manager path is safe.
     TopLevelAuthPolicyMergeResult top_level_policy_merge;
-    if (auth_manager_) {
-        std::string auth_err;
-        if (!auth_manager_->Reload(new_config.auth, auth_err)) {
-            logging::Get()->error(
-                "Reload rejected: auth: {}; live state preserved", auth_err);
-            return false;
-        }
-        // Build the live issuer name set for the topology merge.
-        std::unordered_set<std::string> live_issuer_names;
-        live_issuer_names.reserve(auth_config_.issuers.size());
-        for (const auto& [name, _] : auth_config_.issuers) {
-            live_issuer_names.insert(name);
-        }
-        top_level_policy_merge =
-            MergeTopLevelAuthPoliciesPreservingLiveTopology(
-                auth_config_.policies, new_config.auth.policies,
-                live_issuer_names);
-        auth_config_ = BuildLiveAppliedAuthConfig(
-            auth_config_, new_config.auth,
-            top_level_policy_merge.policies);
-    }
 
     // Pre-apply DNS resolve — re-resolve all LIVE upstreams (restart-only
     // topology) using the staged DNS timeout knobs (hot-reloadable).
-    // Build and call BEFORE any irreversible apply step so a DNS failure
-    // can reject the entire reload with stale_on_error=false.
+    // Runs BEFORE auth commit so a DNS failure (stale_on_error=false) can
+    // abort cleanly with zero live-state mutations.
     {
         std::vector<NET_DNS_NAMESPACE::ResolveRequest> batch;
         batch.reserve(live_config_.upstreams.size());
@@ -4459,11 +4442,40 @@ bool HttpServer::Reload(ServerConfig new_config) {
                 new_config.dns.stale_on_error,
                 &total_reload_stale_served_);
 
-            // Gate 3: abort between auth (committed above) and DNS commit.
+            // Gate 3: abort before any irreversible apply step.
             if (stopping_.load(std::memory_order_acquire)) {
                 logging::Get()->info(
                     "Reload aborted after DNS merge (stop requested)");
                 return false;
+            }
+
+            // Auth Phase 1 — the ONLY apply step with a rejecting bool
+            // contract. Runs here (after all DNS gates) so a Stop race or
+            // stale_on_error=false DNS failure can abort with ZERO live-state
+            // mutations. On false the entire reload hard-aborts: no DNS
+            // commit, no rate_limit, no CB, no size-limits.
+            if (auth_manager_) {
+                std::string auth_err;
+                if (!auth_manager_->Reload(new_config.auth, auth_err)) {
+                    logging::Get()->error(
+                        "Reload rejected: auth: {}; live state preserved",
+                        auth_err);
+                    return false;
+                }
+                // Source of truth is the running AuthManager, not auth_config_.issuers.
+                // auth_manager_->Reload has just published new live issuer state above;
+                // LiveIssuerNames() reads from the runtime issuers_ map which is
+                // topology-stable post-Start. auth_config_.issuers may carry
+                // staged-only issuers from earlier deferred reloads.
+                std::unordered_set<std::string> live_issuer_names =
+                    auth_manager_->LiveIssuerNames();
+                top_level_policy_merge =
+                    MergeTopLevelAuthPoliciesPreservingLiveTopology(
+                        auth_config_.policies, new_config.auth.policies,
+                        live_issuer_names);
+                auth_config_ = BuildLiveAppliedAuthConfig(
+                    auth_config_, new_config.auth,
+                    top_level_policy_merge.policies);
             }
 
             // Log resolved addresses + record per-upstream status in a single
@@ -4486,15 +4498,43 @@ bool HttpServer::Reload(ServerConfig new_config) {
             // endpoint via acquire-load (release-acquire sequenced-before).
             upstream_manager_->UpdateResolvedEndpoints(dns_merged);
             upstream_resolved_ = std::move(dns_merged);
+        } else {
+            // No DNS batch (origin-only server or no upstreams). Still need
+            // Gate 3 and auth Phase 1 to run on the non-DNS code path.
+            if (stopping_.load(std::memory_order_acquire)) {
+                logging::Get()->info(
+                    "Reload aborted after DNS phase (stop requested)");
+                return false;
+            }
+            if (auth_manager_) {
+                std::string auth_err;
+                if (!auth_manager_->Reload(new_config.auth, auth_err)) {
+                    logging::Get()->error(
+                        "Reload rejected: auth: {}; live state preserved",
+                        auth_err);
+                    return false;
+                }
+                std::unordered_set<std::string> live_issuer_names =
+                    auth_manager_->LiveIssuerNames();
+                top_level_policy_merge =
+                    MergeTopLevelAuthPoliciesPreservingLiveTopology(
+                        auth_config_.policies, new_config.auth.policies,
+                        live_issuer_names);
+                auth_config_ = BuildLiveAppliedAuthConfig(
+                    auth_config_, new_config.auth,
+                    top_level_policy_merge.policies);
+            }
         }
 
         // Persist hot-reloadable DNS knobs unconditionally so origin-only
         // servers (no upstreams, empty batch) also pick up timeout changes.
         // lookup_family is restart-only — do NOT copy it.
-        live_config_.dns.resolve_timeout_ms    = new_config.dns.resolve_timeout_ms;
-        live_config_.dns.overall_timeout_ms    = new_config.dns.overall_timeout_ms;
-        live_config_.dns.stale_on_error        = new_config.dns.stale_on_error;
-        live_config_.dns.resolver_max_inflight = new_config.dns.resolver_max_inflight;
+        // resolver_max_inflight is restart-only: the worker pool is sized at
+        // construction and not resized on reload, so the live snapshot must
+        // continue reflecting the construction-time value.
+        live_config_.dns.resolve_timeout_ms = new_config.dns.resolve_timeout_ms;
+        live_config_.dns.overall_timeout_ms = new_config.dns.overall_timeout_ms;
+        live_config_.dns.stale_on_error     = new_config.dns.stale_on_error;
     }
 
     // Rate limit reload — always safe because manager is always created

@@ -197,7 +197,7 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
     PurgeExpiredWaitEntries();
     if (!alive->load(std::memory_order_acquire)) return;
 
-    if (shutting_down_) {
+    if (shutting_down_.load(std::memory_order_acquire)) {
         error_cb(CHECKOUT_SHUTTING_DOWN);
         return;
     }
@@ -266,7 +266,7 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
         // In production (HttpServer), the timer callback calls EvictExpired
         // periodically. In standalone mode, we schedule a self-rescheduling
         // purge task that checks timestamps each iteration.
-        if (dispatcher_ && !shutting_down_) {
+        if (dispatcher_ && !shutting_down_.load(std::memory_order_acquire)) {
             ScheduleWaitQueuePurge();
         }
         return;
@@ -517,7 +517,7 @@ void PoolPartition::InitiateShutdown() {
     // Either may synchronously tear down the pool/manager.
     auto alive = alive_;
 
-    shutting_down_ = true;
+    shutting_down_.store(true, std::memory_order_release);
 
     // Close all idle connections (no user callbacks — pool-owned)
     while (!idle_conns_.empty()) {
@@ -573,7 +573,7 @@ void PoolPartition::DrainWaitQueueOnTrip() {
     // test harness). Same pattern used by InitiateShutdown.
     auto alive = alive_;
 
-    if (shutting_down_) {
+    if (shutting_down_.load(std::memory_order_acquire)) {
         // Already draining via InitiateShutdown — that path will send
         // CHECKOUT_SHUTTING_DOWN to every waiter. Don't double-fire.
         return;
@@ -614,7 +614,7 @@ void PoolPartition::EnqueueIdleCleanupOnEndpointChange(
     std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> old_ep)
 {
     if (!old_ep) return;
-    if (shutting_down_) return;
+    if (shutting_down_.load(std::memory_order_acquire)) return;
     if (!dispatcher_) return;
     if (dispatcher_->was_stopped()) return;
 
@@ -853,7 +853,7 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
             int code = 0;
             bool should_notify = raw_conn->IsConnecting();
             if (should_notify) {
-                if (shutting_down_ ||
+                if (shutting_down_.load(std::memory_order_acquire) ||
                     manager_shutting_down_.load(std::memory_order_acquire)) {
                     code = CHECKOUT_SHUTTING_DOWN;
                 } else if (*timed_out) {
@@ -891,7 +891,7 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
             int code = 0;
             bool should_notify = raw_conn->IsConnecting();
             if (should_notify) {
-                if (shutting_down_ ||
+                if (shutting_down_.load(std::memory_order_acquire) ||
                     manager_shutting_down_.load(std::memory_order_acquire)) {
                     code = CHECKOUT_SHUTTING_DOWN;
                 } else if (*timed_out) {
@@ -1121,7 +1121,7 @@ void PoolPartition::ServiceWaitQueue() {
         // after manager_shutting_down_ is already true, making the
         // shutdown nondeterministic. Re-check shutdown flags after
         // every waiter callback and bail out if they flipped.
-        if (shutting_down_ ||
+        if (shutting_down_.load(std::memory_order_acquire) ||
             manager_shutting_down_.load(std::memory_order_acquire)) {
             return;
         }
@@ -1146,7 +1146,7 @@ void PoolPartition::ServiceWaitQueue() {
         // shutdown just like ready_callback above. Without this the
         // next loop iteration could still create a new connection
         // after manager_shutting_down_ is true.
-        if (shutting_down_ ||
+        if (shutting_down_.load(std::memory_order_acquire) ||
             manager_shutting_down_.load(std::memory_order_acquire)) {
             return;
         }
@@ -1155,7 +1155,7 @@ void PoolPartition::ServiceWaitQueue() {
 }
 
 void PoolPartition::ScheduleWaitQueuePurge() {
-    if (!dispatcher_ || shutting_down_) return;
+    if (!dispatcher_ || shutting_down_.load(std::memory_order_acquire)) return;
     // Dedup: one chain is enough. Without this, every queued waiter would
     // spawn its own chain, burning CPU under back-pressure.
     if (purge_chain_active_) return;
@@ -1173,13 +1173,13 @@ void PoolPartition::ScheduleWaitQueuePurge() {
         }
         // alive==true and destructor waits for inflight=0 (guard not yet
         // destroyed) before freeing members, so touching `this` is safe.
-        if (shutting_down_) {
+        if (shutting_down_.load(std::memory_order_acquire)) {
             purge_chain_active_ = false;
             return;
         }
         PurgeExpiredWaitEntries();
         if (!alive->load(std::memory_order_acquire)) return;
-        if (wait_queue_.empty() || shutting_down_ || !dispatcher_) {
+        if (wait_queue_.empty() || shutting_down_.load(std::memory_order_acquire) || !dispatcher_) {
             purge_chain_active_ = false;
             return;
         }
@@ -1197,13 +1197,13 @@ void PoolPartition::ScheduleWaitQueuePurge() {
             if (!alive2 || !alive2->load(std::memory_order_acquire)) {
                 return;
             }
-            if (shutting_down_) {
+            if (shutting_down_.load(std::memory_order_acquire)) {
                 purge_chain_active_ = false;
                 return;
             }
             PurgeExpiredWaitEntries();
             if (!alive2->load(std::memory_order_acquire)) return;
-            if (wait_queue_.empty() || shutting_down_) {
+            if (wait_queue_.empty() || shutting_down_.load(std::memory_order_acquire)) {
                 purge_chain_active_ = false;
                 return;
             }
@@ -1239,7 +1239,7 @@ void PoolPartition::PurgeExpiredWaitEntries() {
             // error_cb can trigger shutdown — bail so no further
             // waiter is handed a new connect or a queue timeout
             // after the manager has begun tearing down.
-            if (shutting_down_ ||
+            if (shutting_down_.load(std::memory_order_acquire) ||
                 manager_shutting_down_.load(std::memory_order_acquire)) {
                 return;
             }
@@ -1258,7 +1258,7 @@ void PoolPartition::CreateForWaiters() {
     PurgeExpiredWaitEntries();
     if (!alive->load(std::memory_order_acquire)) return;
 
-    while (!shutting_down_ &&
+    while (!shutting_down_.load(std::memory_order_acquire) &&
            !manager_shutting_down_.load(std::memory_order_acquire) &&
            !wait_queue_.empty() &&
            TotalCount() < partition_max_connections_) {
@@ -1314,7 +1314,7 @@ void PoolPartition::MaybeSignalDrain() {
     // Without the manager check, a lease returned between manager shutdown
     // and partition shutdown won't signal the drain CV, leaving WaitForDrain
     // blocked until timeout.
-    if ((shutting_down_ || manager_shutting_down_.load(std::memory_order_acquire)) &&
+    if ((shutting_down_.load(std::memory_order_acquire) || manager_shutting_down_.load(std::memory_order_acquire)) &&
         outstanding_conns_.load(std::memory_order_acquire) <= 0) {
         // Lock drain_mtx_ before notify to prevent lost wakeups.
         // Without this, the waiter can check the predicate (sees non-zero),

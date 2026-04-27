@@ -114,7 +114,9 @@ public:
     // clients who are about to be served 503 anyway.
     void DrainWaitQueueOnTrip();
 
-    bool IsShuttingDown() const { return shutting_down_; }
+    bool IsShuttingDown() const {
+        return shutting_down_.load(std::memory_order_acquire);
+    }
 
     // Reload-time endpoint publication. Release-store; observable to any
     // subsequent atomic_load_explicit(acquire) in CreateNewConnection.
@@ -238,7 +240,10 @@ private:
     // scheduled. Prevents spawning duplicate chains per queued waiter.
     // Cleared when the chain terminates (queue empty or shutdown).
     bool purge_chain_active_ = false;
-    bool shutting_down_ = false;
+    // Written by InitiateShutdown (dispatcher thread); read by
+    // EnqueueIdleCleanupOnEndpointChange (reload thread) — must be atomic.
+    // Mirror of manager_shutting_down_ which is already std::atomic<bool>.
+    std::atomic<bool> shutting_down_{false};
 
     // Internal helpers
     void CreateNewConnection(ReadyCallback ready_cb, ErrorCallback error_cb);
