@@ -39,7 +39,12 @@ Commands:
 Start options:
   -c, --config <file>         Config file (default: config/server.json)
   -p, --port <port>           Override bind port (0-65535, 0=ephemeral)
-  -H, --host <address>        Override bind address (numeric IPv4 only)
+  -H, --host <address>        Override bind address (IPv4 literal, IPv6 literal bare or
+                              bracketed, or RFC 1123 hostname). Examples:
+                                -H 0.0.0.0
+                                -H '::1'
+                                -H '[::1]'
+                                -H localhost
   -l, --log-level <level>     Override log level
                               (trace, debug, info, warn, error, critical)
   -w, --workers <N>           Override worker thread count (0 = auto)
@@ -53,7 +58,7 @@ Stop/status/reload options:
 Validate/config options:
   -c, --config <file>         Config file
   -p, --port <port>           Override bind port
-  -H, --host <address>        Override bind address
+  -H, --host <address>        Override bind address (IPv4 literal, IPv6 literal, or hostname)
   -l, --log-level <level>     Override log level
   -w, --workers <N>           Override worker threads
   -d, --daemonize             Check daemon-mode constraints (validate only)

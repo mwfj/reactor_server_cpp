@@ -1,14 +1,17 @@
 #include "upstream/upstream_connection.h"
 #include "tls/tls_connection.h"
 #include "log/logger.h"
+#include "net/dns_resolver.h"
 #include <poll.h>
 
 UpstreamConnection::UpstreamConnection(
     std::shared_ptr<ConnectionHandler> conn,
-    const std::string& host, int port)
+    const std::string& host, int port,
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> captured_endpoint)
     : conn_(std::move(conn))
     , upstream_host_(host)
     , upstream_port_(port)
+    , captured_endpoint_(std::move(captured_endpoint))
     , created_at_(std::chrono::steady_clock::now())
     , last_used_at_(created_at_)
 {

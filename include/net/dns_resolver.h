@@ -103,6 +103,23 @@ using ResolvedMap = std::unordered_map<
     std::string, std::shared_ptr<const ResolvedEndpoint>>;
 
 // ---------------------------------------------------------------------------
+// ResolverSnapshot — point-in-time counter snapshot for /stats rendering.
+//
+// Resolver-internal counters only. Reload-mechanism counters (e.g.
+// total_reload_stale_served) are owned by HttpServer, not DnsResolver.
+// ---------------------------------------------------------------------------
+struct ResolverSnapshot {
+    int64_t total_resolutions         = 0;   // every completed resolve (success + fail + timeout)
+    int64_t total_resolutions_failed  = 0;   // getaddrinfo returned error (non-saturation)
+    int64_t total_resolutions_timeout = 0;   // queue-time or in-flight deadline expired
+    int64_t queue_depth               = 0;   // current pending-queue size (instantaneous)
+    int64_t in_flight                 = 0;   // current workers running getaddrinfo
+    int64_t queued                    = 0;   // alias for queue_depth (schema back-compat)
+    int64_t completed                 = 0;   // alias for total_resolutions (schema back-compat)
+    int64_t eai_again                 = 0;   // saturation rejections (queue >= cap)
+};
+
+// ---------------------------------------------------------------------------
 // DnsResolver — per-instance pool + pure helpers
 // ---------------------------------------------------------------------------
 //
@@ -204,6 +221,11 @@ public:
     // authority use the dotless form for cert / vhost compatibility.
     static std::string StripTrailingDot(const std::string& s);
 
+    // Return a point-in-time snapshot of resolver-internal counters.
+    // Thread-safe: counters are atomics read with relaxed ordering;
+    // queue_depth and in_flight are read under state_->mtx for consistency.
+    ResolverSnapshot Snapshot() const;
+
 private:
     struct WorkItem;
     struct PoolState;
@@ -277,5 +299,26 @@ private:
     static ResolvedEndpoint MakeTimeoutResult(const ResolveRequest& req,
                                                const std::string& msg);
 };
+
+// Reload-time merge of a fresh DNS batch against the current live ResolvedMap.
+//
+// For each entry in `batch`:
+//   - On success: a fresh shared_ptr<const ResolvedEndpoint> enters the result.
+//   - On failure + stale_on_error=true: the live entry is preserved; a warn
+//     is emitted per stale fallback.
+//   - On failure + stale_on_error=false: the caller is expected to have already
+//     short-circuited before calling this. Defensively preserves the live entry
+//     and logs an error so a programming error never propagates a half-formed map.
+//
+// Emits an info log per IP change: "Reload: IP changed for upstream=X A -> B".
+// Live entries whose service name is NOT in `batch` are preserved (defensive).
+//
+// stale_counter: if non-null, incremented (relaxed) for each entry that falls
+// back to the live map due to a resolve failure with stale_on_error=true.
+// Owned by HttpServer; nullptr is accepted for test callers that don't track it.
+ResolvedMap MergeResolvedForReload(const ResolvedMap& live,
+                                    const std::vector<ResolvedEndpoint>& batch,
+                                    bool stale_on_error,
+                                    std::atomic<uint64_t>* stale_counter = nullptr);
 
 }  // namespace NET_DNS_NAMESPACE

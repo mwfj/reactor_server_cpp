@@ -140,6 +140,61 @@ Environment variables take precedence over JSON file values:
 
 Per-zone rate limit config (the `zones[]` array) is JSON-only — env vars cover the global toggles only.
 
+### DNS Configuration
+
+The `dns` block controls how the server resolves upstream hostnames at startup and on SIGHUP-triggered reloads. IP-literal upstream hosts (`10.0.1.5`, `::1`) bypass resolution entirely; this block only affects entries whose `host` is a DNS name.
+
+```json
+{
+  "dns": {
+    "lookup_family": "v4",
+    "resolve_timeout_ms": 5000,
+    "overall_timeout_ms": 10000,
+    "stale_on_error": true,
+    "resolver_max_inflight": 8
+  }
+}
+```
+
+**DNS fields:**
+
+| Field | Default | Hot-reload | Description |
+|-------|---------|------------|-------------|
+| `lookup_family` | `"v4"` | No | Address family for `getaddrinfo`: `"v4"` (AF_INET), `"v6"` (AF_INET6), or `"any"` (no constraint). Restart required to take effect. |
+| `resolve_timeout_ms` | `5000` | Yes | Per-hostname `getaddrinfo` deadline in milliseconds. |
+| `overall_timeout_ms` | `10000` | Yes | Wall-clock ceiling for the entire batch resolution pass during a reload. If the batch does not complete within this window, incomplete entries are handled according to `stale_on_error`. |
+| `stale_on_error` | `true` | Yes | Controls what happens when a hostname fails to resolve during a reload. See "DNS Hot Reload" below. |
+| `resolver_max_inflight` | `8` | No | Maximum number of concurrent `getaddrinfo` calls. Restart required — the worker pool is fixed at startup. |
+
+**Environment variable overrides:**
+
+| Variable | Config Field |
+|----------|-------------|
+| `REACTOR_DNS_LOOKUP_FAMILY` | `dns.lookup_family` |
+| `REACTOR_DNS_RESOLVE_TIMEOUT_MS` | `dns.resolve_timeout_ms` |
+| `REACTOR_DNS_OVERALL_TIMEOUT_MS` | `dns.overall_timeout_ms` |
+| `REACTOR_DNS_STALE_ON_ERROR` | `dns.stale_on_error` |
+
+`resolver_max_inflight` is restart-only and has no env var override.
+
+### DNS Hot Reload
+
+On SIGHUP, the server re-resolves all upstream hostnames before applying any other reload-safe edits. The `stale_on_error` field governs what happens when a resolution fails:
+
+- **`stale_on_error: true` (default)** — upstreams with failed re-resolves keep their prior resolved IP. A `warn` log is emitted per fallback entry. All other reload-safe field changes (rate limits, circuit breaker, size limits, timeouts, HTTP/2 settings) still apply. New connections to the affected upstream continue using the last-known-good IP until the next successful reload.
+
+- **`stale_on_error: false`** — if any upstream's hostname fails to resolve, the entire reload is rejected atomically: no field changes apply at all, and `Reload` returns `false`. The running server is fully preserved. Use this mode when connecting to the wrong IP is worse than keeping stale config.
+
+The reload apply order is: auth validation → DNS commit → rate_limit → circuit_breaker → size limits → max_connections → timeouts → timer cadence → HTTP/2 settings → auth policy publish. Auth validation runs first because it is the only step that can hard-abort the reload — if the new auth config is invalid, no DNS commit or subsequent step runs, and the live state is fully preserved.
+
+**Connection-reuse semantics after a hostname re-resolves to a new IP:**
+
+- The next NEW connection to that upstream uses the new IP (the swap is visible immediately to all dispatchers via a release/acquire pair on the per-partition endpoint).
+- Idle keepalive connections already in the pool continue serving the OLD IP until they are naturally closed (idle timeout, upstream teardown, or a best-effort cleanup task that runs asynchronously after the reload).
+- In-flight connections (TCP/TLS handshake in progress) complete against the OLD IP via refcount on the captured endpoint — no use-after-free.
+
+**Security note:** `/stats` now includes resolved IPs under `upstream[*].resolved_ip`. Gate the `/stats` endpoint behind auth middleware or a network ACL if the upstream IP topology is sensitive.
+
 ### Upstream Configuration
 
 Upstream connection pools are configured via the `upstreams` array in the JSON config. Each entry defines a named backend service with its own pool and optional TLS settings.
@@ -203,6 +258,17 @@ Upstream connection pools are configured via the `upstreams` array in the JSON c
 | `verify_peer` | true | Verify upstream server certificate |
 | `sni_hostname` | "" | SNI hostname for TLS handshake |
 | `min_version` | "1.2" | Minimum TLS version ("1.2" or "1.3") |
+
+**TLS SNI resolution rule:** the effective SNI hostname sent during the TLS handshake depends on the upstream `host` type and the `tls.sni_hostname` override:
+
+| `host` type | `tls.sni_hostname` set | SNI sent | Verify name |
+|---|---|---|---|
+| Hostname | No | `host` value (trailing dot stripped) | `host` (dotless) |
+| Hostname | Yes | `sni_hostname` | `sni_hostname` |
+| IP literal | No | None (no SNI extension; RFC 6066 §3) | None |
+| IP literal | Yes | `sni_hostname` | `sni_hostname` |
+
+**Validator constraint:** `verify_peer: true` with an IP-literal `host` and no `sni_hostname` override is rejected at config load with an error. Use `sni_hostname` to supply the certificate name when connecting to an upstream by IP address with peer verification enabled.
 
 **Note:** Upstream configuration changes require a server restart — pools are built once during `Start()` and cannot be rebuilt at runtime.
 

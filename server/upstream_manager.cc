@@ -400,3 +400,14 @@ PoolPartition* UpstreamManager::GetPoolPartition(
     }
     return it->second->GetPartition(dispatcher_index);
 }
+
+void UpstreamManager::UpdateResolvedEndpoints(
+    const NET_DNS_NAMESPACE::ResolvedMap& merged)
+{
+    for (const auto& [service_name, new_ep] : merged) {
+        auto it = pools_.find(service_name);
+        if (it == pools_.end()) continue;
+        if (!new_ep) continue;
+        it->second->UpdateResolvedEndpoint(new_ep);
+    }
+}

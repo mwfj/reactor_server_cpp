@@ -93,6 +93,15 @@ public:
     PoolPartition* GetPoolPartition(const std::string& service_name,
                                     size_t dispatcher_index);
 
+    // Reload-time endpoint refresh. Synchronous on the caller's thread.
+    // Iterates every entry in `merged` and, for the matching pool's
+    // partitions, performs a release-store on resolved_endpoint_. Returns
+    // ONLY after every partition for every matching service has been
+    // published. Entries in `merged` with no matching pool are ignored.
+    // Called by HttpServer::Reload while holding reload_mtx_.
+    void UpdateResolvedEndpoints(
+        const NET_DNS_NAMESPACE::ResolvedMap& merged);
+
     // Install a non-owning pointer to the server's CircuitBreakerManager.
     // Called once from HttpServer::MarkServerReady after both managers are
     // constructed (§3.1). Lifetime guarantee: the CircuitBreakerManager
