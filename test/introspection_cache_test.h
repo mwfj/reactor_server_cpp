@@ -1124,6 +1124,58 @@ static void Test_MaxShardsCache_64Shards_CtorSucceeds() {
 }
 
 // ---------------------------------------------------------------------------
+// Test_Clear_DropsAllEntries: After Clear(), every previously-inserted
+// key reads as Miss. Used by AuthManager / Issuer reload paths when the
+// operator changes claim_keys (forward.claims_to_headers or
+// issuer.required_claims) — cached ctx.claims/non_scalar_claims would be
+// missing newly-requested keys, causing spurious "missing_required_claim"
+// denials and missing outbound headers until the positive TTL expired.
+// ---------------------------------------------------------------------------
+static void Test_Clear_DropsAllEntries() {
+    using namespace AUTH_NAMESPACE;
+    try {
+        IntrospectionCache cache("issuer-reload", 100, 4);
+
+        AuthContext ctx;
+        ctx.subject = "alice";
+        cache.Insert("aaaa11112222333344445555666677778888",
+                     ctx, /*active=*/true, std::chrono::seconds(60));
+        cache.Insert("bbbb11112222333344445555666677778888",
+                     ctx, /*active=*/false, std::chrono::seconds(60));
+
+        const auto pre = cache.SnapshotStats();
+        bool inserted_ok = pre.entries == 2;
+
+        cache.Clear();
+
+        const auto post = cache.SnapshotStats();
+        bool empty_after = post.entries == 0;
+
+        const auto now = std::chrono::steady_clock::now();
+        bool a_miss = cache.Lookup(
+            "aaaa11112222333344445555666677778888", now)
+            .state == IntrospectionCache::LookupState::Miss;
+        bool b_miss = cache.Lookup(
+            "bbbb11112222333344445555666677778888", now)
+            .state == IntrospectionCache::LookupState::Miss;
+
+        // After Clear(), inserts must succeed (LRU lists not corrupted).
+        cache.Insert("cccc11112222333344445555666677778888",
+                     ctx, /*active=*/true, std::chrono::seconds(60));
+        bool reinsert_ok = cache.Lookup(
+            "cccc11112222333344445555666677778888", now)
+            .state == IntrospectionCache::LookupState::Fresh;
+
+        bool ok = inserted_ok && empty_after && a_miss && b_miss && reinsert_ok;
+        Record("IntrospectionCache: Clear_DropsAllEntries", ok,
+               "expected pre.entries=2, post.entries=0, both Lookup() return Miss, "
+               "and post-Clear Insert+Lookup round-trips");
+    } catch (const std::exception& e) {
+        Record("IntrospectionCache: Clear_DropsAllEntries", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
 static void RunAllTests() {
     std::cout << "\n[IntrospectionCache Tests]" << std::endl;
     Test_InsertAndLookup_Fresh();
@@ -1160,6 +1212,7 @@ static void RunAllTests() {
     Test_LookupDuringEviction_NoUseAfterFree();
     Test_SingleShardCache_CtorAndBasicOps();
     Test_MaxShardsCache_64Shards_CtorSucceeds();
+    Test_Clear_DropsAllEntries();
 }
 
 }  // namespace IntrospectionCacheTests

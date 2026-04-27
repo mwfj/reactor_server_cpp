@@ -1454,6 +1454,55 @@ void TestPopulateFromPayloadClearsStaleFields() {
 }
 
 // -----------------------------------------------------------------------------
+// PopulateFromPayload: non-scalar (array/object) claim_keys land in
+// ctx.non_scalar_claims (NOT in ctx.claims with a sentinel value). Tokens
+// that legitimately carry the literal "<present>" string in a scalar
+// claim must round-trip through ctx.claims unchanged.
+// -----------------------------------------------------------------------------
+void TestPopulateFromPayloadNonScalarTracking() {
+    std::cout << "\n[TEST] PopulateFromPayload tracks non-scalar claims separately..." << std::endl;
+    try {
+        AUTH_NAMESPACE::AuthContext ctx;
+
+        // Token with both a scalar `<present>` literal AND a non-scalar
+        // `groups` array. Both keys are operator-requested via claim_keys.
+        nlohmann::json payload = nlohmann::json::parse(R"({
+            "iss": "https://issuer.example",
+            "sub": "alice",
+            "literal_present": "<present>",
+            "groups": ["admin", "ops"]
+        })");
+        std::vector<std::string> keys = {"literal_present", "groups"};
+        bool ok = AUTH_NAMESPACE::PopulateFromPayload(payload, keys, ctx);
+
+        bool literal_intact =
+            ctx.claims.count("literal_present") == 1 &&
+            ctx.claims.at("literal_present") == "<present>";
+        bool group_in_set =
+            ctx.non_scalar_claims.count("groups") == 1 &&
+            ctx.claims.count("groups") == 0;
+
+        bool pass = ok && literal_intact && group_in_set;
+        std::string err;
+        if (!literal_intact) {
+            err = "scalar '<present>' literal value got dropped or mangled "
+                  "(was treated as the old non-scalar sentinel)";
+        } else if (!group_in_set) {
+            err = "non-scalar 'groups' claim should land in "
+                  "ctx.non_scalar_claims, not ctx.claims";
+        }
+        TestFramework::RecordTest(
+            "AuthFoundation: PopulateFromPayload tracks non-scalar claims separately",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthFoundation: PopulateFromPayload tracks non-scalar claims separately",
+            false, std::string("unexpected exception: ") + e.what(),
+            TestFramework::TestCategory::OTHER);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // ConfigLoader::Validate — disabled inline proxy.auth still gets structural
 // validation (review P2 #2). Operators are expected to pre-stage disabled
 // auth blocks during the rollout; typos must surface NOW, not at the
@@ -4796,6 +4845,7 @@ inline void RunAllTests() {
     TestConfigLoaderRejectsOutOfRangeIntegers();
     TestConfigLoaderRejectsReservedForwardHeaders();
     TestPopulateFromPayloadClearsStaleFields();
+    TestPopulateFromPayloadNonScalarTracking();
     TestConfigLoaderValidatesDisabledInlineAuth();
     TestConfigLoaderRoundTripsAuthOnlyProxy();
     TestConfigLoaderDisabledTopLevelPoliciesDoNotCollide();

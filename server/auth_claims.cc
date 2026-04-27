@@ -6,15 +6,6 @@ namespace AUTH_NAMESPACE {
 
 namespace {
 
-// Local alias for the public sentinel constant declared in auth_claims.h.
-// HeaderRewriter::ApplyIdentityInject MUST compare-and-skip this value
-// when iterating claims_to_headers so it is never emitted to upstream
-// services as a literal header value. Operators who need the value of
-// an array/object claim (not just presence) must list the claim under
-// forward.claims_to_headers AND wait for HeaderRewriter to grow native
-// array→header flattening — until then, the value is dropped silently.
-constexpr const char* kNonScalarSentinel = kNonScalarClaimSentinel;
-
 std::vector<std::string> SplitWhitespace(const std::string& s) {
     // operator>>(istream&, string&) skips leading whitespace and reads a
     // non-empty run of non-whitespace characters — it cannot produce an
@@ -101,6 +92,7 @@ bool PopulateFromPayload(const nlohmann::json& payload,
     ctx.scopes.clear();
     ctx.audiences.clear();
     ctx.claims.clear();
+    ctx.non_scalar_claims.clear();
 
     if (!payload.is_object()) return false;
 
@@ -182,13 +174,14 @@ bool PopulateFromPayload(const nlohmann::json& payload,
         } else if (v.is_boolean()) {
             ctx.claims[key] = v.get<bool>() ? "true" : "false";
         } else if (!v.is_null()) {
-            // Non-scalar (array / object): record presence with a sentinel
-            // so RunPolicyAndIssuerClaimChecks's
-            // ctx.claims.find(c) presence test matches JWT mode's
-            // payload.contains(c) semantics. Common case is a `groups`
-            // claim shaped as an array. Loses type / value, but
-            // required_claims is a presence-only check by design.
-            ctx.claims[key] = kNonScalarSentinel;
+            // Non-scalar (array / object): record presence in a separate
+            // set so RunPolicyAndIssuerClaimChecks can match JWT mode's
+            // payload.contains(c) semantics for required_claims without
+            // colliding with any literal string a token might legitimately
+            // carry. Common case: a `groups` claim shaped as an array.
+            // Loses type/value here — operators who need the actual value
+            // must wait for HeaderRewriter array→header flattening.
+            ctx.non_scalar_claims.insert(key);
         }
     }
     return true;

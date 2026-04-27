@@ -77,6 +77,17 @@ class IntrospectionCache {
     // is restart-required and ignored here.
     void ApplyReload(const IntrospectionConfig& new_cfg);
 
+    // Drop every entry across all shards. Used by AuthManager / Issuer
+    // reload paths when the operator-requested claim-key set
+    // (forward.claim_keys ∪ issuer.required_claims) changes — existing
+    // positive entries were populated using the OLD claim_keys list, so
+    // their cached `ctx.claims` / `ctx.non_scalar_claims` are missing
+    // newly-requested keys. Subsequent live POSTs repopulate against the
+    // new key set; the only cost is a temporary cache-hit-rate dip. Each
+    // shard's mutex is acquired in turn so concurrent Lookup/Insert calls
+    // for unrelated shards remain unblocked.
+    void Clear();
+
     // Snapshot stats counters for /stats observability. Approximate entry
     // count under relaxed ordering.
     Stats SnapshotStats() const;

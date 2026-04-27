@@ -30,21 +30,21 @@ constexpr size_t kMaxBearerTokenBytes = 8192;
 // Re-run policy + issuer claim checks against an already-populated
 // AuthContext. Used by:
 //   - cache hit / stale-hit paths in InvokeAsyncIntrospection (no body
-//     available; required_claim presence falls back to ctx.claims —
-//     string-typed required claims work, array/object-typed are skipped
-//     because PopulateFromPayload only flattens scalars into ctx.claims).
+//     available; required_claim presence checks BOTH ctx.claims (scalars)
+//     AND ctx.non_scalar_claims (arrays/objects), giving cache-hit parity
+//     with JWT-mode payload.contains(c) regardless of claim shape).
 //   - IntrospectionClient post-parse path (body available — the live
 //     POST result still goes through this same helper for symmetry,
 //     after PopulateFromPayload has copied required_claim names into
-//     ctx.claims via the augmented claim_keys list).
+//     either ctx.claims or ctx.non_scalar_claims via the augmented
+//     claim_keys list).
 //
 // Audience: policy.required_audience overrides; otherwise issuer
 // snap.audiences fallback (any-match). Empty on both sides → accept.
 //
-// Required claims: presence-only check against ctx.claims keys (matches
-// JWT-mode semantics — JwtVerifier checks payload.contains(c)). Cache
-// hits can only verify presence for scalar-typed claims; document the
-// limitation in docs/oauth2.md.
+// Required claims: presence-only check against ctx.claims OR
+// ctx.non_scalar_claims (matches JWT-mode semantics — JwtVerifier checks
+// payload.contains(c)).
 //
 // Required scopes: HasRequiredScopes(ctx.scopes, policy.required_scopes).
 //
@@ -70,7 +70,10 @@ VerifyResult RunPolicyAndIssuerClaimChecks(
         }
     }
     for (const auto& c : snap.required_claims) {
-        if (ctx.claims.find(c) == ctx.claims.end()) {
+        const bool present = ctx.claims.find(c) != ctx.claims.end() ||
+                             ctx.non_scalar_claims.find(c) !=
+                                 ctx.non_scalar_claims.end();
+        if (!present) {
             return VerifyResult::InvalidToken("missing required claim",
                                                 "missing_required_claim");
         }
@@ -315,6 +318,13 @@ void AuthManager::CommitPolicyAndEnforcement(
     AuthForwardConfig fwd_copy = new_forward;
     fwd_copy.PopulateDerived();
     auto fwd_snap = std::make_shared<const AuthForwardConfig>(std::move(fwd_copy));
+    // Detect a forward.claim_keys change so we can drop stale positive
+    // introspection cache entries AFTER the swap. Cached
+    // ctx.claims/non_scalar_claims were populated using the OLD claim_keys
+    // list — any new key added by the operator would otherwise be missing
+    // from the cached ctx until the positive TTL expired, dropping
+    // outbound headers (claims_to_headers) for cache-hit requests.
+    bool claim_keys_changed = false;
     // Single atomic cutover under snapshot_mtx_:
     //   1. forward_ swap
     //   2. policies_ swap
@@ -327,10 +337,34 @@ void AuthManager::CommitPolicyAndEnforcement(
     // still on the old policy list.
     {
         std::lock_guard<std::mutex> lk(snapshot_mtx_);
+        if (forward_) {
+            claim_keys_changed = forward_->claim_keys != fwd_snap->claim_keys;
+        } else {
+            claim_keys_changed = !fwd_snap->claim_keys.empty();
+        }
         forward_ = std::move(fwd_snap);
         policies_ = rebuilt;
         master_enabled_.store(new_master_enabled,
                                std::memory_order_release);
+    }
+    // Drop positive introspection cache entries on every issuer when
+    // forward.claim_keys changed — done AFTER the snapshot swap so any
+    // concurrent cache-miss POST observes the new claim_keys via the
+    // augmented `claim_keys` list InvokeAsyncIntrospection threads through.
+    // Lock-free walk: issuers_ is topology-stable post-construction
+    // (Reload preserves the existing map; topology changes are restart-
+    // required), and IntrospectionCache::Clear takes per-shard locks
+    // internally.
+    if (claim_keys_changed) {
+        for (auto& [name, issuer_ptr] : issuers_) {
+            if (!issuer_ptr) continue;
+            if (auto* cache = issuer_ptr->introspection_cache()) {
+                cache->Clear();
+            }
+        }
+        logging::Get()->info(
+            "AuthManager commit: introspection caches cleared "
+            "(forward.claim_keys changed) issuers={}", issuers_.size());
     }
     logging::Get()->info(
         "AuthManager commit: policies={} enforcing={}",

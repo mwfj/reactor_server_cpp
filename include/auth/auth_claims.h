@@ -7,14 +7,6 @@
 
 namespace AUTH_NAMESPACE {
 
-// Sentinel value PopulateFromPayload writes into ctx.claims for non-scalar
-// (array / object) claim_keys. Lets RunPolicyAndIssuerClaimChecks's
-// presence test (`ctx.claims.find(c) != end`) match JWT-mode
-// `payload.contains(c)` semantics for required_claims. HeaderRewriter
-// MUST compare-and-skip this value when iterating claims_to_headers so it
-// is never emitted to upstream services as a literal header value.
-inline constexpr const char* kNonScalarClaimSentinel = "<present>";
-
 // Helpers that translate a decoded-JWT payload OR an introspection-response
 // JSON into the AuthContext we attach to HttpRequest.
 //

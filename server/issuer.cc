@@ -316,11 +316,16 @@ bool Issuer::ApplyReload(const IssuerConfig& new_config, std::string& err_out) {
     // so a reload doesn't blow away IdP-provided values. The operator's
     // static override (when discovery=false) already flows through
     // BuildMutableSnapshotFromConfig.
+    bool required_claims_changed = false;
     {
         std::lock_guard<std::mutex> lk(snapshot_mtx_);
         if (snapshot_ && discovery_) {
             new_snap->jwks_uri = snapshot_->jwks_uri;
             new_snap->introspection_endpoint = snapshot_->introspection_endpoint;
+        }
+        if (snapshot_) {
+            required_claims_changed =
+                snapshot_->required_claims != new_snap->required_claims;
         }
         snapshot_ = new_snap;
     }
@@ -329,6 +334,19 @@ bool Issuer::ApplyReload(const IssuerConfig& new_config, std::string& err_out) {
     }
     if (mode_ == kModeIntrospection && introspection_cache_) {
         introspection_cache_->ApplyReload(new_config.introspection);
+        // Existing positive entries were populated using the prior
+        // required_claims set — their cached ctx.claims /
+        // ctx.non_scalar_claims are missing newly-required keys, which
+        // would cause RunPolicyAndIssuerClaimChecks on cache-hit to
+        // reject valid tokens with `missing_required_claim` until the
+        // positive TTL expires. Drop them so subsequent live POSTs
+        // repopulate against the new key set.
+        if (required_claims_changed) {
+            introspection_cache_->Clear();
+            logging::Get()->info(
+                "Issuer reload: introspection cache cleared "
+                "(required_claims changed) issuer={}", name_);
+        }
     }
     const uint64_t new_gen =
         generation_->fetch_add(1, std::memory_order_release) + 1;

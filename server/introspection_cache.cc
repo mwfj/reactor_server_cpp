@@ -238,6 +238,16 @@ void IntrospectionCache::ApplyReload(const IntrospectionConfig& new_cfg) {
     }
 }
 
+void IntrospectionCache::Clear() {
+    for (auto& shard : shards_) {
+        std::lock_guard<std::mutex> lk(shard->mtx);
+        shard->map.clear();
+        shard->head = nullptr;
+        shard->tail = nullptr;
+        shard->size_approx.store(0, std::memory_order_relaxed);
+    }
+}
+
 IntrospectionCache::Stats IntrospectionCache::SnapshotStats() const {
     Stats s;
     s.hit = hit_.load(std::memory_order_relaxed);
