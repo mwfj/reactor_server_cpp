@@ -901,6 +901,70 @@ inline void TestStartupAbortsBeforeDnsWhenStopRanFirst() {
     }
 }
 
+// Architectural invariant: Stop() MUST NOT acquire `reload_mtx_`. Even
+// if a future hostname-aware reload (step 11) holds reload_mtx_ briefly,
+// SIGTERM/Stop must remain responsive. We can't directly observe that
+// the mutex isn't taken, but we CAN verify the cooperative contract: a
+// Reload that runs concurrently with Stop must not delay Stop beyond a
+// small constant. This pins the design: any future code that puts Stop
+// behind reload_mtx_ would let a slow Reload block this test past the
+// fast-stop budget.
+inline void TestStopNotBlockedByConcurrentReload() {
+    std::cout << "\n[TEST] DualStack: Stop not blocked by concurrent Reload..."
+              << std::endl;
+    try {
+        HttpServer server("127.0.0.1", 0);
+        TestServerRunner<HttpServer> runner(server);
+
+        // Drive a sequence of Reload calls on a worker; they should
+        // cooperate with Stop. Use the live config (a Normalize+Validate
+        // copy) so reload paths don't bail on shape errors.
+        std::atomic<bool> reload_done{false};
+        std::thread reload_thread([&]() {
+            ServerConfig snap = server.GetLiveConfigSnapshot();
+            // Several reloads in a tight loop — each one fences
+            // reload_in_flight_ around its body, so Stop running
+            // concurrently must not wait on this thread's progress.
+            for (int i = 0; i < 5; ++i) {
+                server.Reload(snap);
+            }
+            reload_done.store(true, std::memory_order_release);
+        });
+
+        // Give the reload thread a moment to enter Reload.
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        const auto t0 = std::chrono::steady_clock::now();
+        server.Stop();
+        const auto stop_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+
+        if (reload_thread.joinable()) reload_thread.join();
+
+        // Stop on a quiescent server with a few in-flight Reloads should
+        // complete well under one second. A regression to Stop-takes-
+        // reload_mtx_ would still pass this most of the time (Reload is
+        // fast today), but it would fail catastrophically once step-11's
+        // DNS-bearing reload landed. Pinning the budget now is the
+        // architectural guard: future code that adds slow ops under
+        // reload_mtx_ AND lets Stop wait on it would push stop_ms past
+        // the 2000ms ceiling immediately.
+        const bool ok = stop_ms < 2000 &&
+                        reload_done.load(std::memory_order_acquire);
+        std::string err;
+        if (!ok) {
+            err = "stop_ms=" + std::to_string(stop_ms) +
+                  " reload_done=" +
+                  std::to_string(reload_done.load(std::memory_order_acquire));
+        }
+        Record("DualStack: Stop not blocked by concurrent Reload", ok, err);
+    } catch (const std::exception& e) {
+        Record("DualStack: Stop not blocked by concurrent Reload",
+                false, e.what());
+    }
+}
+
 // Step 9 full: PoolPartition stores its connect endpoint via an atomic
 // shared_ptr target that step 11's reload will swap. This test exercises
 // the atomic-load path end-to-end: an IP-literal upstream is configured,
@@ -981,6 +1045,7 @@ inline void RunAllTests() {
     TestBindResolvedPresentAfterStart();
     TestStartupAbortsWhenStopCalledFirst();
     TestStartupAbortsBeforeDnsWhenStopRanFirst();
+    TestStopNotBlockedByConcurrentReload();
 
     // Step 9 full — PoolPartition resolved-endpoint split
     TestPoolPartitionResolvedEndpointAtomic();

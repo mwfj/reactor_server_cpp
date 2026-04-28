@@ -262,11 +262,34 @@ private:
     ServerConfig live_config_;
 
     // Serialises (a) Reload-vs-Reload; (b) `GetLiveConfigSnapshot() const`
-    // vs in-flight Reload; (c) Stop's post-drain teardown barrier vs
-    // in-flight Reload (§11 v0.45 round-44 P1 narrowing). `mutable` per
-    // v0.28 ("serialization, not state"). NOT acquired on Stop's
-    // pre-drain accept-close path — that stays lock-free.
+    // vs in-flight Reload. `mutable` per v0.28 ("serialization, not
+    // state").
+    //
+    // INVARIANT — NO BLOCKING I/O UNDER THIS MUTEX. The lock holder must
+    // not call DNS resolution, network I/O, file I/O, or any operation
+    // that can stall for a wall-clock duration. Future hostname-aware
+    // reload (step 11) MUST resolve hostnames OUTSIDE this lock and only
+    // re-acquire to swap the resolved-state pointer atomically.
+    //
+    // INVARIANT — Stop() MUST NOT acquire this mutex. The earlier
+    // "post-drain teardown barrier" idea was rejected: if a long-running
+    // Reload were ever to hold this mutex (even momentarily across a
+    // slow operation), Stop would block until that completes — bypassing
+    // the `stopping_` fast-stop path. Stop-vs-Reload synchronization, if
+    // ever needed, must use `reload_in_flight_` (acquire-poll with
+    // bounded retries) so SIGTERM responsiveness stays decoupled from
+    // mutex contention. NOT acquired on Stop's pre-drain accept-close
+    // path either — that stays lock-free.
     mutable std::mutex reload_mtx_;
+
+    // Counts in-flight Reload() calls. Incremented at Reload entry,
+    // decremented at exit. Stop() can poll this with bounded retries to
+    // observe a quiescent point WITHOUT taking `reload_mtx_`, preserving
+    // SIGTERM responsiveness even if a Reload is mid-flight. Currently
+    // unread by Stop (no teardown barrier exists today); the counter is
+    // installed up-front so step-11's hostname-aware reload can fence
+    // against Stop without inheriting reload_mtx_'s blocking-I/O risk.
+    std::atomic<int> reload_in_flight_{0};
 
     // Per-server DNS resolver. Ctor is cheap (allocates `PoolState` only;
     // lazy worker spawn on first non-literal ResolveAsync). Owned via

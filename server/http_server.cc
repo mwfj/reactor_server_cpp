@@ -2388,10 +2388,15 @@ void HttpServer::Stop() {
     // First executable line: publish shutdown intent with release
     // ordering (§11 v0.41 invariant). Start()/Reload() poll this at
     // phase boundaries with acquire ordering so they can abort cleanly
-    // even while wedged in DNS. MUST happen before the listener close
-    // and BEFORE any later lock acquisition — if Stop ever acquires
-    // reload_mtx_ (post-drain teardown barrier in step 11), this store
-    // must still run first so a mutex-waiting Stop still signals shutdown.
+    // even while wedged in DNS.
+    //
+    // Stop MUST NOT acquire `reload_mtx_` — see the header invariant.
+    // If a future Stop-vs-Reload teardown barrier is ever needed, use
+    // `reload_in_flight_` (acquire-load + bounded poll) so a slow
+    // Reload (e.g. step-11's hostname re-resolution) cannot block
+    // SIGTERM responsiveness. Keeping the `stopping_` store here as
+    // line one preserves the design invariant that shutdown intent is
+    // visible BEFORE any accept-close, drain, or barrier work runs.
     stopping_.store(true, std::memory_order_release);
 
     logging::Get()->info("HttpServer stopping");
@@ -4493,6 +4498,22 @@ bool HttpServer::Reload(ServerConfig new_config) {
         logging::Get()->warn("Reload() called before server is ready, ignored");
         return false;
     }
+
+    // RAII fence for `reload_in_flight_`: lets a future Stop() barrier
+    // observe a quiescent point WITHOUT acquiring `reload_mtx_` (see the
+    // header invariant — reload_mtx_ must never be in Stop's wait path,
+    // because step-11's hostname-aware reload may end up holding it
+    // briefly across operations the mutex contract forbids blocking on).
+    // The increment is acquire-release so a Stop poll on a different
+    // thread sees the in-flight reload before the body runs and the
+    // decrement after the body completes.
+    reload_in_flight_.fetch_add(1, std::memory_order_acq_rel);
+    struct ReloadInFlightGuard {
+        std::atomic<int>& counter;
+        ~ReloadInFlightGuard() {
+            counter.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    } reload_guard{reload_in_flight_};
 
     // Self-normalize — in-process callers that build a ServerConfig
     // and call Reload() directly get the same canonicalization as the
