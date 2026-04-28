@@ -210,10 +210,22 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
         return;
     }
 
-    // 1. Try to find a valid idle connection (MRU = front)
+    // 1. Try to find a valid idle connection (MRU = front).
+    // Defense-in-depth against the reload-cleanup task race: a connection
+    // idle at reload time should be reaped by EnqueueIdleCleanupOnEndpointChange,
+    // but if a checkout lands BEFORE that cleanup task runs, the popped idle
+    // entry may still carry the old captured_endpoint(). Skip + destroy in
+    // that case so a stale-IP connection is never handed to a borrower.
+    auto current_ep_for_pop = LoadResolvedEndpoint();
     while (!idle_conns_.empty()) {
         auto conn = std::move(idle_conns_.front());
         idle_conns_.pop_front();
+
+        const auto* captured = conn->captured_endpoint().get();
+        if (captured && current_ep_for_pop.get() != captured) {
+            DestroyConnection(std::move(conn));
+            continue;
+        }
 
         if (!ValidateConnection(conn.get())) {
             DestroyConnection(std::move(conn));
@@ -340,6 +352,22 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
         DestroyConnection(std::move(owned));
         CreateForWaiters();
         return;
+    }
+
+    // Stale-endpoint guard: if the partition's resolved endpoint changed
+    // while this connection was checked out (or completing a connect),
+    // its captured_endpoint() no longer matches the current generation.
+    // Destroying it on return prevents continued traffic to the old IP via
+    // pool reuse — the design's "next NEW connection uses new endpoint"
+    // contract requires this once a busy connection comes home.
+    {
+        auto current_ep = LoadResolvedEndpoint();
+        const auto* captured = owned->captured_endpoint().get();
+        if (captured && current_ep.get() != captured) {
+            DestroyConnection(std::move(owned));
+            CreateForWaiters();
+            return;
+        }
     }
 
     owned->IncrementRequestCount();

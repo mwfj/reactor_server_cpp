@@ -4940,9 +4940,13 @@ HttpServer::HttpServerDnsStats HttpServer::GetDnsStatsSnapshot() const {
 std::vector<HttpServer::UpstreamResolvedEntry>
 HttpServer::GetUpstreamResolvedSnapshot() const {
     std::vector<UpstreamResolvedEntry> result;
-    const auto now = std::chrono::steady_clock::now();
 
     std::lock_guard<std::mutex> lk(reload_mtx_);
+
+    // Capture `now` AFTER the lock — if /stats blocks waiting on a reload,
+    // a fresh upstream_resolved_ entry's resolved_at can be later than a
+    // pre-lock now, producing negative age_seconds.
+    const auto now = std::chrono::steady_clock::now();
 
     // Walk upstream_configs_ to preserve declaration order and include
     // upstreams whose DNS resolution is absent (not yet resolved).

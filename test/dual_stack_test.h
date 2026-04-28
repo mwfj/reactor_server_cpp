@@ -919,13 +919,17 @@ inline void TestReloadDnsResolvePrecedesAuthApply() {
     try {
         using namespace NET_DNS_NAMESPACE;
 
-        // Build a live map with one stale entry.
-        auto old_ep = std::make_shared<const ResolvedEndpoint>();
-        const_cast<ResolvedEndpoint&>(*old_ep).host = "svc-a";
-        const_cast<ResolvedEndpoint&>(*old_ep).port = 8080;
-        const_cast<ResolvedEndpoint&>(*old_ep).tag  = "upstream:svc-a";
-        const_cast<ResolvedEndpoint&>(*old_ep).addr = InetAddr("10.0.0.1", 8080);
-        const_cast<ResolvedEndpoint&>(*old_ep).resolved_at = std::chrono::steady_clock::now();
+        // Build a live map with one stale entry. Populate a mutable
+        // ResolvedEndpoint first; only then store it as a shared_ptr<const ...>.
+        // Mutating through const_cast on an originally-const allocation is UB.
+        ResolvedEndpoint old_ep_init;
+        old_ep_init.host = "svc-a";
+        old_ep_init.port = 8080;
+        old_ep_init.tag  = "upstream:svc-a";
+        old_ep_init.addr = InetAddr("10.0.0.1", 8080);
+        old_ep_init.resolved_at = std::chrono::steady_clock::now();
+        std::shared_ptr<const ResolvedEndpoint> old_ep =
+            std::make_shared<const ResolvedEndpoint>(std::move(old_ep_init));
 
         ResolvedMap live;
         live["svc-a"] = old_ep;
@@ -979,21 +983,25 @@ inline void TestReloadStaleOnErrorTrueKeepsPriorIp() {
     try {
         using namespace NET_DNS_NAMESPACE;
 
-        // Live map: two services.
-        auto ep_ok = std::make_shared<const ResolvedEndpoint>();
-        const_cast<ResolvedEndpoint&>(*ep_ok).host = "svc-b";
-        const_cast<ResolvedEndpoint&>(*ep_ok).port = 9090;
-        const_cast<ResolvedEndpoint&>(*ep_ok).tag  = "upstream:svc-b";
-        const_cast<ResolvedEndpoint&>(*ep_ok).addr = InetAddr("10.1.0.1", 9090);
-        const_cast<ResolvedEndpoint&>(*ep_ok).resolved_at = std::chrono::steady_clock::now();
+        // Live map: two services. Populate mutable, then store as const-shared.
+        ResolvedEndpoint ep_ok_init;
+        ep_ok_init.host = "svc-b";
+        ep_ok_init.port = 9090;
+        ep_ok_init.tag  = "upstream:svc-b";
+        ep_ok_init.addr = InetAddr("10.1.0.1", 9090);
+        ep_ok_init.resolved_at = std::chrono::steady_clock::now();
+        std::shared_ptr<const ResolvedEndpoint> ep_ok =
+            std::make_shared<const ResolvedEndpoint>(std::move(ep_ok_init));
 
-        auto ep_stale = std::make_shared<const ResolvedEndpoint>();
-        const_cast<ResolvedEndpoint&>(*ep_stale).host = "svc-c";
-        const_cast<ResolvedEndpoint&>(*ep_stale).port = 7070;
-        const_cast<ResolvedEndpoint&>(*ep_stale).tag  = "upstream:svc-c";
-        const_cast<ResolvedEndpoint&>(*ep_stale).addr = InetAddr("10.1.0.5", 7070);
-        const_cast<ResolvedEndpoint&>(*ep_stale).resolved_at = std::chrono::steady_clock::now()
+        ResolvedEndpoint ep_stale_init;
+        ep_stale_init.host = "svc-c";
+        ep_stale_init.port = 7070;
+        ep_stale_init.tag  = "upstream:svc-c";
+        ep_stale_init.addr = InetAddr("10.1.0.5", 7070);
+        ep_stale_init.resolved_at = std::chrono::steady_clock::now()
             - std::chrono::seconds(300);  // 5 min old
+        std::shared_ptr<const ResolvedEndpoint> ep_stale =
+            std::make_shared<const ResolvedEndpoint>(std::move(ep_stale_init));
 
         ResolvedMap live;
         live["svc-b"] = ep_ok;
@@ -1063,12 +1071,14 @@ inline void TestReloadStaleOnErrorFalseRejectsAtomically() {
         using namespace NET_DNS_NAMESPACE;
 
         // Live map: one good entry, one that will "fail" in the batch.
-        auto ep_live = std::make_shared<const ResolvedEndpoint>();
-        const_cast<ResolvedEndpoint&>(*ep_live).host = "svc-d";
-        const_cast<ResolvedEndpoint&>(*ep_live).port = 5050;
-        const_cast<ResolvedEndpoint&>(*ep_live).tag  = "upstream:svc-d";
-        const_cast<ResolvedEndpoint&>(*ep_live).addr = InetAddr("192.168.1.1", 5050);
-        const_cast<ResolvedEndpoint&>(*ep_live).resolved_at = std::chrono::steady_clock::now();
+        ResolvedEndpoint ep_live_init;
+        ep_live_init.host = "svc-d";
+        ep_live_init.port = 5050;
+        ep_live_init.tag  = "upstream:svc-d";
+        ep_live_init.addr = InetAddr("192.168.1.1", 5050);
+        ep_live_init.resolved_at = std::chrono::steady_clock::now();
+        std::shared_ptr<const ResolvedEndpoint> ep_live =
+            std::make_shared<const ResolvedEndpoint>(std::move(ep_live_init));
 
         ResolvedMap live;
         live["svc-d"] = ep_live;
