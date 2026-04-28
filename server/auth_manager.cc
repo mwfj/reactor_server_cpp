@@ -232,6 +232,33 @@ std::shared_ptr<const AuthForwardConfig> AuthManager::ForwardConfig() const {
     return forward_;
 }
 
+bool AuthManager::ValidateReload(const AuthConfig& new_config,
+                                   std::string& err_out) const {
+    // Topology check — same as Reload's Pass 1, but pure (no plan-vector
+    // build, no iteration of issuers_ besides counting + name lookup).
+    // const-qualified to make the no-mutation invariant a type-system
+    // guarantee.
+    if (new_config.issuers.size() != issuers_.size()) {
+        err_out = "auth issuer topology change (add/remove) requires restart";
+        return false;
+    }
+    for (const auto& [name, ic] : new_config.issuers) {
+        auto it = issuers_.find(name);
+        if (it == issuers_.end()) {
+            err_out = "auth issuer topology change: unknown '" + name + "'";
+            return false;
+        }
+        IssuerConfig normalized = ic;
+        if (normalized.name.empty()) normalized.name = name;
+        std::string validate_err;
+        if (!it->second->ValidateReload(normalized, validate_err)) {
+            err_out = "issuer '" + normalized.name + "': " + validate_err;
+            return false;
+        }
+    }
+    return true;
+}
+
 bool AuthManager::Reload(const AuthConfig& new_config, std::string& err_out) {
     std::lock_guard<std::mutex> reload_lock(reload_mtx_);
 

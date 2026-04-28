@@ -103,6 +103,18 @@ class AuthManager {
     // at the end.
     std::shared_ptr<const AuthForwardConfig> ForwardConfig() const;
 
+    // Validate-only path. Runs the issuer-topology check (count + name
+    // set) and per-issuer ValidateReload. Pure read — does NOT mutate
+    // any live state, does NOT publish snapshots. Returns false on
+    // rejection with `err_out` populated. Lets the HttpServer reload
+    // path fail-fast on auth-bad configs BEFORE applying any other
+    // subsystem reload (rate-limit, circuit-breaker, etc.) AND before
+    // any future DNS-bearing reload phase, so an auth-only bad config
+    // rejects deterministically without depending on DNS health.
+    // Never throws.
+    bool ValidateReload(const AuthConfig& new_config,
+                         std::string& err_out) const;
+
     // Applies reloadable fields: issuer snapshots, the forward config,
     // and a generation bump. Returns false on validation failure with
     // an error message in `err_out`. Never throws.

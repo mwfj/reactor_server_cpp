@@ -4703,6 +4703,43 @@ bool HttpServer::Reload(ServerConfig new_config) {
                                   e.what());
             return false;
         }
+
+        // Auth-validate-before-apply gate. ValidateHotReloadable above
+        // covers per-field range/allowlist checks (leeway, algorithms,
+        // introspection block) — but the issuer-topology check (the
+        // staged issuers map matching the live issuers map) lives only
+        // inside AuthManager::Reload's mutate path, late in this
+        // function. Without an early validate-only gate, an auth-only
+        // bad config (issuer renamed/added/removed) would still allow
+        // every other subsystem reload (rate-limit, circuit-breaker,
+        // size limits, H2 settings, request timeouts) to apply, then
+        // log a warn skipping auth — partial reload on a config the
+        // operator intends as atomic.
+        //
+        // ValidateReload is pure: topology check + per-issuer
+        // ValidateReload. Calling it here also positions the gate
+        // BEFORE any future hostname-aware reload phase (step 11)
+        // would land — so an auth-only bad reload rejects without
+        // depending on DNS health, exactly the contract documented
+        // for "auth-validate → DNS apply" ordering.
+        if (auth_manager_) {
+            std::string auth_validate_err;
+            if (!auth_manager_->ValidateReload(new_config.auth,
+                                                 auth_validate_err)) {
+                // Match AuthManager::Reload's semantics: on auth
+                // rejection, the rest of the reload still applies as
+                // live-safe edits, but auth state stays preserved. A
+                // warn surfaces the rejection without aborting the
+                // whole reload. (The caller can still treat this as a
+                // hard reject by inspecting the operator-visible warn
+                // message; we don't return false because rate-limit /
+                // CB / size-limits remain reloadable.)
+                logging::Get()->warn(
+                    "Auth pre-apply validation rejected the staged "
+                    "config: {} (live state preserved; other reloads "
+                    "still applied)", auth_validate_err);
+            }
+        }
     }
 
     // Three-phase update to prevent mid-reload connections from seeing

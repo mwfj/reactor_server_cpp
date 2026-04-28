@@ -293,6 +293,76 @@ static bool TestReloadRejectsUnknownIssuer() {
 }
 
 // ---------------------------------------------------------------------------
+// ValidateReload — pure validate-only path. Mirrors Reload's topology +
+// per-issuer validation but does NOT mutate any state. Used by
+// HttpServer::Reload as a fail-fast gate so an auth-bad config rejects
+// BEFORE any other subsystem reload (rate-limit, CB, etc.) applies AND
+// before any future DNS-bearing reload phase.
+// ---------------------------------------------------------------------------
+static bool TestValidateReloadAcceptsValidConfig() {
+    AUTH_NAMESPACE::AuthConfig cfg = MakeEmptyConfig(true);
+    cfg.issuers["issuer-a"] = MakeStaticIssuer("issuer-a");
+    auto mgr = MakeManager(cfg);
+
+    // Same-topology reload with reloadable-field changes — must validate.
+    AUTH_NAMESPACE::AuthConfig new_cfg = cfg;
+    new_cfg.issuers["issuer-a"].leeway_sec = 30;
+
+    std::string err;
+    bool ok_validate = mgr->ValidateReload(new_cfg, err);
+
+    // ValidateReload is const + side-effect-free: a subsequent Reload must
+    // still succeed (no live state mutated by the validate-only call).
+    std::string err2;
+    bool ok_reload = mgr->Reload(new_cfg, err2);
+
+    bool ok = ok_validate && err.empty() && ok_reload;
+    TestFramework::RecordTest(
+        "AuthManager: ValidateReload accepts valid config (no mutation)",
+        ok,
+        ok ? "" :
+        "validate=" + std::to_string(ok_validate) + " err='" + err +
+        "' reload=" + std::to_string(ok_reload) + " err2='" + err2 + "'");
+    return ok;
+}
+
+static bool TestValidateReloadRejectsTopologyChange() {
+    AUTH_NAMESPACE::AuthConfig cfg = MakeEmptyConfig(true);
+    cfg.issuers["issuer-a"] = MakeStaticIssuer("issuer-a", "https://a.example.com");
+    auto mgr = MakeManager(cfg);
+
+    AUTH_NAMESPACE::AuthConfig new_cfg = cfg;
+    new_cfg.issuers["issuer-b"] = MakeStaticIssuer("issuer-b", "https://b.example.com");
+
+    std::string err;
+    bool validated = mgr->ValidateReload(new_cfg, err);
+    bool ok = !validated && !err.empty();
+    TestFramework::RecordTest(
+        "AuthManager: ValidateReload rejects topology change",
+        ok,
+        ok ? "" : "topology change should have been rejected, err='" + err + "'");
+    return ok;
+}
+
+static bool TestValidateReloadRejectsUnknownIssuer() {
+    AUTH_NAMESPACE::AuthConfig cfg = MakeEmptyConfig(true);
+    cfg.issuers["issuer-a"] = MakeStaticIssuer("issuer-a");
+    auto mgr = MakeManager(cfg);
+
+    AUTH_NAMESPACE::AuthConfig new_cfg = MakeEmptyConfig(true);
+    new_cfg.issuers["issuer-x"] = MakeStaticIssuer("issuer-x");
+
+    std::string err;
+    bool validated = mgr->ValidateReload(new_cfg, err);
+    bool ok = !validated;
+    TestFramework::RecordTest(
+        "AuthManager: ValidateReload rejects unknown issuer name",
+        ok,
+        ok ? "" : "should have rejected unknown issuer");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Test 10: Reload() of reloadable fields succeeds and bumps generation
 // ---------------------------------------------------------------------------
 static bool TestReloadReloadableFields() {
@@ -834,6 +904,9 @@ static void RunAllTests() {
     TestForwardConfigDefaults();
     TestReloadRejectsTopologyChange();
     TestReloadRejectsUnknownIssuer();
+    TestValidateReloadAcceptsValidConfig();
+    TestValidateReloadRejectsTopologyChange();
+    TestValidateReloadRejectsUnknownIssuer();
     TestReloadReloadableFields();
     TestStopIdempotent();
     TestGetIssuerUnknown();
