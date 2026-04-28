@@ -846,6 +846,61 @@ inline void TestStartupAbortsWhenStopCalledFirst() {
     }
 }
 
+// Pre-DNS-dispatch shutdown gate: when bind_host is a HOSTNAME and Stop()
+// fires before Start() enters Phase-A, the gate must return BEFORE
+// dispatching the DNS batch (so resolver threads aren't spawned and the
+// caller doesn't pay dns.overall_timeout_ms). The literal-only stop-
+// before-start test above doesn't cover this path because IP literals
+// short-circuit DnsResolver without threads regardless of the gate.
+//
+// Test strategy: configure an unresolvable hostname with a deliberately
+// long overall_timeout_ms, call Stop() before Start(), and assert
+// Start() returns quickly (well under the timeout). Without the pre-
+// dispatch gate, Start would block for ~1s before the post-DNS gate
+// could fire.
+inline void TestStartupAbortsBeforeDnsWhenStopRanFirst() {
+    std::cout << "\n[TEST] DualStack: Start aborts before DNS when Stop ran first..."
+              << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host = "this-host-does-not-resolve-aaaa.invalid";
+        cfg.bind_port = 0;
+        // Long resolve / overall budget so a missing pre-dispatch gate
+        // would clearly exceed our wall-clock assertion below.
+        cfg.dns.resolve_timeout_ms = 1000;
+        cfg.dns.overall_timeout_ms = 1500;
+
+        HttpServer server(cfg);
+        server.Stop();  // sets stopping_=true
+
+        const auto t0 = std::chrono::steady_clock::now();
+        server.Start();  // must hit pre-DNS gate, return immediately
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+
+        // Bounded by the gate, not the resolver. 200ms is generous —
+        // the gate path does no I/O. A regression to "spawn resolver
+        // first, gate post-DNS" would push elapsed >= 1000ms.
+        const bool fast_return = elapsed_ms < 200;
+        const bool no_listener = !server.GetBindResolved().has_value() &&
+                                  server.GetBoundPort() == 0;
+        const bool ok = fast_return && no_listener;
+        std::string err;
+        if (!ok) {
+            err = "elapsed_ms=" + std::to_string(elapsed_ms) +
+                  " bind_resolved_has=" +
+                  std::to_string(server.GetBindResolved().has_value()) +
+                  " bound_port=" + std::to_string(server.GetBoundPort());
+        }
+        Record("DualStack: Start aborts before DNS when Stop ran first",
+                ok, err);
+    } catch (const std::exception& e) {
+        Record("DualStack: Start aborts before DNS when Stop ran first",
+                false, e.what());
+    }
+}
+
 // Step 9 full: PoolPartition stores its connect endpoint via an atomic
 // shared_ptr target that step 11's reload will swap. This test exercises
 // the atomic-load path end-to-end: an IP-literal upstream is configured,
@@ -925,6 +980,7 @@ inline void RunAllTests() {
     // Step 8 — HttpServer::Start DNS orchestration
     TestBindResolvedPresentAfterStart();
     TestStartupAbortsWhenStopCalledFirst();
+    TestStartupAbortsBeforeDnsWhenStopRanFirst();
 
     // Step 9 full — PoolPartition resolved-endpoint split
     TestPoolPartitionResolvedEndpointAtomic();

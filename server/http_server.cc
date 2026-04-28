@@ -2232,6 +2232,22 @@ void HttpServer::Start() {
     // could race with MarkServerReady's RegisterProxyRoutes inserts.
     startup_begun_.store(true, std::memory_order_release);
 
+    // Pre-DNS shutdown gate. If Stop() landed BEFORE Start() entered
+    // here (e.g. signal during the startup_begun_ window), we must not
+    // spawn resolver threads or block on dns.overall_timeout_ms — the
+    // existing post-DNS gate would only fire after a slow/wedged
+    // resolver had already consumed up to the overall timeout. Release-
+    // acquire semantics: pairs with Stop's release-store on `stopping_`.
+    // Literal-only configs short-circuit DnsResolver without threads,
+    // so this gate primarily protects hostname-bearing configurations
+    // where the resolver could meaningfully block.
+    if (stopping_.load(std::memory_order_acquire)) {
+        logging::Get()->info(
+            "Startup aborted before DNS resolution (stop requested); "
+            "no resolver threads spawned, no listen socket opened");
+        return;
+    }
+
     // DNS resolution (off the reactor; no threads running) ──
     // §5.4a. Batch contains one entry per configured upstream plus a
     // `bind` entry for bind_host. For literal hosts (IP addresses)

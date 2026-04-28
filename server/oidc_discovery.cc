@@ -325,6 +325,22 @@ void OidcDiscovery::Start(size_t dispatcher_index,
                         schedule_retry();
                         return;
                     }
+                    // Accept-side partial-drop log: when the gate passes
+                    // BUT the parser cleared one of the endpoints (e.g.
+                    // valid jwks_uri + non-https introspection_endpoint
+                    // for a JWT-mode issuer), `reason` carries the
+                    // dropped-field signal. Without this warn, an
+                    // operator who configured a multi-mode metadata
+                    // source would never see why the unused field
+                    // didn't land — only the surviving field's success
+                    // line. Mode-irrelevance for THIS issuer doesn't
+                    // make the silent drop self-explanatory.
+                    if (!reason.empty()) {
+                        logging::Get()->warn(
+                            "OIDC discovery partial endpoint drop issuer={} "
+                            "reason={} (other field accepted)",
+                            issuer_name, reason);
+                    }
                     logging::Get()->info(
                         "OIDC discovery ok issuer={} has_introspection={}",
                         issuer_name, !intro_endpoint.empty());

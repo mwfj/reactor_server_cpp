@@ -122,6 +122,14 @@ bool IsStrictIpv4Literal(const std::string& s) {
 bool ParseIpv6Literal(const std::string& s) {
     if (s.empty()) return false;
     if (s.find('%') != std::string::npos) return false;   // §1.2.7
+    // Reject embedded NULs BEFORE inet_pton — `inet_pton` parses the
+    // C-string prefix only and would silently validate "::1\0bad" while
+    // the std::string still carries the suffix. That suffix could then
+    // flow into Host / X-Upstream-Host / log fields with an embedded
+    // NUL even though bind/connect target the prefix address. Same
+    // discipline as IsStrictIpv4Literal — fail closed on attacker-
+    // controllable string content before handing to a C string API.
+    if (s.find('\0') != std::string::npos) return false;
     unsigned char buf[sizeof(struct in6_addr)];
     return ::inet_pton(AF_INET6, s.c_str(), buf) == 1;
 }

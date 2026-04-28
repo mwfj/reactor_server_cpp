@@ -207,6 +207,69 @@ inline void TestIpv6LiteralRejectsScopeId() {
     }
 }
 
+// Regression: IPv6 literals containing an embedded NUL must be rejected
+// across the same entry-point matrix used for scope-id rejection.
+// Without this, inet_pton would validate only the C-string prefix while
+// the std::string still carries the suffix — a config like "::1\0bad"
+// would bind/connect to ::1 but flow into Host / X-Upstream-Host / log
+// fields with the suffix attached.
+inline void TestIpv6LiteralRejectsEmbeddedNul() {
+    std::cout << "\n[TEST] DnsResolver: IPv6 literal rejects embedded NUL..."
+              << std::endl;
+    try {
+        bool ok = true;
+        std::string err;
+
+        auto must_reject = [&](const std::string& in, const std::string& label) {
+            if (DnsResolver::IsIpLiteral(in)) {
+                ok = false;
+                err += "IsIpLiteral accepted " + label + "; ";
+            }
+            if (DnsResolver::IsValidHostOrIpLiteral(in)) {
+                ok = false;
+                err += "IsValidHostOrIpLiteral accepted " + label + "; ";
+            }
+            std::string bare;
+            if (DnsResolver::NormalizeHostToBare(in, &bare)) {
+                ok = false;
+                err += "NormalizeHostToBare (bare) accepted " + label + "; ";
+            }
+        };
+
+        // "::1\0bad" — prefix is a valid IPv6, suffix would survive in
+        // the std::string after inet_pton stops at the NUL.
+        std::string with_suffix;
+        with_suffix += "::1";
+        with_suffix.push_back('\0');
+        with_suffix += "bad";
+        must_reject(with_suffix, "'::1\\0bad'");
+
+        // Embedded NUL alone (no suffix bytes) — inet_pton would still
+        // validate the prefix portion.
+        std::string trailing_nul;
+        trailing_nul += "::1";
+        trailing_nul.push_back('\0');
+        must_reject(trailing_nul, "'::1\\0'");
+
+        // Leading NUL — defensive.
+        std::string leading_nul;
+        leading_nul.push_back('\0');
+        leading_nul += "::1";
+        must_reject(leading_nul, "'\\0::1'");
+
+        // Control: clean "::1" still accepts.
+        if (!DnsResolver::IsIpLiteral("::1")) {
+            ok = false;
+            err += "control '::1' rejected; ";
+        }
+
+        Record("DnsResolver: IPv6 literal rejects embedded NUL", ok, err);
+    } catch (const std::exception& e) {
+        Record("DnsResolver: IPv6 literal rejects embedded NUL",
+                false, e.what());
+    }
+}
+
 inline void TestFormatAuthority() {
     std::cout << "\n[TEST] DnsResolver: FormatAuthority..." << std::endl;
     try {
@@ -2162,6 +2225,7 @@ inline void RunAllTests() {
     TestMixedTimeoutSaturationTriggersFullSweep();
     TestIsValidHostOrIpLiteralRejectsLegacyNumericForms();
     TestIpv6LiteralRejectsScopeId();
+    TestIpv6LiteralRejectsEmbeddedNul();
     TestParseHostPortRejectsMalformedPort();
     TestResolveAsyncRejectsInvalidHostBeforeQueue();
     TestParseHostPortValidatesHostToken();

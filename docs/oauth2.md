@@ -265,7 +265,7 @@ Raw tokens are **never** logged; operators get the issuer / kid / short reason l
 
 ## Security recommendations
 
-1. **Always use TLS between the gateway and the IdP.** `jwks_uri` and `introspection.endpoint` are rejected at config load if they start with `http://` — not negotiable.
+1. **Always use TLS between the gateway and the IdP.** `jwks_uri` and `introspection.endpoint` are rejected at config load if they start with `http://` — not negotiable. For introspection-mode issuers the upstream pool ALSO must have `tls.enabled=true` (the actual transport runs over the pool's TLS config, not the URL scheme). The upstream-TLS check exempts strict loopback host literals — `127.0.0.1`, the `127.0.0.0/8` prefix, `::1`, and the lowercase string `localhost` — for test/local-dev only. Other forms (`0:0:0:0:0:0:0:1` uncompressed, bracketed `[::1]`, `localhost.localdomain`, `127.0.0.1` with surrounding whitespace, hostname CNAMEs that resolve to loopback) are NOT recognized; deployments must use the canonical literals or supply a TLS upstream.
 2. **Keep the algorithm allowlist tight.** If your IdP only signs with `RS256`, list just `RS256`. Admitting extra algorithms is a substitution risk.
 3. **Strip inbound identity headers.** `strip_inbound_identity_headers: true` is the default for a reason. Forged `X-Auth-Subject` headers are a classic auth bypass.
 4. **Never inline `client_secret`.** Use `client_secret_env` and load from a secret-manager-populated environment variable. The validator rejects inline secrets at load.
