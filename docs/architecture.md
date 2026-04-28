@@ -182,7 +182,7 @@ Stats counters use `memory_order_relaxed` atomics — snapshots are approximate 
 
 ### `/stats` JSON Schema
 
-The `/stats` response body is JSON. The top-level object contains legacy fields (uptime, connection counters, config echo) plus three sub-objects added in Phase 2:
+The `/stats` response body is JSON. The top-level object contains legacy fields (uptime, connection counters, config echo) plus three sub-objects covering the bind address, per-upstream resolved endpoints, and DNS resolver counters:
 
 **`bind`** — resolved bind address (present only after a successful `Start()`):
 
