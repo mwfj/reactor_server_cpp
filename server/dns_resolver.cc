@@ -649,14 +649,33 @@ void* DnsResolver::WorkerTrampoline(void* raw) {
             std::lock_guard<std::mutex> lk(state->mtx);
             if (!item->done) {
                 item->done = true;
-                // Count every worker-completed resolve (success + non-timeout failure).
+                // Late-completion guard: getaddrinfo can return after the
+                // per-item deadline but before the reaper acquires mtx.
+                // Without this check, the worker would publish/count the
+                // result as a normal completion — direct ResolveAsync
+                // callers would observe success past their deadline, and
+                // /stats counters would misclassify the timeout. Honour
+                // the deadline by emitting a timeout result instead.
+                const bool late =
+                    std::chrono::steady_clock::now() > item->deadline;
                 state->total_resolutions.fetch_add(1, std::memory_order_relaxed);
-                if (result.error) {
-                    state->total_resolutions_failed.fetch_add(1, std::memory_order_relaxed);
+                if (late) {
+                    state->total_resolutions_timeout.fetch_add(
+                        1, std::memory_order_relaxed);
+                    try {
+                        item->promise.set_value(MakeTimeoutResult(
+                            item->req,
+                            "queue-time exceeded deadline"));
+                    } catch (const std::future_error&) {}
+                } else {
+                    if (result.error) {
+                        state->total_resolutions_failed.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                    try {
+                        item->promise.set_value(std::move(result));
+                    } catch (const std::future_error&) {}
                 }
-                try {
-                    item->promise.set_value(std::move(result));
-                } catch (const std::future_error&) {}
                 state->in_flight.erase(in_flight_it);
             }
             // else: reaper beat us to it and already erased

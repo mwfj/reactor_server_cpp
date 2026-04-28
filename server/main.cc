@@ -211,6 +211,11 @@ nlohmann::json BuildDnsObject(HttpServer* server) {
     obj["eai_again"]                 = s.resolver.eai_again;
     obj["queue_depth"]               = s.resolver.queue_depth;
     obj["in_flight"]                 = s.resolver.in_flight;
+    // Schema back-compat aliases — `queued` mirrors `queue_depth`,
+    // `completed` mirrors `total_resolutions`. ResolverSnapshot fills both;
+    // emit them so clients pinned to the older shape keep parsing.
+    obj["queued"]                    = s.resolver.queued;
+    obj["completed"]                 = s.resolver.completed;
     obj["total_reload_stale_served"] = static_cast<uint64_t>(s.total_reload_stale_served);
     return obj;
 }

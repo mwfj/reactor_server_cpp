@@ -4512,7 +4512,12 @@ bool HttpServer::Reload(ServerConfig new_config) {
             auth_config_ = BuildLiveAppliedAuthConfig(
                 auth_config_, new_config.auth,
                 top_level_policy_merge.policies);
-            live_config_.auth = new_config.auth;
+            // Publish the APPLIED auth state, not the staged block. Restart-
+            // only fields (e.g. hmac_cache_key_env) live inside auth_config_
+            // at their pre-reload values; assigning new_config.auth here
+            // would expose the staged value via GetLiveConfigSnapshot()
+            // even though AuthManager continues to use the startup key.
+            live_config_.auth = auth_config_;
         }
 
         if (ran_dns_batch) {
@@ -4537,6 +4542,23 @@ bool HttpServer::Reload(ServerConfig new_config) {
                 status.succeeded     = !r.error;
                 status.error_message = r.error ? r.error_message : std::string{};
             }
+        }
+
+        // Warn when staged restart-only DNS fields differ from live —
+        // operators editing only `lookup_family` or `resolver_max_inflight`
+        // must know the values won't take effect until restart, and the
+        // post-success live snapshot continues reporting the construction-
+        // time values.
+        if (new_config.dns.lookup_family != live_config_.dns.lookup_family) {
+            logging::Get()->warn(
+                "Reload: dns.lookup_family change is restart-only — "
+                "running resolver continues with the startup value");
+        }
+        if (new_config.dns.resolver_max_inflight !=
+            live_config_.dns.resolver_max_inflight) {
+            logging::Get()->warn(
+                "Reload: dns.resolver_max_inflight change is restart-only — "
+                "running resolver pool size is fixed at construction");
         }
 
         // Persist hot-reloadable DNS knobs unconditionally so origin-only
