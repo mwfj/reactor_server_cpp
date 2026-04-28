@@ -5046,31 +5046,69 @@ bool HttpServer::Reload(ServerConfig new_config) {
     // proxy.auth equality discipline documented in §11.1 — circuit-
     // breaker precedent.
     if (auth_manager_) {
+        // Pre-compute the merged auth_config_ from the OLD live state +
+        // NEW staged config, BEFORE invoking AuthManager::Reload. The
+        // merge uses live_issuer_names (drawn from the still-OLD
+        // auth_config_.issuers map) to detect staged policies that
+        // reference non-live issuers (restart-required delta; the merge
+        // preserves the live applies_to/name set and flags
+        // topology_changed for the operator warn).
+        //
+        // Why pre-compute (was inline between Reload and Commit before):
+        // request threads read issuer snapshots via Issuer::LoadSnapshot
+        // and read AuthManager policies/forward/master_enabled via
+        // AuthManager::snapshot_mtx_ — they DON'T take any HttpServer
+        // mutex. AuthManager::Reload publishes issuer snapshots on
+        // return; CommitPolicyAndEnforcement publishes the policy/
+        // forward/master_enabled cutover. With ~17 lines of metadata
+        // work between them, a request thread could verify a token with
+        // NEW audiences/algorithms/leeway while still matching the OLD
+        // policy and forward config — a security-relevant mixed window
+        // (e.g., new permissive audience + old policy = token accepted
+        // against a wider audience than the operator intended). Pre-
+        // computing collapses the gap to the function-call return of
+        // Reload + the reacquire of snapshot_mtx_ by Commit (sub-
+        // microsecond), so the worst-case window is bounded by a single
+        // function-call return rather than a configurable amount of
+        // metadata work.
+        std::unordered_set<std::string> live_issuer_names;
+        live_issuer_names.reserve(auth_config_.issuers.size());
+        for (const auto& [name, _] : auth_config_.issuers) {
+            live_issuer_names.insert(name);
+        }
+        top_level_policy_merge =
+            MergeTopLevelAuthPoliciesPreservingLiveTopology(
+                auth_config_.policies, new_config.auth.policies,
+                live_issuer_names);
+        // Stage the merged config in a local; only commit it on Reload
+        // success so a rejected reload leaves auth_config_ matching the
+        // unchanged live state.
+        AUTH_NAMESPACE::AuthConfig pending_auth_config =
+            BuildLiveAppliedAuthConfig(
+                auth_config_, new_config.auth,
+                top_level_policy_merge.policies);
+
         std::string auth_err;
         if (!auth_manager_->Reload(new_config.auth, auth_err)) {
             logging::Get()->warn(
                 "Auth reload skipped: {} (live state preserved)", auth_err);
         } else {
             auth_reload_ok = true;
-            // Build the live issuer name set once — the merge uses it to
-            // detect staged policies that reference non-live issuers (a
-            // restart-required delta; the merge preserves live issuers
-            // list and flags topology_changed for the operator warn).
-            std::unordered_set<std::string> live_issuer_names;
-            live_issuer_names.reserve(auth_config_.issuers.size());
-            for (const auto& [name, _] : auth_config_.issuers) {
-                live_issuer_names.insert(name);
-            }
-            top_level_policy_merge =
-                MergeTopLevelAuthPoliciesPreservingLiveTopology(
-                    auth_config_.policies, new_config.auth.policies,
-                    live_issuer_names);
-            auth_config_ = BuildLiveAppliedAuthConfig(
-                auth_config_, new_config.auth,
-                top_level_policy_merge.policies);
+            // Adopt the staged config now that the manager accepted the
+            // reload. Commit follows IMMEDIATELY below — no metadata
+            // work between this assignment and the policy/forward swap.
+            auth_config_ = std::move(pending_auth_config);
         }
     }
     if (auth_reload_ok) {
+        // CommitPolicyAndEnforcement publishes policy + forward +
+        // master_enabled atomically under AuthManager's snapshot_mtx_.
+        // Combined with the pre-Reload merge above, the gap between
+        // issuer-snapshot publication (inside Reload) and this commit
+        // is bounded by a function-call return only — no metadata work,
+        // no I/O, no scheduling — so the mixed-state window collapses
+        // to sub-microsecond and request threads cannot meaningfully
+        // observe NEW issuer with OLD policy/forward.
         auth_manager_->CommitPolicyAndEnforcement(
             upstream_configs_,
             auth_config_.policies,
