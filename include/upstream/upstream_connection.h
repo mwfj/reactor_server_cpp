@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "connection_handler.h"
+#include "net/dns_resolver.h"
 // <memory>, <functional>, <chrono>, <string>, <atomic> provided by common.h
 // (via connection_handler.h)
 
@@ -22,7 +23,9 @@ public:
     };
 
     UpstreamConnection(std::shared_ptr<ConnectionHandler> conn,
-                       const std::string& host, int port);
+                       const std::string& host, int port,
+                       std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>
+                           captured_endpoint = nullptr);
     ~UpstreamConnection();
 
     // Non-copyable, non-movable (pool owns via unique_ptr)
@@ -75,12 +78,20 @@ public:
     // to lose track of upstream disconnections until the lease is returned.
     std::shared_ptr<ConnectionHandler> GetTransport() const { return conn_; }
 
+    // The resolved endpoint that was active when this connection was
+    // created. Used by the async idle-cleanup task to identify connections
+    // that connected to a superseded IP after a reload.
+    const std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>&
+    captured_endpoint() const { return captured_endpoint_; }
+
 private:
     std::shared_ptr<ConnectionHandler> conn_;
     State state_ = State::CONNECTING;
 
     std::string upstream_host_;
     int upstream_port_;
+
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> captured_endpoint_;
 
     std::chrono::steady_clock::time_point created_at_;
     std::chrono::steady_clock::time_point last_used_at_;

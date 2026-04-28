@@ -62,6 +62,43 @@ TlsClientContext(const UpstreamTlsConfig& config);
 
 Key difference from `TlsContext` (server mode): no certificate/key loading (client doesn't present a cert), no ALPN advertisement (upstream is HTTP/1.1 only for now).
 
+## Upstream TLS SNI Rule
+
+The SNI hostname sent during the upstream TLS handshake is determined by a three-tier rule based on the upstream `host` type and the `tls.sni_hostname` config field:
+
+| `host` type | `tls.sni_hostname` set | SNI sent | Verify name |
+|---|---|---|---|
+| Hostname | No | `host` value (trailing dot stripped) | `host` (dotless) |
+| Hostname | Yes | `sni_hostname` | `sni_hostname` |
+| IP literal | No | None — no SNI extension (RFC 6066 §3) | None |
+| IP literal | Yes | `sni_hostname` | `sni_hostname` |
+
+**No SNI on IP literals** — RFC 6066 §3 prohibits sending the SNI extension when the server is identified by an IP address. The gateway honours this by omitting the extension entirely when `host` is an IPv4 or IPv6 literal and no explicit `sni_hostname` is configured.
+
+**Validator constraint** — `verify_peer: true` combined with an IP-literal `host` and no `sni_hostname` override is rejected at config load with a clear error. This combination is rejected because there is no certificate name to verify against.
+
+**Explicit override example** — connecting to an upstream by IP while verifying its certificate:
+
+```json
+{
+  "upstreams": [
+    {
+      "name": "secure-backend",
+      "host": "10.0.1.5",
+      "port": 443,
+      "tls": {
+        "enabled": true,
+        "verify_peer": true,
+        "sni_hostname": "api.internal",
+        "ca_file": "/etc/ssl/ca-bundle.crt"
+      }
+    }
+  ]
+}
+```
+
+With `sni_hostname: "api.internal"`, the TLS handshake sends `api.internal` as the SNI extension and verifies the server certificate against that name — even though the TCP connection goes to `10.0.1.5`.
+
 ## TlsConnection
 
 One per client connection. Created in `NetServer::HandleNewConnection()` when TLS context is configured.

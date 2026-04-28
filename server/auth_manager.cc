@@ -76,7 +76,7 @@ AuthManager::AuthManager(const AuthConfig& config,
         if (normalized.name.empty()) normalized.name = name;
         auto issuer = std::make_shared<Issuer>(
             normalized, upstream_manager_, dispatchers_,
-            upstream_http_client_, hmac_key_);
+            upstream_http_client_, hmac_key_, &stopping_);
         issuers_.emplace(normalized.name, std::move(issuer));
     }
 
@@ -104,7 +104,28 @@ void AuthManager::Start() {
     logging::Get()->info("AuthManager started issuers={}", issuers_.size());
 }
 
+void AuthManager::RequestStop() {
+    stopping_.store(true, std::memory_order_release);
+}
+
+void AuthManager::FlushPostReloadKicks() {
+    // Stopping check first — if shutdown was published between Reload
+    // and here, skip the kicks. Issuer::FlushPostReloadKick repeats the
+    // check defensively; this short-circuit avoids the per-issuer loop.
+    if (stopping_.load(std::memory_order_acquire)) return;
+    for (auto& [name, issuer] : issuers_) {
+        if (issuer) issuer->FlushPostReloadKick();
+    }
+}
+
 void AuthManager::Stop() {
+    // Acquire reload_mtx_ first: serialises with any in-flight Reload that
+    // is already inside its critical section past the stopping_ check
+    // (i.e. the Reload thread reached Reload's lock_guard before we set
+    // stopping_ above). Without this, Stop's per-issuer issuer->Stop()
+    // could race with that Reload's issuer->ApplyReload(), losing the
+    // cancel when ApplyReload re-arms discovery.
+    std::lock_guard<std::mutex> reload_lock(reload_mtx_);
     stopping_.store(true, std::memory_order_release);
     for (auto& [name, issuer] : issuers_) {
         if (issuer) issuer->Stop();
@@ -146,6 +167,15 @@ std::shared_ptr<const AuthForwardConfig> AuthManager::ForwardConfig() const {
 
 bool AuthManager::Reload(const AuthConfig& new_config, std::string& err_out) {
     std::lock_guard<std::mutex> reload_lock(reload_mtx_);
+
+    // Bail if shutdown has been requested. RequestStop() / Stop() publish
+    // stopping_ with release ordering; we acquire it under reload_mtx_ so
+    // that a concurrent Stop after RequestStop sees this Reload exit
+    // cleanly without ApplyReload re-arming background discovery.
+    if (stopping_.load(std::memory_order_acquire)) {
+        err_out = "auth manager is stopping";
+        return false;
+    }
 
     // Pass 1 — topology check. Any add/remove/rename rejects the whole
     //          reload; the manager preserves live state.
