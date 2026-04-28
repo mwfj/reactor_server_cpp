@@ -627,6 +627,53 @@ void TestUpstreamConnectionIsAlive() {
 }
 
 // fd() returns -1 when the underlying conn_ holds no socket.
+// captured_endpoint() round-trip: SetCapturedEndpoint pins the
+// ResolvedEndpoint snapshot the connection was created against; the
+// getter returns the same shared_ptr (pointer compare is the fence
+// PoolPartition::ConnectionEndpointMatches relies on). This is the
+// stale-keepalive guard that pre-fences step-11's hostname-aware
+// reload when atomic_store on resolved_endpoint_ lands.
+void TestUpstreamConnectionCapturedEndpointRoundTrip() {
+    std::cout << "\n[TEST] UpstreamPool UpstreamConnection: captured_endpoint round-trip..." << std::endl;
+    try {
+        UpstreamConnection uc(nullptr, "127.0.0.1", 9999);
+
+        // Default-constructed: captured pointer is null.
+        bool default_null = (uc.captured_endpoint() == nullptr);
+
+        // Install a snapshot; getter returns the same shared_ptr.
+        auto ep = std::make_shared<NET_DNS_NAMESPACE::ResolvedEndpoint>();
+        ep->host = "127.0.0.1";
+        ep->port = 9999;
+        std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> ep_const = ep;
+        uc.SetCapturedEndpoint(ep_const);
+        bool round_trip = (uc.captured_endpoint() == ep_const);
+
+        // Replacing with a different pointer changes the captured value
+        // (so PoolPartition's same-pointer compare becomes a mismatch
+        // when step 11 atomic-stores a new resolved_endpoint_).
+        auto ep2 = std::make_shared<const NET_DNS_NAMESPACE::ResolvedEndpoint>();
+        uc.SetCapturedEndpoint(ep2);
+        bool replaces = (uc.captured_endpoint() == ep2 &&
+                         uc.captured_endpoint() != ep_const);
+
+        bool pass = default_null && round_trip && replaces;
+        std::string err;
+        if (!pass) {
+            err = "default_null=" + std::to_string(default_null) +
+                  " round_trip=" + std::to_string(round_trip) +
+                  " replaces=" + std::to_string(replaces);
+        }
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamConnection: captured_endpoint round-trip",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamConnection: captured_endpoint round-trip",
+            false, e.what());
+    }
+}
+
 void TestUpstreamConnectionNullFd() {
     std::cout << "\n[TEST] UpstreamPool UpstreamConnection: fd() with null conn..." << std::endl;
     try {
@@ -2147,6 +2194,7 @@ void RunAllTests() {
     TestUpstreamConnectionExpiredRequestCount();
     TestUpstreamConnectionIsAlive();
     TestUpstreamConnectionNullFd();
+    TestUpstreamConnectionCapturedEndpointRoundTrip();
     TestUpstreamConnectionRequestCount();
     TestUpstreamConnectionReadPauseResumesBufferedData();
     TestUpstreamConnectionQueuedResumeHonorsCallbackOwnership();

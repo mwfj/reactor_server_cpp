@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "connection_handler.h"
+#include "net/dns_resolver.h"
 // <memory>, <functional>, <chrono>, <string>, <atomic> provided by common.h
 // (via connection_handler.h)
 
@@ -75,12 +76,36 @@ public:
     // to lose track of upstream disconnections until the lease is returned.
     std::shared_ptr<ConnectionHandler> GetTransport() const { return conn_; }
 
+    // The ResolvedEndpoint snapshot the partition was advertising when
+    // this connection was created. Set once at construction time by
+    // PoolPartition::CreateNewConnection; never mutated after. Today
+    // partitions hold a single immutable resolved_endpoint_ for the
+    // server's lifetime, so this captured pointer always equals the
+    // current resolved_endpoint_ and the check is a same-pointer
+    // compare. Step-11's hostname-aware reload will swap
+    // resolved_endpoint_ atomically; idle keepalive connections still
+    // captured to the OLD endpoint must be detected and destroyed
+    // before being handed back out to a new request, otherwise a waiter
+    // or fresh checkout would relay through a TCP socket connected to
+    // the previously-resolved IP after the operator reload pointed at a
+    // new IP. PoolPartition::CheckoutAsync and ServiceWaitQueue both
+    // consult this getter via PoolPartition::ConnectionEndpointMatches
+    // before activating an idle connection.
+    const std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>&
+    captured_endpoint() const noexcept { return captured_endpoint_; }
+    void SetCapturedEndpoint(
+        std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> ep) {
+        captured_endpoint_ = std::move(ep);
+    }
+
 private:
     std::shared_ptr<ConnectionHandler> conn_;
     State state_ = State::CONNECTING;
 
     std::string upstream_host_;
     int upstream_port_;
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>
+        captured_endpoint_;
 
     std::chrono::steady_clock::time_point created_at_;
     std::chrono::steady_clock::time_point last_used_at_;

@@ -2278,6 +2278,15 @@ void HttpServer::Start() {
         batch.push_back(std::move(r));
     }
 
+    // INVARIANT — `reload_mtx_` MUST NOT be held across this call.
+    // ResolveMany blocks for up to `dns.overall_timeout_ms` on slow/
+    // wedged DNS; if the lock were held here, GetLiveConfigSnapshot()
+    // (and any future Stop teardown barrier or /stats reader that
+    // takes reload_mtx_) would block for the full DNS budget. Start()
+    // is the only caller today and runs before reload_mtx_ has any
+    // contender; step-11's hostname-aware reload MUST follow the same
+    // discipline (compute the new endpoint OUTSIDE the mutex, then
+    // atomic-store the resolved_endpoint_ pointer atomically).
     auto results = dns_resolver_->ResolveMany(
         std::move(batch),
         std::chrono::milliseconds(live_config_.dns.overall_timeout_ms));

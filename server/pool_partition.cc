@@ -215,6 +215,15 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
         auto conn = std::move(idle_conns_.front());
         idle_conns_.pop_front();
 
+        // Endpoint generation check (no-op until step-11 publishes a new
+        // resolved_endpoint_). A keepalive captured against an old
+        // resolved IP must not be handed out after the partition adopts
+        // a new endpoint.
+        if (!ConnectionEndpointMatches(*conn)) {
+            DestroyConnection(std::move(conn));
+            continue;
+        }
+
         if (!ValidateConnection(conn.get())) {
             DestroyConnection(std::move(conn));
             continue;
@@ -655,6 +664,17 @@ void PoolPartition::ForceCloseActive() {
     }
 }
 
+bool PoolPartition::ConnectionEndpointMatches(
+        const UpstreamConnection& c) const {
+    // atomic_load matches the publisher contract documented at the
+    // resolved_endpoint_ declaration: step-11 will swap with
+    // atomic_store; today, the load returns the same pointer for the
+    // partition's lifetime so this compare is always true.
+    auto current = std::atomic_load_explicit(
+        &resolved_endpoint_, std::memory_order_acquire);
+    return c.captured_endpoint() == current;
+}
+
 void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
                                          ErrorCallback error_cb) {
 
@@ -735,6 +755,13 @@ void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
     // Create the upstream connection wrapper
     auto upstream_conn = std::make_unique<UpstreamConnection>(
         conn_handler, upstream_host_, upstream_port_);
+    // Pin the resolved-endpoint snapshot this connection is captured to.
+    // Today resolved_endpoint_ is immutable post-construction so the
+    // captured pointer == the live pointer for the connection's lifetime.
+    // Step-11's hostname-aware reload will atomic-store a new
+    // resolved_endpoint_; the captured pointer lets idle-connection
+    // checkout paths reject keepalives still pointing at the old IP.
+    upstream_conn->SetCapturedEndpoint(endpoint);
     UpstreamConnection* raw_conn = upstream_conn.get();
 
     // Safety invariant for `this` captures: PoolPartition destruction only happens
@@ -1052,6 +1079,18 @@ void PoolPartition::ServiceWaitQueue() {
         // Validate the idle connection
         auto conn = std::move(idle_conns_.front());
         idle_conns_.pop_front();
+
+        // Endpoint generation check — mirrors CheckoutAsync. Without
+        // this, a queued waiter could receive an idle keepalive
+        // captured to a stale resolved IP if a hostname-aware reload
+        // (step 11) atomic-stored a new resolved_endpoint_ between the
+        // connection's return-to-idle and ServiceWaitQueue running.
+        // The check is a same-pointer compare today; once step 11 lands
+        // it actually fences stale handoffs.
+        if (!ConnectionEndpointMatches(*conn)) {
+            DestroyConnection(std::move(conn));
+            continue;
+        }
 
         if (!ValidateConnection(conn.get())) {
             DestroyConnection(std::move(conn));
