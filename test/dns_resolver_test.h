@@ -1866,9 +1866,12 @@ inline void TestResolveManyDispatchDeadlineExpiresInternalItems() {
             }
         }
         ok = ok && timeouts == 4;
-        // ResolveMany must not exceed ~250ms wall-clock (dispatch
-        // deadline + generous scheduler slack).
-        ok = ok && batch_elapsed_ms < 250;
+        // ResolveMany must not exceed ~500ms wall-clock (dispatch
+        // deadline + generous scheduler slack). The orphaned-queue-item
+        // regression this test pins would push elapsed into multi-second
+        // territory; a 500ms bound preserves regression-detection while
+        // tolerating macOS scheduler jitter under full-suite CPU load.
+        ok = ok && batch_elapsed_ms < 500;
 
         // Small settling window past the batch deadline so the item
         // deadlines (dispatch_time + 80ms) have definitely fired in
@@ -1924,8 +1927,8 @@ inline void TestResolveManyDispatchDeadlineExpiresInternalItems() {
         // Upper bound catches a secondary failure mode where the probe
         // WAS admitted but the resolver is still wedged; under the
         // tight cap=4 this is unreachable in the healthy state the
-        // fix provides.
-        ok = ok && probe_elapsed_ms < 250;
+        // fix provides. 500ms tolerates full-suite scheduler jitter.
+        ok = ok && probe_elapsed_ms < 500;
 
         // Cleanup: release the wedged worker so the warmup future
         // completes and the resolver tears down cleanly.
@@ -2039,8 +2042,10 @@ inline void TestResolveManyBatchDeadlineClampsItemDeadline() {
         }
         ok = ok && timeouts == 2;
         // Caller-visible wait is bounded by the batch ceiling plus
-        // scheduler slack.
-        ok = ok && batch_elapsed_ms < 250;
+        // scheduler slack. 500ms tolerates full-suite CPU pressure
+        // without weakening regression detection (the bug pushes
+        // elapsed into multi-second territory).
+        ok = ok && batch_elapsed_ms < 500;
 
         // Settling window. The reaper runs on a separate thread and
         // may fire a few ms past the deadline even in the clamped
@@ -2080,7 +2085,7 @@ inline void TestResolveManyBatchDeadlineClampsItemDeadline() {
         // acceptable.
         ok = ok && probe_res.error_message.find("saturated")
                     == std::string::npos;
-        ok = ok && probe_elapsed_ms < 250;
+        ok = ok && probe_elapsed_ms < 500;
 
         // Cleanup: release the wedged workers so the resolver tears
         // down cleanly.

@@ -4856,9 +4856,20 @@ bool HttpServer::Reload(ServerConfig new_config) {
             // carry into upstream_configs_ for the policy rebuild below.
             merged.push_back(*it->second);
         } else {
-            // Restart-only divergence on THIS upstream — keep live.
+            // Restart-only divergence on THIS upstream — keep live topology,
+            // but copy the staged `circuit_breaker` block so the live
+            // snapshot stays coherent with what CircuitBreakerManager::Reload
+            // (above) just applied. The CB manager iterates by service name
+            // and applies the staged CB regardless of topology delta; without
+            // this copy, GetLiveConfigSnapshot() would report the pre-reload
+            // CB and a later in-process reload from that snapshot would push
+            // the old values back to the manager. proxy.auth reloadable
+            // subset stays deferred per the warn-doc contract — those edits
+            // require the topology restart to take effect.
             any_diverged = true;
-            merged.push_back(live);
+            UpstreamConfig keep = live;
+            keep.circuit_breaker = it->second->circuit_breaker;
+            merged.push_back(std::move(keep));
         }
     }
     // New upstreams (in staged, not live) are restart-required and
