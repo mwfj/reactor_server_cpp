@@ -351,6 +351,30 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
         return;
     }
 
+    // Endpoint generation check on return. A reload that atomic-stored a
+    // new resolved_endpoint_ between this connection's checkout and its
+    // return leaves the connection bound to the OLD IP. The downstream
+    // CheckoutAsync / ServiceWaitQueue idle-pop sites already reject
+    // mismatched endpoints, but two paths in this function bypass that
+    // gate by reusing `owned` synchronously without going through
+    // idle_conns_:
+    //   (1) the over-idle-cap direct waiter handoff below pops a waiter
+    //       and hands it `owned` after only ValidateConnection — never
+    //       consulting ConnectionEndpointMatches.
+    //   (2) the trailing ServiceWaitQueue() fires while `owned` is still
+    //       at the front of idle_conns_ (just pushed); the queued waiter
+    //       could grab a stale-IP keepalive that was returned post-swap.
+    // Failing closed at the entry guarantees a returning post-swap
+    // connection is destroyed + a fresh-endpoint replacement is created
+    // for any queued waiter via CreateForWaiters. Today (pre-step-11)
+    // this is a same-pointer compare and a no-op; once step-11 lands,
+    // it actually fences the race the reviewer described.
+    if (!ConnectionEndpointMatches(*owned)) {
+        DestroyConnection(std::move(owned));
+        CreateForWaiters();
+        return;
+    }
+
     owned->IncrementRequestCount();
     owned->MarkIdle();
 
