@@ -2430,11 +2430,29 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 for (const auto& u : config.upstreams) {
                     if (u.name != ic.upstream) continue;
                     if (u.tls.enabled) break;
+                    // 127.0.0.0/8 must be tested against an actual IPv4
+                    // literal — a hostname like "127.example.com" passes
+                    // a naive prefix check but DNS resolves it off-host,
+                    // which would route the bearer-token + client_secret
+                    // POST through plaintext to a public IP. IsIpLiteral
+                    // rejects anything that isn't a valid IPv4/IPv6
+                    // literal, and only IPv4 literals can carry the
+                    // "127." first octet. The canonical "::1" string
+                    // and the literal "localhost" are accepted by exact
+                    // match (see docs/oauth2.md for the recognized-form
+                    // list). Other loopback aliases ("0:0:0:0:0:0:0:1"
+                    // uncompressed, "[::1]" bracketed, hostnames that
+                    // happen to resolve to 127.0.0.1, etc.) are NOT
+                    // exempted — operators must use canonical literals
+                    // or supply a TLS upstream.
+                    const bool is_ipv4_loopback =
+                        NET_DNS_NAMESPACE::DnsResolver::IsIpLiteral(u.host) &&
+                        u.host.size() > 4 &&
+                        u.host.compare(0, 4, "127.") == 0;
                     const bool is_loopback =
-                        u.host == "127.0.0.1" ||
+                        is_ipv4_loopback ||
                         u.host == "::1" ||
-                        u.host == "localhost" ||
-                        (u.host.size() > 4 && u.host.compare(0, 4, "127.") == 0);
+                        u.host == "localhost";
                     if (is_loopback) {
                         logging::Get()->warn(
                             "{}.upstream='{}' has tls.enabled=false but host "

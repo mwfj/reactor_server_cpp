@@ -1125,6 +1125,61 @@ void TestConfigLoaderRejectsPlaintextIntrospectionUpstream() {
                 "TLS-on-upstream check; got: " + err);
         }
 
+        // Reject: hostname starting with "127." (e.g. 127.example.com)
+        // — DNS-resolved name that starts with the loopback prefix string
+        // must NOT be exempted. The fix tightens the prefix check to
+        // require an actual IPv4 literal so a DNS-resolved off-host
+        // hostname can't slip through and route bearer-token + client-
+        // secret POSTs over plaintext.
+        err = validate(R"({
+            "upstreams": [{"name":"x","host":"127.example.com","port":80}],
+            "auth": {
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://idp.example.com",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://idp.example.com/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E"
+                        }
+                    }
+                }
+            }
+        })");
+        if (err.find("tls.enabled=false") == std::string::npos) {
+            throw std::runtime_error(
+                "DNS-name '127.example.com' must not be exempted as "
+                "loopback (would let plaintext upstream slip through); "
+                "got: " + err);
+        }
+
+        // Accept: full 127.x.y.z IPv4 literal (any host in 127.0.0.0/8)
+        // is a real loopback IP — exempted.
+        err = validate(R"({
+            "upstreams": [{"name":"x","host":"127.42.0.1","port":8080}],
+            "auth": {
+                "issuers": {
+                    "ours": {
+                        "issuer_url": "https://idp.example.com",
+                        "upstream": "x",
+                        "mode": "introspection",
+                        "introspection": {
+                            "endpoint": "https://idp.example.com/introspect",
+                            "client_id": "c",
+                            "client_secret_env": "E"
+                        }
+                    }
+                }
+            }
+        })");
+        if (!err.empty()) {
+            throw std::runtime_error(
+                "127.42.0.1 (full IPv4 literal in 127.0.0.0/8) should "
+                "be exempt; got: " + err);
+        }
+
         TestFramework::RecordTest(
             "AuthFoundation: ConfigLoader rejects plaintext introspection upstream (non-loopback)",
             true, "", TestFramework::TestCategory::OTHER);
