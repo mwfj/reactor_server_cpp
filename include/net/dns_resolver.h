@@ -313,12 +313,13 @@ private:
 // Emits an info log per IP change: "Reload: IP changed for upstream=X A -> B".
 // Live entries whose service name is NOT in `batch` are preserved (defensive).
 //
-// stale_counter: if non-null, incremented (relaxed) for each entry that falls
-// back to the live map due to a resolve failure with stale_on_error=true.
-// Owned by HttpServer; nullptr is accepted for test callers that don't track it.
+// stale_counter: if non-null, incremented by the count of stale fallbacks for
+// this call. The caller commits the value to the live atomic AFTER the DNS
+// result is published, so a reload that aborts before commit never inflates
+// the counter. nullptr is accepted for test callers that don't track it.
 ResolvedMap MergeResolvedForReload(const ResolvedMap& live,
                                     const std::vector<ResolvedEndpoint>& batch,
                                     bool stale_on_error,
-                                    std::atomic<uint64_t>* stale_counter = nullptr);
+                                    uint64_t* stale_counter = nullptr);
 
 }  // namespace NET_DNS_NAMESPACE

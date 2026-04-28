@@ -194,8 +194,10 @@ public:
     // age_seconds is monotonic (steady_clock), not wall-clock epoch.
     struct UpstreamResolvedEntry {
         std::string service_name;
-        std::string host_raw;
-        std::string resolved_authority;
+        std::string host_bare;           // configured hostname, post-normalization
+        std::string resolved_ip;         // resolved IP address string
+        std::string resolved_authority;  // ip:port authority (IPv6 bracketed)
+        std::string resolved_family;     // "v4" or "v6"
         int64_t age_seconds = 0;
         std::optional<bool>        last_reresolve_succeeded;
         std::optional<std::string> last_reresolve_error;

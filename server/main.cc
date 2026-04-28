@@ -185,8 +185,10 @@ nlohmann::json BuildUpstreamObject(HttpServer* server) {
     nlohmann::json result = nlohmann::json::object();
     for (const auto& e : server->GetUpstreamResolvedSnapshot()) {
         nlohmann::json obj;
-        obj["host_raw"]           = e.host_raw;
+        obj["host_bare"]          = e.host_bare;
+        obj["resolved_ip"]        = e.resolved_ip;
         obj["resolved_authority"] = e.resolved_authority;
+        obj["resolved_family"]    = e.resolved_family;
         obj["age_seconds"]        = e.age_seconds;
         if (e.last_reresolve_succeeded.has_value()) {
             obj["last_reresolve_succeeded"] = *e.last_reresolve_succeeded;

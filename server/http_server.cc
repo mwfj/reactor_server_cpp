@@ -4385,7 +4385,7 @@ bool HttpServer::Reload(ServerConfig new_config) {
         }
     }
 
-    // Declared at function scope: assigned inside the DNS block after Gate 3
+    // Declared at function scope: assigned in the auth Phase 1 block below
     // and used again at the end of Reload for the topology-change warn and
     // CommitPolicyAndEnforcement. Default-initialised (topology_changed=false)
     // so the no-auth-manager path is safe.
@@ -4393,8 +4393,8 @@ bool HttpServer::Reload(ServerConfig new_config) {
 
     // Pre-apply DNS resolve — re-resolve all LIVE upstreams (restart-only
     // topology) using the staged DNS timeout knobs (hot-reloadable).
-    // Runs BEFORE auth commit so a DNS failure (stale_on_error=false) can
-    // abort cleanly with zero live-state mutations.
+    // Auth Phase 1 runs after all DNS gates so a DNS failure or a Stop race
+    // can abort with zero live-state mutations.
     {
         std::vector<NET_DNS_NAMESPACE::ResolveRequest> batch;
         batch.reserve(live_config_.upstreams.size());
@@ -4409,10 +4409,18 @@ bool HttpServer::Reload(ServerConfig new_config) {
             batch.push_back(std::move(r));
         }
 
+        // dns_results / dns_merged / local_stale are valid only when the
+        // DNS batch ran. local_stale is committed to the live atomic AFTER
+        // UpdateResolvedEndpoints so aborted reloads never inflate the counter.
+        std::vector<NET_DNS_NAMESPACE::ResolvedEndpoint> dns_results;
+        NET_DNS_NAMESPACE::ResolvedMap dns_merged;
+        uint64_t local_stale = 0;
+        bool ran_dns_batch = false;
+
         if (!batch.empty() && dns_resolver_ && upstream_manager_) {
             static constexpr std::string_view kUpstreamPrefix = "upstream:";
 
-            auto results = dns_resolver_->ResolveMany(
+            dns_results = dns_resolver_->ResolveMany(
                 std::move(batch),
                 std::chrono::milliseconds(new_config.dns.overall_timeout_ms));
 
@@ -4425,7 +4433,7 @@ bool HttpServer::Reload(ServerConfig new_config) {
 
             // Fail-closed when stale_on_error=false and any resolve failed.
             if (!new_config.dns.stale_on_error) {
-                for (const auto& r : results) {
+                for (const auto& r : dns_results) {
                     if (r.error) {
                         logging::Get()->error(
                             "Reload rejected: DNS for '{}' failed ({} — {}); "
@@ -4437,10 +4445,10 @@ bool HttpServer::Reload(ServerConfig new_config) {
                 }
             }
 
-            auto dns_merged = NET_DNS_NAMESPACE::MergeResolvedForReload(
-                upstream_resolved_, results,
+            dns_merged = NET_DNS_NAMESPACE::MergeResolvedForReload(
+                upstream_resolved_, dns_results,
                 new_config.dns.stale_on_error,
-                &total_reload_stale_served_);
+                &local_stale);
 
             // Gate 3: abort before any irreversible apply step.
             if (stopping_.load(std::memory_order_acquire)) {
@@ -4449,80 +4457,80 @@ bool HttpServer::Reload(ServerConfig new_config) {
                 return false;
             }
 
-            // Auth Phase 1 — the ONLY apply step with a rejecting bool
-            // contract. Runs here (after all DNS gates) so a Stop race or
-            // stale_on_error=false DNS failure can abort with ZERO live-state
-            // mutations. On false the entire reload hard-aborts: no DNS
-            // commit, no rate_limit, no CB, no size-limits.
-            if (auth_manager_) {
-                std::string auth_err;
-                if (!auth_manager_->Reload(new_config.auth, auth_err)) {
-                    logging::Get()->error(
-                        "Reload rejected: auth: {}; live state preserved",
-                        auth_err);
-                    return false;
-                }
-                // Source of truth is the running AuthManager, not auth_config_.issuers.
-                // auth_manager_->Reload has just published new live issuer state above;
-                // LiveIssuerNames() reads from the runtime issuers_ map which is
-                // topology-stable post-Start. auth_config_.issuers may carry
-                // staged-only issuers from earlier deferred reloads.
-                std::unordered_set<std::string> live_issuer_names =
-                    auth_manager_->LiveIssuerNames();
-                top_level_policy_merge =
-                    MergeTopLevelAuthPoliciesPreservingLiveTopology(
-                        auth_config_.policies, new_config.auth.policies,
-                        live_issuer_names);
-                auth_config_ = BuildLiveAppliedAuthConfig(
-                    auth_config_, new_config.auth,
-                    top_level_policy_merge.policies);
-            }
-
-            // Log resolved addresses + record per-upstream status in a single
-            // pass. Status is tracked for ALL results (success and failure).
-            for (const auto& r : results) {
+            // Emit info logs for resolved addresses. Status map writes happen
+            // after DNS commit (below) so a bad_alloc in unordered_map ops
+            // never leaves auth committed but DNS unpublished.
+            for (const auto& r : dns_results) {
                 if (r.tag.rfind(kUpstreamPrefix, 0) != 0) continue;
-                std::string svc = r.tag.substr(kUpstreamPrefix.size());
                 if (!r.error) {
+                    std::string svc = r.tag.substr(kUpstreamPrefix.size());
                     logging::Get()->info(
                         "Reload DNS resolved upstream={} host={} -> {}:{}",
                         svc, r.host, r.addr.Ip(), r.addr.Port());
                 }
-                auto& status = upstream_reresolve_status_[svc];
-                status.succeeded     = !r.error;
-                status.error_message = r.error ? r.error_message : std::string{};
             }
 
-            // DNS commit — synchronous release-store on every partition.
-            // After this returns, any CreateNewConnection observes the new
-            // endpoint via acquire-load (release-acquire sequenced-before).
-            upstream_manager_->UpdateResolvedEndpoints(dns_merged);
-            upstream_resolved_ = std::move(dns_merged);
+            ran_dns_batch = true;
         } else {
-            // No DNS batch (origin-only server or no upstreams). Still need
-            // Gate 3 and auth Phase 1 to run on the non-DNS code path.
+            // No DNS batch (origin-only server or no upstreams).
+            // Gate 3 still applies so a Stop race aborts cleanly.
             if (stopping_.load(std::memory_order_acquire)) {
                 logging::Get()->info(
                     "Reload aborted after DNS phase (stop requested)");
                 return false;
             }
-            if (auth_manager_) {
-                std::string auth_err;
-                if (!auth_manager_->Reload(new_config.auth, auth_err)) {
-                    logging::Get()->error(
-                        "Reload rejected: auth: {}; live state preserved",
-                        auth_err);
-                    return false;
-                }
-                std::unordered_set<std::string> live_issuer_names =
-                    auth_manager_->LiveIssuerNames();
-                top_level_policy_merge =
-                    MergeTopLevelAuthPoliciesPreservingLiveTopology(
-                        auth_config_.policies, new_config.auth.policies,
-                        live_issuer_names);
-                auth_config_ = BuildLiveAppliedAuthConfig(
-                    auth_config_, new_config.auth,
-                    top_level_policy_merge.policies);
+        }
+
+        // Auth Phase 1 — the ONLY apply step with a rejecting bool contract.
+        // Runs once here, after all DNS gates, regardless of whether the DNS
+        // batch ran. On false the entire reload hard-aborts: no DNS commit,
+        // no rate_limit, no CB, no size-limits.
+        if (auth_manager_) {
+            std::string auth_err;
+            if (!auth_manager_->Reload(new_config.auth, auth_err)) {
+                logging::Get()->error(
+                    "Reload rejected: auth: {}; live state preserved",
+                    auth_err);
+                return false;
+            }
+            // Source of truth is the running AuthManager, not auth_config_.issuers.
+            // auth_manager_->Reload has just published new live issuer state;
+            // LiveIssuerNames() reads from the runtime issuers_ map which is
+            // topology-stable post-Start. auth_config_.issuers may carry
+            // staged-only issuers from earlier deferred reloads.
+            std::unordered_set<std::string> auth_live_issuer_names =
+                auth_manager_->LiveIssuerNames();
+            top_level_policy_merge =
+                MergeTopLevelAuthPoliciesPreservingLiveTopology(
+                    auth_config_.policies, new_config.auth.policies,
+                    auth_live_issuer_names);
+            auth_config_ = BuildLiveAppliedAuthConfig(
+                auth_config_, new_config.auth,
+                top_level_policy_merge.policies);
+            live_config_.auth = new_config.auth;
+        }
+
+        if (ran_dns_batch) {
+            // DNS commit — synchronous release-store on every partition.
+            // After this returns, any CreateNewConnection observes the new
+            // endpoint via acquire-load (release-acquire sequenced-before).
+            upstream_manager_->UpdateResolvedEndpoints(dns_merged);
+            upstream_resolved_ = std::move(dns_merged);
+
+            // Commit stale-fallback counter now that the DNS result is published.
+            total_reload_stale_served_.fetch_add(local_stale,
+                                                  std::memory_order_relaxed);
+
+            // Write per-upstream re-resolve status AFTER DNS commit.
+            // A bad_alloc here cannot leave auth committed but DNS unpublished
+            // because DNS commit already succeeded above.
+            static constexpr std::string_view kUpstreamPrefix = "upstream:";
+            for (const auto& r : dns_results) {
+                if (r.tag.rfind(kUpstreamPrefix, 0) != 0) continue;
+                std::string svc = r.tag.substr(kUpstreamPrefix.size());
+                auto& status = upstream_reresolve_status_[svc];
+                status.succeeded     = !r.error;
+                status.error_message = r.error ? r.error_message : std::string{};
             }
         }
 
@@ -4540,6 +4548,7 @@ bool HttpServer::Reload(ServerConfig new_config) {
     // Rate limit reload — always safe because manager is always created
     if (rate_limit_manager_) {
         rate_limit_manager_->Reload(new_config.rate_limit);
+        live_config_.rate_limit = new_config.rate_limit;
     }
 
     // Circuit breaker reload — live-propagates breaker-field edits on
@@ -4631,6 +4640,12 @@ bool HttpServer::Reload(ServerConfig new_config) {
                 });
             }
         }
+
+        // Persist size-limit scalars so GetLiveConfigSnapshot() stays coherent.
+        live_config_.max_body_size        = new_config.max_body_size;
+        live_config_.max_header_size      = new_config.max_header_size;
+        live_config_.max_ws_message_size  = new_config.max_ws_message_size;
+        live_config_.max_connections      = new_config.max_connections;
     }
 
     // Update the remaining reload-safe fields
@@ -4681,6 +4696,11 @@ bool HttpServer::Reload(ServerConfig new_config) {
     net_server_.SetConnectionTimeout(
         std::chrono::seconds(new_config.idle_timeout_sec));
 
+    // Persist timeout scalars so GetLiveConfigSnapshot() stays coherent.
+    live_config_.idle_timeout_sec           = new_config.idle_timeout_sec;
+    live_config_.request_timeout_sec        = new_config.request_timeout_sec;
+    live_config_.shutdown_drain_timeout_sec = new_config.shutdown_drain_timeout_sec;
+
     // Recompute timer scan interval from the new timeout values. Always
     // apply — the old "only shorten" logic permanently ratcheted the
     // interval down, pinning the server to 1s scans for its entire
@@ -4728,6 +4748,8 @@ bool HttpServer::Reload(ServerConfig new_config) {
         // keep the value they were created with — RFC 9113 §6.5.2 forbids
         // a server from sending ENABLE_PUSH after the preface.
         h2_settings_.enable_push            = new_config.http2.enable_push;
+        // Persist so GetLiveConfigSnapshot() returns the applied settings.
+        live_config_.http2 = new_config.http2;
     }
 
     // Upstream topology changes (host/port/pool/proxy/tls) require a
@@ -4900,17 +4922,22 @@ HttpServer::GetUpstreamResolvedSnapshot() const {
     for (const auto& cfg : upstream_configs_) {
         UpstreamResolvedEntry e;
         e.service_name = cfg.name;
-        e.host_raw     = cfg.host;
+        e.host_bare    = cfg.host;
 
         auto it = upstream_resolved_.find(cfg.name);
         if (it != upstream_resolved_.end() && it->second) {
             const auto& ep = *it->second;
+            e.resolved_ip        = ep.addr.Ip();
             e.resolved_authority = ep.addr.ToString();
+            e.resolved_family    =
+                (ep.addr.family() == InetAddr::Family::kIPv6) ? "v6" : "v4";
             e.age_seconds = std::chrono::duration_cast<std::chrono::seconds>(
                 now - ep.resolved_at).count();
         } else {
-            // No resolved entry: report empty authority and negative age
+            // No resolved entry: report empty fields and negative age.
+            e.resolved_ip        = "";
             e.resolved_authority = "";
+            e.resolved_family    = "";
             e.age_seconds        = -1;
         }
 

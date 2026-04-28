@@ -939,7 +939,7 @@ inline void TestReloadDnsResolvePrecedesAuthApply() {
         fresh.error = false;
         fresh.resolved_at = std::chrono::steady_clock::now();
 
-        std::atomic<uint64_t> stale_count{0};
+        uint64_t stale_count = 0;
         ResolvedMap merged = MergeResolvedForReload(live, {fresh}, /*stale_on_error=*/true,
                                                      &stale_count);
 
@@ -954,8 +954,8 @@ inline void TestReloadDnsResolvePrecedesAuthApply() {
         }
 
         // No stale fallback was needed.
-        if (stale_count.load() != 0) {
-            ok = false; err += "unexpected stale_count=" + std::to_string(stale_count.load()) + "; ";
+        if (stale_count != 0) {
+            ok = false; err += "unexpected stale_count=" + std::to_string(stale_count) + "; ";
         }
 
         // The old shared_ptr is different from the new one (fresh allocation).
@@ -1016,7 +1016,7 @@ inline void TestReloadStaleOnErrorTrueKeepsPriorIp() {
         fail_c.error_code = 11001;  // simulated WSAHOST_NOT_FOUND
         fail_c.error_message = "simulated resolve failure";
 
-        std::atomic<uint64_t> stale_count{0};
+        uint64_t stale_count = 0;
         ResolvedMap merged = MergeResolvedForReload(live, {fresh_b, fail_c},
                                                      /*stale_on_error=*/true,
                                                      &stale_count);
@@ -1039,8 +1039,8 @@ inline void TestReloadStaleOnErrorTrueKeepsPriorIp() {
         }
 
         // stale_counter must be 1 (svc-c fell back).
-        if (stale_count.load() != 1) {
-            ok = false; err += "stale_count=" + std::to_string(stale_count.load()) + " want 1; ";
+        if (stale_count != 1) {
+            ok = false; err += "stale_count=" + std::to_string(stale_count) + " want 1; ";
         }
 
         Record("DualStack: MergeResolvedForReload stale_on_error=true keeps prior IP",
@@ -1085,7 +1085,7 @@ inline void TestReloadStaleOnErrorFalseRejectsAtomically() {
         // The function's contract says the CALLER should have already rejected
         // before reaching this. Defensively, the live entry is preserved so
         // the result is not a half-formed map.
-        std::atomic<uint64_t> stale_count{0};
+        uint64_t stale_count = 0;
         ResolvedMap merged = MergeResolvedForReload(live, {fail_d},
                                                      /*stale_on_error=*/false,
                                                      &stale_count);
@@ -1100,8 +1100,8 @@ inline void TestReloadStaleOnErrorFalseRejectsAtomically() {
 
         // The stale_counter is NOT incremented for stale_on_error=false
         // (that path is specifically gated by stale_on_error==true in the impl).
-        if (stale_count.load() != 0) {
-            ok = false; err += "stale_count=" + std::to_string(stale_count.load()) + " want 0; ";
+        if (stale_count != 0) {
+            ok = false; err += "stale_count=" + std::to_string(stale_count) + " want 0; ";
         }
 
         // A success entry in the same batch DOES get committed.

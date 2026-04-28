@@ -199,14 +199,12 @@ The `/stats` response body is JSON. The top-level object contains legacy fields 
 | Field | Type | Description |
 |-------|------|-------------|
 | `host_bare` | string | Configured upstream hostname (post-normalization) |
-| `authority` | string | Configured `host:port` authority |
 | `resolved_ip` | string | Currently resolved IP address |
-| `resolved_authority` | string | `resolved_ip:port` authority string (IPv6 bracketed) |
+| `resolved_authority` | string | `resolved_ip:port` authority string (IPv6 bracketed per RFC 3986) |
 | `resolved_family` | string | `"v4"` or `"v6"` |
 | `age_seconds` | int | Seconds since current resolved endpoint was obtained |
-| `last_reresolve_age_seconds` | int/null | Seconds since the last SIGHUP-triggered re-resolve attempt; `null` if no reload has occurred |
-| `last_reresolve_error` | string/null | Error message from the last failed re-resolve; `null` on success or no attempt |
-| `effective_sni` | string | SNI hostname that would be sent for TLS connections (empty for IP upstreams without `sni_hostname`) |
+| `last_reresolve_succeeded` | bool | Whether the most recent SIGHUP re-resolve attempt succeeded; absent if no reload has occurred |
+| `last_reresolve_error` | string | Error message from the last failed re-resolve; absent on success or no attempt |
 
 **`dns`** — resolver and reload counters:
 

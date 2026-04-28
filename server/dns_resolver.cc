@@ -1136,7 +1136,7 @@ ResolverSnapshot DnsResolver::Snapshot() const {
 ResolvedMap MergeResolvedForReload(const ResolvedMap& live,
                                     const std::vector<ResolvedEndpoint>& batch,
                                     bool stale_on_error,
-                                    std::atomic<uint64_t>* stale_counter)
+                                    uint64_t* stale_counter)
 {
     static constexpr std::string_view kUpstreamPrefix = "upstream:";
 
@@ -1182,9 +1182,11 @@ ResolvedMap MergeResolvedForReload(const ResolvedMap& live,
                     live_it->second->addr.Port(),
                     age);
                 merged.emplace(service, live_it->second);
-                // Count the stale fallback for /stats observability.
+                // Count the stale fallback. The caller commits this local
+                // counter to the live atomic AFTER UpdateResolvedEndpoints
+                // succeeds, ensuring aborted reloads never inflate /stats.
                 if (stale_counter) {
-                    stale_counter->fetch_add(1, std::memory_order_relaxed);
+                    ++(*stale_counter);
                 }
             } else {
                 logging::Get()->warn(
