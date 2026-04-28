@@ -60,7 +60,18 @@ class AuthManager {
     // until ready.
     void Start();
 
-    // Aborts in-flight fetches and marks the manager stopping. Idempotent.
+    // Publish the stopping_ atomic so future Reload calls bail at entry
+    // and background discovery / JWKS retry kicks observe the shutdown.
+    // Does NOT cancel per-issuer in-flight work; that happens in Stop().
+    // Safe to call from HttpServer::Stop BEFORE the protocol drain so
+    // background fetches don't burn drain budget on non-client work.
+    // Idempotent. Cheap (one atomic store).
+    void RequestStop();
+
+    // Aborts in-flight fetches and marks the manager stopping. Acquires
+    // the manager's reload_mtx_ to serialize with concurrent Reload —
+    // a Reload past this point will observe stopping_=true at entry and
+    // bail without re-kicking discovery. Idempotent.
     void Stop();
 
     // Register a policy against one or more path prefixes. Idempotent on
@@ -84,7 +95,20 @@ class AuthManager {
     // Applies reloadable fields: issuer snapshots, the forward config,
     // and a generation bump. Returns false on validation failure with
     // an error message in `err_out`. Never throws.
+    //
+    // Reload is side-effect-free with respect to outbound auth fetches:
+    // a post-reload OIDC re-kick that would otherwise dispatch through
+    // UpstreamHttpClient is queued on each Issuer and not actually
+    // fired until `FlushPostReloadKicks()` runs. HttpServer::Reload
+    // calls FlushPostReloadKicks AFTER DNS commit so any kicked fetch
+    // observes the freshly-published partition->resolved_endpoint_.
     bool Reload(const AuthConfig& new_config, std::string& err_out);
+
+    // Drain the post-reload OIDC re-kick queued by the most recent
+    // successful Reload(). No-op when no reload has run, when shutdown
+    // is in progress, or for issuers whose discovery is already ready
+    // / not configured. Idempotent.
+    void FlushPostReloadKicks();
 
     // Final reload cutover — under the SAME `snapshot_mtx_` lock:
     //   1. swap `forward_` to `new_forward`

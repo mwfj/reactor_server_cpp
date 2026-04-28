@@ -188,7 +188,8 @@ static std::shared_ptr<AUTH_NAMESPACE::Issuer> MakeFakeIssuer(
         /*upstream_manager=*/nullptr,
         /*dispatchers=*/std::vector<std::shared_ptr<Dispatcher>>{},
         /*http_client=*/nullptr,
-        /*hmac_key=*/std::string(32, 'k'));
+        /*hmac_key=*/std::string(32, 'k'),
+        /*manager_stopping=*/nullptr);
 
     // Install the public key directly into the cache.
     issuer->jwks_cache()->InstallKeys({{kid, public_pem}});

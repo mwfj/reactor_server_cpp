@@ -2376,18 +2376,18 @@ void HttpServer::Stop() {
     // accepted in the gap would miss the 1001 "Going Away" close frame.
     net_server_.StopAccepting();
 
-    // NOTE: auth_manager_->Stop() is deferred until AFTER the post-drain
-    // reload_mtx_ barrier below. A Reload thread past its final stopping_
-    // gate is committed to the apply phase and may still be inside
-    // auth_manager_->Reload() / Issuer::ApplyReload(); calling Stop here
-    // would race with that ApplyReload, potentially losing the OIDC/JWKS
-    // cancel when ApplyReload re-kicks discovery during shutdown. The
-    // barrier guarantees no in-progress Reload is inside auth state
-    // mutation by the time we cancel.
-    //
-    // During the drain window (between here and the barrier) the auth
-    // middleware on in-flight requests still uses cached JWKS state —
-    // pending background fetches don't affect already-loaded keys.
+    // Publish auth shutdown intent EARLY (before the protocol drain) so
+    // background OIDC/JWKS retry timers and middleware-triggered kid-miss
+    // refreshes observe stopping_ and stop kicking new UpstreamHttpClient
+    // checkouts during the drain window. RequestStop() only sets the
+    // atomic — per-issuer teardown (which serialises against in-flight
+    // Reload via AuthManager::reload_mtx_) is deferred to the post-barrier
+    // Stop() call. AuthManager::Reload also acquire-loads stopping_ at
+    // entry, so a Reload thread that observes the publish bails before
+    // re-arming discovery.
+    if (auth_manager_) {
+        auth_manager_->RequestStop();
+    }
 
     // NOTE: upstream_manager_->InitiateShutdown() is NOT called here.
     // It is deferred to pre_stop_drain_cb (after H2/WS/H1 protocol drain)
@@ -4500,9 +4500,12 @@ bool HttpServer::Reload(ServerConfig new_config) {
         }
 
         // Auth Phase 1 — the ONLY apply step with a rejecting bool contract.
-        // Runs once here, after all DNS gates, regardless of whether the DNS
-        // batch ran. On false the entire reload hard-aborts: no DNS commit,
-        // no rate_limit, no CB, no size-limits.
+        // Runs FIRST so a rejected auth reload aborts before any irreversible
+        // mutation (DNS commit, rate_limit, CB, size_limits). AuthManager::Reload
+        // is side-effect-free with respect to outbound fetches: any post-reload
+        // OIDC re-kick is queued on each Issuer (pending_post_reload_kick_) and
+        // not actually dispatched until FlushPostReloadKicks() fires below,
+        // AFTER UpdateResolvedEndpoints publishes the new partition endpoints.
         if (auth_manager_) {
             std::string auth_err;
             if (!auth_manager_->Reload(new_config.auth, auth_err)) {
@@ -4511,11 +4514,6 @@ bool HttpServer::Reload(ServerConfig new_config) {
                     auth_err);
                 return false;
             }
-            // Source of truth is the running AuthManager, not auth_config_.issuers.
-            // auth_manager_->Reload has just published new live issuer state;
-            // LiveIssuerNames() reads from the runtime issuers_ map which is
-            // topology-stable post-Start. auth_config_.issuers may carry
-            // staged-only issuers from earlier deferred reloads.
             std::unordered_set<std::string> auth_live_issuer_names =
                 auth_manager_->LiveIssuerNames();
             top_level_policy_merge =
@@ -4525,18 +4523,13 @@ bool HttpServer::Reload(ServerConfig new_config) {
             auth_config_ = BuildLiveAppliedAuthConfig(
                 auth_config_, new_config.auth,
                 top_level_policy_merge.policies);
-            // Publish the APPLIED auth state, not the staged block. Restart-
-            // only fields (e.g. hmac_cache_key_env) live inside auth_config_
-            // at their pre-reload values; assigning new_config.auth here
-            // would expose the staged value via GetLiveConfigSnapshot()
-            // even though AuthManager continues to use the startup key.
             live_config_.auth = auth_config_;
         }
 
+        // DNS commit — synchronous release-store on every partition. After
+        // this returns, any CreateNewConnection observes the new endpoint
+        // via acquire-load (release-acquire sequenced-before).
         if (ran_dns_batch) {
-            // DNS commit — synchronous release-store on every partition.
-            // After this returns, any CreateNewConnection observes the new
-            // endpoint via acquire-load (release-acquire sequenced-before).
             upstream_manager_->UpdateResolvedEndpoints(dns_merged);
             upstream_resolved_ = std::move(dns_merged);
 
@@ -4545,8 +4538,6 @@ bool HttpServer::Reload(ServerConfig new_config) {
                                                   std::memory_order_relaxed);
 
             // Write per-upstream re-resolve status AFTER DNS commit.
-            // A bad_alloc here cannot leave auth committed but DNS unpublished
-            // because DNS commit already succeeded above.
             static constexpr std::string_view kUpstreamPrefix = "upstream:";
             for (const auto& r : dns_results) {
                 if (r.tag.rfind(kUpstreamPrefix, 0) != 0) continue;
@@ -4555,6 +4546,14 @@ bool HttpServer::Reload(ServerConfig new_config) {
                 status.succeeded     = !r.error;
                 status.error_message = r.error ? r.error_message : std::string{};
             }
+        }
+
+        // Drain any queued OIDC re-kicks now that DNS endpoints are
+        // published. Discovery fetches dispatched here read the new
+        // partition resolved_endpoint_ via acquire-load. No-op when no
+        // issuer needed re-kicking.
+        if (auth_manager_) {
+            auth_manager_->FlushPostReloadKicks();
         }
 
         // Warn when staged restart-only DNS fields differ from live —

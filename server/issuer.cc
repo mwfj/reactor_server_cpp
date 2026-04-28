@@ -80,7 +80,8 @@ Issuer::Issuer(const IssuerConfig& config,
                UpstreamManager* upstream_manager,
                std::vector<std::shared_ptr<Dispatcher>> dispatchers,
                std::shared_ptr<UpstreamHttpClient> http_client,
-               const std::string& hmac_key)
+               const std::string& hmac_key,
+               const std::atomic<bool>* manager_stopping)
     : name_(config.name),
       issuer_url_(config.issuer_url),
       mode_(config.mode),
@@ -91,7 +92,8 @@ Issuer::Issuer(const IssuerConfig& config,
                                                 config.jwks_cache_sec)),
       upstream_http_client_(std::move(http_client)),
       upstream_manager_(upstream_manager),
-      dispatchers_(std::move(dispatchers)) {
+      dispatchers_(std::move(dispatchers)),
+      manager_stopping_(manager_stopping) {
     (void)hmac_key;  // Reserved for introspection cache wiring.
     // Construct the helper objects now so dependencies are stable; Start
     // kicks off the async work on the caller's chosen dispatcher. Both
@@ -229,29 +231,18 @@ bool Issuer::ApplyReload(const IssuerConfig& new_config, std::string& err_out) {
     if (jwks_cache_) {
         jwks_cache_->SetTtlSec(new_config.jwks_cache_sec);
     }
-    const uint64_t new_gen =
-        generation_->fetch_add(1, std::memory_order_release) + 1;
+    generation_->fetch_add(1, std::memory_order_release);
     // If discovery is still in its retry cycle (pre-first-success), the
     // existing oidc_discovery_->Start callback captured the OLD generation.
-    // Bumping generation_ without re-arming discovery wedges the issuer:
-    // every future on_ready_cb is rejected as stale, so the retry cycle
-    // never reaches InstallJwksUriLocked / ready_. Re-kick with the new
-    // generation. For already-ready issuers we leave the running cycle
-    // alone — re-kicking would clear ready_ momentarily and drop in-flight
-    // JWKS fetches for no benefit.
+    // Bumping generation_ without re-arming discovery wedges the issuer.
+    // Apply the reloaded retry interval here, but DEFER the actual re-kick
+    // to FlushPostReloadKick() — the caller invokes that AFTER DNS commit
+    // so the discovery fetch reads the freshly-published partition
+    // resolved_endpoint_ rather than the stale pre-reload IP.
     if (discovery_ && oidc_discovery_ &&
         !ready_.load(std::memory_order_acquire)) {
-        // Apply the reloaded retry interval to the live OidcDiscovery
-        // BEFORE re-kicking — Start() captures retry_sec_ by value into
-        // the new cycle, so without this the fresh cycle would still
-        // sleep on the old interval and `discovery_retry_sec` would not
-        // actually hot-reload in the state where it matters (retrying
-        // pre-first-success).
         oidc_discovery_->SetRetrySec(new_config.discovery_retry_sec);
-        logging::Get()->info(
-            "Issuer reload: re-kicking OIDC discovery issuer={} new_gen={}",
-            name_, new_gen);
-        KickOffOidcDiscovery(PickDispatcherForFetch(0), new_gen);
+        pending_post_reload_kick_.store(true, std::memory_order_release);
     }
     logging::Get()->info(
         "Issuer reloaded issuer={} leeway_sec={} audiences={} algorithms={}",
@@ -326,8 +317,35 @@ size_t Issuer::PickDispatcherForFetch(size_t caller_dispatcher_index) const noex
     return 0;
 }
 
+void Issuer::FlushPostReloadKick() {
+    if (!pending_post_reload_kick_.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    // Re-check the kick condition now (state may have changed since
+    // ApplyReload set the flag — e.g. an in-flight discovery completion
+    // raced and flipped ready_).
+    if (!discovery_ || !oidc_discovery_) return;
+    if (ready_.load(std::memory_order_acquire)) return;
+    if (manager_stopping_ &&
+        manager_stopping_->load(std::memory_order_acquire)) {
+        return;
+    }
+    const uint64_t gen = generation_->load(std::memory_order_acquire);
+    logging::Get()->info(
+        "Issuer reload: re-kicking OIDC discovery issuer={} new_gen={}",
+        name_, gen);
+    KickOffOidcDiscovery(PickDispatcherForFetch(0), gen);
+}
+
 void Issuer::KickOffOidcDiscovery(size_t dispatcher_index, uint64_t generation) {
     if (!oidc_discovery_) return;
+    // Bail if shutdown has been requested via AuthManager::RequestStop().
+    // Without this, a kid-miss or post-reload flush during the Stop drain
+    // window would still issue UpstreamHttpClient checkouts.
+    if (manager_stopping_ &&
+        manager_stopping_->load(std::memory_order_acquire)) {
+        return;
+    }
     // Capture a weak_ptr so delayed retry closures that fire after
     // ~Issuer (EnQueueDelayed tasks the Dispatcher cannot drain) safely
     // observe the Issuer is gone rather than dereferencing freed memory.
@@ -375,6 +393,15 @@ void Issuer::InstallJwksUriLocked(const std::string& uri,
 
 void Issuer::ScheduleInitialFetch(size_t dispatcher_index) {
     if (!jwks_fetcher_ || !jwks_cache_) return;
+    // Middleware kid-misses, TTL refreshes, and post-discovery scheduling
+    // all flow through here. RequestStop() publishes shutdown intent
+    // before the protocol drain — once observed, skip new fetch
+    // dispatches so the drain window doesn't burn upstream checkouts on
+    // background auth work.
+    if (manager_stopping_ &&
+        manager_stopping_->load(std::memory_order_acquire)) {
+        return;
+    }
     // Coalesce: if a refresh is already in flight, skip. Otherwise claim
     // the slot and dispatch.
     if (!jwks_cache_->AcquireRefreshSlot()) {

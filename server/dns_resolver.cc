@@ -1019,7 +1019,10 @@ DnsResolver::ResolveAsyncImpl(
             // Bounded queue — synchronous saturation per §5.2.2. The
             // sweep above has already removed every expired item, so
             // this path fires only when the queue is genuinely
-            // backlogged with live work.
+            // backlogged with live work. Count the saturated attempt
+            // against total_resolutions too — the caller got a terminal
+            // result, so /stats.dns must include it in completed totals.
+            state_->total_resolutions.fetch_add(1, std::memory_order_relaxed);
             state_->eai_again.fetch_add(1, std::memory_order_relaxed);
             std::promise<ResolvedEndpoint> p;
             auto saturated = p.get_future();
