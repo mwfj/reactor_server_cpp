@@ -2376,13 +2376,18 @@ void HttpServer::Stop() {
     // accepted in the gap would miss the 1001 "Going Away" close frame.
     net_server_.StopAccepting();
 
-    // Cancel in-flight auth discovery / JWKS fetches before teardown. Each
-    // Issuer bumps its generation token so late-arriving completions drop
-    // cleanly. Idempotent — safe to call multiple times (~HttpServer
-    // destructor also calls ~AuthManager → Stop()). §20 risk #4.
-    if (auth_manager_) {
-        auth_manager_->Stop();
-    }
+    // NOTE: auth_manager_->Stop() is deferred until AFTER the post-drain
+    // reload_mtx_ barrier below. A Reload thread past its final stopping_
+    // gate is committed to the apply phase and may still be inside
+    // auth_manager_->Reload() / Issuer::ApplyReload(); calling Stop here
+    // would race with that ApplyReload, potentially losing the OIDC/JWKS
+    // cancel when ApplyReload re-kicks discovery during shutdown. The
+    // barrier guarantees no in-progress Reload is inside auth state
+    // mutation by the time we cancel.
+    //
+    // During the drain window (between here and the barrier) the auth
+    // middleware on in-flight requests still uses cached JWKS state —
+    // pending background fetches don't affect already-loaded keys.
 
     // NOTE: upstream_manager_->InitiateShutdown() is NOT called here.
     // It is deferred to pre_stop_drain_cb (after H2/WS/H1 protocol drain)
@@ -2831,6 +2836,14 @@ void HttpServer::Stop() {
     // acquire-load gates, so this lock just waits for the
     // gate-check-then-return path.
     { std::lock_guard<std::mutex> lck(reload_mtx_); }
+
+    // Cancel in-flight auth discovery / JWKS fetches AFTER the barrier so
+    // it cannot race with a Reload's auth ApplyReload. Each Issuer bumps
+    // its generation token so late-arriving completions drop cleanly.
+    // Idempotent — ~AuthManager → Stop() runs again at destruction.
+    if (auth_manager_) {
+        auth_manager_->Stop();
+    }
 
     // Do NOT reset upstream_manager_ here. In the stop-from-handler case,
     // the calling handler is still on the stack and may hold an UpstreamLease
