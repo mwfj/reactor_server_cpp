@@ -104,7 +104,7 @@ Issuer::Issuer(const IssuerConfig& config,
     if (discovery_) {
         oidc_discovery_ = std::make_unique<OidcDiscovery>(
             config.name, issuer_url_, upstream_http_client_, upstream_,
-            config.discovery_retry_sec);
+            config.discovery_retry_sec, manager_stopping_);
     }
     logging::Get()->debug(
         "Issuer constructed name={} issuer_url={} mode={} upstream={} "
