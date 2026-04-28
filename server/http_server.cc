@@ -4259,6 +4259,11 @@ bool HttpServer::Reload(ServerConfig new_config) {
         //      field changes (timeouts, limits, log level).
         validation_copy.http2.enabled =
             http2_enabled_ && new_config.http2.enabled;
+        // dns.resolver_max_inflight is restart-only (the worker pool is sized
+        // at construction). Reset to the running value so a staged invalid
+        // cap doesn't reject otherwise-live-safe edits.
+        validation_copy.dns.resolver_max_inflight =
+            live_config_.dns.resolver_max_inflight;
         // Upstream configs are RESTART-ONLY for topology fields, but the
         // per-upstream `circuit_breaker` block is HOT-RELOADABLE — clearing
         // upstreams entirely from validation_copy would skip CB-field

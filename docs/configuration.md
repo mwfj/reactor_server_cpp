@@ -147,11 +147,11 @@ The `dns` block controls how the server resolves upstream hostnames at startup a
 ```json
 {
   "dns": {
-    "lookup_family": "v4",
+    "lookup_family": "v4_preferred",
     "resolve_timeout_ms": 5000,
-    "overall_timeout_ms": 10000,
+    "overall_timeout_ms": 15000,
     "stale_on_error": true,
-    "resolver_max_inflight": 8
+    "resolver_max_inflight": 32
   }
 }
 ```
@@ -160,11 +160,11 @@ The `dns` block controls how the server resolves upstream hostnames at startup a
 
 | Field | Default | Hot-reload | Description |
 |-------|---------|------------|-------------|
-| `lookup_family` | `"v4"` | No | Address family for `getaddrinfo`: `"v4"` (AF_INET), `"v6"` (AF_INET6), or `"any"` (no constraint). Restart required to take effect. |
+| `lookup_family` | `"v4_preferred"` | No | Address family preference for `getaddrinfo`. Accepted values: `"v4_only"`, `"v6_only"`, `"v4_preferred"`, `"v6_preferred"`. Restart required to take effect. |
 | `resolve_timeout_ms` | `5000` | Yes | Per-hostname `getaddrinfo` deadline in milliseconds. |
-| `overall_timeout_ms` | `10000` | Yes | Wall-clock ceiling for the entire batch resolution pass during a reload. If the batch does not complete within this window, incomplete entries are handled according to `stale_on_error`. |
+| `overall_timeout_ms` | `15000` | Yes | Wall-clock ceiling for the entire batch resolution pass during a reload. If the batch does not complete within this window, incomplete entries are handled according to `stale_on_error`. |
 | `stale_on_error` | `true` | Yes | Controls what happens when a hostname fails to resolve during a reload. See "DNS Hot Reload" below. |
-| `resolver_max_inflight` | `8` | No | Maximum number of concurrent `getaddrinfo` calls. Restart required — the worker pool is fixed at startup. |
+| `resolver_max_inflight` | `32` | No | Maximum number of concurrent `getaddrinfo` calls. Restart required — the worker pool is fixed at startup. |
 
 **Environment variable overrides:**
 
