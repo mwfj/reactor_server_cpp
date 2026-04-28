@@ -4875,54 +4875,21 @@ bool HttpServer::Reload(ServerConfig new_config) {
         circuit_breaker_manager_->Reload(new_config.upstreams);
     }
 
-    // Auth reload. Two passes:
-    //   1. AuthManager::Reload applies reloadable issuer fields + forward
-    //      config under its own mutex. Topology-restart fields (add /
-    //      remove issuer, change issuer_url / upstream / mode / discovery)
-    //      are rejected with a reason — we log and skip the policy rebuild
-    //      in that case to keep live state consistent with the rejected
-    //      staged config.
-    //   2. CommitPolicyAndEnforcement rebuilds the applied policy
-    //      list from live upstreams + new top-level policies and
-    //      atomic-swaps. Always called on success so inline proxy.auth
-    //      edits take effect live (matching the ProxyConfig::operator==
-    //      exclusion of `auth`).
-    // Same proxy.auth equality discipline documented in §11.1 —
-    // circuit-breaker precedent.
+    // Auth reload is intentionally DEFERRED to right before
+    // CommitPolicyAndEnforcement below (post-upstream-topology-check).
+    // Earlier rounds invoked AuthManager::Reload here, which publishes
+    // new IssuerSnapshots (audience / algorithms / required_claims /
+    // leeway) immediately — but the policy + forward + master_enabled
+    // cutover happens later in CommitPolicyAndEnforcement. That ordering
+    // opened a mixed-state window across the upstream topology check,
+    // timer recompute, and H2 settings update where requests could
+    // combine the NEW issuer snapshot with the OLD policy/forward
+    // snapshot, transiently allowing or denying differently from both
+    // the old and final configurations. Deferring collapses the window
+    // to the function-call gap between Reload and Commit (no I/O, no
+    // other reload work between them).
     bool auth_reload_ok = false;
     TopLevelAuthPolicyMergeResult top_level_policy_merge;
-    if (auth_manager_) {
-        std::string auth_err;
-        if (!auth_manager_->Reload(new_config.auth, auth_err)) {
-            logging::Get()->warn(
-                "Auth reload skipped: {} (live state preserved)", auth_err);
-        } else {
-            auth_reload_ok = true;
-            // Build the live issuer name set once — the merge uses it to
-            // detect staged policies that reference non-live issuers (a
-            // restart-required delta; the merge preserves live issuers
-            // list and flags topology_changed for the operator warn).
-            std::unordered_set<std::string> live_issuer_names;
-            live_issuer_names.reserve(auth_config_.issuers.size());
-            for (const auto& [name, _] : auth_config_.issuers) {
-                live_issuer_names.insert(name);
-            }
-            top_level_policy_merge =
-                MergeTopLevelAuthPoliciesPreservingLiveTopology(
-                    auth_config_.policies, new_config.auth.policies,
-                    live_issuer_names);
-            auth_config_ = BuildLiveAppliedAuthConfig(
-                auth_config_, new_config.auth,
-                top_level_policy_merge.policies);
-            // NOTE: the policy-list rebuild is INTENTIONALLY deferred until
-            // after the upstream topology check below. Calling it here with
-            // `new_config.upstreams` would commit staged `proxy.route_prefix`
-            // values to the auth matcher while the router still serves the
-            // old routes — requests to the still-live old prefixes would lose
-            // authentication coverage. The rebuild runs once upstream_configs_
-            // reflects the reality that will actually be served this run.
-        }
-    }
 
     // Upstream topology changes (host/port/pool/proxy/tls) require a
     // restart — pools are built once in Start() and cannot be rebuilt
@@ -5025,22 +4992,59 @@ bool HttpServer::Reload(ServerConfig new_config) {
             "restart to take effect (preserving live applies_to/name set)");
     }
 
-    // Rebuild the applied auth policy list from the LIVE upstream set.
-    // When topology matched, upstream_configs_ now carries the new
-    // proxy.auth fields (reload-safe) and route_prefix (unchanged). When
-    // topology diverged, upstream_configs_ still holds the live values
-    // — inline proxy.auth edits on mismatched topology are carried
-    // alongside the staged prefix and would only re-apply on restart.
-    // Top-level auth.policies[] contributes the live-applied subset:
-    // reloadable fields on stable identities take effect, while staged
-    // name/applies_to topology remains deferred until restart.
-    // Final atomic cutover: policy rebuild + master_enabled_ release-store
-    // under the same lock inside AuthManager::CommitPolicyAndEnforcement.
-    // This runs AFTER the upstream topology check so `upstream_configs_`
-    // reflects the prefixes the router will actually serve, and it closes
-    // the `false → true` reload window that a separate master-enabled
-    // flip in AuthManager::Reload would have left open. See design doc
-    // §11.2 step 4 + §18.5.
+    // Auth cutover. Two passes, intentionally ADJACENT (no I/O or other
+    // reload work between them) so the mixed-state window between issuer
+    // snapshot publication and policy/forward/master_enabled swap is as
+    // narrow as possible:
+    //   1. AuthManager::Reload applies reloadable issuer fields under
+    //      its own reload_mtx_. Topology-restart fields (add / remove
+    //      issuer, change issuer_url / upstream / mode / discovery) are
+    //      rejected with a reason — we log and skip the policy rebuild
+    //      in that case to keep live state consistent with the rejected
+    //      staged config.
+    //   2. CommitPolicyAndEnforcement rebuilds the applied policy list
+    //      from live upstreams + new top-level policies and atomic-swaps
+    //      forward_, policies_, master_enabled_ under snapshot_mtx_.
+    //
+    // Why deferred to here (not earlier in Reload): the upstream
+    // topology check above must run first so `upstream_configs_`
+    // reflects the route prefixes the router will actually serve; this
+    // also closes the `false → true` reload window that a separate
+    // master-enabled flip in AuthManager::Reload would have left open.
+    // See design doc §11.2 step 4 + §18.5. Earlier rounds had Reload
+    // here run BEFORE upstream topology + timer + H2 settings — that
+    // ordering exposed a mixed-state window where a request could see
+    // NEW issuer audience/algorithms/required_claims with OLD policy/
+    // forward, transiently allowing or denying differently from both
+    // the old and final configurations.
+    //
+    // proxy.auth equality discipline documented in §11.1 — circuit-
+    // breaker precedent.
+    if (auth_manager_) {
+        std::string auth_err;
+        if (!auth_manager_->Reload(new_config.auth, auth_err)) {
+            logging::Get()->warn(
+                "Auth reload skipped: {} (live state preserved)", auth_err);
+        } else {
+            auth_reload_ok = true;
+            // Build the live issuer name set once — the merge uses it to
+            // detect staged policies that reference non-live issuers (a
+            // restart-required delta; the merge preserves live issuers
+            // list and flags topology_changed for the operator warn).
+            std::unordered_set<std::string> live_issuer_names;
+            live_issuer_names.reserve(auth_config_.issuers.size());
+            for (const auto& [name, _] : auth_config_.issuers) {
+                live_issuer_names.insert(name);
+            }
+            top_level_policy_merge =
+                MergeTopLevelAuthPoliciesPreservingLiveTopology(
+                    auth_config_.policies, new_config.auth.policies,
+                    live_issuer_names);
+            auth_config_ = BuildLiveAppliedAuthConfig(
+                auth_config_, new_config.auth,
+                top_level_policy_merge.policies);
+        }
+    }
     if (auth_reload_ok) {
         auth_manager_->CommitPolicyAndEnforcement(
             upstream_configs_,
