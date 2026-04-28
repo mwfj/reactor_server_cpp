@@ -2376,10 +2376,30 @@ int HttpServer::GetBoundPort() const {
 }
 
 ServerConfig HttpServer::GetLiveConfigSnapshot() const {
-    // `reload_mtx_` is mutable so `const` callers can lock.
-    // Takes a full copy under the mutex so the caller sees a coherent
-    // snapshot even while a Reload is mutating the live state.
-    std::lock_guard<std::mutex> lock(reload_mtx_);
+    // No lock. `live_config_` is assigned ONCE during construction
+    // (PrepareConfig in the initializer list) and NEVER mutated after.
+    // Reload() applies its changes to subsystem configs (rate_limit_,
+    // circuit_breaker_, auth_, dispatcher timer cadence, etc.) directly
+    // — it does NOT write back into `live_config_`. The accessor
+    // therefore returns a coherent post-Normalize+Validate copy without
+    // synchronizing with any reload work.
+    //
+    // INVARIANT — `reload_mtx_` MUST NOT be acquired here. Earlier
+    // rounds locked it defensively against a hypothetical future Reload
+    // that would mutate `live_config_`. That coupled /stats observability
+    // (via this accessor) to the reload path; a slow reload acquiring
+    // `reload_mtx_` (forbidden by header invariant but defended-against
+    // in depth) would have stalled stats handlers and Stop's post-drain
+    // teardown barrier on `dns.overall_timeout_ms`. By dropping the
+    // lock here, the /stats path is provably independent of any reload-
+    // serialization mechanism — present or future.
+    //
+    // If a future Reload ever needs to mutate `live_config_`, the
+    // publication mechanism MUST be an atomic shared_ptr swap (writer:
+    // `std::atomic_store(&live_config_ptr_, std::make_shared<const
+    // ServerConfig>(new_cfg))`; reader: `std::atomic_load`) — NOT a
+    // mutex. See the header comment on `reload_in_flight_` for the
+    // analogous fix on Stop-vs-Reload synchronization.
     return live_config_;
 }
 

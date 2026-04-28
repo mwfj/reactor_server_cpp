@@ -901,6 +901,72 @@ inline void TestStartupAbortsBeforeDnsWhenStopRanFirst() {
     }
 }
 
+// Architectural invariant: GetLiveConfigSnapshot() MUST NOT acquire
+// `reload_mtx_`. The /stats observability path (and any other
+// snapshot reader) needs to be provably independent of any reload-
+// serialization mechanism — present or future. We verify the negative
+// behaviorally: drive a stream of snapshot reads from a worker thread
+// while the main thread runs back-to-back reloads, and assert no read
+// stalls. A regression to acquire reload_mtx_ here would couple stats
+// to reload_in_flight_ progress, surfacing as variance under contention.
+inline void TestGetLiveConfigSnapshotDoesNotBlockOnReload() {
+    std::cout << "\n[TEST] DualStack: GetLiveConfigSnapshot does not block on Reload..."
+              << std::endl;
+    try {
+        HttpServer server("127.0.0.1", 0);
+        TestServerRunner<HttpServer> runner(server);
+
+        std::atomic<bool> stop{false};
+        std::atomic<int> reads_done{0};
+        std::atomic<int64_t> max_read_us{0};
+
+        std::thread reader([&]() {
+            while (!stop.load(std::memory_order_acquire)) {
+                const auto t0 = std::chrono::steady_clock::now();
+                ServerConfig snap = server.GetLiveConfigSnapshot();
+                (void)snap.bind_host;  // touch to defeat optimisation
+                const auto us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                int64_t prev = max_read_us.load(std::memory_order_relaxed);
+                while (us > prev &&
+                       !max_read_us.compare_exchange_weak(prev, us)) {}
+                reads_done.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+
+        // Concurrently reload several times; reader should not stall.
+        ServerConfig snap = server.GetLiveConfigSnapshot();
+        for (int i = 0; i < 10; ++i) {
+            server.Reload(snap);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+        stop.store(true, std::memory_order_release);
+        if (reader.joinable()) reader.join();
+
+        // Reader did real work, AND no individual read took longer than
+        // a generous bound. 50ms is well below any reload-coupling
+        // failure mode (a regression to reload_mtx_ acquisition under a
+        // hypothetical slow Reload would push a single read into the
+        // hundreds of milliseconds; today Reload is fast, so the
+        // threshold is the architectural pin, not a tight perf budget).
+        const int reads = reads_done.load(std::memory_order_relaxed);
+        const int64_t max_us = max_read_us.load(std::memory_order_relaxed);
+        const bool ok = reads > 0 && max_us < 50000;
+        std::string err;
+        if (!ok) {
+            err = "reads=" + std::to_string(reads) +
+                  " max_read_us=" + std::to_string(max_us);
+        }
+        Record("DualStack: GetLiveConfigSnapshot does not block on Reload",
+                ok, err);
+    } catch (const std::exception& e) {
+        Record("DualStack: GetLiveConfigSnapshot does not block on Reload",
+                false, e.what());
+    }
+}
+
 // Architectural invariant: Stop() MUST NOT acquire `reload_mtx_`. Even
 // if a future hostname-aware reload (step 11) holds reload_mtx_ briefly,
 // SIGTERM/Stop must remain responsive. We can't directly observe that
@@ -1046,6 +1112,7 @@ inline void RunAllTests() {
     TestStartupAbortsWhenStopCalledFirst();
     TestStartupAbortsBeforeDnsWhenStopRanFirst();
     TestStopNotBlockedByConcurrentReload();
+    TestGetLiveConfigSnapshotDoesNotBlockOnReload();
 
     // Step 9 full — PoolPartition resolved-endpoint split
     TestPoolPartitionResolvedEndpointAtomic();

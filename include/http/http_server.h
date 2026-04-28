@@ -261,15 +261,19 @@ private:
     // `live_config_` holds the Normalize+Validate result from ctor time.
     ServerConfig live_config_;
 
-    // Serialises (a) Reload-vs-Reload; (b) `GetLiveConfigSnapshot() const`
-    // vs in-flight Reload. `mutable` per v0.28 ("serialization, not
-    // state").
+    // VESTIGIAL — currently UNACQUIRED by every production callsite
+    // (GetLiveConfigSnapshot dropped its lock; Reload, Stop, and stats
+    // paths never took it). Retained as an explicit slot for any future
+    // Reload-vs-Reload serialization that genuinely needs a mutex
+    // (atomic-shared_ptr publication is the preferred path — see
+    // GetLiveConfigSnapshot's comment).
     //
-    // INVARIANT — NO BLOCKING I/O UNDER THIS MUTEX. The lock holder must
-    // not call DNS resolution, network I/O, file I/O, or any operation
-    // that can stall for a wall-clock duration. Future hostname-aware
-    // reload (step 11) MUST resolve hostnames OUTSIDE this lock and only
-    // re-acquire to swap the resolved-state pointer atomically.
+    // INVARIANT — NO BLOCKING I/O UNDER THIS MUTEX. Whoever ever does
+    // start acquiring it must not call DNS resolution, network I/O,
+    // file I/O, or any operation that can stall for a wall-clock
+    // duration. Future hostname-aware reload (step 11) MUST resolve
+    // hostnames OUTSIDE this lock and only re-acquire to swap the
+    // resolved-state pointer atomically.
     //
     // INVARIANT — Stop() MUST NOT acquire this mutex. The earlier
     // "post-drain teardown barrier" idea was rejected: if a long-running
@@ -278,8 +282,15 @@ private:
     // the `stopping_` fast-stop path. Stop-vs-Reload synchronization, if
     // ever needed, must use `reload_in_flight_` (acquire-poll with
     // bounded retries) so SIGTERM responsiveness stays decoupled from
-    // mutex contention. NOT acquired on Stop's pre-drain accept-close
-    // path either — that stays lock-free.
+    // mutex contention.
+    //
+    // INVARIANT — observability paths (GetLiveConfigSnapshot, /stats,
+    // any future getter) MUST NOT acquire this mutex. They publish via
+    // atomic loads on per-snapshot pointers so a stalled reload can
+    // never block stats handlers.
+    //
+    // `mutable` per v0.28 ("serialization, not state"). NOT acquired on
+    // Stop's pre-drain accept-close path either — that stays lock-free.
     mutable std::mutex reload_mtx_;
 
     // Counts in-flight Reload() calls. Incremented at Reload entry,
