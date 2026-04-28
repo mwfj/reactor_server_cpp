@@ -179,10 +179,10 @@ public:
     // its own `current_config` reference rather than round-tripping
     // through this getter.
     //
-    // Acquires `reload_mtx_` defensively so a future step 11 that
-    // writes `live_config_` under the mutex cannot race this reader.
-    // Step 11 (deferred) will make the docstring promise stronger —
-    // at that point this becomes a fully reload-coherent snapshot.
+    // Lock-free. `live_config_` is write-once (set during construction,
+    // never mutated by Reload). Future Reload that needs to mutate it
+    // MUST publish via atomic shared_ptr swap, NOT a mutex — see the
+    // implementation comment for the rationale.
     ServerConfig GetLiveConfigSnapshot() const;
 
     // Return a copy of the resolved bind endpoint, or std::nullopt if
@@ -261,45 +261,39 @@ private:
     // `live_config_` holds the Normalize+Validate result from ctor time.
     ServerConfig live_config_;
 
-    // VESTIGIAL — currently UNACQUIRED by every production callsite
-    // (GetLiveConfigSnapshot dropped its lock; Reload, Stop, and stats
-    // paths never took it). Retained as an explicit slot for any future
-    // Reload-vs-Reload serialization that genuinely needs a mutex
-    // (atomic-shared_ptr publication is the preferred path — see
-    // GetLiveConfigSnapshot's comment).
-    //
-    // INVARIANT — NO BLOCKING I/O UNDER THIS MUTEX. Whoever ever does
-    // start acquiring it must not call DNS resolution, network I/O,
-    // file I/O, or any operation that can stall for a wall-clock
-    // duration. Future hostname-aware reload (step 11) MUST resolve
-    // hostnames OUTSIDE this lock and only re-acquire to swap the
-    // resolved-state pointer atomically.
-    //
-    // INVARIANT — Stop() MUST NOT acquire this mutex. The earlier
-    // "post-drain teardown barrier" idea was rejected: if a long-running
-    // Reload were ever to hold this mutex (even momentarily across a
-    // slow operation), Stop would block until that completes — bypassing
-    // the `stopping_` fast-stop path. Stop-vs-Reload synchronization, if
-    // ever needed, must use `reload_in_flight_` (acquire-poll with
-    // bounded retries) so SIGTERM responsiveness stays decoupled from
-    // mutex contention.
-    //
-    // INVARIANT — observability paths (GetLiveConfigSnapshot, /stats,
-    // any future getter) MUST NOT acquire this mutex. They publish via
-    // atomic loads on per-snapshot pointers so a stalled reload can
-    // never block stats handlers.
-    //
-    // `mutable` per v0.28 ("serialization, not state"). NOT acquired on
-    // Stop's pre-drain accept-close path either — that stays lock-free.
-    mutable std::mutex reload_mtx_;
+    // `reload_mtx_` was REMOVED in this round. Earlier rounds carried it
+    // as a vestigial slot, but it generated repeat false-positive review
+    // findings ("held across DNS in Reload!", "blocks /stats!", "blocks
+    // Stop!") even after every production acquirer had been migrated to
+    // a lock-free path:
+    //   - GetLiveConfigSnapshot publishes via plain return of a
+    //     write-once `live_config_` (Reload doesn't mutate it; if a
+    //     future Reload needs to, it MUST use atomic shared_ptr swap,
+    //     NOT a mutex — documented in the accessor's comment).
+    //   - Reload-vs-Reload serialization is currently unnecessary;
+    //     `reload_in_flight_` (atomic int) is available for any future
+    //     Stop-vs-Reload barrier without coupling shutdown to mutex
+    //     contention.
+    //   - Stop is lock-free for the pre-drain accept-close path and
+    //     uses `reload_in_flight_` polling for any future post-drain
+    //     barrier.
+    //   - Observability paths (/stats, GetLiveConfigSnapshot, etc.) are
+    //     all lock-free reads of atomic / write-once state.
+    // If a future Reload-vs-Reload genuinely needs a mutex, it MUST be
+    // a freshly-named field (e.g. `reload_serialization_mtx_`) whose
+    // docstring spells out the same invariants the deleted
+    // `reload_mtx_` carried: NO BLOCKING I/O under the lock, NOT
+    // acquired by Stop, NOT acquired by observability getters. The
+    // preferred pattern is still atomic shared_ptr publication, which
+    // sidesteps the mutex entirely.
 
     // Counts in-flight Reload() calls. Incremented at Reload entry,
     // decremented at exit. Stop() can poll this with bounded retries to
-    // observe a quiescent point WITHOUT taking `reload_mtx_`, preserving
+    // observe a quiescent point WITHOUT acquiring any mutex, preserving
     // SIGTERM responsiveness even if a Reload is mid-flight. Currently
     // unread by Stop (no teardown barrier exists today); the counter is
     // installed up-front so step-11's hostname-aware reload can fence
-    // against Stop without inheriting reload_mtx_'s blocking-I/O risk.
+    // against Stop without coupling shutdown to wall-clock-bound work.
     std::atomic<int> reload_in_flight_{0};
 
     // Per-server DNS resolver. Ctor is cheap (allocates `PoolState` only;
@@ -308,10 +302,10 @@ private:
     std::unique_ptr<NET_DNS_NAMESPACE::DnsResolver> dns_resolver_;
 
     // Lock-free signal channel from Stop() to in-progress Start()/Reload()
-    // Stop() stores true with release ordering as
-    // the FIRST executable line; Start/Reload load with acquire at each
-    // phase boundary. Separate from `reload_mtx_` so a Stop signal can
-    // reach a Start blocked in DNS without waiting on the mutex.
+    // Stop() stores true with release ordering as the FIRST executable
+    // line; Start/Reload load with acquire at each phase boundary.
+    // Stop signals reach a Start blocked in DNS via this atomic without
+    // waiting on any mutex.
     std::atomic<bool> stopping_{false};
 
     // Populated by Start()'s two-phase commit:

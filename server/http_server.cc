@@ -2278,15 +2278,18 @@ void HttpServer::Start() {
         batch.push_back(std::move(r));
     }
 
-    // INVARIANT — `reload_mtx_` MUST NOT be held across this call.
-    // ResolveMany blocks for up to `dns.overall_timeout_ms` on slow/
-    // wedged DNS; if the lock were held here, GetLiveConfigSnapshot()
-    // (and any future Stop teardown barrier or /stats reader that
-    // takes reload_mtx_) would block for the full DNS budget. Start()
-    // is the only caller today and runs before reload_mtx_ has any
-    // contender; step-11's hostname-aware reload MUST follow the same
-    // discipline (compute the new endpoint OUTSIDE the mutex, then
-    // atomic-store the resolved_endpoint_ pointer atomically).
+    // INVARIANT — NO MUTEX held across this call. ResolveMany blocks
+    // for up to `dns.overall_timeout_ms` on slow/wedged DNS; if any
+    // lock were held here that observability getters or Stop's barrier
+    // also acquired, /stats and shutdown would block for the full DNS
+    // budget. Start() is the only caller today and runs lock-free.
+    // Step-11's hostname-aware reload MUST follow the same discipline:
+    // compute the new endpoint OUTSIDE any lock, then atomic-store the
+    // resolved_endpoint_ pointer atomically. Reload-vs-Reload
+    // serialization, if needed, must use a freshly-named mutex with
+    // strict invariants (NO blocking I/O, NOT acquired by Stop, NOT
+    // acquired by observability getters) — see the deleted `reload_mtx_`
+    // docstring in http_server.h for the rationale.
     auto results = dns_resolver_->ResolveMany(
         std::move(batch),
         std::chrono::milliseconds(live_config_.dns.overall_timeout_ms));
@@ -2382,24 +2385,16 @@ ServerConfig HttpServer::GetLiveConfigSnapshot() const {
     // circuit_breaker_, auth_, dispatcher timer cadence, etc.) directly
     // — it does NOT write back into `live_config_`. The accessor
     // therefore returns a coherent post-Normalize+Validate copy without
-    // synchronizing with any reload work.
-    //
-    // INVARIANT — `reload_mtx_` MUST NOT be acquired here. Earlier
-    // rounds locked it defensively against a hypothetical future Reload
-    // that would mutate `live_config_`. That coupled /stats observability
-    // (via this accessor) to the reload path; a slow reload acquiring
-    // `reload_mtx_` (forbidden by header invariant but defended-against
-    // in depth) would have stalled stats handlers and Stop's post-drain
-    // teardown barrier on `dns.overall_timeout_ms`. By dropping the
-    // lock here, the /stats path is provably independent of any reload-
-    // serialization mechanism — present or future.
+    // synchronizing with any reload work, making /stats provably
+    // independent of any reload-serialization mechanism.
     //
     // If a future Reload ever needs to mutate `live_config_`, the
     // publication mechanism MUST be an atomic shared_ptr swap (writer:
     // `std::atomic_store(&live_config_ptr_, std::make_shared<const
     // ServerConfig>(new_cfg))`; reader: `std::atomic_load`) — NOT a
-    // mutex. See the header comment on `reload_in_flight_` for the
-    // analogous fix on Stop-vs-Reload synchronization.
+    // mutex. The deleted `reload_mtx_` field documented why mutex-based
+    // publication kept generating availability concerns for stats and
+    // shutdown; the atomic-swap pattern sidesteps the issue entirely.
     return live_config_;
 }
 
@@ -2419,8 +2414,9 @@ void HttpServer::Stop() {
     // phase boundaries with acquire ordering so they can abort cleanly
     // even while wedged in DNS.
     //
-    // Stop MUST NOT acquire `reload_mtx_` — see the header invariant.
-    // If a future Stop-vs-Reload teardown barrier is ever needed, use
+    // Stop is lock-free. The deleted `reload_mtx_` field documented why
+    // mutex-based teardown synchronization caused recurring availability
+    // concerns — a future Stop-vs-Reload barrier, if needed, MUST use
     // `reload_in_flight_` (acquire-load + bounded poll) so a slow
     // Reload (e.g. step-11's hostname re-resolution) cannot block
     // SIGTERM responsiveness. Keeping the `stopping_` store here as
@@ -4529,13 +4525,13 @@ bool HttpServer::Reload(ServerConfig new_config) {
     }
 
     // RAII fence for `reload_in_flight_`: lets a future Stop() barrier
-    // observe a quiescent point WITHOUT acquiring `reload_mtx_` (see the
-    // header invariant — reload_mtx_ must never be in Stop's wait path,
-    // because step-11's hostname-aware reload may end up holding it
-    // briefly across operations the mutex contract forbids blocking on).
-    // The increment is acquire-release so a Stop poll on a different
-    // thread sees the in-flight reload before the body runs and the
-    // decrement after the body completes.
+    // observe a quiescent point via lock-free polling. The deleted
+    // `reload_mtx_` field documented why a mutex-based barrier kept
+    // generating availability concerns; this counter sidesteps the
+    // issue — Stop polls without ever blocking on a wall-clock-bound
+    // reload operation. The increment is acquire-release so a Stop
+    // poll on a different thread sees the in-flight reload before the
+    // body runs and the decrement after the body completes.
     reload_in_flight_.fetch_add(1, std::memory_order_acq_rel);
     struct ReloadInFlightGuard {
         std::atomic<int>& counter;
