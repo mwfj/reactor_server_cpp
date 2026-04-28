@@ -4403,7 +4403,7 @@ bool HttpServer::Reload(ServerConfig new_config) {
         }
     }
 
-    // Declared at function scope: assigned in the auth Phase 1 block below
+    // Declared at function scope: assigned in the auth block below
     // and used again at the end of Reload for the topology-change warn and
     // CommitPolicyAndEnforcement. Default-initialised (topology_changed=false)
     // so the no-auth-manager path is safe.
@@ -4411,7 +4411,7 @@ bool HttpServer::Reload(ServerConfig new_config) {
 
     // Pre-apply DNS resolve — re-resolve all LIVE upstreams (restart-only
     // topology) using the staged DNS timeout knobs (hot-reloadable).
-    // Auth Phase 1 runs after all DNS gates so a DNS failure or a Stop race
+    // Auth runs after all DNS gates so a DNS failure or a Stop race
     // can abort with zero live-state mutations.
     {
         std::vector<NET_DNS_NAMESPACE::ResolveRequest> batch;
@@ -4499,7 +4499,7 @@ bool HttpServer::Reload(ServerConfig new_config) {
             }
         }
 
-        // Auth Phase 1 — the ONLY apply step with a rejecting bool contract.
+        // the ONLY apply step with a rejecting bool contract.
         // Runs FIRST so a rejected auth reload aborts before any irreversible
         // mutation (DNS commit, rate_limit, CB, size_limits). AuthManager::Reload
         // is side-effect-free with respect to outbound fetches: any post-reload
