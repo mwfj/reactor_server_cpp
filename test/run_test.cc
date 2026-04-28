@@ -228,6 +228,7 @@ void PrintUsage(const char* program_name) {
     std::cout << "  introspection_cache, -Y  Run introspection cache unit tests only" << std::endl;
     std::cout << "  intro_client, -y   Run introspection client static-helper + AsyncPendingState tests" << std::endl;
     std::cout << "  auth_intro,  -Z    Run introspection integration tests only" << std::endl;
+    std::cout << "  dual_stack,  -D    Run dual-stack DNS resolver tests only" << std::endl;
     std::cout << "  help,        -h    Show this help message" << std::endl;
     std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route + kqueue + upstream + proxy + rate_limit + circuit_breaker + auth + auth-phase2)" << std::endl;
 }
@@ -344,6 +345,12 @@ int main(int argc, char* argv[]) {
         // Run introspection integration tests
         }else if(mode == "auth_intro" || mode == "-Z"){
             AuthIntrospectionIntegrationTests::RunAllTests();
+        // Run dual-stack DNS resolver tests
+        }else if(mode == "dual_stack" || mode == "-D"){
+            DualStackTests::RunAllTests();
+        // Run only TSAN-instrumented dual-stack stop/reload/destruction tests
+        }else if(mode == "dual_stack_tsan"){
+            DualStackTests::RunTSANTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

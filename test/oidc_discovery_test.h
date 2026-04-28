@@ -45,7 +45,8 @@ static std::unique_ptr<AUTH_NAMESPACE::OidcDiscovery> MakeDiscovery(
     return std::make_unique<AUTH_NAMESPACE::OidcDiscovery>(
         issuer_name, issuer_url, /*client=*/nullptr,
         /*upstream_pool_name=*/"idp-pool", retry_sec,
-        requires_jwks_uri);
+        requires_jwks_uri,
+        /*manager_stopping=*/nullptr);
 }
 
 // ---------------------------------------------------------------------------

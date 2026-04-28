@@ -191,7 +191,7 @@ $(SERVER_TARGET): $(LIB_SRCS) $(MAIN_SRC) $(HEADERS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ
 
 # Clean build artifacts
 clean:
-	rm -rf $(TARGET)* $(SERVER_TARGET) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) *.dSYM *.plist
+	rm -rf $(TARGET)* $(TSAN_TARGET) $(SERVER_TARGET) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) *.dSYM *.plist
 
 # Run all tests
 test: $(TARGET) $(SERVER_TARGET)
@@ -332,6 +332,32 @@ test_auth_intro: $(TARGET)
 	@echo "Running introspection integration tests only..."
 	./$(TARGET) auth_intro
 
+test_dual_stack: $(TARGET)
+	@echo "Running dual-stack DNS resolver tests only..."
+	./$(TARGET) dual_stack
+
+# Thread-Sanitizer build for dual-stack stop/reload/destruction race tests.
+# Builds a separate binary (test_runner_tsan) with -fsanitize=thread and
+# runs the dual_stack TSAN subset (stop-vs-reload, teardown barrier,
+# destructor race, abort-gate ordering).
+#
+# Usage:  make test_dual_stack_tsan
+# Note:   TSAN + OpenSSL may emit benign suppressible reports for internal
+#         OpenSSL initialisation on macOS (Apple system libraries are not
+#         TSAN-instrumented).  Any report touching reactor or HttpServer code
+#         is a real race.
+TSAN_CXXFLAGS = $(CXXFLAGS) -fsanitize=thread
+TSAN_LDFLAGS  = $(LDFLAGS) -fsanitize=thread
+TSAN_TARGET   = test_runner_tsan
+
+$(TSAN_TARGET): $(TEST_SRCS) $(HEADERS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ)
+	@echo "Building TSAN test runner ($(TSAN_TARGET))..."
+	$(CXX) $(TSAN_CXXFLAGS) $(TEST_SRCS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) $(TSAN_LDFLAGS) -o $(TSAN_TARGET)
+
+test_dual_stack_tsan: $(TSAN_TARGET)
+	@echo "Running dual-stack TSAN tests (stop/reload/destruction) under ThreadSanitizer..."
+	./$(TSAN_TARGET) dual_stack_tsan
+
 # Display help information
 help:
 	@echo "Reactor Server C++ - Makefile Help"
@@ -412,4 +438,4 @@ help:
 # Build only the production server binary
 server: $(SERVER_TARGET)
 
-.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache test_intro_client test_auth_intro help
+.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache test_intro_client test_auth_intro test_dual_stack test_dual_stack_tsan help

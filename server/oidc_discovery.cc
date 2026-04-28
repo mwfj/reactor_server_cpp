@@ -159,13 +159,15 @@ OidcDiscovery::OidcDiscovery(std::string issuer_name,
                               std::shared_ptr<UpstreamHttpClient> client,
                               std::string upstream_pool_name,
                               int retry_sec,
-                              bool requires_jwks_uri)
+                              bool requires_jwks_uri,
+                              const std::atomic<bool>* manager_stopping)
     : issuer_name_(std::move(issuer_name)),
       issuer_url_(std::move(issuer_url)),
       client_(std::move(client)),
       upstream_pool_name_(std::move(upstream_pool_name)),
       retry_sec_(retry_sec > 0 ? retry_sec : 30),
       requires_jwks_uri_(requires_jwks_uri),
+      manager_stopping_(manager_stopping),
       ready_(std::make_shared<std::atomic<bool>>(false)),
       cancel_token_(std::make_shared<std::atomic<bool>>(false)) {
     logging::Get()->debug(
@@ -237,11 +239,20 @@ void OidcDiscovery::Start(size_t dispatcher_index,
     cycle_state_ = std::make_shared<CycleState>();
     std::weak_ptr<CycleState> weak_state = cycle_state_;
     const bool requires_jwks_uri = requires_jwks_uri_;
+    const std::atomic<bool>* manager_stopping = manager_stopping_;
     cycle_state_->run =
         [weak_state, issuer_name, issuer_url, pool_name, client_copy,
          dispatcher, retry_sec, generation, on_ready_cb, token,
-         ready_flag, requires_jwks_uri](size_t disp_index) {
+         ready_flag, requires_jwks_uri, manager_stopping](size_t disp_index) {
             if (token->load(std::memory_order_acquire)) {
+                return;
+            }
+            // Bail if AuthManager::RequestStop() has been published.
+            // Without this gate, an in-flight discovery cycle whose token
+            // hasn't been Cancel()-ed yet would keep issuing upstream
+            // checkouts during the shutdown drain window.
+            if (manager_stopping &&
+                manager_stopping->load(std::memory_order_acquire)) {
                 return;
             }
 
@@ -258,9 +269,16 @@ void OidcDiscovery::Start(size_t dispatcher_index,
                 pool_name, disp_index, std::move(req),
                 [weak_state, issuer_name, issuer_url, dispatcher, retry_sec,
                  generation, on_ready_cb, token, ready_flag, disp_index,
-                 requires_jwks_uri](
+                 requires_jwks_uri, manager_stopping](
                         UpstreamHttpClient::Response resp) {
                     if (token->load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    // Same RequestStop() gate as the entry of run — a
+                    // response that landed after RequestStop() should not
+                    // trigger another retry that issues new upstream work.
+                    if (manager_stopping &&
+                        manager_stopping->load(std::memory_order_acquire)) {
                         return;
                     }
                     // Re-arm after retry_sec seconds on the same dispatcher.

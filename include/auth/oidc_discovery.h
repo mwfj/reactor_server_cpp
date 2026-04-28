@@ -36,7 +36,8 @@ class OidcDiscovery {
                    std::shared_ptr<UpstreamHttpClient> client,
                    std::string upstream_pool_name,
                    int retry_sec,
-                   bool requires_jwks_uri);
+                   bool requires_jwks_uri,
+                   const std::atomic<bool>* manager_stopping);
     ~OidcDiscovery();
 
     OidcDiscovery(const OidcDiscovery&) = delete;
@@ -91,6 +92,13 @@ class OidcDiscovery {
     std::string upstream_pool_name_;
     int retry_sec_;
     bool requires_jwks_uri_;
+    // Non-owning pointer to AuthManager::stopping_. Checked at the top of
+    // every Issue() and before scheduling a retry so an in-flight cycle
+    // doesn't keep dispatching upstream work during the shutdown drain
+    // window between RequestStop() and the post-barrier full Stop().
+    // Lifetime: AuthManager owns each Issuer (which owns this), so the
+    // atomic outlives the discovery cycle.
+    const std::atomic<bool>* manager_stopping_ = nullptr;
     // Both flags are held as shared_ptr<atomic<bool>> so that delayed-retry
     // closures can safely access them after ~OidcDiscovery runs. Raw pointer
     // captures (e.g. `&ready_`) would be UAF if the object is destroyed while

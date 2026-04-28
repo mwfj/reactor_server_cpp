@@ -78,7 +78,8 @@ class Issuer : public std::enable_shared_from_this<Issuer> {
            UpstreamManager* upstream_manager,
            std::vector<std::shared_ptr<Dispatcher>> dispatchers,
            std::shared_ptr<UpstreamHttpClient> http_client,
-           const std::string& hmac_key);
+           const std::string& hmac_key,
+           const std::atomic<bool>* manager_stopping);
     ~Issuer();
 
     Issuer(const Issuer&) = delete;
@@ -110,6 +111,14 @@ class Issuer : public std::enable_shared_from_this<Issuer> {
     // to log and preserve the existing state. Also runs the same range
     // checks as ValidateReload for defence-in-depth.
     bool ApplyReload(const IssuerConfig& new_config, std::string& err_out);
+
+    // Run the deferred OIDC re-kick that ApplyReload deliberately skipped.
+    // Called by AuthManager::FlushPostReloadKicks AFTER HttpServer::Reload
+    // has committed DNS, so the discovery fetch dispatched here observes
+    // the freshly-published partition->resolved_endpoint_ rather than the
+    // stale pre-reload IP. No-op if no pending kick is queued, or if
+    // shutdown has been requested. Idempotent.
+    void FlushPostReloadKick();
 
     // Atomic-load the snapshot. Safe from any dispatcher thread.
     std::shared_ptr<const IssuerSnapshot> LoadSnapshot() const;
@@ -222,6 +231,18 @@ class Issuer : public std::enable_shared_from_this<Issuer> {
 
     UpstreamManager* upstream_manager_;                    // non-owning
     std::vector<std::shared_ptr<Dispatcher>> dispatchers_;
+
+    // Non-owning pointer to AuthManager::stopping_ — let kick paths bail
+    // when shutdown has been published via RequestStop(), without running
+    // discovery / JWKS work that would burn drain budget on dead state.
+    // Lifetime: AuthManager outlives every Issuer it owns; safe for the
+    // Issuer's full lifetime.
+    const std::atomic<bool>* manager_stopping_ = nullptr;
+
+    // Set by ApplyReload when discovery is in its retry cycle and the
+    // generation bump requires a fresh kick. Drained by FlushPostReloadKick
+    // (run by HttpServer::Reload AFTER DNS commit).
+    std::atomic<bool> pending_post_reload_kick_{false};
 
     // Pick a dispatcher to issue a fetch from. Returns 0 when no
     // preference is available. Kept as a small helper so both Start() and
