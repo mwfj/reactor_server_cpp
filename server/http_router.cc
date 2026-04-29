@@ -526,11 +526,21 @@ void HttpRouter::PrependMiddleware(Middleware middleware) {
 }
 
 void HttpRouter::PrependAsyncMiddleware(AsyncMiddleware middleware) {
+    // Multi-async-middleware support is not yet implemented (see FIXME in
+    // RunAsyncMiddleware). Silently dropping a second registration would be
+    // a security regression: when AuthManager installs the introspection
+    // middleware in MarkServerReady, an embedder-provided async middleware
+    // already at the head would cause auth to be skipped for opaque-token
+    // routes. Fail closed instead — the throw propagates out of
+    // MarkServerReady and NetServer::Start cleans up partial startup.
     if (!async_middlewares_.empty()) {
         logging::Get()->error(
             "PrependAsyncMiddleware: chain already has an async middleware; "
-            "registering more than one is not yet supported");
-        return;
+            "multi-async-middleware chains are not supported");
+        throw std::logic_error(
+            "PrependAsyncMiddleware: only one async middleware may be "
+            "registered (auth introspection conflicts with prior async "
+            "middleware registration)");
     }
     async_middlewares_.insert(
         async_middlewares_.begin(), std::move(middleware));

@@ -1002,8 +1002,19 @@ void HttpServer::MarkServerReady() {
         // master_enabled_ inline so installing at boot keeps
         // `auth.enabled: false → true` live-reloadable (a SIGHUP cannot
         // retroactively add middleware after MarkServerReady returns).
-        router_.PrependAsyncMiddleware(
-            AUTH_NAMESPACE::MakeAsyncMiddleware(auth_manager_.get()));
+        //
+        // Async-auth is skipped when no issuers are configured at boot:
+        // issuer add is restart-required (AuthManager::Reload rejects
+        // issuer-set deltas), so an empty issuer list means introspection
+        // is impossible until restart. Skipping the install lets embedders
+        // register their own async middleware without auth-conflict in
+        // configurations that genuinely have no auth backend. When issuers
+        // ARE configured, PrependAsyncMiddleware throws on a pre-existing
+        // entry rather than silently bypassing introspection.
+        if (!auth_config_.issuers.empty()) {
+            router_.PrependAsyncMiddleware(
+                AUTH_NAMESPACE::MakeAsyncMiddleware(auth_manager_.get()));
+        }
         router_.PrependMiddleware(
             AUTH_NAMESPACE::MakeMiddleware(auth_manager_.get()));
 
