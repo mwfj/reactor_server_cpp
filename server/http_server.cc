@@ -4796,18 +4796,19 @@ bool HttpServer::Reload(ServerConfig new_config) {
             std::string auth_validate_err;
             if (!auth_manager_->ValidateReload(new_config.auth,
                                                  auth_validate_err)) {
-                // Match AuthManager::Reload's semantics: on auth
-                // rejection, the rest of the reload still applies as
-                // live-safe edits, but auth state stays preserved. A
-                // warn surfaces the rejection without aborting the
-                // whole reload. (The caller can still treat this as a
-                // hard reject by inspecting the operator-visible warn
-                // message; we don't return false because rate-limit /
-                // CB / size-limits remain reloadable.)
-                logging::Get()->warn(
-                    "Auth pre-apply validation rejected the staged "
-                    "config: {} (live state preserved; other reloads "
-                    "still applied)", auth_validate_err);
+                // Fail-fast: abort the entire reload. The docstring
+                // above mandates atomic application — letting later
+                // subsystems (DNS commit, rate_limit, circuit_breaker,
+                // size_limits, H2 settings, request timeouts) apply
+                // while auth is preserved produces a partial reload
+                // the operator did not stage. Mirrors the contract of
+                // auth_manager_->Reload below, which also rejects on
+                // these same conditions; this gate moves the rejection
+                // earlier so no DNS resolution work is wasted.
+                logging::Get()->error(
+                    "Reload rejected: auth pre-apply validation failed: "
+                    "{}; live state preserved", auth_validate_err);
+                return false;
             }
         }
     }
