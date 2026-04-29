@@ -340,12 +340,23 @@ MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
         }
 
         // Merge legacy JSON with bind/upstream/dns sub-objects via nlohmann,
-        // then append the auth snapshot. nlohmann::json::parse the snprintf
-        // output so sub-objects can be attached with proper escaping; buf
-        // was constructed from known-safe format strings and no user-
-        // supplied free-form strings.
+        // then append the auth snapshot. nlohmann::json::parse needs a
+        // complete document — the snprintf format string above
+        // intentionally OMITS the outer top-level closing brace because
+        // the legacy fallback path below splices auth fields ahead of
+        // its own `body += '}'`. Append the missing brace into a
+        // throwaway parseable copy so json::parse sees a balanced
+        // document; the original `buf` stays unchanged for the fallback
+        // branch. Without this fix, json::parse always threw on the
+        // unmatched opening brace, every /stats request fell back to
+        // the legacy path, bind / upstream / dns sub-objects were never
+        // emitted, and the catch arm logged an error per request.
+        // Construction is from known-safe format strings + no user-
+        // supplied free-form strings, so the parsed result is trusted.
+        std::string parseable(buf);
+        parseable += '}';
         try {
-            nlohmann::json root = nlohmann::json::parse(buf);
+            nlohmann::json root = nlohmann::json::parse(parseable);
             root["bind"]     = BuildBindObject(server);
             root["upstream"] = BuildUpstreamObject(server);
             root["dns"]      = BuildDnsObject(server);
