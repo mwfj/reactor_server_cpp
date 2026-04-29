@@ -7,9 +7,9 @@
 #   make clean  - Remove build artifacts
 #   make help   - Show detailed help
 
-# Compiler and flags
-CXX = g++
-CC = gcc
+# Compiler and flags. CXX/CC use ?= so CI can override via env (e.g. CXX=clang++).
+CXX ?= g++
+CC ?= gcc
 
 # Platform-specific OpenSSL configuration
 # - Linux: OpenSSL headers/libs are in system paths, no extra flags needed
@@ -25,10 +25,13 @@ ifeq ($(UNAME_S),Darwin)
     endif
 endif
 
-CXXFLAGS = -std=c++17 -g -Wall -Iinclude -Ithread_pool/include -Iutil -Itest -Ithird_party -Ithird_party/nghttp2 -Ithird_party/jwt-cpp/include -DJWT_DISABLE_PICOJSON $(OPENSSL_CFLAGS)
-CFLAGS = -g -Wall -Ithird_party/llhttp
-NGHTTP2_CFLAGS = -std=c99 -g -Wall -DHAVE_CONFIG_H -Ithird_party/nghttp2
-LDFLAGS = $(OPENSSL_LDFLAGS) -lpthread -lssl -lcrypto
+# *_EXTRA hooks let CI layer in sanitizers (-fsanitize=...) and other one-off
+# flags without clobbering the project's required compile/link flags. Empty
+# by default; populated via `make CXXFLAGS_EXTRA=...` or env.
+CXXFLAGS = -std=c++17 -g -Wall -Iinclude -Ithread_pool/include -Iutil -Itest -Ithird_party -Ithird_party/nghttp2 -Ithird_party/jwt-cpp/include -DJWT_DISABLE_PICOJSON $(OPENSSL_CFLAGS) $(CXXFLAGS_EXTRA)
+CFLAGS = -g -Wall -Ithird_party/llhttp $(CFLAGS_EXTRA)
+NGHTTP2_CFLAGS = -std=c99 -g -Wall -DHAVE_CONFIG_H -Ithird_party/nghttp2 $(NGHTTP2_CFLAGS_EXTRA)
+LDFLAGS = $(OPENSSL_LDFLAGS) -lpthread -lssl -lcrypto $(LDFLAGS_EXTRA)
 
 # Directories
 SERVER_DIR = server
