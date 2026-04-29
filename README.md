@@ -1,15 +1,18 @@
-# Reactor pattern based HTTP/Websocket Server
+# Reactor Pattern HTTP/WebSocket Server
 
-A high-performance C++ network server built on the Reactor pattern with epoll/kqueue I/O multiplexing. Supports HTTP/1.1, HTTP/2 (RFC 9113), WebSocket (RFC 6455), and TLS — all layered on top of a non-blocking, edge-triggered event loop designed for thousands of concurrent connections.
+A C++17 network server and gateway built on the Reactor pattern. It uses non-blocking, edge-triggered I/O (`epoll` on Linux, `kqueue` on macOS) and includes HTTP/1.1, HTTP/2, WebSocket, TLS, upstream proxying, rate limiting, circuit breaking, DNS resolution, and OAuth 2.0 bearer-token validation.
 
 ## Features
 
-- **HTTP/1.1** — request routing, middleware, keep-alive, pipelining, chunked transfer
-- **HTTP/2** — RFC 9113 compliant: stream multiplexing, HPACK, flow control, ALPN negotiation, flood protection
-- **WebSocket** — RFC 6455 compliant: handshake, binary/text frames, fragmentation, close handshake, ping/pong
-- **TLS/SSL** — optional OpenSSL 3.x integration with configurable minimum version and cipher suites
-- **Upstream Proxy** — per-service connection pools with TLS, request forwarding, retry policy, header rewriting (XFF, Via, Host)
-- **Rate Limiting** — per-client / per-route token-bucket middleware with sharded state, LRU eviction, IETF `RateLimit-*` headers, dry-run mode, hot-reloadable
+- **HTTP/1.1** — request routing, middleware, keep-alive, pipelining, chunked transfer, strict parser validation
+- **HTTP/2** — RFC 9113 support: stream multiplexing, HPACK, flow control, h2c detection, TLS ALPN, Early Hints, optional server push
+- **WebSocket** — RFC 6455 support: handshake, binary/text frames, fragmentation, close handshake, ping/pong
+- **TLS/SSL** — OpenSSL 3.x integration for downstream server TLS and upstream client TLS
+- **Upstream Proxy** — per-service connection pools with TLS, streaming response relay, retry policy, trailer handling, and header rewriting
+- **Rate Limiting** — per-client / per-route token-bucket middleware with LRU eviction, `RateLimit-*` headers, dry-run mode, hot reload
+- **Circuit Breaking** — per-upstream state machines, retry budgets, dry-run mode, wait-queue drain, hot-reloadable breaker tuning
+- **OAuth 2.0 Token Validation** — JWT validation with JWKS/OIDC discovery, multi-issuer policies, outbound identity headers, and RFC 7662 introspection mode
+- **DNS and IPv6** — bind-host and upstream hostname resolution, IPv4/IPv6 family selection, stale-on-error reload handling
 - **Reactor Core** — edge-triggered epoll (Linux) / kqueue (macOS), non-blocking I/O, multi-threaded dispatcher pool
 - **Thread Pool** — configurable worker threads for event loop dispatchers
 - **Connection Management** — idle timeout detection, request deadlines (Slowloris protection), graceful shutdown with WS close frames and H2 GOAWAY drain
@@ -63,18 +66,18 @@ make
 ./server_runner version -V
 
 # Show usage
-./server_runner
+./server_runner help
 ```
 
 ### CLI Reference
 
-```
+```text
 server_runner <command> [options]
 
 Commands:
   start       Start the server (foreground, or -d for daemon)
   stop        Stop a running server
-  reload      Reload configuration (daemon: hot-reload, foreground: shutdown)
+  reload      Reload configuration (daemon mode; shuts down foreground)
   status      Check server status
   validate    Validate configuration
   config      Show effective configuration
@@ -84,16 +87,27 @@ Commands:
 Start options:
   -c, --config <file>         Config file (default: config/server.json)
   -p, --port <port>           Override bind port (0-65535, 0=ephemeral)
-  -H, --host <address>        Override bind address (numeric IPv4 only)
-  -l, --log-level <level>     Override log level (trace/debug/info/warn/error/critical)
+  -H, --host <address>        Override bind address: IPv4 literal,
+                              IPv6 literal (bare or bracketed), or hostname
+  -l, --log-level <level>     Override log level
+                              (trace, debug, info, warn, error, critical)
   -w, --workers <N>           Override worker thread count (0 = auto)
   -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)
   -d, --daemonize             Run as a background daemon
-  --no-health-endpoint       Disable /health and /stats endpoints
-  --no-stats-endpoint        Disable the /stats endpoint
+  --no-health-endpoint        Disable the /health endpoint
+  --no-stats-endpoint         Disable the /stats endpoint
 
-Stop/status options:
-  -P, --pid-file <file>       PID file path
+Stop/status/reload options:
+  -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)
+
+Validate/config options:
+  -c, --config <file>         Config file
+  -p, --port <port>           Override bind port
+  -H, --host <address>        Override bind address
+  -l, --log-level <level>     Override log level
+  -w, --workers <N>           Override worker threads
+  -d, --daemonize             Check daemon-mode constraints (validate only)
+  -P, --pid-file <file>       PID file to validate (validate -d only)
 
 Global options:
   -v, --version               Same as 'version'
@@ -116,7 +130,34 @@ Global options:
 defaults < config file < environment variables < CLI flags
 ```
 
-Environment variables: `REACTOR_BIND_HOST`, `REACTOR_BIND_PORT`, `REACTOR_TLS_ENABLED`, `REACTOR_TLS_CERT`, `REACTOR_TLS_KEY`, `REACTOR_LOG_LEVEL`, `REACTOR_LOG_FILE`, `REACTOR_MAX_CONNECTIONS`, `REACTOR_IDLE_TIMEOUT`, `REACTOR_WORKER_THREADS`, `REACTOR_REQUEST_TIMEOUT`
+Environment overrides include:
+
+```text
+REACTOR_BIND_HOST
+REACTOR_BIND_PORT
+REACTOR_TLS_ENABLED
+REACTOR_TLS_CERT
+REACTOR_TLS_KEY
+REACTOR_LOG_LEVEL
+REACTOR_LOG_FILE
+REACTOR_MAX_CONNECTIONS
+REACTOR_IDLE_TIMEOUT
+REACTOR_WORKER_THREADS
+REACTOR_REQUEST_TIMEOUT
+REACTOR_SHUTDOWN_DRAIN_TIMEOUT
+REACTOR_HTTP2_ENABLED
+REACTOR_HTTP2_MAX_CONCURRENT_STREAMS
+REACTOR_HTTP2_INITIAL_WINDOW_SIZE
+REACTOR_HTTP2_MAX_FRAME_SIZE
+REACTOR_HTTP2_MAX_HEADER_LIST_SIZE
+REACTOR_RATE_LIMIT_ENABLED
+REACTOR_RATE_LIMIT_DRY_RUN
+REACTOR_RATE_LIMIT_STATUS_CODE
+REACTOR_DNS_LOOKUP_FAMILY
+REACTOR_DNS_RESOLVE_TIMEOUT_MS
+REACTOR_DNS_OVERALL_TIMEOUT_MS
+REACTOR_DNS_STALE_ON_ERROR
+```
 
 ### Health & Stats Endpoints
 
@@ -138,22 +179,23 @@ Disable with `--no-health-endpoint` (disables both) or `--no-stats-endpoint` (di
 
 ```cpp
 #include "http/http_server.h"
+#include "http/http_status.h"
 
 HttpServer server("0.0.0.0", 8080);
 
 // Middleware
 server.Use([](const HttpRequest& req, HttpResponse& res) {
-    res.Header("X-Request-Id", generate_id());
+    res.Header("X-Request-Id", "example");
     return true;  // continue chain
 });
 
 // Routes
 server.Get("/health", [](const HttpRequest& req, HttpResponse& res) {
-    res.Status(200).Json(R"({"status":"ok"})");
+    res.Status(HttpStatus::OK).Json(R"({"status":"ok"})");
 });
 
 server.Post("/echo", [](const HttpRequest& req, HttpResponse& res) {
-    res.Status(200).Body(req.body, "text/plain");
+    res.Status(HttpStatus::OK).Body(req.body, "text/plain");
 });
 
 server.Start();  // blocks in event loop
@@ -194,13 +236,13 @@ JSON config file:
 
 ```json
 {
-    "bind_host": "0.0.0.0",
+    "bind_host": "127.0.0.1",
     "bind_port": 8080,
     "max_connections": 10000,
     "idle_timeout_sec": 300,
     "worker_threads": 3,
-    "max_body_size": 1048576,
     "max_header_size": 8192,
+    "max_body_size": 1048576,
     "max_ws_message_size": 16777216,
     "request_timeout_sec": 30,
     "shutdown_drain_timeout_sec": 30,
@@ -221,22 +263,126 @@ JSON config file:
         "max_concurrent_streams": 100,
         "initial_window_size": 65535,
         "max_frame_size": 16384,
-        "max_header_list_size": 65536
+        "max_header_list_size": 65536,
+        "enable_push": false
+    },
+    "dns": {
+        "lookup_family": "v4_preferred",
+        "resolve_timeout_ms": 5000,
+        "overall_timeout_ms": 15000,
+        "stale_on_error": true,
+        "resolver_max_inflight": 32
+    },
+    "rate_limit": {
+        "enabled": false,
+        "dry_run": false,
+        "status_code": 429,
+        "include_headers": true,
+        "zones": []
+    },
+    "upstreams": []
+}
+```
+
+`upstreams[]` entries can define connection-pool limits, upstream TLS, proxy route settings, retry behavior, circuit breaker tuning, and inline auth policies. See `config/server.example.json` and [docs/configuration.md](docs/configuration.md) for more examples.
+
+### Proxy, circuit breaker, and auth configuration
+
+The production config can auto-register proxy routes from `upstreams[].proxy.route_prefix`, or application code can call `server.Proxy(pattern, upstream_name)`.
+
+```json
+{
+    "upstreams": [
+        {
+            "name": "api",
+            "host": "api.internal",
+            "port": 8080,
+            "pool": {
+                "max_connections": 64,
+                "max_idle_connections": 16,
+                "connect_timeout_ms": 5000
+            },
+            "proxy": {
+                "route_prefix": "/api",
+                "strip_prefix": true,
+                "methods": ["GET", "POST", "PUT", "DELETE"],
+                "buffering": "auto",
+                "retry": {
+                    "max_retries": 1,
+                    "retry_on_connect_failure": true,
+                    "retry_on_disconnect": true
+                }
+            },
+            "circuit_breaker": {
+                "enabled": true,
+                "consecutive_failure_threshold": 5,
+                "failure_rate_threshold": 50,
+                "minimum_volume": 20,
+                "window_seconds": 10,
+                "retry_budget_percent": 20,
+                "retry_budget_min_concurrency": 3
+            }
+        }
+    ]
+}
+```
+
+OAuth validation is configured as resource-server middleware. JWT mode validates bearer tokens locally against JWKS keys; introspection mode posts opaque tokens to an RFC 7662 endpoint and caches the result.
+
+```json
+{
+    "auth": {
+        "enabled": true,
+        "issuers": {
+            "main": {
+                "issuer_url": "https://issuer.example.com",
+                "discovery": true,
+                "upstream": "issuer",
+                "mode": "jwt",
+                "audiences": ["https://api.example.com"],
+                "algorithms": ["RS256"]
+            }
+        },
+        "policies": [
+            {
+                "name": "api-read",
+                "enabled": true,
+                "applies_to": ["/api"],
+                "issuers": ["main"],
+                "required_scopes": ["api.read"],
+                "on_undetermined": "deny",
+                "realm": "api"
+            }
+        ],
+        "forward": {
+            "subject_header": "X-Auth-Subject",
+            "issuer_header": "X-Auth-Issuer",
+            "scopes_header": "X-Auth-Scopes",
+            "strip_inbound_identity_headers": true,
+            "preserve_authorization": true
+        }
     }
 }
 ```
 
+For opaque tokens, set an issuer to `"mode": "introspection"` and provide `introspection.endpoint`, `client_id`, `client_secret_env`, cache TTLs, and timeout settings. Inline proxy auth is also supported through `upstreams[].proxy.auth`.
+
+Issuer `upstream` values refer to named entries in `upstreams[]`; define one for each identity provider the gateway must call.
+
 ## Architecture
 
 ```
-Layer 5: HttpServer                          (application entry point)
-Layer 4: HttpRouter, WebSocketConnection    (routing, WS message API)
+Layer 6: server_runner, ConfigLoader        (CLI, config, signals, health/stats)
+Layer 5: HttpServer                         (application entry point)
+Layer 4: HttpRouter, AuthManager,           (routing, middleware, OAuth, rate limit)
+         RateLimiter, ProxyHandler
 Layer 3: HttpParser, WebSocketParser        (protocol parsing)
          HttpConnectionHandler              (HTTP/1.1 state machine)
          Http2Session, Http2Stream          (HTTP/2 session/stream management)
          Http2ConnectionHandler             (HTTP/2 state machine)
          ProtocolDetector                   (HTTP/1.x vs HTTP/2 detection)
-Layer 2: TlsContext, TlsConnection          (optional TLS, ALPN)
+Layer 2: TlsContext, TlsConnection,         (TLS, ALPN, hostname resolution)
+         DnsResolver
 Layer 1: ConnectionHandler, Channel,        (reactor core)
          Dispatcher, EventHandler
 ```
@@ -248,22 +394,25 @@ See [docs/architecture.md](docs/architecture.md) for the full design, data flow 
 ```
 reactor_server_cpp/
 ├── include/              # Headers
-│   ├── http/             #   HTTP layer (server, router, parser, request/response)
-│   ├── http2/            #   HTTP/2 layer (session, stream, connection handler)
-│   ├── ws/               #   WebSocket layer (connection, parser, frame, handshake)
-│   ├── tls/              #   TLS layer (context, connection)
-│   ├── upstream/         #   Upstream proxy (pool, proxy handler, retry policy)
-│   ├── rate_limit/       #   Rate limiting (manager, zone, token bucket)
+│   ├── auth/             #   OAuth/JWT/OIDC/introspection validation
+│   ├── circuit_breaker/  #   Circuit breaker and retry budget
 │   ├── cli/              #   CLI layer (parser, signal handler, PID file, version)
 │   ├── config/           #   Configuration (server_config, config_loader)
+│   ├── http/             #   HTTP layer (server, router, parser, request/response)
+│   ├── http2/            #   HTTP/2 layer (session, stream, connection handler)
 │   ├── log/              #   Logging (logger, log_utils)
+│   ├── net/              #   DNS resolver
+│   ├── rate_limit/       #   Rate limiting (manager, zone, token bucket)
+│   ├── tls/              #   TLS layer (context, connection)
+│   ├── upstream/         #   Upstream proxy (pool, proxy handler, retry policy)
+│   ├── ws/               #   WebSocket layer (connection, parser, frame, handshake)
 │   └── *.h               #   Reactor core (dispatcher, channel, connection, etc.)
 ├── server/               # Implementation (.cc)
 │   ├── main.cc           #   Production entry point
 │   └── *.cc              #   All component implementations
-├── test/                 # Test suites (basic, stress, race, timeout, http, ws, tls, http2, cli, route, upstream, proxy, rate_limit, kqueue)
+├── test/                 # Test suites and harnesses
 ├── thread_pool/          # Standalone thread pool (separate build)
-├── third_party/          # llhttp, nghttp2, nlohmann/json, spdlog
+├── third_party/          # llhttp, nghttp2, nlohmann/json, spdlog, jwt-cpp
 ├── config/               # Example config files
 ├── docs/                 # Documentation
 └── Makefile
@@ -274,32 +423,54 @@ reactor_server_cpp/
 ```bash
 make                    # Build both test runner (./test_runner) and server (./server_runner)
 make server             # Build only the production server
-make test               # Build and run all tests (372 tests across 16 suites)
+make test               # Build and run all tests
 make clean              # Remove artifacts
 make help               # Show all targets
 
 # Run specific test suites
-./test_runner basic     # Basic functionality (9 tests)
-./test_runner stress    # Stress tests — 100 concurrent clients (3 tests)
-./test_runner race      # Race condition tests (9 tests)
-./test_runner timeout   # Connection timeout tests (6 tests)
-./test_runner config    # Configuration tests (8 tests)
-./test_runner http      # HTTP protocol tests (21 tests)
-./test_runner ws        # WebSocket protocol tests (10 tests)
-./test_runner tls       # TLS/SSL tests (2 tests)
-./test_runner http2     # HTTP/2 protocol tests (37 tests)
-./test_runner cli       # CLI entry point tests (79 tests)
-./test_runner route     # Route trie/pattern matching (50 tests)
-./test_runner upstream  # Upstream connection pool tests (30 tests)
-./test_runner proxy     # Proxy engine tests (56 tests)
-./test_runner rate_limit # Rate limit tests (46 tests)
-./test_runner kqueue    # macOS kqueue platform tests (7 tests, skipped on Linux)
+./test_runner basic
+./test_runner stress
+./test_runner race
+./test_runner timeout
+./test_runner config
+./test_runner http
+./test_runner ws
+./test_runner tls
+./test_runner http2
+./test_runner cli
+./test_runner route
+./test_runner upstream
+./test_runner proxy
+./test_runner rate_limit
+./test_runner circuit_breaker
+./test_runner auth
+./test_runner jwt
+./test_runner jwks
+./test_runner oidc
+./test_runner hrauth
+./test_runner auth_mgr
+./test_runner auth2
+./test_runner auth_fail
+./test_runner auth_reload
+./test_runner auth_multi
+./test_runner auth_ws
+./test_runner auth_race
+./test_runner router_async
+./test_runner introspection_cache
+./test_runner intro_client
+./test_runner auth_intro
+./test_runner dual_stack
+./test_runner kqueue    # macOS only; skipped on Linux
+./test_runner help      # Show all runner options
 
 # Thread pool subproject (independent)
-cd thread_pool && make && ./run
+make -C thread_pool
+./thread_pool/run
 ```
 
-**Requirements:** g++ (C++17), pthreads, OpenSSL 3.x (libssl-dev)
+`make test_dual_stack_tsan` builds and runs the ThreadSanitizer dual-stack race subset.
+
+**Requirements:** g++ or clang++ with C++17 support, pthreads, OpenSSL 3.x development headers/libraries, and make.
 
 ## Documentation
 
@@ -313,12 +484,14 @@ cd thread_pool && make && ./run
 | [docs/http2.md](docs/http2.md) | HTTP/2 layer — streams, HPACK, flow control, ALPN |
 | [docs/websocket.md](docs/websocket.md) | WebSocket — upgrade flow, frames, message API, RFC 6455 compliance |
 | [docs/tls.md](docs/tls.md) | TLS/SSL — configuration, state machine, OpenSSL integration |
-| [docs/configuration.md](docs/configuration.md) | JSON config, environment variables, rate limiting, structured logging |
+| [docs/configuration.md](docs/configuration.md) | JSON config, environment variables, DNS, upstreams, rate limiting, structured logging |
+| [docs/oauth2.md](docs/oauth2.md) | OAuth 2.0 JWT and introspection validation |
+| [docs/circuit_breaker.md](docs/circuit_breaker.md) | Circuit breaker configuration, retry budgets, hot reload, observability |
 
 ## Platform Support
 
 | Platform | Status |
 |----------|--------|
-| Linux (epoll) | Production-ready |
-| macOS (kqueue) | Production-ready |
-| Windows (IOCP) | Planned |
+| Linux (`epoll`) | Supported |
+| macOS (`kqueue`) | Supported |
+| Windows | Not implemented |
