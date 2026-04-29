@@ -11,8 +11,8 @@ class Dispatcher;
 namespace AUTH_NAMESPACE {
 
 class JwksCache;
-class JwksFetcher;       // Defined in jwks_fetcher.h (Phase B)
-class OidcDiscovery;     // Defined in oidc_discovery.h (Phase B)
+class JwksFetcher;       // Defined in jwks_fetcher.h
+class OidcDiscovery;     // Defined in oidc_discovery.h
 class UpstreamHttpClient;
 class IntrospectionCache;
 

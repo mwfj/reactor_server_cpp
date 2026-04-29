@@ -85,6 +85,101 @@ struct RequestGuard {
     RequestGuard& operator=(const RequestGuard&) = delete;
 };
 
+namespace {
+
+// Build the resume callback for a suspended async-middleware request.
+// Shared by the H1 and H2 paths — the outer scaffolding (handle.lock,
+// GetConnection guard, payload heap-copy, RunOnDispatcher, cancelled
+// check, exception-safe finalizer + DispatchHandler, do_bookkeeping)
+// is identical between the two; only three protocol-specific callables
+// differ:
+//
+//   pre_dispatch(handle) -> bool
+//     Runs after the cancelled-check, before the dispatch try-block.
+//     Return false to drop the resume (do_bookkeeping fires, no submit).
+//     May have side effects.
+//       H1: returns h.IsAsyncResponsePending().
+//       H2: erases the stream's abort hook and returns true.
+//
+//   tweak_response(resp, threw)
+//     Runs after the try/catch, before submit. Lets the protocol layer
+//     stamp Connection: close (H1) or no-op (H2) based on shutdown
+//     state and whether the user handler threw.
+//
+//   submit(handle, resp)
+//     Sends the final response.
+//       H1: ClearDeferred + CompleteAsyncResponse (close handled inside).
+//       H2: SubmitStreamResponse(stream_id, resp).
+//
+// Lifetime: state, req, resp are shared_ptrs captured by value; HandlerT
+// is held weakly and re-locked at each invocation so a torn-down
+// connection short-circuits to bookkeeping cleanup.
+template <typename HandlerT, typename PreDispatch,
+          typename TweakResp, typename SubmitFn>
+std::function<void(HttpRouter::AsyncMiddlewarePayload)>
+MakeAsyncResumeCallback(
+        HttpRouter& router,
+        std::weak_ptr<HandlerT> handler_weak,
+        std::shared_ptr<HttpRequest> req,
+        std::shared_ptr<HttpResponse> resp,
+        std::shared_ptr<HttpRouter::AsyncPendingState> state,
+        PreDispatch pre_dispatch,
+        TweakResp tweak_response,
+        SubmitFn submit) {
+    return [&router, handler_weak, req, resp, state,
+            pre_dispatch = std::move(pre_dispatch),
+            tweak_response = std::move(tweak_response),
+            submit = std::move(submit)]
+        (HttpRouter::AsyncMiddlewarePayload payload) mutable {
+        auto do_bookkeeping = [state]() { state->DecrementOnce(); };
+        auto handle = handler_weak.lock();
+        if (!handle) { do_bookkeeping(); return; }
+        auto conn = handle->GetConnection();
+        if (!conn) { do_bookkeeping(); return; }
+        auto shared_payload =
+            std::make_shared<HttpRouter::AsyncMiddlewarePayload>(
+                std::move(payload));
+        conn->RunOnDispatcher(
+            [&router, handle, req, resp, state, shared_payload, do_bookkeeping,
+             pre_dispatch, tweak_response, submit]() mutable {
+            if (state->cancelled()) { do_bookkeeping(); return; }
+            if (!pre_dispatch(*handle)) { do_bookkeeping(); return; }
+            // Mirror the sync-path catch in HttpConnectionHandler: on
+            // user-handler / finalizer throw, replace the in-flight
+            // response with a generic 500 so the client always gets a
+            // reply and active_requests_ is released via do_bookkeeping
+            // at the end. Never leak e.what() over the wire.
+            bool threw = false;
+            try {
+                if (shared_payload->finalizer) {
+                    shared_payload->finalizer(*req, *resp);
+                }
+                if (shared_payload->result ==
+                        HttpRouter::AsyncMiddlewareResult::PASS) {
+                    if (!router.DispatchHandler(*req, *resp)) {
+                        resp->Status(HttpStatus::NOT_FOUND).Text("Not Found");
+                    }
+                }
+            } catch (const std::exception& e) {
+                threw = true;
+                logging::Get()->error(
+                    "Exception in resumed request handler: {}", e.what());
+                *resp = HttpResponse::InternalError();
+            }
+            tweak_response(*resp, threw);
+            try {
+                submit(*handle, *resp);
+            } catch (const std::exception& e) {
+                logging::Get()->error(
+                    "Exception sending resumed response: {}", e.what());
+            }
+            do_bookkeeping();
+        });
+    };
+}
+
+}  // namespace
+
 // Thread-local scope flag that lets MarkServerReady's internal
 // registration pass (pending_proxy_routes_ + RegisterProxyRoutes) call
 // back through the public entry points without tripping the startup
@@ -3424,72 +3519,33 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 // Capture state by VALUE — RunOnDispatcher enqueues for
                 // a future tick. `this` (HttpServer) outlives the
                 // connection: RemoveConnection trips the abort hook
-                // before the resume can run.
-                auto resume_cb =
-                    [this, h1_weak, req_copy, resp_copy, state]
-                    (HttpRouter::AsyncMiddlewarePayload payload) {
-                    auto do_bookkeeping = [state]() {
-                        state->DecrementOnce();
-                    };
-                    auto h1 = h1_weak.lock();
-                    if (!h1) { do_bookkeeping(); return; }
-                    auto conn = h1->GetConnection();
-                    if (!conn) { do_bookkeeping(); return; }
-                    auto shared_payload =
-                        std::make_shared<HttpRouter::AsyncMiddlewarePayload>(
-                            std::move(payload));
-                    conn->RunOnDispatcher(
-                        [this, h1, req_copy, resp_copy, state,
-                         shared_payload, do_bookkeeping]() mutable {
-                        if (state->cancelled()) {
-                            do_bookkeeping();
-                            return;
-                        }
-                        if (!h1->IsAsyncResponsePending()) {
-                            do_bookkeeping();
-                            return;
-                        }
-                        // Mirror the sync-path catch in
-                        // HttpConnectionHandler: on user-handler /
-                        // finalizer throw, replace the in-flight response
-                        // with a generic 500 + Connection: close so the
-                        // client always gets a reply and active_requests_
-                        // is released via do_bookkeeping at the end. Never
-                        // leak e.what() over the wire.
-                        try {
-                            if (shared_payload->finalizer) {
-                                shared_payload->finalizer(*req_copy, *resp_copy);
-                            }
-                            if (shared_payload->result ==
-                                    HttpRouter::AsyncMiddlewareResult::PASS) {
-                                if (!router_.DispatchHandler(
-                                        *req_copy, *resp_copy)) {
-                                    resp_copy->Status(HttpStatus::NOT_FOUND)
-                                              .Text("Not Found");
-                                }
-                                if (!server_ready_.load(
-                                        std::memory_order_acquire)) {
-                                    resp_copy->Header("Connection", "close");
-                                }
-                            }
-                        } catch (const std::exception& e) {
-                            logging::Get()->error(
-                                "Exception in resumed request handler: {}",
-                                e.what());
-                            *resp_copy = HttpResponse::InternalError();
-                            resp_copy->Header("Connection", "close");
-                        }
-                        resp_copy->ClearDeferred();
-                        try {
-                            h1->CompleteAsyncResponse(std::move(*resp_copy));
-                        } catch (const std::exception& e) {
-                            logging::Get()->error(
-                                "Exception sending resumed response: {}",
-                                e.what());
-                        }
-                        do_bookkeeping();
-                    });
+                // before the resume can run. Protocol-specific bits go
+                // into the three callables below; the common scaffolding
+                // is in MakeAsyncResumeCallback.
+                auto pre_dispatch =
+                    [](HttpConnectionHandler& h) -> bool {
+                    return h.IsAsyncResponsePending();
                 };
+                auto tweak_response =
+                    [this](HttpResponse& r, bool threw) {
+                    // H1 sets Connection: close on either the catch path
+                    // (always) or the success path during shutdown (so a
+                    // keep-alive client is told the socket won't be reused).
+                    if (threw ||
+                        !server_ready_.load(std::memory_order_acquire)) {
+                        r.Header("Connection", "close");
+                    }
+                };
+                auto submit =
+                    [](HttpConnectionHandler& h, HttpResponse& r) {
+                    r.ClearDeferred();
+                    h.CompleteAsyncResponse(std::move(r));
+                };
+                auto resume_cb = MakeAsyncResumeCallback(
+                    router_, h1_weak, req_copy, resp_copy, state,
+                    std::move(pre_dispatch),
+                    std::move(tweak_response),
+                    std::move(submit));
 
                 state->ArmResume(std::move(resume_cb), active_counter_local);
                 guard.release();
@@ -4455,61 +4511,32 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     state->TripCancel();
                 });
 
-                auto resume_cb =
-                    [this, h2_weak, stream_id, req_copy, resp_copy, state]
-                    (HttpRouter::AsyncMiddlewarePayload payload) {
-                    auto do_bookkeeping = [state]() {
-                        state->DecrementOnce();
-                    };
-                    auto h2 = h2_weak.lock();
-                    if (!h2) { do_bookkeeping(); return; }
-                    auto conn = h2->GetConnection();
-                    if (!conn) { do_bookkeeping(); return; }
-                    auto shared_payload =
-                        std::make_shared<HttpRouter::AsyncMiddlewarePayload>(
-                            std::move(payload));
-                    conn->RunOnDispatcher(
-                        [this, h2, stream_id, req_copy, resp_copy, state,
-                         shared_payload, do_bookkeeping]() mutable {
-                        if (state->cancelled()) {
-                            do_bookkeeping();
-                            return;
-                        }
-                        h2->EraseStreamAbortHook(stream_id);
-                        // Mirror the sync-path contract: on user-handler
-                        // / finalizer throw, replace the response with a
-                        // generic 500 so the stream still completes and
-                        // active_requests_ is released. H2 has no
-                        // Connection: close — graceful shutdown handles
-                        // GOAWAY/RST_STREAM separately.
-                        try {
-                            if (shared_payload->finalizer) {
-                                shared_payload->finalizer(*req_copy, *resp_copy);
-                            }
-                            if (shared_payload->result ==
-                                    HttpRouter::AsyncMiddlewareResult::PASS) {
-                                if (!router_.DispatchHandler(
-                                        *req_copy, *resp_copy)) {
-                                    resp_copy->Status(HttpStatus::NOT_FOUND)
-                                              .Text("Not Found");
-                                }
-                            }
-                        } catch (const std::exception& e) {
-                            logging::Get()->error(
-                                "Exception in resumed H2 request handler: {}",
-                                e.what());
-                            *resp_copy = HttpResponse::InternalError();
-                        }
-                        try {
-                            h2->SubmitStreamResponse(stream_id, *resp_copy);
-                        } catch (const std::exception& e) {
-                            logging::Get()->error(
-                                "Exception submitting resumed H2 response: {}",
-                                e.what());
-                        }
-                        do_bookkeeping();
-                    });
+                // Protocol-specific bits go into the three callables below;
+                // the common scaffolding is in MakeAsyncResumeCallback.
+                auto pre_dispatch =
+                    [stream_id](Http2ConnectionHandler& h) -> bool {
+                    // Erasing the abort hook here (matching the sync-path
+                    // contract) prevents a late RST_STREAM from racing
+                    // with the in-flight response submission. Always
+                    // proceed — H2 has no per-handler "is response
+                    // pending" gate distinct from cancelled/aborted.
+                    h.EraseStreamAbortHook(stream_id);
+                    return true;
                 };
+                auto tweak_response =
+                    [](HttpResponse&, bool) {
+                    // H2 has no Connection: close — graceful shutdown
+                    // handles GOAWAY/RST_STREAM separately.
+                };
+                auto submit =
+                    [stream_id](Http2ConnectionHandler& h, HttpResponse& r) {
+                    h.SubmitStreamResponse(stream_id, r);
+                };
+                auto resume_cb = MakeAsyncResumeCallback(
+                    router_, h2_weak, req_copy, resp_copy, state,
+                    std::move(pre_dispatch),
+                    std::move(tweak_response),
+                    std::move(submit));
 
                 state->ArmResume(std::move(resume_cb), active_counter_local);
                 guard.release();

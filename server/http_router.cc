@@ -868,6 +868,8 @@ void HttpRouter::PopulateRouteParams(const HttpRequest& request) {
     }
 }
 
+// FIXME: Is some potential issue on this logic: either all success or all failed?
+//        Should we convert it to accept the partial success?
 bool HttpRouter::RunMiddleware(const HttpRequest& request, HttpResponse& response) {
     PopulateRouteParams(request);
     for (const auto& mw : middlewares_) {

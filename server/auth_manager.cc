@@ -1060,6 +1060,321 @@ std::chrono::seconds ClampPositiveTtl(int cache_sec,
     return std::chrono::seconds{ttl};
 }
 
+// Inputs needed by the introspection completion callback. Built by both
+// InvokeAsyncIntrospection (cached) and InvokeIntrospectionUncached
+// (uncached); the only behavioral differences between the two paths
+// live in three fields — enable_cache_ops, cache_key, cache_log_label
+// (and the optional intro_stale_served counter pointer).
+//
+// Counter pointers reference AuthManager's atomics. They survive the
+// closure because AuthManager outlives every in-flight transaction:
+// AuthManager::Stop drives Issuer::Stop which flips the cancel token
+// before AuthManager destruction, so weak_issuer.lock() returns null
+// in the closure before any counter increment runs post-destruction.
+struct IntrospectionDoneCtx {
+    // Identity / suspend state
+    std::shared_ptr<HttpRouter::AsyncPendingState> state;
+    std::weak_ptr<Issuer> weak_issuer;
+    uint64_t gen = 0;
+    std::string token;
+
+    // Per-request snapshot (immutable for the lifetime of the call)
+    std::string sanitized_req_path;
+    std::string realm;
+    std::string issuer_name;
+    std::string policy_name;
+    std::string on_undetermined;
+    std::vector<std::string> required_scopes;
+    std::string raw_jwt_header;
+    int retry_after_sec = 0;
+    AuthPolicy policy;
+    std::vector<std::string> snap_audiences;
+    std::vector<std::string> snap_required_claims;
+
+    // Observability counters
+    std::atomic<uint64_t>* total_undetermined = nullptr;
+    std::atomic<uint64_t>* total_allowed = nullptr;
+    std::atomic<uint64_t>* total_denied = nullptr;
+    std::atomic<uint64_t>* intro_ok = nullptr;
+    std::atomic<uint64_t>* intro_fail = nullptr;
+    std::atomic<uint64_t>* intro_stale_served = nullptr;  // null on uncached path
+
+    // Cache control
+    bool enable_cache_ops = false;
+    std::string cache_key;          // non-empty only when enable_cache_ops=true
+    const char* cache_log_label = "miss";  // "miss" (cached) or "uncached"
+};
+
+// Build the dispatcher-thread completion callback shared by the cached
+// and uncached introspection paths. Behavior differences are encoded in
+// IntrospectionDoneCtx (enable_cache_ops gates the cache-insert + stale-
+// serve block; cache_log_label rides into the auth_allow debug log).
+IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
+        IntrospectionDoneCtx c) {
+    return [c = std::move(c)](IntrospectionClient::Result result) mutable {
+        AsyncMiddlewarePayload payload;
+
+        // Build an UNDETERMINED payload (used by drop guards AND by the
+        // genuine UNDETERMINED outcome branch). Mirrors the JWT path's
+        // observability: increment total_undetermined, emit the warn log,
+        // and on `allow` stamp an advisory ctx with policy_name + issuer.
+        auto build_undetermined = [&](std::string log_reason) {
+            if (c.on_undetermined == kOnUndeterminedAllow) {
+                payload.result = AsyncMiddlewareResult::PASS;
+                payload.finalizer =
+                    [issuer_name = c.issuer_name,
+                     policy_name = c.policy_name,
+                     sanitized_req_path = c.sanitized_req_path,
+                     log_reason,
+                     total_undetermined = c.total_undetermined]
+                    (const HttpRequest& r, HttpResponse&) {
+                    // intro_fail is incremented at the cache-insert site
+                    // for outcomes from a real IdP roundtrip; drop-guard
+                    // UNDETERMINED paths bypass the cache site by design
+                    // and intentionally do NOT count as introspection_fail
+                    // — those are issuer-state failures, not IdP failures.
+                    total_undetermined->fetch_add(
+                        1, std::memory_order_relaxed);
+                    logging::Get()->warn(
+                        "auth_undetermined route={} issuer={} reason={} policy={}",
+                        sanitized_req_path,
+                        logging::SanitizeLogValue(issuer_name),
+                        log_reason,
+                        logging::SanitizeLogValue(policy_name));
+                    AuthContext advisory;
+                    advisory.undetermined = true;
+                    advisory.policy_name = policy_name;
+                    advisory.issuer = issuer_name;
+                    r.auth.emplace(std::move(advisory));
+                };
+            } else {
+                payload.result = AsyncMiddlewareResult::DENY;
+                payload.finalizer =
+                    [realm = c.realm,
+                     retry_after_sec = c.retry_after_sec,
+                     issuer_name = c.issuer_name,
+                     policy_name = c.policy_name,
+                     sanitized_req_path = c.sanitized_req_path,
+                     log_reason,
+                     total_undetermined = c.total_undetermined]
+                    (const HttpRequest&, HttpResponse& rs) {
+                    total_undetermined->fetch_add(
+                        1, std::memory_order_relaxed);
+                    logging::Get()->warn(
+                        "auth_undetermined route={} issuer={} reason={} policy={}",
+                        sanitized_req_path,
+                        logging::SanitizeLogValue(issuer_name),
+                        log_reason,
+                        logging::SanitizeLogValue(policy_name));
+                    rs = MakeServiceUnavailable(
+                        realm, retry_after_sec,
+                        "authentication unavailable");
+                };
+            }
+        };
+
+        // Drop guards must STILL Complete — otherwise the suspended
+        // request is orphaned and active_requests_ leaks until the
+        // heartbeat safety-cap fires.
+        auto issuer_strong = c.weak_issuer.lock();
+        if (!issuer_strong) {
+            build_undetermined("issuer_unavailable");
+            c.state->Complete(std::move(payload));
+            return;
+        }
+        if (c.gen != issuer_strong->generation()) {
+            build_undetermined("reload_in_flight");
+            c.state->Complete(std::move(payload));
+            return;
+        }
+        if (issuer_strong->stopping()) {
+            build_undetermined("issuer_stopping");
+            c.state->Complete(std::move(payload));
+            return;
+        }
+
+        // Cache-insert decision is gated on the explicit idp_active
+        // flag set by ParseResponseSafe. Negative entries land ONLY
+        // for explicit `active: false` responses — policy-scoped
+        // denials (audience/scope/required_claims fail on
+        // active: true) keep the positive entry so a different
+        // policy may legitimately ALLOW the same token. Skipped
+        // entirely on the uncached path.
+        if (c.enable_cache_ops) {
+            if (auto* cache = issuer_strong->introspection_cache()) {
+                if (result.idp_active) {
+                    auto snap_now = issuer_strong->LoadSnapshot();
+                    if (snap_now) {
+                        auto ttl = ClampPositiveTtl(
+                            snap_now->introspection.cache_sec,
+                            result.exp_from_resp,
+                            std::chrono::system_clock::now());
+                        if (ttl > std::chrono::seconds{0}) {
+                            cache->Insert(c.cache_key, result.ctx,
+                                          /*active=*/true, ttl);
+                        }
+                    }
+                } else if (result.vr.outcome == VerifyOutcome::DENY_401 &&
+                           result.vr.log_reason == "introspection_inactive") {
+                    auto snap_now = issuer_strong->LoadSnapshot();
+                    if (snap_now) {
+                        cache->Insert(
+                            c.cache_key, AuthContext{}, /*active=*/false,
+                            std::chrono::seconds{
+                                snap_now->introspection.negative_cache_sec});
+                    }
+                } else if (result.vr.outcome == VerifyOutcome::UNDETERMINED) {
+                    // Live POST failed (timeout, circuit_open, 5xx, etc.) —
+                    // last-resort stale-serve from a positive entry within
+                    // grace, before producing the policy's UNDETERMINED
+                    // response. NEVER stale-serves negative entries
+                    // (LookupStale enforces that invariant). Re-run policy
+                    // checks against the stale ctx so cross-policy reuse
+                    // stays correct.
+                    auto stale = cache->LookupStale(
+                        c.cache_key, std::chrono::steady_clock::now());
+                    if (stale.state == IntrospectionCache::LookupState::Stale
+                            && stale.active) {
+                        IssuerSnapshot snap_for_check;
+                        snap_for_check.audiences = c.snap_audiences;
+                        snap_for_check.required_claims = c.snap_required_claims;
+                        VerifyResult vr_stale = RunPolicyAndIssuerClaimChecks(
+                            c.policy, snap_for_check, stale.ctx);
+                        if (vr_stale.outcome == VerifyOutcome::ALLOW) {
+                            result.vr = VerifyResult::Allow();
+                            result.ctx = std::move(stale.ctx);
+                            if (c.intro_stale_served) {
+                                c.intro_stale_served->fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Layer issuer-level audience fallback + required_claims on top
+        // of IntrospectionClient's policy-only check. Cache write above
+        // already used the un-overridden ctx so cross-policy reuse stays
+        // intact — the override only affects THIS request's response.
+        // Skips stale-promoted ctx (already policy-checked above).
+        if (result.idp_active &&
+            result.vr.outcome == VerifyOutcome::ALLOW) {
+            IssuerSnapshot snap_for_check;
+            snap_for_check.audiences = c.snap_audiences;
+            snap_for_check.required_claims = c.snap_required_claims;
+            VerifyResult vr_full = RunPolicyAndIssuerClaimChecks(
+                c.policy, snap_for_check, result.ctx);
+            if (vr_full.outcome != VerifyOutcome::ALLOW) {
+                result.vr = std::move(vr_full);
+            }
+        }
+
+        // IdP-outcome counters fire HERE — AFTER the issuer-level
+        // re-check so the final result.vr.outcome is what gets counted.
+        // Critically, this fires REGARDLESS of whether the resume_cb is
+        // later armed; async-route warmup paths (which 503 the client
+        // and never run the finalizer) still increment intro_ok /
+        // intro_fail correctly. total_allowed / total_denied stay in
+        // the finalizer because those track CLIENT-VISIBLE verdicts.
+        if (result.vr.outcome == VerifyOutcome::ALLOW) {
+            c.intro_ok->fetch_add(1, std::memory_order_relaxed);
+        } else {
+            c.intro_fail->fetch_add(1, std::memory_order_relaxed);
+        }
+
+        switch (result.vr.outcome) {
+          case VerifyOutcome::ALLOW: {
+              payload.result = AsyncMiddlewareResult::PASS;
+              AuthContext ctx = result.ctx;
+              payload.finalizer =
+                  [ctx = std::move(ctx),
+                   issuer_name = c.issuer_name,
+                   policy_name = c.policy_name,
+                   sanitized_req_path = c.sanitized_req_path,
+                   raw_jwt_header = c.raw_jwt_header,
+                   token = c.token,
+                   total_allowed = c.total_allowed,
+                   cache_log_label = c.cache_log_label]
+                  (const HttpRequest& r, HttpResponse&) {
+                  AuthContext local_ctx = ctx;
+                  local_ctx.policy_name = policy_name;
+                  if (local_ctx.issuer.empty())
+                      local_ctx.issuer = issuer_name;
+                  if (!raw_jwt_header.empty()) {
+                      local_ctx.raw_token = token;
+                  }
+                  r.auth.emplace(std::move(local_ctx));
+                  total_allowed->fetch_add(
+                      1, std::memory_order_relaxed);
+                  if (auto lg = logging::Get();
+                          lg->should_log(spdlog::level::debug)) {
+                      lg->debug(
+                          "auth_allow route={} issuer={} sub={} policy={} cache={}",
+                          sanitized_req_path,
+                          logging::SanitizeLogValue(issuer_name),
+                          logging::SanitizeLogValue(
+                              r.auth ? r.auth->subject : std::string{}),
+                          logging::SanitizeLogValue(policy_name),
+                          cache_log_label);
+                  }
+              };
+              break;
+          }
+          case VerifyOutcome::DENY_401: {
+              payload.result = AsyncMiddlewareResult::DENY;
+              payload.finalizer =
+                  [realm = c.realm,
+                   ec = result.vr.error_code,
+                   desc = result.vr.error_description,
+                   log_reason = result.vr.log_reason,
+                   issuer_name = c.issuer_name,
+                   sanitized_req_path = c.sanitized_req_path,
+                   policy_name = c.policy_name,
+                   total_denied = c.total_denied]
+                  (const HttpRequest&, HttpResponse& rs) {
+                  rs = MakeUnauthorized(realm, ec, desc);
+                  total_denied->fetch_add(1, std::memory_order_relaxed);
+                  logging::Get()->info(
+                      "auth_deny route={} issuer={} reason={} policy={}",
+                      sanitized_req_path,
+                      logging::SanitizeLogValue(issuer_name),
+                      log_reason,
+                      logging::SanitizeLogValue(policy_name));
+              };
+              break;
+          }
+          case VerifyOutcome::DENY_403: {
+              payload.result = AsyncMiddlewareResult::DENY;
+              payload.finalizer =
+                  [realm = c.realm,
+                   desc = result.vr.error_description,
+                   scopes = c.required_scopes,
+                   sanitized_req_path = c.sanitized_req_path,
+                   issuer_name = c.issuer_name,
+                   policy_name = c.policy_name,
+                   log_reason = result.vr.log_reason,
+                   total_denied = c.total_denied]
+                  (const HttpRequest&, HttpResponse& rs) {
+                  rs = MakeForbidden(realm, desc, scopes);
+                  total_denied->fetch_add(1, std::memory_order_relaxed);
+                  logging::Get()->info(
+                      "auth_deny route={} issuer={} reason={} policy={}",
+                      sanitized_req_path,
+                      logging::SanitizeLogValue(issuer_name),
+                      log_reason,
+                      logging::SanitizeLogValue(policy_name));
+              };
+              break;
+          }
+          case VerifyOutcome::UNDETERMINED:
+              build_undetermined(result.vr.log_reason);
+              break;
+        }
+        c.state->Complete(std::move(payload));
+    };
+}
+
 }  // namespace
 
 void AuthManager::InvokeAsyncIntrospection(
@@ -1248,276 +1563,56 @@ void AuthManager::InvokeAsyncIntrospection(
     auto* intro_fail_ptr = &introspection_fail_;
     auto* intro_stale_ptr = &introspection_stale_served_;
 
+    // Bind each Verify() argument to a named local so the call site
+    // matches the header's parameter list one-line-per-parameter.
+    const std::string& endpoint      = snap.introspection_endpoint;
+    const std::string& client_id     = snap.introspection.client_id;
+    const std::string  client_secret = issuer->client_secret();
+    const std::string& auth_style    = snap.introspection.auth_style;
+
+    // Build the introspection completion callback via the shared factory
+    // (cached path: enable_cache_ops=true, cache_log_label="miss",
+    // intro_stale_served counter wired in for stale-serve).
+    IntrospectionDoneCtx done_ctx;
+    done_ctx.state                = state;
+    done_ctx.weak_issuer          = weak_issuer;
+    done_ctx.gen                  = gen;
+    done_ctx.token                = token;
+    done_ctx.sanitized_req_path   = sanitized_req_path;
+    done_ctx.realm                = realm_local;
+    done_ctx.issuer_name          = issuer_name;
+    done_ctx.policy_name          = policy_name;
+    done_ctx.on_undetermined      = on_undet;
+    done_ctx.required_scopes      = required_scopes;
+    done_ctx.raw_jwt_header       = raw_jwt_header;
+    done_ctx.retry_after_sec      = retry_after_sec;
+    done_ctx.policy               = policy_copy;
+    done_ctx.snap_audiences       = snap_audiences;
+    done_ctx.snap_required_claims = snap_required_claims;
+    done_ctx.total_undetermined   = total_undet_ptr;
+    done_ctx.total_allowed        = total_allow_ptr;
+    done_ctx.total_denied         = total_deny_ptr;
+    done_ctx.intro_ok             = intro_ok_ptr;
+    done_ctx.intro_fail           = intro_fail_ptr;
+    done_ctx.intro_stale_served   = intro_stale_ptr;
+    done_ctx.enable_cache_ops     = true;
+    done_ctx.cache_key            = key;
+    done_ctx.cache_log_label      = "miss";
+    IntrospectionClient::DoneCallback on_verify_done =
+        MakeIntrospectionDoneCallback(std::move(done_ctx));
+
     introspection_client_->Verify(
-        weak_issuer, snap.introspection_endpoint,
-        snap.introspection.client_id, issuer->client_secret(),
-        snap.introspection.auth_style, token, dispatcher_idx,
-        policy_copy, claim_keys, gen,
-        [state, weak_issuer, gen, key, realm_local, issuer_name,
-         sanitized_req_path, policy_name, on_undet, required_scopes,
-         raw_jwt_header, retry_after_sec, token,
-         total_undet_ptr, total_allow_ptr, total_deny_ptr,
-         intro_ok_ptr, intro_fail_ptr, intro_stale_ptr,
-         policy_copy, snap_audiences, snap_required_claims]
-        (IntrospectionClient::Result result) {
-            AsyncMiddlewarePayload payload;
-
-            // Build an UNDETERMINED payload (used by drop guards AND by
-            // the genuine UNDETERMINED outcome branch). Mirrors the JWT
-            // UNDETERMINED observability: increment total_undetermined_,
-            // emit auth_undetermined warn log, on `allow` stamp advisory
-            // ctx with policy_name + issuer.
-            auto build_undetermined = [&](std::string log_reason) {
-                if (on_undet == kOnUndeterminedAllow) {
-                    payload.result = AsyncMiddlewareResult::PASS;
-                    payload.finalizer =
-                        [issuer_name, policy_name, sanitized_req_path,
-                         log_reason, total_undet_ptr]
-                        (const HttpRequest& r, HttpResponse&) {
-                        // intro_fail_ptr is incremented at the cache-
-                        // insert site for outcomes from a real IdP
-                        // roundtrip; drop-guard UNDETERMINED paths
-                        // (issuer_unavailable / reload_in_flight /
-                        // issuer_stopping) bypass the cache site by
-                        // design and intentionally do NOT count as
-                        // introspection_fail — those are issuer-state
-                        // failures, not IdP failures.
-                        total_undet_ptr->fetch_add(
-                            1, std::memory_order_relaxed);
-                        logging::Get()->warn(
-                            "auth_undetermined route={} issuer={} reason={} policy={}",
-                            sanitized_req_path,
-                            logging::SanitizeLogValue(issuer_name),
-                            log_reason,
-                            logging::SanitizeLogValue(policy_name));
-                        AuthContext advisory;
-                        advisory.undetermined = true;
-                        advisory.policy_name = policy_name;
-                        advisory.issuer = issuer_name;
-                        r.auth.emplace(std::move(advisory));
-                    };
-                } else {
-                    payload.result = AsyncMiddlewareResult::DENY;
-                    payload.finalizer =
-                        [realm_local, retry_after_sec, issuer_name,
-                         policy_name, sanitized_req_path, log_reason,
-                         total_undet_ptr]
-                        (const HttpRequest&, HttpResponse& rs) {
-                        total_undet_ptr->fetch_add(
-                            1, std::memory_order_relaxed);
-                        logging::Get()->warn(
-                            "auth_undetermined route={} issuer={} reason={} policy={}",
-                            sanitized_req_path,
-                            logging::SanitizeLogValue(issuer_name),
-                            log_reason,
-                            logging::SanitizeLogValue(policy_name));
-                        rs = MakeServiceUnavailable(
-                            realm_local, retry_after_sec,
-                            "authentication unavailable");
-                    };
-                }
-            };
-
-            // Drop guards must STILL Complete — otherwise the suspended
-            // request is orphaned and active_requests_ leaks until the
-            // heartbeat safety-cap fires.
-            auto issuer_strong = weak_issuer.lock();
-            if (!issuer_strong) {
-                build_undetermined("issuer_unavailable");
-                state->Complete(std::move(payload));
-                return;
-            }
-            if (gen != issuer_strong->generation()) {
-                build_undetermined("reload_in_flight");
-                state->Complete(std::move(payload));
-                return;
-            }
-            if (issuer_strong->stopping()) {
-                build_undetermined("issuer_stopping");
-                state->Complete(std::move(payload));
-                return;
-            }
-
-            // Cache-insert decision is gated on the explicit idp_active
-            // flag set by ParseResponseSafe. Negative entries land ONLY
-            // for explicit `active: false` responses — policy-scoped
-            // denials (audience/scope/required_claims fail on
-            // active: true) keep the positive entry so a different
-            // policy may legitimately ALLOW the same token.
-            if (auto* cache = issuer_strong->introspection_cache()) {
-                if (result.idp_active) {
-                    auto snap_now = issuer_strong->LoadSnapshot();
-                    if (snap_now) {
-                        auto ttl = ClampPositiveTtl(
-                            snap_now->introspection.cache_sec,
-                            result.exp_from_resp,
-                            std::chrono::system_clock::now());
-                        if (ttl > std::chrono::seconds{0}) {
-                            cache->Insert(key, result.ctx,
-                                          /*active=*/true, ttl);
-                        }
-                    }
-                } else if (result.vr.outcome == VerifyOutcome::DENY_401 &&
-                           result.vr.log_reason == "introspection_inactive") {
-                    auto snap_now = issuer_strong->LoadSnapshot();
-                    if (snap_now) {
-                        cache->Insert(
-                            key, AuthContext{}, /*active=*/false,
-                            std::chrono::seconds{
-                                snap_now->introspection.negative_cache_sec});
-                    }
-                } else if (result.vr.outcome == VerifyOutcome::UNDETERMINED) {
-                    // Live POST failed (timeout, circuit_open, 5xx, etc.) —
-                    // last-resort stale-serve from a positive entry within
-                    // grace, before producing the policy's UNDETERMINED
-                    // response. NEVER stale-serves negative entries
-                    // (LookupStale enforces that invariant). Re-run policy
-                    // checks against the stale ctx so cross-policy reuse
-                    // stays correct.
-                    auto stale = cache->LookupStale(
-                        key, std::chrono::steady_clock::now());
-                    if (stale.state == IntrospectionCache::LookupState::Stale
-                            && stale.active) {
-                        IssuerSnapshot snap_for_check;
-                        snap_for_check.audiences = snap_audiences;
-                        snap_for_check.required_claims = snap_required_claims;
-                        VerifyResult vr_stale = RunPolicyAndIssuerClaimChecks(
-                            policy_copy, snap_for_check, stale.ctx);
-                        if (vr_stale.outcome == VerifyOutcome::ALLOW) {
-                            result.vr = VerifyResult::Allow();
-                            result.ctx = std::move(stale.ctx);
-                            intro_stale_ptr->fetch_add(
-                                1, std::memory_order_relaxed);
-                        }
-                    }
-                }
-            }
-
-            // Layer issuer-level audience fallback + required_claims on top
-            // of IntrospectionClient's policy-only check. Cache write above
-            // already used the un-overridden ctx so cross-policy reuse stays
-            // intact — the override only affects THIS request's response.
-            // Skips stale-promoted ctx (already policy-checked above).
-            if (result.idp_active &&
-                result.vr.outcome == VerifyOutcome::ALLOW) {
-                IssuerSnapshot snap_for_check;
-                snap_for_check.audiences = snap_audiences;
-                snap_for_check.required_claims = snap_required_claims;
-                VerifyResult vr_full = RunPolicyAndIssuerClaimChecks(
-                    policy_copy, snap_for_check, result.ctx);
-                if (vr_full.outcome != VerifyOutcome::ALLOW) {
-                    result.vr = std::move(vr_full);
-                }
-            }
-
-            // IdP-outcome counters fire HERE — AFTER the issuer-level
-            // re-check so the final result.vr.outcome is what gets
-            // counted. Critically, this fires REGARDLESS of whether the
-            // resume_cb is later armed; async-route warmup paths (which
-            // 503 the client and never run the finalizer) still increment
-            // intro_ok / intro_fail correctly. total_allowed_ /
-            // total_denied_ stay in the finalizer because those track
-            // CLIENT-VISIBLE verdicts (warmup is 503, not allow/deny).
-            //
-            // Semantics: intro_ok = final ALLOW; intro_fail = everything
-            // else (active:false → DENY_401, policy-scoped DENY_401/403,
-            // UNDETERMINED, malformed, 4xx/5xx, timeouts, circuit-open).
-            // Drop guards (issuer_unavailable / reload_in_flight /
-            // issuer_stopping) skip this site by their early return and
-            // intentionally do NOT count as intro_fail — those are
-            // issuer-state failures, not IdP failures.
-            if (result.vr.outcome == VerifyOutcome::ALLOW) {
-                intro_ok_ptr->fetch_add(1, std::memory_order_relaxed);
-            } else {
-                intro_fail_ptr->fetch_add(1, std::memory_order_relaxed);
-            }
-
-            switch (result.vr.outcome) {
-              case VerifyOutcome::ALLOW: {
-                  payload.result = AsyncMiddlewareResult::PASS;
-                  AuthContext ctx = result.ctx;
-                  payload.finalizer =
-                      [ctx = std::move(ctx), issuer_name, policy_name,
-                       sanitized_req_path, raw_jwt_header, token,
-                       total_allow_ptr]
-                      (const HttpRequest& r, HttpResponse&) {
-                      // intro_ok_ptr already incremented at the post-
-                      // re-check site above so warmup paths still count.
-                      AuthContext local_ctx = ctx;
-                      local_ctx.policy_name = policy_name;
-                      if (local_ctx.issuer.empty())
-                          local_ctx.issuer = issuer_name;
-                      if (!raw_jwt_header.empty()) {
-                          local_ctx.raw_token = token;
-                      }
-                      r.auth.emplace(std::move(local_ctx));
-                      total_allow_ptr->fetch_add(
-                          1, std::memory_order_relaxed);
-                      if (auto lg = logging::Get();
-                              lg->should_log(spdlog::level::debug)) {
-                          lg->debug(
-                              "auth_allow route={} issuer={} sub={} policy={} cache=miss",
-                              sanitized_req_path,
-                              logging::SanitizeLogValue(issuer_name),
-                              logging::SanitizeLogValue(
-                                  r.auth ? r.auth->subject : std::string{}),
-                              logging::SanitizeLogValue(policy_name));
-                      }
-                  };
-                  break;
-              }
-              case VerifyOutcome::DENY_401: {
-                  payload.result = AsyncMiddlewareResult::DENY;
-                  payload.finalizer =
-                      [realm_local, ec = result.vr.error_code,
-                       desc = result.vr.error_description,
-                       log_reason = result.vr.log_reason, issuer_name,
-                       sanitized_req_path, policy_name,
-                       total_deny_ptr]
-                      (const HttpRequest&, HttpResponse& rs) {
-                      // intro_ok_ptr / intro_fail_ptr already incremented
-                      // at the cache-insert site above based on idp_active.
-                      rs = MakeUnauthorized(realm_local, ec, desc);
-                      total_deny_ptr->fetch_add(
-                          1, std::memory_order_relaxed);
-                      logging::Get()->info(
-                          "auth_deny route={} issuer={} reason={} policy={}",
-                          sanitized_req_path,
-                          logging::SanitizeLogValue(issuer_name),
-                          log_reason,
-                          logging::SanitizeLogValue(policy_name));
-                  };
-                  break;
-              }
-              case VerifyOutcome::DENY_403: {
-                  payload.result = AsyncMiddlewareResult::DENY;
-                  payload.finalizer =
-                      [realm_local, desc = result.vr.error_description,
-                       scopes = required_scopes, sanitized_req_path,
-                       issuer_name, policy_name,
-                       log_reason = result.vr.log_reason,
-                       total_deny_ptr]
-                      (const HttpRequest&, HttpResponse& rs) {
-                      // intro_ok_ptr already incremented at the cache-
-                      // insert site above (DENY_403 implies idp_active).
-                      rs = MakeForbidden(realm_local, desc, scopes);
-                      total_deny_ptr->fetch_add(
-                          1, std::memory_order_relaxed);
-                      logging::Get()->info(
-                          "auth_deny route={} issuer={} reason={} policy={}",
-                          sanitized_req_path,
-                          logging::SanitizeLogValue(issuer_name),
-                          log_reason,
-                          logging::SanitizeLogValue(policy_name));
-                  };
-                  break;
-              }
-              case VerifyOutcome::UNDETERMINED:
-                  build_undetermined(result.vr.log_reason);
-                  break;
-            }
-            state->Complete(std::move(payload));
-        },
+        weak_issuer,
+        endpoint,
+        client_id,
+        client_secret,
+        auth_style,
+        token,
+        dispatcher_idx,
+        policy_copy,
+        claim_keys,
+        gen,
+        std::move(on_verify_done),
         cancel_token);
 }
 
@@ -1592,195 +1687,55 @@ void AuthManager::InvokeIntrospectionUncached(
     auto* intro_ok_ptr = &introspection_ok_;
     auto* intro_fail_ptr = &introspection_fail_;
 
+    // Bind each Verify() argument to a named local so the call site
+    // matches the header's parameter list one-line-per-parameter.
+    const std::string& endpoint      = snap.introspection_endpoint;
+    const std::string& client_id     = snap.introspection.client_id;
+    const std::string  client_secret = issuer->client_secret();
+    const std::string& auth_style    = snap.introspection.auth_style;
+
+    // Build the introspection completion callback via the shared factory
+    // (uncached path: enable_cache_ops=false, cache_log_label="uncached",
+    // intro_stale_served pointer left null — no cache → no stale-serve).
+    IntrospectionDoneCtx done_ctx;
+    done_ctx.state                = state;
+    done_ctx.weak_issuer          = weak_issuer;
+    done_ctx.gen                  = gen;
+    done_ctx.token                = token;
+    done_ctx.sanitized_req_path   = sanitized_req_path;
+    done_ctx.realm                = realm_local;
+    done_ctx.issuer_name          = issuer_name;
+    done_ctx.policy_name          = policy_name;
+    done_ctx.on_undetermined      = on_undet;
+    done_ctx.required_scopes      = required_scopes;
+    done_ctx.raw_jwt_header       = raw_jwt_header;
+    done_ctx.retry_after_sec      = retry_after_sec;
+    done_ctx.policy               = policy_copy;
+    done_ctx.snap_audiences       = snap_audiences;
+    done_ctx.snap_required_claims = snap_required_claims;
+    done_ctx.total_undetermined   = total_undet_ptr;
+    done_ctx.total_allowed        = total_allow_ptr;
+    done_ctx.total_denied         = total_deny_ptr;
+    done_ctx.intro_ok             = intro_ok_ptr;
+    done_ctx.intro_fail           = intro_fail_ptr;
+    done_ctx.intro_stale_served   = nullptr;
+    done_ctx.enable_cache_ops     = false;
+    done_ctx.cache_log_label      = "uncached";
+    IntrospectionClient::DoneCallback on_verify_done =
+        MakeIntrospectionDoneCallback(std::move(done_ctx));
+
     introspection_client_->Verify(
-        weak_issuer, snap.introspection_endpoint,
-        snap.introspection.client_id, issuer->client_secret(),
-        snap.introspection.auth_style, token, dispatcher_idx,
-        policy_copy, claim_keys, gen,
-        [state, weak_issuer, gen, realm_local, issuer_name,
-         sanitized_req_path, policy_name, on_undet, required_scopes,
-         raw_jwt_header, retry_after_sec, token,
-         total_undet_ptr, total_allow_ptr, total_deny_ptr,
-         intro_ok_ptr, intro_fail_ptr,
-         policy_copy, snap_audiences, snap_required_claims]
-        (IntrospectionClient::Result result) {
-            AsyncMiddlewarePayload payload;
-            auto build_undetermined = [&](std::string log_reason) {
-                if (on_undet == kOnUndeterminedAllow) {
-                    payload.result = AsyncMiddlewareResult::PASS;
-                    payload.finalizer =
-                        [issuer_name, policy_name, sanitized_req_path,
-                         log_reason, total_undet_ptr]
-                        (const HttpRequest& r, HttpResponse&) {
-                        // intro_fail_ptr is incremented at the cache-
-                        // insert site for outcomes from a real IdP
-                        // roundtrip; drop-guard UNDETERMINED paths
-                        // (issuer_unavailable / reload_in_flight /
-                        // issuer_stopping) bypass the cache site by
-                        // design and intentionally do NOT count as
-                        // introspection_fail — those are issuer-state
-                        // failures, not IdP failures.
-                        total_undet_ptr->fetch_add(
-                            1, std::memory_order_relaxed);
-                        logging::Get()->warn(
-                            "auth_undetermined route={} issuer={} reason={} policy={}",
-                            sanitized_req_path,
-                            logging::SanitizeLogValue(issuer_name),
-                            log_reason,
-                            logging::SanitizeLogValue(policy_name));
-                        AuthContext advisory;
-                        advisory.undetermined = true;
-                        advisory.policy_name = policy_name;
-                        advisory.issuer = issuer_name;
-                        r.auth.emplace(std::move(advisory));
-                    };
-                } else {
-                    payload.result = AsyncMiddlewareResult::DENY;
-                    payload.finalizer =
-                        [realm_local, retry_after_sec, issuer_name,
-                         policy_name, sanitized_req_path, log_reason,
-                         total_undet_ptr]
-                        (const HttpRequest&, HttpResponse& rs) {
-                        total_undet_ptr->fetch_add(
-                            1, std::memory_order_relaxed);
-                        logging::Get()->warn(
-                            "auth_undetermined route={} issuer={} reason={} policy={}",
-                            sanitized_req_path,
-                            logging::SanitizeLogValue(issuer_name),
-                            log_reason,
-                            logging::SanitizeLogValue(policy_name));
-                        rs = MakeServiceUnavailable(
-                            realm_local, retry_after_sec,
-                            "authentication unavailable");
-                    };
-                }
-            };
-
-            auto issuer_strong = weak_issuer.lock();
-            if (!issuer_strong) {
-                build_undetermined("issuer_unavailable");
-                state->Complete(std::move(payload));
-                return;
-            }
-            if (gen != issuer_strong->generation()) {
-                build_undetermined("reload_in_flight");
-                state->Complete(std::move(payload));
-                return;
-            }
-            if (issuer_strong->stopping()) {
-                build_undetermined("issuer_stopping");
-                state->Complete(std::move(payload));
-                return;
-            }
-
-            // No cache insert in the uncached path — that's the whole
-            // point of falling here when TokenHasher::Hash failed.
-
-            // Layer issuer-level audience fallback + required_claims on top
-            // of IntrospectionClient's policy-only check.
-            if (result.idp_active &&
-                result.vr.outcome == VerifyOutcome::ALLOW) {
-                IssuerSnapshot snap_for_check;
-                snap_for_check.audiences = snap_audiences;
-                snap_for_check.required_claims = snap_required_claims;
-                VerifyResult vr_full = RunPolicyAndIssuerClaimChecks(
-                    policy_copy, snap_for_check, result.ctx);
-                if (vr_full.outcome != VerifyOutcome::ALLOW) {
-                    result.vr = std::move(vr_full);
-                }
-            }
-
-            // IdP-outcome counters fire AFTER the layered re-check so the
-            // final outcome is what gets counted. Same warmup-friendly
-            // semantics as InvokeAsyncIntrospection above.
-            if (result.vr.outcome == VerifyOutcome::ALLOW) {
-                intro_ok_ptr->fetch_add(1, std::memory_order_relaxed);
-            } else {
-                intro_fail_ptr->fetch_add(1, std::memory_order_relaxed);
-            }
-
-            switch (result.vr.outcome) {
-              case VerifyOutcome::ALLOW: {
-                  payload.result = AsyncMiddlewareResult::PASS;
-                  AuthContext ctx = result.ctx;
-                  payload.finalizer =
-                      [ctx = std::move(ctx), issuer_name, policy_name,
-                       sanitized_req_path, raw_jwt_header, token,
-                       total_allow_ptr]
-                      (const HttpRequest& r, HttpResponse&) {
-                      // intro_ok_ptr already counted at the cache-site
-                      // block above for parity with the cached path.
-                      AuthContext local_ctx = ctx;
-                      local_ctx.policy_name = policy_name;
-                      if (local_ctx.issuer.empty())
-                          local_ctx.issuer = issuer_name;
-                      if (!raw_jwt_header.empty()) {
-                          local_ctx.raw_token = token;
-                      }
-                      r.auth.emplace(std::move(local_ctx));
-                      total_allow_ptr->fetch_add(
-                          1, std::memory_order_relaxed);
-                      if (auto lg = logging::Get();
-                              lg->should_log(spdlog::level::debug)) {
-                          lg->debug(
-                              "auth_allow route={} issuer={} sub={} policy={} cache=uncached",
-                              sanitized_req_path,
-                              logging::SanitizeLogValue(issuer_name),
-                              logging::SanitizeLogValue(
-                                  r.auth ? r.auth->subject : std::string{}),
-                              logging::SanitizeLogValue(policy_name));
-                      }
-                  };
-                  break;
-              }
-              case VerifyOutcome::DENY_401: {
-                  payload.result = AsyncMiddlewareResult::DENY;
-                  payload.finalizer =
-                      [realm_local, ec = result.vr.error_code,
-                       desc = result.vr.error_description,
-                       log_reason = result.vr.log_reason, issuer_name,
-                       sanitized_req_path, policy_name,
-                       total_deny_ptr]
-                      (const HttpRequest&, HttpResponse& rs) {
-                      rs = MakeUnauthorized(realm_local, ec, desc);
-                      total_deny_ptr->fetch_add(
-                          1, std::memory_order_relaxed);
-                      logging::Get()->info(
-                          "auth_deny route={} issuer={} reason={} policy={}",
-                          sanitized_req_path,
-                          logging::SanitizeLogValue(issuer_name),
-                          log_reason,
-                          logging::SanitizeLogValue(policy_name));
-                  };
-                  break;
-              }
-              case VerifyOutcome::DENY_403: {
-                  payload.result = AsyncMiddlewareResult::DENY;
-                  payload.finalizer =
-                      [realm_local, desc = result.vr.error_description,
-                       scopes = required_scopes, sanitized_req_path,
-                       issuer_name, policy_name,
-                       log_reason = result.vr.log_reason,
-                       total_deny_ptr]
-                      (const HttpRequest&, HttpResponse& rs) {
-                      rs = MakeForbidden(realm_local, desc, scopes);
-                      total_deny_ptr->fetch_add(
-                          1, std::memory_order_relaxed);
-                      logging::Get()->info(
-                          "auth_deny route={} issuer={} reason={} policy={}",
-                          sanitized_req_path,
-                          logging::SanitizeLogValue(issuer_name),
-                          log_reason,
-                          logging::SanitizeLogValue(policy_name));
-                  };
-                  break;
-              }
-              case VerifyOutcome::UNDETERMINED:
-                  build_undetermined(result.vr.log_reason);
-                  break;
-            }
-            state->Complete(std::move(payload));
-        },
+        weak_issuer,
+        endpoint,
+        client_id,
+        client_secret,
+        auth_style,
+        token,
+        dispatcher_idx,
+        policy_copy,
+        claim_keys,
+        gen,
+        std::move(on_verify_done),
         cancel_token);
 }
 

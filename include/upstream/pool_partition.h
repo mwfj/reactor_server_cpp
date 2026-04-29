@@ -225,10 +225,9 @@ private:
     // Mismatch means a hostname-aware reload (step 11) atomic-stored a
     // new endpoint after this connection was created — the keepalive
     // is still bound to the old IP and must not be handed back out.
-    // Today (pre-step-11) resolved_endpoint_ never changes after
-    // construction, so this check is a same-pointer compare and always
-    // true; installing the wiring now keeps every idle-pop call site
-    // in sync when step 11 lands.
+    // resolved_endpoint_ never changes after construction, 
+    // so this check is a same-pointer compare and always true; 
+    // installing the wiring now keeps every idle-pop call site in sync when step 11 lands.
     bool ConnectionEndpointMatches(const UpstreamConnection& c) const;
 
     size_t partition_max_connections_;
