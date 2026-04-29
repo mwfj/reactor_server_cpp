@@ -221,8 +221,14 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
         auto conn = std::move(idle_conns_.front());
         idle_conns_.pop_front();
 
-        const auto* captured = conn->captured_endpoint().get();
-        if (captured && current_ep_for_pop.get() != captured) {
+        // Endpoint match check: a keepalive captured against an old
+        // resolved IP must not be handed out after the partition adopts
+        // a new endpoint. ConnectionEndpointMatches atomic-loads the
+        // current resolved_endpoint_ and compares with the connection's
+        // captured pointer; idle connections from a superseded endpoint
+        // get destroyed here.
+        (void)current_ep_for_pop;  // helper does its own atomic_load
+        if (!ConnectionEndpointMatches(*conn)) {
             DestroyConnection(std::move(conn));
             continue;
         }
@@ -354,20 +360,26 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
         return;
     }
 
-    // Stale-endpoint guard: if the partition's resolved endpoint changed
-    // while this connection was checked out (or completing a connect),
-    // its captured_endpoint() no longer matches the current generation.
-    // Destroying it on return prevents continued traffic to the old IP via
-    // pool reuse — the design's "next NEW connection uses new endpoint"
-    // contract requires this once a busy connection comes home.
-    {
-        auto current_ep = LoadResolvedEndpoint();
-        const auto* captured = owned->captured_endpoint().get();
-        if (captured && current_ep.get() != captured) {
-            DestroyConnection(std::move(owned));
-            CreateForWaiters();
-            return;
-        }
+    // Endpoint generation check on return. A reload that atomic-stored a
+    // new resolved_endpoint_ between this connection's checkout and its
+    // return leaves the connection bound to the OLD IP. The downstream
+    // CheckoutAsync / ServiceWaitQueue idle-pop sites already reject
+    // mismatched endpoints, but two paths in this function bypass that
+    // gate by reusing `owned` synchronously without going through
+    // idle_conns_:
+    //   (1) the over-idle-cap direct waiter handoff below pops a waiter
+    //       and hands it `owned` after only ValidateConnection — never
+    //       consulting ConnectionEndpointMatches.
+    //   (2) the trailing ServiceWaitQueue() fires while `owned` is still
+    //       at the front of idle_conns_ (just pushed); the queued waiter
+    //       could grab a stale-IP keepalive that was returned post-swap.
+    // Failing closed at the entry guarantees a returning post-swap
+    // connection is destroyed + a fresh-endpoint replacement is created
+    // for any queued waiter via CreateForWaiters.
+    if (!ConnectionEndpointMatches(*owned)) {
+        DestroyConnection(std::move(owned));
+        CreateForWaiters();
+        return;
     }
 
     owned->IncrementRequestCount();
@@ -722,6 +734,17 @@ void PoolPartition::ForceCloseActive() {
             try { w.on_msg(w.transport, empty); } catch (...) {}
         }
     }
+}
+
+bool PoolPartition::ConnectionEndpointMatches(
+        const UpstreamConnection& c) const {
+    // atomic_load matches the publisher contract documented at the
+    // resolved_endpoint_ declaration: step-11 will swap with
+    // atomic_store; today, the load returns the same pointer for the
+    // partition's lifetime so this compare is always true.
+    auto current = std::atomic_load_explicit(
+        &resolved_endpoint_, std::memory_order_acquire);
+    return c.captured_endpoint() == current;
 }
 
 void PoolPartition::CreateNewConnection(ReadyCallback ready_cb,
@@ -1123,6 +1146,18 @@ void PoolPartition::ServiceWaitQueue() {
         // Validate the idle connection
         auto conn = std::move(idle_conns_.front());
         idle_conns_.pop_front();
+
+        // Endpoint generation check — mirrors CheckoutAsync. Without
+        // this, a queued waiter could receive an idle keepalive
+        // captured to a stale resolved IP if a hostname-aware reload
+        // (step 11) atomic-stored a new resolved_endpoint_ between the
+        // connection's return-to-idle and ServiceWaitQueue running.
+        // The check is a same-pointer compare today; once step 11 lands
+        // it actually fences stale handoffs.
+        if (!ConnectionEndpointMatches(*conn)) {
+            DestroyConnection(std::move(conn));
+            continue;
+        }
 
         if (!ValidateConnection(conn.get())) {
             DestroyConnection(std::move(conn));

@@ -1984,9 +1984,13 @@ void TestH2C_InvalidPreface() {
         if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
             pass = false; err = "raw connect failed";
         } else {
-            // Send 30 bytes of garbage
+            // Send the full garbage buffer (28 declared bytes; > the
+            // 24-byte HTTP/2 preface threshold so the protocol detector
+            // sees enough to reject). Use sizeof-1 to exclude the
+            // implicit NUL terminator — passing a hardcoded count larger
+            // than the array trips ASan with a stack-buffer-overflow.
             const char garbage[] = "\xFF\xFE\x00\x01\x02\x03GARBAGE_DATA_HERE12345";
-            ::send(fd, garbage, 30, 0);
+            ::send(fd, garbage, sizeof(garbage) - 1, 0);
 
             // Server should close the connection — receive EOF or error
             struct timeval tv{}; tv.tv_sec = 3;

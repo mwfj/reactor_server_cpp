@@ -220,6 +220,16 @@ private:
     // Returns the number of entries removed.
     size_t PurgeCancelledWaitEntries();
 
+    // Returns true when the connection's captured endpoint pointer
+    // matches the partition's currently-published resolved_endpoint_.
+    // Mismatch means a hostname-aware reload (step 11) atomic-stored a
+    // new endpoint after this connection was created — the keepalive
+    // is still bound to the old IP and must not be handed back out.
+    // resolved_endpoint_ never changes after construction, 
+    // so this check is a same-pointer compare and always true; 
+    // installing the wiring now keeps every idle-pop call site in sync when step 11 lands.
+    bool ConnectionEndpointMatches(const UpstreamConnection& c) const;
+
     size_t partition_max_connections_;
 
     // Shared atomic flag cleared in destructor. Atomic because it's written

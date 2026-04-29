@@ -67,6 +67,14 @@ public:
     HttpResponse& Defer() { deferred_ = true; return *this; }
     bool IsDeferred() const { return deferred_; }
 
+    // Clear the deferred flag. Used by the async-middleware H1 / WS
+    // resume path so CompleteAsyncResponse serializes the response after
+    // the suspend window without observing the residual Defer flag (which
+    // had blocked the inline sync write). H2's resume path goes through
+    // SubmitStreamResponse, which writes unconditionally and does not
+    // require this reset.
+    HttpResponse& ClearDeferred() { deferred_ = false; return *this; }
+
     // Preserve caller-set Content-Length instead of auto-computing from
     // body_.size(). Used by the proxy path for HEAD responses where the
     // upstream's Content-Length (e.g., 1234) must be forwarded even though

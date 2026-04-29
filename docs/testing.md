@@ -65,7 +65,7 @@ make test_auth_ws       # Build and run auth WebSocket-upgrade tests (6)
 make test_auth_race     # Build and run auth race-condition tests (10)
 ```
 
-At current head, `./test_runner` reports **799 / 799 passing** (100 %). Three new backpressure integration tests were added alongside the kqueue EV_EOF coalescing fix — see `.claude/documents/bug-fixes/KQUEUE_EOF_COALESCING_RACE.md` for background.
+At current head, `./test_runner` reports **799 / 799 passing** (100 %). Three new backpressure integration tests were added alongside the kqueue EV_EOF coalescing fix
 
 ## Test Suites
 

@@ -6,38 +6,108 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel an in-flight run on the same branch when a newer commit lands so
+# stale runs don't burn runner-minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-linux:
+  # ----------------------------------------------------------------------
+  # Linux smoke — gcc, no sanitizers. Fastest signal that the build links
+  # and the full suite passes.
+  # ----------------------------------------------------------------------
+  build-linux-gcc:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
-      - name: Build
+      - name: Build (gcc)
         run: make -j$(nproc)
-      - name: Test - Basic
-        run: ./test_runner basic
-      - name: Test - Stress
-        run: ./test_runner stress
-      - name: Test - Race Condition
-        run: ./test_runner race
-      - name: Test - Timeout
-        run: ./test_runner timeout
-      - name: Test - Config
-        run: ./test_runner config
-      - name: Test - HTTP
-        run: ./test_runner http
-      - name: Test - WebSocket
-        run: ./test_runner ws
-      - name: Test - TLS
-        run: ./test_runner tls
-      - name: Test - HTTP/2
-        run: ./test_runner http2
-      - name: Test - CLI
-        run: ./test_runner cli
-      - name: Test - Route
-        run: ./test_runner route
+      - name: Test (full sweep)
+        run: ./test_runner
 
+  # ----------------------------------------------------------------------
+  # Linux compiler dimension — same suite under clang. Catches warnings /
+  # codegen-driven UB that gcc misses.
+  # ----------------------------------------------------------------------
+  build-linux-clang:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev clang
+      - name: Build (clang)
+        run: make -j$(nproc) CXX=clang++ CC=clang
+      - name: Test (full sweep)
+        run: ./test_runner
+
+  # ----------------------------------------------------------------------
+  # AddressSanitizer + UndefinedBehaviorSanitizer. Catches use-after-free,
+  # heap/stack overflows, signed overflow, alignment, null deref. ~2x
+  # runtime overhead.
+  # ----------------------------------------------------------------------
+  build-linux-asan:
+    runs-on: ubuntu-latest
+    env:
+      # detect_leaks=0: at-exit shared_ptr leaks from test-harness teardown
+      # (not production code — tests do not always join every dispatcher
+      # task before scope-exiting their HttpServer) would amplify test-
+      # shutdown gaps into red CI. The high-value ASan signal — UAF,
+      # buffer overflow, stack-buffer-overflow, double-free, alignment,
+      # signed-overflow — is unaffected by disabling LSan. If a real
+      # leak audit is wanted, run `ASAN_OPTIONS=detect_leaks=1` locally
+      # against a focused suite and fix the reported sites.
+      ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Build (asan + ubsan)
+        run: |
+          make -j$(nproc) \
+            CXXFLAGS_EXTRA="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all" \
+            CFLAGS_EXTRA="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            NGHTTP2_CFLAGS_EXTRA="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            LDFLAGS_EXTRA="-fsanitize=address,undefined"
+      - name: Test (full sweep)
+        run: ./test_runner
+
+  # ----------------------------------------------------------------------
+  # ThreadSanitizer. Catches data races, deadlocks, and lock-order
+  # inversions. The race / auth_race / circuit_breaker / dual_stack suites
+  # are the primary signal source. ~5-10x runtime overhead.
+  # ----------------------------------------------------------------------
+  build-linux-tsan:
+    runs-on: ubuntu-latest
+    env:
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:history_size=7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Build (tsan)
+        run: |
+          make -j$(nproc) \
+            CXXFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
+            CFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
+            NGHTTP2_CFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
+            LDFLAGS_EXTRA="-fsanitize=thread"
+      - name: Test (full sweep)
+        run: ./test_runner
+
+  # ----------------------------------------------------------------------
+  # macOS — only the suites whose behavior is influenced by the OS layer
+  # (kqueue, BSD sockets, signals, Apple OpenSSL/Security framework, BSD
+  # getaddrinfo). Pure-logic suites (route trie, JWT, claim parsing,
+  # token bucket, CB state machine, policy matcher, etc.) are
+  # platform-deterministic and already covered by the Linux jobs;
+  # running them again on macOS adds CI cost without signal. The build
+  # itself still happens on macOS, so compile-only differences (header
+  # ordering, missing SOCK_CLOEXEC) still get caught.
+  # ----------------------------------------------------------------------
   build-macos:
     runs-on: macos-14
     steps:
@@ -46,27 +116,27 @@ jobs:
         run: brew install --quiet openssl@3 || true
       - name: Build
         run: make -j$(sysctl -n hw.ncpu)
-      - name: Test - Basic
+      - name: Test - basic (sanity)
         run: ./test_runner basic
-      - name: Test - Stress
-        run: ./test_runner stress
-      - name: Test - Race Condition
-        run: ./test_runner race
-      - name: Test - Timeout
-        run: ./test_runner timeout
-      - name: Test - Config
-        run: ./test_runner config
-      - name: Test - HTTP
-        run: ./test_runner http
-      - name: Test - WebSocket
-        run: ./test_runner ws
-      - name: Test - TLS
-        run: ./test_runner tls
-      - name: Test - HTTP/2
-        run: ./test_runner http2
-      - name: Test - CLI
-        run: ./test_runner cli
-      - name: Test - Route
-        run: ./test_runner route
-      - name: Test - Kqueue
+      - name: Test - kqueue (mandatory)
         run: ./test_runner kqueue
+      - name: Test - race (threading + I/O multiplexing)
+        run: ./test_runner race
+      - name: Test - timeout (timer + I/O multiplexing)
+        run: ./test_runner timeout
+      - name: Test - tls (Apple OpenSSL)
+        run: ./test_runner tls
+      - name: Test - cli (signals, PID files, daemonize)
+        run: ./test_runner cli
+      - name: Test - upstream (pool + fd reuse)
+        run: ./test_runner upstream
+      - name: Test - proxy (sockets through OS-sensitive layers)
+        run: ./test_runner proxy
+      - name: Test - http (real-socket HTTP/1.1)
+        run: ./test_runner http
+      - name: Test - http2 (real-socket HTTP/2)
+        run: ./test_runner http2
+      - name: Test - ws (real-socket WebSocket)
+        run: ./test_runner ws
+      - name: Test - dual_stack (BSD getaddrinfo)
+        run: ./test_runner dual_stack

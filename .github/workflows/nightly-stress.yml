@@ -1,0 +1,41 @@
+name: Nightly Stress
+
+# Stress tests (100-1000 concurrent clients) are quantitatively different
+# from logic tests: they're noisy, occasionally flaky on shared CI runners,
+# and a failure means "investigate flake," not "investigate code." Running
+# them on every PR would red-X PRs for runner-load reasons, so they live
+# in a separate cron-driven workflow that does NOT gate merges.
+on:
+  schedule:
+    # 07:00 UTC daily (= 00:00 PT, late-evening Asia).
+    - cron: '0 7 * * *'
+  workflow_dispatch:  # allow manual runs from the Actions UI
+
+concurrency:
+  group: nightly-stress
+  cancel-in-progress: false
+
+jobs:
+  stress-linux:
+    runs-on: ubuntu-latest
+    continue-on-error: true  # flake should not red-X the workflow
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Build
+        run: make -j$(nproc)
+      - name: Test - stress
+        run: ./test_runner stress
+
+  stress-macos:
+    runs-on: macos-14
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install --quiet openssl@3 || true
+      - name: Build
+        run: make -j$(sysctl -n hw.ncpu)
+      - name: Test - stress
+        run: ./test_runner stress

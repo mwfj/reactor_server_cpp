@@ -179,8 +179,21 @@ void NetServer::Start(){
     // early requests hit the shutdown path (Connection: close, WS 503, H2
     // GOAWAY) on an otherwise healthy server. The stop_requested_ guard
     // suppresses the callback if Stop() raced in during startup.
+    //
+    // Wrap in cleanup_partial_startup so a throw from MarkServerReady
+    // (e.g. PrependAsyncMiddleware fail-closed when a pre-existing async
+    // middleware conflicts with auth introspection) immediately tears down
+    // the running socket dispatchers and worker pool. Without this rollback
+    // the dispatchers leak until the destructor, which delays observable
+    // startup failure and leaves worker threads alive after Start() throws.
     if (ready_callback_ && !stop_requested_.load(std::memory_order_acquire)) {
-        ready_callback_();
+        try {
+            ready_callback_();
+        } catch (...) {
+            ready_callback_ = nullptr;
+            cleanup_partial_startup();
+            throw;
+        }
         ready_callback_ = nullptr;
     }
 

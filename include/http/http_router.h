@@ -5,12 +5,113 @@
 #include "http/http_callbacks.h"
 #include "http/route_trie.h"
 #include <unordered_set>
-// <string>, <vector>, <functional>, <memory>, <unordered_map> provided by
-// common.h (via http_request.h) and route_trie.h
+#include <mutex>
+// <string>, <vector>, <functional>, <memory>, <unordered_map>, <atomic>
+// provided by common.h (via http_request.h) and route_trie.h
 
 // Forward declaration
 class HttpConnectionHandler;
 class WebSocketConnection;
+
+// Verdict an async middleware produces.
+enum class AsyncMiddlewareResult { PASS, DENY };
+
+// Owned completion payload for the deferred path. The finalizer runs once
+// on the dispatcher thread against the callsite's req_copy / resp_copy
+// before the write; it must not retain references to the original stack.
+struct AsyncMiddlewarePayload {
+    AsyncMiddlewareResult result = AsyncMiddlewareResult::PASS;
+    std::function<void(const HttpRequest&, HttpResponse&)> finalizer;
+};
+
+// Per-request suspend/resume state, shared by value (shared_ptr) between
+// the middleware's deferred completion and the H1/H2/WS resume wiring.
+//
+// Sync fast-path (SetSyncResult + MarkCompletedSync) is lock-free.
+// Complete/ArmResume serialize through mu_; user callbacks fire outside
+// the lock. TripCancel/DecrementOnce share bookkeeping_done_ — exactly
+// one of the two decrements active_requests_.
+class AsyncPendingState {
+public:
+    // Sync fast-path.
+    bool completed_sync() const {
+        return completed_sync_.load(std::memory_order_acquire);
+    }
+    AsyncMiddlewareResult sync_result() const { return sync_result_; }
+    void SetSyncResult(AsyncMiddlewareResult r) { sync_result_ = r; }
+    void MarkCompletedSync() {
+        completed_sync_.store(true, std::memory_order_release);
+    }
+
+    // Deferred-path handoff. Complete fires resume_cb directly if
+    // ArmResume already wired it; otherwise stores the payload for
+    // ArmResume to replay. One-shot each.
+    void Complete(AsyncMiddlewarePayload payload);
+    void ArmResume(std::function<void(AsyncMiddlewarePayload)> resume_cb,
+                   std::shared_ptr<std::atomic<int64_t>> active_counter);
+
+    // Cancel path. TripCancel runs from the transport abort hook and
+    // owns the active_requests_ decrement directly — required because
+    // PoolPartition::PurgeCancelledWaitEntries silently drops cancelled
+    // waiters without firing callbacks. DecrementOnce runs from the
+    // resume closure and shares the bookkeeping_done_ exchange.
+    void TripCancel();
+    void DecrementOnce();
+
+    // Middleware installs an upstream-cancel hook before kicking off
+    // async work — typically `[cancel_token]() {
+    // cancel_token->store(true, std::memory_order_release); }`.
+    void SetCancelCb(std::function<void()> cb);
+
+    bool bookkeeping_already_done() const {
+        return bookkeeping_done_.load(std::memory_order_acquire);
+    }
+    bool cancelled() const {
+        return cancelled_.load(std::memory_order_acquire);
+    }
+
+private:
+    // Sync fast-path.
+    std::atomic<bool> completed_sync_{false};
+    AsyncMiddlewareResult sync_result_{AsyncMiddlewareResult::PASS};
+
+    // Deferred-path handoff (protected by mu_).
+    std::mutex mu_;
+    bool completed_ = false;
+    bool resume_armed_ = false;
+    bool completion_pending_ = false;
+    AsyncMiddlewarePayload result_slot_{};
+    std::function<void(AsyncMiddlewarePayload)> resume_cb_;
+    std::function<void()> cancel_cb_;
+    std::shared_ptr<std::atomic<int64_t>> active_counter_;
+
+    // Bookkeeping (lock-free one-shot). bookkeeping_done_ guards the
+    // active_requests_ decrement; cancel_fired_ guards the cancel_cb_
+    // invocation. They are separate one-shots because TripCancel may
+    // legitimately run BEFORE ArmResume wires active_counter_, in which
+    // case the cancel_cb_ must still fire exactly once but bookkeeping
+    // must wait for a later DecrementOnce to do the decrement.
+    //
+    // decrement_owed_ records the case "TripCancel ran while
+    // active_counter_ was null". The eventual ArmResume consumes it: if
+    // set when ArmResume wires active_counter_, ArmResume claims the
+    // bookkeeping_done_ slot and decrements directly. Without this hand-
+    // off, the failure mode is: cancel propagates → queued upstream
+    // checkout is purged silently (no completion callback) → resume_cb
+    // never fires → DecrementOnce never runs → active_requests_ leaks
+    // until shutdown drain hangs.
+    std::atomic<bool> bookkeeping_done_{false};
+    std::atomic<bool> cancel_fired_{false};
+    std::atomic<bool> cancelled_{false};
+    bool decrement_owed_ = false;  // protected by mu_
+};
+
+// Async middleware. `state` is constructed inside RunAsyncMiddleware and
+// is never null. Drive the sync fast-path via SetSyncResult+MarkCompletedSync,
+// or hand off via Complete after kicking off async work.
+using AsyncMiddleware = std::function<void(
+    const HttpRequest& req, HttpResponse& resp,
+    std::shared_ptr<AsyncPendingState> state)>;
 
 class HttpRouter {
 public:
@@ -33,6 +134,15 @@ public:
         const HttpRequest& request,
         HttpResponse& response
     )>;
+
+    // Async middleware re-exports — bring the file-scope types into the
+    // class scope so callers can reference them as
+    // `HttpRouter::AsyncMiddleware` / `HttpRouter::AsyncPendingState` /
+    // `HttpRouter::AsyncMiddlewareResult` / `HttpRouter::AsyncMiddlewarePayload`.
+    using AsyncMiddleware       = ::AsyncMiddleware;
+    using AsyncPendingState     = ::AsyncPendingState;
+    using AsyncMiddlewareResult = ::AsyncMiddlewareResult;
+    using AsyncMiddlewarePayload = ::AsyncMiddlewarePayload;
 
     // WebSocket upgrade handler
     using WsUpgradeHandler = std::function<void(WebSocketConnection& ws)>;
@@ -60,8 +170,30 @@ public:
     // Used by HttpServer to ensure rate limiting runs first.
     void PrependMiddleware(Middleware middleware);
 
-    // Dispatch request to matching handler.
-    // Returns true if route found, false if no match (caller should send 404).
+    // Prepend an async middleware at the front of the async chain. Async
+    // middlewares run after the sync chain. Last prepend runs first.
+    // Only one async middleware may be registered at a time; registering
+    // a second one is a soft error (logged, ignored).
+    void PrependAsyncMiddleware(AsyncMiddleware middleware);
+
+    bool HasAsyncMiddleware() const { return !async_middlewares_.empty(); }
+
+    // Run the async middleware chain. `out_state` is always populated
+    // (never null) so callers uniformly read out_state->sync_result().
+    // Returns true if every middleware completed synchronously; false if
+    // any deferred — caller must call out_state->ArmResume(resume_cb,
+    // active_counter) after wiring the transport cancel trampoline.
+    bool RunAsyncMiddleware(const HttpRequest& request, HttpResponse& response,
+                            std::shared_ptr<AsyncPendingState>& out_state);
+
+    // Route lookup + handler invocation. Returns true if a matched handler
+    // ran; false if no match (caller writes 404/405). Does NOT run
+    // middleware — callers run RunMiddleware + RunAsyncMiddleware first.
+    bool DispatchHandler(const HttpRequest& request, HttpResponse& response);
+
+    // Compat shim for sync-only callers: RunMiddleware → DispatchHandler.
+    // Logs a warn and skips the async chain if any async middleware is
+    // registered (the caller cannot honor the suspend contract).
     bool Dispatch(const HttpRequest& request, HttpResponse& response);
 
     // Async-route lookup. Returns an empty function if no async route matches.
@@ -74,6 +206,15 @@ public:
     // diverges between sync and async routes.
     AsyncHandler GetAsyncHandler(const HttpRequest& request,
                                  bool* head_fallback_out = nullptr) const;
+
+    // Populate request.params from the sync route trie BEFORE middleware
+    // runs, so param-aware middleware (e.g. authorize on /users/:id) sees
+    // captured values. Idempotent: DispatchHandler re-clears and
+    // re-populates before invoking the user handler. Called from inside
+    // RunMiddleware; exposed for callers that want to seed params for
+    // their own non-RunMiddleware paths (e.g. WS upgrades that consult
+    // params before the handshake).
+    void PopulateRouteParams(const HttpRequest& request);
 
     // Run middleware chain only (for WebSocket upgrades that need auth/CORS/etc.)
     // Returns true if all middleware passed, false if any short-circuited.
@@ -194,6 +335,10 @@ private:
 
     // Middleware chain (unchanged)
     std::vector<Middleware> middlewares_;
+
+    // Async middleware chain. Empty in deployments with no async
+    // middleware registered (e.g. tests that use HttpRouter directly).
+    std::vector<AsyncMiddleware> async_middlewares_;
 
     // Async GET patterns that opt out of HEAD→GET fallback. Populated via
     // DisableHeadFallback() — currently only by proxy routes whose

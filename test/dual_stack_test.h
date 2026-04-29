@@ -846,6 +846,191 @@ inline void TestStartupAbortsWhenStopCalledFirst() {
     }
 }
 
+// Pre-DNS-dispatch shutdown gate: when bind_host is a HOSTNAME and Stop()
+// fires before Start() enters Phase-A, the gate must return BEFORE
+// dispatching the DNS batch (so resolver threads aren't spawned and the
+// caller doesn't pay dns.overall_timeout_ms). The literal-only stop-
+// before-start test above doesn't cover this path because IP literals
+// short-circuit DnsResolver without threads regardless of the gate.
+//
+// Test strategy: configure an unresolvable hostname with a deliberately
+// long overall_timeout_ms, call Stop() before Start(), and assert
+// Start() returns quickly (well under the timeout). Without the pre-
+// dispatch gate, Start would block for ~1s before the post-DNS gate
+// could fire.
+inline void TestStartupAbortsBeforeDnsWhenStopRanFirst() {
+    std::cout << "\n[TEST] DualStack: Start aborts before DNS when Stop ran first..."
+              << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host = "this-host-does-not-resolve-aaaa.invalid";
+        cfg.bind_port = 0;
+        // Long resolve / overall budget so a missing pre-dispatch gate
+        // would clearly exceed our wall-clock assertion below.
+        cfg.dns.resolve_timeout_ms = 1000;
+        cfg.dns.overall_timeout_ms = 1500;
+
+        HttpServer server(cfg);
+        server.Stop();  // sets stopping_=true
+
+        const auto t0 = std::chrono::steady_clock::now();
+        server.Start();  // must hit pre-DNS gate, return immediately
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+
+        // Bounded by the gate, not the resolver. 200ms is generous —
+        // the gate path does no I/O. A regression to "spawn resolver
+        // first, gate post-DNS" would push elapsed >= 1000ms.
+        const bool fast_return = elapsed_ms < 200;
+        const bool no_listener = !server.GetBindResolved().has_value() &&
+                                  server.GetBoundPort() == 0;
+        const bool ok = fast_return && no_listener;
+        std::string err;
+        if (!ok) {
+            err = "elapsed_ms=" + std::to_string(elapsed_ms) +
+                  " bind_resolved_has=" +
+                  std::to_string(server.GetBindResolved().has_value()) +
+                  " bound_port=" + std::to_string(server.GetBoundPort());
+        }
+        Record("DualStack: Start aborts before DNS when Stop ran first",
+                ok, err);
+    } catch (const std::exception& e) {
+        Record("DualStack: Start aborts before DNS when Stop ran first",
+                false, e.what());
+    }
+}
+
+// Behavioral pin on GetLiveConfigSnapshot under reload contention:
+// snapshot reads must complete in bounded wall-clock time even while a
+// concurrent thread is driving reloads. The accessor acquires
+// `reload_mtx_` to deliver a coherent post-Normalize+Validate snapshot;
+// since reload bodies are CPU-bound metadata work (no blocking I/O
+// under the lock per the header invariant), the worst-case read budget
+// is sub-millisecond. The 50ms threshold is the architectural pin: a
+// regression that introduces blocking work under reload_mtx_ would push
+// individual reads past the budget immediately.
+inline void TestGetLiveConfigSnapshotDoesNotBlockOnReload() {
+    std::cout << "\n[TEST] DualStack: GetLiveConfigSnapshot does not block on Reload..."
+              << std::endl;
+    try {
+        HttpServer server("127.0.0.1", 0);
+        TestServerRunner<HttpServer> runner(server);
+
+        std::atomic<bool> stop{false};
+        std::atomic<int> reads_done{0};
+        std::atomic<int64_t> max_read_us{0};
+
+        std::thread reader([&]() {
+            while (!stop.load(std::memory_order_acquire)) {
+                const auto t0 = std::chrono::steady_clock::now();
+                ServerConfig snap = server.GetLiveConfigSnapshot();
+                (void)snap.bind_host;  // touch to defeat optimisation
+                const auto us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                int64_t prev = max_read_us.load(std::memory_order_relaxed);
+                while (us > prev &&
+                       !max_read_us.compare_exchange_weak(prev, us)) {}
+                reads_done.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+
+        // Concurrently reload several times; reader should not stall.
+        ServerConfig snap = server.GetLiveConfigSnapshot();
+        for (int i = 0; i < 10; ++i) {
+            server.Reload(snap);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+        stop.store(true, std::memory_order_release);
+        if (reader.joinable()) reader.join();
+
+        // Reader did real work, AND no individual read took longer than
+        // a generous bound. 50ms is well below any reload-coupling
+        // failure mode (a regression to reload_mtx_ acquisition under a
+        // hypothetical slow Reload would push a single read into the
+        // hundreds of milliseconds; today Reload is fast, so the
+        // threshold is the architectural pin, not a tight perf budget).
+        const int reads = reads_done.load(std::memory_order_relaxed);
+        const int64_t max_us = max_read_us.load(std::memory_order_relaxed);
+        const bool ok = reads > 0 && max_us < 50000;
+        std::string err;
+        if (!ok) {
+            err = "reads=" + std::to_string(reads) +
+                  " max_read_us=" + std::to_string(max_us);
+        }
+        Record("DualStack: GetLiveConfigSnapshot does not block on Reload",
+                ok, err);
+    } catch (const std::exception& e) {
+        Record("DualStack: GetLiveConfigSnapshot does not block on Reload",
+                false, e.what());
+    }
+}
+
+// Behavioral pin on Stop under reload contention: Stop must complete
+// in bounded wall-clock time even when a concurrent reload is in
+// flight. Stop's post-drain teardown barrier acquires `reload_mtx_`,
+// so it briefly waits for an in-flight reload body to complete — but
+// reload bodies are CPU-bound (no blocking I/O under the lock per the
+// header invariant), so the budget is sub-second. The 2000ms ceiling
+// is the architectural pin: a regression that introduces blocking
+// work under reload_mtx_ would push Stop past the budget immediately.
+inline void TestStopNotBlockedByConcurrentReload() {
+    std::cout << "\n[TEST] DualStack: Stop not blocked by concurrent Reload..."
+              << std::endl;
+    try {
+        HttpServer server("127.0.0.1", 0);
+        TestServerRunner<HttpServer> runner(server);
+
+        // Drive a sequence of Reload calls on a worker; they should
+        // cooperate with Stop. Use the live config (a Normalize+Validate
+        // copy) so reload paths don't bail on shape errors.
+        std::atomic<bool> reload_done{false};
+        std::thread reload_thread([&]() {
+            ServerConfig snap = server.GetLiveConfigSnapshot();
+            // Several reloads in a tight loop — each one acquires
+            // reload_mtx_ around its body, so Stop's post-drain
+            // teardown barrier briefly serialises with this thread.
+            for (int i = 0; i < 5; ++i) {
+                server.Reload(snap);
+            }
+            reload_done.store(true, std::memory_order_release);
+        });
+
+        // Give the reload thread a moment to enter Reload.
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        const auto t0 = std::chrono::steady_clock::now();
+        server.Stop();
+        const auto stop_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+
+        if (reload_thread.joinable()) reload_thread.join();
+
+        // Stop on a quiescent server with a few in-flight Reloads should
+        // complete well under two seconds. Reloads are CPU-bound
+        // metadata work; Stop's post-drain teardown barrier briefly
+        // serialises with reload_mtx_ but never waits on blocking I/O
+        // (header invariant forbids blocking I/O under the lock). A
+        // regression that introduces a slow op under reload_mtx_ would
+        // push stop_ms past the 2000ms ceiling immediately.
+        const bool ok = stop_ms < 2000 &&
+                        reload_done.load(std::memory_order_acquire);
+        std::string err;
+        if (!ok) {
+            err = "stop_ms=" + std::to_string(stop_ms) +
+                  " reload_done=" +
+                  std::to_string(reload_done.load(std::memory_order_acquire));
+        }
+        Record("DualStack: Stop not blocked by concurrent Reload", ok, err);
+    } catch (const std::exception& e) {
+        Record("DualStack: Stop not blocked by concurrent Reload",
+                false, e.what());
+    }
+}
+
 // PoolPartition stores its connect endpoint via an atomic shared_ptr target
 // that the reload path will swap. This test exercises the atomic-load path
 // end-to-end: an IP-literal upstream is configured, the pool partition is
@@ -1958,6 +2143,9 @@ inline void RunAllTests() {
     // HttpServer::Start DNS orchestration
     TestBindResolvedPresentAfterStart();
     TestStartupAbortsWhenStopCalledFirst();
+    TestStartupAbortsBeforeDnsWhenStopRanFirst();
+    TestStopNotBlockedByConcurrentReload();
+    TestGetLiveConfigSnapshotDoesNotBlockOnReload();
 
     // PoolPartition resolved-endpoint split
     TestPoolPartitionResolvedEndpointAtomic();

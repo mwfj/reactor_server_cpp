@@ -85,6 +85,101 @@ struct RequestGuard {
     RequestGuard& operator=(const RequestGuard&) = delete;
 };
 
+namespace {
+
+// Build the resume callback for a suspended async-middleware request.
+// Shared by the H1 and H2 paths — the outer scaffolding (handle.lock,
+// GetConnection guard, payload heap-copy, RunOnDispatcher, cancelled
+// check, exception-safe finalizer + DispatchHandler, do_bookkeeping)
+// is identical between the two; only three protocol-specific callables
+// differ:
+//
+//   pre_dispatch(handle) -> bool
+//     Runs after the cancelled-check, before the dispatch try-block.
+//     Return false to drop the resume (do_bookkeeping fires, no submit).
+//     May have side effects.
+//       H1: returns h.IsAsyncResponsePending().
+//       H2: erases the stream's abort hook and returns true.
+//
+//   tweak_response(resp, threw)
+//     Runs after the try/catch, before submit. Lets the protocol layer
+//     stamp Connection: close (H1) or no-op (H2) based on shutdown
+//     state and whether the user handler threw.
+//
+//   submit(handle, resp)
+//     Sends the final response.
+//       H1: ClearDeferred + CompleteAsyncResponse (close handled inside).
+//       H2: SubmitStreamResponse(stream_id, resp).
+//
+// Lifetime: state, req, resp are shared_ptrs captured by value; HandlerT
+// is held weakly and re-locked at each invocation so a torn-down
+// connection short-circuits to bookkeeping cleanup.
+template <typename HandlerT, typename PreDispatch,
+          typename TweakResp, typename SubmitFn>
+std::function<void(HttpRouter::AsyncMiddlewarePayload)>
+MakeAsyncResumeCallback(
+        HttpRouter& router,
+        std::weak_ptr<HandlerT> handler_weak,
+        std::shared_ptr<HttpRequest> req,
+        std::shared_ptr<HttpResponse> resp,
+        std::shared_ptr<HttpRouter::AsyncPendingState> state,
+        PreDispatch pre_dispatch,
+        TweakResp tweak_response,
+        SubmitFn submit) {
+    return [&router, handler_weak, req, resp, state,
+            pre_dispatch = std::move(pre_dispatch),
+            tweak_response = std::move(tweak_response),
+            submit = std::move(submit)]
+        (HttpRouter::AsyncMiddlewarePayload payload) mutable {
+        auto do_bookkeeping = [state]() { state->DecrementOnce(); };
+        auto handle = handler_weak.lock();
+        if (!handle) { do_bookkeeping(); return; }
+        auto conn = handle->GetConnection();
+        if (!conn) { do_bookkeeping(); return; }
+        auto shared_payload =
+            std::make_shared<HttpRouter::AsyncMiddlewarePayload>(
+                std::move(payload));
+        conn->RunOnDispatcher(
+            [&router, handle, req, resp, state, shared_payload, do_bookkeeping,
+             pre_dispatch, tweak_response, submit]() mutable {
+            if (state->cancelled()) { do_bookkeeping(); return; }
+            if (!pre_dispatch(*handle)) { do_bookkeeping(); return; }
+            // Mirror the sync-path catch in HttpConnectionHandler: on
+            // user-handler / finalizer throw, replace the in-flight
+            // response with a generic 500 so the client always gets a
+            // reply and active_requests_ is released via do_bookkeeping
+            // at the end. Never leak e.what() over the wire.
+            bool threw = false;
+            try {
+                if (shared_payload->finalizer) {
+                    shared_payload->finalizer(*req, *resp);
+                }
+                if (shared_payload->result ==
+                        HttpRouter::AsyncMiddlewareResult::PASS) {
+                    if (!router.DispatchHandler(*req, *resp)) {
+                        resp->Status(HttpStatus::NOT_FOUND).Text("Not Found");
+                    }
+                }
+            } catch (const std::exception& e) {
+                threw = true;
+                logging::Get()->error(
+                    "Exception in resumed request handler: {}", e.what());
+                *resp = HttpResponse::InternalError();
+            }
+            tweak_response(*resp, threw);
+            try {
+                submit(*handle, *resp);
+            } catch (const std::exception& e) {
+                logging::Get()->error(
+                    "Exception sending resumed response: {}", e.what());
+            }
+            do_bookkeeping();
+        });
+    };
+}
+
+}  // namespace
+
 // Thread-local scope flag that lets MarkServerReady's internal
 // registration pass (pending_proxy_routes_ + RegisterProxyRoutes) call
 // back through the public entry points without tripping the startup
@@ -679,6 +774,12 @@ std::unordered_set<std::string> HttpServer::LiveAuthIssuerNames() const {
     return auth_manager_->LiveIssuerNames();
 }
 
+std::optional<AUTH_NAMESPACE::AuthManager::SnapshotView>
+HttpServer::GetAuthSnapshot() const {
+    if (!auth_manager_) return std::nullopt;
+    return auth_manager_->SnapshotAll();
+}
+
 void HttpServer::MarkServerReady() {
     // Bypass RejectIfServerLive for the internal registration pass below.
     // MarkServerReady runs on the dispatcher thread and is the ONLY
@@ -985,11 +1086,30 @@ void HttpServer::MarkServerReady() {
         // Start discovery / static-fetch asynchronously; non-blocking.
         auth_manager_->Start();
 
-        // Install the auth middleware UNCONDITIONALLY. InvokeMiddleware
-        // checks AuthManager::master_enabled_ and returns pass-through
-        // when false, so installing at boot time is the cleanest way to
-        // make `auth.enabled: false → true` live-reloadable (otherwise a
-        // SIGHUP can never retroactively add a middleware).
+        // Install the async-auth middleware FIRST so the async chain is
+        // ordered before any future async middleware is prepended. The
+        // sync-auth middleware is installed LAST so that "last prepend
+        // runs first" places sync auth at the head of the sync chain
+        // (sync auth → rate_limit). Net per-request order is:
+        //   sync auth (JWT) → sync rate_limit → async auth (introspection)
+        //   → DispatchHandler.
+        // Both InvokeMiddleware and InvokeAsyncMiddleware check
+        // master_enabled_ inline so installing at boot keeps
+        // `auth.enabled: false → true` live-reloadable (a SIGHUP cannot
+        // retroactively add middleware after MarkServerReady returns).
+        //
+        // Async-auth is skipped when no issuers are configured at boot:
+        // issuer add is restart-required (AuthManager::Reload rejects
+        // issuer-set deltas), so an empty issuer list means introspection
+        // is impossible until restart. Skipping the install lets embedders
+        // register their own async middleware without auth-conflict in
+        // configurations that genuinely have no auth backend. When issuers
+        // ARE configured, PrependAsyncMiddleware throws on a pre-existing
+        // entry rather than silently bypassing introspection.
+        if (!auth_config_.issuers.empty()) {
+            router_.PrependAsyncMiddleware(
+                AUTH_NAMESPACE::MakeAsyncMiddleware(auth_manager_.get()));
+        }
         router_.PrependMiddleware(
             AUTH_NAMESPACE::MakeMiddleware(auth_manager_.get()));
 
@@ -1381,6 +1501,8 @@ void HttpServer::Delete(const std::string& path, HttpRouter::Handler handler) { 
 void HttpServer::Route(const std::string& method, const std::string& path, HttpRouter::Handler handler) { if (RejectIfServerLive("Route", path)) return; router_.Route(method, path, std::move(handler)); }
 void HttpServer::WebSocket(const std::string& path, HttpRouter::WsUpgradeHandler handler) { if (RejectIfServerLive("WebSocket", path)) return; router_.WebSocket(path, std::move(handler)); }
 void HttpServer::Use(HttpRouter::Middleware middleware) { if (RejectIfServerLive("Use", "<middleware>")) return; router_.Use(std::move(middleware)); }
+
+void HttpServer::PrependAsyncMiddleware(HttpRouter::AsyncMiddleware middleware) { if (RejectIfServerLive("PrependAsyncMiddleware", "<async-middleware>")) return; router_.PrependAsyncMiddleware(std::move(middleware)); }
 
 void HttpServer::GetAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { if (RejectIfServerLive("GetAsync", path)) return; router_.RouteAsync("GET",    path, std::move(handler)); }
 void HttpServer::PostAsync(const std::string& path, HttpRouter::AsyncHandler handler)   { if (RejectIfServerLive("PostAsync", path)) return; router_.RouteAsync("POST",   path, std::move(handler)); }
@@ -2216,6 +2338,22 @@ void HttpServer::Start() {
     // could race with MarkServerReady's RegisterProxyRoutes inserts.
     startup_begun_.store(true, std::memory_order_release);
 
+    // Pre-DNS shutdown gate. If Stop() landed BEFORE Start() entered
+    // here (e.g. signal during the startup_begun_ window), we must not
+    // spawn resolver threads or block on dns.overall_timeout_ms — the
+    // existing post-DNS gate would only fire after a slow/wedged
+    // resolver had already consumed up to the overall timeout. Release-
+    // acquire semantics: pairs with Stop's release-store on `stopping_`.
+    // Literal-only configs short-circuit DnsResolver without threads,
+    // so this gate primarily protects hostname-bearing configurations
+    // where the resolver could meaningfully block.
+    if (stopping_.load(std::memory_order_acquire)) {
+        logging::Get()->info(
+            "Startup aborted before DNS resolution (stop requested); "
+            "no resolver threads spawned, no listen socket opened");
+        return;
+    }
+
     // DNS resolution (off the reactor; no threads running) ──
     // §5.4a. Batch contains one entry per configured upstream plus a
     // `bind` entry for bind_host. For literal hosts (IP addresses)
@@ -2246,6 +2384,18 @@ void HttpServer::Start() {
         batch.push_back(std::move(r));
     }
 
+    // INVARIANT — NO MUTEX held across this call. ResolveMany blocks
+    // for up to `dns.overall_timeout_ms` on slow/wedged DNS; if any
+    // lock were held here that observability getters or Stop's barrier
+    // also acquired, /stats and shutdown would block for the full DNS
+    // budget. Start() is the only caller today and runs lock-free.
+    // Step-11's hostname-aware reload MUST follow the same discipline:
+    // compute the new endpoint OUTSIDE any lock, then atomic-store the
+    // resolved_endpoint_ pointer atomically. Reload-vs-Reload
+    // serialization, if needed, must use a freshly-named mutex with
+    // strict invariants (NO blocking I/O, NOT acquired by Stop, NOT
+    // acquired by observability getters) — see the deleted `reload_mtx_`
+    // docstring in http_server.h for the rationale.
     auto results = dns_resolver_->ResolveMany(
         std::move(batch),
         std::chrono::milliseconds(live_config_.dns.overall_timeout_ms));
@@ -2356,10 +2506,16 @@ void HttpServer::Stop() {
     // First executable line: publish shutdown intent with release
     // ordering (§11 v0.41 invariant). Start()/Reload() poll this at
     // phase boundaries with acquire ordering so they can abort cleanly
-    // even while wedged in DNS. MUST happen before the listener close
-    // and BEFORE any later lock acquisition — if Stop ever acquires
-    // reload_mtx_ (post-drain teardown barrier in step 11), this store
-    // must still run first so a mutex-waiting Stop still signals shutdown.
+    // even while wedged in DNS.
+    //
+    // Stop's pre-drain accept-close path stays lock-free. The post-drain
+    // teardown barrier acquires `reload_mtx_` so a Stop observed mid-
+    // reload waits for the reload body to complete before tearing the
+    // server down. Setting `stopping_` here as line one preserves the
+    // design invariant that shutdown intent is visible BEFORE any
+    // accept-close, drain, or barrier work runs — Reload polls this
+    // atomic at every phase boundary so a Stop landing mid-DNS still
+    // aborts the reload cleanly.
     stopping_.store(true, std::memory_order_release);
 
     logging::Get()->info("HttpServer stopping");
@@ -2968,6 +3124,62 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     return;  // Sync send path below runs auto-send
                 }
 
+                // Run async middleware (e.g. OAuth introspection) BEFORE the
+                // async handler so proxy routes registered via RouteAsync
+                // are protected. The async-handler state machine below is
+                // tightly coupled to the dispatch frame and can't host a
+                // suspend/resume trampoline without a substantial refactor;
+                // here we only support the SYNCHRONOUS-completion path.
+                // Cache-hit / negative-hit / sync-DENY all pass through
+                // immediately — only a cache miss that would actually fire
+                // a network POST gets rejected with 503 + Retry-After. The
+                // operator sees a clean failure (and a one-shot increment
+                // of the introspection_undetermined counter) instead of a
+                // silent auth bypass. Subsequent requests that hit the
+                // populated cache succeed normally.
+                {
+                    std::shared_ptr<HttpRouter::AsyncPendingState> mw_state;
+                    bool mw_sync_complete = router_.RunAsyncMiddleware(
+                        request, response, mw_state);
+                    if (!mw_sync_complete) {
+                        // FIXME: tier-2 follow-up — wire the async-handler
+                        // dispatch through the same ArmResume trampoline
+                        // sync routes use, so cache-miss requests resume
+                        // into the user handler instead of being 503'd.
+                        //
+                        // Cache-warmup-friendly fallback: do NOT TripCancel
+                        // the in-flight introspection POST. Letting it
+                        // complete populates the IntrospectionCache so the
+                        // next request for the same token gets a hit. The
+                        // mw_state's resume_cb was never armed, so when
+                        // Complete fires it just stores the payload in
+                        // result_slot_ and returns; the state's shared_ptr
+                        // ref count drops with the closure and the slot is
+                        // destroyed unused. Counter-pollution in payload's
+                        // finalizer is a non-issue because the finalizer
+                        // never runs.
+                        response = HttpResponse();
+                        response.Status(503)
+                                .Header("Retry-After", "1")
+                                .Header("Cache-Control", "no-store")
+                                .Text("authentication unavailable on async route — retry");
+                        if (!server_ready_.load(std::memory_order_acquire)) {
+                            response.Header("Connection", "close");
+                        }
+                        return;
+                    }
+                    if (mw_state &&
+                        mw_state->sync_result() ==
+                            HttpRouter::AsyncMiddlewareResult::DENY) {
+                        // Sync DENY path — response was populated by the
+                        // middleware (401 / 403 / 503 builder).
+                        if (!server_ready_.load(std::memory_order_acquire)) {
+                            response.Header("Connection", "close");
+                        }
+                        return;
+                    }
+                }
+
                 // BeginAsyncResponse must see the ORIGINAL request so
                 // deferred_was_head_ captures the real client method —
                 // CompleteAsyncResponse uses it to strip the body at send
@@ -3273,7 +3485,85 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 return;
             }
 
-            if (!router_.Dispatch(request, response)) {
+            // Phased dispatch: sync middleware → async middleware →
+            // handler. RequestGuard stays armed through every path
+            // except the async-middleware suspend branch, which releases
+            // it after ArmResume so TripCancel/DecrementOnce can share
+            // ownership of the active_requests_ decrement.
+
+            if (!router_.RunMiddleware(request, response)) {
+                HttpRouter::FillDefaultRejectionResponse(response);
+                if (!server_ready_.load(std::memory_order_acquire)) {
+                    response.Header("Connection", "close");
+                }
+                return;
+            }
+
+            std::shared_ptr<HttpRouter::AsyncPendingState> state;
+            if (!router_.RunAsyncMiddleware(request, response, state)) {
+                // Suspend: flip Defer, capture deep copies (the
+                // connection's request slot is reused by the parser),
+                // wire cancel/resume, ArmResume, release guard.
+                response.Defer();
+                self->BeginAsyncResponse(request);
+
+                auto req_copy  = std::make_shared<HttpRequest>(request);
+                auto resp_copy = std::make_shared<HttpResponse>(std::move(response));
+                std::weak_ptr<HttpConnectionHandler> h1_weak = self;
+                auto active_counter_local = active_requests_;
+
+                self->SetAsyncAbortHook([state]() {
+                    state->TripCancel();
+                });
+
+                // Capture state by VALUE — RunOnDispatcher enqueues for
+                // a future tick. `this` (HttpServer) outlives the
+                // connection: RemoveConnection trips the abort hook
+                // before the resume can run. Protocol-specific bits go
+                // into the three callables below; the common scaffolding
+                // is in MakeAsyncResumeCallback.
+                auto pre_dispatch =
+                    [](HttpConnectionHandler& h) -> bool {
+                    return h.IsAsyncResponsePending();
+                };
+                auto tweak_response =
+                    [this](HttpResponse& r, bool threw) {
+                    // H1 sets Connection: close on either the catch path
+                    // (always) or the success path during shutdown (so a
+                    // keep-alive client is told the socket won't be reused).
+                    if (threw ||
+                        !server_ready_.load(std::memory_order_acquire)) {
+                        r.Header("Connection", "close");
+                    }
+                };
+                auto submit =
+                    [](HttpConnectionHandler& h, HttpResponse& r) {
+                    r.ClearDeferred();
+                    h.CompleteAsyncResponse(std::move(r));
+                };
+                auto resume_cb = MakeAsyncResumeCallback(
+                    router_, h1_weak, req_copy, resp_copy, state,
+                    std::move(pre_dispatch),
+                    std::move(tweak_response),
+                    std::move(submit));
+
+                state->ArmResume(std::move(resume_cb), active_counter_local);
+                guard.release();
+                return;
+            }
+
+            // Sync fast-path. Guard stays armed through scope exit.
+            // `state` is null when no async middleware was registered
+            // (implicit PASS); only inspect sync_result when state exists.
+            if (state && state->sync_result() ==
+                    HttpRouter::AsyncMiddlewareResult::DENY) {
+                if (!server_ready_.load(std::memory_order_acquire)) {
+                    response.Header("Connection", "close");
+                }
+                return;
+            }
+
+            if (!router_.DispatchHandler(request, response)) {
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
             // During shutdown, signal the client to close the connection.
@@ -3291,6 +3581,14 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetMiddlewareCallback(
         [this](const HttpRequest& request, HttpResponse& response) -> bool {
             return router_.RunMiddleware(request, response);
+        }
+    );
+
+    // Bridge WS-upgrade dispatch into the async chain.
+    http_conn->SetAsyncMiddlewareCallback(
+        [this](const HttpRequest& request, HttpResponse& response,
+               std::shared_ptr<AsyncPendingState>& out_state) -> bool {
+            return router_.RunAsyncMiddleware(request, response, out_state);
         }
     );
 
@@ -3881,6 +4179,36 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     HttpRouter::FillDefaultRejectionResponse(response);
                     return;
                 }
+
+                // See H1 path above for the rationale on this sync-only
+                // gate. Cache hits / negative hits / sync-DENY all work;
+                // a cache miss that would actually fire a network POST
+                // gets a clean 503 + Retry-After instead of a silent auth
+                // bypass. Subsequent requests that hit the populated cache
+                // succeed normally.
+                {
+                    // FIXME: tier-2 follow-up — see H1 path above for
+                    // the same gap. Cache-miss requests are 503'd; the
+                    // in-flight POST is allowed to complete so the
+                    // cache populates for subsequent requests.
+                    std::shared_ptr<HttpRouter::AsyncPendingState> mw_state;
+                    bool mw_sync_complete = router_.RunAsyncMiddleware(
+                        request, response, mw_state);
+                    if (!mw_sync_complete) {
+                        response = HttpResponse();
+                        response.Status(503)
+                                .Header("Retry-After", "1")
+                                .Header("Cache-Control", "no-store")
+                                .Text("authentication unavailable on async route — retry");
+                        return;
+                    }
+                    if (mw_state &&
+                        mw_state->sync_result() ==
+                            HttpRouter::AsyncMiddlewareResult::DENY) {
+                        return;
+                    }
+                }
+
                 response.Defer();
 
                 auto mw_headers = response.GetHeaders();
@@ -4156,7 +4484,72 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 ~PusherSlotGuard() { HttpServer::current_sync_pusher_ = nullptr; }
             } pusher_slot_guard;
 
-            if (!router_.Dispatch(request, response)) {
+            // Phased dispatch — same shape as the H1 path. H2 uses
+            // stream-scoped abort hooks and SubmitStreamResponse on
+            // resume; ClearDeferred is unnecessary because the H2
+            // initial-dispatch gate (Http2Session::SubmitResponseIfFinished
+            // checks IsDeferred) doesn't apply to the resume submit.
+
+            if (!router_.RunMiddleware(request, response)) {
+                HttpRouter::FillDefaultRejectionResponse(response);
+                return;
+            }
+
+            std::shared_ptr<HttpRouter::AsyncPendingState> state;
+            if (!router_.RunAsyncMiddleware(request, response, state)) {
+                // Defer() is required on H2 too: without it, the H2
+                // dispatcher submits an immediate default response and
+                // closes the stream before resume runs.
+                response.Defer();
+
+                auto req_copy  = std::make_shared<HttpRequest>(request);
+                auto resp_copy = std::make_shared<HttpResponse>(std::move(response));
+                std::weak_ptr<Http2ConnectionHandler> h2_weak = self;
+                auto active_counter_local = active_requests_;
+
+                self->SetStreamAbortHook(stream_id, [state]() {
+                    state->TripCancel();
+                });
+
+                // Protocol-specific bits go into the three callables below;
+                // the common scaffolding is in MakeAsyncResumeCallback.
+                auto pre_dispatch =
+                    [stream_id](Http2ConnectionHandler& h) -> bool {
+                    // Erasing the abort hook here (matching the sync-path
+                    // contract) prevents a late RST_STREAM from racing
+                    // with the in-flight response submission. Always
+                    // proceed — H2 has no per-handler "is response
+                    // pending" gate distinct from cancelled/aborted.
+                    h.EraseStreamAbortHook(stream_id);
+                    return true;
+                };
+                auto tweak_response =
+                    [](HttpResponse&, bool) {
+                    // H2 has no Connection: close — graceful shutdown
+                    // handles GOAWAY/RST_STREAM separately.
+                };
+                auto submit =
+                    [stream_id](Http2ConnectionHandler& h, HttpResponse& r) {
+                    h.SubmitStreamResponse(stream_id, r);
+                };
+                auto resume_cb = MakeAsyncResumeCallback(
+                    router_, h2_weak, req_copy, resp_copy, state,
+                    std::move(pre_dispatch),
+                    std::move(tweak_response),
+                    std::move(submit));
+
+                state->ArmResume(std::move(resume_cb), active_counter_local);
+                guard.release();
+                return;
+            }
+
+            // `state` is null on empty-chain implicit PASS.
+            if (state && state->sync_result() ==
+                    HttpRouter::AsyncMiddlewareResult::DENY) {
+                return;
+            }
+
+            if (!router_.DispatchHandler(request, response)) {
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
         }
@@ -4218,6 +4611,12 @@ bool HttpServer::Reload(ServerConfig new_config) {
     // dns.overall_timeout_ms during a reload. Consider splitting into a
     // serialization mutex (held across the whole Reload) plus a brief
     // snapshot mutex (held only across live_config_ writes/reads).
+    // Reload-vs-Reload + Reload-vs-snapshot serialization. Held across
+    // the entire reload body, including the upstream re-resolution batch
+    // dispatched against `dns_resolver_->ResolveMany`. Stop's post-drain
+    // teardown barrier acquires + releases this same mutex so a Stop()
+    // observed mid-reload waits for completion before tearing the
+    // server down.
     std::lock_guard<std::mutex> reload_lock(reload_mtx_);
 
     // Gate 1: abort immediately if Stop() has already signalled shutdown.
@@ -4400,6 +4799,44 @@ bool HttpServer::Reload(ServerConfig new_config) {
             logging::Get()->error("Reload() rejected invalid config: {}",
                                   e.what());
             return false;
+        }
+
+        // Auth-validate-before-apply gate. ValidateHotReloadable above
+        // covers per-field range/allowlist checks (leeway, algorithms,
+        // introspection block) — but the issuer-topology check (the
+        // staged issuers map matching the live issuers map) lives only
+        // inside AuthManager::Reload's mutate path, late in this
+        // function. Without an early validate-only gate, an auth-only
+        // bad config (issuer renamed/added/removed) would still allow
+        // every other subsystem reload (rate-limit, circuit-breaker,
+        // size limits, H2 settings, request timeouts) to apply, then
+        // log a warn skipping auth — partial reload on a config the
+        // operator intends as atomic.
+        //
+        // ValidateReload is pure: topology check + per-issuer
+        // ValidateReload. Calling it here also positions the gate
+        // BEFORE any future hostname-aware reload phase (step 11)
+        // would land — so an auth-only bad reload rejects without
+        // depending on DNS health, exactly the contract documented
+        // for "auth-validate → DNS apply" ordering.
+        if (auth_manager_) {
+            std::string auth_validate_err;
+            if (!auth_manager_->ValidateReload(new_config.auth,
+                                                 auth_validate_err)) {
+                // Fail-fast: abort the entire reload. The docstring
+                // above mandates atomic application — letting later
+                // subsystems (DNS commit, rate_limit, circuit_breaker,
+                // size_limits, H2 settings, request timeouts) apply
+                // while auth is preserved produces a partial reload
+                // the operator did not stage. Mirrors the contract of
+                // auth_manager_->Reload below, which also rejects on
+                // these same conditions; this gate moves the rejection
+                // earlier so no DNS resolution work is wasted.
+                logging::Get()->error(
+                    "Reload rejected: auth pre-apply validation failed: "
+                    "{}; live state preserved", auth_validate_err);
+                return false;
+            }
         }
     }
 
@@ -4791,6 +5228,33 @@ bool HttpServer::Reload(ServerConfig new_config) {
         live_config_.http2 = new_config.http2;
     }
 
+    // Rate limit reload — always safe because manager is always created
+    if (rate_limit_manager_) {
+        rate_limit_manager_->Reload(new_config.rate_limit);
+    }
+
+    // Circuit breaker reload — live-propagates breaker-field edits on
+    // existing upstream services. CircuitBreakerManager::Reload is
+    // idempotent (atomic stores to unchanged values), so calling it
+    // unconditionally costs nothing when the operator didn't edit any
+    // breaker fields. Topology changes (added / removed service names)
+    // are logged as warn + skipped inside the manager; the outer
+    // restart-required warning still fires via the upstreams-inequality
+    // check below. After this call, update the breaker slices on every
+    // partition via per-dispatcher EnQueue — the manager handles that
+    // routing internally. The topology check itself now only diffs non-
+    // breaker fields (UpstreamConfig::operator== excludes circuit_breaker),
+    // so a CB-only SIGHUP is a clean hot reload with no spurious warn.
+    if (circuit_breaker_manager_) {
+        circuit_breaker_manager_->Reload(new_config.upstreams);
+    }
+
+    // AuthManager::Reload was invoked earlier (auth-first reject gate,
+    // before DNS commit / rate-limit / CB / size-limits / H2 settings).
+    // Issuer snapshots are already live by this point; the final
+    // CommitPolicyAndEnforcement below publishes policies/forward/
+    // master_enabled as the closing cutover.
+
     // Upstream topology changes (host/port/pool/proxy/tls) require a
     // restart — pools are built once in Start() and cannot be rebuilt
     // at runtime without a full drain cycle. The equality operator on
@@ -4909,7 +5373,10 @@ bool HttpServer::Reload(ServerConfig new_config) {
     // Final policy publish. Void return; cannot reject. Runs LAST so it sees
     // post-merge live upstream topology. The rebuild + master_enabled_ atomic
     // cutover happen under AuthManager's own snapshot_mtx_, closing the
-    // false→true reload window.
+    // false→true reload window. AuthManager::Reload was already invoked
+    // earlier in this function (auth-first reject gate, before DNS commit /
+    // rate-limit / CB / size-limits / H2 settings) so a rejected auth
+    // reload short-circuited the entire reload before reaching here.
     if (auth_manager_) {
         auth_manager_->CommitPolicyAndEnforcement(
             upstream_configs_,

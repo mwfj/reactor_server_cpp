@@ -1,9 +1,8 @@
 #include "ws/websocket_handshake.h"
 
+#include "base64.h"
+
 #include <openssl/sha.h>
-#include <openssl/bio.h>
-#include <openssl/evp.h>
-#include <openssl/buffer.h>
 
 #include <algorithm>
 #include <cstring>
@@ -157,18 +156,5 @@ std::string WebSocketHandshake::ComputeAcceptKey(const std::string& client_key) 
     unsigned char hash[SHA_DIGEST_LENGTH];
     SHA1(reinterpret_cast<const unsigned char*>(input.data()), input.size(), hash);
 
-    // Base64 encode
-    BIO* bio = BIO_new(BIO_s_mem());
-    BIO* b64 = BIO_new(BIO_f_base64());
-    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-    bio = BIO_push(b64, bio);
-    BIO_write(bio, hash, SHA_DIGEST_LENGTH);
-    BIO_flush(bio);
-
-    BUF_MEM* bptr;
-    BIO_get_mem_ptr(bio, &bptr);
-    std::string result(bptr->data, bptr->length);
-    BIO_free_all(bio);
-
-    return result;
+    return base64_util::EncodeNoNewline(hash, SHA_DIGEST_LENGTH);
 }

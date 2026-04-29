@@ -5,6 +5,13 @@
 
 namespace AUTH_NAMESPACE {
 
+// Mode discriminator string values for IssuerConfig::mode. Bare-string
+// comparisons to "jwt" / "introspection" appear in many sites (issuer.cc,
+// auth_manager.cc, config_loader.cc); centralise here so a typo at one site
+// fails to compile rather than silently misbehaving.
+inline constexpr const char* kModeJwt = "jwt";
+inline constexpr const char* kModeIntrospection = "introspection";
+
 // ---------------------------------------------------------------------------
 // Introspection-mode config (RFC 7662 token introspection).
 // ---------------------------------------------------------------------------
@@ -110,6 +117,19 @@ struct AuthForwardConfig {
     std::map<std::string, std::string> claims_to_headers;  // claim -> outbound header name
     bool strip_inbound_identity_headers = true;            // Drop inbound X-Auth-* to prevent spoofing
     bool preserve_authorization = true;                    // Forward original Authorization header
+
+    // Derived from claims_to_headers; populated by PopulateDerived() before
+    // the snapshot is wrapped in shared_ptr<const>. Avoids a per-request
+    // rebuild on the hot verify path. Excluded from equality (derived).
+    std::vector<std::string> claim_keys;
+
+    void PopulateDerived() {
+        claim_keys.clear();
+        claim_keys.reserve(claims_to_headers.size());
+        for (const auto& kv : claims_to_headers) {
+            claim_keys.push_back(kv.first);
+        }
+    }
 
     bool operator==(const AuthForwardConfig& o) const {
         return subject_header == o.subject_header &&

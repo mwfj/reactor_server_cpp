@@ -79,8 +79,13 @@ public:
     std::shared_ptr<ConnectionHandler> GetTransport() const { return conn_; }
 
     // The resolved endpoint that was active when this connection was
-    // created. Used by the async idle-cleanup task to identify connections
-    // that connected to a superseded IP after a reload.
+    // created. Used by the async idle-cleanup task to identify
+    // connections that connected to a superseded IP after a reload.
+    // The pool also calls this in CheckoutAsync / ServiceWaitQueue /
+    // ReturnConnection (via PoolPartition::ConnectionEndpointMatches)
+    // to short-circuit reuse of an idle keepalive whose captured IP
+    // was superseded by a hostname-aware reload before the async
+    // cleanup task ran.
     const std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>&
     captured_endpoint() const { return captured_endpoint_; }
 
@@ -90,8 +95,8 @@ private:
 
     std::string upstream_host_;
     int upstream_port_;
-
-    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> captured_endpoint_;
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>
+        captured_endpoint_;
 
     std::chrono::steady_clock::time_point created_at_;
     std::chrono::steady_clock::time_point last_used_at_;

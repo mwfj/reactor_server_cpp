@@ -11,6 +11,7 @@ class WebSocketConnection;
 class Dispatcher;
 struct HttpRequest;
 class HttpResponse;
+class AsyncPendingState;   // defined in http/http_router.h
 
 namespace HTTP_CALLBACKS_NAMESPACE {
 
@@ -24,6 +25,16 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     using HttpConnMiddlewareCallback = std::function<bool(
         const HttpRequest& request,
         HttpResponse& response
+    )>;
+
+    // Async middleware callback for WS-upgrade dispatch. Returns true if
+    // the chain completed synchronously, false on suspend. `out_state`
+    // is always populated (never null), mirroring
+    // HttpRouter::RunAsyncMiddleware's contract.
+    using HttpConnAsyncMiddlewareCallback = std::function<bool(
+        const HttpRequest& request,
+        HttpResponse& response,
+        std::shared_ptr<::AsyncPendingState>& out_state
     )>;
     using HttpConnUpgradeCallback = std::function<void(
         std::shared_ptr<HttpConnectionHandler> self,
@@ -41,7 +52,13 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     struct HttpConnCallbacks {
         HttpConnRequestCallback       request_callback       = nullptr;
         HttpConnRouteCheckCallback    route_check_callback    = nullptr;
+        // Sync middleware callback (rate-limit, sync auth). The setter
+        // is `SetMiddlewareCallback` for source compatibility with
+        // existing tests / embedders.
         HttpConnMiddlewareCallback    middleware_callback     = nullptr;
+        // Async middleware callback. When null, the WS-upgrade path
+        // skips the async phase entirely and runs the sync path only.
+        HttpConnAsyncMiddlewareCallback async_middleware_callback = nullptr;
         HttpConnUpgradeCallback       upgrade_callback       = nullptr;
         HttpConnRequestCountCallback  request_count_callback  = nullptr;
         HttpConnShutdownCheckCallback shutdown_check_callback = nullptr;
@@ -70,7 +87,7 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     // ordering against the eventual final response. Calls that arrive after
     // complete() has been invoked for the originating request are dropped
     // silently (request-scoped guard) so stale interims never leak into a
-    // pipelined next request's response window. See design spec §4.2.
+    // pipelined next request's response window.
     using InterimResponseSender = std::function<void(
         int status_code,
         const std::vector<std::pair<std::string, std::string>>& headers
@@ -89,7 +106,6 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     // MUST call from the dispatcher thread (sync handler or inline
     // during the async handler's dispatcher invocation, before
     // enqueuing complete()).
-    // See design spec §2.2.
     using ResourcePusher = std::function<int32_t(
         const std::string& method,
         const std::string& scheme,
@@ -123,7 +139,7 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     //   - Binds protocol-specific streaming senders so the handler can use
     //     one API across HTTP/1.1 and HTTP/2
     // Invoked by HttpServer (NOT HttpRouter — the router has no transport
-    // context). See design §2.2 and §4.2.
+    // context).
     using AsyncHandler = std::function<void(
         const HttpRequest& request,
         InterimResponseSender send_interim,
