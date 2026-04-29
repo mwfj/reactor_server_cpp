@@ -230,7 +230,7 @@ These fields are **restart-required**:
 - Changing an issuer's `issuer_url`, `discovery`, `jwks_uri`, `upstream`, or `mode`
 - Changing inline `proxy.route_prefix` (the inline prefix is coupled to proxy route registration, so changing it live would diverge auth matching from what the router serves). Use a top-level `auth.policies[]` entry instead if you need to reload the protected prefix without a restart.
 
-A reload that only touches live-reloadable fields applies immediately to the next request. A reload that requests a topology change logs a warn ("restart required") and the live topology stays as-is — nothing silently diverges from what operators typed. Already-running requests continue with the snapshot they started against.
+A reload that only touches live-reloadable fields applies immediately to the next request. A reload that contains an auth restart-only divergence — issuer add/remove/rename, or a per-issuer restart-only field change (`issuer_url`, `discovery`, `jwks_uri`, `upstream`, `mode`, introspection `endpoint` / `client_id` / `client_secret_env` / `shards`) — is **rejected atomically by `HttpServer::Reload`'s pre-validate gate**: the entire reload returns `false`, no other live-safe edits in the same payload apply, and live state is fully preserved. Operators see one error log naming the offending field and re-issue the reload after either reverting the bad field or accepting that this change is a restart. Already-running requests continue with the snapshot they started against.
 
 ### Observability
 
