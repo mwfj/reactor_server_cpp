@@ -4059,11 +4059,12 @@ void TestConfigLoaderRequiresIntrospectionCredentials() {
 
 // -----------------------------------------------------------------------------
 // ConfigLoader::Validate — a policy listing multiple introspection-mode
-// issuers triggers a soft warn but does NOT reject. Each cache miss may
-// fan out one RFC 7662 POST per issuer until one accepts the token; the
-// loader logs a warning so an accidental fanout surfaces in operator
-// logs without blocking deployment. Single-issuer and mixed jwt+intro
-// policies remain silent.
+// issuers triggers a soft warn but does NOT reject. The runtime probes
+// only the FIRST ready introspection issuer on a cache miss; tokens
+// issued by a non-selected issuer in the list are denied (no live fan-
+// out). The loader logs a warning so an accidental misconfig surfaces
+// in operator logs without blocking deployment. Single-issuer and
+// mixed jwt+intro policies remain silent.
 // -----------------------------------------------------------------------------
 void TestConfigLoaderWarnsOnMultiIntrospectionPolicy() {
     std::cout << "\n[TEST] ConfigLoader warns on multi-introspection policy..."

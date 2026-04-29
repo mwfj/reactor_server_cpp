@@ -2499,13 +2499,15 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
         ValidateTopLevelPolicies(config);
 
         // Soft-warn on policies that mix multiple introspection-mode
-        // issuers. Each introspection issuer maintains its own per-policy
-        // RFC 7662 round-trip on cache miss, so a policy with N>1
-        // introspection issuers fans out N synchronous IdP calls per
-        // request (the verifier walks issuers in order until one accepts).
-        // Operators who do this on purpose are accepting the cost; we
-        // warn so an accidental misconfig surfaces in logs without
-        // failing the load.
+        // issuers. The runtime probes only ONE issuer per request
+        // (peeked-issuer match if the token is a JWT, else first ready
+        // introspection issuer in the policy.issuers list). Tokens
+        // owned by a NON-selected issuer are denied on that issuer's
+        // active:false response — no live fan-out across the remaining
+        // allowed issuers. The recommended shape is one introspection
+        // issuer per policy; multi-tenant federation should split the
+        // route into per-tenant policies. See docs/oauth2.md
+        // "Multi-introspection-issuer policies" for the workaround.
         for (const auto& p : config.auth.policies) {
             int introspection_count = 0;
             for (const auto& iss_name : p.issuers) {
@@ -2518,10 +2520,11 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             if (introspection_count > 1) {
                 logging::Get()->warn(
                     "auth_policy_multi_introspection policy={} "
-                    "issuer_count={} — each cache miss may fan out one "
-                    "RFC 7662 POST per issuer until one accepts the "
-                    "token; consider scoping the policy to a single "
-                    "introspection issuer",
+                    "issuer_count={} — only the FIRST ready introspection "
+                    "issuer is probed on a cache miss; tokens issued by "
+                    "any other issuer in the list will be denied (no live "
+                    "fan-out). Split into per-tenant policies with a "
+                    "single introspection issuer each.",
                     p.name, introspection_count);
             }
         }
