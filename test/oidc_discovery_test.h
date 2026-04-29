@@ -264,7 +264,14 @@ static bool TestConcurrentConstructionDestruction() {
 
     std::vector<std::thread> threads;
     for (int t = 0; t < THREADS; ++t) {
-        threads.emplace_back([&]() {
+        // Capture `t` BY VALUE — `[&]` would dangle: the thread reads `t`
+        // after the loop body has incremented or returned, racing the
+        // worker against the parent stack frame. ASan flags this as a
+        // stack-use-after-scope. `errors` is a std::atomic<int> that
+        // outlives the join() barrier below, so by-reference is safe.
+        threads.emplace_back([&errors, t]() {
+            (void)errors;  // currently unused; keeps the capture if
+                            // future code increments on construction failure
             for (int i = 0; i < PER_THREAD; ++i) {
                 auto d = MakeDiscovery(
                     "issuer-" + std::to_string(t) + "-" + std::to_string(i),

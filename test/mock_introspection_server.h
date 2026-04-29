@@ -96,24 +96,30 @@ class MockIntrospectionServer {
     // Bind to 127.0.0.1:0, start the worker thread, and return true on
     // success. Sets host_, port_, endpoint_url_ for caller introspection.
     bool Start() {
-        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd_ < 0) return false;
+        // listen_fd_ is std::atomic<int> so the cross-thread read from
+        // RunLoop's accept call has a defined memory model. The setup
+        // here happens-before the worker thread starts (running_.store
+        // + thread ctor publish), so plain stores during setup are safe
+        // — but use atomic store anyway to keep TSan's view clean.
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        listen_fd_.store(fd, std::memory_order_relaxed);
+        if (fd < 0) return false;
         int one = 1;
-        ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = 0;
-        if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-            ::close(listen_fd_);
-            listen_fd_ = -1;
+        if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            ::close(fd);
+            listen_fd_.store(-1, std::memory_order_relaxed);
             return false;
         }
         socklen_t len = sizeof(addr);
-        if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
-            ::close(listen_fd_);
-            listen_fd_ = -1;
+        if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+            ::close(fd);
+            listen_fd_.store(-1, std::memory_order_relaxed);
             return false;
         }
         port_ = ntohs(addr.sin_port);
@@ -121,9 +127,9 @@ class MockIntrospectionServer {
         endpoint_url_ = "http://" + host_ + ":" + std::to_string(port_)
             + "/introspect";
 
-        if (::listen(listen_fd_, 16) != 0) {
-            ::close(listen_fd_);
-            listen_fd_ = -1;
+        if (::listen(fd, 16) != 0) {
+            ::close(fd);
+            listen_fd_.store(-1, std::memory_order_relaxed);
             return false;
         }
 
@@ -134,10 +140,15 @@ class MockIntrospectionServer {
 
     void Stop() {
         bool was_running = running_.exchange(false, std::memory_order_acq_rel);
-        if (listen_fd_ >= 0) {
-            ::shutdown(listen_fd_, SHUT_RDWR);
-            ::close(listen_fd_);
-            listen_fd_ = -1;
+        // Snapshot the fd under acquire so the worker's accept-loop read
+        // (also via load/acquire) and our shutdown sequence here have a
+        // happens-before edge through this atomic. Keeping the close
+        // here means the worker's blocking accept unblocks with EBADF /
+        // ECONNABORTED and falls through to its running_ check.
+        int fd = listen_fd_.exchange(-1, std::memory_order_acq_rel);
+        if (fd >= 0) {
+            ::shutdown(fd, SHUT_RDWR);
+            ::close(fd);
         }
         if (was_running && worker_.joinable()) {
             worker_.join();
@@ -184,10 +195,12 @@ class MockIntrospectionServer {
 
     void RunLoop() {
         while (running_.load(std::memory_order_acquire)) {
+            int fd = listen_fd_.load(std::memory_order_acquire);
+            if (fd < 0) return;
             sockaddr_in caddr{};
             socklen_t clen = sizeof(caddr);
             int cfd = ::accept(
-                listen_fd_, reinterpret_cast<sockaddr*>(&caddr), &clen);
+                fd, reinterpret_cast<sockaddr*>(&caddr), &clen);
             if (cfd < 0) {
                 if (!running_.load(std::memory_order_acquire)) return;
                 continue;
@@ -331,7 +344,7 @@ class MockIntrospectionServer {
         }
     }
 
-    int listen_fd_ = -1;
+    std::atomic<int> listen_fd_{-1};
     std::thread worker_;
     std::atomic<bool> running_{false};
     std::atomic<size_t> request_count_{0};

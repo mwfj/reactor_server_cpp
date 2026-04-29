@@ -1505,6 +1505,21 @@ void Http2Session::ResetStream(int32_t stream_id, uint32_t error_code) {
             "nghttp2_submit_rst_stream failed stream={} rv={} ({})",
             stream_id, rv, nghttp2_strerror(rv));
     }
+    // Skip the inline flush when we are inside `nghttp2_session_mem_recv2`
+    // (set by ReceiveData via the in_receive_data_ guard). Calling
+    // nghttp2_session_mem_send2 reentrantly from within a recv callback
+    // can run the post-send hooks (session_after_frame_sent1 →
+    // nghttp2_session_close_stream → nghttp2_session_destroy_stream),
+    // which frees the stream object that the OUTER recv path
+    // (session_after_header_block_received) is still holding a pointer
+    // to — a single-threaded heap-use-after-free that TSan caught. The
+    // RST frame stays queued; the post-receive flush in
+    // Http2ConnectionHandler::OnRawData unwinds nghttp2 fully before
+    // the next mem_send2 call, so the RST goes out on that flush.
+    // Mirrors the existing SubmitInterimHeaders / push_resource pattern.
+    if (in_receive_data_) {
+        return;
+    }
     SendPendingFrames();
 }
 
