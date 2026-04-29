@@ -3449,23 +3449,44 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                             do_bookkeeping();
                             return;
                         }
-                        if (shared_payload->finalizer) {
-                            shared_payload->finalizer(*req_copy, *resp_copy);
-                        }
-                        if (shared_payload->result ==
-                                HttpRouter::AsyncMiddlewareResult::PASS) {
-                            if (!router_.DispatchHandler(
-                                    *req_copy, *resp_copy)) {
-                                resp_copy->Status(HttpStatus::NOT_FOUND)
-                                          .Text("Not Found");
+                        // Mirror the sync-path catch in
+                        // HttpConnectionHandler: on user-handler /
+                        // finalizer throw, replace the in-flight response
+                        // with a generic 500 + Connection: close so the
+                        // client always gets a reply and active_requests_
+                        // is released via do_bookkeeping at the end. Never
+                        // leak e.what() over the wire.
+                        try {
+                            if (shared_payload->finalizer) {
+                                shared_payload->finalizer(*req_copy, *resp_copy);
                             }
-                            if (!server_ready_.load(
-                                    std::memory_order_acquire)) {
-                                resp_copy->Header("Connection", "close");
+                            if (shared_payload->result ==
+                                    HttpRouter::AsyncMiddlewareResult::PASS) {
+                                if (!router_.DispatchHandler(
+                                        *req_copy, *resp_copy)) {
+                                    resp_copy->Status(HttpStatus::NOT_FOUND)
+                                              .Text("Not Found");
+                                }
+                                if (!server_ready_.load(
+                                        std::memory_order_acquire)) {
+                                    resp_copy->Header("Connection", "close");
+                                }
                             }
+                        } catch (const std::exception& e) {
+                            logging::Get()->error(
+                                "Exception in resumed request handler: {}",
+                                e.what());
+                            *resp_copy = HttpResponse::InternalError();
+                            resp_copy->Header("Connection", "close");
                         }
                         resp_copy->ClearDeferred();
-                        h1->CompleteAsyncResponse(std::move(*resp_copy));
+                        try {
+                            h1->CompleteAsyncResponse(std::move(*resp_copy));
+                        } catch (const std::exception& e) {
+                            logging::Get()->error(
+                                "Exception sending resumed response: {}",
+                                e.what());
+                        }
                         do_bookkeeping();
                     });
                 };
@@ -4455,18 +4476,37 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                             return;
                         }
                         h2->EraseStreamAbortHook(stream_id);
-                        if (shared_payload->finalizer) {
-                            shared_payload->finalizer(*req_copy, *resp_copy);
-                        }
-                        if (shared_payload->result ==
-                                HttpRouter::AsyncMiddlewareResult::PASS) {
-                            if (!router_.DispatchHandler(
-                                    *req_copy, *resp_copy)) {
-                                resp_copy->Status(HttpStatus::NOT_FOUND)
-                                          .Text("Not Found");
+                        // Mirror the sync-path contract: on user-handler
+                        // / finalizer throw, replace the response with a
+                        // generic 500 so the stream still completes and
+                        // active_requests_ is released. H2 has no
+                        // Connection: close — graceful shutdown handles
+                        // GOAWAY/RST_STREAM separately.
+                        try {
+                            if (shared_payload->finalizer) {
+                                shared_payload->finalizer(*req_copy, *resp_copy);
                             }
+                            if (shared_payload->result ==
+                                    HttpRouter::AsyncMiddlewareResult::PASS) {
+                                if (!router_.DispatchHandler(
+                                        *req_copy, *resp_copy)) {
+                                    resp_copy->Status(HttpStatus::NOT_FOUND)
+                                              .Text("Not Found");
+                                }
+                            }
+                        } catch (const std::exception& e) {
+                            logging::Get()->error(
+                                "Exception in resumed H2 request handler: {}",
+                                e.what());
+                            *resp_copy = HttpResponse::InternalError();
                         }
-                        h2->SubmitStreamResponse(stream_id, *resp_copy);
+                        try {
+                            h2->SubmitStreamResponse(stream_id, *resp_copy);
+                        } catch (const std::exception& e) {
+                            logging::Get()->error(
+                                "Exception submitting resumed H2 response: {}",
+                                e.what());
+                        }
                         do_bookkeeping();
                     });
                 };

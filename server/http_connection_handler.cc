@@ -1851,8 +1851,30 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
         // OnMessage. Calling upgrade_callback AFTER the flush would mean
         // those early frames are parsed against a still-null OnMessage
         // handler and silently dropped.
-        if (callbacks_.upgrade_callback) {
-            callbacks_.upgrade_callback(shared_from_this(), req);
+        // Wrap upgrade_callback so a throwing user handler doesn't
+        // leave the connection half-upgraded with the 101 unsent. On
+        // the async-resume path, upgraded_ + ws_conn_ are set BEFORE
+        // CompleteAsyncResponse runs, so the sync-path post-101 catch
+        // (which sends WS close 1011) doesn't apply — 101 is not yet
+        // on the wire. Roll back the in-progress upgrade and respond
+        // with HTTP 500 + Connection: close instead. CompleteAsyncResponse
+        // clears deferred_pending_buf_ on close so any pipelined WS
+        // frames the client sent during suspend are discarded rather
+        // than misparsed as HTTP.
+        try {
+            if (callbacks_.upgrade_callback) {
+                callbacks_.upgrade_callback(shared_from_this(), req);
+            }
+        } catch (const std::exception& e) {
+            logging::Get()->error(
+                "Exception in resumed WS upgrade handler: {}", e.what());
+            upgraded_ = false;
+            ws_conn_.reset();
+            HttpResponse err = HttpResponse::InternalError();
+            err.Header("Connection", "close");
+            err.ClearDeferred();
+            CompleteAsyncResponse(std::move(err));
+            return false;
         }
         upgrade_resp.ClearDeferred();
         CompleteAsyncResponse(std::move(upgrade_resp));
