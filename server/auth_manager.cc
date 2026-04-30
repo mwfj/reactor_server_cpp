@@ -903,10 +903,46 @@ void AuthManager::BumpPerPolicy(const std::string& issuer,
     if (issuer.empty() && policy.empty()) {
         return;
     }
+    // Acquire the policies snapshot BEFORE per_policy_mtx_ to avoid lock
+    // inversion with CommitPolicyAndEnforcement (which holds snapshot_mtx_
+    // for publication and per_policy_mtx_ for reconciliation in separate
+    // critical sections).
+    std::shared_ptr<const AppliedPolicyList> policies_snap;
+    {
+        std::lock_guard<std::mutex> lk_snap(snapshot_mtx_);
+        policies_snap = policies_;
+    }
+
     std::lock_guard<std::mutex> lk(per_policy_mtx_);
     auto key = std::make_pair(issuer, policy);
     auto it = per_policy_.find(key);
     if (it == per_policy_.end()) {
+        // Lazy-create gate: the (issuer, policy) tuple must still be a
+        // member of the live identity space. If a concurrent reload has
+        // just reconciled the bucket out by removing the policy (or, in a
+        // future world, the issuer), drop this verdict's per-policy bump
+        // silently — the aggregate counter still increments at the caller.
+        // Without this gate, an async introspection finalizer arriving
+        // after a reload would resurrect the bucket post-reconciliation,
+        // breaking the documented "removed-then-readded resets to zero"
+        // contract. Empty issuer is always allowed (pre-issuer-selection
+        // denies). issuers_ is topology-stable post-Start so the lookup
+        // is lock-free.
+        if (!issuer.empty() && issuers_.find(issuer) == issuers_.end()) {
+            return;
+        }
+        bool policy_live = false;
+        if (policies_snap) {
+            for (const auto& ap : *policies_snap) {
+                if (ap.policy.name == policy) {
+                    policy_live = true;
+                    break;
+                }
+            }
+        }
+        if (!policy_live) {
+            return;
+        }
         auto inserted = per_policy_.emplace(
             std::move(key), std::make_unique<PerPolicyCounters>());
         it = inserted.first;
@@ -954,7 +990,17 @@ void AuthManager::ReconcilePerPolicyKeysLocked(
         kept.insert(ap.policy.name);
     }
     for (auto it = per_policy_.begin(); it != per_policy_.end(); ) {
-        if (kept.count(it->first.second) == 0) {
+        const std::string& key_issuer = it->first.first;
+        const std::string& key_policy = it->first.second;
+        // Drop buckets keyed on a removed policy.name. Also drop buckets
+        // keyed on a non-empty issuer that has left issuers_ (defensive
+        // — issuers_ is topology-stable post-Start today, so this branch
+        // should not trigger; included to keep the bucket map bounded if
+        // issuer add/remove ever becomes live-reloadable).
+        const bool policy_gone = kept.count(key_policy) == 0;
+        const bool issuer_gone =
+            !key_issuer.empty() && issuers_.find(key_issuer) == issuers_.end();
+        if (policy_gone || issuer_gone) {
             it = per_policy_.erase(it);
         } else {
             ++it;
@@ -1257,7 +1303,13 @@ struct IntrospectionDoneCtx {
     // Cache control
     bool enable_cache_ops = false;
     std::string cache_key;          // non-empty only when enable_cache_ops=true
-    AuthCache cache = AuthCache::Miss;  // Miss (cached) or Uncached (uncached)
+    // Default `None` so a future call site that forgets to set this field
+    // emits an empty X-Auth-Cache (header omitted) rather than silently
+    // claiming `miss`. Both real call sites (cached / uncached) set this
+    // explicitly at dispatch — see InvokeAsyncIntrospection +
+    // InvokeIntrospectionUncached. The stale-promotion path inside
+    // MakeIntrospectionDoneCallback overrides to AuthCache::Stale.
+    AuthCache cache = AuthCache::None;
 
     AuthManager* manager = nullptr;
 };
@@ -1405,6 +1457,14 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                         if (vr_stale.outcome == VerifyOutcome::ALLOW) {
                             result.vr = VerifyResult::Allow();
                             result.ctx = std::move(stale.ctx);
+                            // Promote the cache label so the resume
+                            // finalizer's RecordVerdict emits
+                            // X-Auth-Cache: stale rather than the
+                            // dispatch-time `miss`. Operators reading
+                            // /stats see auth.introspection.stale_served
+                            // bumped via intro_stale_served below; the
+                            // per-response header now agrees.
+                            c.cache = AuthCache::Stale;
                             if (c.intro_stale_served) {
                                 c.intro_stale_served->fetch_add(
                                     1, std::memory_order_relaxed);
