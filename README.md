@@ -427,23 +427,30 @@ make test               # Build and run all tests
 make clean              # Remove artifacts
 make help               # Show all targets
 
-# Run specific test suites
+# Run a specific test suite (single-suite categories)
 ./test_runner basic
 ./test_runner stress
 ./test_runner race
 ./test_runner timeout
 ./test_runner config
-./test_runner http
+./test_runner http       # internal regressions + end-to-end HTTP
+./test_runner http2      # internal regressions + end-to-end HTTP/2
 ./test_runner ws
 ./test_runner tls
-./test_runner http2
 ./test_runner cli
 ./test_runner route
 ./test_runner upstream
-./test_runner proxy
 ./test_runner rate_limit
-./test_runner circuit_breaker
-./test_runner auth
+./test_runner kqueue     # macOS only; skipped on Linux
+
+# Feature-family umbrellas — each runs every sub-suite in the family
+./test_runner auth              # full auth feature family
+./test_runner circuit_breaker   # full circuit-breaker feature family
+./test_runner proxy             # internal proxy regressions + engine
+./test_runner dns               # DnsResolver primitives + dual-stack (alias: dual_stack)
+
+# Auth sub-suites (drill into one aspect)
+./test_runner auth_foundation
 ./test_runner jwt
 ./test_runner jwks
 ./test_runner oidc
@@ -459,9 +466,9 @@ make help               # Show all targets
 ./test_runner introspection_cache
 ./test_runner intro_client
 ./test_runner auth_intro
-./test_runner dual_stack
-./test_runner kqueue    # macOS only; skipped on Linux
-./test_runner help      # Show all runner options
+./test_runner auth_observability
+
+./test_runner help       # Show all runner options
 
 # Thread pool subproject (independent)
 make -C thread_pool

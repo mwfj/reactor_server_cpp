@@ -74,6 +74,22 @@ void RunAllCircuitBreakerFamily() {
     CircuitBreakerReloadTests::RunAllTests();
 }
 
+// Single entry point for the proxy feature family — internal state-machine
+// regressions plus the end-to-end engine tests. Both run the same proxy
+// transaction code paths from different angles.
+void RunAllProxyFamily() {
+    ProxyTransactionInternalTests::RunAllTests();
+    ProxyTests::RunAllTests();
+}
+
+// Single entry point for the DNS / dual-stack feature family. Same rationale
+// as the other family wrappers — DnsResolver primitives + dual-stack
+// integration are one feature split across two suites for readability.
+void RunAllDnsFamily() {
+    DnsResolverTests::RunAllTests();
+    DualStackTests::RunAllTests();
+}
+
 // Single entry point for the auth feature family. Same rationale as
 // RunAllCircuitBreakerFamily — multi-phase development produced multiple
 // suites, but they're all the same feature. Order matches a bottom-up
@@ -116,9 +132,6 @@ void RunAllTest(){
     // Run config tests
     ConfigTests::RunAllTests();
 
-    // Run focused internal proxy transaction regressions
-    ProxyTransactionInternalTests::RunAllTests();
-
     // Run focused internal HTTP/1 streaming regressions
     HttpInternalTests::RunAllTests();
 
@@ -149,8 +162,8 @@ void RunAllTest(){
     // Run upstream connection pool tests
     UpstreamPoolTests::RunAllTests();
 
-    // Run proxy engine tests
-    ProxyTests::RunAllTests();
+    // Proxy feature family (internal regressions + end-to-end engine).
+    RunAllProxyFamily();
 
     // Run rate limit tests
     RateLimitTests::RunAllTests();
@@ -165,10 +178,8 @@ void RunAllTest(){
     // cache + client + integration, observability).
     RunAllAuthFamily();
 
-    // DNS / dual-stack live outside the auth family (transport layer,
-    // not inbound auth).
-    DnsResolverTests::RunAllTests();
-    DualStackTests::RunAllTests();
+    // DNS / dual-stack feature family (transport layer, not inbound auth).
+    RunAllDnsFamily();
 
     std::cout << "====================================\n" << std::endl;
 }
@@ -189,7 +200,7 @@ void PrintUsage(const char* program_name) {
     std::cout << "  route,   -R    Run route trie/router pattern tests only" << std::endl;
     std::cout << "  kqueue,   -K    Run kqueue platform tests only (macOS; skipped on Linux)" << std::endl;
     std::cout << "  upstream, -U    Run upstream connection pool tests only" << std::endl;
-    std::cout << "  proxy,    -P    Run proxy engine tests only" << std::endl;
+    std::cout << "  proxy,    -P    Run the full proxy feature family (internal regressions + engine)" << std::endl;
     std::cout << "  rate_limit, -L  Run rate limit tests only" << std::endl;
     std::cout << std::endl;
     std::cout << "  circuit_breaker, -B  Run the full circuit-breaker feature family" << std::endl;
@@ -218,7 +229,9 @@ void PrintUsage(const char* program_name) {
     std::cout << "  auth_intro,  -Z    Introspection integration tests" << std::endl;
     std::cout << "  auth_observability, -o    Auth observability tests" << std::endl;
     std::cout << std::endl;
-    std::cout << "  dual_stack,  -D    Run dual-stack DNS resolver tests only" << std::endl;
+    std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
+    std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
+    std::cout << "                     (alias: dual_stack — kept for back-compat)" << std::endl;
     std::cout << "  help,        -h    Show this help message" << std::endl;
     std::cout << "\nNo arguments: Run all tests (full sweep — every suite above plus the dual_stack and DnsResolver suites)." << std::endl;
 }
@@ -272,9 +285,10 @@ int main(int argc, char* argv[]) {
         // Run upstream connection pool tests
         }else if(mode == "upstream" || mode == "-U"){
             UpstreamPoolTests::RunAllTests();
-        // Run proxy engine tests
+        // Run the full proxy feature family (internal proxy-transaction
+        // regressions + end-to-end proxy engine tests).
         }else if(mode == "proxy" || mode == "-P"){
-            ProxyTests::RunAllTests();
+            RunAllProxyFamily();
         // Run rate limit tests
         }else if(mode == "rate_limit" || mode == "-L"){
             RateLimitTests::RunAllTests();
@@ -342,9 +356,11 @@ int main(int argc, char* argv[]) {
         // Run introspection integration tests
         }else if(mode == "auth_intro" || mode == "-Z"){
             AuthIntrospectionIntegrationTests::RunAllTests();
-        // Run dual-stack DNS resolver tests
-        }else if(mode == "dual_stack" || mode == "-D"){
-            DualStackTests::RunAllTests();
+        // Run the full DNS / dual-stack feature family (DnsResolver
+        // primitives + dual-stack integration). `dns` is the canonical
+        // umbrella; `dual_stack` is kept as an alias for back-compat.
+        }else if(mode == "dns" || mode == "dual_stack" || mode == "-D"){
+            RunAllDnsFamily();
         // Run only TSAN-instrumented dual-stack stop/reload/destruction tests
         }else if(mode == "dual_stack_tsan"){
             DualStackTests::RunTSANTests();

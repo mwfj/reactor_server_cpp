@@ -3,108 +3,134 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all tests (799 tests across 35 suites, all pass)
+make test               # Build and run the full sweep (1021 tests across 35+ suites at HEAD)
 ./test_runner                   # Run all tests directly (after building)
+./test_runner help              # Print every supported flag
 
-# Individual test suites
+# Single-suite categories
 ./test_runner basic             # Basic functionality (or: ./test_runner -b)
 ./test_runner stress            # Stress tests — 100 concurrent clients (or: ./test_runner -s)
 ./test_runner race              # Race condition tests (or: ./test_runner -r)
 ./test_runner timeout           # Connection timeout tests (or: ./test_runner -t)
 ./test_runner config            # Configuration tests (or: ./test_runner -c)
-./test_runner http              # HTTP protocol tests (or: ./test_runner -H)
+./test_runner http              # HTTP/1.1 internal regressions + integration (or: ./test_runner -H)
 ./test_runner ws                # WebSocket protocol tests (or: ./test_runner -w)
 ./test_runner tls               # TLS/SSL tests (or: ./test_runner -T)
-./test_runner http2             # HTTP/2 protocol tests (or: ./test_runner -2)
+./test_runner http2             # HTTP/2 internal regressions + integration (or: ./test_runner -2)
 ./test_runner cli               # CLI entry point tests (or: ./test_runner -C)
-./test_runner route             # Route trie/pattern matching tests (or: ./test_runner -R)
+./test_runner route             # Route trie / pattern matching (or: ./test_runner -R)
 ./test_runner upstream          # Upstream connection pool tests (or: ./test_runner -U)
-./test_runner proxy             # Proxy engine tests (or: ./test_runner -P)
 ./test_runner rate_limit        # Rate limit tests (or: ./test_runner -L)
-./test_runner circuit_breaker   # Circuit breaker tests (or: ./test_runner -B)
-./test_runner auth              # OAuth foundation tests — Phase 1a utils (or: ./test_runner -A)
-./test_runner jwt               # JWT verifier unit tests (or: ./test_runner -J)
-./test_runner jwks              # JWKS cache unit tests (or: ./test_runner -j)
-./test_runner oidc              # OIDC discovery unit tests (or: ./test_runner -O)
-./test_runner hrauth            # HeaderRewriter auth-overlay tests (or: ./test_runner -W)
+./test_runner kqueue            # macOS kqueue platform tests (or: ./test_runner -K)
+
+# Feature-family umbrellas (each runs every sub-suite in the family)
+./test_runner auth              # full auth feature family (or: ./test_runner -A)
+./test_runner circuit_breaker   # full circuit-breaker feature family (or: ./test_runner -B)
+./test_runner proxy             # full proxy feature family — internal regressions + engine (or: ./test_runner -P)
+./test_runner dns               # full DNS / dual-stack feature family (or: ./test_runner -D; alias: dual_stack)
+
+# Auth sub-suites (drill into one aspect)
+./test_runner auth_foundation
+./test_runner jwt               # JWT verifier (or: ./test_runner -J)
+./test_runner jwks              # JWKS cache (or: ./test_runner -j)
+./test_runner oidc              # OIDC discovery (or: ./test_runner -O)
+./test_runner hrauth            # HeaderRewriter auth overlay (or: ./test_runner -W)
 ./test_runner auth_mgr          # AuthManager unit tests (or: ./test_runner -M)
-./test_runner auth2             # Auth integration tests — Phase 2 (or: ./test_runner -V)
+./test_runner auth2             # Auth integration tests (or: ./test_runner -V)
 ./test_runner auth_fail         # Auth failure-mode tests (or: ./test_runner -F)
 ./test_runner auth_reload       # Auth reload tests (or: ./test_runner -X)
 ./test_runner auth_multi        # Auth multi-issuer tests (or: ./test_runner -I)
 ./test_runner auth_ws           # Auth WebSocket-upgrade tests (or: ./test_runner -G)
 ./test_runner auth_race         # Auth race-condition tests (or: ./test_runner -Q)
-./test_runner kqueue            # macOS kqueue platform tests (or: ./test_runner -K)
-./test_runner help              # Show all options
+./test_runner router_async      # Router async-middleware tests (or: ./test_runner -N)
+./test_runner introspection_cache  # (or: ./test_runner -Y)
+./test_runner intro_client      # Introspection client + AsyncPendingState (or: ./test_runner -y)
+./test_runner auth_intro        # Introspection integration (or: ./test_runner -Z)
+./test_runner auth_observability  # Debug response headers + per-policy counters (or: ./test_runner -o)
 
-# Make targets for individual suites
-make test_basic         # Build and run basic tests
-make test_stress        # Build and run stress tests
-make test_race          # Build and run race condition tests
-make test_config        # Build and run config tests
-make test_http          # Build and run HTTP tests
-make test_ws            # Build and run WebSocket tests
-make test_tls           # Build and run TLS tests
-make test_http2         # Build and run HTTP/2 tests
-make test_cli           # Build and run CLI tests
-make test_upstream      # Build and run upstream pool tests
-make test_proxy         # Build and run proxy engine tests
-make test_rate_limit    # Build and run rate limit tests
-make test_circuit_breaker # Build and run circuit breaker tests
-make test_auth          # Build and run OAuth foundation tests (41)
-make test_jwt           # Build and run JWT verifier unit tests (21)
-make test_jwks          # Build and run JWKS cache unit tests (20)
-make test_oidc          # Build and run OIDC discovery unit tests (14)
-make test_hrauth        # Build and run HeaderRewriter auth-overlay tests (18)
-make test_auth_mgr      # Build and run AuthManager unit tests (20)
-make test_auth2         # Build and run auth integration tests (20)
-make test_auth_fail     # Build and run auth failure-mode tests (15)
-make test_auth_reload   # Build and run auth reload tests (14)
-make test_auth_multi    # Build and run auth multi-issuer tests (8)
-make test_auth_ws       # Build and run auth WebSocket-upgrade tests (6)
-make test_auth_race     # Build and run auth race-condition tests (10)
+# Make targets — single-suite
+make test_basic
+make test_stress
+make test_race
+make test_config
+make test_http
+make test_ws
+make test_tls
+make test_http2
+make test_cli
+make test_upstream
+make test_rate_limit
+
+# Make targets — feature-family umbrellas
+make test_auth                  # full auth feature family
+make test_circuit_breaker       # full circuit-breaker feature family
+make test_proxy                 # full proxy feature family
+make test_dns                   # full DNS / dual-stack feature family (alias: test_dual_stack)
+
+# Make targets — auth sub-suites
+make test_auth_foundation
+make test_jwt
+make test_jwks
+make test_oidc
+make test_hrauth
+make test_auth_mgr
+make test_auth2
+make test_auth_fail
+make test_auth_reload
+make test_auth_multi
+make test_auth_ws
+make test_auth_race
+make test_auth_observability
 ```
 
-At current head, `./test_runner` reports **799 / 799 passing** (100 %). Three new backpressure integration tests were added alongside the kqueue EV_EOF coalescing fix
+At current head, `./test_runner` reports **1021 / 1021 passing** (100 %).
 
 ## Test Suites
 
-| Suite | Tests | Port | File | Command |
-|-------|-------|------|------|---------|
-| Basic | 9 | ephemeral | `test/basic_test.h` | `./test_runner basic` |
-| Stress | 3 | ephemeral | `test/stress_test.h` | `./test_runner stress` |
-| Race Condition | 9 | ephemeral | `test/race_condition_test.h` | `./test_runner race` |
-| Timeout | 6 | ephemeral | `test/timeout_test.h` | `./test_runner timeout` |
-| Config | 8 | N/A | `test/config_test.h` | `./test_runner config` |
-| HTTP | 21 | ephemeral | `test/http_test.h` | `./test_runner http` |
-| WebSocket | 10 | ephemeral | `test/websocket_test.h` | `./test_runner ws` |
-| TLS | 2 | ephemeral | `test/tls_test.h` | `./test_runner tls` |
-| HTTP/2 | 37 | ephemeral | `test/http2_test.h` | `./test_runner http2` |
-| CLI | 79 | N/A | `test/cli_test.h` | `./test_runner cli` |
-| Route | 50 | ephemeral | `test/route_test.h` | `./test_runner route` |
-| Upstream Pool | 30 | ephemeral | `test/upstream_pool_test.h` | `./test_runner upstream` |
-| Proxy | 56 | ephemeral | `test/proxy_test.h` | `./test_runner proxy` |
-| Rate Limit | 46 | ephemeral | `test/rate_limit_test.h` | `./test_runner rate_limit` |
-| Circuit Breaker (state machine + window) | 45 | N/A | `test/circuit_breaker_test.h` | `./test_runner circuit_breaker` |
-| Circuit Breaker (components) | 11 | N/A | `test/circuit_breaker_components_test.h` | (bundled with `circuit_breaker`) |
-| Circuit Breaker (integration) | 14 | ephemeral | `test/circuit_breaker_integration_test.h` | (bundled with `circuit_breaker`) |
-| Circuit Breaker (retry budget) | 4 | ephemeral | `test/circuit_breaker_retry_budget_test.h` | (bundled with `circuit_breaker`) |
-| Circuit Breaker (wait-queue drain) | 2 | ephemeral | `test/circuit_breaker_wait_queue_drain_test.h` | (bundled with `circuit_breaker`) |
-| Circuit Breaker (observability) | 3 | ephemeral | `test/circuit_breaker_observability_test.h` | (bundled with `circuit_breaker`) |
-| Circuit Breaker (reload) | 7 | ephemeral | `test/circuit_breaker_reload_test.h` | (bundled with `circuit_breaker`) |
-| Auth Foundation (Phase 1a utilities) | 41 | N/A | `test/auth_foundation_test.h` | `./test_runner auth` |
-| JWT Verifier (Phase 2 unit) | 21 | N/A | `test/jwt_verifier_test.h` | `./test_runner jwt` |
-| JWKS Cache (Phase 2 unit) | 20 | N/A | `test/jwks_cache_test.h` | `./test_runner jwks` |
-| OIDC Discovery (Phase 2 unit) | 14 | N/A | `test/oidc_discovery_test.h` | `./test_runner oidc` |
-| HeaderRewriter Auth Overlay | 18 | N/A | `test/header_rewriter_auth_test.h` | `./test_runner hrauth` |
-| AuthManager (Phase 2 unit) | 20 | N/A | `test/auth_manager_test.h` | `./test_runner auth_mgr` |
-| Auth Integration (HTTP end-to-end) | 20 | ephemeral | `test/auth_integration_test.h` | `./test_runner auth2` |
-| Auth Failure Modes | 15 | ephemeral | `test/auth_failure_mode_test.h` | `./test_runner auth_fail` |
-| Auth Reload | 14 | ephemeral | `test/auth_reload_test.h` | `./test_runner auth_reload` |
-| Auth Multi-Issuer | 8 | ephemeral | `test/auth_multi_issuer_test.h` | `./test_runner auth_multi` |
-| Auth WebSocket Upgrade | 6 | ephemeral | `test/auth_websocket_upgrade_test.h` | `./test_runner auth_ws` |
-| Auth Race Conditions | 10 | ephemeral | `test/auth_race_test.h` | `./test_runner auth_race` |
-| Kqueue | 7 | ephemeral | `test/kqueue_test.h` | `./test_runner kqueue` (macOS only, skipped on Linux) |
+| Suite | Port | File | Command |
+|-------|------|------|---------|
+| Basic | ephemeral | `test/basic_test.h` | `./test_runner basic` |
+| Stress | ephemeral | `test/stress_test.h` | `./test_runner stress` |
+| Race Condition | ephemeral | `test/race_condition_test.h` | `./test_runner race` |
+| Timeout | ephemeral | `test/timeout_test.h` | `./test_runner timeout` |
+| Config | N/A | `test/config_test.h` | `./test_runner config` |
+| HTTP (internal + integration) | ephemeral | `test/http_test.h`, `test/http_internal_test.h` | `./test_runner http` |
+| WebSocket | ephemeral | `test/websocket_test.h` | `./test_runner ws` |
+| TLS | ephemeral | `test/tls_test.h` | `./test_runner tls` |
+| HTTP/2 (internal + integration) | ephemeral | `test/http2_test.h`, `test/http2_internal_test.h` | `./test_runner http2` |
+| CLI | N/A | `test/cli_test.h` | `./test_runner cli` |
+| Route | ephemeral | `test/route_test.h` | `./test_runner route` |
+| Upstream Pool | ephemeral | `test/upstream_pool_test.h` | `./test_runner upstream` |
+| Proxy (engine) | ephemeral | `test/proxy_test.h` | `./test_runner proxy` (umbrella runs internal regressions too) |
+| Rate Limit | ephemeral | `test/rate_limit_test.h` | `./test_runner rate_limit` |
+| Circuit Breaker (state machine + window) | N/A | `test/circuit_breaker_test.h` | `./test_runner circuit_breaker` (umbrella) |
+| Circuit Breaker (components) | N/A | `test/circuit_breaker_components_test.h` | (bundled with `circuit_breaker`) |
+| Circuit Breaker (integration) | ephemeral | `test/circuit_breaker_integration_test.h` | (bundled with `circuit_breaker`) |
+| Circuit Breaker (retry budget) | ephemeral | `test/circuit_breaker_retry_budget_test.h` | (bundled with `circuit_breaker`) |
+| Circuit Breaker (wait-queue drain) | ephemeral | `test/circuit_breaker_wait_queue_drain_test.h` | (bundled with `circuit_breaker`) |
+| Circuit Breaker (observability) | ephemeral | `test/circuit_breaker_observability_test.h` | (bundled with `circuit_breaker`) |
+| Circuit Breaker (reload) | ephemeral | `test/circuit_breaker_reload_test.h` | (bundled with `circuit_breaker`) |
+| Auth Foundation | N/A | `test/auth_foundation_test.h` | `./test_runner auth_foundation` (or via `auth` umbrella) |
+| JWT Verifier | N/A | `test/jwt_verifier_test.h` | `./test_runner jwt` (or via `auth` umbrella) |
+| JWKS Cache | N/A | `test/jwks_cache_test.h` | `./test_runner jwks` (or via `auth` umbrella) |
+| OIDC Discovery | N/A | `test/oidc_discovery_test.h` | `./test_runner oidc` (or via `auth` umbrella) |
+| HeaderRewriter Auth Overlay | N/A | `test/header_rewriter_auth_test.h` | `./test_runner hrauth` (or via `auth` umbrella) |
+| AuthManager unit | N/A | `test/auth_manager_test.h` | `./test_runner auth_mgr` (or via `auth` umbrella) |
+| Auth Integration (HTTP end-to-end) | ephemeral | `test/auth_integration_test.h` | `./test_runner auth2` (or via `auth` umbrella) |
+| Auth Failure Modes | ephemeral | `test/auth_failure_mode_test.h` | `./test_runner auth_fail` (or via `auth` umbrella) |
+| Auth Reload | ephemeral | `test/auth_reload_test.h` | `./test_runner auth_reload` (or via `auth` umbrella) |
+| Auth Multi-Issuer | ephemeral | `test/auth_multi_issuer_test.h` | `./test_runner auth_multi` (or via `auth` umbrella) |
+| Auth WebSocket Upgrade | ephemeral | `test/auth_websocket_upgrade_test.h` | `./test_runner auth_ws` (or via `auth` umbrella) |
+| Auth Race Conditions | ephemeral | `test/auth_race_test.h` | `./test_runner auth_race` (or via `auth` umbrella) |
+| Router Async-Middleware | N/A | `test/router_async_middleware_test.h` | `./test_runner router_async` (or via `auth` umbrella) |
+| Introspection Cache | N/A | `test/introspection_cache_test.h` | `./test_runner introspection_cache` (or via `auth` umbrella) |
+| Introspection Client | N/A | `test/introspection_client_test.h` | `./test_runner intro_client` (or via `auth` umbrella) |
+| Auth Introspection Integration | ephemeral | `test/auth_introspection_integration_test.h` | `./test_runner auth_intro` (or via `auth` umbrella) |
+| Auth Observability | ephemeral | `test/auth_observability_test.h` | `./test_runner auth_observability` (or via `auth` umbrella) |
+| Proxy Transaction Internal | N/A | `test/proxy_transaction_internal_test.h` | (bundled with `proxy`) |
+| DnsResolver | N/A | `test/dns_resolver_test.h` | (bundled with `dns`) |
+| DualStack | ephemeral | `test/dual_stack_test.h` | (bundled with `dns`) |
+| Kqueue | ephemeral | `test/kqueue_test.h` | `./test_runner kqueue` (macOS only, skipped on Linux) |
 
 ### Basic Tests
 - Single client connection

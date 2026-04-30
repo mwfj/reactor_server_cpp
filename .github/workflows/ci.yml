@@ -138,5 +138,5 @@ jobs:
         run: ./test_runner http2
       - name: Test - ws (real-socket WebSocket)
         run: ./test_runner ws
-      - name: Test - dual_stack (BSD getaddrinfo)
-        run: ./test_runner dual_stack
+      - name: Test - dns (DnsResolver primitives + dual-stack BSD getaddrinfo)
+        run: ./test_runner dns

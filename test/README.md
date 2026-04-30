@@ -1,47 +1,96 @@
 # Test Suite
 
-218 tests across 13 suites covering the reactor core, HTTP/1.1, HTTP/2, WebSocket, TLS, configuration, CLI, and route matching.
+Comprehensive test coverage across the reactor core, HTTP/1.1, HTTP/2, WebSocket, TLS, configuration, CLI, route matching, upstream/proxy, rate limiting, circuit breaker, OAuth, and DNS / dual-stack networking. Total at HEAD: 1021 tests across 35+ suites.
 
 ## Running Tests
 
 ```bash
 make clean && make -j4    # Build test_runner and server_runner
-./test_runner             # Run all 218 tests
+./test_runner             # Run all tests (no-arg full sweep)
 ./test_runner <suite>     # Run a specific suite (see table below)
+./test_runner help        # List every supported flag
 ```
 
 All tests use ephemeral ports (port 0) to avoid conflicts. The test runner automatically raises the fd limit on macOS where the default soft limit (256) is insufficient.
 
-### Suite Commands
+### Single-suite categories
 
-| Suite | Command | Short | Tests | What It Validates |
-|-------|---------|-------|------:|-------------------|
-| basic | `./test_runner basic` | `-b` | 6 | Connection lifecycle, echo, sequential/concurrent connections, large messages, quick disconnect |
-| stress | `./test_runner stress` | `-s` | 1 | 1000 concurrent clients (200 in CI); validates no crashes under load |
-| race | `./test_runner race` | `-r` | 7 | Reactor core race conditions: dispatcher init, deadlock prevention, double close, concurrent events, channel_map races, TOCTOU, atomic flags |
-| timeout | `./test_runner timeout` | `-t` | 3 | Idle connection timeout with custom and default timer parameters |
-| config | `./test_runner config` | `-c` | 8 | JSON config loading, environment variable overrides, validation, serialization |
-| http | `./test_runner http` | `-H` | 14 | HTTP/1.1 parsing, routing, middleware, integration (request/response cycle), request timeout |
-| ws | `./test_runner ws` | `-w` | 10 | WebSocket handshake validation, frame serialization, parser (masked/binary/16-bit/64-bit length frames), close frame handling, integration |
-| tls | `./test_runner tls` | `-T` | 2 | TLS context creation and HTTPS request/response |
-| http2 | `./test_runner http2` | `-2` | 37 | Protocol detection, ALPN, HTTP/2 stream lifecycle, header/body handling, H2C cleartext (GET, POST, 404, middleware, multiple streams, large body, invalid preface, body limits), config/settings |
-| cli | `./test_runner cli` | `-C` | 79 | CLI argument parsing (start/stop/status/reload/validate/config commands), signal handling, PID file management, logging subsystem, config reload, /stats endpoint, server counters |
-| route | `./test_runner route` | `-R` | 44 | Route trie: exact/param/catch-all matching, regex constraints, priority (static > param > catch-all), conflict detection, edge cases. HttpRouter: dispatch, 405, HEAD fallback, middleware, WebSocket routes |
-| kqueue | `./test_runner kqueue` | `-K` | 7 | macOS-only: EVFILT_TIMER idle timeout, EV_EOF on write filter, pipe wakeup under load, filter consolidation, churn stability, timer re-arm, SO_NOSIGPIPE |
+| Suite | Command | Short | What It Validates |
+|-------|---------|-------|-------------------|
+| basic | `./test_runner basic` | `-b` | Connection lifecycle, echo, sequential/concurrent connections, large messages, quick disconnect |
+| stress | `./test_runner stress` | `-s` | 1000 concurrent clients (200 in CI); validates no crashes under load |
+| race | `./test_runner race` | `-r` | Reactor core race conditions: dispatcher init, deadlock prevention, double close, concurrent events, channel_map races, TOCTOU, atomic flags |
+| timeout | `./test_runner timeout` | `-t` | Idle connection timeout with custom and default timer parameters |
+| config | `./test_runner config` | `-c` | JSON config loading, environment variable overrides, validation, serialization |
+| http | `./test_runner http` | `-H` | HTTP/1.1 internal regressions + parsing/routing/middleware/integration |
+| ws | `./test_runner ws` | `-w` | WebSocket handshake validation, frame serialization, parser, close handling, integration |
+| tls | `./test_runner tls` | `-T` | TLS context creation and HTTPS request/response |
+| http2 | `./test_runner http2` | `-2` | HTTP/2 internal regressions + protocol detection, ALPN, stream lifecycle, H2C, settings |
+| cli | `./test_runner cli` | `-C` | CLI argument parsing, signal handling, PID file management, logging, config reload, /stats |
+| route | `./test_runner route` | `-R` | Route trie + HttpRouter dispatch, middleware, WebSocket routes |
+| upstream | `./test_runner upstream` | `-U` | Upstream connection pool — partitions, lease lifecycle, connect, drain |
+| rate_limit | `./test_runner rate_limit` | `-L` | Token bucket, sharded zones, hot-reload, IETF headers |
+| kqueue | `./test_runner kqueue` | `-K` | macOS-only: EVFILT_TIMER, EV_EOF on write filter, pipe wakeup, filter consolidation |
+
+### Feature-family umbrellas
+
+A single CLI flag runs every sub-suite in the family. Sub-suites stay accessible via the no-arg full sweep and (for auth) via individual flags.
+
+| Family | Command | Short | Sub-suites covered |
+|--------|---------|-------|---------------------|
+| Auth | `./test_runner auth` | `-A` | foundation, JWT verifier, JWKS cache, OIDC discovery, header rewriter overlay, AuthManager, integration, failure modes, reload, multi-issuer, WS upgrade, race, router async, introspection cache + client + integration, observability |
+| Circuit breaker | `./test_runner circuit_breaker` | `-B` | state machine, components, integration, retry budget, drain, observability, reload |
+| Proxy | `./test_runner proxy` | `-P` | internal proxy-transaction regressions + end-to-end engine |
+| DNS / dual-stack | `./test_runner dns` | `-D` | DnsResolver primitives + dual-stack integration (alias: `dual_stack`) |
+
+### Auth sub-suite drill-down
+
+Every auth sub-suite has its own flag. Use these when you only want to exercise one aspect.
+
+```bash
+./test_runner auth_foundation        # foundation: token_hasher / claims / policy matcher
+./test_runner jwt                    # JWT verifier
+./test_runner jwks                   # JWKS cache
+./test_runner oidc                   # OIDC discovery
+./test_runner hrauth                 # HeaderRewriter auth overlay
+./test_runner auth_mgr               # AuthManager unit tests
+./test_runner auth2                  # auth integration (HttpServer + middleware)
+./test_runner auth_fail              # auth failure-mode tests
+./test_runner auth_reload            # auth reload tests
+./test_runner auth_multi             # auth multi-issuer tests
+./test_runner auth_ws                # auth WebSocket-upgrade tests
+./test_runner auth_race              # auth race-condition tests
+./test_runner router_async           # router async-middleware tests
+./test_runner introspection_cache    # introspection cache unit tests
+./test_runner intro_client           # introspection client + AsyncPendingState
+./test_runner auth_intro             # introspection integration tests
+./test_runner auth_observability     # debug response headers + per-policy counters
+```
 
 ### Make Targets
 
 ```bash
-make test            # Build and run all tests
-make test_basic      # Build and run basic tests only
-make test_stress     # Build and run stress tests only
-make test_race       # Build and run race condition tests only
-make test_config     # Build and run config tests only
-make test_http       # Build and run HTTP tests only
-make test_ws         # Build and run WebSocket tests only
-make test_tls        # Build and run TLS tests only
-make test_http2      # Build and run HTTP/2 tests only
-make test_cli        # Build and run CLI tests only
+make test                    # Build and run the full sweep
+make test_basic              # Single-suite targets — one per CLI flag above
+make test_stress
+make test_race
+make test_config
+make test_http
+make test_ws
+make test_tls
+make test_http2
+make test_cli
+make test_upstream
+make test_rate_limit
+
+# Family umbrellas
+make test_auth               # full auth feature family
+make test_circuit_breaker    # full circuit-breaker feature family
+make test_proxy              # full proxy feature family
+make test_dns                # full DNS / dual-stack feature family (alias: test_dual_stack)
+
+# Auth sub-suite targets exist for every auth flag (test_auth_foundation,
+# test_jwt, test_jwks, test_oidc, test_hrauth, test_auth_mgr, ...).
 ```
 
 ## Test Infrastructure
