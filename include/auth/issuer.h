@@ -203,6 +203,13 @@ class Issuer : public std::enable_shared_from_this<Issuer> {
 
     std::atomic<bool> ready_{false};
     std::atomic<bool> stopping_{false};
+    // Wall-clock seconds-since-epoch of the most recent OIDC discovery
+    // response that the Issuer ACCEPTED — i.e. the response passed the
+    // generation gate and InstallJwksUriLocked ran. Reload-rejected and
+    // Stop-superseded responses do NOT update this field, so /stats
+    // reports the timestamp of an actually-installed metadata, not of a
+    // dropped network response.
+    std::atomic<int64_t> last_discovery_success_epoch_sec_{0};
     // Generation bumped on Stop() and on every successful ApplyReload.
     // Heap-owned via shared_ptr so JwksFetcher / OidcDiscovery completion
     // callbacks can safely capture it by value — if the Issuer is destroyed

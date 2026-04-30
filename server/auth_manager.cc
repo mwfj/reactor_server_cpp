@@ -903,31 +903,35 @@ void AuthManager::BumpPerPolicy(const std::string& issuer,
     if (issuer.empty() && policy.empty()) {
         return;
     }
-    // Acquire the policies snapshot BEFORE per_policy_mtx_ to avoid lock
-    // inversion with CommitPolicyAndEnforcement (which holds snapshot_mtx_
-    // for publication and per_policy_mtx_ for reconciliation in separate
-    // critical sections).
-    std::shared_ptr<const AppliedPolicyList> policies_snap;
-    {
-        std::lock_guard<std::mutex> lk_snap(snapshot_mtx_);
-        policies_snap = policies_;
-    }
-
+    // Lock acquisition: per_policy_mtx_ first, then snapshot_mtx_ on the
+    // cold path only. snapshot_mtx_ and per_policy_mtx_ are NEVER held
+    // simultaneously by CommitPolicyAndEnforcement or SnapshotAll — both
+    // use separate critical sections. BumpPerPolicy's cold path is the
+    // only path that nests them, in per_policy_mtx_ → snapshot_mtx_
+    // order. Any future caller that holds snapshot_mtx_ MUST NOT wait on
+    // per_policy_mtx_ — that would deadlock against this cold path.
     std::lock_guard<std::mutex> lk(per_policy_mtx_);
     auto key = std::make_pair(issuer, policy);
     auto it = per_policy_.find(key);
     if (it == per_policy_.end()) {
-        // Lazy-create gate: the (issuer, policy) tuple must still be a
-        // member of the live identity space. If a concurrent reload has
-        // just reconciled the bucket out by removing the policy (or, in a
-        // future world, the issuer), drop this verdict's per-policy bump
-        // silently — the aggregate counter still increments at the caller.
-        // Without this gate, an async introspection finalizer arriving
-        // after a reload would resurrect the bucket post-reconciliation,
-        // breaking the documented "removed-then-readded resets to zero"
-        // contract. Empty issuer is always allowed (pre-issuer-selection
-        // denies). issuers_ is topology-stable post-Start so the lookup
-        // is lock-free.
+        // Cold path: lazy-create. Read the policies snapshot UNDER
+        // per_policy_mtx_ so the gate cannot race with a concurrent
+        // reload. CommitPolicyAndEnforcement publishes the new
+        // `policies_` under snapshot_mtx_ FIRST, then releases and
+        // acquires per_policy_mtx_ to run ReconcilePerPolicyKeysLocked.
+        // Because we hold per_policy_mtx_ for the entire decision, any
+        // reconciler whose publish-half has already happened is either
+        // (a) still queued behind our lock, or (b) already finished.
+        // Either way, the snapshot we read here reflects the post-publish
+        // state, so a verdict whose policy was just removed sees the
+        // updated list and drops — no stale-bucket resurrection.
+        std::shared_ptr<const AppliedPolicyList> policies_snap;
+        {
+            std::lock_guard<std::mutex> lk_snap(snapshot_mtx_);
+            policies_snap = policies_;
+        }
+        // Empty issuer is always allowed (pre-issuer-selection denies).
+        // issuers_ is topology-stable post-Start so the lookup is lock-free.
         if (!issuer.empty() && issuers_.find(issuer) == issuers_.end()) {
             return;
         }
