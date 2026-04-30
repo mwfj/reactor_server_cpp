@@ -27,7 +27,9 @@ make test               # Build and run the full sweep (1021 tests across 35+ su
 ./test_runner auth              # full auth feature family (or: ./test_runner -A)
 ./test_runner circuit_breaker   # full circuit-breaker feature family (or: ./test_runner -B)
 ./test_runner proxy             # full proxy feature family — internal regressions + engine (or: ./test_runner -P)
-./test_runner dns               # full DNS / dual-stack feature family (or: ./test_runner -D; alias: dual_stack)
+./test_runner dns               # full DNS / dual-stack feature family (or: ./test_runner -D)
+./test_runner dual_stack        # sub-suite — dual-stack integration only (OS-sensitive; macOS CI subset)
+./test_runner dns_resolver      # sub-suite — DnsResolver primitives only (timing-sensitive)
 
 # Auth sub-suites (drill into one aspect)
 ./test_runner auth_foundation
@@ -65,7 +67,9 @@ make test_rate_limit
 make test_auth                  # full auth feature family
 make test_circuit_breaker       # full circuit-breaker feature family
 make test_proxy                 # full proxy feature family
-make test_dns                   # full DNS / dual-stack feature family (alias: test_dual_stack)
+make test_dns                   # full DNS / dual-stack feature family
+make test_dual_stack            # sub-suite — dual-stack integration only (OS-sensitive)
+make test_dns_resolver          # sub-suite — DnsResolver primitives only
 
 # Make targets — auth sub-suites
 make test_auth_foundation

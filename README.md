@@ -447,7 +447,9 @@ make help               # Show all targets
 ./test_runner auth              # full auth feature family
 ./test_runner circuit_breaker   # full circuit-breaker feature family
 ./test_runner proxy             # internal proxy regressions + engine
-./test_runner dns               # DnsResolver primitives + dual-stack (alias: dual_stack)
+./test_runner dns               # DnsResolver primitives + dual-stack (umbrella)
+./test_runner dual_stack        # Sub-suite — dual-stack integration only
+./test_runner dns_resolver      # Sub-suite — DnsResolver primitives only
 
 # Auth sub-suites (drill into one aspect)
 ./test_runner auth_foundation

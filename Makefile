@@ -341,12 +341,22 @@ test_auth_intro: $(TARGET)
 	./$(TARGET) auth_intro
 
 # Run the full DNS / dual-stack feature family (DnsResolver primitives +
-# dual-stack integration). `test_dual_stack` is an alias kept for back-compat.
+# dual-stack integration).
 test_dns: $(TARGET)
 	@echo "Running the full DNS / dual-stack feature family..."
 	./$(TARGET) dns
 
-test_dual_stack: test_dns
+# Sub-suite — dual-stack integration only (OS-sensitive). Used by the
+# macOS CI subset; primitive timing tests excluded to avoid runner-load
+# flake.
+test_dual_stack: $(TARGET)
+	@echo "Running dual-stack integration tests only..."
+	./$(TARGET) dual_stack
+
+# Sub-suite — DnsResolver primitives only (timing-sensitive).
+test_dns_resolver: $(TARGET)
+	@echo "Running DnsResolver primitives tests only..."
+	./$(TARGET) dns_resolver
 
 test_auth_observability: $(TARGET)
 	@echo "Running auth observability tests only..."
@@ -454,4 +464,4 @@ help:
 # Build only the production server binary
 server: $(SERVER_TARGET)
 
-.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_auth_foundation test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache test_intro_client test_auth_intro test_dns test_dual_stack test_dual_stack_tsan test_auth_observability help
+.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_auth_foundation test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache test_intro_client test_auth_intro test_dns test_dual_stack test_dual_stack_tsan test_dns_resolver test_auth_observability help

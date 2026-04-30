@@ -231,7 +231,8 @@ void PrintUsage(const char* program_name) {
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
-    std::cout << "                     (alias: dual_stack — kept for back-compat)" << std::endl;
+    std::cout << "  dual_stack         Sub-suite — dual-stack integration only (OS-sensitive)" << std::endl;
+    std::cout << "  dns_resolver       Sub-suite — DnsResolver primitives only (timing-sensitive)" << std::endl;
     std::cout << "  help,        -h    Show this help message" << std::endl;
     std::cout << "\nNo arguments: Run all tests (full sweep — every suite above plus the dual_stack and DnsResolver suites)." << std::endl;
 }
@@ -356,11 +357,21 @@ int main(int argc, char* argv[]) {
         // Run introspection integration tests
         }else if(mode == "auth_intro" || mode == "-Z"){
             AuthIntrospectionIntegrationTests::RunAllTests();
-        // Run the full DNS / dual-stack feature family (DnsResolver
-        // primitives + dual-stack integration). `dns` is the canonical
-        // umbrella; `dual_stack` is kept as an alias for back-compat.
-        }else if(mode == "dns" || mode == "dual_stack" || mode == "-D"){
+        // Run the full DNS / dual-stack feature family — DnsResolver
+        // primitives + dual-stack integration via RunAllDnsFamily().
+        }else if(mode == "dns" || mode == "-D"){
             RunAllDnsFamily();
+        // Run only the dual-stack integration sub-suite (sockets / IPv6
+        // bind / hostname rejection / Reload integration). OS-sensitive;
+        // exercised on the macOS CI subset. The DnsResolver primitives
+        // are pure-logic + timing-sensitive — flaky on shared runners,
+        // so they live behind the `dns` umbrella for the no-arg full
+        // sweep (Linux) and the `dns_resolver` sub-flag for local dev.
+        }else if(mode == "dual_stack"){
+            DualStackTests::RunAllTests();
+        // Run only the DnsResolver primitives sub-suite.
+        }else if(mode == "dns_resolver"){
+            DnsResolverTests::RunAllTests();
         // Run only TSAN-instrumented dual-stack stop/reload/destruction tests
         }else if(mode == "dual_stack_tsan"){
             DualStackTests::RunTSANTests();

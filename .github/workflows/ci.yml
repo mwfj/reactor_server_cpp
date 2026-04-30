@@ -138,5 +138,11 @@ jobs:
         run: ./test_runner http2
       - name: Test - ws (real-socket WebSocket)
         run: ./test_runner ws
-      - name: Test - dns (DnsResolver primitives + dual-stack BSD getaddrinfo)
-        run: ./test_runner dns
+      - name: Test - dual_stack (BSD getaddrinfo + IPv6 bind / Reload integration)
+        # Runs the dual-stack integration sub-suite only. The DnsResolver
+        # primitives suite (timing-sensitive deadline checks) is excluded
+        # from this macOS subset by design — shared runners have variable
+        # scheduling latency that breaks sub-100ms deadline assertions.
+        # Linux full-sweep ./test_runner runs both suites via the `dns`
+        # umbrella; macOS only carries the OS-sensitive integration half.
+        run: ./test_runner dual_stack

@@ -41,7 +41,7 @@ A single CLI flag runs every sub-suite in the family. Sub-suites stay accessible
 | Auth | `./test_runner auth` | `-A` | foundation, JWT verifier, JWKS cache, OIDC discovery, header rewriter overlay, AuthManager, integration, failure modes, reload, multi-issuer, WS upgrade, race, router async, introspection cache + client + integration, observability |
 | Circuit breaker | `./test_runner circuit_breaker` | `-B` | state machine, components, integration, retry budget, drain, observability, reload |
 | Proxy | `./test_runner proxy` | `-P` | internal proxy-transaction regressions + end-to-end engine |
-| DNS / dual-stack | `./test_runner dns` | `-D` | DnsResolver primitives + dual-stack integration (alias: `dual_stack`) |
+| DNS / dual-stack | `./test_runner dns` | `-D` | DnsResolver primitives + dual-stack integration |
 
 ### Auth sub-suite drill-down
 
