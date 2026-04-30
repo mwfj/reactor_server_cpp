@@ -177,18 +177,36 @@ static void AppendJsonEscaped(std::string& out, const std::string& s) {
 }
 
 // Render the optional `,"auth":{...}` JSON fragment. Emits nothing when
-// the snapshot is absent (auth never constructed). Aggregate
-// `introspection.*` counters are always emitted when auth exists; the
-// per-issuer `introspection.cache_entries` field is emitted only for
-// issuers that own a cache (introspection-mode).
+// the snapshot is absent (auth never constructed). The shape is documented
+// in docs/oauth2.md and includes:
+//  - top-level: enabled, debug_response_headers, total_*, policy_count,
+//    generation
+//  - introspection.{ok,fail,cache_hit,cache_miss,cache_negative_hit,
+//    stale_served} aggregate
+//  - per_policy[]: flat list of {issuer,policy,allowed,denied,undetermined}
+//    buckets — empty issuer represents pre-issuer-selection denies
+//  - issuers[<name>]: mode, ready, jwks block, last refresh epochs,
+//    introspection.cache_entries (introspection-mode only), and a filtered
+//    per_policy[] for that issuer
 static void AppendAuthSnapshot(
         std::string& out,
         const std::optional<AUTH_NAMESPACE::AuthManager::SnapshotView>& snap) {
     if (!snap) return;
-    // Sized for the longest field block: per-issuer "jwks" object with six
-    // %llu values plus surrounding key text fits in well under 256 bytes.
     char num[256];
-    out += R"(,"auth":{"introspection":{)";
+    out += R"(,"auth":{)";
+    std::snprintf(num, sizeof(num),
+        R"("enabled":%s,"debug_response_headers":%s,)"
+        R"("total_allowed":%llu,"total_denied":%llu,"total_undetermined":%llu,)"
+        R"("policy_count":%zu,"generation":%llu,)",
+        snap->enabled ? "true" : "false",
+        snap->debug_response_headers ? "true" : "false",
+        static_cast<unsigned long long>(snap->total_allowed),
+        static_cast<unsigned long long>(snap->total_denied),
+        static_cast<unsigned long long>(snap->total_undetermined),
+        snap->policy_count,
+        static_cast<unsigned long long>(snap->generation));
+    out += num;
+    out += R"("introspection":{)";
     std::snprintf(num, sizeof(num),
         R"("ok":%llu,"fail":%llu,"cache_hit":%llu,"cache_miss":%llu,)"
         R"("cache_negative_hit":%llu,"stale_served":%llu)",
@@ -199,7 +217,25 @@ static void AppendAuthSnapshot(
         static_cast<unsigned long long>(snap->introspection_cache_negative_hit),
         static_cast<unsigned long long>(snap->introspection_stale_served));
     out += num;
-    out += "},\"issuers\":{";
+    out += "},\"per_policy\":[";
+    {
+        bool first = true;
+        for (const auto& pp : snap->per_policy) {
+            if (!first) out += ',';
+            first = false;
+            out += R"({"issuer":")";
+            AppendJsonEscaped(out, pp.issuer);
+            out += R"(","policy":")";
+            AppendJsonEscaped(out, pp.policy);
+            std::snprintf(num, sizeof(num),
+                R"(","allowed":%llu,"denied":%llu,"undetermined":%llu})",
+                static_cast<unsigned long long>(pp.allowed),
+                static_cast<unsigned long long>(pp.denied),
+                static_cast<unsigned long long>(pp.undetermined));
+            out += num;
+        }
+    }
+    out += "],\"issuers\":{";
     bool first = true;
     for (const auto& [name, view] : snap->issuers) {
         if (!first) out += ',';
@@ -208,14 +244,24 @@ static void AppendAuthSnapshot(
         AppendJsonEscaped(out, name);
         out += R"(":{"mode":")";
         AppendJsonEscaped(out, view.mode);
+        const int64_t last_jwks_epoch =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                view.last_jwks_refresh.time_since_epoch()).count();
+        const int64_t last_disc_epoch =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                view.last_discovery_refresh.time_since_epoch()).count();
         std::snprintf(num, sizeof(num),
             R"(","ready":%s,"jwks":{"key_count":%zu,"refresh_ok":%llu,)"
-            R"("refresh_fail":%llu,"stale_served":%llu})",
+            R"("refresh_fail":%llu,"stale_served":%llu},)"
+            R"("last_jwks_refresh_epoch":%lld,)"
+            R"("last_discovery_refresh_epoch":%lld)",
             view.ready ? "true" : "false",
             view.jwks_key_count,
             static_cast<unsigned long long>(view.jwks_refresh_ok),
             static_cast<unsigned long long>(view.jwks_refresh_fail),
-            static_cast<unsigned long long>(view.jwks_stale_served));
+            static_cast<unsigned long long>(view.jwks_stale_served),
+            static_cast<long long>(last_jwks_epoch),
+            static_cast<long long>(last_disc_epoch));
         out += num;
         if (view.mode == "introspection") {
             std::snprintf(num, sizeof(num),
@@ -223,6 +269,26 @@ static void AppendAuthSnapshot(
                 view.introspection_cache_entries);
             out += num;
         }
+        // Per-issuer per_policy[] — filtered from the flat list by issuer
+        // key. Empty for issuers with no observations under any policy.
+        out += R"(,"per_policy":[)";
+        {
+            bool ip_first = true;
+            for (const auto& pp : snap->per_policy) {
+                if (pp.issuer != name) continue;
+                if (!ip_first) out += ',';
+                ip_first = false;
+                out += R"({"policy":")";
+                AppendJsonEscaped(out, pp.policy);
+                std::snprintf(num, sizeof(num),
+                    R"(","allowed":%llu,"denied":%llu,"undetermined":%llu})",
+                    static_cast<unsigned long long>(pp.allowed),
+                    static_cast<unsigned long long>(pp.denied),
+                    static_cast<unsigned long long>(pp.undetermined));
+                out += num;
+            }
+        }
+        out += "]";
         out += '}';
     }
     out += "}}";

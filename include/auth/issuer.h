@@ -54,6 +54,10 @@ struct IssuerSnapshotView {
     uint64_t jwks_stale_served = 0;
     size_t jwks_key_count = 0;
     std::chrono::system_clock::time_point last_jwks_refresh{};
+    // Last successful OIDC discovery completion. Default-constructed
+    // (epoch zero) for issuers that don't run discovery (`discovery=false`)
+    // or whose discovery has not yet succeeded.
+    std::chrono::system_clock::time_point last_discovery_refresh{};
     // Approximate per-shard sum from IntrospectionCache. Zero for JWT-mode
     // issuers (no cache constructed).
     size_t introspection_cache_entries = 0;

@@ -579,6 +579,7 @@ static AUTH_NAMESPACE::AuthConfig BuildLiveAppliedAuthConfig(
         std::vector<AUTH_NAMESPACE::AuthPolicy> live_top_level_policies) {
     AUTH_NAMESPACE::AuthConfig applied = live_auth;
     applied.enabled = staged_auth.enabled;
+    applied.debug_response_headers = staged_auth.debug_response_headers;
     applied.issuers = staged_auth.issuers;
     applied.forward = staged_auth.forward;
     applied.policies = std::move(live_top_level_policies);
@@ -5382,7 +5383,8 @@ bool HttpServer::Reload(ServerConfig new_config) {
             upstream_configs_,
             auth_config_.policies,
             new_config.auth.forward,
-            new_config.auth.enabled);
+            new_config.auth.enabled,
+            new_config.auth.debug_response_headers);
     }
 
     return true;

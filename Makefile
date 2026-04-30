@@ -261,15 +261,20 @@ test_rate_limit: $(TARGET)
 	@echo "Running rate limit tests only..."
 	./$(TARGET) rate_limit
 
-# Run only circuit breaker tests
+# Run the full circuit-breaker feature family (umbrella — every CB sub-suite)
 test_circuit_breaker: $(TARGET)
-	@echo "Running circuit breaker tests only..."
+	@echo "Running the full circuit-breaker feature family..."
 	./$(TARGET) circuit_breaker
 
-# Run only auth foundation tests
+# Run the full auth feature family (umbrella — every auth-related sub-suite)
 test_auth: $(TARGET)
-	@echo "Running auth foundation tests only..."
+	@echo "Running the full auth feature family..."
 	./$(TARGET) auth
+
+# Auth foundation sub-suite (token_hasher / claims / policy matcher / config validation)
+test_auth_foundation: $(TARGET)
+	@echo "Running auth foundation sub-suite only..."
+	./$(TARGET) auth_foundation
 
 test_jwt: $(TARGET)
 	@echo "Running JWT verifier unit tests only..."
@@ -338,6 +343,10 @@ test_auth_intro: $(TARGET)
 test_dual_stack: $(TARGET)
 	@echo "Running dual-stack DNS resolver tests only..."
 	./$(TARGET) dual_stack
+
+test_auth_observability: $(TARGET)
+	@echo "Running auth observability tests only..."
+	./$(TARGET) auth_observability
 
 # Thread-Sanitizer build for dual-stack stop/reload/destruction race tests.
 # Builds a separate binary (test_runner_tsan) with -fsanitize=thread and
@@ -441,4 +450,4 @@ help:
 # Build only the production server binary
 server: $(SERVER_TARGET)
 
-.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache test_intro_client test_auth_intro test_dual_stack test_dual_stack_tsan help
+.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_auth_foundation test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache test_intro_client test_auth_intro test_dual_stack test_dual_stack_tsan test_auth_observability help

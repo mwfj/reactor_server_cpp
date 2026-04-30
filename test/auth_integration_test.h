@@ -983,7 +983,8 @@ static bool TestReloadForwardConfigUpdates() {
     if (reloaded) {
         AUTH_NAMESPACE::AuthForwardConfig fwd = new_cfg.forward;
         mgr->CommitPolicyAndEnforcement(
-            /*new_upstreams=*/{}, new_cfg.policies, fwd, new_cfg.enabled);
+            /*new_upstreams=*/{}, new_cfg.policies, fwd, new_cfg.enabled,
+            new_cfg.debug_response_headers);
     }
 
     auto fwd_after = mgr->ForwardConfig();

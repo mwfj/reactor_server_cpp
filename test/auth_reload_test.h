@@ -108,7 +108,8 @@ static bool ReloadAndCommit(
         /*new_upstreams=*/{},
         new_cfg.policies,
         new_cfg.forward,
-        new_cfg.enabled);
+        new_cfg.enabled,
+        new_cfg.debug_response_headers);
     return true;
 }
 
@@ -555,7 +556,8 @@ static bool TestRebuildPolicyListFromLiveSources() {
     std::vector<UpstreamConfig> empty_upstreams;
     AUTH_NAMESPACE::AuthForwardConfig fwd;
     mgr->CommitPolicyAndEnforcement(
-        empty_upstreams, {p0, p1}, fwd, /*new_master_enabled=*/true);
+        empty_upstreams, {p0, p1}, fwd, /*new_master_enabled=*/true,
+        /*new_debug_response_headers=*/false);
 
     auto snap1 = mgr->SnapshotAll();
     mgr->Stop();

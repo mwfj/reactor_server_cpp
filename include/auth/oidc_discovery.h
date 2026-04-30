@@ -70,6 +70,15 @@ class OidcDiscovery {
         return ready_ && ready_->load(std::memory_order_acquire);
     }
 
+    // Wall-clock time of the most recent successful discovery completion,
+    // expressed as seconds since epoch. Returns 0 when discovery has not
+    // yet succeeded. Cross-thread safe — atomic int64 read.
+    int64_t LastSuccessEpochSec() const noexcept {
+        return last_success_epoch_sec_
+                ? last_success_epoch_sec_->load(std::memory_order_acquire)
+                : 0;
+    }
+
     // Pure-function endpoint extractor exposed for unit tests. Not used by
     // production callers — `Start()`'s response handler invokes the same
     // logic internally. See the implementation comment for the full
@@ -105,6 +114,14 @@ class OidcDiscovery {
     // a retry task is queued on a Dispatcher.
     std::shared_ptr<std::atomic<bool>> ready_;
     std::shared_ptr<std::atomic<bool>> cancel_token_;
+    // Wall-clock seconds-since-epoch of the most recent successful
+    // discovery. Updated on the dispatcher thread the response handler
+    // runs on; read from any thread via LastSuccessEpochSec(). Default
+    // zero means "never succeeded". Held as `shared_ptr<atomic>` so the
+    // response-handler closure (which may outlive `*this` if a Cancel()
+    // races destruction) can capture it by value without UAF — same
+    // pattern as `ready_` / `cancel_token_` above.
+    std::shared_ptr<std::atomic<int64_t>> last_success_epoch_sec_;
     // Owns the recursive retry closure so delayed-retry callbacks can capture
     // weak_ptr<CycleState> without the closure holding a strong self-reference
     // (which would leak the CycleState forever). Cleared on Cancel() and

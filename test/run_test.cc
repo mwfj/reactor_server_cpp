@@ -41,6 +41,7 @@
 #include "introspection_cache_test.h"
 #include "introspection_client_test.h"
 #include "auth_introspection_integration_test.h"
+#include "auth_observability_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -57,6 +58,46 @@ static void RaiseFdLimit() {
     }
 }
 
+
+// Single entry point for the circuit-breaker feature family. Mirrors the
+// order operators see when running individual CLI flags, so the umbrella
+// invocation (`./test_runner circuit_breaker`) and the full sweep both
+// produce stable, predictable output. Sub-suites split because the work
+// landed across multiple development phases — they remain ONE feature.
+void RunAllCircuitBreakerFamily() {
+    CircuitBreakerTests::RunAllTests();
+    CircuitBreakerComponentsTests::RunAllTests();
+    CircuitBreakerIntegrationTests::RunAllTests();
+    CircuitBreakerRetryBudgetTests::RunAllTests();
+    CircuitBreakerWaitQueueDrainTests::RunAllTests();
+    CircuitBreakerObservabilityTests::RunAllTests();
+    CircuitBreakerReloadTests::RunAllTests();
+}
+
+// Single entry point for the auth feature family. Same rationale as
+// RunAllCircuitBreakerFamily — multi-phase development produced multiple
+// suites, but they're all the same feature. Order matches a bottom-up
+// dependency walk: foundation → primitives → manager → integration →
+// failure / reload / multi-issuer / WS / race → introspection → observability.
+void RunAllAuthFamily() {
+    AuthFoundationTests::RunAllTests();
+    JwtVerifierTests::RunAllTests();
+    JwksCacheTests::RunAllTests();
+    OidcDiscoveryTests::RunAllTests();
+    HeaderRewriterAuthTests::RunAllTests();
+    AuthManagerTests::RunAllTests();
+    AuthIntegrationTests::RunAllTests();
+    AuthFailureModeTests::RunAllTests();
+    AuthReloadTests::RunAllTests();
+    AuthMultiIssuerTests::RunAllTests();
+    AuthWebSocketUpgradeTests::RunAllTests();
+    AuthRaceTests::RunAllTests();
+    RouterAsyncMiddlewareTests::RunAllTests();
+    IntrospectionCacheTests::RunAllTests();
+    IntrospectionClientTests::RunAllTests();
+    AuthIntrospectionIntegrationTests::RunAllTests();
+    AuthObservabilityTests::RunAllTests();
+}
 
 void RunAllTest(){
     std::cout << "Run All Tests - Test Suite" << std::endl;
@@ -114,81 +155,20 @@ void RunAllTest(){
     // Run rate limit tests
     RateLimitTests::RunAllTests();
 
-    // Run circuit breaker tests
-    CircuitBreakerTests::RunAllTests();
+    // Circuit-breaker feature family (umbrella runs every CB sub-suite).
+    RunAllCircuitBreakerFamily();
 
-    // Run circuit-breaker component unit tests (RetryBudget / Host / Manager)
-    CircuitBreakerComponentsTests::RunAllTests();
+    // Auth feature family (umbrella runs every auth-related sub-suite —
+    // foundation, JWT verifier, JWKS cache, OIDC discovery, header
+    // rewriter overlay, AuthManager, integration, failure modes, reload,
+    // multi-issuer, WebSocket upgrade, race, router async, introspection
+    // cache + client + integration, observability).
+    RunAllAuthFamily();
 
-    // Run circuit-breaker integration tests (end-to-end through
-    // ProxyTransaction + UpstreamManager + HttpServer)
-    CircuitBreakerIntegrationTests::RunAllTests();
-
-    // Run circuit-breaker retry-budget integration tests
-    CircuitBreakerRetryBudgetTests::RunAllTests();
-
-    // Run circuit-breaker wait-queue-drain-on-trip tests
-    CircuitBreakerWaitQueueDrainTests::RunAllTests();
-
-    // Run circuit-breaker observability tests
-    CircuitBreakerObservabilityTests::RunAllTests();
-
-    // Run circuit-breaker hot-reload tests
-    CircuitBreakerReloadTests::RunAllTests();
-
-    // Run auth foundation tests (minimal — pins r3/r5 security invariants)
-    AuthFoundationTests::RunAllTests();
-
-    // Run JWT verifier unit tests (stateless, no server)
-    JwtVerifierTests::RunAllTests();
-
-    // Run JWKS cache unit tests
-    JwksCacheTests::RunAllTests();
-
-    // Run OIDC discovery unit tests (no live IdP)
-    OidcDiscoveryTests::RunAllTests();
-
-    // Run header rewriter auth overlay tests
-    HeaderRewriterAuthTests::RunAllTests();
-
-    // Run AuthManager unit tests (no server)
-    AuthManagerTests::RunAllTests();
-
-    // Run auth integration tests (HttpServer + AuthManager middleware)
-    AuthIntegrationTests::RunAllTests();
-
-    // Run auth failure mode tests (UNDETERMINED path, stale JWKS)
-    AuthFailureModeTests::RunAllTests();
-
-    // Run auth reload tests (Reload API — topology, reloadable fields)
-    AuthReloadTests::RunAllTests();
-
-    // Run auth multi-issuer tests (PeekIssuer routing, allowlist enforcement)
-    AuthMultiIssuerTests::RunAllTests();
-
-    // Run auth WebSocket upgrade tests
-    AuthWebSocketUpgradeTests::RunAllTests();
-
-    // Run auth race condition tests
-    AuthRaceTests::RunAllTests();
-
-    // Run DnsResolver tests (lazy pool, static helpers, detach-not-join)
+    // DNS / dual-stack live outside the auth family (transport layer,
+    // not inbound auth).
     DnsResolverTests::RunAllTests();
-
-    // Run dual-stack integration tests (IPv6 bind, hostname rejection, …)
     DualStackTests::RunAllTests();
-
-    // Run router async-middleware tests (P3-0 — no-op adapter, no behavior change)
-    RouterAsyncMiddlewareTests::RunAllTests();
-
-    // Run introspection cache unit tests
-    IntrospectionCacheTests::RunAllTests();
-
-    // Run introspection client static-helper + AsyncPendingState unit tests
-    IntrospectionClientTests::RunAllTests();
-
-    // Run introspection integration tests (async middleware + mock IdP)
-    AuthIntrospectionIntegrationTests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;
 }
@@ -211,26 +191,36 @@ void PrintUsage(const char* program_name) {
     std::cout << "  upstream, -U    Run upstream connection pool tests only" << std::endl;
     std::cout << "  proxy,    -P    Run proxy engine tests only" << std::endl;
     std::cout << "  rate_limit, -L  Run rate limit tests only" << std::endl;
-    std::cout << "  circuit_breaker, -B  Run circuit-breaker tests only" << std::endl;
-    std::cout << "  auth,        -A    Run auth foundation tests only" << std::endl;
-    std::cout << "  jwt,         -J    Run JWT verifier unit tests only" << std::endl;
-    std::cout << "  jwks,        -j    Run JWKS cache unit tests only" << std::endl;
-    std::cout << "  oidc,        -O    Run OIDC discovery unit tests only" << std::endl;
-    std::cout << "  hrauth,      -W    Run header rewriter auth overlay tests only" << std::endl;
-    std::cout << "  auth_mgr,    -M    Run AuthManager unit tests only" << std::endl;
-    std::cout << "  auth2,       -V    Run auth integration tests (Phase 2) only" << std::endl;
-    std::cout << "  auth_fail,   -F    Run auth failure mode tests only" << std::endl;
-    std::cout << "  auth_reload, -X    Run auth reload tests only" << std::endl;
-    std::cout << "  auth_multi,  -I    Run auth multi-issuer tests only" << std::endl;
-    std::cout << "  auth_ws,     -G    Run auth WebSocket upgrade tests only" << std::endl;
-    std::cout << "  auth_race,   -Q    Run auth race condition tests only" << std::endl;
-    std::cout << "  router_async,-N    Run router async-middleware tests (P3-0)" << std::endl;
-    std::cout << "  introspection_cache, -Y  Run introspection cache unit tests only" << std::endl;
-    std::cout << "  intro_client, -y   Run introspection client static-helper + AsyncPendingState tests" << std::endl;
-    std::cout << "  auth_intro,  -Z    Run introspection integration tests only" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  circuit_breaker, -B  Run the full circuit-breaker feature family" << std::endl;
+    std::cout << "                       (state machine + components + integration +" << std::endl;
+    std::cout << "                        retry budget + drain + observability + reload)" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  auth,        -A    Run the full auth feature family (umbrella —" << std::endl;
+    std::cout << "                     runs every auth-related sub-suite). Use the" << std::endl;
+    std::cout << "                     sub-flags below to drill into one aspect." << std::endl;
+    std::cout << "  auth_foundation    Auth foundation sub-suite (token_hasher / claims /" << std::endl;
+    std::cout << "                     policy matcher / config validation)" << std::endl;
+    std::cout << "  jwt,         -J    JWT verifier unit tests" << std::endl;
+    std::cout << "  jwks,        -j    JWKS cache unit tests" << std::endl;
+    std::cout << "  oidc,        -O    OIDC discovery unit tests" << std::endl;
+    std::cout << "  hrauth,      -W    Header rewriter auth overlay tests" << std::endl;
+    std::cout << "  auth_mgr,    -M    AuthManager unit tests" << std::endl;
+    std::cout << "  auth2,       -V    Auth integration tests (HttpServer + middleware)" << std::endl;
+    std::cout << "  auth_fail,   -F    Auth failure mode tests" << std::endl;
+    std::cout << "  auth_reload, -X    Auth reload tests" << std::endl;
+    std::cout << "  auth_multi,  -I    Auth multi-issuer tests" << std::endl;
+    std::cout << "  auth_ws,     -G    Auth WebSocket upgrade tests" << std::endl;
+    std::cout << "  auth_race,   -Q    Auth race condition tests" << std::endl;
+    std::cout << "  router_async,-N    Router async-middleware tests" << std::endl;
+    std::cout << "  introspection_cache, -Y  Introspection cache unit tests" << std::endl;
+    std::cout << "  intro_client, -y   Introspection client static-helper + AsyncPendingState tests" << std::endl;
+    std::cout << "  auth_intro,  -Z    Introspection integration tests" << std::endl;
+    std::cout << "  auth_observability, -o    Auth observability tests" << std::endl;
+    std::cout << std::endl;
     std::cout << "  dual_stack,  -D    Run dual-stack DNS resolver tests only" << std::endl;
     std::cout << "  help,        -h    Show this help message" << std::endl;
-    std::cout << "\nNo arguments: Run all tests (basic + stress + race + timeout + config + http + ws + tls + cli + http2 + route + kqueue + upstream + proxy + rate_limit + circuit_breaker + auth + auth-phase2)" << std::endl;
+    std::cout << "\nNo arguments: Run all tests (full sweep — every suite above plus the dual_stack and DnsResolver suites)." << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -288,17 +278,24 @@ int main(int argc, char* argv[]) {
         // Run rate limit tests
         }else if(mode == "rate_limit" || mode == "-L"){
             RateLimitTests::RunAllTests();
-        // Run circuit-breaker tests (unit + components + integration + retry-budget + drain + observability + reload)
+        // Run the full circuit-breaker feature family — calls every CB
+        // sub-suite via RunAllCircuitBreakerFamily(). Sub-suites stay
+        // accessible by name through the no-arg full sweep; individual
+        // CLI flags for sub-suites are not currently exposed.
         }else if(mode == "circuit_breaker" || mode == "-B"){
-            CircuitBreakerTests::RunAllTests();
-            CircuitBreakerComponentsTests::RunAllTests();
-            CircuitBreakerIntegrationTests::RunAllTests();
-            CircuitBreakerRetryBudgetTests::RunAllTests();
-            CircuitBreakerWaitQueueDrainTests::RunAllTests();
-            CircuitBreakerObservabilityTests::RunAllTests();
-            CircuitBreakerReloadTests::RunAllTests();
-        // Run auth foundation tests (token_hasher + base64url env auto-detect + scope extractors)
+            RunAllCircuitBreakerFamily();
+        // Run the full auth feature family — calls every auth-related
+        // sub-suite via RunAllAuthFamily(). Use the sub-flags below
+        // (auth_foundation, jwt, jwks, oidc, hrauth, auth_mgr, auth2,
+        // auth_fail, auth_reload, auth_multi, auth_ws, auth_race,
+        // router_async, introspection_cache, intro_client, auth_intro,
+        // auth_observability) to drill into a specific aspect.
         }else if(mode == "auth" || mode == "-A"){
+            RunAllAuthFamily();
+        // Run only the auth foundation sub-suite (token_hasher + base64url env
+        // auto-detect + scope extractors). Was previously the `auth` flag —
+        // the umbrella now lives under `auth`.
+        }else if(mode == "auth_foundation"){
             AuthFoundationTests::RunAllTests();
         // Run JWT verifier unit tests
         }else if(mode == "jwt" || mode == "-J"){
@@ -351,6 +348,9 @@ int main(int argc, char* argv[]) {
         // Run only TSAN-instrumented dual-stack stop/reload/destruction tests
         }else if(mode == "dual_stack_tsan"){
             DualStackTests::RunTSANTests();
+        // Run auth observability tests
+        }else if(mode == "auth_observability" || mode == "-o"){
+            AuthObservabilityTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

@@ -169,7 +169,8 @@ OidcDiscovery::OidcDiscovery(std::string issuer_name,
       requires_jwks_uri_(requires_jwks_uri),
       manager_stopping_(manager_stopping),
       ready_(std::make_shared<std::atomic<bool>>(false)),
-      cancel_token_(std::make_shared<std::atomic<bool>>(false)) {
+      cancel_token_(std::make_shared<std::atomic<bool>>(false)),
+      last_success_epoch_sec_(std::make_shared<std::atomic<int64_t>>(0)) {
     logging::Get()->debug(
         "OidcDiscovery constructed issuer={} url={} pool={} retry_sec={}",
         issuer_name_, issuer_url_, upstream_pool_name_, retry_sec_);
@@ -240,10 +241,12 @@ void OidcDiscovery::Start(size_t dispatcher_index,
     std::weak_ptr<CycleState> weak_state = cycle_state_;
     const bool requires_jwks_uri = requires_jwks_uri_;
     const std::atomic<bool>* manager_stopping = manager_stopping_;
+    auto last_success = last_success_epoch_sec_;
     cycle_state_->run =
         [weak_state, issuer_name, issuer_url, pool_name, client_copy,
          dispatcher, retry_sec, generation, on_ready_cb, token,
-         ready_flag, requires_jwks_uri, manager_stopping](size_t disp_index) {
+         ready_flag, requires_jwks_uri, manager_stopping,
+         last_success](size_t disp_index) {
             if (token->load(std::memory_order_acquire)) {
                 return;
             }
@@ -269,7 +272,7 @@ void OidcDiscovery::Start(size_t dispatcher_index,
                 pool_name, disp_index, std::move(req),
                 [weak_state, issuer_name, issuer_url, dispatcher, retry_sec,
                  generation, on_ready_cb, token, ready_flag, disp_index,
-                 requires_jwks_uri, manager_stopping](
+                 requires_jwks_uri, manager_stopping, last_success](
                         UpstreamHttpClient::Response resp) {
                     if (token->load(std::memory_order_acquire)) {
                         return;
@@ -362,6 +365,14 @@ void OidcDiscovery::Start(size_t dispatcher_index,
                     logging::Get()->info(
                         "OIDC discovery ok issuer={} has_introspection={}",
                         issuer_name, !intro_endpoint.empty());
+                    if (last_success) {
+                        const auto secs =
+                            std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::system_clock::now()
+                                    .time_since_epoch()).count();
+                        last_success->store(static_cast<int64_t>(secs),
+                                             std::memory_order_release);
+                    }
                     // Flip ready_flag AFTER on_ready_cb runs so this
                     // OidcDiscovery::IsReady() cannot briefly report true
                     // for a cycle whose callback the Issuer's own

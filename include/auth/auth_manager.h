@@ -22,6 +22,19 @@ namespace AUTH_NAMESPACE {
 class UpstreamHttpClient;
 class IntrospectionClient;
 
+// Cache-state label emitted on the X-Auth-Cache response header. JWT mode
+// has no per-request cache and uses None (header omitted). Introspection
+// mode walks Hit / Miss / Stale / Negative / Uncached based on the
+// dispatch path.
+enum class AuthCache {
+    None,
+    Hit,
+    Miss,
+    Stale,
+    Negative,
+    Uncached,
+};
+
 // ---------------------------------------------------------------------------
 // Top-level owner of issuers, the applied-policy list, and the forward-
 // overlay snapshot. Installed as a middleware via `AuthMiddleware` and
@@ -41,6 +54,17 @@ class IntrospectionClient;
 // ---------------------------------------------------------------------------
 class AuthManager {
  public:
+    // Per-(issuer, policy) accumulator surfaced under /stats auth.per_policy
+    // and auth.issuers[].per_policy. `issuer` is empty for verdicts produced
+    // before issuer selection (e.g. missing_authorization, token_too_large).
+    struct PerPolicyCountersView {
+        std::string issuer;
+        std::string policy;
+        uint64_t allowed = 0;
+        uint64_t denied = 0;
+        uint64_t undetermined = 0;
+    };
+
     struct SnapshotView {
         std::map<std::string, IssuerSnapshotView> issuers;
         uint64_t total_allowed = 0;
@@ -56,6 +80,11 @@ class AuthManager {
         uint64_t introspection_cache_miss = 0;
         uint64_t introspection_cache_negative_hit = 0;
         uint64_t introspection_stale_served = 0;
+        bool enabled = false;
+        bool debug_response_headers = false;
+        // Sorted by (issuer, policy) — std::map iteration in SnapshotAll
+        // produces stable JSON ordering for /stats.
+        std::vector<PerPolicyCountersView> per_policy;
     };
 
     AuthManager(const AuthConfig& config,
@@ -166,7 +195,8 @@ class AuthManager {
         const std::vector<UpstreamConfig>& new_upstreams,
         const std::vector<AuthPolicy>& new_top_level_policies,
         const AuthForwardConfig& new_forward,
-        bool new_master_enabled);
+        bool new_master_enabled,
+        bool new_debug_response_headers);
 
     // Snapshot of runtime counters + per-issuer views.
     SnapshotView SnapshotAll() const;
@@ -189,6 +219,20 @@ class AuthManager {
     // handlers that drive InvokeMiddleware manually. Returns nullptr when
     // the name is unknown.
     Issuer* GetIssuer(const std::string& issuer_name);
+
+    // Single-call observability helper for every auth verdict. Bumps the
+    // process-wide aggregate (total_allowed_ / total_denied_ /
+    // total_undetermined_), bumps the (issuer, policy) bucket, and stamps
+    // X-Auth-Decision / X-Auth-Issuer / X-Auth-Cache when the live
+    // debug_response_headers_ flag is on. Empty issuer omits the issuer
+    // header (no issuer was matched yet). Public so the introspection
+    // resume finalizers (built in an anonymous namespace) can call it via
+    // a captured manager pointer.
+    void RecordVerdict(HttpResponse& resp,
+                        VerifyOutcome outcome,
+                        const std::string& issuer,
+                        const std::string& policy,
+                        AuthCache cache);
 
     // Snapshot of the LIVE issuer name set — the keys of `issuers_` at
     // call time. Used by the reload-validation path to scope per-issuer
@@ -265,6 +309,32 @@ class AuthManager {
                                   const std::string& raw_jwt_header,
                                   const std::string& token);
 
+    // Drop buckets whose policy.name is no longer present in `new_policies`.
+    // Buckets keyed on a still-present policy.name are preserved across
+    // reload — operators see the same counter through a same-name reload.
+    // Removed-then-readded names reset to zero. Caller holds per_policy_mtx_.
+    void ReconcilePerPolicyKeysLocked(const AppliedPolicyList& new_policies);
+
+    // Bump the (issuer, policy) bucket. Lazy-creates on first observation.
+    // Skips silently when both keys are empty. Issuer may be "" for verdicts
+    // produced before issuer selection (token missing, oversized, etc.).
+    // The atomic increment runs inside per_policy_mtx_ so a concurrent
+    // ReconcilePerPolicyKeysLocked cannot erase the bucket between lookup
+    // and use.
+    void BumpPerPolicy(const std::string& issuer,
+                        const std::string& policy,
+                        VerifyOutcome outcome);
+
+    // Stamp X-Auth-Decision / X-Auth-Issuer / X-Auth-Cache on `resp`. No-op
+    // when the live `debug_response_headers_` flag is false. Empty issuer
+    // omits the issuer header (no issuer was matched yet); cache_label
+    // empty / nullptr omits the cache header (JWT mode has no per-request
+    // cache).
+    void StampDebugHeader(HttpResponse& resp,
+                          const char* decision,
+                          const std::string& issuer,
+                          const char* cache_label) const;
+
     std::unordered_map<std::string, std::shared_ptr<Issuer>> issuers_;
     std::shared_ptr<UpstreamHttpClient> upstream_http_client_;
 
@@ -285,6 +355,12 @@ class AuthManager {
     // true immediately (pass-through). The middleware is installed whenever
     // AuthManager exists (enabled or not) so a later reload can flip it on.
     std::atomic<bool> master_enabled_{false};
+    // Live debug-response-headers switch — published in the same
+    // snapshot_mtx_ critical section as policies_ / forward_ /
+    // master_enabled_, BEFORE master_enabled_'s release-store. Hot path
+    // reads with memory_order_acquire; cost when off is one acquire load
+    // and one branch.
+    std::atomic<bool> debug_response_headers_{false};
 
     std::atomic<uint64_t> total_allowed_{0};
     std::atomic<uint64_t> total_denied_{0};
@@ -308,6 +384,20 @@ class AuthManager {
     // Constructed at Start() once `upstream_http_client_` is wired. Owns
     // the introspection POST plumbing for every issuer.
     std::unique_ptr<IntrospectionClient> introspection_client_;
+
+    // Per-(issuer, policy) accumulators. Independent of snapshot_mtx_ —
+    // these are runtime counters, not config snapshot. unique_ptr because
+    // PerPolicyCounters holds non-movable atomics; std::map keeps lookup
+    // ordered for stable /stats JSON output. Lookups happen once per
+    // request after the verdict is known, never on the per-byte hot path.
+    struct PerPolicyCounters {
+        std::atomic<uint64_t> allowed{0};
+        std::atomic<uint64_t> denied{0};
+        std::atomic<uint64_t> undetermined{0};
+    };
+    using PerPolicyKey = std::pair<std::string, std::string>;
+    mutable std::mutex per_policy_mtx_;
+    std::map<PerPolicyKey, std::unique_ptr<PerPolicyCounters>> per_policy_;
 
     std::mutex reload_mtx_;
 };

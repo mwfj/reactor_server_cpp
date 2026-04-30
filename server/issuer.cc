@@ -436,6 +436,14 @@ IssuerSnapshotView Issuer::BuildView() const {
         view.introspection_cache_entries =
             introspection_cache_->SnapshotStats().entries;
     }
+    if (oidc_discovery_) {
+        const int64_t epoch_sec = oidc_discovery_->LastSuccessEpochSec();
+        if (epoch_sec > 0) {
+            view.last_discovery_refresh =
+                std::chrono::system_clock::time_point(
+                    std::chrono::seconds(epoch_sec));
+        }
+    }
     return view;
 }
 
