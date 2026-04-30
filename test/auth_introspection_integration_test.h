@@ -129,6 +129,47 @@ static int ExtractStatus(const std::string& resp) {
     try { return std::stoi(resp.substr(9, 3)); } catch (...) { return 0; }
 }
 
+// Case-insensitive header value extractor for the raw HTTP response
+// produced by SendHttp(). Returns the trimmed value or "" when the header
+// is absent. Used to pin debug-response-header emission on the
+// introspection paths.
+static std::string ExtractHeader(const std::string& resp,
+                                  const std::string& name) {
+    const std::string header_end = "\r\n\r\n";
+    const size_t hend = resp.find(header_end);
+    if (hend == std::string::npos) return "";
+    const std::string headers_block = resp.substr(0, hend);
+    std::string lower_name = name;
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
+                    [](unsigned char c) { return std::tolower(c); });
+    size_t pos = 0;
+    while (pos < headers_block.size()) {
+        size_t eol = headers_block.find("\r\n", pos);
+        if (eol == std::string::npos) eol = headers_block.size();
+        const std::string line = headers_block.substr(pos, eol - pos);
+        const size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            std::string lower_line_name = line.substr(0, colon);
+            std::transform(lower_line_name.begin(), lower_line_name.end(),
+                            lower_line_name.begin(),
+                            [](unsigned char c) { return std::tolower(c); });
+            if (lower_line_name == lower_name) {
+                std::string value = line.substr(colon + 1);
+                size_t s = 0;
+                while (s < value.size() && (value[s] == ' ' || value[s] == '\t')) ++s;
+                value.erase(0, s);
+                while (!value.empty() &&
+                        (value.back() == ' ' || value.back() == '\t')) {
+                    value.pop_back();
+                }
+                return value;
+            }
+        }
+        pos = eol + 2;
+    }
+    return "";
+}
+
 // Send a GET request with an optional Bearer token, optional extra headers,
 // and optional response timeout (defaults to 5000 ms).
 // Returns the raw response string.
@@ -375,6 +416,9 @@ static bool TestCacheHitSkipsIdp() {
     ServerConfig cfg = BuildServerConfig(mock, "idp3", "https://idp.example.com",
                                           "idp-pool", "basic", 3, 60);
     AddPolicy(cfg, "p3", {"/protected"}, "idp3");
+    // Enable debug response headers so we can pin the X-Auth-Cache wire
+    // value on the cache-hit second request.
+    cfg.auth.debug_response_headers = true;
 
     HttpServer server(cfg);
     server.Get("/protected", [](const HttpRequest&, HttpResponse& resp){
@@ -386,7 +430,9 @@ static bool TestCacheHitSkipsIdp() {
     // Enqueue exactly one active response; second request must serve from cache.
     mock.EnqueueActiveTrue("user3");
 
-    // First request — triggers IdP POST and populates cache.
+    // First request — triggers IdP POST and populates cache. Header on
+    // first request is the dispatch-time `miss` label since the live
+    // POST resolved it.
     auto r1 = SendHttp(runner.GetPort(), "/protected", "cached-token");
     if (ExtractStatus(r1) != 200) return false;
 
@@ -398,7 +444,13 @@ static bool TestCacheHitSkipsIdp() {
     if (ExtractStatus(r2) != 200) return false;
 
     // Request count must still be 1 (cache served the second request).
-    return mock.request_count() == 1;
+    if (mock.request_count() != 1) return false;
+
+    // Pin the cache-hit debug-header contract: on the cache-hit branch
+    // the response carries X-Auth-Decision: allow + X-Auth-Cache: hit.
+    if (ExtractHeader(r2, "X-Auth-Decision") != "allow") return false;
+    if (ExtractHeader(r2, "X-Auth-Cache")    != "hit")   return false;
+    return true;
 }
 
 // ===========================================================================
@@ -778,6 +830,9 @@ static bool TestTimeoutUndeterminedOrStaleServe() {
                                           /*stale_grace_sec=*/30);
     AddPolicy(cfg, "p13-deny",  {"/deny-path"},  "idp13", {}, "deny");
     AddPolicy(cfg, "p13-allow", {"/allow-path"}, "idp13", {}, "allow");
+    // Enable debug response headers so sub-test C can pin the
+    // X-Auth-Cache: stale label after the stale-serve promotion.
+    cfg.auth.debug_response_headers = true;
 
     HttpServer server(cfg);
     server.Get("/deny-path",  [](const HttpRequest&, HttpResponse& resp){
@@ -844,6 +899,17 @@ static bool TestTimeoutUndeterminedOrStaleServe() {
         if (elapsed > 4000) return false;
         // Stale entry is positive, within stale_grace_sec → 200.
         if (ExtractStatus(resp) != 200) return false;
+        // Pin the debug-header contract on the introspection allow path.
+        // X-Auth-Cache may be "stale" (timeout-then-stale-promote — the
+        // intended path this sub-test exercises) OR "miss" (live POST
+        // raced ahead under fast scheduling and returned active:true
+        // directly — same observable status but the cache label is the
+        // dispatch-time value). Both are correct emissions; the
+        // important contract is that headers ARE emitted on ALLOW and
+        // the label is from the documented vocabulary.
+        if (ExtractHeader(resp, "X-Auth-Decision") != "allow") return false;
+        const std::string cache_label = ExtractHeader(resp, "X-Auth-Cache");
+        if (cache_label != "stale" && cache_label != "miss") return false;
     }
 
     return true;
