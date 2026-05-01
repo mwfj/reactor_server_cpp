@@ -228,11 +228,29 @@ class AuthManager {
     // header (no issuer was matched yet). Public so the introspection
     // resume finalizers (built in an anonymous namespace) can call it via
     // a captured manager pointer.
+    // captured_incarnation is the policy-name incarnation observed at
+    // dispatch time (see PolicyIncarnation). Sync paths pass the default
+    // 0 (no gate) — they have no dispatch-finalize time gap. Async
+    // introspection finalizers capture the value at dispatch and pass it
+    // here so a verdict from a removed-then-readded policy incarnation
+    // does NOT contaminate the new bucket. On mismatch the per-policy
+    // bump is dropped; the aggregate counter and debug headers still
+    // fire because the request was a real client-visible verdict.
     void RecordVerdict(HttpResponse& resp,
                         VerifyOutcome outcome,
                         const std::string& issuer,
                         const std::string& policy,
-                        AuthCache cache);
+                        AuthCache cache,
+                        uint64_t captured_incarnation = 0);
+
+    // Returns the current incarnation for `policy_name`, or 0 if the
+    // policy has never been observed by ReconcilePerPolicyKeysLocked.
+    // Bumped each time a policy.name appears AFTER being absent in the
+    // previous reconcile — i.e., every removed-then-readded cycle. Sync
+    // paths don't need to call this; async paths capture the value at
+    // dispatch and pass it back through RecordVerdict at finalize.
+    // Acquires per_policy_mtx_ briefly.
+    uint64_t PolicyIncarnation(const std::string& policy_name) const;
 
     // Snapshot of the LIVE issuer name set — the keys of `issuers_` at
     // call time. Used by the reload-validation path to scope per-issuer
@@ -323,7 +341,8 @@ class AuthManager {
     // and use.
     void BumpPerPolicy(const std::string& issuer,
                         const std::string& policy,
-                        VerifyOutcome outcome);
+                        VerifyOutcome outcome,
+                        uint64_t captured_incarnation = 0);
 
     // Stamp X-Auth-Decision / X-Auth-Issuer / X-Auth-Cache on `resp`. No-op
     // when the live `debug_response_headers_` flag is false. Empty issuer
@@ -398,6 +417,17 @@ class AuthManager {
     using PerPolicyKey = std::pair<std::string, std::string>;
     mutable std::mutex per_policy_mtx_;
     std::map<PerPolicyKey, std::unique_ptr<PerPolicyCounters>> per_policy_;
+
+    // Per-policy-name incarnation. Bumped each time a policy.name appears
+    // in the new applied list AFTER being absent in the previous reconcile
+    // — i.e. every removed-then-readded cycle. Async dispatch sites
+    // capture the value at request time and pass it back through
+    // RecordVerdict at finalize time so a stale-incarnation verdict is
+    // dropped instead of contaminating the new bucket. Both maps live
+    // under per_policy_mtx_; reads are coalesced with the per-bucket
+    // operations so the gate is mutex-cheap.
+    std::unordered_map<std::string, uint64_t> policy_incarnation_;
+    std::unordered_set<std::string> policy_last_reconciled_;
 
     std::mutex reload_mtx_;
 };
