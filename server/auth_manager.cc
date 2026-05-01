@@ -1773,12 +1773,23 @@ void AuthManager::InvokeAsyncIntrospection(
             "(request bypassed transport-layer wiring)");
         AsyncMiddlewarePayload payload;
         payload.result = AsyncMiddlewareResult::DENY;
-        payload.finalizer = [retry_after_sec, realm](
+        payload.finalizer =
+            [retry_after_sec, realm,
+             manager = this,
+             issuer_name = issuer->name(),
+             policy_name = policy.name](
                 const HttpRequest&, HttpResponse& rs) {
             rs = MakeServiceUnavailable(realm, retry_after_sec,
                                          "authentication unavailable");
+            // Route the verdict through the central observability helper
+            // so total_undetermined_ + per-(issuer, policy) bucket +
+            // debug response headers all fire consistently with every
+            // other emit site. Cache label is None — no cache lookup
+            // occurred on this dispatcher-index error path.
+            manager->RecordVerdict(rs, VerifyOutcome::UNDETERMINED,
+                                    issuer_name, policy_name,
+                                    AuthCache::None);
         };
-        total_undetermined_.fetch_add(1, std::memory_order_relaxed);
         state->Complete(std::move(payload));
         return;
     }
@@ -1900,12 +1911,20 @@ void AuthManager::InvokeIntrospectionUncached(
             "(request bypassed transport-layer wiring)");
         AsyncMiddlewarePayload payload;
         payload.result = AsyncMiddlewareResult::DENY;
-        payload.finalizer = [retry_after_sec, realm_local](
+        payload.finalizer =
+            [retry_after_sec, realm_local,
+             manager = this,
+             issuer_name = issuer->name(),
+             policy_name = policy.name](
                 const HttpRequest&, HttpResponse& rs) {
             rs = MakeServiceUnavailable(realm_local, retry_after_sec,
                                          "authentication unavailable");
+            // Same centralized observability route as the cached path's
+            // dispatcher-index error branch — see InvokeAsyncIntrospection.
+            manager->RecordVerdict(rs, VerifyOutcome::UNDETERMINED,
+                                    issuer_name, policy_name,
+                                    AuthCache::None);
         };
-        total_undetermined_.fetch_add(1, std::memory_order_relaxed);
         state->Complete(std::move(payload));
         return;
     }
