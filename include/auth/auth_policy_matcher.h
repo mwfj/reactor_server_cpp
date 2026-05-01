@@ -12,6 +12,15 @@ namespace AUTH_NAMESPACE {
 struct AppliedPolicy {
     std::string prefix;
     AuthPolicy policy;
+    // Per-policy-name incarnation embedded in the snapshot. Bumped each
+    // time `policy.name` reappears after being absent in the previous
+    // reconcile (i.e., a removed-then-readded cycle). Async dispatch
+    // sites capture this value atomically with the policy match (single
+    // snapshot_mtx_ acquire) and pass it back through RecordVerdict at
+    // finalize so a stale-incarnation verdict cannot contaminate the
+    // new bucket. Default 0 means "incarnation tracking not populated"
+    // (used by the empty-list initial state inside AuthManager's ctor).
+    uint64_t incarnation = 0;
 };
 
 using AppliedPolicyList = std::vector<AppliedPolicy>;

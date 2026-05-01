@@ -395,8 +395,57 @@ void AuthManager::CommitPolicyAndEnforcement(
         const AuthForwardConfig& new_forward,
         bool new_master_enabled,
         bool new_debug_response_headers) {
+    // Compute the new policy.name set up front so we can update
+    // policy_incarnation_ + policy_last_reconciled_ AND build a
+    // ready-to-publish AppliedPolicyList with embedded incarnations,
+    // BEFORE acquiring snapshot_mtx_. Embedding the incarnation in the
+    // snapshot guarantees dispatch sites observe the policy match and
+    // its incarnation atomically — the captured value at dispatch is
+    // exactly what the live policy_incarnation_ map says when the
+    // snapshot is published. Without this ordering, a request that
+    // matched a newly-re-added policy in the new snapshot could capture
+    // the OLD incarnation through a race against the per-policy
+    // bookkeeping update, then the finalizer would drop a legitimate
+    // bump (C-2 reviewer scenario).
+    std::unordered_set<std::string> kept_names;
+    {
+        // Pre-compute kept_names from inputs without building the full
+        // AppliedPolicyList yet — we need this set to update incarnations
+        // first. Mirror what CollectInlineAuthPolicies +
+        // CollectTopLevelPolicies will produce.
+        for (const auto& u : new_upstreams) {
+            if (!u.proxy.auth.enabled) continue;
+            std::string name = u.proxy.auth.name;
+            if (name.empty()) name = "inline:" + u.name;
+            kept_names.insert(std::move(name));
+        }
+        for (const auto& p : new_top_level_policies) {
+            if (!p.enabled) continue;
+            kept_names.insert(p.name);
+        }
+    }
+    std::unordered_map<std::string, uint64_t> incarnation_snapshot;
+    {
+        std::lock_guard<std::mutex> lk(per_policy_mtx_);
+        // Bump incarnation for names that were ABSENT in the previous
+        // reconcile but PRESENT now AND already had an incarnation entry
+        // (the "removed-then-readded" signal). First-ever observations
+        // get value 1 (matching PolicyIncarnation's lazy-create), so
+        // dispatch never captures the stale 0 sentinel.
+        for (const auto& name : kept_names) {
+            auto it = policy_incarnation_.find(name);
+            if (it == policy_incarnation_.end()) {
+                policy_incarnation_[name] = 1;
+            } else if (policy_last_reconciled_.count(name) == 0) {
+                it->second += 1;
+            }
+        }
+        policy_last_reconciled_ = kept_names;
+        incarnation_snapshot = policy_incarnation_;
+    }
     auto rebuilt = BuildAppliedPolicyList(new_upstreams,
-                                            new_top_level_policies);
+                                            new_top_level_policies,
+                                            incarnation_snapshot);
     AuthForwardConfig fwd_copy = new_forward;
     fwd_copy.PopulateDerived();
     auto fwd_snap = std::make_shared<const AuthForwardConfig>(std::move(fwd_copy));
@@ -844,10 +893,23 @@ std::string AuthManager::ExtractBearerToken(const HttpRequest& req,
 
 std::shared_ptr<const AppliedPolicyList> AuthManager::BuildAppliedPolicyList(
         const std::vector<UpstreamConfig>& upstreams,
-        const std::vector<AuthPolicy>& top_level_policies) {
+        const std::vector<AuthPolicy>& top_level_policies,
+        const std::unordered_map<std::string, uint64_t>& incarnations) {
     auto out = std::make_shared<AppliedPolicyList>();
     CollectInlineAuthPolicies(upstreams, *out);
     CollectTopLevelPolicies(top_level_policies, *out);
+    // Embed per-policy incarnation directly in each AppliedPolicy entry
+    // so dispatch sites capture the value atomically with the policy
+    // match (single snapshot_mtx_ acquire — no separate PolicyIncarnation
+    // call that could race against an in-flight CommitPolicyAndEnforcement
+    // bump). Names missing from the supplied map default to 1 — the
+    // first-ever observation of a policy never had an explicit reconcile
+    // pass, but should still be distinguishable from the default-zero
+    // sentinel that means "no incarnation tracking populated".
+    for (auto& ap : *out) {
+        auto it = incarnations.find(ap.policy.name);
+        ap.incarnation = it != incarnations.end() ? it->second : 1;
+    }
     // Post-build integrity check: duplicate exact-prefix collisions between
     // inline proxy.auth blocks and top-level policies can lead to
     // non-deterministic policy selection (FindPolicyForPath returns the
@@ -900,7 +962,7 @@ void AuthManager::StampDebugHeader(HttpResponse& resp,
 void AuthManager::BumpPerPolicy(const std::string& issuer,
                                   const std::string& policy,
                                   VerifyOutcome outcome,
-                                  uint64_t captured_incarnation) {
+                                  std::optional<uint64_t> captured_incarnation) {
     if (issuer.empty() && policy.empty()) {
         return;
     }
@@ -912,19 +974,23 @@ void AuthManager::BumpPerPolicy(const std::string& issuer,
     // order. Any future caller that holds snapshot_mtx_ MUST NOT wait on
     // per_policy_mtx_ — that would deadlock against this cold path.
     std::lock_guard<std::mutex> lk(per_policy_mtx_);
-    // Incarnation gate: when the caller captured a non-zero incarnation
-    // at dispatch time (async paths only — sync paths pass 0 to skip
-    // this check), drop the per-policy bump if the live incarnation has
-    // advanced. Advance happens only when a policy.name is REMOVED and
-    // RE-ADDED across reloads. The aggregate counter and debug headers
-    // still fire because the request was a real client-visible verdict;
-    // only the bucket attribution is suppressed to preserve the
-    // documented "removed-then-readded resets to zero" contract.
-    if (captured_incarnation != 0) {
+    // Incarnation gate: when the caller captured a value at dispatch
+    // time (async paths only — sync paths pass std::nullopt because they
+    // have no dispatch-finalize gap), drop the per-policy bump if the
+    // live incarnation has advanced. Advance happens only when a
+    // policy.name is REMOVED and RE-ADDED across reloads. The aggregate
+    // counter and debug headers still fire because the request was a
+    // real client-visible verdict; only the bucket attribution is
+    // suppressed to preserve the documented "removed-then-readded
+    // resets to zero" contract. The captured value comes from
+    // ap->incarnation in the snapshot the request was processed under,
+    // so it agrees with the live value as long as no remove-readd
+    // happened between dispatch and finalize.
+    if (captured_incarnation.has_value()) {
         auto inc_it = policy_incarnation_.find(policy);
         const uint64_t live_inc =
             inc_it != policy_incarnation_.end() ? inc_it->second : 0;
-        if (captured_incarnation != live_inc) {
+        if (*captured_incarnation != live_inc) {
             return;
         }
     }
@@ -988,7 +1054,7 @@ void AuthManager::RecordVerdict(HttpResponse& resp,
                                   const std::string& issuer,
                                   const std::string& policy,
                                   AuthCache cache,
-                                  uint64_t captured_incarnation) {
+                                  std::optional<uint64_t> captured_incarnation) {
     switch (outcome) {
       case VerifyOutcome::ALLOW:
         total_allowed_.fetch_add(1, std::memory_order_relaxed);
@@ -1008,7 +1074,15 @@ void AuthManager::RecordVerdict(HttpResponse& resp,
 uint64_t AuthManager::PolicyIncarnation(const std::string& policy_name) const {
     std::lock_guard<std::mutex> lk(per_policy_mtx_);
     auto it = policy_incarnation_.find(policy_name);
-    return it != policy_incarnation_.end() ? it->second : 0;
+    if (it != policy_incarnation_.end()) {
+        return it->second;
+    }
+    // Lazy-create at 1 so first-ever observations are distinguishable
+    // from "never observed" — `policy_incarnation_` is now a mutable
+    // member so this method can grow the map under per_policy_mtx_
+    // without violating const-correctness at the storage boundary.
+    policy_incarnation_[policy_name] = 1;
+    return 1;
 }
 
 void AuthManager::ReconcilePerPolicyKeysLocked(
@@ -1017,20 +1091,10 @@ void AuthManager::ReconcilePerPolicyKeysLocked(
     for (const auto& ap : new_policies) {
         kept.insert(ap.policy.name);
     }
-    // Incarnation update: bump each policy.name that was ABSENT in the
-    // previous reconcile but is PRESENT now — the "removed-then-readded"
-    // signal. Async verdicts captured under the prior incarnation will
-    // observe captured != live and drop the per-policy bump in
-    // BumpPerPolicy, preventing contamination of the new bucket. New
-    // policies (never seen before) bump from 0 → 1, matching the value
-    // the dispatch-time PolicyIncarnation() lookup will return for them.
-    for (const auto& name : kept) {
-        if (policy_last_reconciled_.count(name) == 0) {
-            policy_incarnation_[name] += 1;
-        }
-    }
-    policy_last_reconciled_ = kept;
-
+    // Incarnation tracking is updated EARLIER inside
+    // CommitPolicyAndEnforcement (before the snapshot is built) so the
+    // values can be embedded in the rebuilt AppliedPolicyList. This
+    // function only erases orphan buckets.
     for (auto it = per_policy_.begin(); it != per_policy_.end(); ) {
         const std::string& key_issuer = it->first.first;
         const std::string& key_policy = it->first.second;
@@ -1277,9 +1341,16 @@ void AuthManager::InvokeAsyncMiddleware(
         sync_pass();
         return;
     }
+    // Pass `ap->incarnation` rather than calling PolicyIncarnation()
+    // separately — the AppliedPolicy was selected from policies_snap, so
+    // its embedded incarnation is atomic with the policy match. A
+    // separate map lookup would race against a concurrent
+    // CommitPolicyAndEnforcement that just bumped the incarnation but
+    // hasn't yet published the new policies snapshot.
     InvokeAsyncIntrospection(it->second, *snap_issuer, policy, token,
                               req, resp, std::move(state),
-                              std::move(fwd_snap));
+                              std::move(fwd_snap),
+                              ap->incarnation);
 }
 
 namespace {
@@ -1355,11 +1426,14 @@ struct IntrospectionDoneCtx {
 
     AuthManager* manager = nullptr;
 
-    // Incarnation of `policy_name` captured at dispatch time. Forwarded
-    // to RecordVerdict from the resume finalizers. The default 0 disables
-    // the gate (sync paths). Async paths set this from
-    // AuthManager::PolicyIncarnation(policy.name) at dispatch.
-    uint64_t policy_incarnation = 0;
+    // Incarnation captured at dispatch from the matched AppliedPolicy in
+    // the snapshot — atomic with the policy lookup, so a request that
+    // matches a re-added policy in the new snapshot captures the new
+    // incarnation that was bumped BEFORE the snapshot was published.
+    // Forwarded to RecordVerdict from the resume finalizers; std::nullopt
+    // disables the gate (used for sync paths that don't construct this
+    // ctx). For async paths this is always populated.
+    std::optional<uint64_t> policy_incarnation;
 };
 
 // Build the dispatcher-thread completion callback shared by the cached
@@ -1677,13 +1751,15 @@ void AuthManager::InvokeAsyncIntrospection(
         const HttpRequest& req,
         HttpResponse& resp,
         std::shared_ptr<HttpRouter::AsyncPendingState> state,
-        std::shared_ptr<const AuthForwardConfig> fwd_snap) {
+        std::shared_ptr<const AuthForwardConfig> fwd_snap,
+        uint64_t policy_incarnation) {
     auto key_opt = hasher_.Hash(token);
     if (!key_opt) {
         // HMAC failure — extremely rare. Skip the cache; live POST.
         InvokeIntrospectionUncached(issuer, snap, policy, token,
                                      req, resp, std::move(state),
-                                     std::move(fwd_snap));
+                                     std::move(fwd_snap),
+                                     policy_incarnation);
         return;
     }
     const std::string key = *key_opt;
@@ -1694,7 +1770,8 @@ void AuthManager::InvokeAsyncIntrospection(
         // Defence-in-depth: skip the cache layer rather than crash.
         InvokeIntrospectionUncached(issuer, snap, policy, token,
                                      req, resp, std::move(state),
-                                     std::move(fwd_snap));
+                                     std::move(fwd_snap),
+                                     policy_incarnation);
         return;
     }
 
@@ -1902,7 +1979,7 @@ void AuthManager::InvokeAsyncIntrospection(
     done_ctx.manager              = this;
     // Capture the policy incarnation now so a removed-then-readded race
     // before the IdP roundtrip resolves can't pollute the new bucket.
-    done_ctx.policy_incarnation   = PolicyIncarnation(policy.name);
+    done_ctx.policy_incarnation   = policy_incarnation;
     IntrospectionClient::DoneCallback on_verify_done =
         MakeIntrospectionDoneCallback(std::move(done_ctx));
 
@@ -1929,7 +2006,8 @@ void AuthManager::InvokeIntrospectionUncached(
         const HttpRequest& req,
         HttpResponse& resp,
         std::shared_ptr<HttpRouter::AsyncPendingState> state,
-        std::shared_ptr<const AuthForwardConfig> fwd_snap) {
+        std::shared_ptr<const AuthForwardConfig> fwd_snap,
+        uint64_t policy_incarnation) {
     (void)resp;
     introspection_cache_miss_.fetch_add(1, std::memory_order_relaxed);
 
@@ -2029,7 +2107,7 @@ void AuthManager::InvokeIntrospectionUncached(
     done_ctx.enable_cache_ops     = false;
     done_ctx.cache                = AuthCache::Uncached;
     done_ctx.manager              = this;
-    done_ctx.policy_incarnation   = PolicyIncarnation(policy.name);
+    done_ctx.policy_incarnation   = policy_incarnation;
     IntrospectionClient::DoneCallback on_verify_done =
         MakeIntrospectionDoneCallback(std::move(done_ctx));
 

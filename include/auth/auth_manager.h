@@ -229,8 +229,8 @@ class AuthManager {
     // resume finalizers (built in an anonymous namespace) can call it via
     // a captured manager pointer.
     // captured_incarnation is the policy-name incarnation observed at
-    // dispatch time (see PolicyIncarnation). Sync paths pass the default
-    // 0 (no gate) — they have no dispatch-finalize time gap. Async
+    // dispatch time (see PolicyIncarnation). Sync paths pass std::nullopt
+    // (no gate — they have no dispatch-finalize time gap). Async
     // introspection finalizers capture the value at dispatch and pass it
     // here so a verdict from a removed-then-readded policy incarnation
     // does NOT contaminate the new bucket. On mismatch the per-policy
@@ -241,15 +241,18 @@ class AuthManager {
                         const std::string& issuer,
                         const std::string& policy,
                         AuthCache cache,
-                        uint64_t captured_incarnation = 0);
+                        std::optional<uint64_t> captured_incarnation = std::nullopt);
 
-    // Returns the current incarnation for `policy_name`, or 0 if the
-    // policy has never been observed by ReconcilePerPolicyKeysLocked.
-    // Bumped each time a policy.name appears AFTER being absent in the
-    // previous reconcile — i.e., every removed-then-readded cycle. Sync
-    // paths don't need to call this; async paths capture the value at
-    // dispatch and pass it back through RecordVerdict at finalize.
-    // Acquires per_policy_mtx_ briefly.
+    // Returns the current incarnation for `policy_name`. Always >= 1 for
+    // a policy that has ever been part of a reconcile (or that has been
+    // observed at all — see PolicyIncarnation impl, which lazy-creates
+    // entries at value 1 so async dispatchers and sync reconcilers never
+    // disagree about "incarnation 0 means never seen"). Bumped each time
+    // a policy.name appears AFTER being absent in the previous reconcile
+    // — i.e. every removed-then-readded cycle. Sync paths don't need to
+    // call this; async paths capture the value at dispatch and pass it
+    // back through RecordVerdict at finalize. Acquires per_policy_mtx_
+    // briefly.
     uint64_t PolicyIncarnation(const std::string& policy_name) const;
 
     // Snapshot of the LIVE issuer name set — the keys of `issuers_` at
@@ -281,11 +284,16 @@ class AuthManager {
 
     // Build an AppliedPolicyList from live+top-level sources. Used by
     // both RegisterPolicy-driven startup (reused here) and by
-    // CommitPolicyAndEnforcement.
+    // CommitPolicyAndEnforcement. Each AppliedPolicy's `incarnation`
+    // field is populated from `incarnations` (lookup by policy.name);
+    // missing names default to 1 so a fresh-start dispatch can capture
+    // a non-zero value that distinguishes from `incarnation = 0` left
+    // over from default-constructed entries.
     static std::shared_ptr<const AppliedPolicyList>
     BuildAppliedPolicyList(
         const std::vector<UpstreamConfig>& upstreams,
-        const std::vector<AuthPolicy>& top_level_policies);
+        const std::vector<AuthPolicy>& top_level_policies,
+        const std::unordered_map<std::string, uint64_t>& incarnations = {});
 
     // Introspection-mode dispatch: cache lookup with sync fast-paths
     // (Fresh+active / Fresh+!active / Stale+active) and a deferred POST on
@@ -295,6 +303,11 @@ class AuthManager {
     // a separate ForwardConfig() read here would race a concurrent
     // CommitForwardAndPolicies() reload and inject headers/raw_token using
     // a forward overlay that doesn't match the policy's reload generation.
+    // policy_incarnation comes from the matched AppliedPolicy in the
+    // snapshot the caller used to select `policy` — atomic with the
+    // policy match. Threaded into IntrospectionDoneCtx so the resume
+    // finalizer's RecordVerdict gate can detect a removed-then-readded
+    // race.
     void InvokeAsyncIntrospection(
         const std::shared_ptr<Issuer>& issuer,
         const IssuerSnapshot& snap,
@@ -303,7 +316,8 @@ class AuthManager {
         const HttpRequest& req,
         HttpResponse& resp,
         std::shared_ptr<HttpRouter::AsyncPendingState> state,
-        std::shared_ptr<const AuthForwardConfig> fwd_snap);
+        std::shared_ptr<const AuthForwardConfig> fwd_snap,
+        uint64_t policy_incarnation);
 
     // Same as InvokeAsyncIntrospection but skips the cache entirely. Used
     // when TokenHasher::Hash returns nullopt (rare HMAC failure) — caching
@@ -316,7 +330,8 @@ class AuthManager {
         const HttpRequest& req,
         HttpResponse& resp,
         std::shared_ptr<HttpRouter::AsyncPendingState> state,
-        std::shared_ptr<const AuthForwardConfig> fwd_snap);
+        std::shared_ptr<const AuthForwardConfig> fwd_snap,
+        uint64_t policy_incarnation);
 
     // Stamp a validated AuthContext onto req for the sync fast-paths
     // (cache hit / stale-serve). Mirrors the JWT-mode mutation block.
@@ -342,7 +357,7 @@ class AuthManager {
     void BumpPerPolicy(const std::string& issuer,
                         const std::string& policy,
                         VerifyOutcome outcome,
-                        uint64_t captured_incarnation = 0);
+                        std::optional<uint64_t> captured_incarnation = std::nullopt);
 
     // Stamp X-Auth-Decision / X-Auth-Issuer / X-Auth-Cache on `resp`. No-op
     // when the live `debug_response_headers_` flag is false. Empty issuer
@@ -426,7 +441,12 @@ class AuthManager {
     // dropped instead of contaminating the new bucket. Both maps live
     // under per_policy_mtx_; reads are coalesced with the per-bucket
     // operations so the gate is mutex-cheap.
-    std::unordered_map<std::string, uint64_t> policy_incarnation_;
+    // Mutable so the const PolicyIncarnation() can lazy-create entries
+    // at value 1 — the first read for a never-seen name pins the live
+    // value to 1, matching what BuildAppliedPolicyList embeds for
+    // missing-from-incarnations names. Both maps are ALWAYS accessed
+    // under per_policy_mtx_.
+    mutable std::unordered_map<std::string, uint64_t> policy_incarnation_;
     std::unordered_set<std::string> policy_last_reconciled_;
 
     std::mutex reload_mtx_;
