@@ -42,6 +42,7 @@
 #include "introspection_client_test.h"
 #include "auth_introspection_integration_test.h"
 #include "auth_observability_test.h"
+#include "observability_foundation_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -181,6 +182,13 @@ void RunAllTest(){
     // DNS / dual-stack feature family (transport layer, not inbound auth).
     RunAllDnsFamily();
 
+    // Observability foundation — pure value-type tests (TraceId / SpanId /
+    // TraceFlags / TraceState / SpanContext / LabelSet / AttrValue). The
+    // full Span / Tracer / Meter / OtlpHttpExporter / PrometheusExporter
+    // pipeline tests land in observability_test.h once the rest of the
+    // OpenTelemetry slice ships.
+    ObservabilityFoundationTests::RunAllTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -228,6 +236,10 @@ void PrintUsage(const char* program_name) {
     std::cout << "  intro_client, -y   Introspection client static-helper + AsyncPendingState tests" << std::endl;
     std::cout << "  auth_intro,  -Z    Introspection integration tests" << std::endl;
     std::cout << "  auth_observability, -o    Auth observability tests" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  obs_foundation     Observability foundation value-type tests" << std::endl;
+    std::cout << "                     (TraceId / SpanId / TraceFlags / TraceState /" << std::endl;
+    std::cout << "                      SpanContext / LabelSet / AttrValue)" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -378,6 +390,10 @@ int main(int argc, char* argv[]) {
         // Run auth observability tests
         }else if(mode == "auth_observability" || mode == "-o"){
             AuthObservabilityTests::RunAllTests();
+        // Run observability foundation value-type tests (TraceId / SpanId /
+        // TraceFlags / TraceState / SpanContext / LabelSet / AttrValue).
+        }else if(mode == "obs_foundation"){
+            ObservabilityFoundationTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

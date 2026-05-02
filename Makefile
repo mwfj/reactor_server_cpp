@@ -93,6 +93,13 @@ AUTH_SRCS = $(SERVER_DIR)/token_hasher.cc $(SERVER_DIR)/auth_policy_matcher.cc $
             $(SERVER_DIR)/auth_url_util.cc $(SERVER_DIR)/introspection_cache.cc \
             $(SERVER_DIR)/introspection_client.cc
 
+# Observability layer sources (OpenTelemetry — Layer 7 middleware)
+# Foundational value types only at this stage; Span / Tracer / Meter
+# / OtlpHttpExporter / PrometheusExporter / ObservabilityManager land
+# in subsequent slices.
+OBSERVABILITY_SRCS = $(SERVER_DIR)/trace_id.cc $(SERVER_DIR)/trace_state.cc \
+                     $(SERVER_DIR)/attr_value.cc
+
 # CLI layer sources
 CLI_SRCS = $(SERVER_DIR)/cli_parser.cc $(SERVER_DIR)/signal_handler.cc $(SERVER_DIR)/pid_file.cc $(SERVER_DIR)/daemonizer.cc
 
@@ -139,7 +146,7 @@ NGHTTP2_SRC = $(THIRD_PARTY_DIR)/nghttp2/nghttp2_alpn.c \
 NGHTTP2_OBJ = $(NGHTTP2_SRC:.c=.o)
 
 # Server library sources (shared between test and production binaries)
-LIB_SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(FOUNDATION_SRCS) $(HTTP_SRCS) $(HTTP2_SRCS) $(WS_SRCS) $(TLS_SRCS) $(UPSTREAM_SRCS) $(RATE_LIMIT_SRCS) $(CIRCUIT_BREAKER_SRCS) $(AUTH_SRCS) $(CLI_SRCS) $(UTIL_SRCS)
+LIB_SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(FOUNDATION_SRCS) $(HTTP_SRCS) $(HTTP2_SRCS) $(WS_SRCS) $(TLS_SRCS) $(UPSTREAM_SRCS) $(RATE_LIMIT_SRCS) $(CIRCUIT_BREAKER_SRCS) $(AUTH_SRCS) $(OBSERVABILITY_SRCS) $(CLI_SRCS) $(UTIL_SRCS)
 
 # Test binary sources
 TEST_SRCS = $(LIB_SRCS) $(TEST_DIR)/test_framework.cc $(TEST_DIR)/run_test.cc
