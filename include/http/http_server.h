@@ -10,6 +10,7 @@
 #include "tls/tls_context.h"
 #include "rate_limit/rate_limiter.h"
 #include "auth/auth_manager.h"
+#include "observability/common.h"  // forward decl of ObservabilityManager
 
 #include <atomic>
 #include <map>
@@ -64,6 +65,20 @@ public:
     explicit HttpServer(ServerConfig config);
 
     ~HttpServer();
+
+    // Install an ObservabilityManager. MUST be called BEFORE
+    // MarkServerReady runs (otherwise the middleware install in
+    // MarkServerReady will be a no-op for this server's lifetime).
+    // The middleware is installed automatically as the LAST prepend in
+    // MarkServerReady so it executes FIRST, before auth + rate-limit.
+    // Pass nullptr to disable observability (default).
+    void SetObservabilityManager(
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager> mgr) {
+        observability_manager_ = std::move(mgr);
+    }
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* GetObservabilityManager() const {
+        return observability_manager_.get();
+    }
 
     // Route registration (delegates to router) — synchronous handlers.
     // The framework serializes the response and closes out the request when
@@ -264,6 +279,22 @@ public:
     // class so it is namespaced under HttpServer:: rather than polluting
     // the global / http namespace with a free thread-local.
     static thread_local HTTP_CALLBACKS_NAMESPACE::ResourcePusher* current_sync_pusher_;
+
+    // Fire FinalizeFromSnapshot on the request's observability snapshot
+    // (if non-null). Computes the wire body size from the response's
+    // status + body — bodyless statuses (1xx / 204 / 304) and HEAD
+    // requests record 0. `error_type` is the OTel-spec
+    // `error.type` attribute value: empty string for success, or one
+    // of the documented categorical strings ("rejected_by_middleware",
+    // "handler_threw", "client_error", "server_error", etc.) per
+    // OPENTELEMETRY_DESIGN.md §6.1.2.
+    //
+    // Idempotent: multiple calls per request are CAS-gated by the
+    // snapshot itself; only the first call wins. Safe to call even
+    // when `request.obs_snapshot` is null (no-op).
+    static void FinalizeIfSnapshot(HttpRequest& request,
+                                     const HttpResponse& response,
+                                     std::string error_type);
 
 private:
     // `live_config_` is initialized first because every other member's
@@ -502,6 +533,18 @@ private:
     // → circuit_breaker_manager_ → upstream_manager_.
     AUTH_NAMESPACE::AuthConfig auth_config_;
     std::unique_ptr<AUTH_NAMESPACE::AuthManager> auth_manager_;
+
+    // OpenTelemetry observability manager — null when
+    // observability.enabled=false (the default deployment per
+    // OPENTELEMETRY_DESIGN.md §14). When non-null, the request
+    // callback invokes FinalizeFromSnapshot at completion via
+    // FinalizeIfSnapshot. shared_ptr (not unique_ptr) so the
+    // observability-middleware closure can hold a co-owning reference
+    // for its lifetime — see §17.1 r37 weak_ptr lifecycle requirement
+    // for ObservabilityManager (manager inherits enable_shared_from_this
+    // so weak_from_this() inside the kill loop has a seeded weak ref).
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>
+        observability_manager_;
 
     // Proxy handlers keyed by (upstream_service_name + normalized prefix).
     // shared_ptr (not unique_ptr) so that route lambdas capture shared

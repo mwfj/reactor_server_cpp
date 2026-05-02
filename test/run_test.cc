@@ -46,6 +46,7 @@
 #include "observability_tracer_test.h"
 #include "observability_metrics_test.h"
 #include "observability_manager_test.h"
+#include "observability_e2e_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -199,11 +200,13 @@ void RunAllTest(){
 
     // Observability manager + middleware tests — snapshot register-
     // and-count, FinalizeFromSnapshot CAS gate, KillOutstandingSnapshots,
-    // Reload live-flag flipping, end-to-end middleware. The full
-    // BatchSpanProcessor + OtlpHttpExporter + PrometheusExporter
-    // pipeline tests land in observability_test.h once the rest of the
-    // OpenTelemetry slice ships.
+    // Reload live-flag flipping, end-to-end middleware.
     ObservabilityManagerTests::RunAllTests();
+
+    // Observability end-to-end tests — boot a real HttpServer, install
+    // the observability manager + middleware, send TCP-level HTTP
+    // requests, assert spans are captured by the InMemorySpanProcessor.
+    ObservabilityE2ETests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;
 }
@@ -264,6 +267,8 @@ void PrintUsage(const char* program_name) {
     std::cout << "  obs_mgr            Observability manager + middleware tests" << std::endl;
     std::cout << "                     (snapshot lifecycle, finalize CAS gate, kill" << std::endl;
     std::cout << "                      loop, Reload, end-to-end middleware)" << std::endl;
+    std::cout << "  obs_e2e            Observability end-to-end tests (boot real" << std::endl;
+    std::cout << "                     HttpServer, send HTTP requests, verify spans)" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -430,6 +435,11 @@ int main(int argc, char* argv[]) {
         // Reload, middleware end-to-end).
         }else if(mode == "obs_mgr"){
             ObservabilityManagerTests::RunAllTests();
+        // Run observability end-to-end tests (boot real HttpServer,
+        // install observability manager + middleware, send real HTTP
+        // requests, assert spans captured).
+        }else if(mode == "obs_e2e"){
+            ObservabilityE2ETests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

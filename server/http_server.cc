@@ -8,6 +8,9 @@
 #include "upstream/upstream_manager.h"
 #include "upstream/proxy_handler.h"
 #include "auth/auth_manager.h"
+#include "observability/observability_manager.h"
+#include "observability/observability_middleware.h"
+#include "observability/observability_snapshot.h"
 #include "auth/auth_middleware.h"
 #include "circuit_breaker/circuit_breaker_manager.h"
 #include "circuit_breaker/circuit_breaker_host.h"
@@ -26,6 +29,36 @@
 // when the slot is null (called outside any sync dispatch).
 thread_local HTTP_CALLBACKS_NAMESPACE::ResourcePusher*
     HttpServer::current_sync_pusher_ = nullptr;
+
+// Compute the wire body size for the given response under H1/H2
+// bodyless-status semantics. HEAD requests + 1xx / 204 / 304 statuses
+// always emit zero body; other statuses emit response.body.size()
+// bytes (modulo HEAD-strip, which is applied at the wire level inside
+// the connection handler). Mirrors the helper in
+// http_connection_handler.cc but exposed here for FinalizeIfSnapshot.
+static uint64_t ObsWireBodySize(const HttpResponse& response,
+                                  bool was_head_request) noexcept {
+    if (was_head_request) return 0;
+    const int status = response.GetStatusCode();
+    if (status >= 100 && status < 200) return 0;
+    if (status == 204 || status == 304) return 0;
+    return static_cast<uint64_t>(response.GetBody().size());
+}
+
+// static
+void HttpServer::FinalizeIfSnapshot(HttpRequest& request,
+                                      const HttpResponse& response,
+                                      std::string error_type) {
+    if (!request.obs_snapshot) return;
+    auto& snap = *request.obs_snapshot;
+    auto mgr = snap.manager.lock();
+    if (!mgr) return;  // manager torn down before finalize — kill loop ran.
+    const bool was_head = (request.method == "HEAD");
+    const uint64_t wire_body_size = ObsWireBodySize(response, was_head);
+    const int status = response.GetStatusCode();
+    mgr->FinalizeFromSnapshot(snap, status, wire_body_size,
+                               std::move(error_type));
+}
 
 // Factory for the H2 ResourcePusher closure. Both the async (bound on
 // the AsyncHandler signature) and sync (installed into
@@ -1227,6 +1260,20 @@ void HttpServer::MarkServerReady() {
     // programmatic HttpServer::Proxy() API). See RecomputeAsyncDeferredCap
     // for the sizing logic and opt-out sentinel.
     RecomputeAsyncDeferredCap();
+
+    // Observability middleware — installed LAST so PrependMiddleware's
+    // "last prepend runs first" places it at the HEAD of the sync chain.
+    // Per OPENTELEMETRY_DESIGN.md §6.1.1: observability middleware must
+    // run BEFORE auth + rate-limit so middleware-rejection paths can
+    // finalize through a populated snapshot. Skipped when
+    // observability_manager_ is null (default deployment per §14).
+    if (observability_manager_) {
+        router_.PrependMiddleware(
+            OBSERVABILITY_NAMESPACE::MakeObservabilityMiddleware(
+                observability_manager_));
+        logging::Get()->info(
+            "ObservabilityManager middleware installed");
+    }
 
     start_time_ = std::chrono::steady_clock::now();
     server_ready_.store(true, std::memory_order_release);
@@ -3318,6 +3365,12 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 auto bookkeeping_done =
                     std::make_shared<std::atomic<bool>>(false);
                 auto cancelled = std::make_shared<std::atomic<bool>>(false);
+                // Capture observability snapshot + method by value so the
+                // async completion lambda can finalize even after the
+                // request slot has been Reset() for the next pipelined
+                // request. snap may be null when observability is disabled.
+                auto obs_snap_local = request.obs_snapshot;
+                const bool was_head_local = (request.method == "HEAD");
                 // Allocate a cancel slot for handler-installed cleanup
                 // (e.g., ProxyHandler registers tx->Cancel() here).
                 // Fired by the async abort hook below. Populated BEFORE
@@ -3329,7 +3382,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, active_counter,
                      mw_headers, response_claimed, bookkeeping_done,
-                     cancelled](HttpResponse final_resp) {
+                     cancelled, obs_snap_local, was_head_local](HttpResponse final_resp) {
                         if (response_claimed->exchange(
                                 true, std::memory_order_acq_rel)) {
                             return;
@@ -3358,9 +3411,27 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                             std::move(merged));
                         conn->RunOnDispatcher(
                             [s, shared_resp, active_counter,
-                             bookkeeping_done, cancelled]() {
+                             bookkeeping_done, cancelled,
+                             obs_snap_local, was_head_local]() {
                             if (cancelled->load(std::memory_order_acquire)) return;
                             s->CompleteAsyncResponse(std::move(*shared_resp));
+                            // Observability finalize for the H1 async
+                            // completion path. Idempotent CAS gate on
+                            // the snapshot itself; we capture method
+                            // (for HEAD detection) + snap by value at
+                            // dispatch time, before request Reset().
+                            if (obs_snap_local) {
+                                auto mgr = obs_snap_local->manager.lock();
+                                if (mgr) {
+                                    const uint64_t wire_size =
+                                        ObsWireBodySize(*shared_resp, was_head_local);
+                                    mgr->FinalizeFromSnapshot(
+                                        *obs_snap_local,
+                                        shared_resp->GetStatusCode(),
+                                        wire_size,
+                                        /*error_type=*/std::string{});
+                                }
+                            }
                             if (!bookkeeping_done->exchange(
                                     true, std::memory_order_acq_rel)) {
                                 active_counter->fetch_sub(
@@ -3610,6 +3681,8 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 if (!server_ready_.load(std::memory_order_acquire)) {
                     response.Header("Connection", "close");
                 }
+                FinalizeIfSnapshot(request, response,
+                                    /*error_type=*/"rejected_by_middleware");
                 return;
             }
 
@@ -3674,6 +3747,8 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 if (!server_ready_.load(std::memory_order_acquire)) {
                     response.Header("Connection", "close");
                 }
+                FinalizeIfSnapshot(request, response,
+                                    /*error_type=*/"rejected_by_async_middleware");
                 return;
             }
 
@@ -3693,6 +3768,11 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
             if (!server_ready_.load(std::memory_order_acquire)) {
                 response.Header("Connection", "close");
             }
+            // Observability finalize for H1 sync path (per
+            // OPENTELEMETRY_DESIGN.md §6.1.2). Idempotent CAS gate on
+            // the snapshot ensures exactly-once dispatch even if a
+            // future error path also calls finalize.
+            FinalizeIfSnapshot(request, response, /*error_type=*/std::string{});
         }
     );
 
@@ -4353,6 +4433,11 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 auto bookkeeping_done =
                     std::make_shared<std::atomic<bool>>(false);
                 auto cancelled = std::make_shared<std::atomic<bool>>(false);
+                // Capture observability snapshot + method (for HEAD
+                // detection) by value — see H1 async path above for the
+                // full rationale; same pattern.
+                auto obs_snap_local = request.obs_snapshot;
+                const bool was_head_local = (request.method == "HEAD");
                 // Handler-installed cancel slot — mirrors HTTP/1.
                 // Populated before async_handler runs; fired by the
                 // per-stream abort hook on client-side abort (stream
@@ -4363,7 +4448,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, stream_id, active_counter,
                      mw_headers, response_claimed, bookkeeping_done,
-                     cancelled](HttpResponse final_resp) {
+                     cancelled, obs_snap_local, was_head_local](HttpResponse final_resp) {
                         if (response_claimed->exchange(
                                 true, std::memory_order_acq_rel)) {
                             return;
@@ -4392,9 +4477,24 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                             std::move(merged));
                         conn->RunOnDispatcher(
                             [s, stream_id, shared_resp, active_counter,
-                             bookkeeping_done, cancelled]() {
+                             bookkeeping_done, cancelled,
+                             obs_snap_local, was_head_local]() {
                             if (cancelled->load(std::memory_order_acquire)) return;
                             s->SubmitStreamResponse(stream_id, *shared_resp);
+                            // Observability finalize for the H2 async
+                            // completion path. Idempotent CAS gate.
+                            if (obs_snap_local) {
+                                auto mgr = obs_snap_local->manager.lock();
+                                if (mgr) {
+                                    const uint64_t wire_size =
+                                        ObsWireBodySize(*shared_resp, was_head_local);
+                                    mgr->FinalizeFromSnapshot(
+                                        *obs_snap_local,
+                                        shared_resp->GetStatusCode(),
+                                        wire_size,
+                                        /*error_type=*/std::string{});
+                                }
+                            }
                             if (!bookkeeping_done->exchange(
                                     true, std::memory_order_acq_rel)) {
                                 active_counter->fetch_sub(
@@ -4624,6 +4724,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
 
             if (!router_.RunMiddleware(request, response)) {
                 HttpRouter::FillDefaultRejectionResponse(response);
+                FinalizeIfSnapshot(request, response,
+                                    /*error_type=*/"rejected_by_middleware");
                 return;
             }
 
@@ -4678,6 +4780,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
             // `state` is null on empty-chain implicit PASS.
             if (state && state->sync_result() ==
                     HttpRouter::AsyncMiddlewareResult::DENY) {
+                FinalizeIfSnapshot(request, response,
+                                    /*error_type=*/"rejected_by_async_middleware");
                 return;
             }
 
@@ -4691,6 +4795,9 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
             RestoreDebugAuthHeaders(response, auth_hdrs);
+            // Observability finalize for H2 sync path (per
+            // OPENTELEMETRY_DESIGN.md §6.1.2). Idempotent CAS gate.
+            FinalizeIfSnapshot(request, response, /*error_type=*/std::string{});
         }
     );
 

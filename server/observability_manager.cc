@@ -1,7 +1,9 @@
 #include "observability/observability_manager.h"
 
 #include "observability/sampler.h"
+#include "observability/semantic_conventions.h"
 #include "observability/span.h"
+#include "observability/span_status.h"
 
 #include "log/logger.h"
 
@@ -157,14 +159,35 @@ void ObservabilityManager::OnFinalizeWinner(
     snap.wire_body_size.store(wire_body_size, std::memory_order_release);
     snap.error_type = error_type;
 
-    // End the inbound SERVER span (if recording). Span::End is
-    // idempotent + dispatcher-thread-only — we're on the dispatcher
-    // thread because finalize is called from the response-completion
-    // path (sync handler / async-completion / streaming End/Abort /
-    // middleware-rejection). The Phase 1c kill path (which may call
-    // FinalizeFromSnapshot from the shutdown thread) uses CASE A/B
-    // semantics in KillOutstandingSnapshots — see that method.
+    // Attach response-side attributes to the inbound SERVER span before
+    // ending it (per OPENTELEMETRY_DESIGN.md §6.6 + §7.1):
+    //   - http.response.status_code (always when status > 0)
+    //   - http.server.response.body.size (wire-bytes; 0 for HEAD/1xx/204/304)
+    //   - error.type (when set; categorical string per OTel error semconv)
+    //   - SpanStatusCode: server 5xx → ERROR; 4xx → UNSET (client misuse,
+    //     not the gateway's fault); successful operations stay UNSET.
     if (snap.inbound_span) {
+        if (status_code > 0) {
+            snap.inbound_span->SetAttribute(
+                std::string(sem::kHttpResponseStatusCode),
+                AttrValue(static_cast<int64_t>(status_code)));
+        }
+        snap.inbound_span->SetAttribute(
+            std::string(sem::kHttpServerResponseBodySize),
+            AttrValue(static_cast<int64_t>(wire_body_size)));
+        if (!error_type.empty()) {
+            snap.inbound_span->SetAttribute(
+                std::string(sem::kErrorType),
+                AttrValue(error_type));
+            snap.inbound_span->SetStatus(SpanStatusCode::ERROR, error_type);
+        } else if (status_code >= 500 && status_code < 600) {
+            snap.inbound_span->SetStatus(SpanStatusCode::ERROR);
+        }
+        // End is idempotent + dispatcher-thread-only — we're on the
+        // dispatcher thread because finalize is called from the response-
+        // completion path (sync handler / async-completion / streaming
+        // End/Abort / middleware-rejection). The Phase 1c kill path uses
+        // CASE A/B semantics in KillOutstandingSnapshots.
         snap.inbound_span->End();
     }
 }
