@@ -44,6 +44,7 @@
 #include "auth_observability_test.h"
 #include "observability_foundation_test.h"
 #include "observability_tracer_test.h"
+#include "observability_metrics_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -188,11 +189,17 @@ void RunAllTest(){
     ObservabilityFoundationTests::RunAllTests();
 
     // Observability tracer / sampler / span lifecycle tests — pure
-    // in-process (no I/O); uses InMemorySpanProcessor. The full
-    // BatchSpanProcessor + OtlpHttpExporter + PrometheusExporter
-    // pipeline tests land in observability_test.h once the rest of the
-    // OpenTelemetry slice ships.
+    // in-process (no I/O); uses InMemorySpanProcessor.
     ObservabilityTracerTests::RunAllTests();
+
+    // Observability metrics tests — Counter / Histogram / Meter /
+    // MeterProvider + cardinality registry. Pure in-process; covers
+    // the §7.5/§7.6 SeriesMap + per-key __overflow__ rewrite +
+    // multi-shard concurrent writes. The full BatchSpanProcessor +
+    // OtlpHttpExporter + PrometheusExporter pipeline tests land in
+    // observability_test.h once the rest of the OpenTelemetry slice
+    // ships.
+    ObservabilityMetricsTests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;
 }
@@ -247,6 +254,9 @@ void PrintUsage(const char* program_name) {
     std::cout << "                      SpanContext / LabelSet / AttrValue)" << std::endl;
     std::cout << "  obs_tracer         Observability tracer / sampler / span lifecycle" << std::endl;
     std::cout << "                     tests (Tracer / TracerProvider / Span / Sampler)" << std::endl;
+    std::cout << "  obs_metrics        Observability metrics tests (Counter /" << std::endl;
+    std::cout << "                     Histogram / Meter / MeterProvider + cardinality" << std::endl;
+    std::cout << "                     registry)" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -404,6 +414,10 @@ int main(int argc, char* argv[]) {
         // Run observability tracer / sampler / span lifecycle tests.
         }else if(mode == "obs_tracer"){
             ObservabilityTracerTests::RunAllTests();
+        // Run observability metrics tests (Counter / Histogram /
+        // Meter / MeterProvider + cardinality registry).
+        }else if(mode == "obs_metrics"){
+            ObservabilityMetricsTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);
