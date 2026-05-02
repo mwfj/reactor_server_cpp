@@ -70,6 +70,31 @@ public:
     // Http2Session handles the missing-stream case internally.
     void SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
 
+    // ============================================================
+    // Observability finalize hooks (per OPENTELEMETRY_DESIGN.md §6.1.2)
+    // ============================================================
+    using FinalizeHook = std::function<void(uint64_t wire_body_size)>;
+
+    // Stream-targeted async-completion + post-wire finalize. Equivalent
+    // to SubmitStreamResponse + finalize hook. The hook receives the
+    // WIRE body size — bytes ACTUALLY emitted as DATA frames after H2
+    // bodyless-status normalization (1xx / 204 / 304 always pass 0).
+    // Fires AFTER nghttp2's output buffer accepts the response and the
+    // session's pending-frames flush completes.
+    void SubmitStreamResponseWithFinalize(int32_t stream_id,
+                                            const HttpResponse& response,
+                                            FinalizeHook hook);
+
+    // Per-stream orthogonal post-wire-write notification slot. Same
+    // contract as the H1 SetPostWriteNotifyOnce — but H2 multiplexes
+    // streams, so the slot is keyed on stream_id. Used by
+    // ShutdownContext's H2 CASE B path: arms `notify_sent` BEFORE
+    // SubmitStreamResponse, observes the flip after nghttp2 commits
+    // the response frames.
+    void SetPostWriteNotifyOnce(int32_t stream_id,
+                                  std::shared_ptr<std::atomic<bool>> notify_sent);
+    // ============================================================
+
     // Internal: after an explicit SendPendingFrames() flush, re-check whether
     // graceful shutdown can now complete or whether the normal deadline
     // tracking should be refreshed.
@@ -168,10 +193,18 @@ public:
     }
     void FireAndEraseStreamAbortHook(int32_t stream_id) {
         auto it = stream_abort_hooks_.find(stream_id);
-        if (it == stream_abort_hooks_.end()) return;
+        if (it == stream_abort_hooks_.end()) {
+            // Even when the abort hook is absent, fire the post-write
+            // notifier so a shutdown-route pump on this stream sees
+            // "framework gave up" — same semantics as H1's
+            // TripAsyncAbortHook.
+            FireStreamPostWriteNotify(stream_id);
+            return;
+        }
         auto hook = std::move(it->second);
         stream_abort_hooks_.erase(it);
         if (hook) hook();
+        FireStreamPostWriteNotify(stream_id);
     }
     // Fire ALL remaining stream-abort hooks. Called from
     // HttpServer::RemoveConnection when a connection is being torn
@@ -188,7 +221,27 @@ public:
         for (auto& [id, hook] : hooks) {
             if (hook) hook();
         }
+        // Fire every remaining per-stream post-write notifier — the
+        // observability/shutdown-route pumps observe "framework gave
+        // up on this submission" and can proceed to Stop().
+        for (auto& [id, slot] : stream_post_write_notify_) {
+            (void)id;
+            if (slot) slot->store(true, std::memory_order_release);
+        }
+        stream_post_write_notify_.clear();
     }
+
+private:
+    // Fire-and-erase a single stream's post-write notifier. Idempotent.
+    void FireStreamPostWriteNotify(int32_t stream_id) {
+        auto it = stream_post_write_notify_.find(stream_id);
+        if (it == stream_post_write_notify_.end()) return;
+        if (it->second) {
+            it->second->store(true, std::memory_order_release);
+        }
+        stream_post_write_notify_.erase(it);
+    }
+public:
 
 private:
     StreamCloseCallback WrapStreamCloseCallback(StreamCloseCallback callback);
@@ -243,4 +296,12 @@ private:
 
     // Per-stream safety-cap abort hooks. See SetStreamAbortHook.
     std::unordered_map<int32_t, std::function<void()>> stream_abort_hooks_;
+
+    // Per-stream orthogonal post-wire-write notifier slots. Set by
+    // SetPostWriteNotifyOnce(stream_id, ...); flipped after the
+    // response frames are committed to nghttp2's output buffer; cleared
+    // post-signal. Used by ShutdownContext H2 CASE B per
+    // OPENTELEMETRY_DESIGN.md §13 r84.
+    std::unordered_map<int32_t, std::shared_ptr<std::atomic<bool>>>
+        stream_post_write_notify_;
 };

@@ -35,6 +35,53 @@ public:
     // Send an HTTP response
     void SendResponse(const HttpResponse& response);
 
+    // ============================================================
+    // Observability finalize hooks (per OPENTELEMETRY_DESIGN.md §6.1.2)
+    // ============================================================
+    // Hook signature receives the WIRE body size — the byte count
+    // ACTUALLY written to the socket post-normalization. HEAD-stripped
+    // responses + 1xx / 204 / 304 always pass 0 here, so
+    // `http.server.response.body.size` is correct regardless of
+    // normalization. The hook fires AFTER the bytes are buffered for
+    // send (conn_->SendRaw has returned) and BEFORE pipelined-input
+    // resume, so the snapshot's CAS gate races are correctly ordered.
+    using FinalizeHook = std::function<void(uint64_t wire_body_size)>;
+
+    // Sync-path send + post-wire finalize. Equivalent to SendResponse
+    // followed by `hook(wire_body_size)` — but exposed as one call so
+    // the wire-size computation matches the post-normalization bytes
+    // actually written. Used by sync handler paths +
+    // middleware-rejection paths.
+    void SendResponseWithFinalize(HttpResponse response, FinalizeHook hook);
+
+    // Async-path completion + post-wire finalize. Equivalent to
+    // CompleteAsyncResponse + finalize hook. Splits the existing
+    // CompleteAsyncResponse into normalize → write+compute size →
+    // invoke hook → resume pipelined input. The hook fires BEFORE
+    // the OnRawData replay so the snapshot's End() lands on the
+    // request that produced it, not the next pipelined request.
+    void CompleteAsyncResponseWithFinalize(HttpResponse response,
+                                            FinalizeHook hook);
+
+    // Per-request orthogonal post-wire-write notification slot.
+    // Independent of `WithFinalize` (which carries the observability
+    // finalize hook). Both signals fire at the same wire-write
+    // completion instant. CASE B of `WriteResponseAndStop` (per §13)
+    // arms this slot when no observability snapshot exists, so the
+    // shutdown-route pump knows when the response has been buffered.
+    //
+    // The framework signals it by calling `notify_sent->store(true,
+    // std::memory_order_release);` immediately AFTER the post-wire-
+    // write step (the same instant a WithFinalize hook would fire).
+    // Cleared after signal so subsequent pipelined requests see a
+    // fresh state.
+    //
+    // On transport teardown before write completion, the framework
+    // still flips the flag — the helper observes "framework gave up
+    // on this submission" which is the correct shutdown signal.
+    void SetPostWriteNotifyOnce(std::shared_ptr<std::atomic<bool>> notify_sent);
+    // ============================================================
+
     // Create a streaming final-response sender for the current deferred async
     // request. Used by the proxy relay path to stream bytes without going
     // through CompleteAsyncResponse(HttpResponse).
@@ -149,9 +196,20 @@ public:
     // drops the socket while a request is still deferred — without
     // this, the heartbeat timer dies with the connection and a stuck
     // handler would leak active_requests_ permanently.
+    //
+    // Also fires the post_write_notify_ flag (§13 r84) so any
+    // shutdown-route pump waiting on this slot observes "framework
+    // gave up on this submission" — the correct shutdown signal.
+    // The helper does not need to distinguish wrote-OK vs gave-up:
+    // either way the queued submit work has run and Stop() can
+    // proceed.
     void TripAsyncAbortHook() {
         auto hook = std::move(async_abort_hook_);
         if (hook) hook();
+        if (post_write_notify_) {
+            post_write_notify_->store(true, std::memory_order_release);
+            post_write_notify_.reset();
+        }
     }
 
     // Append bytes that arrived while an async response was pending.
@@ -296,6 +354,12 @@ private:
 
     // Safety-cap abort hook. See SetAsyncAbortHook.
     std::function<void()> async_abort_hook_;
+
+    // Per-request orthogonal post-wire-write notifier slot. Set by
+    // SetPostWriteNotifyOnce; flipped after the wire-bytes are buffered;
+    // cleared post-signal so the next pipelined request starts clean.
+    // Per OPENTELEMETRY_DESIGN.md §13 r84.
+    std::shared_ptr<std::atomic<bool>> post_write_notify_;
 
     // Active streaming sender for the current deferred async request.
     // Weak to avoid creating a handler↔sender ownership cycle.

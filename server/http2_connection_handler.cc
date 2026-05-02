@@ -996,6 +996,14 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
         logging::Get()->warn(
             "SubmitStreamResponse called on destroyed H2 session (stream={})",
             stream_id);
+        // Defensive: still fire the per-stream post-write notifier (if
+        // any) so a shutdown-route pump waiting on this stream's slot
+        // observes "framework gave up" rather than hanging.
+        auto it = stream_post_write_notify_.find(stream_id);
+        if (it != stream_post_write_notify_.end()) {
+            it->second->store(true, std::memory_order_release);
+            stream_post_write_notify_.erase(it);
+        }
         return;
     }
     session_->SubmitResponse(stream_id, response);
@@ -1008,6 +1016,60 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
     // any async H2 route.
     session_->SendPendingFrames();
     RecheckShutdownDrainAfterFlush();
+
+    // Fire the per-stream post-write notifier (§13 r84): the response
+    // frames are committed to nghttp2's output buffer; the shutdown-
+    // route pump and any other observer keys on this. Lookup-and-erase
+    // so the next request on this stream_id (post-stream-close +
+    // ID-reuse — H2 stream IDs are monotonic, but the reuse-after-
+    // close semantics are the session's; we keep this idempotent).
+    auto it = stream_post_write_notify_.find(stream_id);
+    if (it != stream_post_write_notify_.end()) {
+        it->second->store(true, std::memory_order_release);
+        stream_post_write_notify_.erase(it);
+    }
+}
+
+namespace {
+// H2 wire-body-size: nghttp2 emits DATA frames matching the body bytes
+// (modulo HEADER frame overhead, which is NOT counted as body). 1xx /
+// 204 / 304 are bodyless; HEAD requests have body-stripped per
+// nghttp2's framing. The observability hook reports application body
+// only — DATA-frame headers + HEADER frame size are NOT counted, per
+// the design's `http.server.response.body.size` definition.
+inline uint64_t ComputeH2WireBodySize(const HttpResponse& response,
+                                       bool was_head_request) noexcept {
+    if (was_head_request) return 0;
+    const int status = response.GetStatusCode();
+    if (status >= 100 && status < 200) return 0;
+    if (status == 204 || status == 304) return 0;
+    return static_cast<uint64_t>(response.GetBody().size());
+}
+}  // namespace
+
+void Http2ConnectionHandler::SubmitStreamResponseWithFinalize(
+    int32_t stream_id, const HttpResponse& response, FinalizeHook hook) {
+    // Compute the wire body size BEFORE handing to nghttp2 so the hook
+    // fires with the right value even on the destroyed-session path.
+    // We can't read the request method directly (it's owned by
+    // Http2Stream, not the handler), but H2 streams are independent
+    // and HEAD-stripping is internal to nghttp2 framing — so for H2
+    // the simpler "report the response body's bodyless-status-aware
+    // size" matches the wire output.
+    const uint64_t wire_body_size =
+        ComputeH2WireBodySize(response, /*was_head_request=*/false);
+    SubmitStreamResponse(stream_id, response);
+    if (hook) hook(wire_body_size);
+}
+
+void Http2ConnectionHandler::SetPostWriteNotifyOnce(
+    int32_t stream_id,
+    std::shared_ptr<std::atomic<bool>> notify_sent) {
+    if (!notify_sent) {
+        stream_post_write_notify_.erase(stream_id);
+        return;
+    }
+    stream_post_write_notify_[stream_id] = std::move(notify_sent);
 }
 
 void Http2ConnectionHandler::RecheckShutdownDrainAfterFlush() {

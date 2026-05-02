@@ -965,6 +965,15 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     if (was_head) StripResponseBodyForHead(wire);
     conn_->SendRaw(wire.data(), wire.size());
 
+    // Fire the per-request post-wire notifier (§13 r84): the wire
+    // bytes are now buffered for send; the shutdown-route pump and
+    // any other observer keys on this. Fired AFTER SendRaw so the
+    // ordering is "bytes buffered → notifier flipped".
+    if (post_write_notify_) {
+        post_write_notify_->store(true, std::memory_order_release);
+        post_write_notify_.reset();
+    }
+
     // Clear deferred state BEFORE resuming parsing/closing — subsequent
     // OnRawData or CloseConnection calls must see the connection as idle.
     // BUT: delay clearing shutdown_exempt_ until AFTER CloseConnection
@@ -1038,6 +1047,85 @@ void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
     versioned.Version(1, current_http_minor_.load(std::memory_order_acquire));
     std::string wire = versioned.Serialize();
     conn_->SendRaw(wire.data(), wire.size());
+    // Fire the per-request post-wire notifier (§13 r84): the wire
+    // bytes are now buffered for send; downstream pumps key on this.
+    if (post_write_notify_) {
+        post_write_notify_->store(true, std::memory_order_release);
+        post_write_notify_.reset();
+    }
+}
+
+namespace {
+
+// Compute the body size that ACTUALLY landed on the wire after
+// normalization. HEAD-stripped responses + 1xx / 204 / 304 produce
+// 0 (no body emitted). Everything else returns the response body's
+// post-normalization byte count.
+//
+// Per OPENTELEMETRY_DESIGN.md §6.1.2: this is the
+// `http.server.response.body.size` value handed to FinalizeFromSnapshot.
+inline uint64_t ComputeWireBodySize(const HttpResponse& response,
+                                      bool was_head_request) noexcept {
+    if (was_head_request) return 0;
+    const int status = response.GetStatusCode();
+    // 1xx / 204 / 304 — bodyless per HTTP semantics.
+    if (status >= 100 && status < 200) return 0;
+    if (status == 204 || status == 304) return 0;
+    return static_cast<uint64_t>(response.GetBody().size());
+}
+
+}  // namespace
+
+void HttpConnectionHandler::SendResponseWithFinalize(HttpResponse response,
+                                                       FinalizeHook hook) {
+    // Compute wire-body-size BEFORE SendRaw. The H1 sync send path
+    // does NOT HEAD-strip (HEAD-stripping is the deferred-async path's
+    // CompleteAsyncResponse responsibility); sync handlers are
+    // responsible for emitting empty bodies on HEAD requests. The
+    // observability hook reports what's on the wire — for sync
+    // responses that's exactly response.body.size() minus the
+    // bodyless-status suppressions (1xx / 204 / 304).
+    const uint64_t wire_body_size =
+        ComputeWireBodySize(response, /*was_head_request=*/false);
+    SendResponse(response);
+    if (hook) hook(wire_body_size);
+}
+
+void HttpConnectionHandler::CompleteAsyncResponseWithFinalize(
+    HttpResponse response, FinalizeHook hook) {
+    if (!deferred_response_pending_) {
+        logging::Get()->warn(
+            "CompleteAsyncResponseWithFinalize called without a pending "
+            "deferred response (fd={})", conn_ ? conn_->fd() : -1);
+        if (hook) hook(0);
+        return;
+    }
+
+    // Save was_head BEFORE CompleteAsyncResponse clears the deferred
+    // state (which also clears deferred_was_head_).
+    const bool was_head = deferred_was_head_;
+    const uint64_t wire_body_size =
+        ComputeWireBodySize(response, was_head);
+
+    // CompleteAsyncResponse handles normalize → SendRaw → state-clear
+    // → resume pipelined input. The post_write_notify_ flag (when set)
+    // is fired inside CompleteAsyncResponse's normal path, so the
+    // shutdown-route pump and the WithFinalize hook see the same
+    // post-wire-write instant.
+    CompleteAsyncResponse(std::move(response));
+
+    // Fire the WithFinalize hook AFTER CompleteAsyncResponse returns:
+    // the wire bytes are buffered, the deferred state is cleared, and
+    // any pipelined-input replay has already fed back into OnRawData.
+    // Per §6.1.2: the hook lands BEFORE the next pipelined request's
+    // span starts (single-threaded dispatcher), so finalize ordering
+    // is preserved on keep-alive connections.
+    if (hook) hook(wire_body_size);
+}
+
+void HttpConnectionHandler::SetPostWriteNotifyOnce(
+    std::shared_ptr<std::atomic<bool>> notify_sent) {
+    post_write_notify_ = std::move(notify_sent);
 }
 
 bool HttpConnectionHandler::SendInterimResponse(
