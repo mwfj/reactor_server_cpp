@@ -361,6 +361,67 @@ static std::string LowerHeaderName(const std::string& name) {
     return lower;
 }
 
+// Snapshot of the three X-Auth-* debug response headers that
+// AuthManager::RecordVerdict stamps on the middleware response when
+// auth.debug_response_headers=true. Captured BEFORE the sync route
+// handler runs so we can re-stamp dropped values AFTER it returns —
+// some handlers do `response = HttpResponse::Ok().Body(...)` which
+// wholesale-replaces the response object and wipes middleware-set
+// headers. The async path already merges middleware headers; this
+// keeps sync ALLOW responses honoring the same debug-header contract.
+struct DebugAuthHeaderCapture {
+    std::string decision;
+    std::string issuer;
+    std::string cache;
+    bool empty() const noexcept {
+        return decision.empty() && issuer.empty() && cache.empty();
+    }
+};
+
+static DebugAuthHeaderCapture CaptureDebugAuthHeaders(
+        const HttpResponse& resp) {
+    DebugAuthHeaderCapture out;
+    for (const auto& h : resp.GetHeaders()) {
+        const std::string lower = LowerHeaderName(h.first);
+        if (lower == "x-auth-decision") {
+            out.decision = h.second;
+        } else if (lower == "x-auth-issuer") {
+            out.issuer = h.second;
+        } else if (lower == "x-auth-cache") {
+            out.cache = h.second;
+        }
+    }
+    return out;
+}
+
+// Re-stamp captured X-Auth-* headers ONLY if the post-handler response
+// no longer carries them. Handler-set values win on collision (matches
+// the MergeAsyncResponseHeaders semantic for the async path). No-op
+// when nothing was captured (debug_response_headers=false steady state
+// path) so the cost is one GetHeaders() iteration in that case.
+static void RestoreDebugAuthHeaders(HttpResponse& resp,
+                                      const DebugAuthHeaderCapture& cap) {
+    if (cap.empty()) return;
+    bool has_decision = false;
+    bool has_issuer = false;
+    bool has_cache = false;
+    for (const auto& h : resp.GetHeaders()) {
+        const std::string lower = LowerHeaderName(h.first);
+        if (lower == "x-auth-decision") has_decision = true;
+        else if (lower == "x-auth-issuer") has_issuer = true;
+        else if (lower == "x-auth-cache") has_cache = true;
+    }
+    if (!has_decision && !cap.decision.empty()) {
+        resp.Header("X-Auth-Decision", cap.decision);
+    }
+    if (!has_issuer && !cap.issuer.empty()) {
+        resp.Header("X-Auth-Issuer", cap.issuer);
+    }
+    if (!has_cache && !cap.cache.empty()) {
+        resp.Header("X-Auth-Cache", cap.cache);
+    }
+}
+
 struct TopLevelAuthPolicyMergeResult {
     std::vector<AUTH_NAMESPACE::AuthPolicy> policies;
     bool topology_changed = false;
@@ -3596,9 +3657,14 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 return;
             }
 
+            // Capture middleware-stamped X-Auth-* debug headers before
+            // dispatch — restored after the handler returns to survive
+            // any handler that wholesale-replaces the response object.
+            const auto auth_hdrs = CaptureDebugAuthHeaders(response);
             if (!router_.DispatchHandler(request, response)) {
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
+            RestoreDebugAuthHeaders(response, auth_hdrs);
             // During shutdown, signal the client to close the connection.
             // Without this, a keep-alive response looks persistent but
             // the server closes the socket anyway (protocol violation).
@@ -4593,9 +4659,16 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 return;
             }
 
+            // Capture middleware-stamped X-Auth-* debug headers before
+            // dispatch — restored after the handler returns to survive
+            // any handler that wholesale-replaces the response object.
+            // Mirrors the H1 sync DispatchHandler site above; see the
+            // CaptureDebugAuthHeaders / RestoreDebugAuthHeaders helpers.
+            const auto auth_hdrs = CaptureDebugAuthHeaders(response);
             if (!router_.DispatchHandler(request, response)) {
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
+            RestoreDebugAuthHeaders(response, auth_hdrs);
         }
     );
 
