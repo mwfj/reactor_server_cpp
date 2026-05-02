@@ -47,6 +47,7 @@
 #include "observability_metrics_test.h"
 #include "observability_manager_test.h"
 #include "observability_propagator_test.h"
+#include "observability_export_pipeline_test.h"
 #include "observability_e2e_test.h"
 #include "test_framework.h"
 #include <algorithm>
@@ -208,6 +209,12 @@ void RunAllTest(){
     // traceparent / tracestate parse + serialize + Inject / Extract.
     ObservabilityPropagatorTests::RunAllTests();
 
+    // Export pipeline tests — BatchSpanProcessor (worker thread + queue
+    // overflow + shutdown propagation), PeriodicMetricReader (interval
+    // worker), OtlpHttpExporter (OTLP/JSON serialization + r84 trio +
+    // controlled-merge reload).
+    ObservabilityExportPipelineTests::RunAllTests();
+
     // Observability end-to-end tests — boot a real HttpServer, install
     // the observability manager + middleware, send TCP-level HTTP
     // requests, assert spans are captured by the InMemorySpanProcessor.
@@ -276,6 +283,8 @@ void PrintUsage(const char* program_name) {
     std::cout << "                     HttpServer, send HTTP requests, verify spans)" << std::endl;
     std::cout << "  obs_propagator     W3C Trace Context propagator tests" << std::endl;
     std::cout << "                     (traceparent / tracestate parse + Inject)" << std::endl;
+    std::cout << "  obs_export         Export pipeline tests (BatchSpanProcessor /" << std::endl;
+    std::cout << "                     PeriodicMetricReader / OtlpHttpExporter)" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -451,6 +460,10 @@ int main(int argc, char* argv[]) {
         // tracestate parse + serialize + Inject / Extract).
         }else if(mode == "obs_propagator"){
             ObservabilityPropagatorTests::RunAllTests();
+        // Run export pipeline tests (BatchSpanProcessor /
+        // PeriodicMetricReader / OtlpHttpExporter).
+        }else if(mode == "obs_export"){
+            ObservabilityExportPipelineTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);
