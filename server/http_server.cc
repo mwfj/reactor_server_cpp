@@ -85,6 +85,74 @@ struct RequestGuard {
     RequestGuard& operator=(const RequestGuard&) = delete;
 };
 
+static std::string LowerHeaderName(const std::string& name) {
+    std::string lower(name);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return lower;
+}
+
+// Snapshot of the three X-Auth-* debug response headers that
+// AuthManager::RecordVerdict stamps on the middleware response when
+// auth.debug_response_headers=true. Captured BEFORE the sync route
+// handler runs so we can re-stamp dropped values AFTER it returns —
+// some handlers do `response = HttpResponse::Ok().Body(...)` which
+// wholesale-replaces the response object and wipes middleware-set
+// headers. The async path already merges middleware headers; this
+// keeps sync ALLOW responses honoring the same debug-header contract.
+struct DebugAuthHeaderCapture {
+    std::string decision;
+    std::string issuer;
+    std::string cache;
+    bool empty() const noexcept {
+        return decision.empty() && issuer.empty() && cache.empty();
+    }
+};
+
+static DebugAuthHeaderCapture CaptureDebugAuthHeaders(
+        const HttpResponse& resp) {
+    DebugAuthHeaderCapture out;
+    for (const auto& h : resp.GetHeaders()) {
+        const std::string lower = LowerHeaderName(h.first);
+        if (lower == "x-auth-decision") {
+            out.decision = h.second;
+        } else if (lower == "x-auth-issuer") {
+            out.issuer = h.second;
+        } else if (lower == "x-auth-cache") {
+            out.cache = h.second;
+        }
+    }
+    return out;
+}
+
+// Re-stamp captured X-Auth-* headers ONLY if the post-handler response
+// no longer carries them. Handler-set values win on collision (matches
+// the MergeAsyncResponseHeaders semantic for the async path). No-op
+// when nothing was captured (debug_response_headers=false steady state
+// path) so the cost is one GetHeaders() iteration in that case.
+static void RestoreDebugAuthHeaders(HttpResponse& resp,
+                                      const DebugAuthHeaderCapture& cap) {
+    if (cap.empty()) return;
+    bool has_decision = false;
+    bool has_issuer = false;
+    bool has_cache = false;
+    for (const auto& h : resp.GetHeaders()) {
+        const std::string lower = LowerHeaderName(h.first);
+        if (lower == "x-auth-decision") has_decision = true;
+        else if (lower == "x-auth-issuer") has_issuer = true;
+        else if (lower == "x-auth-cache") has_cache = true;
+    }
+    if (!has_decision && !cap.decision.empty()) {
+        resp.Header("X-Auth-Decision", cap.decision);
+    }
+    if (!has_issuer && !cap.issuer.empty()) {
+        resp.Header("X-Auth-Issuer", cap.issuer);
+    }
+    if (!has_cache && !cap.cache.empty()) {
+        resp.Header("X-Auth-Cache", cap.cache);
+    }
+}
+
 namespace {
 
 // Build the resume callback for a suspended async-middleware request.
@@ -156,9 +224,16 @@ MakeAsyncResumeCallback(
                 }
                 if (shared_payload->result ==
                         HttpRouter::AsyncMiddlewareResult::PASS) {
+                    // Snapshot X-Auth-* before the user handler runs;
+                    // a handler that does `response = HttpResponse::Ok()...`
+                    // wipes the middleware-stamped debug headers, mirroring
+                    // the sync ALLOW path that uses the same Capture/Restore
+                    // helpers (search for CaptureDebugAuthHeaders below).
+                    const auto auth_hdrs = CaptureDebugAuthHeaders(*resp);
                     if (!router.DispatchHandler(*req, *resp)) {
                         resp->Status(HttpStatus::NOT_FOUND).Text("Not Found");
                     }
+                    RestoreDebugAuthHeaders(*resp, auth_hdrs);
                 }
             } catch (const std::exception& e) {
                 threw = true;
@@ -352,74 +427,6 @@ static bool IsRepeatableResponseHeader(const std::string& name) {
            lower == "vary" ||
            lower == "allow" ||
            lower == "content-language";
-}
-
-static std::string LowerHeaderName(const std::string& name) {
-    std::string lower(name);
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return lower;
-}
-
-// Snapshot of the three X-Auth-* debug response headers that
-// AuthManager::RecordVerdict stamps on the middleware response when
-// auth.debug_response_headers=true. Captured BEFORE the sync route
-// handler runs so we can re-stamp dropped values AFTER it returns —
-// some handlers do `response = HttpResponse::Ok().Body(...)` which
-// wholesale-replaces the response object and wipes middleware-set
-// headers. The async path already merges middleware headers; this
-// keeps sync ALLOW responses honoring the same debug-header contract.
-struct DebugAuthHeaderCapture {
-    std::string decision;
-    std::string issuer;
-    std::string cache;
-    bool empty() const noexcept {
-        return decision.empty() && issuer.empty() && cache.empty();
-    }
-};
-
-static DebugAuthHeaderCapture CaptureDebugAuthHeaders(
-        const HttpResponse& resp) {
-    DebugAuthHeaderCapture out;
-    for (const auto& h : resp.GetHeaders()) {
-        const std::string lower = LowerHeaderName(h.first);
-        if (lower == "x-auth-decision") {
-            out.decision = h.second;
-        } else if (lower == "x-auth-issuer") {
-            out.issuer = h.second;
-        } else if (lower == "x-auth-cache") {
-            out.cache = h.second;
-        }
-    }
-    return out;
-}
-
-// Re-stamp captured X-Auth-* headers ONLY if the post-handler response
-// no longer carries them. Handler-set values win on collision (matches
-// the MergeAsyncResponseHeaders semantic for the async path). No-op
-// when nothing was captured (debug_response_headers=false steady state
-// path) so the cost is one GetHeaders() iteration in that case.
-static void RestoreDebugAuthHeaders(HttpResponse& resp,
-                                      const DebugAuthHeaderCapture& cap) {
-    if (cap.empty()) return;
-    bool has_decision = false;
-    bool has_issuer = false;
-    bool has_cache = false;
-    for (const auto& h : resp.GetHeaders()) {
-        const std::string lower = LowerHeaderName(h.first);
-        if (lower == "x-auth-decision") has_decision = true;
-        else if (lower == "x-auth-issuer") has_issuer = true;
-        else if (lower == "x-auth-cache") has_cache = true;
-    }
-    if (!has_decision && !cap.decision.empty()) {
-        resp.Header("X-Auth-Decision", cap.decision);
-    }
-    if (!has_issuer && !cap.issuer.empty()) {
-        resp.Header("X-Auth-Issuer", cap.issuer);
-    }
-    if (!has_cache && !cap.cache.empty()) {
-        resp.Header("X-Auth-Cache", cap.cache);
-    }
 }
 
 struct TopLevelAuthPolicyMergeResult {
