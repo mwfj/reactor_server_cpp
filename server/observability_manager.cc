@@ -39,6 +39,8 @@ ObservabilityManager::ObservabilityManager(
                             std::memory_order_release);
     metrics_enabled_.store(config_.metrics.enabled,
                             std::memory_order_release);
+    include_target_info_.store(config_.metrics.prometheus.include_target_info,
+                                 std::memory_order_release);
 }
 
 ObservabilityManager::~ObservabilityManager() {
@@ -58,8 +60,8 @@ void ObservabilityManager::Init() {
         resource_, kDefaultMetricShards);
 
     MeterReaderOptions ro;
-    ro.export_interval = config_.metrics.export_interval;
-    ro.export_timeout  = config_.metrics.export_timeout;
+    ro.export_interval = config_.metrics.reader.export_interval;
+    ro.export_timeout  = config_.metrics.reader.export_timeout;
     meter_provider_->Reload(ro);
 }
 
@@ -272,6 +274,9 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
     // them here.
     traces_enabled_.store(new_config.traces.enabled, std::memory_order_release);
     metrics_enabled_.store(new_config.metrics.enabled, std::memory_order_release);
+    include_target_info_.store(
+        new_config.metrics.prometheus.include_target_info,
+        std::memory_order_release);
 
     // Capture the new sampler config for any FUTURE GetTracer() calls.
     config_.traces.sampler  = new_config.traces.sampler;
@@ -287,8 +292,8 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
 
     if (meter_provider_) {
         MeterReaderOptions ro;
-        ro.export_interval = new_config.metrics.export_interval;
-        ro.export_timeout  = new_config.metrics.export_timeout;
+        ro.export_interval = new_config.metrics.reader.export_interval;
+        ro.export_timeout  = new_config.metrics.reader.export_timeout;
         meter_provider_->Reload(ro);
     }
 }

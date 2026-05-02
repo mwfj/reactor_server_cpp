@@ -68,8 +68,9 @@ static CliCommand ParseCommand(const char* str) {
 
 // ── getopt_long option table ─────────────────────────────────────
 
-static constexpr int OPT_NO_HEALTH = 256;
-static constexpr int OPT_NO_STATS  = 257;
+static constexpr int OPT_NO_HEALTH  = 256;
+static constexpr int OPT_NO_STATS   = 257;
+static constexpr int OPT_NO_METRICS = 258;
 
 // Global options — only -v/-V/-h, valid without a command
 static const struct option global_long_options[] = {
@@ -90,6 +91,7 @@ static const struct option subcmd_long_options[] = {
     {"pid-file",           required_argument, nullptr, 'P'},
     {"no-health-endpoint", no_argument,       nullptr, OPT_NO_HEALTH},
     {"no-stats-endpoint",  no_argument,       nullptr, OPT_NO_STATS},
+    {"no-metrics-endpoint",no_argument,       nullptr, OPT_NO_METRICS},
     {"daemonize",          no_argument,       nullptr, 'd'},
     {nullptr, 0, nullptr, 0}
 };
@@ -228,6 +230,9 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
             case OPT_NO_STATS:
                 options.stats_endpoint = false;
                 break;
+            case OPT_NO_METRICS:
+                options.metrics_endpoint = false;
+                break;
             case 'd':
                 options.daemonize = true;
                 break;
@@ -315,6 +320,7 @@ void CliParser::PrintUsage(const char* program_name) {
         << "  -d, --daemonize             Run as a background daemon\n"
         << "  --no-health-endpoint       Disable the /health endpoint\n"
         << "  --no-stats-endpoint        Disable the /stats endpoint\n"
+        << "  --no-metrics-endpoint      Disable the /metrics Prometheus endpoint\n"
         << "\n"
         << "Stop/status/reload options:\n"
         << "  -P, --pid-file <file>       PID file path (default: /tmp/reactor_server.pid)\n"

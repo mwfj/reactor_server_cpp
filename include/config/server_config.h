@@ -7,6 +7,7 @@
 
 #include "auth/auth_config.h"
 #include "net/dns_resolver.h"
+#include "observability/observability_config.h"
 
 struct TlsConfig {
     bool enabled = false;
@@ -317,4 +318,5 @@ struct ServerConfig {
     RateLimitConfig rate_limit;
     AUTH_NAMESPACE::AuthConfig auth;
     NET_DNS_NAMESPACE::DnsConfig dns;
+    OBSERVABILITY_NAMESPACE::ObservabilityConfig observability;
 };

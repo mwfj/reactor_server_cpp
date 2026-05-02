@@ -88,6 +88,12 @@ public:
     bool MetricsEnabled() const noexcept {
         return metrics_enabled_.load(std::memory_order_acquire);
     }
+    // Live read of metrics.prometheus.include_target_info — flipped by
+    // SIGHUP through Reload(). The /metrics handler consults this on
+    // every scrape so operators see flips immediately.
+    bool IncludeTargetInfo() const noexcept {
+        return include_target_info_.load(std::memory_order_acquire);
+    }
 
     // ---- Snapshot lifecycle ----
     //
@@ -178,6 +184,7 @@ private:
     // Live-flag snapshots (atomic; updated on Reload).
     std::atomic<bool> traces_enabled_{true};
     std::atomic<bool> metrics_enabled_{true};
+    std::atomic<bool> include_target_info_{true};
 
     // ---- Snapshot registry + counter (r45 atomic register-and-count) ----
     //

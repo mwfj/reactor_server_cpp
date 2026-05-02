@@ -12,6 +12,11 @@
 #include "http/http_response.h"
 #include "http/http_status.h"
 #include "log/logger.h"
+#include "observability/metrics_handler.h"
+#include "observability/observability_manager.h"
+#include "observability/resource.h"
+#include "observability/span_processor.h"
+#include "observability/trace_id.h"
 #include "nlohmann/json.hpp"
 
 // <cstdio> provided by common.h (via http_server.h)
@@ -1000,6 +1005,64 @@ static int HandleStart(const CliOptions& options) {
     if (options.stats_endpoint && options.health_endpoint) {
         server->Get("/stats", MakeStatsHandler(server.get(), config));
         logging::Get()->info("  Stats:   /stats");
+    }
+
+    // Observability bootstrap (§14.1) — only when the master switch is
+    // on. Resource attributes carry service.name/version/instance.id;
+    // span processor defaults to NoopSpanProcessor (replaced by
+    // BatchSpanProcessor when traces.exporter == "otlp_http" — wired in
+    // a follow-up slice). Manager is attached to HttpServer so the
+    // observability middleware fires on every request.
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>
+        observability_manager;
+    if (config.observability.enabled) {
+        std::vector<OBSERVABILITY_NAMESPACE::Attribute> resource_attrs;
+        resource_attrs.emplace_back(
+            "service.name",
+            OBSERVABILITY_NAMESPACE::AttrValue(
+                config.observability.resource.service_name));
+        if (!config.observability.resource.service_version.empty()) {
+            resource_attrs.emplace_back(
+                "service.version",
+                OBSERVABILITY_NAMESPACE::AttrValue(
+                    config.observability.resource.service_version));
+        }
+        if (!config.observability.resource.service_instance_id.empty()) {
+            resource_attrs.emplace_back(
+                "service.instance.id",
+                OBSERVABILITY_NAMESPACE::AttrValue(
+                    config.observability.resource.service_instance_id));
+        }
+        auto resource = std::make_shared<OBSERVABILITY_NAMESPACE::Resource>(
+            std::move(resource_attrs));
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor> processor =
+            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>();
+        auto random = std::make_shared<OBSERVABILITY_NAMESPACE::RandomSource>();
+        observability_manager =
+            OBSERVABILITY_NAMESPACE::ObservabilityManager::Create(
+                config.observability, resource, processor, std::move(random));
+        server->SetObservabilityManager(observability_manager);
+        logging::Get()->info("  Observability: enabled (service={})",
+                              config.observability.resource.service_name);
+    }
+
+    // Per §10.6: register /metrics ONLY when:
+    //   - master observability.enabled
+    //   - metrics.exporter == "prometheus_pull"
+    //   - metrics_endpoint AND health_endpoint CLI flags are on
+    // Runtime metrics.enabled toggles are handled inside the handler
+    // (returns 404 when off) so the route stays registered across reloads.
+    if (config.observability.enabled
+        && config.observability.metrics.exporter == "prometheus_pull"
+        && options.metrics_endpoint
+        && options.health_endpoint
+        && observability_manager) {
+        const std::string& mp = config.observability.metrics.prometheus.path;
+        server->Get(mp,
+            OBSERVABILITY_NAMESPACE::MakeMetricsHandler(
+                std::weak_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>(
+                    observability_manager)));
+        logging::Get()->info("  Metrics: {}", mp);
     }
 
     // ── Wire readiness callback — fires after bind/listen, before event loop ──

@@ -49,6 +49,7 @@
 #include "observability_propagator_test.h"
 #include "observability_export_pipeline_test.h"
 #include "observability_prometheus_test.h"
+#include "observability_config_test.h"
 #include "observability_e2e_test.h"
 #include "test_framework.h"
 #include <algorithm>
@@ -220,6 +221,10 @@ void RunAllTest(){
     // selection, counter / gauge / histogram exposition + OpenMetrics.
     ObservabilityPrometheusTests::RunAllTests();
 
+    // Observability config schema — JSON load, Validate /
+    // ValidateHotReloadable splits, MakeMetricsHandler runtime gate.
+    ObservabilityConfigTests::RunAllTests();
+
     // Observability end-to-end tests — boot a real HttpServer, install
     // the observability manager + middleware, send TCP-level HTTP
     // requests, assert spans are captured by the InMemorySpanProcessor.
@@ -292,6 +297,8 @@ void PrintUsage(const char* program_name) {
     std::cout << "                     PeriodicMetricReader / OtlpHttpExporter)" << std::endl;
     std::cout << "  obs_prom           PrometheusExporter rendering tests (sanitize," << std::endl;
     std::cout << "                     counter / gauge / histogram exposition, OpenMetrics)" << std::endl;
+    std::cout << "  obs_config         Observability config schema tests (JSON load," << std::endl;
+    std::cout << "                     Validate, ValidateHotReloadable, MetricsHandler)" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -475,6 +482,9 @@ int main(int argc, char* argv[]) {
         // counter / gauge / histogram exposition + OpenMetrics).
         }else if(mode == "obs_prom"){
             ObservabilityPrometheusTests::RunAllTests();
+        // Run observability config schema + MakeMetricsHandler tests.
+        }else if(mode == "obs_config"){
+            ObservabilityConfigTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

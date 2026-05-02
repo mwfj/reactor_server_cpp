@@ -111,7 +111,8 @@ OBSERVABILITY_SRCS = $(SERVER_DIR)/trace_id.cc $(SERVER_DIR)/trace_state.cc \
                      $(SERVER_DIR)/batch_span_processor.cc \
                      $(SERVER_DIR)/periodic_metric_reader.cc \
                      $(SERVER_DIR)/otlp_http_exporter.cc \
-                     $(SERVER_DIR)/prometheus_exporter.cc
+                     $(SERVER_DIR)/prometheus_exporter.cc \
+                     $(SERVER_DIR)/metrics_handler.cc
 
 # CLI layer sources
 CLI_SRCS = $(SERVER_DIR)/cli_parser.cc $(SERVER_DIR)/signal_handler.cc $(SERVER_DIR)/pid_file.cc $(SERVER_DIR)/daemonizer.cc
