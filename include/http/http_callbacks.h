@@ -18,12 +18,12 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     // ---- HttpConnectionHandler callbacks ------------------------------------
     using HttpConnRequestCallback = std::function<void(
         std::shared_ptr<HttpConnectionHandler> self,
-        const HttpRequest& request,
+        HttpRequest& request,
         HttpResponse& response
     )>;
-    using HttpConnRouteCheckCallback = std::function<bool(const HttpRequest& request)>;
+    using HttpConnRouteCheckCallback = std::function<bool(HttpRequest& request)>;
     using HttpConnMiddlewareCallback = std::function<bool(
-        const HttpRequest& request,
+        HttpRequest& request,
         HttpResponse& response
     )>;
 
@@ -32,13 +32,13 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     // is always populated (never null), mirroring
     // HttpRouter::RunAsyncMiddleware's contract.
     using HttpConnAsyncMiddlewareCallback = std::function<bool(
-        const HttpRequest& request,
+        HttpRequest& request,
         HttpResponse& response,
         std::shared_ptr<::AsyncPendingState>& out_state
     )>;
     using HttpConnUpgradeCallback = std::function<void(
         std::shared_ptr<HttpConnectionHandler> self,
-        const HttpRequest& request
+        HttpRequest& request
     )>;
 
     // Fires for every completed HTTP parse (dispatched, rejected, or upgraded).
@@ -141,7 +141,7 @@ namespace HTTP_CALLBACKS_NAMESPACE {
     // Invoked by HttpServer (NOT HttpRouter — the router has no transport
     // context).
     using AsyncHandler = std::function<void(
-        const HttpRequest& request,
+        HttpRequest& request,
         InterimResponseSender send_interim,
         ResourcePusher        push_resource,
         StreamingResponseSender stream_sender,

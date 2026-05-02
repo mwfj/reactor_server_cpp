@@ -175,9 +175,9 @@ static int HandleReload(const CliOptions& options) {
 }
 
 // ── Health endpoint handler ──────────────────────────────────────
-static std::function<void(const HttpRequest&, HttpResponse&)>
+static std::function<void(HttpRequest&, HttpResponse&)>
 MakeHealthHandler(HttpServer* server) {
-    return [server](const HttpRequest& /*req*/, HttpResponse& res) {
+    return [server](HttpRequest& /*req*/, HttpResponse& res) {
         auto stats = server->GetStats();
         char buf[HEALTH_BUF_SIZE];
         std::snprintf(buf, sizeof(buf),
@@ -395,13 +395,13 @@ nlohmann::json BuildDnsObject(HttpServer* server) {
 
 }  // namespace
 
-static std::function<void(const HttpRequest&, HttpResponse&)>
+static std::function<void(HttpRequest&, HttpResponse&)>
 MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
     // Capture config by value so /stats always reflects the startup-time
     // configuration for restart-required fields (bind_host, bind_port, etc.).
     // This avoids a data race: ReloadConfig() mutates the caller's ServerConfig
     // on the main thread while dispatcher threads serve /stats requests.
-    return [server, config](const HttpRequest& /*req*/, HttpResponse& res) {
+    return [server, config](HttpRequest& /*req*/, HttpResponse& res) {
         auto stats = server->GetStats();
 
         // Build legacy fields via snprintf for zero-overhead on the hot keys.

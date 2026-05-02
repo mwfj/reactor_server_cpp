@@ -18,7 +18,7 @@ public:
     // Sets RateLimit-Policy, RateLimit, and Retry-After response headers as
     // appropriate. Returns true if allowed, false if denied.
     // Thread-safe: reads atomic scalars + snapshot of zone list.
-    bool Check(const HttpRequest& request, HttpResponse& response);
+    bool Check(HttpRequest& request, HttpResponse& response);
 
     // Evict expired entries from zone shards assigned to this dispatcher.
     // Called periodically from the dispatcher timer handler.

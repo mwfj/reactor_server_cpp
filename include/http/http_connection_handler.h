@@ -227,7 +227,7 @@ private:
     // sync path uses SendResponse directly; the async resume path uses
     // CompleteAsyncResponse so deferred-response state unwinds correctly.
     // Trailing bytes after the request are flushed by the caller.
-    bool ContinueWsUpgradeAfterAuth(const HttpRequest& req,
+    bool ContinueWsUpgradeAfterAuth(HttpRequest& req,
                                     HttpResponse mw_response,
                                     bool from_async_resume,
                                     const char* trailing_buf,

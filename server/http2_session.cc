@@ -1401,7 +1401,7 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
     OnStreamNoLongerIncomplete();
     stream->MarkCounterDecremented();
 
-    const HttpRequest& req = stream->GetRequest();
+    HttpRequest& req = stream->GetRequest();
 
     // Propagate dispatcher index for upstream pool partition affinity
     if (conn_) {

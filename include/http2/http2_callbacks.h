@@ -16,7 +16,7 @@ namespace HTTP2_CALLBACKS_NAMESPACE {
     using Http2RequestCallback = std::function<void(
         std::shared_ptr<Http2ConnectionHandler> self,
         int32_t stream_id,
-        const HttpRequest& request,
+        HttpRequest& request,
         HttpResponse& response
     )>;
 

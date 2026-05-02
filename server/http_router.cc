@@ -2,6 +2,7 @@
 #include "http/http_status.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
+#include "ws/websocket_handshake.h"
 // <algorithm> provided by common.h (via http_request.h)
 
 // AsyncPendingState invariants:
@@ -238,6 +239,28 @@ void HttpRouter::RouteAsync(const std::string& method, const std::string& path,
     async_pattern_keys_[method].insert(NormalizePatternKey(path));
 }
 
+void HttpRouter::RouteProxyAsync(const std::string& method,
+                                  const std::string& path,
+                                  AsyncHandler handler) {
+    // Insert into the async trie via the same path RouteAsync uses, then
+    // mark the (method, pattern) pair as proxy-owned. The trie itself
+    // does not know whether an entry came from RouteAsync or
+    // RouteProxyAsync; the proxy_async_patterns_ side map is the
+    // authoritative ownership marker that ResolveRouteMatch reads to
+    // demux step (2). Insert first so any duplicate-pattern exception
+    // from the trie leaves proxy_async_patterns_ consistent (matches
+    // the RouteAsync ordering rule).
+    RouteAsync(method, path, std::move(handler));
+    proxy_async_patterns_[method].insert(path);
+}
+
+bool HttpRouter::IsProxyAsyncPattern(const std::string& method,
+                                      const std::string& pattern) const {
+    auto it = proxy_async_patterns_.find(method);
+    if (it == proxy_async_patterns_.end()) return false;
+    return it->second.count(pattern) > 0;
+}
+
 bool HttpRouter::HasAsyncRouteConflict(const std::string& method,
                                         const std::string& pattern) const {
     auto it = async_pattern_keys_.find(method);
@@ -276,8 +299,11 @@ bool HttpRouter::HasSyncRouteConflict(const std::string& method,
 }
 
 HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
-    const HttpRequest& request, bool* head_fallback_out) const {
+    HttpRequest& request, bool* head_fallback_out,
+    std::string* matched_pattern_out) const {
     if (head_fallback_out) *head_fallback_out = false;
+    // matched_pattern_out is left untouched on miss; populated below on
+    // every return-with-handler path.
 
     // 1. Try exact method match in the async trie.
     //    Contract: async routes win over sync routes for the same
@@ -447,6 +473,7 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
 
     if (exact_match_handler) {
         request.params = std::move(exact_match_params);
+        if (matched_pattern_out) *matched_pattern_out = exact_match_pattern;
         return *exact_match_handler;
     }
     // Path miss (or proxy-default HEAD deliberately dropped above) —
@@ -488,6 +515,7 @@ HttpRouter::AsyncHandler HttpRouter::GetAsyncHandler(
                 }
                 request.params = std::move(params);
                 if (head_fallback_out) *head_fallback_out = true;
+                if (matched_pattern_out) *matched_pattern_out = result.matched_pattern;
                 return *result.handler;
             }
         }
@@ -547,7 +575,7 @@ void HttpRouter::PrependAsyncMiddleware(AsyncMiddleware middleware) {
 }
 
 bool HttpRouter::RunAsyncMiddleware(
-    const HttpRequest& request, HttpResponse& response,
+    HttpRequest& request, HttpResponse& response,
     std::shared_ptr<AsyncPendingState>& out_state) {
     // Empty chain: implicit sync PASS. Leave out_state null so callers skip
     // the heap allocation on the hot path; sync DENY is impossible without
@@ -579,7 +607,7 @@ bool HttpRouter::RunAsyncMiddleware(
     return true;
 }
 
-bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
+bool HttpRouter::Dispatch(HttpRequest& request, HttpResponse& response) {
     // Compat shim for sync-only callers. If async middleware is
     // registered, those callers cannot honor the suspend contract — we
     // warn and skip the async chain rather than execute it synchronously.
@@ -597,7 +625,7 @@ bool HttpRouter::Dispatch(const HttpRequest& request, HttpResponse& response) {
     return DispatchHandler(request, response);
 }
 
-bool HttpRouter::DispatchHandler(const HttpRequest& request, HttpResponse& response) {
+bool HttpRouter::DispatchHandler(HttpRequest& request, HttpResponse& response) {
     // Clear params from any previous dispatch on this request object.
     request.params.clear();
 
@@ -820,57 +848,25 @@ bool HttpRouter::DispatchHandler(const HttpRequest& request, HttpResponse& respo
     return false;
 }
 
-void HttpRouter::PopulateRouteParams(const HttpRequest& request) {
-    // Restores the pre-phased-dispatch contract that middleware sees the
-    // route's :param values in request.params (e.g. /users/:id middleware
-    // can authorize on the captured `id`). The legacy Dispatch path called
-    // the route trie BEFORE middleware; the new RunMiddleware →
-    // RunAsyncMiddleware → DispatchHandler split lost that ordering.
+void HttpRouter::PopulateRouteParams(HttpRequest& request) {
+    // r84: now delegates to ResolveRouteMatch — the single source of
+    // truth for route resolution. ResolveRouteMatch populates BOTH
+    // request.params (via the trie walks it performs) AND
+    // request.route_match (kind / pattern / legacy bools). Legacy
+    // callers that only cared about params get the same params they
+    // would have gotten before; new callers reading route_match.kind
+    // get the full precedence-chain decision.
     //
-    // SHORT-CIRCUIT when params are already populated: the H1/H2 async-
-    // route dispatch sites call GetAsyncHandler() (which populates
-    // request.params from the async trie) BEFORE invoking RunMiddleware.
-    // If the same path also matches a sync route (e.g. async `/api/*rest`
-    // catch-all + sync `/api/users` literal), overwriting from the sync
-    // trie would wipe the async-route's :param captures and break the
-    // proxy strip_prefix / user-handler captures. Per-route shape conflicts
-    // are pre-screened by HasAsyncRouteConflict / HasSyncRouteConflict
-    // at registration; co-existing routes with different shapes hit this
-    // exact case at dispatch time.
-    //
-    // The sync-only path always reaches this function with empty params
-    // (default-constructed HttpRequest, or cleared upstream by HCH between
-    // pipelined requests), so the guard short-circuits only for the
-    // already-populated async-route case.
-    if (!request.params.empty()) return;
-    auto it = method_tries_.find(request.method);
-    if (it != method_tries_.end()) {
-        std::unordered_map<std::string, std::string> params;
-        auto result = it->second.Search(request.path, params);
-        if (result.handler) {
-            request.params = std::move(params);
-            return;
-        }
-    }
-    // Mirror DispatchHandler's HEAD→GET fallback (RFC 7231 §4.3.2): for HEAD
-    // requests with no explicit HEAD handler, middleware that authorizes on
-    // request.params (e.g. /users/:id) must see the same captures the
-    // GET-fallback handler would receive at dispatch.
-    if (request.method == "HEAD") {
-        auto get_it = method_tries_.find("GET");
-        if (get_it != method_tries_.end()) {
-            std::unordered_map<std::string, std::string> params;
-            auto result = get_it->second.Search(request.path, params);
-            if (result.handler) {
-                request.params = std::move(params);
-            }
-        }
-    }
+    // The earlier short-circuit `if (!request.params.empty()) return;`
+    // is preserved by ResolveRouteMatch's own idempotency guard
+    // (route_match.kind != None) — once any dispatch site has run the
+    // resolver, subsequent calls no-op.
+    ResolveRouteMatch(request);
 }
 
 // FIXME: Is some potential issue on this logic: either all success or all failed?
 //        Should we convert it to accept the partial success?
-bool HttpRouter::RunMiddleware(const HttpRequest& request, HttpResponse& response) {
+bool HttpRouter::RunMiddleware(HttpRequest& request, HttpResponse& response) {
     PopulateRouteParams(request);
     for (const auto& mw : middlewares_) {
         if (!mw(request, response)) {
@@ -898,13 +894,163 @@ bool HttpRouter::HasWebSocketRoute(const std::string& path) const {
     return ws_trie_.HasMatch(path);
 }
 
-HttpRouter::WsUpgradeHandler HttpRouter::GetWebSocketHandler(const HttpRequest& request) const {
+// Case-insensitive substring check for header tokens. RFC 7230 §3.2.6
+// allows the Connection header to be a comma-separated token list, and
+// individual tokens are case-insensitive. We use a containment check
+// rather than equality so requests with `Connection: keep-alive, Upgrade`
+// (a common shape) trip step (0a) correctly.
+namespace {
+bool HeaderContainsTokenCI(const std::string& header_value,
+                            const std::string& needle_lower) {
+    if (header_value.empty()) return false;
+    std::string lower;
+    lower.reserve(header_value.size());
+    for (char c : header_value) {
+        lower.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c))));
+    }
+    return lower.find(needle_lower) != std::string::npos;
+}
+
+// Step (0a) cheap candidate detection per OPENTELEMETRY_DESIGN.md
+// §17.1 / §5.2 — `method == "GET"` AND a case-insensitive `Connection:
+// Upgrade` token AND `Upgrade: websocket`. Structural intent ONLY, NOT
+// full RFC 6455 validation. Once this returns true, the resolver MUST
+// short-circuit at step (0); the lower-priority kinds (1)–(5) are
+// unreachable regardless of the (0b) full-validation outcome.
+bool IsWebSocketUpgradeCandidate(const HttpRequest& request) {
+    if (request.method != "GET") return false;
+    if (!HeaderContainsTokenCI(request.GetHeader("Connection"), "upgrade")) {
+        return false;
+    }
+    if (!HeaderContainsTokenCI(request.GetHeader("Upgrade"), "websocket")) {
+        return false;
+    }
+    return true;
+}
+}  // namespace
+
+HttpRouter::WsUpgradeHandler HttpRouter::GetWebSocketHandler(
+    HttpRequest& request, std::string* matched_pattern_out) const {
     request.params.clear();
     std::unordered_map<std::string, std::string> params;
     auto result = ws_trie_.Search(request.path, params);
     if (result.handler) {
         request.params = std::move(params);
+        if (matched_pattern_out) *matched_pattern_out = result.matched_pattern;
         return *result.handler;
     }
     return nullptr;
+}
+
+void HttpRouter::ResolveRouteMatch(HttpRequest& request) const {
+    // Idempotent: if a previous call populated route_match.kind, do
+    // nothing. The H1/H2 dispatch frames may invoke ResolveRouteMatch
+    // both pre-middleware (for observability / per-route sampling) AND
+    // at dispatch (for the kind-branch). The first call wins.
+    if (request.route_match.kind != RouteKind::None) return;
+    // Same idempotency for the legacy is_websocket flag — once a step-(0)
+    // outcome was recorded as kind=None+is_websocket=true (path miss or
+    // invalid upgrade), subsequent calls must not overwrite it.
+    if (request.route_match.is_websocket) return;
+
+    // Step (0a) — WS upgrade-candidate detection. Cheap presence check;
+    // structural intent only. Once tripped, the resolver is committed
+    // to a step-(0) outcome regardless of (0b).
+    if (IsWebSocketUpgradeCandidate(request)) {
+        // Step (0b) — full RFC 6455 validation. The dispatch site reads
+        // route_match.kind / is_websocket to pick the correct response
+        // status (101 / 426 / 400).
+        std::string err;
+        bool valid = WebSocketHandshake::Validate(request, err);
+        request.route_match.is_websocket = true;
+        request.route_match.method_for_dispatch = "GET";
+        if (valid) {
+            std::string ws_pattern;
+            auto handler = GetWebSocketHandler(request, &ws_pattern);
+            if (handler) {
+                // VALID + path hit.
+                request.route_match.kind = RouteKind::WsUpgrade;
+                request.route_match.pattern = std::move(ws_pattern);
+            }
+            // VALID + path miss falls through with kind=None +
+            // is_websocket=true so the dispatch site emits 404/426
+            // instead of routing to a non-WS handler.
+        }
+        // INVALID falls through with kind=None + is_websocket=true so
+        // the dispatch site emits 400 per RFC 6455 §4.2.2. Forbid
+        // fallthrough: do NOT consult kinds (1)–(5) on a malformed
+        // upgrade attempt — the existing H1 connection handler rejects
+        // malformed upgrades BEFORE route-existence decisions, and the
+        // resolver MUST mirror that contract.
+        return;
+    }
+
+    // Step (1) — shutdown route. DEFERRED on this branch (the
+    // ShutdownRoute API doesn't exist yet; the OpenTelemetry design's
+    // shutdown-route slice is a separate follow-up). When wired, this
+    // section will consult GetShutdownHandler and set kind=Shutdown
+    // BEFORE step (2) — see OPENTELEMETRY_DESIGN.md §17.1.
+
+    // Step (2) — async route. GetAsyncHandler already encodes the
+    // async-over-sync precedence + proxy-companion runtime yield + the
+    // proxy-default-HEAD precedence + HEAD→GET fallback. We only need
+    // to read the matched pattern and demux Async vs Proxy via the
+    // ownership marker.
+    std::string async_pattern;
+    bool head_fb = false;
+    auto async = GetAsyncHandler(request, &head_fb, &async_pattern);
+    if (async) {
+        if (IsProxyAsyncPattern(request.method, async_pattern)) {
+            request.route_match.kind     = RouteKind::Proxy;
+            request.route_match.is_proxy = true;
+        } else {
+            request.route_match.kind = RouteKind::Async;
+        }
+        request.route_match.pattern             = std::move(async_pattern);
+        request.route_match.method_for_dispatch =
+            head_fb ? "GET" : request.method;
+        request.route_match.head_fallback       = head_fb;
+        return;
+    }
+    // GetAsyncHandler may have set head_fallback_out/matched_pattern_out
+    // in non-trivial paths even when returning null (e.g. companion
+    // yield). Reset for the sync walk below — its own bookkeeping
+    // overwrites these.
+    head_fb = false;
+
+    // Step (3) — sync route, with HEAD→GET fallback to mirror sync
+    // Dispatch's behavior. Walk the trie directly (we don't want
+    // DispatchHandler to ALSO invoke a handler — ResolveRouteMatch is
+    // resolution-only).
+    auto sync_it = method_tries_.find(request.method);
+    if (sync_it != method_tries_.end()) {
+        std::unordered_map<std::string, std::string> params;
+        auto result = sync_it->second.Search(request.path, params);
+        if (result.handler) {
+            request.params                          = std::move(params);
+            request.route_match.kind                = RouteKind::Sync;
+            request.route_match.pattern             = std::move(result.matched_pattern);
+            request.route_match.method_for_dispatch = request.method;
+            return;
+        }
+    }
+    if (request.method == "HEAD") {
+        auto get_it = method_tries_.find("GET");
+        if (get_it != method_tries_.end()) {
+            std::unordered_map<std::string, std::string> params;
+            auto result = get_it->second.Search(request.path, params);
+            if (result.handler) {
+                request.params                          = std::move(params);
+                request.route_match.kind                = RouteKind::Sync;
+                request.route_match.pattern             = std::move(result.matched_pattern);
+                request.route_match.method_for_dispatch = "GET";
+                request.route_match.head_fallback       = true;
+                return;
+            }
+        }
+    }
+
+    // No match — kind stays None. Dispatch path emits 404/405 as it
+    // would have without ResolveRouteMatch.
 }

@@ -871,7 +871,7 @@ void HttpServer::MarkServerReady() {
     {
         RateLimitManager* rl = rate_limit_manager_.get();
         router_.PrependMiddleware([rl](
-            const HttpRequest& request, HttpResponse& response) -> bool {
+            HttpRequest& request, HttpResponse& response) -> bool {
             if (!rl->enabled()) return true;
 
             if (!rl->Check(request, response)) {
@@ -1956,8 +1956,10 @@ void HttpServer::Proxy(const std::string& route_pattern,
             // Capture handler by shared_ptr so the lambda shares
             // ownership — later overwrites of proxy_handlers_[handler_key]
             // don't destroy this handler while this route is still live.
-            router_.RouteAsync(mr.method, pattern,
-                [handler](const HttpRequest& request,
+            // RouteProxyAsync (NOT RouteAsync) so ResolveRouteMatch can
+            // demux this entry as RouteKind::Proxy at step (2).
+            router_.RouteProxyAsync(mr.method, pattern,
+                [handler](HttpRequest& request,
                           HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
                           HTTP_CALLBACKS_NAMESPACE::ResourcePusher        /*push_resource*/,
                           HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender,
@@ -2365,8 +2367,10 @@ void HttpServer::RegisterProxyRoutes() {
             for (const auto& pattern : mr.patterns) {
                 // Capture handler by shared_ptr so the lambda shares
                 // ownership and survives any later overwrite.
-                router_.RouteAsync(mr.method, pattern,
-                    [handler](const HttpRequest& request,
+                // RouteProxyAsync (NOT RouteAsync) so ResolveRouteMatch
+                // can demux this entry as RouteKind::Proxy at step (2).
+                router_.RouteProxyAsync(mr.method, pattern,
+                    [handler](HttpRequest& request,
                               HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
                               HTTP_CALLBACKS_NAMESPACE::ResourcePusher        /*push_resource*/,
                               HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender,
@@ -3174,7 +3178,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     // Set request handler: dispatch through router.
     http_conn->SetRequestCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
-               const HttpRequest& request,
+               HttpRequest& request,
                HttpResponse& response) {
             active_requests_->fetch_add(1, std::memory_order_relaxed);
             RequestGuard guard{active_requests_};
@@ -3694,14 +3698,14 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
 
     // Middleware runner for WebSocket upgrades (auth, CORS, rate limiting)
     http_conn->SetMiddlewareCallback(
-        [this](const HttpRequest& request, HttpResponse& response) -> bool {
+        [this](HttpRequest& request, HttpResponse& response) -> bool {
             return router_.RunMiddleware(request, response);
         }
     );
 
     // Bridge WS-upgrade dispatch into the async chain.
     http_conn->SetAsyncMiddlewareCallback(
-        [this](const HttpRequest& request, HttpResponse& response,
+        [this](HttpRequest& request, HttpResponse& response,
                std::shared_ptr<AsyncPendingState>& out_state) -> bool {
             return router_.RunAsyncMiddleware(request, response, out_state);
         }
@@ -3714,7 +3718,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     // valid WS route. The shutdown_check_callback (after handshake validation,
     // before 101) handles shutdown rejection with a proper 503.
     http_conn->SetRouteCheckCallback(
-        [this](const HttpRequest& request) -> bool {
+        [this](HttpRequest& request) -> bool {
             auto handler = router_.GetWebSocketHandler(request);
             return handler != nullptr;
         }
@@ -3729,7 +3733,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     // Upgrade handler: wires WS callbacks (called exactly once, after ws_conn_ created)
     http_conn->SetUpgradeCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
-               const HttpRequest& request) {
+               HttpRequest& request) {
             // Connection is no longer HTTP/1 — it's now WebSocket.
             // Decrement here so /stats doesn't count WS as HTTP/1.
             // RemoveConnection checks IsUpgraded() to skip the double-decrement.
@@ -4272,7 +4276,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     h2_conn->SetRequestCallback(
         [this](std::shared_ptr<Http2ConnectionHandler> self,
                int32_t stream_id,
-               const HttpRequest& request,
+               HttpRequest& request,
                HttpResponse& response) {
             active_requests_->fetch_add(1, std::memory_order_relaxed);
             RequestGuard guard{active_requests_};

@@ -1212,7 +1212,7 @@ void HttpConnectionHandler::HandleParseError() {
 }
 
 bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& remaining, size_t consumed) {
-    const HttpRequest& req = parser_.GetRequest();
+    HttpRequest& req = parser_.GetRequest();
 
     // Propagate dispatcher index for upstream pool partition affinity
     req.dispatcher_index = conn_->dispatcher_index();
@@ -1721,7 +1721,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
 // return value: the WS upgrade decision is final and the parser is
 // either in WS mode or the connection is closing.
 bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
-    const HttpRequest& req,
+    HttpRequest& req,
     HttpResponse mw_response,
     bool from_async_resume,
     const char* trailing_buf,

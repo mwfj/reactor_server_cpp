@@ -201,7 +201,7 @@ static std::shared_ptr<AUTH_NAMESPACE::AuthManager> AttachAuthManager(
     mgr->Start();
     // Register as middleware: capture shared_ptr so it outlives the lambda.
     std::weak_ptr<AUTH_NAMESPACE::AuthManager> weak_mgr = mgr;
-    server.Use([weak_mgr](const HttpRequest& req, HttpResponse& resp) -> bool {
+    server.Use([weak_mgr](HttpRequest& req, HttpResponse& resp) -> bool {
         auto m = weak_mgr.lock();
         if (!m) return true;  // manager gone — pass through
         return m->InvokeMiddleware(req, resp);

@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "auth/auth_context.h"
+#include "http/route_match.h"
 #include <optional>
 // <unordered_map> provided by common.h
 
@@ -21,8 +22,14 @@ struct HttpRequest {
     bool complete = false;        // True when full request has been parsed
 
     // Route parameters populated by HttpRouter during dispatch.
-    // Mutable because routing is an output of dispatch, not parser input.
-    mutable std::unordered_map<std::string, std::string> params;
+    std::unordered_map<std::string, std::string> params;
+
+    // Resolved route's identity, written by HttpRouter::ResolveRouteMatch /
+    // PopulateRouteParams BEFORE the middleware chain runs. Read by the
+    // observability middleware (per-route sampling, http.route metric
+    // label) and by the dispatch site (which switches on `kind` to pick
+    // the right handler shape). See include/http/route_match.h.
+    RouteMatch route_match;
 
     // Index of the dispatcher (event loop) handling this request's connection.
     // Set by the connection handler; used for upstream pool partition affinity.
@@ -128,6 +135,7 @@ struct HttpRequest {
         headers_complete = false;
         complete = false;
         params.clear();
+        route_match = {};
         dispatcher_index = -1;
         client_ip.clear();
         client_tls = false;
