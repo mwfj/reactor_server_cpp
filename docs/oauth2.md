@@ -130,7 +130,7 @@ The default is `"deny"`. Don't flip this globally in production unless you know 
 
 ### Why 503, not 401, when the IdP is down
 
-A 401 tells the client "your token is bad, get a new one." If the gateway can't reach the IdP to verify, the token might still be fine — and forcing the client to re-auth would stampede the IdP right when it's already struggling. A 503 with `Retry-After` says "not now, come back in N seconds" and clients back off. See design spec §8.2.
+A 401 tells the client "your token is bad, get a new one." If the gateway can't reach the IdP to verify, the token might still be fine — and forcing the client to re-auth would stampede the IdP right when it's already struggling. A 503 with `Retry-After` says "not now, come back in N seconds" and clients back off.
 
 ---
 
@@ -208,7 +208,7 @@ Every issuer has its own JWKS cache.
 
 ### OIDC discovery
 
-When `discovery: true`, the gateway fetches `<issuer_url>/.well-known/openid-configuration` at startup (and on SIGHUP). The response populates `jwks_uri` and (for Phase 3) `introspection_endpoint`.
+When `discovery: true`, the gateway fetches `<issuer_url>/.well-known/openid-configuration` at startup (and on SIGHUP). The response populates `jwks_uri` and `introspection_endpoint`.
 
 If discovery fails, the issuer schedules a retry after `discovery_retry_sec` seconds (default 30). Requests targeting this issuer's policies return 503 / `UNDETERMINED` until discovery succeeds.
 
@@ -373,9 +373,7 @@ Top-level policies always require a `name` (so `/stats` and logs stay stable acr
 
 ## Known risks and open issues
 
-These are tracked in §16 of the design spec:
-
-- **HS256 / symmetric keys not supported.** If you need them, the validator needs extending — scope decision for a future release.
+- **HS256 / symmetric keys not supported.** Asymmetric algorithms only (`RS256/384/512`, `ES256/384`). HS256 would require distributing the IdP's signing secret to every gateway instance — outside the scope of this validator.
 - **`alg: none` explicitly rejected** regardless of allowlist.
 - **No token revocation hook.** A compromised token is valid until `exp`. Keep `leeway_sec` small and TTLs short.
 - **`on_undetermined: allow` is a knowingly-lax degraded mode.** It exists for rollout / observability; don't run it long-term.
@@ -384,7 +382,7 @@ These are tracked in §16 of the design spec:
 - **`negative_cache_sec: 0` disables negative caching.** Every `active: false` IdP response then re-hits the IdP on the next request for the same token. For high-throughput attack patterns (token-fuzzing) this can DoS your IdP via the gateway. Keep `negative_cache_sec >= 5` in production.
 - **Bearer token size cap is 8 KiB.** Tokens longer than 8192 bytes are rejected with 401 / `invalid_request` before any verification work runs. JWT mode and introspection mode share this cap; it is not currently a config knob. If you need bigger tokens (e.g. unusual SAML-style assertions), open an issue.
 - **Multi-introspection-issuer policies probe only ONE issuer per request.** When `policy.issuers` lists multiple `mode: introspection` issuers (e.g. multi-tenant federation), the gateway picks the FIRST introspection issuer in the list and runs the cache lookup + live POST against it only. A token owned by the second issuer's IdP gets denied even though the policy allows it. The config loader emits a warn when it sees this configuration. Workaround: split the route into per-tenant policies with a single introspection issuer each. Serial fan-out across all eligible issuers is a follow-up.
-- **Async-route + introspection cache miss returns 503 + Retry-After.** The async-route dispatch path (proxy routes, `RouteAsync`-registered handlers) can only run synchronously-completing async middleware in this release. Cache hits / negative hits / sync DENY all work normally. A first request to a new-to-cache token under introspection mode gets a 503; the in-flight POST is allowed to complete and populate the cache, so the next request for the same token succeeds. JWT mode is unaffected. Sync routes (`Get`, `Post`, etc.) support the full deferred-suspend path. **Implication:** clients that respect `Retry-After: 1` re-converge after one round-trip on the warm cache; clients that don't will see a 503 on every first-use. **Workaround for high-cardinality opaque-token populations:** prefer JWT-mode issuers when possible; for introspection-only deployments behind a proxy, pre-warm the cache via a startup script that issues a representative request for each known active token. **Tier-2 follow-up:** wire the async-route handler dispatch through the same ArmResume trampoline sync routes use, so cache-miss requests resume into the user handler with the real IdP verdict instead of being 503'd. This is tracked as a `FIXME` marker on the H1 + H2 async-route 503 sites in `server/http_server.cc`.
+- **Async-route + introspection cache miss returns 503 + `Retry-After: 1`.** The async-route dispatch path (proxy routes, `RouteAsync`-registered handlers) only runs the synchronously-completing introspection fast paths today; sync routes (`Get`, `Post`, etc.) support the full deferred-suspend path. JWT mode is unaffected on either route shape. On an async route, a first request for a new-to-cache opaque token gets a 503 — the in-flight POST is still allowed to complete and populate the cache, so the next request for the same token succeeds against the warm cache. **Implication:** clients that respect `Retry-After: 1` re-converge after one round-trip; clients that don't will see a 503 on every first-use of a never-seen token. **Workaround for high-cardinality opaque-token populations:** prefer JWT-mode issuers when possible; for introspection-only deployments, pre-warm the cache via a startup script that issues a representative request per known active token. Wiring async routes through the full ArmResume trampoline is on the deferred-work list.
 
 ## Wire-format changes from previous releases
 
