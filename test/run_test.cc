@@ -48,6 +48,7 @@
 #include "observability_manager_test.h"
 #include "observability_propagator_test.h"
 #include "observability_export_pipeline_test.h"
+#include "observability_prometheus_test.h"
 #include "observability_e2e_test.h"
 #include "test_framework.h"
 #include <algorithm>
@@ -215,6 +216,10 @@ void RunAllTest(){
     // controlled-merge reload).
     ObservabilityExportPipelineTests::RunAllTests();
 
+    // Prometheus exporter rendering — sanitization, content-type, format
+    // selection, counter / gauge / histogram exposition + OpenMetrics.
+    ObservabilityPrometheusTests::RunAllTests();
+
     // Observability end-to-end tests — boot a real HttpServer, install
     // the observability manager + middleware, send TCP-level HTTP
     // requests, assert spans are captured by the InMemorySpanProcessor.
@@ -285,6 +290,8 @@ void PrintUsage(const char* program_name) {
     std::cout << "                     (traceparent / tracestate parse + Inject)" << std::endl;
     std::cout << "  obs_export         Export pipeline tests (BatchSpanProcessor /" << std::endl;
     std::cout << "                     PeriodicMetricReader / OtlpHttpExporter)" << std::endl;
+    std::cout << "  obs_prom           PrometheusExporter rendering tests (sanitize," << std::endl;
+    std::cout << "                     counter / gauge / histogram exposition, OpenMetrics)" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -464,6 +471,10 @@ int main(int argc, char* argv[]) {
         // PeriodicMetricReader / OtlpHttpExporter).
         }else if(mode == "obs_export"){
             ObservabilityExportPipelineTests::RunAllTests();
+        // Run PrometheusExporter rendering tests (sanitization,
+        // counter / gauge / histogram exposition + OpenMetrics).
+        }else if(mode == "obs_prom"){
+            ObservabilityPrometheusTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);
