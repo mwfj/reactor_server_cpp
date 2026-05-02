@@ -667,6 +667,7 @@ All `auth.*` and `proxy.auth.*` keys, with defaults and whether they are live-re
 | Field | Default | Reloadable | Notes |
 |---|---|---|---|
 | `auth.enabled` | `false` | yes | Master switch. When `false`, the middleware no-ops with a single atomic-load per request. |
+| `auth.debug_response_headers` | `false` | yes | When `true`, every auth-evaluated response carries `X-Auth-Decision: allow\|deny\|undetermined`, `X-Auth-Issuer: <id>` (when an issuer was matched), and `X-Auth-Cache: hit\|miss\|stale\|negative\|uncached` (introspection mode only). Off-path cost is one acquire load + one branch. Intended for debugging operator integrations and dashboard wiring; NOT recommended for production-steady-state because it exposes internal verdict details to clients. |
 | `auth.hmac_cache_key_env` | `""` | no (process-local) | Environment variable holding the HMAC-SHA256 key used to hash token-cache lookup keys. Supports base64url, standard base64 (with or without padding), or raw bytes; auto-detected. When unset and `auth.enabled=true`, a per-process random key is generated on startup. |
 
 **Per-issuer (`auth.issuers.<name>`)**
@@ -823,6 +824,7 @@ Requests with an `UNDETERMINED` outcome (IdP unreachable, kid miss, etc.) go thr
 **Live-reloadable** (SIGHUP applies immediately):
 
 - `auth.enabled`
+- `auth.debug_response_headers`
 - Per-issuer: `audiences`, `algorithms`, `leeway_sec`, `required_claims`, `jwks_cache_sec`, `jwks_refresh_timeout_sec`, `discovery_retry_sec`
 - Per-policy: `enabled`, `required_scopes`, `required_audience`, `on_undetermined`, `realm`
 - All `auth.forward.*` fields

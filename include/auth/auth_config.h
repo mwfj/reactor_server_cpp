@@ -148,13 +148,20 @@ struct AuthForwardConfig {
 // ---------------------------------------------------------------------------
 struct AuthConfig {
     bool enabled = false;                                  // Master switch
+    // Live-reloadable. When true, AuthMiddleware emits X-Auth-Decision /
+    // X-Auth-Issuer / X-Auth-Cache on every auth-evaluated response (sync
+    // JWT path + async introspection path + WS upgrade rejection). Off by
+    // default; intended for debugging operator integrations.
+    bool debug_response_headers = false;
     std::unordered_map<std::string, IssuerConfig> issuers; // Keyed by IssuerConfig::name (redundant but stable)
     std::vector<AuthPolicy> policies;                      // Top-level policies with applies_to
     AuthForwardConfig forward;                             // Outbound header overlay config
     std::string hmac_cache_key_env;                        // Env-var name for process-local HMAC key; empty = generated
 
     bool operator==(const AuthConfig& o) const {
-        return enabled == o.enabled && issuers == o.issuers &&
+        return enabled == o.enabled &&
+               debug_response_headers == o.debug_response_headers &&
+               issuers == o.issuers &&
                policies == o.policies && forward == o.forward &&
                hmac_cache_key_env == o.hmac_cache_key_env;
     }

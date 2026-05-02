@@ -436,6 +436,15 @@ IssuerSnapshotView Issuer::BuildView() const {
         view.introspection_cache_entries =
             introspection_cache_->SnapshotStats().entries;
     }
+    {
+        const int64_t epoch_sec = last_discovery_success_epoch_sec_.load(
+            std::memory_order_acquire);
+        if (epoch_sec > 0) {
+            view.last_discovery_refresh =
+                std::chrono::system_clock::time_point(
+                    std::chrono::seconds(epoch_sec));
+        }
+    }
     return view;
 }
 
@@ -505,6 +514,16 @@ void Issuer::KickOffOidcDiscovery(size_t dispatcher_index, uint64_t generation) 
                 std::lock_guard<std::mutex> lk(self->snapshot_mtx_);
                 self->InstallJwksUriLocked(jwks_uri, introspection_endpoint);
             }
+            // Stamp the discovery-success timestamp ONLY after the
+            // generation gate above has passed AND the metadata has been
+            // installed into snapshot_. /stats reports the wall-clock of
+            // the actually-applied response, not of a stale-cycle drop.
+            const auto now_secs =
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            self->last_discovery_success_epoch_sec_.store(
+                static_cast<int64_t>(now_secs),
+                std::memory_order_release);
             // Mode-gated readiness. Each branch decides ready_ from the
             // field its mode actually consults; the other endpoint is
             // advisory.

@@ -234,23 +234,70 @@ A reload that only touches live-reloadable fields applies immediately to the nex
 
 ### Observability
 
-Every `/stats` snapshot includes a per-issuer block:
+Every `/stats` snapshot includes a top-level `auth` block plus per-issuer detail:
 
-```
+```jsonc
 "auth": {
+  "enabled": true,
+  "debug_response_headers": false,
+  "total_allowed": 98234,
+  "total_denied": 71,
+  "total_undetermined": 3,
+  "policy_count": 5,
+  "generation": 12,
+  "introspection": {
+    "ok": 0, "fail": 0,
+    "cache_hit": 0, "cache_miss": 0, "cache_negative_hit": 0,
+    "stale_served": 0
+  },
+  "per_policy": [
+    {"issuer": "google", "policy": "admin-only", "allowed": 412, "denied": 6, "undetermined": 0},
+    {"issuer": "",       "policy": "admin-only", "allowed": 0,   "denied": 11, "undetermined": 0}
+  ],
   "issuers": {
     "google": {
+      "mode": "jwt",
       "ready": true,
-      "jwks_refresh_ok": 142,
-      "jwks_refresh_fail": 2,
-      "jwks_stale_served": 17,
-      "jwks_key_count": 4,
-      "last_jwks_refresh": "2026-04-18T12:03:22Z"
+      "jwks": {"key_count": 4, "refresh_ok": 142, "refresh_fail": 2, "stale_served": 17},
+      "last_jwks_refresh_epoch": 1745922202,
+      "last_discovery_refresh_epoch": 1745919103,
+      "per_policy": [
+        {"policy": "admin-only", "allowed": 412, "denied": 6, "undetermined": 0}
+      ]
     }
-  },
-  "totals": { "allowed": 98234, "denied": 71, "undetermined": 3 }
+  }
 }
 ```
+
+Field meanings:
+
+- `enabled` and `debug_response_headers` mirror the **live** values (live-reloadable; toggle via SIGHUP).
+- `total_allowed` / `total_denied` / `total_undetermined` count CLIENT-VISIBLE verdicts (not raw IdP outcomes — those live under `auth.introspection.{ok,fail}` for introspection mode).
+- `generation` bumps on every successful `Reload`; useful for confirming a SIGHUP took effect.
+- `per_policy[]` (top-level) is a flat list keyed on `(issuer, policy)`. Empty issuer means the verdict fired before issuer selection (missing bearer, oversized token, or `iss`-not-in-allowlist with no peek).
+- Per-issuer `per_policy[]` is the same data filtered to that issuer.
+- Per-policy buckets survive a same-name reload (operator dashboards stay continuous). Removed-then-readded policy names reset to zero, matching operator intent.
+- `last_jwks_refresh_epoch` / `last_discovery_refresh_epoch` are seconds since epoch; `0` means "never succeeded yet".
+
+#### Debug response headers (`auth.debug_response_headers`)
+
+Set `auth.debug_response_headers: true` to have every auth-evaluated response carry:
+
+- `X-Auth-Decision: allow|deny|undetermined`
+- `X-Auth-Issuer: <issuer_id>` — only when an issuer was matched (omitted on pre-issuer denies)
+- `X-Auth-Cache: hit|miss|stale|negative|uncached` — introspection mode only; JWT mode omits the header
+
+```http
+HTTP/1.1 200 OK
+X-Auth-Decision: allow
+X-Auth-Issuer: google
+content-type: application/json
+...
+```
+
+Live-reloadable — flip via SIGHUP without restart. Default `false` (zero hot-path overhead when off — one acquire load and one branch). Intended for debugging operator integrations and dashboard wiring; NOT recommended for production-steady-state because the headers expose internal verdict details to clients.
+
+Note that `X-Auth-Issuer` is intentionally reused as both an outbound REQUEST header (operator-configured under `forward.issuer_header`, sent to the upstream) AND a response DEBUG header (sent to the client). Same name, opposite directions — RFC-legal and harmless.
 
 Operator log lines follow a predictable pattern:
 

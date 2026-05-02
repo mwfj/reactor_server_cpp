@@ -388,7 +388,8 @@ static bool TestReloadReloadableFields() {
         // so this unit test does the same.
         AUTH_NAMESPACE::AuthForwardConfig fwd = new_cfg.forward;
         mgr->CommitPolicyAndEnforcement(
-            /*new_upstreams=*/{}, new_cfg.policies, fwd, new_cfg.enabled);
+            /*new_upstreams=*/{}, new_cfg.policies, fwd, new_cfg.enabled,
+            new_cfg.debug_response_headers);
     }
 
     uint64_t gen_after = mgr->SnapshotAll().generation;
@@ -587,7 +588,8 @@ static bool TestRebuildPolicyList() {
         {},        // new_upstreams
         {p_new},   // new_top_level_policies
         fwd,       // new_forward — bundled into the same atomic cutover
-        true);     // new_master_enabled — mirrors auth.enabled at cutover
+        true,      // new_master_enabled — mirrors auth.enabled at cutover
+        false);    // new_debug_response_headers
 
     auto snap_after = mgr->SnapshotAll();
     // Policy list was replaced. snap_after.policy_count should reflect new_top_level_policies only.

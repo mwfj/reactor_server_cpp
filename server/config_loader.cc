@@ -416,6 +416,7 @@ static void ParseAuthConfig(const nlohmann::json& j, AUTH_NAMESPACE::AuthConfig&
         throw std::invalid_argument("auth must be a JSON object");
     }
     out.enabled = j.value("enabled", false);
+    out.debug_response_headers = j.value("debug_response_headers", false);
     out.hmac_cache_key_env = j.value("hmac_cache_key_env", std::string{});
 
     // Reset collection / sub-object fields BEFORE the conditional parse
@@ -3191,6 +3192,9 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
     if (config.auth != AUTH_NAMESPACE::AuthConfig{}) {
         nlohmann::json aj;
         aj["enabled"] = config.auth.enabled;
+        if (config.auth.debug_response_headers) {
+            aj["debug_response_headers"] = true;
+        }
         if (!config.auth.hmac_cache_key_env.empty()) {
             aj["hmac_cache_key_env"] = config.auth.hmac_cache_key_env;
         }

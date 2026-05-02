@@ -85,6 +85,74 @@ struct RequestGuard {
     RequestGuard& operator=(const RequestGuard&) = delete;
 };
 
+static std::string LowerHeaderName(const std::string& name) {
+    std::string lower(name);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return lower;
+}
+
+// Snapshot of the three X-Auth-* debug response headers that
+// AuthManager::RecordVerdict stamps on the middleware response when
+// auth.debug_response_headers=true. Captured BEFORE the sync route
+// handler runs so we can re-stamp dropped values AFTER it returns —
+// some handlers do `response = HttpResponse::Ok().Body(...)` which
+// wholesale-replaces the response object and wipes middleware-set
+// headers. The async path already merges middleware headers; this
+// keeps sync ALLOW responses honoring the same debug-header contract.
+struct DebugAuthHeaderCapture {
+    std::string decision;
+    std::string issuer;
+    std::string cache;
+    bool empty() const noexcept {
+        return decision.empty() && issuer.empty() && cache.empty();
+    }
+};
+
+static DebugAuthHeaderCapture CaptureDebugAuthHeaders(
+        const HttpResponse& resp) {
+    DebugAuthHeaderCapture out;
+    for (const auto& h : resp.GetHeaders()) {
+        const std::string lower = LowerHeaderName(h.first);
+        if (lower == "x-auth-decision") {
+            out.decision = h.second;
+        } else if (lower == "x-auth-issuer") {
+            out.issuer = h.second;
+        } else if (lower == "x-auth-cache") {
+            out.cache = h.second;
+        }
+    }
+    return out;
+}
+
+// Re-stamp captured X-Auth-* headers ONLY if the post-handler response
+// no longer carries them. Handler-set values win on collision (matches
+// the MergeAsyncResponseHeaders semantic for the async path). No-op
+// when nothing was captured (debug_response_headers=false steady state
+// path) so the cost is one GetHeaders() iteration in that case.
+static void RestoreDebugAuthHeaders(HttpResponse& resp,
+                                      const DebugAuthHeaderCapture& cap) {
+    if (cap.empty()) return;
+    bool has_decision = false;
+    bool has_issuer = false;
+    bool has_cache = false;
+    for (const auto& h : resp.GetHeaders()) {
+        const std::string lower = LowerHeaderName(h.first);
+        if (lower == "x-auth-decision") has_decision = true;
+        else if (lower == "x-auth-issuer") has_issuer = true;
+        else if (lower == "x-auth-cache") has_cache = true;
+    }
+    if (!has_decision && !cap.decision.empty()) {
+        resp.Header("X-Auth-Decision", cap.decision);
+    }
+    if (!has_issuer && !cap.issuer.empty()) {
+        resp.Header("X-Auth-Issuer", cap.issuer);
+    }
+    if (!has_cache && !cap.cache.empty()) {
+        resp.Header("X-Auth-Cache", cap.cache);
+    }
+}
+
 namespace {
 
 // Build the resume callback for a suspended async-middleware request.
@@ -156,9 +224,16 @@ MakeAsyncResumeCallback(
                 }
                 if (shared_payload->result ==
                         HttpRouter::AsyncMiddlewareResult::PASS) {
+                    // Snapshot X-Auth-* before the user handler runs;
+                    // a handler that does `response = HttpResponse::Ok()...`
+                    // wipes the middleware-stamped debug headers, mirroring
+                    // the sync ALLOW path that uses the same Capture/Restore
+                    // helpers (search for CaptureDebugAuthHeaders below).
+                    const auto auth_hdrs = CaptureDebugAuthHeaders(*resp);
                     if (!router.DispatchHandler(*req, *resp)) {
                         resp->Status(HttpStatus::NOT_FOUND).Text("Not Found");
                     }
+                    RestoreDebugAuthHeaders(*resp, auth_hdrs);
                 }
             } catch (const std::exception& e) {
                 threw = true;
@@ -352,13 +427,6 @@ static bool IsRepeatableResponseHeader(const std::string& name) {
            lower == "vary" ||
            lower == "allow" ||
            lower == "content-language";
-}
-
-static std::string LowerHeaderName(const std::string& name) {
-    std::string lower(name);
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return lower;
 }
 
 struct TopLevelAuthPolicyMergeResult {
@@ -579,6 +647,7 @@ static AUTH_NAMESPACE::AuthConfig BuildLiveAppliedAuthConfig(
         std::vector<AUTH_NAMESPACE::AuthPolicy> live_top_level_policies) {
     AUTH_NAMESPACE::AuthConfig applied = live_auth;
     applied.enabled = staged_auth.enabled;
+    applied.debug_response_headers = staged_auth.debug_response_headers;
     applied.issuers = staged_auth.issuers;
     applied.forward = staged_auth.forward;
     applied.policies = std::move(live_top_level_policies);
@@ -1075,8 +1144,21 @@ void HttpServer::MarkServerReady() {
         for (const auto& u : upstream_configs_) {
             if (!u.proxy.auth.enabled) continue;
             if (u.proxy.route_prefix.empty()) continue;
+            // Normalize an empty inline-policy name to the synthesized
+            // "inline:<upstream>" form BEFORE registration so the per-
+            // policy incarnation map and /stats auth.per_policy[] bucket
+            // key match what the reload path's CollectInlineAuthPolicies
+            // produces. Without this, a startup-registered inline policy
+            // with no `name` keys its bucket as "" and its incarnation
+            // entry as "" too — then on the first reload, the same
+            // policy reappears under "inline:<upstream>" and operators
+            // see the bucket "rename" / counter reset.
+            AUTH_NAMESPACE::AuthPolicy inline_policy = u.proxy.auth;
+            if (inline_policy.name.empty()) {
+                inline_policy.name = "inline:" + u.name;
+            }
             auth_manager_->RegisterPolicy({u.proxy.route_prefix},
-                                            u.proxy.auth);
+                                            std::move(inline_policy));
         }
         for (const auto& p : auth_config_.policies) {
             if (!p.enabled) continue;
@@ -3163,6 +3245,34 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                                 .Header("Retry-After", "1")
                                 .Header("Cache-Control", "no-store")
                                 .Text("authentication unavailable on async route — retry");
+                        // The warmup 503 is auth-attributable ONLY when
+                        // auth installed the async middleware. The async
+                        // chain is hard-capped at 1 entry (router throws
+                        // on N>1), and auth installs only when issuers are
+                        // configured at boot — see the install gate above:
+                        //   if (!auth_config_.issuers.empty()) ...
+                        // Issuer-set deltas are restart-required, so this
+                        // gate is stable across the process lifetime and
+                        // mirrors the install decision exactly. If issuers
+                        // are empty, the suspending middleware was an
+                        // embedder's; emitting X-Auth-* headers or bumping
+                        // total_undetermined_ would be misattribution and
+                        // could leak debug headers on a non-auth response.
+                        // Per-policy attribution for auth-owned warmup is
+                        // intentionally not threaded through (BumpPerPolicy
+                        // early-outs on the empty issuer/policy pair, so
+                        // total_undetermined_ moves but no bucket is
+                        // mis-bucketed) — wiring the matched policy
+                        // through AsyncPendingState for a one-shot cache
+                        // warmup path is over-engineering for the value.
+                        if (auth_manager_ &&
+                            !auth_config_.issuers.empty()) {
+                            auth_manager_->RecordVerdict(
+                                response, AUTH_NAMESPACE::VerifyOutcome::UNDETERMINED,
+                                /*issuer=*/std::string{},
+                                /*policy=*/std::string{},
+                                AUTH_NAMESPACE::AuthCache::None);
+                        }
                         if (!server_ready_.load(std::memory_order_acquire)) {
                             response.Header("Connection", "close");
                         }
@@ -3563,9 +3673,14 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 return;
             }
 
+            // Capture middleware-stamped X-Auth-* debug headers before
+            // dispatch — restored after the handler returns to survive
+            // any handler that wholesale-replaces the response object.
+            const auto auth_hdrs = CaptureDebugAuthHeaders(response);
             if (!router_.DispatchHandler(request, response)) {
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
+            RestoreDebugAuthHeaders(response, auth_hdrs);
             // During shutdown, signal the client to close the connection.
             // Without this, a keep-alive response looks persistent but
             // the server closes the socket anyway (protocol violation).
@@ -4200,6 +4315,19 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                                 .Header("Retry-After", "1")
                                 .Header("Cache-Control", "no-store")
                                 .Text("authentication unavailable on async route — retry");
+                        // Same observability route as the H1 warmup-503
+                        // path — gate on the install condition so a
+                        // non-auth embedder's async middleware does not
+                        // get attributed as an auth verdict (see the H1
+                        // site comment for the full rationale).
+                        if (auth_manager_ &&
+                            !auth_config_.issuers.empty()) {
+                            auth_manager_->RecordVerdict(
+                                response, AUTH_NAMESPACE::VerifyOutcome::UNDETERMINED,
+                                /*issuer=*/std::string{},
+                                /*policy=*/std::string{},
+                                AUTH_NAMESPACE::AuthCache::None);
+                        }
                         return;
                     }
                     if (mw_state &&
@@ -4549,9 +4677,16 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 return;
             }
 
+            // Capture middleware-stamped X-Auth-* debug headers before
+            // dispatch — restored after the handler returns to survive
+            // any handler that wholesale-replaces the response object.
+            // Mirrors the H1 sync DispatchHandler site above; see the
+            // CaptureDebugAuthHeaders / RestoreDebugAuthHeaders helpers.
+            const auto auth_hdrs = CaptureDebugAuthHeaders(response);
             if (!router_.DispatchHandler(request, response)) {
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
+            RestoreDebugAuthHeaders(response, auth_hdrs);
         }
     );
 
@@ -5382,7 +5517,8 @@ bool HttpServer::Reload(ServerConfig new_config) {
             upstream_configs_,
             auth_config_.policies,
             new_config.auth.forward,
-            new_config.auth.enabled);
+            new_config.auth.enabled,
+            new_config.auth.debug_response_headers);
     }
 
     return true;

@@ -114,6 +114,28 @@ void CollectTopLevelPolicies(const std::vector<AuthPolicy>& top_level,
     }
 }
 
+const char* DecisionLabel(VerifyOutcome outcome) {
+    switch (outcome) {
+      case VerifyOutcome::ALLOW: return "allow";
+      case VerifyOutcome::DENY_401:
+      case VerifyOutcome::DENY_403: return "deny";
+      case VerifyOutcome::UNDETERMINED: return "undetermined";
+    }
+    return "";
+}
+
+const char* CacheLabel(AuthCache cache) {
+    switch (cache) {
+      case AuthCache::None: return "";
+      case AuthCache::Hit: return "hit";
+      case AuthCache::Miss: return "miss";
+      case AuthCache::Stale: return "stale";
+      case AuthCache::Negative: return "negative";
+      case AuthCache::Uncached: return "uncached";
+    }
+    return "";
+}
+
 }  // namespace
 
 AuthManager::AuthManager(const AuthConfig& config,
@@ -123,6 +145,8 @@ AuthManager::AuthManager(const AuthConfig& config,
       dispatchers_(std::move(dispatchers)) {
     // Master switch — mirrored from AuthConfig::enabled and live-reloadable.
     master_enabled_.store(config.enabled, std::memory_order_release);
+    debug_response_headers_.store(config.debug_response_headers,
+                                   std::memory_order_release);
     // Resolve the HMAC key: operator-supplied env var OR fresh random.
     if (!config.hmac_cache_key_env.empty()) {
         hmac_key_ = LoadHmacKeyFromEnv(config.hmac_cache_key_env);
@@ -235,12 +259,36 @@ void AuthManager::RegisterPolicy(std::vector<std::string> prefixes,
             policy.name);
         return;
     }
+    // Seed the per-policy incarnation BEFORE building the new
+    // AppliedPolicyList so each appended entry's `incarnation` field
+    // matches what the live `policy_incarnation_` map reports. Without
+    // this, the entries default to incarnation 0 while the first reload
+    // bumps the live map to 1 — async requests in flight from before
+    // the reload would then see captured 0 vs live 1 and drop their
+    // legitimate per-policy bump (C-2). Sequential lock acquisition
+    // (per_policy_mtx_ then snapshot_mtx_) preserves the documented
+    // lock-order invariant; pre-Start there are no concurrent readers
+    // anyway, but we follow the rule for defence-in-depth.
+    {
+        std::lock_guard<std::mutex> pp_lk(per_policy_mtx_);
+        if (policy_incarnation_.find(policy.name) == policy_incarnation_.end()) {
+            policy_incarnation_[policy.name] = 1;
+        }
+        policy_last_reconciled_.insert(policy.name);
+    }
+    const uint64_t name_incarnation = [&]() {
+        std::lock_guard<std::mutex> pp_lk(per_policy_mtx_);
+        auto it = policy_incarnation_.find(policy.name);
+        return it != policy_incarnation_.end() ? it->second : 1;
+    }();
     // Append under snapshot_mtx_ — a race with InvokeMiddleware still
     // publishes a coherent shared_ptr after the swap.
     std::lock_guard<std::mutex> lk(snapshot_mtx_);
     auto updated = std::make_shared<AppliedPolicyList>(*policies_);
     for (auto& prefix : prefixes) {
-        updated->push_back({std::move(prefix), policy});
+        AppliedPolicy ap{std::move(prefix), policy};
+        ap.incarnation = name_incarnation;
+        updated->push_back(std::move(ap));
     }
     policies_ = std::shared_ptr<const AppliedPolicyList>(std::move(updated));
     logging::Get()->debug(
@@ -369,9 +417,59 @@ void AuthManager::CommitPolicyAndEnforcement(
         const std::vector<UpstreamConfig>& new_upstreams,
         const std::vector<AuthPolicy>& new_top_level_policies,
         const AuthForwardConfig& new_forward,
-        bool new_master_enabled) {
+        bool new_master_enabled,
+        bool new_debug_response_headers) {
+    // Compute the new policy.name set up front so we can update
+    // policy_incarnation_ + policy_last_reconciled_ AND build a
+    // ready-to-publish AppliedPolicyList with embedded incarnations,
+    // BEFORE acquiring snapshot_mtx_. Embedding the incarnation in the
+    // snapshot guarantees dispatch sites observe the policy match and
+    // its incarnation atomically — the captured value at dispatch is
+    // exactly what the live policy_incarnation_ map says when the
+    // snapshot is published. Without this ordering, a request that
+    // matched a newly-re-added policy in the new snapshot could capture
+    // the OLD incarnation through a race against the per-policy
+    // bookkeeping update, then the finalizer would drop a legitimate
+    // bump (C-2 reviewer scenario).
+    std::unordered_set<std::string> kept_names;
+    {
+        // Pre-compute kept_names from inputs without building the full
+        // AppliedPolicyList yet — we need this set to update incarnations
+        // first. Mirror what CollectInlineAuthPolicies +
+        // CollectTopLevelPolicies will produce.
+        for (const auto& u : new_upstreams) {
+            if (!u.proxy.auth.enabled) continue;
+            std::string name = u.proxy.auth.name;
+            if (name.empty()) name = "inline:" + u.name;
+            kept_names.insert(std::move(name));
+        }
+        for (const auto& p : new_top_level_policies) {
+            if (!p.enabled) continue;
+            kept_names.insert(p.name);
+        }
+    }
+    std::unordered_map<std::string, uint64_t> incarnation_snapshot;
+    {
+        std::lock_guard<std::mutex> lk(per_policy_mtx_);
+        // Bump incarnation for names that were ABSENT in the previous
+        // reconcile but PRESENT now AND already had an incarnation entry
+        // (the "removed-then-readded" signal). First-ever observations
+        // get value 1 (matching PolicyIncarnation's lazy-create), so
+        // dispatch never captures the stale 0 sentinel.
+        for (const auto& name : kept_names) {
+            auto it = policy_incarnation_.find(name);
+            if (it == policy_incarnation_.end()) {
+                policy_incarnation_[name] = 1;
+            } else if (policy_last_reconciled_.count(name) == 0) {
+                it->second += 1;
+            }
+        }
+        policy_last_reconciled_ = kept_names;
+        incarnation_snapshot = policy_incarnation_;
+    }
     auto rebuilt = BuildAppliedPolicyList(new_upstreams,
-                                            new_top_level_policies);
+                                            new_top_level_policies,
+                                            incarnation_snapshot);
     AuthForwardConfig fwd_copy = new_forward;
     fwd_copy.PopulateDerived();
     auto fwd_snap = std::make_shared<const AuthForwardConfig>(std::move(fwd_copy));
@@ -385,13 +483,14 @@ void AuthManager::CommitPolicyAndEnforcement(
     // Single atomic cutover under snapshot_mtx_:
     //   1. forward_ swap
     //   2. policies_ swap
-    //   3. master_enabled_ release-store (final publication edge)
-    // A reader observing master_enabled_=true sees fresh forward_ and
-    // policies_ pointers via the lock-mutex acquire ordering. Forward is
-    // grouped here (not in Reload) so a TRUE→TRUE reload combining a
-    // forward overlay edit with a policy edit can't expose the window
-    // where ProxyTransaction reads new forward_ while the matcher is
-    // still on the old policy list.
+    //   3. debug_response_headers_ release-store
+    //   4. master_enabled_ release-store (final publication edge)
+    // A reader observing master_enabled_=true sees fresh forward_ /
+    // policies_ / debug_response_headers_ via the lock-mutex acquire
+    // ordering. Forward is grouped here (not in Reload) so a TRUE→TRUE
+    // reload combining a forward overlay edit with a policy edit can't
+    // expose the window where ProxyTransaction reads new forward_ while
+    // the matcher is still on the old policy list.
     {
         std::lock_guard<std::mutex> lk(snapshot_mtx_);
         if (forward_) {
@@ -401,8 +500,20 @@ void AuthManager::CommitPolicyAndEnforcement(
         }
         forward_ = std::move(fwd_snap);
         policies_ = rebuilt;
+        debug_response_headers_.store(new_debug_response_headers,
+                                       std::memory_order_release);
         master_enabled_.store(new_master_enabled,
                                std::memory_order_release);
+    }
+    // Reconcile per-policy buckets: drop counters keyed on policy.name
+    // values that no longer appear in the rebuilt list. Same-name buckets
+    // are preserved so operators see stable counters through a same-name
+    // reload; removed-then-readded names reset to zero on next emit.
+    {
+        std::lock_guard<std::mutex> lk(per_policy_mtx_);
+        if (rebuilt) {
+            ReconcilePerPolicyKeysLocked(*rebuilt);
+        }
     }
     // Drop positive introspection cache entries on every issuer when
     // forward.claim_keys changed — done AFTER the snapshot swap so any
@@ -468,6 +579,9 @@ AuthManager::SnapshotView AuthManager::SnapshotAll() const {
     out.total_denied = total_denied_.load(std::memory_order_relaxed);
     out.total_undetermined = total_undetermined_.load(std::memory_order_relaxed);
     out.generation = generation_.load(std::memory_order_acquire);
+    out.enabled = master_enabled_.load(std::memory_order_acquire);
+    out.debug_response_headers =
+        debug_response_headers_.load(std::memory_order_acquire);
     out.introspection_ok =
         introspection_ok_.load(std::memory_order_relaxed);
     out.introspection_fail =
@@ -483,6 +597,19 @@ AuthManager::SnapshotView AuthManager::SnapshotAll() const {
     {
         std::lock_guard<std::mutex> lk(snapshot_mtx_);
         out.policy_count = policies_ ? policies_->size() : 0;
+    }
+    {
+        std::lock_guard<std::mutex> lk(per_policy_mtx_);
+        out.per_policy.reserve(per_policy_.size());
+        for (const auto& [k, v] : per_policy_) {
+            PerPolicyCountersView pp;
+            pp.issuer = k.first;
+            pp.policy = k.second;
+            pp.allowed = v->allowed.load(std::memory_order_relaxed);
+            pp.denied = v->denied.load(std::memory_order_relaxed);
+            pp.undetermined = v->undetermined.load(std::memory_order_relaxed);
+            out.per_policy.push_back(std::move(pp));
+        }
     }
     for (const auto& [name, issuer] : issuers_) {
         if (!issuer) continue;
@@ -541,6 +668,12 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
     }
     const AuthPolicy& policy = ap->policy;
     if (!policy.enabled) return true;
+    // Capture the policy incarnation atomically with the policy match —
+    // ap->incarnation was embedded in the snapshot built before publish.
+    // Threaded to every RecordVerdict in this function so a remove-then-
+    // readd race during JWT verify (~ms-scale window) cannot pollute the
+    // new bucket.
+    const uint64_t policy_incarnation = ap->incarnation;
 
     const std::string realm = policy.realm.empty()
         ? std::string("api") : policy.realm;
@@ -549,13 +682,14 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
     std::string log_label;
     std::string token = ExtractBearerToken(req, log_label);
     if (token.empty()) {
-        total_denied_.fetch_add(1, std::memory_order_relaxed);
         logging::Get()->info(
             "auth_deny reason={} route={} policy={}",
             log_label.empty() ? std::string("missing_authorization") : log_label,
             logging::SanitizePath(req.path), policy.name);
         resp = MakeUnauthorized(realm, AuthErrorCode::InvalidRequest,
                                  "authorization required");
+        RecordVerdict(resp, VerifyOutcome::DENY_401, std::string{},
+                       policy.name, AuthCache::None, policy_incarnation);
         return false;
     }
     // 8 KiB DoS guard mirrors InvokeAsyncMiddleware. JWT-only requests and
@@ -563,12 +697,13 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
     // before any verification work — otherwise the cap is bypassable on
     // pure JWT deployments.
     if (token.size() > kMaxBearerTokenBytes) {
-        total_denied_.fetch_add(1, std::memory_order_relaxed);
         logging::Get()->info(
             "auth_deny reason=token_too_large route={} policy={}",
             logging::SanitizePath(req.path), policy.name);
         resp = MakeUnauthorized(realm, AuthErrorCode::InvalidRequest,
                                  "token too large");
+        RecordVerdict(resp, VerifyOutcome::DENY_401, std::string{},
+                       policy.name, AuthCache::None, policy_incarnation);
         return false;
     }
 
@@ -589,12 +724,13 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
         }
         if (!chosen) {
             // `iss` present but not in the policy allowlist — DENY 401.
-            total_denied_.fetch_add(1, std::memory_order_relaxed);
             logging::Get()->info(
                 "auth_deny reason=issuer_not_accepted route={} policy={}",
                 logging::SanitizePath(req.path), policy.name);
             resp = MakeUnauthorized(realm, AuthErrorCode::InvalidToken,
                                      "issuer not accepted");
+            RecordVerdict(resp, VerifyOutcome::DENY_401, std::string{},
+                           policy.name, AuthCache::None, policy_incarnation);
             return false;
         }
     } else if (!policy.issuers.empty()) {
@@ -624,16 +760,19 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
         logging::Get()->warn(
             "auth_undetermined reason=no_issuer_for_policy route={} policy={}",
             logging::SanitizePath(req.path), policy.name);
-        total_undetermined_.fetch_add(1, std::memory_order_relaxed);
         if (policy.on_undetermined == "allow") {
             AuthContext ctx;
             ctx.undetermined = true;
             ctx.policy_name = policy.name;
             req.auth.emplace(std::move(ctx));
+            RecordVerdict(resp, VerifyOutcome::UNDETERMINED, std::string{},
+                           policy.name, AuthCache::None, policy_incarnation);
             return true;
         }
         resp = MakeServiceUnavailable(realm, 5,
                                         "authentication unavailable");
+        RecordVerdict(resp, VerifyOutcome::UNDETERMINED, std::string{},
+                       policy.name, AuthCache::None, policy_incarnation);
         return false;
     }
 
@@ -680,7 +819,8 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
                 ctx.raw_token = token;
             }
             req.auth.emplace(std::move(ctx));
-            total_allowed_.fetch_add(1, std::memory_order_relaxed);
+            RecordVerdict(resp, VerifyOutcome::ALLOW, chosen->name(),
+                           policy.name, AuthCache::None, policy_incarnation);
             if (auto lg = logging::Get();
                     lg->should_log(spdlog::level::debug)) {
                 lg->debug("auth_allow route={} issuer={} sub={} policy={}",
@@ -692,7 +832,6 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
             return true;
         }
         case VerifyOutcome::DENY_401: {
-            total_denied_.fetch_add(1, std::memory_order_relaxed);
             logging::Get()->info(
                 "auth_deny route={} issuer={} reason={} policy={}",
                 logging::SanitizePath(req.path),
@@ -701,10 +840,11 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
                 logging::SanitizeLogValue(policy.name));
             resp = MakeUnauthorized(realm, vr.error_code,
                                      vr.error_description);
+            RecordVerdict(resp, VerifyOutcome::DENY_401, chosen->name(),
+                           policy.name, AuthCache::None, policy_incarnation);
             return false;
         }
         case VerifyOutcome::DENY_403: {
-            total_denied_.fetch_add(1, std::memory_order_relaxed);
             logging::Get()->info(
                 "auth_deny route={} issuer={} reason={} policy={}",
                 logging::SanitizePath(req.path),
@@ -713,10 +853,11 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
                 logging::SanitizeLogValue(policy.name));
             resp = MakeForbidden(realm, vr.error_description,
                                   policy.required_scopes);
+            RecordVerdict(resp, VerifyOutcome::DENY_403, chosen->name(),
+                           policy.name, AuthCache::None, policy_incarnation);
             return false;
         }
         case VerifyOutcome::UNDETERMINED: {
-            total_undetermined_.fetch_add(1, std::memory_order_relaxed);
             logging::Get()->warn(
                 "auth_undetermined route={} issuer={} reason={} policy={}",
                 logging::SanitizePath(req.path),
@@ -729,10 +870,15 @@ bool AuthManager::InvokeMiddleware(const HttpRequest& req,
                 advisory.policy_name = policy.name;
                 advisory.issuer = chosen->name();
                 req.auth.emplace(std::move(advisory));
+                RecordVerdict(resp, VerifyOutcome::UNDETERMINED,
+                               chosen->name(), policy.name, AuthCache::None,
+                               policy_incarnation);
                 return true;
             }
             resp = MakeServiceUnavailable(realm, vr.retry_after_sec,
                                             "authentication unavailable");
+            RecordVerdict(resp, VerifyOutcome::UNDETERMINED, chosen->name(),
+                           policy.name, AuthCache::None, policy_incarnation);
             return false;
         }
     }
@@ -778,10 +924,23 @@ std::string AuthManager::ExtractBearerToken(const HttpRequest& req,
 
 std::shared_ptr<const AppliedPolicyList> AuthManager::BuildAppliedPolicyList(
         const std::vector<UpstreamConfig>& upstreams,
-        const std::vector<AuthPolicy>& top_level_policies) {
+        const std::vector<AuthPolicy>& top_level_policies,
+        const std::unordered_map<std::string, uint64_t>& incarnations) {
     auto out = std::make_shared<AppliedPolicyList>();
     CollectInlineAuthPolicies(upstreams, *out);
     CollectTopLevelPolicies(top_level_policies, *out);
+    // Embed per-policy incarnation directly in each AppliedPolicy entry
+    // so dispatch sites capture the value atomically with the policy
+    // match (single snapshot_mtx_ acquire — no separate PolicyIncarnation
+    // call that could race against an in-flight CommitPolicyAndEnforcement
+    // bump). Names missing from the supplied map default to 1 — the
+    // first-ever observation of a policy never had an explicit reconcile
+    // pass, but should still be distinguishable from the default-zero
+    // sentinel that means "no incarnation tracking populated".
+    for (auto& ap : *out) {
+        auto it = incarnations.find(ap.policy.name);
+        ap.incarnation = it != incarnations.end() ? it->second : 1;
+    }
     // Post-build integrity check: duplicate exact-prefix collisions between
     // inline proxy.auth blocks and top-level policies can lead to
     // non-deterministic policy selection (FindPolicyForPath returns the
@@ -811,6 +970,179 @@ void AuthManager::StampAuthContext(const HttpRequest& req,
         ctx.raw_token = token;
     }
     req.auth.emplace(std::move(ctx));
+}
+
+void AuthManager::StampDebugHeader(HttpResponse& resp,
+                                     const char* decision,
+                                     const std::string& issuer,
+                                     const char* cache_label) const {
+    if (!debug_response_headers_.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (decision && *decision) {
+        resp.Header("X-Auth-Decision", decision);
+    }
+    if (!issuer.empty()) {
+        resp.Header("X-Auth-Issuer", issuer);
+    }
+    if (cache_label && *cache_label) {
+        resp.Header("X-Auth-Cache", cache_label);
+    }
+}
+
+void AuthManager::BumpPerPolicy(const std::string& issuer,
+                                  const std::string& policy,
+                                  VerifyOutcome outcome,
+                                  std::optional<uint64_t> captured_incarnation) {
+    if (issuer.empty() && policy.empty()) {
+        return;
+    }
+    // Lock acquisition: per_policy_mtx_ first, then snapshot_mtx_ on the
+    // cold path only. snapshot_mtx_ and per_policy_mtx_ are NEVER held
+    // simultaneously by CommitPolicyAndEnforcement or SnapshotAll — both
+    // use separate critical sections. BumpPerPolicy's cold path is the
+    // only path that nests them, in per_policy_mtx_ → snapshot_mtx_
+    // order. Any future caller that holds snapshot_mtx_ MUST NOT wait on
+    // per_policy_mtx_ — that would deadlock against this cold path.
+    std::lock_guard<std::mutex> lk(per_policy_mtx_);
+    // Incarnation gate: when the caller captured a value at dispatch
+    // time (async paths only — sync paths pass std::nullopt because they
+    // have no dispatch-finalize gap), drop the per-policy bump if the
+    // live incarnation has advanced. Advance happens only when a
+    // policy.name is REMOVED and RE-ADDED across reloads. The aggregate
+    // counter and debug headers still fire because the request was a
+    // real client-visible verdict; only the bucket attribution is
+    // suppressed to preserve the documented "removed-then-readded
+    // resets to zero" contract. The captured value comes from
+    // ap->incarnation in the snapshot the request was processed under,
+    // so it agrees with the live value as long as no remove-readd
+    // happened between dispatch and finalize.
+    if (captured_incarnation.has_value()) {
+        auto inc_it = policy_incarnation_.find(policy);
+        const uint64_t live_inc =
+            inc_it != policy_incarnation_.end() ? inc_it->second : 0;
+        if (*captured_incarnation != live_inc) {
+            return;
+        }
+    }
+    auto key = std::make_pair(issuer, policy);
+    auto it = per_policy_.find(key);
+    if (it == per_policy_.end()) {
+        // Cold path: lazy-create. Read the policies snapshot UNDER
+        // per_policy_mtx_ so the gate cannot race with a concurrent
+        // reload. CommitPolicyAndEnforcement publishes the new
+        // `policies_` under snapshot_mtx_ FIRST, then releases and
+        // acquires per_policy_mtx_ to run ReconcilePerPolicyKeysLocked.
+        // Because we hold per_policy_mtx_ for the entire decision, any
+        // reconciler whose publish-half has already happened is either
+        // (a) still queued behind our lock, or (b) already finished.
+        // Either way, the snapshot we read here reflects the post-publish
+        // state, so a verdict whose policy was just removed sees the
+        // updated list and drops — no stale-bucket resurrection.
+        std::shared_ptr<const AppliedPolicyList> policies_snap;
+        {
+            std::lock_guard<std::mutex> lk_snap(snapshot_mtx_);
+            policies_snap = policies_;
+        }
+        // Empty issuer is always allowed (pre-issuer-selection denies).
+        // issuers_ is topology-stable post-Start so the lookup is lock-free.
+        if (!issuer.empty() && issuers_.find(issuer) == issuers_.end()) {
+            return;
+        }
+        bool policy_live = false;
+        if (policies_snap) {
+            for (const auto& ap : *policies_snap) {
+                if (ap.policy.name == policy) {
+                    policy_live = true;
+                    break;
+                }
+            }
+        }
+        if (!policy_live) {
+            return;
+        }
+        auto inserted = per_policy_.emplace(
+            std::move(key), std::make_unique<PerPolicyCounters>());
+        it = inserted.first;
+    }
+    PerPolicyCounters& counters = *it->second;
+    switch (outcome) {
+      case VerifyOutcome::ALLOW:
+        counters.allowed.fetch_add(1, std::memory_order_relaxed);
+        break;
+      case VerifyOutcome::DENY_401:
+      case VerifyOutcome::DENY_403:
+        counters.denied.fetch_add(1, std::memory_order_relaxed);
+        break;
+      case VerifyOutcome::UNDETERMINED:
+        counters.undetermined.fetch_add(1, std::memory_order_relaxed);
+        break;
+    }
+}
+
+void AuthManager::RecordVerdict(HttpResponse& resp,
+                                  VerifyOutcome outcome,
+                                  const std::string& issuer,
+                                  const std::string& policy,
+                                  AuthCache cache,
+                                  std::optional<uint64_t> captured_incarnation) {
+    switch (outcome) {
+      case VerifyOutcome::ALLOW:
+        total_allowed_.fetch_add(1, std::memory_order_relaxed);
+        break;
+      case VerifyOutcome::DENY_401:
+      case VerifyOutcome::DENY_403:
+        total_denied_.fetch_add(1, std::memory_order_relaxed);
+        break;
+      case VerifyOutcome::UNDETERMINED:
+        total_undetermined_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    }
+    BumpPerPolicy(issuer, policy, outcome, captured_incarnation);
+    StampDebugHeader(resp, DecisionLabel(outcome), issuer, CacheLabel(cache));
+}
+
+uint64_t AuthManager::PolicyIncarnation(const std::string& policy_name) const {
+    std::lock_guard<std::mutex> lk(per_policy_mtx_);
+    auto it = policy_incarnation_.find(policy_name);
+    if (it != policy_incarnation_.end()) {
+        return it->second;
+    }
+    // Lazy-create at 1 so first-ever observations are distinguishable
+    // from "never observed" — `policy_incarnation_` is now a mutable
+    // member so this method can grow the map under per_policy_mtx_
+    // without violating const-correctness at the storage boundary.
+    policy_incarnation_[policy_name] = 1;
+    return 1;
+}
+
+void AuthManager::ReconcilePerPolicyKeysLocked(
+        const AppliedPolicyList& new_policies) {
+    std::unordered_set<std::string> kept;
+    for (const auto& ap : new_policies) {
+        kept.insert(ap.policy.name);
+    }
+    // Incarnation tracking is updated EARLIER inside
+    // CommitPolicyAndEnforcement (before the snapshot is built) so the
+    // values can be embedded in the rebuilt AppliedPolicyList. This
+    // function only erases orphan buckets.
+    for (auto it = per_policy_.begin(); it != per_policy_.end(); ) {
+        const std::string& key_issuer = it->first.first;
+        const std::string& key_policy = it->first.second;
+        // Drop buckets keyed on a removed policy.name. Also drop buckets
+        // keyed on a non-empty issuer that has left issuers_ (defensive
+        // — issuers_ is topology-stable post-Start today, so this branch
+        // should not trigger; included to keep the bucket map bounded if
+        // issuer add/remove ever becomes live-reloadable).
+        const bool policy_gone = kept.count(key_policy) == 0;
+        const bool issuer_gone =
+            !key_issuer.empty() && issuers_.find(key_issuer) == issuers_.end();
+        if (policy_gone || issuer_gone) {
+            it = per_policy_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void AuthManager::InvokeAsyncMiddleware(
@@ -851,6 +1183,16 @@ void AuthManager::InvokeAsyncMiddleware(
     const AuthPolicy& policy = ap->policy;
     const std::string realm = policy.realm.empty()
         ? std::string("api") : policy.realm;
+    // Capture the policy incarnation atomically with the policy match.
+    // Threaded to every sync RecordVerdict in this function and to
+    // InvokeAsyncIntrospection / InvokeIntrospectionUncached for the
+    // deferred path. Pinning the incarnation here closes the same
+    // remove-then-readd race the JWT sync path closes — the deferred
+    // path's gap is much wider (IdP roundtrip), the sync DENY paths'
+    // gap is microseconds, but the contract is the same: a verdict
+    // dispatched under incarnation N must not contaminate incarnation
+    // N+1's bucket.
+    const uint64_t policy_incarnation = ap->incarnation;
 
     // Bearer extraction. The sync chain runs first, so a JWT-mode policy
     // would have either ALLOW'd (req.auth set) or DENY'd before we see it
@@ -861,7 +1203,6 @@ void AuthManager::InvokeAsyncMiddleware(
     std::string log_label;
     std::string token = ExtractBearerToken(req, log_label);
     if (token.empty()) {
-        total_denied_.fetch_add(1, std::memory_order_relaxed);
         logging::Get()->info(
             "auth_deny reason={} route={} policy={}",
             log_label.empty() ? std::string("missing_authorization") : log_label,
@@ -869,18 +1210,21 @@ void AuthManager::InvokeAsyncMiddleware(
             logging::SanitizeLogValue(policy.name));
         resp = MakeUnauthorized(realm, AuthErrorCode::InvalidRequest,
                                  "authorization required");
+        RecordVerdict(resp, VerifyOutcome::DENY_401, std::string{},
+                       policy.name, AuthCache::None, policy_incarnation);
         state->SetSyncResult(AsyncMiddlewareResult::DENY);
         state->MarkCompletedSync();
         return;
     }
     if (token.size() > kMaxBearerTokenBytes) {
-        total_denied_.fetch_add(1, std::memory_order_relaxed);
         logging::Get()->info(
             "auth_deny reason=token_too_large route={} policy={}",
             logging::SanitizePath(req.path),
             logging::SanitizeLogValue(policy.name));
         resp = MakeUnauthorized(realm, AuthErrorCode::InvalidRequest,
                                  "token too large");
+        RecordVerdict(resp, VerifyOutcome::DENY_401, std::string{},
+                       policy.name, AuthCache::None, policy_incarnation);
         state->SetSyncResult(AsyncMiddlewareResult::DENY);
         state->MarkCompletedSync();
         return;
@@ -920,13 +1264,14 @@ void AuthManager::InvokeAsyncMiddleware(
             }
         }
         if (!chosen) {
-            total_denied_.fetch_add(1, std::memory_order_relaxed);
             logging::Get()->info(
                 "auth_deny reason=issuer_not_accepted route={} policy={}",
                 logging::SanitizePath(req.path),
                 logging::SanitizeLogValue(policy.name));
             resp = MakeUnauthorized(realm, AuthErrorCode::InvalidToken,
                                      "issuer not accepted");
+            RecordVerdict(resp, VerifyOutcome::DENY_401, std::string{},
+                           policy.name, AuthCache::None, policy_incarnation);
             state->SetSyncResult(AsyncMiddlewareResult::DENY);
             state->MarkCompletedSync();
             return;
@@ -1004,7 +1349,6 @@ void AuthManager::InvokeAsyncMiddleware(
     if (!chosen->IsReady() || !snap_issuer) {
         const int retry_after = snap_issuer
             ? snap_issuer->discovery_retry_sec : 30;
-        total_undetermined_.fetch_add(1, std::memory_order_relaxed);
         logging::Get()->warn(
             "auth_undetermined route={} issuer={} reason=issuer_not_ready policy={}",
             logging::SanitizePath(req.path),
@@ -1016,11 +1360,16 @@ void AuthManager::InvokeAsyncMiddleware(
             advisory.policy_name = policy.name;
             advisory.issuer = chosen->name();
             req.auth.emplace(std::move(advisory));
+            RecordVerdict(resp, VerifyOutcome::UNDETERMINED,
+                           chosen->name(), policy.name, AuthCache::None,
+                           policy_incarnation);
             sync_pass();
             return;
         }
         resp = MakeServiceUnavailable(realm, retry_after,
                                         "authentication unavailable");
+        RecordVerdict(resp, VerifyOutcome::UNDETERMINED, chosen->name(),
+                       policy.name, AuthCache::None, policy_incarnation);
         state->SetSyncResult(AsyncMiddlewareResult::DENY);
         state->MarkCompletedSync();
         return;
@@ -1034,9 +1383,16 @@ void AuthManager::InvokeAsyncMiddleware(
         sync_pass();
         return;
     }
+    // Pass `ap->incarnation` rather than calling PolicyIncarnation()
+    // separately — the AppliedPolicy was selected from policies_snap, so
+    // its embedded incarnation is atomic with the policy match. A
+    // separate map lookup would race against a concurrent
+    // CommitPolicyAndEnforcement that just bumped the incarnation but
+    // hasn't yet published the new policies snapshot.
     InvokeAsyncIntrospection(it->second, *snap_issuer, policy, token,
                               req, resp, std::move(state),
-                              std::move(fwd_snap));
+                              std::move(fwd_snap),
+                              ap->incarnation);
 }
 
 namespace {
@@ -1062,15 +1418,16 @@ std::chrono::seconds ClampPositiveTtl(int cache_sec,
 
 // Inputs needed by the introspection completion callback. Built by both
 // InvokeAsyncIntrospection (cached) and InvokeIntrospectionUncached
-// (uncached); the only behavioral differences between the two paths
-// live in three fields — enable_cache_ops, cache_key, cache_log_label
-// (and the optional intro_stale_served counter pointer).
+// (uncached). Behavioural differences between the two paths live in
+// `enable_cache_ops`, `cache_key`, `cache` (and the optional
+// `intro_stale_served` counter pointer).
 //
-// Counter pointers reference AuthManager's atomics. They survive the
-// closure because AuthManager outlives every in-flight transaction:
-// AuthManager::Stop drives Issuer::Stop which flips the cancel token
-// before AuthManager destruction, so weak_issuer.lock() returns null
-// in the closure before any counter increment runs post-destruction.
+// `manager` is non-owning — AuthManager outlives every in-flight
+// transaction (Stop flips weak_issuer's underlying object first, so the
+// closure short-circuits via the weak_issuer.lock() drop-guard before
+// any manager-> call runs post-destruction). Used by the resume
+// finalizers to drive RecordVerdict for total + per-policy + debug
+// header emission.
 struct IntrospectionDoneCtx {
     // Identity / suspend state
     std::shared_ptr<HttpRouter::AsyncPendingState> state;
@@ -1091,10 +1448,9 @@ struct IntrospectionDoneCtx {
     std::vector<std::string> snap_audiences;
     std::vector<std::string> snap_required_claims;
 
-    // Observability counters
-    std::atomic<uint64_t>* total_undetermined = nullptr;
-    std::atomic<uint64_t>* total_allowed = nullptr;
-    std::atomic<uint64_t>* total_denied = nullptr;
+    // Introspection-specific counters. AuthManager-aggregate counters
+    // (total_allowed / total_denied / total_undetermined) are bumped
+    // inside RecordVerdict via the captured manager pointer.
     std::atomic<uint64_t>* intro_ok = nullptr;
     std::atomic<uint64_t>* intro_fail = nullptr;
     std::atomic<uint64_t>* intro_stale_served = nullptr;  // null on uncached path
@@ -1102,7 +1458,24 @@ struct IntrospectionDoneCtx {
     // Cache control
     bool enable_cache_ops = false;
     std::string cache_key;          // non-empty only when enable_cache_ops=true
-    const char* cache_log_label = "miss";  // "miss" (cached) or "uncached"
+    // Default `None` so a future call site that forgets to set this field
+    // emits an empty X-Auth-Cache (header omitted) rather than silently
+    // claiming `miss`. Both real call sites (cached / uncached) set this
+    // explicitly at dispatch — see InvokeAsyncIntrospection +
+    // InvokeIntrospectionUncached. The stale-promotion path inside
+    // MakeIntrospectionDoneCallback overrides to AuthCache::Stale.
+    AuthCache cache = AuthCache::None;
+
+    AuthManager* manager = nullptr;
+
+    // Incarnation captured at dispatch from the matched AppliedPolicy in
+    // the snapshot — atomic with the policy lookup, so a request that
+    // matches a re-added policy in the new snapshot captures the new
+    // incarnation that was bumped BEFORE the snapshot was published.
+    // Forwarded to RecordVerdict from the resume finalizers; std::nullopt
+    // disables the gate (used for sync paths that don't construct this
+    // ctx). For async paths this is always populated.
+    std::optional<uint64_t> policy_incarnation;
 };
 
 // Build the dispatcher-thread completion callback shared by the cached
@@ -1115,9 +1488,11 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
         AsyncMiddlewarePayload payload;
 
         // Build an UNDETERMINED payload (used by drop guards AND by the
-        // genuine UNDETERMINED outcome branch). Mirrors the JWT path's
-        // observability: increment total_undetermined, emit the warn log,
-        // and on `allow` stamp an advisory ctx with policy_name + issuer.
+        // genuine UNDETERMINED outcome branch). intro_fail is incremented
+        // at the cache-insert site for outcomes from a real IdP roundtrip;
+        // drop-guard UNDETERMINED paths bypass the cache site by design and
+        // intentionally do NOT count as introspection_fail — those are
+        // issuer-state failures, not IdP failures.
         auto build_undetermined = [&](std::string log_reason) {
             if (c.on_undetermined == kOnUndeterminedAllow) {
                 payload.result = AsyncMiddlewareResult::PASS;
@@ -1126,15 +1501,10 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                      policy_name = c.policy_name,
                      sanitized_req_path = c.sanitized_req_path,
                      log_reason,
-                     total_undetermined = c.total_undetermined]
-                    (const HttpRequest& r, HttpResponse&) {
-                    // intro_fail is incremented at the cache-insert site
-                    // for outcomes from a real IdP roundtrip; drop-guard
-                    // UNDETERMINED paths bypass the cache site by design
-                    // and intentionally do NOT count as introspection_fail
-                    // — those are issuer-state failures, not IdP failures.
-                    total_undetermined->fetch_add(
-                        1, std::memory_order_relaxed);
+                     manager = c.manager,
+                     cache = c.cache,
+                     incarnation = c.policy_incarnation]
+                    (const HttpRequest& r, HttpResponse& rs) {
                     logging::Get()->warn(
                         "auth_undetermined route={} issuer={} reason={} policy={}",
                         sanitized_req_path,
@@ -1146,6 +1516,12 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                     advisory.policy_name = policy_name;
                     advisory.issuer = issuer_name;
                     r.auth.emplace(std::move(advisory));
+                    if (manager) {
+                        manager->RecordVerdict(
+                            rs, VerifyOutcome::UNDETERMINED,
+                            issuer_name, policy_name, cache,
+                            incarnation);
+                    }
                 };
             } else {
                 payload.result = AsyncMiddlewareResult::DENY;
@@ -1156,10 +1532,10 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                      policy_name = c.policy_name,
                      sanitized_req_path = c.sanitized_req_path,
                      log_reason,
-                     total_undetermined = c.total_undetermined]
+                     manager = c.manager,
+                     cache = c.cache,
+                     incarnation = c.policy_incarnation]
                     (const HttpRequest&, HttpResponse& rs) {
-                    total_undetermined->fetch_add(
-                        1, std::memory_order_relaxed);
                     logging::Get()->warn(
                         "auth_undetermined route={} issuer={} reason={} policy={}",
                         sanitized_req_path,
@@ -1169,6 +1545,12 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                     rs = MakeServiceUnavailable(
                         realm, retry_after_sec,
                         "authentication unavailable");
+                    if (manager) {
+                        manager->RecordVerdict(
+                            rs, VerifyOutcome::UNDETERMINED,
+                            issuer_name, policy_name, cache,
+                            incarnation);
+                    }
                 };
             }
         };
@@ -1243,6 +1625,14 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                         if (vr_stale.outcome == VerifyOutcome::ALLOW) {
                             result.vr = VerifyResult::Allow();
                             result.ctx = std::move(stale.ctx);
+                            // Promote the cache label so the resume
+                            // finalizer's RecordVerdict emits
+                            // X-Auth-Cache: stale rather than the
+                            // dispatch-time `miss`. Operators reading
+                            // /stats see auth.introspection.stale_served
+                            // bumped via intro_stale_served below; the
+                            // per-response header now agrees.
+                            c.cache = AuthCache::Stale;
                             if (c.intro_stale_served) {
                                 c.intro_stale_served->fetch_add(
                                     1, std::memory_order_relaxed);
@@ -1275,8 +1665,10 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
         // Critically, this fires REGARDLESS of whether the resume_cb is
         // later armed; async-route warmup paths (which 503 the client
         // and never run the finalizer) still increment intro_ok /
-        // intro_fail correctly. total_allowed / total_denied stay in
-        // the finalizer because those track CLIENT-VISIBLE verdicts.
+        // intro_fail correctly. AuthManager-aggregate counters
+        // (total_allowed / total_denied / total_undetermined) fire from
+        // RecordVerdict inside the finalizer so they track CLIENT-VISIBLE
+        // verdicts, not IdP-side raw outcomes.
         if (result.vr.outcome == VerifyOutcome::ALLOW) {
             c.intro_ok->fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -1294,9 +1686,10 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                    sanitized_req_path = c.sanitized_req_path,
                    raw_jwt_header = c.raw_jwt_header,
                    token = c.token,
-                   total_allowed = c.total_allowed,
-                   cache_log_label = c.cache_log_label]
-                  (const HttpRequest& r, HttpResponse&) {
+                   manager = c.manager,
+                   cache = c.cache,
+                   incarnation = c.policy_incarnation]
+                  (const HttpRequest& r, HttpResponse& rs) {
                   AuthContext local_ctx = ctx;
                   local_ctx.policy_name = policy_name;
                   if (local_ctx.issuer.empty())
@@ -1305,8 +1698,11 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                       local_ctx.raw_token = token;
                   }
                   r.auth.emplace(std::move(local_ctx));
-                  total_allowed->fetch_add(
-                      1, std::memory_order_relaxed);
+                  if (manager) {
+                      manager->RecordVerdict(rs, VerifyOutcome::ALLOW,
+                                              issuer_name, policy_name, cache,
+                                              incarnation);
+                  }
                   if (auto lg = logging::Get();
                           lg->should_log(spdlog::level::debug)) {
                       lg->debug(
@@ -1316,7 +1712,7 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                           logging::SanitizeLogValue(
                               r.auth ? r.auth->subject : std::string{}),
                           logging::SanitizeLogValue(policy_name),
-                          cache_log_label);
+                          CacheLabel(cache));
                   }
               };
               break;
@@ -1331,10 +1727,16 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                    issuer_name = c.issuer_name,
                    sanitized_req_path = c.sanitized_req_path,
                    policy_name = c.policy_name,
-                   total_denied = c.total_denied]
+                   manager = c.manager,
+                   cache = c.cache,
+                   incarnation = c.policy_incarnation]
                   (const HttpRequest&, HttpResponse& rs) {
                   rs = MakeUnauthorized(realm, ec, desc);
-                  total_denied->fetch_add(1, std::memory_order_relaxed);
+                  if (manager) {
+                      manager->RecordVerdict(rs, VerifyOutcome::DENY_401,
+                                              issuer_name, policy_name, cache,
+                                              incarnation);
+                  }
                   logging::Get()->info(
                       "auth_deny route={} issuer={} reason={} policy={}",
                       sanitized_req_path,
@@ -1354,10 +1756,16 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                    issuer_name = c.issuer_name,
                    policy_name = c.policy_name,
                    log_reason = result.vr.log_reason,
-                   total_denied = c.total_denied]
+                   manager = c.manager,
+                   cache = c.cache,
+                   incarnation = c.policy_incarnation]
                   (const HttpRequest&, HttpResponse& rs) {
                   rs = MakeForbidden(realm, desc, scopes);
-                  total_denied->fetch_add(1, std::memory_order_relaxed);
+                  if (manager) {
+                      manager->RecordVerdict(rs, VerifyOutcome::DENY_403,
+                                              issuer_name, policy_name, cache,
+                                              incarnation);
+                  }
                   logging::Get()->info(
                       "auth_deny route={} issuer={} reason={} policy={}",
                       sanitized_req_path,
@@ -1385,13 +1793,15 @@ void AuthManager::InvokeAsyncIntrospection(
         const HttpRequest& req,
         HttpResponse& resp,
         std::shared_ptr<HttpRouter::AsyncPendingState> state,
-        std::shared_ptr<const AuthForwardConfig> fwd_snap) {
+        std::shared_ptr<const AuthForwardConfig> fwd_snap,
+        uint64_t policy_incarnation) {
     auto key_opt = hasher_.Hash(token);
     if (!key_opt) {
         // HMAC failure — extremely rare. Skip the cache; live POST.
         InvokeIntrospectionUncached(issuer, snap, policy, token,
                                      req, resp, std::move(state),
-                                     std::move(fwd_snap));
+                                     std::move(fwd_snap),
+                                     policy_incarnation);
         return;
     }
     const std::string key = *key_opt;
@@ -1402,7 +1812,8 @@ void AuthManager::InvokeAsyncIntrospection(
         // Defence-in-depth: skip the cache layer rather than crash.
         InvokeIntrospectionUncached(issuer, snap, policy, token,
                                      req, resp, std::move(state),
-                                     std::move(fwd_snap));
+                                     std::move(fwd_snap),
+                                     policy_incarnation);
         return;
     }
 
@@ -1424,7 +1835,6 @@ void AuthManager::InvokeAsyncIntrospection(
         // permissive policy can't grant access on a stricter policy.
         VerifyResult vr = RunPolicyAndIssuerClaimChecks(policy, snap, hit.ctx);
         if (vr.outcome == VerifyOutcome::DENY_401) {
-            total_denied_.fetch_add(1, std::memory_order_relaxed);
             logging::Get()->info(
                 "auth_deny route={} issuer={} reason={} policy={} cache=hit",
                 logging::SanitizePath(req.path),
@@ -1432,12 +1842,13 @@ void AuthManager::InvokeAsyncIntrospection(
                 vr.log_reason,
                 logging::SanitizeLogValue(policy.name));
             resp = MakeUnauthorized(realm, vr.error_code, vr.error_description);
+            RecordVerdict(resp, VerifyOutcome::DENY_401, issuer_name,
+                           policy.name, AuthCache::Hit, policy_incarnation);
             state->SetSyncResult(AsyncMiddlewareResult::DENY);
             state->MarkCompletedSync();
             return;
         }
         if (vr.outcome == VerifyOutcome::DENY_403) {
-            total_denied_.fetch_add(1, std::memory_order_relaxed);
             logging::Get()->info(
                 "auth_deny route={} issuer={} reason={} policy={} cache=hit",
                 logging::SanitizePath(req.path),
@@ -1446,13 +1857,16 @@ void AuthManager::InvokeAsyncIntrospection(
                 logging::SanitizeLogValue(policy.name));
             resp = MakeForbidden(realm, vr.error_description,
                                   policy.required_scopes);
+            RecordVerdict(resp, VerifyOutcome::DENY_403, issuer_name,
+                           policy.name, AuthCache::Hit, policy_incarnation);
             state->SetSyncResult(AsyncMiddlewareResult::DENY);
             state->MarkCompletedSync();
             return;
         }
         StampAuthContext(req, std::move(hit.ctx), issuer_name, policy.name,
                           raw_jwt_header, token);
-        total_allowed_.fetch_add(1, std::memory_order_relaxed);
+        RecordVerdict(resp, VerifyOutcome::ALLOW, issuer_name, policy.name,
+                       AuthCache::Hit, policy_incarnation);
         if (auto lg = logging::Get();
                 lg->should_log(spdlog::level::debug)) {
             lg->debug("auth_allow route={} issuer={} policy={} cache=hit",
@@ -1467,7 +1881,6 @@ void AuthManager::InvokeAsyncIntrospection(
     if (hit.state == IntrospectionCache::LookupState::Fresh && !hit.active) {
         introspection_cache_negative_hit_.fetch_add(
             1, std::memory_order_relaxed);
-        total_denied_.fetch_add(1, std::memory_order_relaxed);
         logging::Get()->info(
             "auth_deny route={} issuer={} reason=introspection_inactive policy={} cache=negative",
             logging::SanitizePath(req.path),
@@ -1475,6 +1888,8 @@ void AuthManager::InvokeAsyncIntrospection(
             logging::SanitizeLogValue(policy.name));
         resp = MakeUnauthorized(realm, AuthErrorCode::InvalidToken,
                                  "token is not active");
+        RecordVerdict(resp, VerifyOutcome::DENY_401, issuer_name,
+                       policy.name, AuthCache::Negative, policy_incarnation);
         state->SetSyncResult(AsyncMiddlewareResult::DENY);
         state->MarkCompletedSync();
         return;
@@ -1531,12 +1946,24 @@ void AuthManager::InvokeAsyncIntrospection(
             "(request bypassed transport-layer wiring)");
         AsyncMiddlewarePayload payload;
         payload.result = AsyncMiddlewareResult::DENY;
-        payload.finalizer = [retry_after_sec, realm](
+        payload.finalizer =
+            [retry_after_sec, realm,
+             manager = this,
+             issuer_name = issuer->name(),
+             policy_name = policy.name,
+             incarnation = policy_incarnation](
                 const HttpRequest&, HttpResponse& rs) {
             rs = MakeServiceUnavailable(realm, retry_after_sec,
                                          "authentication unavailable");
+            // Route the verdict through the central observability helper
+            // so total_undetermined_ + per-(issuer, policy) bucket +
+            // debug response headers all fire consistently with every
+            // other emit site. Cache label is None — no cache lookup
+            // occurred on this dispatcher-index error path.
+            manager->RecordVerdict(rs, VerifyOutcome::UNDETERMINED,
+                                    issuer_name, policy_name,
+                                    AuthCache::None, incarnation);
         };
-        total_undetermined_.fetch_add(1, std::memory_order_relaxed);
         state->Complete(std::move(payload));
         return;
     }
@@ -1556,9 +1983,6 @@ void AuthManager::InvokeAsyncIntrospection(
     // drives Issuer::Stop which flips cancel_token, so the closure's
     // weak_issuer.lock() returns null before any counter increment runs
     // post-destruction. The pointers are safe under that ordering.
-    auto* total_undet_ptr = &total_undetermined_;
-    auto* total_allow_ptr = &total_allowed_;
-    auto* total_deny_ptr = &total_denied_;
     auto* intro_ok_ptr = &introspection_ok_;
     auto* intro_fail_ptr = &introspection_fail_;
     auto* intro_stale_ptr = &introspection_stale_served_;
@@ -1589,15 +2013,16 @@ void AuthManager::InvokeAsyncIntrospection(
     done_ctx.policy               = policy_copy;
     done_ctx.snap_audiences       = snap_audiences;
     done_ctx.snap_required_claims = snap_required_claims;
-    done_ctx.total_undetermined   = total_undet_ptr;
-    done_ctx.total_allowed        = total_allow_ptr;
-    done_ctx.total_denied         = total_deny_ptr;
     done_ctx.intro_ok             = intro_ok_ptr;
     done_ctx.intro_fail           = intro_fail_ptr;
     done_ctx.intro_stale_served   = intro_stale_ptr;
     done_ctx.enable_cache_ops     = true;
     done_ctx.cache_key            = key;
-    done_ctx.cache_log_label      = "miss";
+    done_ctx.cache                = AuthCache::Miss;
+    done_ctx.manager              = this;
+    // Capture the policy incarnation now so a removed-then-readded race
+    // before the IdP roundtrip resolves can't pollute the new bucket.
+    done_ctx.policy_incarnation   = policy_incarnation;
     IntrospectionClient::DoneCallback on_verify_done =
         MakeIntrospectionDoneCallback(std::move(done_ctx));
 
@@ -1624,7 +2049,8 @@ void AuthManager::InvokeIntrospectionUncached(
         const HttpRequest& req,
         HttpResponse& resp,
         std::shared_ptr<HttpRouter::AsyncPendingState> state,
-        std::shared_ptr<const AuthForwardConfig> fwd_snap) {
+        std::shared_ptr<const AuthForwardConfig> fwd_snap,
+        uint64_t policy_incarnation) {
     (void)resp;
     introspection_cache_miss_.fetch_add(1, std::memory_order_relaxed);
 
@@ -1663,12 +2089,21 @@ void AuthManager::InvokeIntrospectionUncached(
             "(request bypassed transport-layer wiring)");
         AsyncMiddlewarePayload payload;
         payload.result = AsyncMiddlewareResult::DENY;
-        payload.finalizer = [retry_after_sec, realm_local](
+        payload.finalizer =
+            [retry_after_sec, realm_local,
+             manager = this,
+             issuer_name = issuer->name(),
+             policy_name = policy.name,
+             incarnation = policy_incarnation](
                 const HttpRequest&, HttpResponse& rs) {
             rs = MakeServiceUnavailable(realm_local, retry_after_sec,
                                          "authentication unavailable");
+            // Same centralized observability route as the cached path's
+            // dispatcher-index error branch — see InvokeAsyncIntrospection.
+            manager->RecordVerdict(rs, VerifyOutcome::UNDETERMINED,
+                                    issuer_name, policy_name,
+                                    AuthCache::None, incarnation);
         };
-        total_undetermined_.fetch_add(1, std::memory_order_relaxed);
         state->Complete(std::move(payload));
         return;
     }
@@ -1681,9 +2116,6 @@ void AuthManager::InvokeIntrospectionUncached(
         cancel_token->store(true, std::memory_order_release);
     });
 
-    auto* total_undet_ptr = &total_undetermined_;
-    auto* total_allow_ptr = &total_allowed_;
-    auto* total_deny_ptr = &total_denied_;
     auto* intro_ok_ptr = &introspection_ok_;
     auto* intro_fail_ptr = &introspection_fail_;
 
@@ -1713,14 +2145,13 @@ void AuthManager::InvokeIntrospectionUncached(
     done_ctx.policy               = policy_copy;
     done_ctx.snap_audiences       = snap_audiences;
     done_ctx.snap_required_claims = snap_required_claims;
-    done_ctx.total_undetermined   = total_undet_ptr;
-    done_ctx.total_allowed        = total_allow_ptr;
-    done_ctx.total_denied         = total_deny_ptr;
     done_ctx.intro_ok             = intro_ok_ptr;
     done_ctx.intro_fail           = intro_fail_ptr;
     done_ctx.intro_stale_served   = nullptr;
     done_ctx.enable_cache_ops     = false;
-    done_ctx.cache_log_label      = "uncached";
+    done_ctx.cache                = AuthCache::Uncached;
+    done_ctx.manager              = this;
+    done_ctx.policy_incarnation   = policy_incarnation;
     IntrospectionClient::DoneCallback on_verify_done =
         MakeIntrospectionDoneCallback(std::move(done_ctx));
 

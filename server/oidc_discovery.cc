@@ -362,6 +362,13 @@ void OidcDiscovery::Start(size_t dispatcher_index,
                     logging::Get()->info(
                         "OIDC discovery ok issuer={} has_introspection={}",
                         issuer_name, !intro_endpoint.empty());
+                    // Discovery-success timestamp is owned by Issuer and
+                    // stamped inside on_ready_cb AFTER the generation gate
+                    // passes — see Issuer::KickOffOidcDiscovery callback.
+                    // OidcDiscovery deliberately does NOT track per-cycle
+                    // success here so a late-arriving response that the
+                    // Issuer drops (gen mismatch / Stop) cannot report a
+                    // bogus refresh in /stats.
                     // Flip ready_flag AFTER on_ready_cb runs so this
                     // OidcDiscovery::IsReady() cannot briefly report true
                     // for a cycle whose callback the Issuer's own

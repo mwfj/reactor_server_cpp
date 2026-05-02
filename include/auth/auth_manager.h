@@ -22,6 +22,19 @@ namespace AUTH_NAMESPACE {
 class UpstreamHttpClient;
 class IntrospectionClient;
 
+// Cache-state label emitted on the X-Auth-Cache response header. JWT mode
+// has no per-request cache and uses None (header omitted). Introspection
+// mode walks Hit / Miss / Stale / Negative / Uncached based on the
+// dispatch path.
+enum class AuthCache {
+    None,
+    Hit,
+    Miss,
+    Stale,
+    Negative,
+    Uncached,
+};
+
 // ---------------------------------------------------------------------------
 // Top-level owner of issuers, the applied-policy list, and the forward-
 // overlay snapshot. Installed as a middleware via `AuthMiddleware` and
@@ -41,6 +54,17 @@ class IntrospectionClient;
 // ---------------------------------------------------------------------------
 class AuthManager {
  public:
+    // Per-(issuer, policy) accumulator surfaced under /stats auth.per_policy
+    // and auth.issuers[].per_policy. `issuer` is empty for verdicts produced
+    // before issuer selection (e.g. missing_authorization, token_too_large).
+    struct PerPolicyCountersView {
+        std::string issuer;
+        std::string policy;
+        uint64_t allowed = 0;
+        uint64_t denied = 0;
+        uint64_t undetermined = 0;
+    };
+
     struct SnapshotView {
         std::map<std::string, IssuerSnapshotView> issuers;
         uint64_t total_allowed = 0;
@@ -56,6 +80,11 @@ class AuthManager {
         uint64_t introspection_cache_miss = 0;
         uint64_t introspection_cache_negative_hit = 0;
         uint64_t introspection_stale_served = 0;
+        bool enabled = false;
+        bool debug_response_headers = false;
+        // Sorted by (issuer, policy) — std::map iteration in SnapshotAll
+        // produces stable JSON ordering for /stats.
+        std::vector<PerPolicyCountersView> per_policy;
     };
 
     AuthManager(const AuthConfig& config,
@@ -166,7 +195,8 @@ class AuthManager {
         const std::vector<UpstreamConfig>& new_upstreams,
         const std::vector<AuthPolicy>& new_top_level_policies,
         const AuthForwardConfig& new_forward,
-        bool new_master_enabled);
+        bool new_master_enabled,
+        bool new_debug_response_headers);
 
     // Snapshot of runtime counters + per-issuer views.
     SnapshotView SnapshotAll() const;
@@ -189,6 +219,41 @@ class AuthManager {
     // handlers that drive InvokeMiddleware manually. Returns nullptr when
     // the name is unknown.
     Issuer* GetIssuer(const std::string& issuer_name);
+
+    // Single-call observability helper for every auth verdict. Bumps the
+    // process-wide aggregate (total_allowed_ / total_denied_ /
+    // total_undetermined_), bumps the (issuer, policy) bucket, and stamps
+    // X-Auth-Decision / X-Auth-Issuer / X-Auth-Cache when the live
+    // debug_response_headers_ flag is on. Empty issuer omits the issuer
+    // header (no issuer was matched yet). Public so the introspection
+    // resume finalizers (built in an anonymous namespace) can call it via
+    // a captured manager pointer.
+    // captured_incarnation is the policy-name incarnation observed at
+    // dispatch time (see PolicyIncarnation). Sync paths pass std::nullopt
+    // (no gate — they have no dispatch-finalize time gap). Async
+    // introspection finalizers capture the value at dispatch and pass it
+    // here so a verdict from a removed-then-readded policy incarnation
+    // does NOT contaminate the new bucket. On mismatch the per-policy
+    // bump is dropped; the aggregate counter and debug headers still
+    // fire because the request was a real client-visible verdict.
+    void RecordVerdict(HttpResponse& resp,
+                        VerifyOutcome outcome,
+                        const std::string& issuer,
+                        const std::string& policy,
+                        AuthCache cache,
+                        std::optional<uint64_t> captured_incarnation = std::nullopt);
+
+    // Returns the current incarnation for `policy_name`. Always >= 1 for
+    // a policy that has ever been part of a reconcile (or that has been
+    // observed at all — see PolicyIncarnation impl, which lazy-creates
+    // entries at value 1 so async dispatchers and sync reconcilers never
+    // disagree about "incarnation 0 means never seen"). Bumped each time
+    // a policy.name appears AFTER being absent in the previous reconcile
+    // — i.e. every removed-then-readded cycle. Sync paths don't need to
+    // call this; async paths capture the value at dispatch and pass it
+    // back through RecordVerdict at finalize. Acquires per_policy_mtx_
+    // briefly.
+    uint64_t PolicyIncarnation(const std::string& policy_name) const;
 
     // Snapshot of the LIVE issuer name set — the keys of `issuers_` at
     // call time. Used by the reload-validation path to scope per-issuer
@@ -219,11 +284,16 @@ class AuthManager {
 
     // Build an AppliedPolicyList from live+top-level sources. Used by
     // both RegisterPolicy-driven startup (reused here) and by
-    // CommitPolicyAndEnforcement.
+    // CommitPolicyAndEnforcement. Each AppliedPolicy's `incarnation`
+    // field is populated from `incarnations` (lookup by policy.name);
+    // missing names default to 1 so a fresh-start dispatch can capture
+    // a non-zero value that distinguishes from `incarnation = 0` left
+    // over from default-constructed entries.
     static std::shared_ptr<const AppliedPolicyList>
     BuildAppliedPolicyList(
         const std::vector<UpstreamConfig>& upstreams,
-        const std::vector<AuthPolicy>& top_level_policies);
+        const std::vector<AuthPolicy>& top_level_policies,
+        const std::unordered_map<std::string, uint64_t>& incarnations = {});
 
     // Introspection-mode dispatch: cache lookup with sync fast-paths
     // (Fresh+active / Fresh+!active / Stale+active) and a deferred POST on
@@ -233,6 +303,11 @@ class AuthManager {
     // a separate ForwardConfig() read here would race a concurrent
     // CommitForwardAndPolicies() reload and inject headers/raw_token using
     // a forward overlay that doesn't match the policy's reload generation.
+    // policy_incarnation comes from the matched AppliedPolicy in the
+    // snapshot the caller used to select `policy` — atomic with the
+    // policy match. Threaded into IntrospectionDoneCtx so the resume
+    // finalizer's RecordVerdict gate can detect a removed-then-readded
+    // race.
     void InvokeAsyncIntrospection(
         const std::shared_ptr<Issuer>& issuer,
         const IssuerSnapshot& snap,
@@ -241,7 +316,8 @@ class AuthManager {
         const HttpRequest& req,
         HttpResponse& resp,
         std::shared_ptr<HttpRouter::AsyncPendingState> state,
-        std::shared_ptr<const AuthForwardConfig> fwd_snap);
+        std::shared_ptr<const AuthForwardConfig> fwd_snap,
+        uint64_t policy_incarnation);
 
     // Same as InvokeAsyncIntrospection but skips the cache entirely. Used
     // when TokenHasher::Hash returns nullopt (rare HMAC failure) — caching
@@ -254,7 +330,8 @@ class AuthManager {
         const HttpRequest& req,
         HttpResponse& resp,
         std::shared_ptr<HttpRouter::AsyncPendingState> state,
-        std::shared_ptr<const AuthForwardConfig> fwd_snap);
+        std::shared_ptr<const AuthForwardConfig> fwd_snap,
+        uint64_t policy_incarnation);
 
     // Stamp a validated AuthContext onto req for the sync fast-paths
     // (cache hit / stale-serve). Mirrors the JWT-mode mutation block.
@@ -264,6 +341,33 @@ class AuthManager {
                                   const std::string& policy,
                                   const std::string& raw_jwt_header,
                                   const std::string& token);
+
+    // Drop buckets whose policy.name is no longer present in `new_policies`.
+    // Buckets keyed on a still-present policy.name are preserved across
+    // reload — operators see the same counter through a same-name reload.
+    // Removed-then-readded names reset to zero. Caller holds per_policy_mtx_.
+    void ReconcilePerPolicyKeysLocked(const AppliedPolicyList& new_policies);
+
+    // Bump the (issuer, policy) bucket. Lazy-creates on first observation.
+    // Skips silently when both keys are empty. Issuer may be "" for verdicts
+    // produced before issuer selection (token missing, oversized, etc.).
+    // The atomic increment runs inside per_policy_mtx_ so a concurrent
+    // ReconcilePerPolicyKeysLocked cannot erase the bucket between lookup
+    // and use.
+    void BumpPerPolicy(const std::string& issuer,
+                        const std::string& policy,
+                        VerifyOutcome outcome,
+                        std::optional<uint64_t> captured_incarnation = std::nullopt);
+
+    // Stamp X-Auth-Decision / X-Auth-Issuer / X-Auth-Cache on `resp`. No-op
+    // when the live `debug_response_headers_` flag is false. Empty issuer
+    // omits the issuer header (no issuer was matched yet); cache_label
+    // empty / nullptr omits the cache header (JWT mode has no per-request
+    // cache).
+    void StampDebugHeader(HttpResponse& resp,
+                          const char* decision,
+                          const std::string& issuer,
+                          const char* cache_label) const;
 
     std::unordered_map<std::string, std::shared_ptr<Issuer>> issuers_;
     std::shared_ptr<UpstreamHttpClient> upstream_http_client_;
@@ -285,6 +389,12 @@ class AuthManager {
     // true immediately (pass-through). The middleware is installed whenever
     // AuthManager exists (enabled or not) so a later reload can flip it on.
     std::atomic<bool> master_enabled_{false};
+    // Live debug-response-headers switch — published in the same
+    // snapshot_mtx_ critical section as policies_ / forward_ /
+    // master_enabled_, BEFORE master_enabled_'s release-store. Hot path
+    // reads with memory_order_acquire; cost when off is one acquire load
+    // and one branch.
+    std::atomic<bool> debug_response_headers_{false};
 
     std::atomic<uint64_t> total_allowed_{0};
     std::atomic<uint64_t> total_denied_{0};
@@ -308,6 +418,36 @@ class AuthManager {
     // Constructed at Start() once `upstream_http_client_` is wired. Owns
     // the introspection POST plumbing for every issuer.
     std::unique_ptr<IntrospectionClient> introspection_client_;
+
+    // Per-(issuer, policy) accumulators. Independent of snapshot_mtx_ —
+    // these are runtime counters, not config snapshot. unique_ptr because
+    // PerPolicyCounters holds non-movable atomics; std::map keeps lookup
+    // ordered for stable /stats JSON output. Lookups happen once per
+    // request after the verdict is known, never on the per-byte hot path.
+    struct PerPolicyCounters {
+        std::atomic<uint64_t> allowed{0};
+        std::atomic<uint64_t> denied{0};
+        std::atomic<uint64_t> undetermined{0};
+    };
+    using PerPolicyKey = std::pair<std::string, std::string>;
+    mutable std::mutex per_policy_mtx_;
+    std::map<PerPolicyKey, std::unique_ptr<PerPolicyCounters>> per_policy_;
+
+    // Per-policy-name incarnation. Bumped each time a policy.name appears
+    // in the new applied list AFTER being absent in the previous reconcile
+    // — i.e. every removed-then-readded cycle. Async dispatch sites
+    // capture the value at request time and pass it back through
+    // RecordVerdict at finalize time so a stale-incarnation verdict is
+    // dropped instead of contaminating the new bucket. Both maps live
+    // under per_policy_mtx_; reads are coalesced with the per-bucket
+    // operations so the gate is mutex-cheap.
+    // Mutable so the const PolicyIncarnation() can lazy-create entries
+    // at value 1 — the first read for a never-seen name pins the live
+    // value to 1, matching what BuildAppliedPolicyList embeds for
+    // missing-from-incarnations names. Both maps are ALWAYS accessed
+    // under per_policy_mtx_.
+    mutable std::unordered_map<std::string, uint64_t> policy_incarnation_;
+    std::unordered_set<std::string> policy_last_reconciled_;
 
     std::mutex reload_mtx_;
 };
