@@ -45,6 +45,7 @@
 #include "observability_foundation_test.h"
 #include "observability_tracer_test.h"
 #include "observability_metrics_test.h"
+#include "observability_manager_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -193,13 +194,16 @@ void RunAllTest(){
     ObservabilityTracerTests::RunAllTests();
 
     // Observability metrics tests — Counter / Histogram / Meter /
-    // MeterProvider + cardinality registry. Pure in-process; covers
-    // the §7.5/§7.6 SeriesMap + per-key __overflow__ rewrite +
-    // multi-shard concurrent writes. The full BatchSpanProcessor +
-    // OtlpHttpExporter + PrometheusExporter pipeline tests land in
-    // observability_test.h once the rest of the OpenTelemetry slice
-    // ships.
+    // MeterProvider + cardinality registry.
     ObservabilityMetricsTests::RunAllTests();
+
+    // Observability manager + middleware tests — snapshot register-
+    // and-count, FinalizeFromSnapshot CAS gate, KillOutstandingSnapshots,
+    // Reload live-flag flipping, end-to-end middleware. The full
+    // BatchSpanProcessor + OtlpHttpExporter + PrometheusExporter
+    // pipeline tests land in observability_test.h once the rest of the
+    // OpenTelemetry slice ships.
+    ObservabilityManagerTests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;
 }
@@ -257,6 +261,9 @@ void PrintUsage(const char* program_name) {
     std::cout << "  obs_metrics        Observability metrics tests (Counter /" << std::endl;
     std::cout << "                     Histogram / Meter / MeterProvider + cardinality" << std::endl;
     std::cout << "                     registry)" << std::endl;
+    std::cout << "  obs_mgr            Observability manager + middleware tests" << std::endl;
+    std::cout << "                     (snapshot lifecycle, finalize CAS gate, kill" << std::endl;
+    std::cout << "                      loop, Reload, end-to-end middleware)" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -418,6 +425,11 @@ int main(int argc, char* argv[]) {
         // Meter / MeterProvider + cardinality registry).
         }else if(mode == "obs_metrics"){
             ObservabilityMetricsTests::RunAllTests();
+        // Run observability manager + middleware tests (snapshot
+        // lifecycle, FinalizeFromSnapshot CAS gate, kill loop,
+        // Reload, middleware end-to-end).
+        }else if(mode == "obs_mgr"){
+            ObservabilityManagerTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);
