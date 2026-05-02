@@ -3245,19 +3245,28 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                                 .Header("Retry-After", "1")
                                 .Header("Cache-Control", "no-store")
                                 .Text("authentication unavailable on async route — retry");
-                        // The warmup 503 IS an auth-evaluated response —
-                        // route it through RecordVerdict so the aggregate
-                        // total_undetermined_ counter increments and the
-                        // debug response headers (X-Auth-Decision /
-                        // X-Auth-Cache when debug_response_headers=true)
-                        // fire consistently with every other emit site.
-                        // Issuer + policy + incarnation are unavailable
-                        // here (resume_cb was never armed so we don't see
-                        // the IntrospectionDoneCtx); pass empty issuer +
-                        // empty policy + nullopt incarnation — BumpPerPolicy
-                        // early-outs on the empty pair, so no bucket is
-                        // mis-attributed.
-                        if (auth_manager_) {
+                        // The warmup 503 is auth-attributable ONLY when
+                        // auth installed the async middleware. The async
+                        // chain is hard-capped at 1 entry (router throws
+                        // on N>1), and auth installs only when issuers are
+                        // configured at boot — see the install gate above:
+                        //   if (!auth_config_.issuers.empty()) ...
+                        // Issuer-set deltas are restart-required, so this
+                        // gate is stable across the process lifetime and
+                        // mirrors the install decision exactly. If issuers
+                        // are empty, the suspending middleware was an
+                        // embedder's; emitting X-Auth-* headers or bumping
+                        // total_undetermined_ would be misattribution and
+                        // could leak debug headers on a non-auth response.
+                        // Per-policy attribution for auth-owned warmup is
+                        // intentionally not threaded through (BumpPerPolicy
+                        // early-outs on the empty issuer/policy pair, so
+                        // total_undetermined_ moves but no bucket is
+                        // mis-bucketed) — wiring the matched policy
+                        // through AsyncPendingState for a one-shot cache
+                        // warmup path is over-engineering for the value.
+                        if (auth_manager_ &&
+                            !auth_config_.issuers.empty()) {
                             auth_manager_->RecordVerdict(
                                 response, AUTH_NAMESPACE::VerifyOutcome::UNDETERMINED,
                                 /*issuer=*/std::string{},
@@ -4307,10 +4316,12 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                                 .Header("Cache-Control", "no-store")
                                 .Text("authentication unavailable on async route — retry");
                         // Same observability route as the H1 warmup-503
-                        // path — keeps the auth-evaluated debug headers +
-                        // total_undetermined_ counter consistent across
-                        // the H1/H2 transports.
-                        if (auth_manager_) {
+                        // path — gate on the install condition so a
+                        // non-auth embedder's async middleware does not
+                        // get attributed as an auth verdict (see the H1
+                        // site comment for the full rationale).
+                        if (auth_manager_ &&
+                            !auth_config_.issuers.empty()) {
                             auth_manager_->RecordVerdict(
                                 response, AUTH_NAMESPACE::VerifyOutcome::UNDETERMINED,
                                 /*issuer=*/std::string{},
