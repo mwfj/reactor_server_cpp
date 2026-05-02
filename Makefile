@@ -98,7 +98,9 @@ AUTH_SRCS = $(SERVER_DIR)/token_hasher.cc $(SERVER_DIR)/auth_policy_matcher.cc $
 # / OtlpHttpExporter / PrometheusExporter / ObservabilityManager land
 # in subsequent slices.
 OBSERVABILITY_SRCS = $(SERVER_DIR)/trace_id.cc $(SERVER_DIR)/trace_state.cc \
-                     $(SERVER_DIR)/attr_value.cc
+                     $(SERVER_DIR)/attr_value.cc $(SERVER_DIR)/sampler.cc \
+                     $(SERVER_DIR)/span.cc $(SERVER_DIR)/tracer.cc \
+                     $(SERVER_DIR)/tracer_provider.cc
 
 # CLI layer sources
 CLI_SRCS = $(SERVER_DIR)/cli_parser.cc $(SERVER_DIR)/signal_handler.cc $(SERVER_DIR)/pid_file.cc $(SERVER_DIR)/daemonizer.cc
