@@ -1076,8 +1076,21 @@ void HttpServer::MarkServerReady() {
         for (const auto& u : upstream_configs_) {
             if (!u.proxy.auth.enabled) continue;
             if (u.proxy.route_prefix.empty()) continue;
+            // Normalize an empty inline-policy name to the synthesized
+            // "inline:<upstream>" form BEFORE registration so the per-
+            // policy incarnation map and /stats auth.per_policy[] bucket
+            // key match what the reload path's CollectInlineAuthPolicies
+            // produces. Without this, a startup-registered inline policy
+            // with no `name` keys its bucket as "" and its incarnation
+            // entry as "" too — then on the first reload, the same
+            // policy reappears under "inline:<upstream>" and operators
+            // see the bucket "rename" / counter reset.
+            AUTH_NAMESPACE::AuthPolicy inline_policy = u.proxy.auth;
+            if (inline_policy.name.empty()) {
+                inline_policy.name = "inline:" + u.name;
+            }
             auth_manager_->RegisterPolicy({u.proxy.route_prefix},
-                                            u.proxy.auth);
+                                            std::move(inline_policy));
         }
         for (const auto& p : auth_config_.policies) {
             if (!p.enabled) continue;
@@ -3164,6 +3177,25 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                                 .Header("Retry-After", "1")
                                 .Header("Cache-Control", "no-store")
                                 .Text("authentication unavailable on async route — retry");
+                        // The warmup 503 IS an auth-evaluated response —
+                        // route it through RecordVerdict so the aggregate
+                        // total_undetermined_ counter increments and the
+                        // debug response headers (X-Auth-Decision /
+                        // X-Auth-Cache when debug_response_headers=true)
+                        // fire consistently with every other emit site.
+                        // Issuer + policy + incarnation are unavailable
+                        // here (resume_cb was never armed so we don't see
+                        // the IntrospectionDoneCtx); pass empty issuer +
+                        // empty policy + nullopt incarnation — BumpPerPolicy
+                        // early-outs on the empty pair, so no bucket is
+                        // mis-attributed.
+                        if (auth_manager_) {
+                            auth_manager_->RecordVerdict(
+                                response, AUTH_NAMESPACE::VerifyOutcome::UNDETERMINED,
+                                /*issuer=*/std::string{},
+                                /*policy=*/std::string{},
+                                AUTH_NAMESPACE::AuthCache::None);
+                        }
                         if (!server_ready_.load(std::memory_order_acquire)) {
                             response.Header("Connection", "close");
                         }
@@ -4201,6 +4233,17 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                                 .Header("Retry-After", "1")
                                 .Header("Cache-Control", "no-store")
                                 .Text("authentication unavailable on async route — retry");
+                        // Same observability route as the H1 warmup-503
+                        // path — keeps the auth-evaluated debug headers +
+                        // total_undetermined_ counter consistent across
+                        // the H1/H2 transports.
+                        if (auth_manager_) {
+                            auth_manager_->RecordVerdict(
+                                response, AUTH_NAMESPACE::VerifyOutcome::UNDETERMINED,
+                                /*issuer=*/std::string{},
+                                /*policy=*/std::string{},
+                                AUTH_NAMESPACE::AuthCache::None);
+                        }
                         return;
                     }
                     if (mw_state &&
