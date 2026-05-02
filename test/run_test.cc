@@ -46,6 +46,7 @@
 #include "observability_tracer_test.h"
 #include "observability_metrics_test.h"
 #include "observability_manager_test.h"
+#include "observability_propagator_test.h"
 #include "observability_e2e_test.h"
 #include "test_framework.h"
 #include <algorithm>
@@ -203,6 +204,10 @@ void RunAllTest(){
     // Reload live-flag flipping, end-to-end middleware.
     ObservabilityManagerTests::RunAllTests();
 
+    // W3C Trace Context propagator tests — pure value-type tests for
+    // traceparent / tracestate parse + serialize + Inject / Extract.
+    ObservabilityPropagatorTests::RunAllTests();
+
     // Observability end-to-end tests — boot a real HttpServer, install
     // the observability manager + middleware, send TCP-level HTTP
     // requests, assert spans are captured by the InMemorySpanProcessor.
@@ -269,6 +274,8 @@ void PrintUsage(const char* program_name) {
     std::cout << "                      loop, Reload, end-to-end middleware)" << std::endl;
     std::cout << "  obs_e2e            Observability end-to-end tests (boot real" << std::endl;
     std::cout << "                     HttpServer, send HTTP requests, verify spans)" << std::endl;
+    std::cout << "  obs_propagator     W3C Trace Context propagator tests" << std::endl;
+    std::cout << "                     (traceparent / tracestate parse + Inject)" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -440,6 +447,10 @@ int main(int argc, char* argv[]) {
         // requests, assert spans captured).
         }else if(mode == "obs_e2e"){
             ObservabilityE2ETests::RunAllTests();
+        // Run W3C Trace Context propagator tests (traceparent /
+        // tracestate parse + serialize + Inject / Extract).
+        }else if(mode == "obs_propagator"){
+            ObservabilityPropagatorTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

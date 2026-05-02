@@ -4,6 +4,7 @@
 #include "http/http_response.h"
 #include "observability/observability_manager.h"
 #include "observability/observability_snapshot.h"
+#include "observability/propagator.h"
 #include "observability/semantic_conventions.h"
 #include "observability/span.h"
 #include "observability/span_context.h"
@@ -23,23 +24,21 @@ namespace {
 // "all gateway-emitted server spans" by scope name.
 constexpr const char* kInboundTracerName = "reactor.http.server";
 
-// Capture inbound trace context from the request. Task #69 will
-// implement full W3C Propagator extraction; for now we treat the
-// inbound `traceparent` header as ABSENT (RequestTraceContext gets a
-// freshly-generated current_local trace+span id) because the
-// Propagator hasn't landed yet. This is correct behavior for the
-// "no inbound context" case; the propagator slice extends the helper
-// without changing the middleware shape.
+// Capture inbound trace context from the request via the W3C
+// propagator (per OPENTELEMETRY_DESIGN.md §4.5.1). When the inbound
+// `traceparent` header is present + valid, `remote_parent` carries
+// the extracted parent SpanContext (is_remote=true). When absent or
+// malformed, remote_parent is left invalid → the SERVER span becomes
+// a root span. `current_local` is filled by the caller AFTER
+// StartSpan returns, so this helper just sets up the parent.
 RequestTraceContext BuildRequestTraceContext(
-    const HttpRequest& /*request*/,
-    Tracer* tracer) {
+    const HttpRequest& request,
+    Tracer* /*tracer*/) {
     RequestTraceContext rtx;
-    // Empty remote_parent → root span.
-    // current_local is built by the tracer when StartSpan generates
-    // ids; the middleware reads it back from the resulting Span's
-    // Context() and copies into rtx so outbound propagation has a
-    // stable identity.
-    (void)tracer;  // unused until Propagator lands.
+    auto parent = W3CPropagator::Extract(request.headers);
+    if (parent.has_value()) {
+        rtx.remote_parent = std::move(*parent);
+    }
     return rtx;
 }
 
