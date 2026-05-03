@@ -5,11 +5,11 @@
 // rejected with a warn log); `UpDownCounter::Add` accepts both
 // directions.
 //
-// Per OPENTELEMETRY_DESIGN.md §7.6: the SeriesMap uses shared_lock for
-// steady-state reads (existing series found) + unique_lock for new
-// series creation. Concurrent record() from multiple dispatchers
-// shards across `kDefaultMetricShards` parallel maps so writers never
-// collide on the same mutex; Snapshot() merges shards at scrape time.
+// SeriesMap uses shared_lock for steady-state reads (existing series
+// found) + unique_lock for new series creation. Concurrent record()
+// from multiple dispatchers shards across `kDefaultMetricShards`
+// parallel maps so writers never collide on the same mutex;
+// Snapshot() merges shards at scrape time.
 
 #include "observability/attr_value.h"
 #include "observability/metric_label_registry.h"

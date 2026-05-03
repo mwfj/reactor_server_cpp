@@ -1,6 +1,6 @@
 #pragma once
 
-// W3C Trace Context propagator tests (task #69). Pure value-type tests
+// W3C Trace Context propagator tests. Pure value-type tests
 // — no I/O. Covers traceparent parse + serialize round-trip, the
 // W3C §3.2.2.5 invalid-form rejections, tracestate forward/back, and
 // outbound Inject's strip-then-replace behavior.

@@ -14,7 +14,7 @@
 // charset rules — the inbound traceparent path validates structure;
 // tracestate is treated as best-effort metadata that round-trips through
 // the gateway. Oversized list-members or >32 entries → drop tracestate
-// entirely (per the design's "TraceStateOversized" test in §16.2).
+// entirely.
 
 #include <cstddef>
 #include <optional>

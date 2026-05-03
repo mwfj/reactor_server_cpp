@@ -217,8 +217,8 @@ void RunAllTest(){
 
     // Export pipeline tests — BatchSpanProcessor (worker thread + queue
     // overflow + shutdown propagation), PeriodicMetricReader (interval
-    // worker), OtlpHttpExporter (OTLP/JSON serialization + r84 trio +
-    // controlled-merge reload).
+    // worker), OtlpHttpExporter (OTLP/JSON serialization + lifecycle
+    // hooks + controlled-merge reload).
     ObservabilityExportPipelineTests::RunAllTests();
 
     // Prometheus exporter rendering — sanitization, content-type, format
@@ -229,7 +229,7 @@ void RunAllTest(){
     // ValidateHotReloadable splits, MakeMetricsHandler runtime gate.
     ObservabilityConfigTests::RunAllTests();
 
-    // Phase 1c shutdown — finalize CAS gate, KillOutstandingSnapshots
+    // Shutdown drain — finalize CAS gate, KillOutstandingSnapshots
     // counter drain, BeginShutdown idempotency.
     ObservabilityShutdownTests::RunAllTests();
 
@@ -320,7 +320,7 @@ void PrintUsage(const char* program_name) {
     std::cout << "                     counter / gauge / histogram exposition, OpenMetrics)" << std::endl;
     std::cout << "  obs_config         Observability config schema tests (JSON load," << std::endl;
     std::cout << "                     Validate, ValidateHotReloadable, MetricsHandler)" << std::endl;
-    std::cout << "  obs_shutdown       Phase 1c shutdown tests (CAS gate," << std::endl;
+    std::cout << "  obs_shutdown       Shutdown drain tests (CAS gate," << std::endl;
     std::cout << "                     KillOutstandingSnapshots drain, BeginShutdown idempotency)" << std::endl;
     std::cout << "  obs_linkkill       Observability link/kill protocol tests" << std::endl;
     std::cout << "                     (ProxyTransaction link, KillOutstandingSnapshots wiring)" << std::endl;
@@ -427,7 +427,7 @@ int main(int argc, char* argv[]) {
         // Run AuthManager unit tests
         }else if(mode == "auth_mgr" || mode == "-M"){
             AuthManagerTests::RunAllTests();
-        // Run auth integration tests (Phase 2)
+        // Run auth integration tests
         }else if(mode == "auth2" || mode == "-V"){
             AuthIntegrationTests::RunAllTests();
         // Run auth failure mode tests
@@ -514,7 +514,7 @@ int main(int argc, char* argv[]) {
         // Run observability config schema + MakeMetricsHandler tests.
         }else if(mode == "obs_config"){
             ObservabilityConfigTests::RunAllTests();
-        // Run Phase 1c shutdown / kill loop tests.
+        // Run observability shutdown drain / kill loop tests.
         }else if(mode == "obs_shutdown"){
             ObservabilityShutdownTests::RunAllTests();
         // Run observability link/kill protocol tests.

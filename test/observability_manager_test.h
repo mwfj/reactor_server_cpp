@@ -1,8 +1,8 @@
 #pragma once
 
-// ObservabilityManager + ObservabilityMiddleware unit tests (task #66).
-// Covers: snapshot register-and-count atomicity, FinalizeFromSnapshot
-// CAS gate, KillOutstandingSnapshots, Reload live-flag flipping,
+// ObservabilityManager + ObservabilityMiddleware unit tests. Covers
+// snapshot register-and-count atomicity, FinalizeFromSnapshot CAS
+// gate, KillOutstandingSnapshots, Reload live-flag flipping, and
 // middleware end-to-end snapshot population.
 
 #include "test_framework.h"

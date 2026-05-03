@@ -395,12 +395,11 @@ void OtlpHttpExporter::SignalShutdown() {
 }
 
 void OtlpHttpExporter::CancelAllActiveExports() {
-    // Per r84: this is invoked ONLY from §13's self-dispatcher /
-    // single-dispatcher branch. The transport callback is responsible
-    // for honoring the cancel — typical implementations watch for
-    // shutting_down_ between retry attempts. We bump the cancelled
-    // counter as a diagnostic signal; the actual cancel is
-    // transport-specific.
+    // Invoked only from the self-dispatcher / single-dispatcher
+    // shutdown branch. The transport callback honors the cancel —
+    // typical implementations watch for shutting_down_ between retry
+    // attempts. We bump the cancelled counter as a diagnostic signal;
+    // the actual cancel is transport-specific.
     exports_cancelled_.fetch_add(active_exports_.load(std::memory_order_acquire),
                                   std::memory_order_relaxed);
 }
@@ -410,8 +409,8 @@ void OtlpHttpExporter::ReloadHeaders(
     const std::map<std::string, std::string>& metric_headers,
     std::chrono::milliseconds trace_timeout,
     std::chrono::milliseconds metric_timeout) {
-    // Controlled merge per r79: clone the LIVE Options, overwrite
-    // ONLY the live-reloadable subset (headers + timeout), atomic-store.
+    // Controlled merge: clone the LIVE Options, overwrite ONLY the
+    // live-reloadable subset (headers + timeout), atomic-store.
     std::lock_guard<std::mutex> g(options_mtx_);
     auto live = options_;
     auto next = std::make_shared<Options>(*live);

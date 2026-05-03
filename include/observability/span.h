@@ -8,22 +8,21 @@
 // SpanData into the SpanProcessor and marks the Span as
 // no-longer-recording.
 //
-// Per OPENTELEMETRY_DESIGN.md §3.2.2: ALL Span mutation methods are
-// dispatcher-thread-only. Cross-thread access from a worker thread (e.g.
-// a BatchSpanProcessor flushing the queue) is forbidden — the
-// processor receives a fully-detached SpanData snapshot and never
-// touches the Span object. The §13 Phase 1c kill loop respects this
-// contract via the synchronized link/kill protocol (`link_mtx_` on
-// ObservabilitySnapshot) plus `DropWithoutEnd()`, which mutates Span
-// members on the OWNING DISPATCHER (either inline when the kill loop
-// is on-thread, or marshaled via EnQueue per r80).
+// Span mutation is dispatcher-thread-only. Cross-thread access from a
+// worker thread (e.g. a BatchSpanProcessor flushing the queue) is
+// forbidden — the processor receives a fully-detached SpanData snapshot
+// and never touches the Span object. The shutdown kill loop respects
+// this contract via the synchronized link/kill protocol on
+// ObservabilitySnapshot plus DropWithoutEnd(), which mutates Span
+// members on the OWNING DISPATCHER (inline when the kill loop is on-
+// thread, or marshaled via EnQueue otherwise).
 //
 // Idempotent guarantees:
-//   - `End()` may be called at most once. Repeat calls are silently
+//   - End() may be called at most once. Repeat calls are silently
 //     dropped (logged in debug builds).
-//   - `DropWithoutEnd()` is safe to call BEFORE `End()` — it cancels
-//     the OnEnd dispatch so SpanProcessor::OnEnd never fires for this
-//     span. Used by the §13 kill path on processor teardown.
+//   - DropWithoutEnd() is safe to call BEFORE End() — it cancels the
+//     OnEnd dispatch so SpanProcessor::OnEnd never fires for this
+//     span. Used by the shutdown kill path on processor teardown.
 
 #include "observability/instrumentation_scope.h"
 #include "observability/resource.h"
@@ -113,14 +112,14 @@ public:
     void End(std::chrono::system_clock::time_point end_system =
                  std::chrono::system_clock::now());
 
-    // Drop without firing OnEnd. Used by the §13 kill path on shutdown
-    // to release Span members WITHOUT enqueuing to the processor (which
+    // Drop without firing OnEnd. Used by the shutdown kill path to
+    // release Span members WITHOUT enqueueing to the processor (which
     // may already be torn down). Idempotent. After DropWithoutEnd,
     // subsequent End() / mutator calls are no-ops.
     //
-    // MUST be called on the owning dispatcher per the dispatcher-thread-
-    // only mutation contract. The §13 kill loop (CASE B inline branch
-    // per r80) calls this directly; CASE A marshals via EnQueue.
+    // Must be called on the owning dispatcher per the dispatcher-
+    // thread-only mutation contract. Inline kills run it directly;
+    // cross-dispatcher kills marshal via EnQueue.
     void DropWithoutEnd();
 
 private:
@@ -151,9 +150,9 @@ private:
     // Held by shared_ptr so the processor stays alive as long as ANY
     // Span references it. The TracerProvider holds the canonical
     // shared_ptr; per-span ownership is a weak reference upgraded to
-    // strong at construction. r80: when the manager is torn down before
+    // strong at construction. When the manager is torn down before
     // End(), the kill-marshal closure captures `weak_from_this()` on
-    // the manager, NOT raw `this` — see §13.
+    // the manager (NOT raw `this`) so the closure no-ops cleanly.
     std::shared_ptr<SpanProcessor> processor_;
 
     // Atomic flags so IsRecording() can be queried from any thread

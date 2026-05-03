@@ -41,10 +41,9 @@ struct HttpRequest {
     // ============== OpenTelemetry observability fields ==============
     //
     // All six fields are populated by the observability middleware and/or
-    // the connection handler. When `observability.enabled=false` (the
-    // default deployment per OPENTELEMETRY_DESIGN.md §14), the manager
-    // is null and these stay default-constructed — the disabled fast
-    // path's only cost is one branch per request.
+    // the connection handler. When observability is disabled (the
+    // default deployment), the manager is null and these stay default-
+    // constructed — the disabled fast path costs one branch per request.
 
     // W3C Trace Context state for this request — extracted from inbound
     // `traceparent` (may be default-constructed when absent), plus a
@@ -52,7 +51,7 @@ struct HttpRequest {
     // gateway's INBOUND server hop. Always-set when observability is
     // enabled (regardless of sampling decision); used for outbound
     // propagation including DROP-sampled requests so downstream services
-    // attach to a synthetic per-attempt span_id. See §4.5.1.
+    // attach to a synthetic per-attempt span_id.
     std::optional<OBSERVABILITY_NAMESPACE::RequestTraceContext> trace_ctx;
 
     // The inbound SERVER span allocated by the observability middleware,
@@ -62,24 +61,23 @@ struct HttpRequest {
     std::shared_ptr<OBSERVABILITY_NAMESPACE::Span> observability_span;
 
     // url.scheme — populated by the connection handler at parse time.
-    // H1 derives `"http"` / `"https"` from `ConnectionHandler::HasTls()`;
-    // H2 copies the `:scheme` pseudo-header. Used to satisfy the §7.1
-    // `url.scheme` attribute on server spans + metric labels.
+    // H1 derives "http" / "https" from `ConnectionHandler::HasTls()`;
+    // H2 copies the `:scheme` pseudo-header. Carries the OTel HTTP
+    // semconv `url.scheme` value for server spans + metric labels.
     std::string url_scheme;
 
     // network.protocol.version — populated by the connection handler at
-    // parse time. H1 formats as `"1.0"` / `"1.1"` (this server explicitly
-    // accepts HTTP/1.0; hardcoding `"1.1"` would mislabel HTTP/1.0 spans).
-    // H2 always emits `"2"`. Required for the §7.1
-    // `http.server.request.duration{network.protocol.version=...}` series.
+    // parse time. H1 formats as "1.0" / "1.1" (this server explicitly
+    // accepts HTTP/1.0; hardcoding "1.1" would mislabel HTTP/1.0 spans).
+    // H2 always emits "2". Carries the OTel HTTP semconv
+    // `network.protocol.version` value.
     std::string network_protocol_version;
 
     // The dispatcher (event loop) that owns this connection. The
     // observability snapshot's kill-marshal target reads this field to
-    // choose between inline-on-self-dispatcher and EnQueue-cross-dispatcher
-    // execution per §13. Set by the connection handler at parse time
-    // (Dispatcher exposes no thread-local Current() accessor, so the
-    // request must carry the dispatcher pointer explicitly).
+    // choose between inline-on-self-dispatcher and cross-dispatcher
+    // EnQueue. Set by the connection handler at parse time (Dispatcher
+    // has no thread-local Current() accessor).
     Dispatcher* owning_dispatcher = nullptr;
 
     // Per-request observability bookkeeping snapshot — populated by the
@@ -87,7 +85,7 @@ struct HttpRequest {
     // rate-limit run (so middleware-rejection paths can finalize through
     // the snapshot). Async wrappers + streaming senders capture this
     // shared_ptr by value BEFORE any HttpRequest::Reset(), so the
-    // snapshot's lifetime is independent of the request slot. See §6.1.2.
+    // snapshot's lifetime is independent of the request slot.
     std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> obs_snapshot;
     // ===============================================================
 
@@ -197,11 +195,10 @@ struct HttpRequest {
         params.clear();
         route_match = {};
         // Observability fields — cleared symmetrically with the other
-        // dispatch-time mutable state. Async wrappers + streaming senders
-        // capture obs_snapshot by value BEFORE Reset, so this reset is
-        // safe; it just tells the next pipelined request "you start with
-        // a fresh observability slot, allocate your own snapshot." See
-        // OPENTELEMETRY_DESIGN.md §6.1.2.
+        // dispatch-time mutable state. Async wrappers + streaming
+        // senders capture obs_snapshot by value BEFORE Reset, so this
+        // reset is safe; it just tells the next pipelined request to
+        // allocate its own snapshot.
         trace_ctx.reset();
         observability_span.reset();
         url_scheme.clear();

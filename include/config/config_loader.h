@@ -161,7 +161,7 @@ public:
     //     (rejects route_trie patterns because the auth matcher is
     //     literal-only)
     //   - enforcement-not-yet-wired gate: rejects `proxy.auth.enabled=true`
-    //     until request-time enforcement is wired (design spec §14 Phase 2)
+    //     until request-time enforcement is wired
     //
     // Does NOT run collision detection — that requires the cross-source
     // view (inline + top-level applies_to) which the full Validate owns.

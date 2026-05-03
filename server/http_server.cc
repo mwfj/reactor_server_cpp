@@ -3833,10 +3833,9 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
             if (!server_ready_.load(std::memory_order_acquire)) {
                 response.Header("Connection", "close");
             }
-            // Observability finalize for H1 sync path (per
-            // OPENTELEMETRY_DESIGN.md §6.1.2). Idempotent CAS gate on
-            // the snapshot ensures exactly-once dispatch even if a
-            // future error path also calls finalize.
+            // H1 sync-path observability finalize. The CAS gate on the
+            // snapshot ensures exactly-once dispatch even if a future
+            // error path also calls finalize.
             FinalizeIfSnapshot(request, response, /*error_type=*/std::string{});
         }
     );
@@ -4860,8 +4859,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
             RestoreDebugAuthHeaders(response, auth_hdrs);
-            // Observability finalize for H2 sync path (per
-            // OPENTELEMETRY_DESIGN.md §6.1.2). Idempotent CAS gate.
+            // H2 sync-path observability finalize. CAS gate ensures
+            // exactly-once dispatch.
             FinalizeIfSnapshot(request, response, /*error_type=*/std::string{});
         }
     );

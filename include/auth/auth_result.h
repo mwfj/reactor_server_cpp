@@ -9,7 +9,7 @@ namespace AUTH_NAMESPACE {
 // Result vocabulary for the auth pipeline (middleware + verifier). Kept in
 // a dedicated header so `auth_context.h` stays a pure data struct and so
 // downstream modules that only need the outcome enum can avoid pulling in
-// the full AuthContext definition. See design spec §6.1 / §8.
+// the full AuthContext definition. 
 // ---------------------------------------------------------------------------
 
 // Outcome of a verify pass over a bearer token + policy.

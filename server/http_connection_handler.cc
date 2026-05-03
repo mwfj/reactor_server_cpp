@@ -965,10 +965,9 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     if (was_head) StripResponseBodyForHead(wire);
     conn_->SendRaw(wire.data(), wire.size());
 
-    // Fire the per-request post-wire notifier (§13 r84): the wire
-    // bytes are now buffered for send; the shutdown-route pump and
-    // any other observer keys on this. Fired AFTER SendRaw so the
-    // ordering is "bytes buffered → notifier flipped".
+    // Fire the per-request post-wire notifier: the wire bytes are now
+    // buffered for send. Fired AFTER SendRaw so the ordering is
+    // "bytes buffered → notifier flipped".
     if (post_write_notify_) {
         post_write_notify_->store(true, std::memory_order_release);
         post_write_notify_.reset();
@@ -1047,8 +1046,8 @@ void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
     versioned.Version(1, current_http_minor_.load(std::memory_order_acquire));
     std::string wire = versioned.Serialize();
     conn_->SendRaw(wire.data(), wire.size());
-    // Fire the per-request post-wire notifier (§13 r84): the wire
-    // bytes are now buffered for send; downstream pumps key on this.
+    // Fire the per-request post-wire notifier: the wire bytes are now
+    // buffered for send; downstream pumps key on this.
     if (post_write_notify_) {
         post_write_notify_->store(true, std::memory_order_release);
         post_write_notify_.reset();
@@ -1059,11 +1058,9 @@ namespace {
 
 // Compute the body size that ACTUALLY landed on the wire after
 // normalization. HEAD-stripped responses + 1xx / 204 / 304 produce
-// 0 (no body emitted). Everything else returns the response body's
-// post-normalization byte count.
-//
-// Per OPENTELEMETRY_DESIGN.md §6.1.2: this is the
-// `http.server.response.body.size` value handed to FinalizeFromSnapshot.
+// 0 (no body emitted); everything else returns the response body's
+// post-normalization byte count. The result is the
+// `http.server.response.body.size` semconv value.
 inline uint64_t ComputeWireBodySize(const HttpResponse& response,
                                       bool was_head_request) noexcept {
     if (was_head_request) return 0;

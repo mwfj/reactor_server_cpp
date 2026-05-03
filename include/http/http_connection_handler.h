@@ -36,7 +36,7 @@ public:
     void SendResponse(const HttpResponse& response);
 
     // ============================================================
-    // Observability finalize hooks (per OPENTELEMETRY_DESIGN.md §6.1.2)
+    // Observability finalize hooks
     // ============================================================
     // Hook signature receives the WIRE body size — the byte count
     // ACTUALLY written to the socket post-normalization. HEAD-stripped
@@ -66,9 +66,9 @@ public:
     // Per-request orthogonal post-wire-write notification slot.
     // Independent of `WithFinalize` (which carries the observability
     // finalize hook). Both signals fire at the same wire-write
-    // completion instant. CASE B of `WriteResponseAndStop` (per §13)
-    // arms this slot when no observability snapshot exists, so the
-    // shutdown-route pump knows when the response has been buffered.
+    // completion instant. The shutdown-route pump arms this slot when
+    // no observability snapshot exists so it knows when the response
+    // has been buffered.
     //
     // The framework signals it by calling `notify_sent->store(true,
     // std::memory_order_release);` immediately AFTER the post-wire-
@@ -197,9 +197,9 @@ public:
     // this, the heartbeat timer dies with the connection and a stuck
     // handler would leak active_requests_ permanently.
     //
-    // Also fires the post_write_notify_ flag (§13 r84) so any
-    // shutdown-route pump waiting on this slot observes "framework
-    // gave up on this submission" — the correct shutdown signal.
+    // Also fires the post_write_notify_ flag so any shutdown-route
+    // pump waiting on this slot observes "framework gave up on this
+    // submission" — the correct shutdown signal.
     // The helper does not need to distinguish wrote-OK vs gave-up:
     // either way the queued submit work has run and Stop() can
     // proceed.
@@ -358,7 +358,6 @@ private:
     // Per-request orthogonal post-wire-write notifier slot. Set by
     // SetPostWriteNotifyOnce; flipped after the wire-bytes are buffered;
     // cleared post-signal so the next pipelined request starts clean.
-    // Per OPENTELEMETRY_DESIGN.md §13 r84.
     std::shared_ptr<std::atomic<bool>> post_write_notify_;
 
     // Active streaming sender for the current deferred async request.

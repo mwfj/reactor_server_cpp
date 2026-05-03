@@ -274,7 +274,7 @@ public:
     // + legacy bool flags. Idempotent: a second call short-circuits when
     // route_match.kind is already non-None.
     //
-    // Precedence chain (per OPENTELEMETRY_DESIGN.md §5.2 / §17.1):
+    // Precedence chain:
     //   (0a) WS upgrade-candidate detection (cheap presence check).
     //   (0b) Full RFC 6455 validation for upgrade candidates. On VALID
     //        + WS-trie hit → kind=WsUpgrade. On VALID + miss OR INVALID

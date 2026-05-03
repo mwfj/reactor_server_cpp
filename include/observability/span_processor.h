@@ -1,17 +1,16 @@
 #pragma once
 
-// SpanProcessor interface per OTel SDK spec §5.
+// SpanProcessor interface per OTel SDK spec.
 //
 // Tracer and Span call into the processor at OnStart / OnEnd; the
 // processor decides whether to enqueue for export, drop, or both.
 // Concrete implementations:
-//   - NoopSpanProcessor — discards everything (used when traces are
-//     disabled but the manager still exists for metric/structured-log
-//     correlation purposes).
+//   - NoopSpanProcessor — discards everything; used when traces are
+//     disabled but the manager still exists for metric / structured-
+//     log correlation.
 //   - InMemorySpanProcessor — retains finished SpanData for in-process
-//     tests (no worker thread, no export). Used by the §16 unit-test
-//     suite to assert span shapes WITHOUT spinning up the OTLP pipeline.
-//   - BatchSpanProcessor — production export path; lands in task #70.
+//     tests (no worker thread, no export).
+//   - BatchSpanProcessor — production export path.
 
 #include "observability/span_data.h"
 
@@ -36,14 +35,14 @@ public:
     // SpanData (move semantics — caller passes by value).
     virtual void OnEnd(SpanData data) = 0;
 
-    // Called by SpanExporter / TracerProvider shutdown. r84 contract:
-    // the exporter owns the trio (SignalShutdown / CancelAllActiveExports
-    // / RebindDispatcher). Processors expose their own lifecycle:
-    //   - SignalShutdown: stop accepting new OnEnd; begin draining.
-    //   - JoinWorkers(deadline): block until the drain completes or the
-    //     deadline expires.
-    // The default no-op processors don't have workers; only
-    // BatchSpanProcessor (task #70) overrides these.
+    // Lifecycle hooks. SpanExporter / TracerProvider call them on
+    // shutdown; SpanExporter owns the SignalShutdown /
+    // CancelAllActiveExports / RebindDispatcher trio separately.
+    //   SignalShutdown: stop accepting new OnEnd; begin draining.
+    //   JoinWorkers:    block until the drain completes or `deadline`
+    //                   expires.
+    // Default no-op processors don't have workers; only
+    // BatchSpanProcessor overrides these.
     virtual void SignalShutdown() {}
     virtual void JoinWorkers(std::chrono::milliseconds /*deadline*/) {}
 };

@@ -377,8 +377,8 @@ private:
     bool ConsultBreaker();
 
     // ReportBreakerOutcome: classify a result_code into
-    // success/failure/neutral (per design §7) and call slice->Report*
-    // with admission_generation_. Clears admission_generation_ so a
+    // success/failure/neutral and call slice->Report* with
+    // admission_generation_. Clears admission_generation_ so a
     // double-report is impossible.
     //
     // failure_kind is ignored unless the outcome is a FailureKind-bearing

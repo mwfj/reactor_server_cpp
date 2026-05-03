@@ -283,11 +283,10 @@ public:
     // Fire FinalizeFromSnapshot on the request's observability snapshot
     // (if non-null). Computes the wire body size from the response's
     // status + body — bodyless statuses (1xx / 204 / 304) and HEAD
-    // requests record 0. `error_type` is the OTel-spec
+    // requests record 0. `error_type` is the OTel HTTP semconv
     // `error.type` attribute value: empty string for success, or one
-    // of the documented categorical strings ("rejected_by_middleware",
-    // "handler_threw", "client_error", "server_error", etc.) per
-    // OPENTELEMETRY_DESIGN.md §6.1.2.
+    // of the categorical strings ("rejected_by_middleware",
+    // "handler_threw", "client_error", "server_error", etc.).
     //
     // Idempotent: multiple calls per request are CAS-gated by the
     // snapshot itself; only the first call wins. Safe to call even
@@ -546,15 +545,13 @@ private:
     AUTH_NAMESPACE::AuthConfig auth_config_;
     std::unique_ptr<AUTH_NAMESPACE::AuthManager> auth_manager_;
 
-    // OpenTelemetry observability manager — null when
-    // observability.enabled=false (the default deployment per
-    // OPENTELEMETRY_DESIGN.md §14). When non-null, the request
-    // callback invokes FinalizeFromSnapshot at completion via
-    // FinalizeIfSnapshot. shared_ptr (not unique_ptr) so the
-    // observability-middleware closure can hold a co-owning reference
-    // for its lifetime — see §17.1 r37 weak_ptr lifecycle requirement
-    // for ObservabilityManager (manager inherits enable_shared_from_this
-    // so weak_from_this() inside the kill loop has a seeded weak ref).
+    // OpenTelemetry observability manager — null when observability
+    // is disabled (the default deployment). When non-null, the request
+    // callback invokes FinalizeIfSnapshot at completion. shared_ptr
+    // (not unique_ptr) so the observability-middleware closure can
+    // hold a co-owning reference for its lifetime; the manager
+    // inherits enable_shared_from_this so kill-loop closures can use
+    // weak_from_this().
     std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>
         observability_manager_;
 

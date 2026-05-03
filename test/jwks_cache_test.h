@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// JwksCache unit tests — Phase 1b / Phase 2 test suite.
+// JwksCache unit tests.
 //
 // Exercises the JwksCache class in isolation (no network, no server).
 // Covers: hit/miss/single-key-tolerance, TTL expiry, coalescing refresh

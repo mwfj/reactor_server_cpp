@@ -1,7 +1,7 @@
 #pragma once
 
 // MetricExporter — the wire-format export interface for metrics.
-// Same r84 trio shape as SpanExporter (SignalShutdown /
+// Same lifecycle hooks as SpanExporter (SignalShutdown /
 // CancelAllActiveExports / RebindDispatcher).
 
 #include "observability/metrics_snapshot.h"

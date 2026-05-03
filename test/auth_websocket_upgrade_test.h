@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// Auth WebSocket upgrade tests — Phase 2 test suite.
+// Auth WebSocket upgrade tests.
 //
 // WebSocket upgrade requests pass through the HTTP middleware chain before
 // the 101 Switching Protocols response is sent. These tests verify that

@@ -1,6 +1,6 @@
 #pragma once
 
-// IssueTraceContext outbound injection tests (task #75). Verifies that
+// IssueTraceContext outbound injection tests. Verifies that
 // UpstreamHttpClient::ApplyOutboundTraceContext follows the §6.3 strip-
 // and-replace contract for the JWKS / OIDC / introspection / OTLP
 // outbound paths.

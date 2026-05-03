@@ -71,7 +71,7 @@ public:
     void SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
 
     // ============================================================
-    // Observability finalize hooks (per OPENTELEMETRY_DESIGN.md §6.1.2)
+    // Observability finalize hooks
     // ============================================================
     using FinalizeHook = std::function<void(uint64_t wire_body_size)>;
 
@@ -297,11 +297,9 @@ private:
     // Per-stream safety-cap abort hooks. See SetStreamAbortHook.
     std::unordered_map<int32_t, std::function<void()>> stream_abort_hooks_;
 
-    // Per-stream orthogonal post-wire-write notifier slots. Set by
-    // SetPostWriteNotifyOnce(stream_id, ...); flipped after the
-    // response frames are committed to nghttp2's output buffer; cleared
-    // post-signal. Used by ShutdownContext H2 CASE B per
-    // OPENTELEMETRY_DESIGN.md §13 r84.
+    // Per-stream post-wire-write notifier slots. Flipped after the
+    // response frames commit to nghttp2's output buffer; cleared post-
+    // signal. Consumed by the shutdown-route pump.
     std::unordered_map<int32_t, std::shared_ptr<std::atomic<bool>>>
         stream_post_write_notify_;
 };

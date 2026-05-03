@@ -1,6 +1,6 @@
 #pragma once
 
-// PrometheusExporter unit tests (task #71).
+// PrometheusExporter unit tests.
 //
 // Pure-text rendering — no I/O. Builds MetricsSnapshot fixtures by hand
 // and asserts on the rendered exposition / OpenMetrics output.

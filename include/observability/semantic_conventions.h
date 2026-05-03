@@ -6,10 +6,9 @@
 // All values are `constexpr string_view` so they participate in
 // compile-time deduplication and incur no runtime allocation.
 //
-// Per OPENTELEMETRY_DESIGN.md §3.4 / §7.1: the OTel-spec HTTP semconv
-// catalog uses dotted identifiers. The Prometheus exporter (§8.3)
-// translates these to `_`-separated names at render time; the OTLP
-// path emits them verbatim.
+// The OTel-spec HTTP semconv catalog uses dotted identifiers. The
+// Prometheus exporter translates these to `_`-separated names at
+// render time; the OTLP path emits them verbatim.
 
 #include <string_view>
 

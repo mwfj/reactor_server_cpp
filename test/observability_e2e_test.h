@@ -1,8 +1,8 @@
 #pragma once
 
-// End-to-end observability tests (task #68 — verify FinalizeFromSnapshot
-// fires on real HTTP requests through HttpServer with the observability
-// middleware installed).
+// End-to-end observability tests — verify FinalizeFromSnapshot fires
+// on real HTTP requests through HttpServer with the observability
+// middleware installed.
 //
 // These tests boot a real HttpServer, install an ObservabilityManager
 // backed by the InMemorySpanProcessor, send TCP-level HTTP requests via

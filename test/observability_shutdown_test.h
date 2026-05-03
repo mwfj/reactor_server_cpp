@@ -1,9 +1,9 @@
 #pragma once
 
-// Phase 1c shutdown tests (task #73). Exercises WaitForAllAsyncDrain
-// indirectly through the public counters on UpstreamManager and
-// ObservabilityManager, plus KillOutstandingSnapshots' CASE A/B
-// behavior on snapshots that survive the drain.
+// Shutdown drain tests. Exercises WaitForAllAsyncDrain indirectly
+// through the public counters on UpstreamManager and
+// ObservabilityManager, plus KillOutstandingSnapshots' behavior on
+// snapshots that survive the drain.
 
 #include "test_framework.h"
 #include "observability/observability_manager.h"
@@ -42,8 +42,8 @@ void TestNoLiveSnapshotsZeroCounter() {
 }
 
 // Registering a snapshot bumps inflight_finalizations; finalize-win
-// drops it back to zero — the post-finalize state is what Phase 1c
-// waits for.
+// drops it back to zero — the post-finalize state is what the
+// shutdown drain waits for.
 void TestRegisterFinalizeRoundTrip() {
     try {
         auto m = MakeManager();

@@ -10,18 +10,19 @@
 //   - `kind`              — SpanKind (SERVER / CLIENT / INTERNAL / etc).
 //   - `parent`            — parent SpanContext (default-constructed for
 //                            root spans).
-//   - `precomputed_context` — when set, the new Span uses THIS context
+//   - `precomputed_context` — when set, the new Span uses this context
 //                              verbatim instead of generating a fresh
-//                              span_id. Required for the §6.1 r5 contract:
-//                              the proxy / auth callers want the exported
-//                              CLIENT span's `Context().span_id` to match
-//                              the wire-format span_id they ALREADY
-//                              injected via `AttemptTraceContext.attempt_local`
-//                              / `IssueTraceContext.local`. Without this,
-//                              outbound traceparent injection (which uses
-//                              the per-call context) and the exported
-//                              CLIENT span (which would otherwise use a
-//                              freshly-generated span_id) would diverge.
+//                              span_id. Proxy / auth callers want the
+//                              exported CLIENT span's
+//                              `Context().span_id` to match the wire-
+//                              format span_id they already injected via
+//                              `AttemptTraceContext.attempt_local` /
+//                              `IssueTraceContext.local`. Without this,
+//                              outbound traceparent (which uses the
+//                              per-call context) and the exported
+//                              CLIENT span (which would otherwise use
+//                              a freshly-generated span_id) would
+//                              diverge.
 //   - `start_time`        — explicit start time; defaults to now().
 //   - `attributes`        — initial attribute set (saves `SetAttribute`
 //                            calls from the hot path).

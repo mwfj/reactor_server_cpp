@@ -223,7 +223,7 @@ static nlohmann::json SerializeAuthPolicy(const AUTH_NAMESPACE::AuthPolicy& p) {
 // `allow_applies_to` controls whether the `applies_to` field is permitted
 // in this JSON. Top-level policies set it to true (applies_to is the
 // REQUIRED prefix declaration). Inline proxy.auth blocks set it to false:
-// per design spec §3.2 / §5.2, the prefix for an inline policy is
+// the prefix for an inline policy is
 // derived from `proxy.route_prefix` at AuthManager::RegisterPolicy time,
 // and an inline `applies_to` would be silently ignored — the JSON would
 // then describe a different protected path than what the runtime uses,
@@ -255,7 +255,7 @@ static void ParseAuthPolicy(const nlohmann::json& j, AUTH_NAMESPACE::AuthPolicy&
             throw std::invalid_argument(
                 context + ".applies_to is not permitted on inline auth "
                 "(the prefix is derived from the surrounding proxy's "
-                "route_prefix, see design spec §3.2 / §5.2). Remove "
+                "route_prefix, ). Remove "
                 "applies_to here, or move this policy to top-level "
                 "auth.policies[] if it needs an explicit prefix list.");
         }
@@ -384,7 +384,7 @@ static void ParseIssuerConfig(const std::string& name, const nlohmann::json& j,
         }
         const auto& i = j["introspection"];
         // Reject inline client_secret — only env-var sourcing is allowed
-        // (design spec §9 item 8, §5.3).
+        //.
         if (i.contains("client_secret")) {
             throw std::invalid_argument(
                 ctx + ".introspection.client_secret must NOT be set inline; "
@@ -777,12 +777,11 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
 
                 // Inline per-proxy auth policy. `applies_to` is derived from
                 // `route_prefix` at AuthManager::RegisterPolicy time — the
-                // inline stanza never declares its own `applies_to`. See
-                // design spec §3.2 / §5.2. Pass `allow_applies_to=false`
-                // so the parser rejects misleading inline applies_to
-                // declarations at parse time, before they can mislead an
-                // operator into thinking that field governs runtime
-                // matching.
+                // inline stanza never declares its own `applies_to`. Pass
+                // `allow_applies_to=false` so the parser rejects misleading
+                // inline applies_to declarations at parse time, before they
+                // can mislead an operator into thinking that field governs
+                // runtime matching.
                 if (proxy.contains("auth")) {
                     ParseAuthPolicy(
                         proxy["auth"],
@@ -968,7 +967,7 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
             dns, "resolver_max_inflight", config.dns.resolver_max_inflight, "dns");
     }
 
-    // Observability section (full §10 schema). The master switch is
+    // Observability section. The master switch is
     // `observability.enabled` (RESTART). Sub-blocks override defaults
     // when present; missing blocks keep struct defaults.
     if (j.contains("observability")) {
@@ -1894,7 +1893,7 @@ void ConfigLoader::ValidateHotReloadable(
                 throw std::invalid_argument(
                     ctx + ".algorithms contains unsupported value '" + a +
                     "' (v1 supports only RS256/RS384/RS512/ES256/ES384; "
-                    "HS*/none/PS*/auto are deferred per design spec §15)");
+                    "HS*/none/PS*/auto are deferred )");
             }
         }
         // Introspection-block input validation runs for ALL staged issuers
@@ -1974,7 +1973,7 @@ void ConfigLoader::ValidateHotReloadable(
 // Validate the observability schema. Splits into a "live-reloadable"
 // subset (called from ValidateHotReloadable) and a "restart-required"
 // subset (called only from Validate at startup). The split mirrors
-// OPENTELEMETRY_DESIGN.md §11.2.
+// the field classification in `ObservabilityConfig`.
 static void ValidateObservabilityLive(const ServerConfig& config) {
     const auto& oc = config.observability;
     if (!oc.enabled) return;  // master switch off — nothing to live-validate.
@@ -2635,7 +2634,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
     ValidateRateLimitHotReloadable(config);
 
     // -------------------------------------------------------------------
-    // Auth validation (design spec §5.3).
+    // Auth validation.
     //
     // Scope: defensive input validation on the parsed auth config. Hard-
     // reject conditions that cannot safely be live-applied later by
@@ -2661,7 +2660,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             if (ic.issuer_url.empty()) {
                 throw std::invalid_argument(ctx + ".issuer_url is required");
             }
-            // TLS-mandatory to IdP (design spec §9 item 4). Plaintext rejected.
+            // TLS-mandatory to IdP. Plaintext rejected.
             // Case-insensitive scheme per RFC 3986 §3.1.
             if (!AUTH_NAMESPACE::HasHttpsScheme(ic.issuer_url)) {
                 throw std::invalid_argument(
@@ -2681,7 +2680,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     throw std::invalid_argument(
                         ctx + ".algorithms contains unsupported value '" + a +
                         "' (v1 supports only RS256/RS384/RS512/ES256/ES384; "
-                        "HS*/none/PS*/auto are deferred per design spec §15)");
+                        "HS*/none/PS*/auto are deferred )");
                 }
             }
             // Referenced upstream is mandatory — JWKS refresh, OIDC
@@ -2742,7 +2741,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 throw std::invalid_argument(ctx + ".jwks_cache_sec must be > 0");
             }
 
-            // Mode-specific required fields (design spec §5.3).
+            // Mode-specific required fields.
             // jwt mode requires at least one algorithm and a key source —
             // either OIDC discovery OR a static jwks_uri.
             // introspection mode requires the endpoint (the POST target).
@@ -2764,7 +2763,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             }
 
             // TLS-mandatory on actual outbound IdP endpoints, not just on
-            // issuer_url (design spec §9 item 4 hardening). The issuer_url
+            // issuer_url. The issuer_url
             // check above protects discovery; these checks protect the two
             // other URLs that carry security-sensitive data:
             //
@@ -2788,14 +2787,14 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 throw std::invalid_argument(
                     ctx + ".jwks_uri must start with https:// — plaintext "
                     "JWKS allows MITM key substitution and would compromise "
-                    "token verification (design spec §9 item 4)");
+                    "token verification");
             }
             if (!ic.introspection.endpoint.empty() &&
                 !AUTH_NAMESPACE::HasHttpsScheme(ic.introspection.endpoint)) {
                 throw std::invalid_argument(
                     ctx + ".introspection.endpoint must start with https:// "
                     "— plaintext introspection would leak bearer tokens and "
-                    "client credentials over the wire (design spec §9 item 4)");
+                    "client credentials over the wire");
             }
 
             // TLS-on-upstream check for introspection-mode issuers.
@@ -2866,7 +2865,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 }
             }
 
-            // Mode/endpoint mismatch — warn per design spec §5.3. Not a
+            // Mode/endpoint mismatch — warn Not a
             // hard-reject because operators sometimes template both blocks
             // and select mode dynamically; emitting a warn ensures the
             // unused field is noticed without blocking deployment.
@@ -2939,7 +2938,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
 
             // ---- Structural validation: runs regardless of `enabled` ----
             //
-            // Per the rollout plan (design spec §14), operators are EXPECTED
+            // Per the rollout plan, operators are EXPECTED
             // to pre-stage inline auth blocks with `enabled=false` while
             // request-time enforcement is being wired in follow-up PRs.
             // If we only validated when enabled=true, typos in the staged
@@ -2989,7 +2988,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
 
             // route_prefix must be a LITERAL byte prefix when inline auth
             // is populated. AUTH_NAMESPACE::FindPolicyForPath does literal-prefix
-            // matching (design spec §3.2) — it has no understanding of the
+            // matching — it has no understanding of the
             // route_trie's :param / *splat syntax. A proxy with
             // `/api/:version/users/*path` routes real requests like
             // `/api/v1/users/123` via the trie just fine, but the AUTH
@@ -3027,7 +3026,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                                 ? "':" + s.param_name + "' param"
                                 : "'*" + s.param_name + "' catch-all") +
                             " segment). The auth matcher does byte-prefix "
-                            "matching only (design spec §3.2). If you need "
+                            "matching only. If you need "
                             "to protect a patterned route, use top-level "
                             "auth.policies[] with applies_to listing the "
                             "literal prefix(es) the pattern expands through "
@@ -3236,7 +3235,7 @@ void ConfigLoader::ValidateAuthPrefixCollisions(
                 "auth policy prefix '" + u.proxy.route_prefix +
                 "' declared by both " + ins.first->second + " and " +
                 owner + " — exact-prefix collisions must be resolved at "
-                "config time (design spec §3.2)");
+                "config time");
         }
     }
     for (size_t i = 0; i < config.auth.policies.size(); ++i) {
@@ -3253,7 +3252,7 @@ void ConfigLoader::ValidateAuthPrefixCollisions(
                     "auth policy prefix '" + pref + "' declared by both " +
                     ins.first->second + " and " + policy_owner +
                     " — exact-prefix collisions must be resolved at "
-                    "config time (design spec §3.2)");
+                    "config time");
             }
         }
     }
@@ -3391,7 +3390,7 @@ void ConfigLoader::ValidateProxyAuth(
                             ? "':" + s.param_name + "' param"
                             : "'*" + s.param_name + "' catch-all") +
                         " segment). The auth matcher does byte-prefix "
-                        "matching only (design spec §3.2). If you need "
+                        "matching only. If you need "
                         "to protect a patterned route, use top-level "
                         "auth.policies[] with applies_to listing the "
                         "literal prefix(es) the pattern expands through "

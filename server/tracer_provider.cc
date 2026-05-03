@@ -44,9 +44,9 @@ void TracerProvider::Reload(std::shared_ptr<const Sampler> new_sampler,
     }
     // Atomic-swap the sampler on every cached Tracer. processor_
     // itself stays put — it's owned by ObservabilityManager and gets
-    // reload-knob updates via its own Reload() (BatchSpanProcessor's
-    // schedule_delay / max_export_batch_size are processor-side, not
-    // exporter-side, per design r79).
+    // its reload-knob updates via its own Reload(). Trace-side knobs
+    // (schedule_delay, max_export_batch_size) live on
+    // BatchSpanProcessor.
     if (new_sampler) {
         std::lock_guard<std::mutex> g(tracer_mtx_);
         for (auto& [_, tracer] : tracers_) {

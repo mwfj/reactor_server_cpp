@@ -1,7 +1,6 @@
 #pragma once
 
-// Sampler interface + four built-in implementations per OTel SDK spec
-// + OPENTELEMETRY_DESIGN.md §5.
+// Sampler interface + four built-in implementations per OTel SDK spec.
 //
 //   AlwaysOn        — every span sampled.
 //   AlwaysOff       — every span dropped (still recordable for in-process
@@ -24,7 +23,7 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
-// Sampling decision per OTel SDK spec §6.5.
+// Sampling decision returned by Sampler::ShouldSample.
 enum class SamplingDecision {
     DROP                = 0,  // Don't record, don't export.
     RECORD_ONLY         = 1,  // Record locally, don't export (rare; mostly for debugging).
@@ -82,9 +81,9 @@ public:
 };
 
 // Deterministic ratio sampler — uses the upper 64 bits of the trace_id
-// as a uniform-distribution sampling key. Per OTel spec §6.5: `ratio=0`
-// → AlwaysOff equivalent; `ratio=1` → AlwaysOn equivalent; intermediate
-// values produce ~ratio fraction of trace_ids sampled.
+// as a uniform-distribution sampling key. ratio=0 is AlwaysOff;
+// ratio=1 is AlwaysOn; intermediate values sample ~ratio fraction of
+// trace_ids.
 class TraceIdRatioSampler final : public Sampler {
 public:
     explicit TraceIdRatioSampler(double ratio);

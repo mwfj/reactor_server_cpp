@@ -1,6 +1,6 @@
 #pragma once
 
-// Tracer / Sampler / Span unit tests (task #64). No I/O — uses
+// Tracer / Sampler / Span unit tests. No I/O — uses
 // InMemorySpanProcessor to capture finished SpanData for inspection.
 
 #include "test_framework.h"

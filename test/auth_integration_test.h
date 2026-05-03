@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// Auth integration tests — Phase 2 test suite.
+// Auth integration tests.
 //
 // These tests run an HttpServer with an AuthManager registered as middleware
 // via HttpServer::Use(). The AuthManager is constructed directly (not through

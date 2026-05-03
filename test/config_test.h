@@ -618,14 +618,14 @@ namespace ConfigTests {
     }
 
     // ───────────────────────────────────────────────────────────────────
-    // Step 6 (ConfigLoader Normalize + DNS) tests — §15.1 row 6
+    // ConfigLoader Normalize + DNS tests
     // ───────────────────────────────────────────────────────────────────
 
-    // Pins the Phase 1 non-goal §1.2.7: scope-id-qualified IPv6 literals
-    // (fe80::1%eth0 / fe80::1%5) MUST be rejected by the validation
-    // chain. If this ever starts passing, the XFF / rate-limit / ACL
-    // assumptions documented in DEVELOPMENT_RULES.md break silently —
-    // the test fails loudly so a reintroduction has to be deliberate.
+    // Scope-id-qualified IPv6 literals (fe80::1%eth0 / fe80::1%5) MUST
+    // be rejected by the validation chain. If this ever starts passing,
+    // the XFF / rate-limit / ACL assumptions documented in
+    // DEVELOPMENT_RULES.md break silently — the test fails loudly so a
+    // reintroduction has to be deliberate.
     void TestIsValidRejectsScopeId() {
         std::cout << "\n[TEST] Config: IsValid* / Validate reject scope-id IPv6..."
                   << std::endl;

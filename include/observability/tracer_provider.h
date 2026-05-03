@@ -5,12 +5,11 @@
 // holds a shared_ptr<Resource> + a shared_ptr<RandomSource> shared
 // across all spawned Tracers.
 //
-// Reload contract (§11.1 r79): `tracer_provider_->Reload(...)` accepts
-// a new sampler shared_ptr + new processor options (which are passed
-// THROUGH to the underlying BatchSpanProcessor; the provider itself
-// doesn't own batch knobs). The Reload is atomic: in-flight spans
-// keep their original processor (captured at StartSpan time), new
-// spans see the new sampler / processor.
+// Reload accepts a new sampler shared_ptr + new processor options
+// (which pass through to the underlying BatchSpanProcessor; the
+// provider itself doesn't own batch knobs). Reload is atomic: in-
+// flight spans keep their original processor (captured at StartSpan
+// time); new spans see the new sampler / processor.
 
 #include "observability/resource.h"
 #include "observability/sampler.h"

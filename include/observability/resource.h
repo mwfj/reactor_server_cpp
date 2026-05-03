@@ -4,9 +4,9 @@
 // produced the telemetry. Built once at startup from the
 // `service.name` / `service.version` / `service.instance.id` config
 // fields plus the standard process / host / sdk attributes; held
-// IMMUTABLY for the manager's lifetime (per §11.2 — these fields are
-// restart-required because mid-flight resource swap would create
-// inconsistent traces).
+// IMMUTABLY for the manager's lifetime — these fields are restart-
+// required because mid-flight resource swap would create inconsistent
+// traces.
 
 #include "observability/attr_value.h"
 

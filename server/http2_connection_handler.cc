@@ -1017,12 +1017,9 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
     session_->SendPendingFrames();
     RecheckShutdownDrainAfterFlush();
 
-    // Fire the per-stream post-write notifier (§13 r84): the response
-    // frames are committed to nghttp2's output buffer; the shutdown-
-    // route pump and any other observer keys on this. Lookup-and-erase
-    // so the next request on this stream_id (post-stream-close +
-    // ID-reuse — H2 stream IDs are monotonic, but the reuse-after-
-    // close semantics are the session's; we keep this idempotent).
+    // Fire the per-stream post-write notifier: response frames are
+    // committed to nghttp2's output buffer. Lookup-and-erase keeps
+    // the operation idempotent across stream-id reuse.
     auto it = stream_post_write_notify_.find(stream_id);
     if (it != stream_post_write_notify_.end()) {
         it->second->store(true, std::memory_order_release);

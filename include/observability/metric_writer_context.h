@@ -4,11 +4,11 @@
 // Histogram writes across multiple per-shard maps so concurrent record()
 // calls from different dispatchers don't contend on a single mutex.
 //
-// Per OPENTELEMETRY_DESIGN.md §7.7: each dispatcher gets a stable shard
-// ID at construction; the metric Counter/Histogram pipelines fan out
-// to `shard_count` parallel maps and merge at Snapshot() time. A 0
-// shard count means "no sharding" (single map, all writes converge on
-// one mutex — fine for low-concurrency tests).
+// Each dispatcher pins a stable shard ID at construction; the metric
+// Counter/Histogram pipelines fan out to `shard_count` parallel maps
+// and merge at Snapshot() time. shard_count == 0 means "no sharding"
+// (single map, all writes converge on one mutex — fine for low-
+// concurrency tests).
 
 #include <cstddef>
 

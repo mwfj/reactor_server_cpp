@@ -10,9 +10,9 @@
 #include <string>
 
 // Foundational value-type tests for the OpenTelemetry observability
-// pipeline (task #62). Covers the pure value types only — Span /
-// Tracer / Meter / exporter pipeline tests live in
-// observability_test.h once those slices land.
+// pipeline. Covers TraceId / SpanId / TraceFlags / SpanContext /
+// TraceState / RandomSource only; Span / Tracer / Meter / exporter
+// pipeline live in their own test files.
 
 namespace ObservabilityFoundationTests {
 

@@ -5,10 +5,9 @@
 // holds shared Resource + a fixed shard count for every Meter it
 // produces.
 //
-// Reload contract (§11.1 r79): `meter_provider_->Reload(...)` accepts
-// new reader options (export interval / timeout) for the
-// PeriodicMetricReader. Histogram bucket boundaries + cardinality caps
-// are restart-only; the provider itself doesn't carry mutable
+// Reload accepts new reader options (export interval / timeout) for
+// the PeriodicMetricReader. Histogram bucket boundaries + cardinality
+// caps are restart-only; the provider itself doesn't carry mutable
 // histogram state.
 
 #include "observability/meter.h"
@@ -24,9 +23,9 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
-// Subset of PeriodicMetricReader knobs passed through Reload. r79:
-// reader-side knobs are export_interval_ms + export_timeout_ms only;
-// max_export_batch_size + schedule_delay_ms are TRACE-only and live on
+// Subset of PeriodicMetricReader knobs passed through Reload.
+// Reader-side knobs are export_interval + export_timeout only;
+// max_export_batch_size + schedule_delay are TRACE-only and live on
 // BatchSpanProcessor instead.
 struct MeterReaderOptions {
     std::chrono::milliseconds export_interval = std::chrono::milliseconds{60000};

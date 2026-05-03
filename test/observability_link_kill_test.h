@@ -1,10 +1,10 @@
 #pragma once
 
-// Observability link/kill protocol tests (task #74). Validates that:
+// Observability link/kill protocol tests. Validates that:
 //   - ProxyTransaction implements UpstreamTransactionLink correctly
 //     (MarkKilledForShutdown / IsKilledForShutdown)
 //   - The link site under ObservabilitySnapshot::link_mtx publishes
-//     tx_weak so the Phase 1c kill loop can find it
+//     tx_weak so the shutdown kill loop can find it
 //   - KillOutstandingSnapshots reaches the linked transaction and
 //     flips its kill flag
 //   - inflight_transactions_ on UpstreamManager is bumped at Start

@@ -14,7 +14,7 @@ namespace AUTH_NAMESPACE {
 // One-shot async HTTP client layered on UpstreamManager. Used by:
 //   - OidcDiscovery  (GET .well-known/openid-configuration)
 //   - JwksFetcher    (GET jwks_uri)
-//   - IntrospectionClient (Phase 3; POST application/x-www-form-urlencoded)
+//   - IntrospectionClient (POST application/x-www-form-urlencoded)
 //
 // Rationale (§19.3):
 // - Reuses UpstreamManager so JWKS / discovery / introspection inherit

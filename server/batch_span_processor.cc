@@ -115,9 +115,9 @@ void BatchSpanProcessor::SignalShutdown() {
             std::memory_order_acq_rel)) {
         return;  // idempotent
     }
-    // Tell the exporter to refuse new exports (per r84). The processor
-    // worker will continue draining the queue under the shutdown flag
-    // until empty; subsequent OnEnd calls land in dropped_on_overflow_.
+    // Tell the exporter to refuse new exports. The processor worker
+    // continues draining the queue under the shutdown flag until
+    // empty; subsequent OnEnd calls land in dropped_on_overflow_.
     if (exporter_) exporter_->SignalShutdown();
     cv_.notify_all();
 }

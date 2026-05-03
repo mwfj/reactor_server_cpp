@@ -1,29 +1,26 @@
 #pragma once
 
-// cli_test.h — Comprehensive test suite for the CLI entry point components.
+// cli_test.h — test suite for the CLI entry point components.
 //
 // Covers:
-//   - CliParser (17 tests): default values, all short/long options, validation errors
-//   - PidFile (7 tests): acquire/release lifecycle, stale detection, ReadPid, CheckRunning
-//   - Config override precedence (5 tests): defaults < file < env < CLI
-//   - SignalHandler (2 tests): install/cleanup, sigwait unblocks WaitForShutdown
-//   - Phase 2 additions:
-//     - Logger (6 tests): SetConsoleEnabled, Reopen, no-op paths, level persistence
-//     - SignalHandler Phase 2 (3 tests): WaitForSignal SIGTERM/SIGHUP,
-//                                        WaitForShutdown ignores SIGHUP
-//     - CliParser daemonize (7 tests): -d/-daemonize flag and per-command validation
-//   - Logger Enhanced (6 tests): EnsureLogDir, date-based naming, CheckRotation,
-//                                 WriteMarker, SanitizePath, append-on-restart
-//   - Phase 3+4 additions (sections 8–12):
-//     - Config Reload (5 tests): reload-safe fields applied, restart-required skipped,
-//                                missing/invalid file handled, log level change
-//     - reload CLI subcommand (4 tests): parsing, per-command validation, help text
-//     - /stats endpoint (3 tests): JSON shape, uptime increases, config section matches
-//     - Counter accuracy (4 tests): connection +/-, request counter, H2 stream counters
-//     - SIGHUP integration (3 tests): WaitForSignal RELOAD, invalid config no crash,
-//                                     daemon vs foreground SIGHUP behaviour
+//   - CliParser: default values, all short/long options, validation
+//   - PidFile: acquire/release lifecycle, stale detection
+//   - Config override precedence: defaults < file < env < CLI
+//   - SignalHandler: install/cleanup, sigwait unblocks WaitForShutdown,
+//                    WaitForSignal SIGTERM/SIGHUP routing
+//   - Logger: SetConsoleEnabled, Reopen, level persistence,
+//             EnsureLogDir, date-based naming, CheckRotation,
+//             WriteMarker, SanitizePath, append-on-restart
+//   - daemonize: -d/-daemonize flag and per-command validation
+//   - Config Reload: reload-safe fields applied, restart-required
+//                    skipped, missing/invalid file handled
+//   - reload CLI subcommand: parsing, per-command validation, help text
+//   - /stats endpoint: JSON shape, uptime, config section
+//   - Counter accuracy: connection +/-, request counter, H2 streams
+//   - SIGHUP integration: WaitForSignal RELOAD, invalid config no crash,
+//                         daemon vs foreground SIGHUP behaviour
 //
-// Port range: 10500-10599 (unit tests) + 10600-10699 (Phase 3+4 integration tests)
+// Port range: 10500-10599 (unit) + 10600-10699 (integration)
 // Temp file pattern: /tmp/test_reactor_NNNN.pid
 
 #include "test_framework.h"
@@ -1160,7 +1157,7 @@ void TestSignalHandlerSigwaitUnblock() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SECTION 5: Logger Phase 2 Tests (32–37)
+// SECTION 5: Logger Tests (32–37)
 //
 // These tests exercise the new logging::SetConsoleEnabled() and
 // logging::Reopen() APIs added for daemon mode support.
@@ -1440,7 +1437,7 @@ void TestReopenPreservesLevel() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SECTION 6: SignalHandler Phase 2 Tests (38–40)
+// SECTION 6: SignalHandler Tests (38–40)
 //
 // Test the new WaitForSignal() API which returns SignalResult::RELOAD for
 // SIGHUP and SignalResult::SHUTDOWN for SIGTERM/SIGINT.
@@ -3668,7 +3665,7 @@ void RunAllTests() {
     TestSignalHandlerInstallAndCleanup();
     TestSignalHandlerSigwaitUnblock();
 
-    // ── Section 5: Logger Phase 2 ─────────────────────────────────
+    // ── Section 5: Logger ─────────────────────────────────
     TestSetConsoleEnabled();
     TestSetConsoleEnabledPersists();
     TestReopenWithFileSink();
@@ -3676,7 +3673,7 @@ void RunAllTests() {
     TestReopenBeforeInit();
     TestReopenPreservesLevel();
 
-    // ── Section 6: SignalHandler Phase 2 ─────────────────────────
+    // ── Section 6: SignalHandler ─────────────────────────
     TestWaitForSignalSIGTERM();
     TestWaitForSignalSIGHUP();
     TestWaitForShutdownIgnoresSIGHUP();

@@ -4,11 +4,9 @@
 // SDK spec. Sharded SeriesMap (same shape as Counter) so concurrent
 // dispatcher writes never contend.
 //
-// Bucket boundaries are fixed at construction time per
-// OPENTELEMETRY_DESIGN.md §11.2 ("histogram_buckets is restart-only —
-// reshaping live histograms drops counts"). The default boundaries
-// match OTel HTTP semconv recommendations (14 buckets covering
-// 5ms..10s).
+// Bucket boundaries are fixed at construction time — restart-only;
+// reshaping live histograms would drop counts. Defaults match OTel
+// HTTP semconv recommendations (14 buckets covering 5ms..10s).
 
 #include "observability/attr_value.h"
 #include "observability/metric_label_registry.h"

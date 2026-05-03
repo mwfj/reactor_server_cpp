@@ -2,13 +2,13 @@
 
 // MetricLabelRegistry — per-instrument allowed-label-key allowlist plus
 // per-(instrument, label_key) cardinality cap with `__overflow__` value
-// rewrite per OPENTELEMETRY_DESIGN.md §7.5 / §7.6.
+// rewrite.
 //
 // Hot path:
 //   1. Caller submits a (label_key, label_value) sequence.
-//   2. Registry rejects keys not in the per-instrument allowlist
-//      (silent drop — per the §7.5 "labels not in allowlist are
-//      silently dropped" rule, not a hard error).
+//   2. Registry silently drops keys not in the per-instrument
+//      allowlist (drop is not an error — bounded cardinality is the
+//      explicit operator contract).
 //   3. For each accepted (key, value): if value already in
 //      `seen_values[key]` → emit literal value. Else if `cap_full`
 //      latched → emit `__overflow__`. Else acquire unique_lock,
@@ -38,17 +38,17 @@ namespace OBSERVABILITY_NAMESPACE {
 // Operators see this in /metrics + OTLP as a structured overflow signal.
 inline constexpr std::string_view kOverflowSentinel = "__overflow__";
 
-// Default cardinality caps per OPENTELEMETRY_DESIGN.md §7.6.
+// Default per-key cardinality caps used when a Catalog entry omits one.
 inline constexpr size_t kDefaultRouteCap   = 256;
 inline constexpr size_t kDefaultUrlPathCap = 1000;
 inline constexpr size_t kDefaultGenericCap = 256;
 
 class MetricLabelRegistry {
 public:
-    // Catalog entry per §7.5 / §10.3 kMetricCatalog. Operators reject
-    // labels not in `allowed_keys` and apply per-key caps from
-    // `value_cardinality_caps` (defaulting to kDefaultGenericCap when
-    // a key is in the allowlist but missing from the cap map).
+    // Catalog entry. Operators reject labels not in `allowed_keys` and
+    // apply per-key caps from `value_cardinality_caps` (defaulting to
+    // kDefaultGenericCap when a key is in the allowlist but missing
+    // from the cap map).
     struct Catalog {
         std::vector<std::string> allowed_keys;
         std::unordered_map<std::string, size_t> value_cardinality_caps;

@@ -137,8 +137,7 @@ bool W3CPropagator::Inject(const SpanContext& ctx,
         headers["tracestate"] = ctx.state().Serialize();
     } else {
         // If a previous tracestate was in the map, leave it alone —
-        // strip-then-inject is the caller's responsibility per
-        // OPENTELEMETRY_DESIGN.md §4.4.
+        // strip-then-inject is the caller's responsibility.
     }
     return true;
 }

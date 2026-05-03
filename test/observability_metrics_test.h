@@ -1,6 +1,6 @@
 #pragma once
 
-// Counter / Histogram / Meter / MeterProvider unit tests (task #65).
+// Counter / Histogram / Meter / MeterProvider unit tests.
 // No I/O — exercises the in-process metrics pipeline directly via
 // MeterProvider::Snapshot().
 

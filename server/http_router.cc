@@ -849,8 +849,8 @@ bool HttpRouter::DispatchHandler(HttpRequest& request, HttpResponse& response) {
 }
 
 void HttpRouter::PopulateRouteParams(HttpRequest& request) {
-    // r84: now delegates to ResolveRouteMatch — the single source of
-    // truth for route resolution. ResolveRouteMatch populates BOTH
+    // Delegates to ResolveRouteMatch — the single source of truth for
+    // route resolution. ResolveRouteMatch populates BOTH
     // request.params (via the trie walks it performs) AND
     // request.route_match (kind / pattern / legacy bools). Legacy
     // callers that only cared about params get the same params they
@@ -912,12 +912,12 @@ bool HeaderContainsTokenCI(const std::string& header_value,
     return lower.find(needle_lower) != std::string::npos;
 }
 
-// Step (0a) cheap candidate detection per OPENTELEMETRY_DESIGN.md
-// §17.1 / §5.2 — `method == "GET"` AND a case-insensitive `Connection:
-// Upgrade` token AND `Upgrade: websocket`. Structural intent ONLY, NOT
-// full RFC 6455 validation. Once this returns true, the resolver MUST
-// short-circuit at step (0); the lower-priority kinds (1)–(5) are
-// unreachable regardless of the (0b) full-validation outcome.
+// Cheap WebSocket-upgrade-candidate detection: method == "GET" AND a
+// case-insensitive "Connection: Upgrade" token AND
+// "Upgrade: websocket". Structural intent only, NOT full RFC 6455
+// validation. Once this returns true, the resolver short-circuits;
+// later precedence-chain steps are unreachable regardless of the
+// follow-up validation outcome.
 bool IsWebSocketUpgradeCandidate(const HttpRequest& request) {
     if (request.method != "GET") return false;
     if (!HeaderContainsTokenCI(request.GetHeader("Connection"), "upgrade")) {
@@ -986,11 +986,9 @@ void HttpRouter::ResolveRouteMatch(HttpRequest& request) const {
         return;
     }
 
-    // Step (1) — shutdown route. DEFERRED on this branch (the
-    // ShutdownRoute API doesn't exist yet; the OpenTelemetry design's
-    // shutdown-route slice is a separate follow-up). When wired, this
-    // section will consult GetShutdownHandler and set kind=Shutdown
-    // BEFORE step (2) — see OPENTELEMETRY_DESIGN.md §17.1.
+    // Step (1) — shutdown route. Not yet wired on this branch; the
+    // ShutdownRoute API doesn't exist. When wired, this section will
+    // consult GetShutdownHandler and set kind=Shutdown BEFORE step (2).
 
     // Step (2) — async route. GetAsyncHandler already encodes the
     // async-over-sync precedence + proxy-companion runtime yield + the

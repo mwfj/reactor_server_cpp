@@ -84,8 +84,7 @@ CIRCUIT_BREAKER_SRCS = $(SERVER_DIR)/circuit_breaker_window.cc $(SERVER_DIR)/cir
 
 # Auth layer sources (OAuth 2.0 token validation — Layer 7 middleware)
 # Note: JWT decode + signature verification is delegated to vendored jwt-cpp
-# (third_party/jwt-cpp/, header-only). See design spec §12.1 and r4/r5 revision
-# history for the library-adoption rationale.
+# (third_party/jwt-cpp/, header-only).
 AUTH_SRCS = $(SERVER_DIR)/token_hasher.cc $(SERVER_DIR)/auth_policy_matcher.cc $(SERVER_DIR)/auth_claims.cc \
             $(SERVER_DIR)/jwks_cache.cc $(SERVER_DIR)/auth_upstream_http_client.cc $(SERVER_DIR)/issuer.cc \
             $(SERVER_DIR)/jwks_fetcher.cc $(SERVER_DIR)/oidc_discovery.cc $(SERVER_DIR)/jwt_verifier.cc \
@@ -242,17 +241,17 @@ test_config: $(TARGET)
 	@echo "Running config tests only..."
 	./$(TARGET) config
 
-# Run only HTTP tests (placeholder for Phase 2)
+# Run only HTTP tests
 test_http: $(TARGET)
 	@echo "Running HTTP tests only..."
 	./$(TARGET) http
 
-# Run only WebSocket tests (placeholder for Phase 3)
+# Run only WebSocket tests
 test_ws: $(TARGET)
 	@echo "Running WebSocket tests only..."
 	./$(TARGET) ws
 
-# Run only TLS tests (placeholder for Phase 4)
+# Run only TLS tests
 test_tls: $(TARGET)
 	@echo "Running TLS tests only..."
 	./$(TARGET) tls
@@ -318,7 +317,7 @@ test_auth_mgr: $(TARGET)
 	./$(TARGET) auth_mgr
 
 test_auth2: $(TARGET)
-	@echo "Running auth integration tests (Phase 2) only..."
+	@echo "Running auth integration tests only..."
 	./$(TARGET) auth2
 
 test_auth_fail: $(TARGET)
@@ -432,11 +431,11 @@ help:
 	@echo "  make test_config - Build and run only config tests"
 	@echo "                     Runs configuration loading/validation tests"
 	@echo ""
-	@echo "  make test_http   - Build and run only HTTP tests (Phase 2)"
+	@echo "  make test_http   - Build and run only HTTP tests"
 	@echo ""
-	@echo "  make test_ws     - Build and run only WebSocket tests (Phase 3)"
+	@echo "  make test_ws     - Build and run only WebSocket tests"
 	@echo ""
-	@echo "  make test_tls    - Build and run only TLS tests (Phase 4)"
+	@echo "  make test_tls    - Build and run only TLS tests"
 	@echo ""
 	@echo "  make clean       - Remove build artifacts"
 	@echo "                     Deletes './test_runner' executable and llhttp object files"

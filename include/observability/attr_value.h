@@ -9,7 +9,7 @@
 // InstrumentationScope. `Label` is the metric-side equivalent — a
 // (key, value) pair where the value is constrained to small types
 // suitable for cardinality-bounded series (no arrays, no large
-// strings; the §7.5 metric label registry enforces this).
+// strings; the metric label registry enforces this).
 
 #include <cstdint>
 #include <string>
@@ -56,7 +56,7 @@ struct Attribute {
 };
 
 // Metric-label primitive — used by Counter / Histogram instruments.
-// Label values are restricted at the registry level (§7.5) to
+// Label values are restricted at the registry level to
 // strings / bools / int64 / double; we still carry an AttrValue for
 // uniformity with span attributes, but instruments reject array
 // shapes at record time.

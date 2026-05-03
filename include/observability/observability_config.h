@@ -1,8 +1,8 @@
 #pragma once
 
-// ObservabilityConfig — full §10 schema. Field-by-field semantics
-// follow OPENTELEMETRY_DESIGN.md §10.1; restart-vs-live-reloadable
-// classification follows §11.2.
+// ObservabilityConfig — operator-facing observability schema mirrored
+// onto ServerConfig::observability. Field-by-field restart vs live-
+// reloadable classification:
 //
 // Restart-required:
 //   - enabled (master switch)
@@ -37,8 +37,8 @@ enum class SamplerType {
     ParentBased    = 3,  // root sampler defaults to TraceIdRatio.
 };
 
-// Per-route sampler override (§5.2). `path` is matched as a literal
-// byte-prefix against `req.path` BEFORE any pattern resolution.
+// Per-route sampler override. `path` is matched as a literal byte-
+// prefix against `req.path` BEFORE any pattern resolution.
 struct SamplerRouteOverride {
     std::string path;        // e.g. "/metrics", "/health"
     SamplerType sampler = SamplerType::AlwaysOff;
@@ -51,15 +51,15 @@ struct SamplerConfig {
     std::vector<SamplerRouteOverride> routes;
 };
 
-// OTLP/HTTP transport options (§10.4 — the OTLP collector is modelled
-// as a regular `upstreams[]` entry referenced by name).
+// OTLP/HTTP transport options. The OTLP collector is modelled as a
+// regular `upstreams[]` entry referenced here by name.
 struct OtlpTransportConfig {
     std::string upstream;                        // upstreams[].name (cross-ref)
     std::map<std::string, std::string> headers;  // additional outbound headers
     std::chrono::milliseconds timeout_ms = std::chrono::milliseconds{10000};
 };
 
-// BatchSpanProcessor knobs (§8.4 / §11.2) — all live-reloadable.
+// BatchSpanProcessor knobs — all live-reloadable.
 struct BatchSpanRetriesConfig {
     int max_attempts = 3;
     std::chrono::milliseconds initial_backoff = std::chrono::milliseconds{1000};

@@ -8,14 +8,14 @@
 //                 (parsed/serialized via TraceState; this propagator
 //                 just hands the header value through.)
 //
-// W3CPropagator is stateless — no instance state, no synchronization.
-// All methods are static. Per OPENTELEMETRY_DESIGN.md §4.5.1 split-
-// context model: `Extract` returns the REMOTE PARENT (immutable
-// snapshot of the inbound traceparent); `Inject` writes a LOCAL
-// SpanContext (e.g. AttemptTraceContext.attempt_local) — outbound
-// callers MUST NOT inject `RequestTraceContext.current_local`
-// directly per §4.5.1, otherwise downstream services would attach
-// to the SERVER hop instead of the gateway-internal CLIENT span.
+// W3CPropagator is stateless — no instance state, no synchronization;
+// all methods are static. The split-context model means `Extract`
+// returns the REMOTE PARENT (immutable snapshot of the inbound
+// traceparent), and `Inject` writes a LOCAL SpanContext (e.g.
+// AttemptTraceContext.attempt_local). Outbound callers MUST NOT inject
+// `RequestTraceContext.current_local` directly — that would make
+// downstream services attach to the SERVER hop instead of the gateway-
+// internal CLIENT span.
 
 #include "observability/span_context.h"
 #include "observability/trace_state.h"
@@ -48,10 +48,10 @@ public:
     static std::optional<SpanContext> ParseTraceparent(
         std::string_view header_value) noexcept;
 
-    // Parse a `tracestate` header value. Returns the parsed TraceState on
-    // success (including empty header → empty TraceState), nullopt when
-    // the header violates W3C list-member caps (>32 members or any
-    // member >256 chars) — per the "TraceStateOversized" rule from §16.2.
+    // Parse a `tracestate` header value. Returns the parsed TraceState
+    // on success (including empty header → empty TraceState); nullopt
+    // when the header violates W3C list-member caps (>32 members or
+    // any member >256 chars).
     static std::optional<TraceState> ParseTracestate(
         std::string_view header_value);
 
@@ -82,10 +82,9 @@ public:
 
     // Inject `ctx`'s SpanContext into the outbound headers map. Writes
     // `traceparent` (always when ctx.IsValid()) and `tracestate` (when
-    // ctx.state() is non-empty). Caller is responsible for stripping any
-    // pre-existing inbound `traceparent`/`tracestate` headers BEFORE
-    // calling Inject — see OPENTELEMETRY_DESIGN.md §4.4 strip-and-replace
-    // rule.
+    // ctx.state() is non-empty). Caller MUST strip any pre-existing
+    // `traceparent`/`tracestate` headers BEFORE calling Inject —
+    // there is no implicit replace.
     //
     // Returns false when ctx is invalid (no header written).
     static bool Inject(const SpanContext& ctx,

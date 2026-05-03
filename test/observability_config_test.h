@@ -1,6 +1,6 @@
 #pragma once
 
-// ObservabilityConfig schema + ConfigLoader integration tests (task #72).
+// ObservabilityConfig schema + ConfigLoader integration tests.
 // Validates JSON load, startup Validate, ValidateHotReloadable subset,
 // and the MakeMetricsHandler factory live-reads.
 

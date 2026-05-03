@@ -1,8 +1,8 @@
 #pragma once
 
 // BatchSpanProcessor + PeriodicMetricReader + OtlpHttpExporter unit
-// tests (task #70). Pure in-process — uses a capture transport
-// callback to retain serialized OTLP/JSON for inspection.
+// tests. Pure in-process — uses a capture transport callback to
+// retain serialized OTLP/JSON for inspection.
 
 #include "test_framework.h"
 #include "nlohmann/json.hpp"
@@ -363,7 +363,7 @@ void TestOtlpExporterShutdownRefusesExport() {
     }
 }
 
-// ReloadHeaders applies live (controlled merge per r79).
+// ReloadHeaders applies live (controlled merge of headers + timeout).
 void TestOtlpExporterReloadHeaders() {
     try {
         std::map<std::string, std::string> seen_headers;
