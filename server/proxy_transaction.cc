@@ -253,6 +253,15 @@ ProxyTransaction::~ProxyTransaction() {
     // (e.g., transaction was abandoned due to client disconnect).
     Cleanup();
 
+    // Phase 1c counter — paired with the Start()-time fetch_add. Drop
+    // the count exactly once, only if Start() actually ran (the
+    // inflight_counter_held_ latch protects against transactions that
+    // were constructed but never Start()ed).
+    if (inflight_counter_held_ && upstream_manager_) {
+        upstream_manager_->DecInflightTransactions();
+        inflight_counter_held_ = false;
+    }
+
     if (!complete_cb_invoked_ && complete_cb_) {
         logging::Get()->warn("ProxyTransaction destroyed without delivering "
                              "response client_fd={} service={} state={}",
@@ -261,7 +270,36 @@ ProxyTransaction::~ProxyTransaction() {
     }
 }
 
+void ProxyTransaction::AttachObservabilitySnapshot(
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap) {
+    obs_snapshot_ = std::move(snap);
+}
+
 void ProxyTransaction::Start() {
+    // Phase 1c counter — bumped exactly once per transaction. Paired
+    // with the destructor's fetch_sub. The latch guards against
+    // accidental double-Start (which would inflate the counter and
+    // wedge Phase 1c). Decrement happens in ~ProxyTransaction.
+    if (!inflight_counter_held_ && upstream_manager_) {
+        upstream_manager_->IncInflightTransactions();
+        inflight_counter_held_ = true;
+    }
+
+    // Observability link site (§13 r63/r65). Establish the bidirectional
+    // link under the snapshot's link_mtx so either ordering with the
+    // Phase 1c kill loop converges:
+    //   - link-first → kill-second: kill loop reads tx_weak under
+    //     link_mtx_ and marks us via MarkKilledForShutdown.
+    //   - kill-first → link-second: we observe the marker via
+    //     IsKilledForShutdown immediately after publishing tx_weak; no
+    //     "linked-but-not-marked" snapshot can exist.
+    if (obs_snapshot_) {
+        std::lock_guard<std::mutex> g(obs_snapshot_->link_mtx);
+        obs_snapshot_->tx_weak = std::weak_ptr<
+            OBSERVABILITY_NAMESPACE::UpstreamTransactionLink>(
+                shared_from_this());
+    }
+
     // Tell the codec the request method so it handles HEAD correctly
     // (no body despite Content-Length/Transfer-Encoding in response).
     codec_.SetRequestMethod(method_);

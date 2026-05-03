@@ -2925,6 +2925,28 @@ void HttpServer::Stop() {
                     WaitForH2Drain();
                 }
             }
+            // Phase 1c (§13 r78/r80) — wait for every async-counter to
+            // reach zero before initiating upstream shutdown. Bounds on
+            // half the configured drain budget so the kill loop + the
+            // upstream WaitForDrain still have time to run within the
+            // overall budget.
+            const auto drain_budget = std::chrono::seconds(
+                shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
+            const auto phase_1c_budget =
+                std::chrono::milliseconds(drain_budget) / 2;
+            bool phase_1c_drained =
+                WaitForAllAsyncDrain(phase_1c_budget);
+            if (!phase_1c_drained && observability_manager_) {
+                // Snapshots that survived the drain — fire CASE A/B kill.
+                observability_manager_->KillOutstandingSnapshots(
+                    phase_1c_budget);
+            }
+            // Begin observability shutdown — drains BatchSpanProcessor +
+            // PeriodicMetricReader. Idempotent; safe to call from any
+            // thread.
+            if (observability_manager_) {
+                observability_manager_->BeginShutdown(phase_1c_budget);
+            }
             // Upstream shutdown — deferred until AFTER H2/WS/H1 protocol
             // drains so proxy handlers dispatched during the drain window
             // can still call CheckoutAsync() successfully. Initiating here
@@ -2932,9 +2954,7 @@ void HttpServer::Stop() {
             // for in-flight leases to complete.
             if (upstream_manager_) {
                 upstream_manager_->InitiateShutdown();
-                upstream_manager_->WaitForDrain(
-                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
-                        std::memory_order_relaxed)));
+                upstream_manager_->WaitForDrain(drain_budget);
             }
             // Post-upstream H1 flush window: an async (exempt) HTTP/1 handler
             // whose completion fires during the upstream drain (or that takes
@@ -3075,6 +3095,22 @@ void HttpServer::Stop() {
                     }
                 }
             }
+            // Phase 1c (§13 r78/r80) — same predicate as the off-thread
+            // path. Half the configured drain budget so the kill loop +
+            // upstream drain still have headroom.
+            const auto drain_budget_sec = std::chrono::seconds(
+                shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
+            const auto phase_1c_budget =
+                std::chrono::milliseconds(drain_budget_sec) / 2;
+            bool phase_1c_drained =
+                WaitForAllAsyncDrain(phase_1c_budget);
+            if (!phase_1c_drained && observability_manager_) {
+                observability_manager_->KillOutstandingSnapshots(
+                    phase_1c_budget);
+            }
+            if (observability_manager_) {
+                observability_manager_->BeginShutdown(phase_1c_budget);
+            }
             // Upstream drain — initiate AFTER protocol drains so late
             // proxy handlers can still check out. Then poll with task pump
             // until leases are returned, and force-close stragglers.
@@ -3205,6 +3241,57 @@ void HttpServer::WaitForH2Drain() {
             if (d.conn) d.conn->ForceClose();
         }
     }
+}
+
+bool HttpServer::WaitForAllAsyncDrain(std::chrono::milliseconds timeout) {
+    // Phase 1c per OPENTELEMETRY_DESIGN.md §13. Predicate gates each
+    // counter on its owning manager being non-null (per r78). The call
+    // itself runs unconditionally — null managers contribute zero, so
+    // the predicate short-circuits true when nothing is in flight.
+    auto* upm = upstream_manager_.get();
+    auto* obs = observability_manager_.get();
+    auto predicate = [upm, obs]() {
+        return (upm == nullptr
+                || (upm->active_leases() == 0
+                    && upm->inflight_transactions() == 0))
+            && (obs == nullptr || obs->inflight_finalizations() == 0);
+    };
+
+    if (predicate()) return true;
+
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    if (obs) {
+        // Block on the observability manager's CV — it's signaled on
+        // every finalize-decrement so we wake at the right moment.
+        // The CV doesn't cover upstream counters; fall through to a
+        // short poll loop after each wake to re-check the upstream half
+        // of the predicate.
+        std::unique_lock<std::mutex> lck(obs->finalizers_done_mtx());
+        while (!predicate()) {
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            obs->finalizers_done_cv().wait_for(
+                lck, std::chrono::milliseconds(50));
+        }
+    } else {
+        // No observability manager — poll just the upstream half.
+        while (!predicate()) {
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    bool drained = predicate();
+    if (!drained) {
+        logging::Get()->warn(
+            "Phase 1c WaitForAllAsyncDrain timeout — "
+            "active_leases={} inflight_transactions={} "
+            "inflight_finalizations={}",
+            upm ? upm->active_leases() : 0,
+            upm ? upm->inflight_transactions() : 0,
+            obs ? obs->inflight_finalizations() : 0);
+    }
+    return drained;
 }
 
 void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn) {

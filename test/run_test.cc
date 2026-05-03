@@ -50,6 +50,8 @@
 #include "observability_export_pipeline_test.h"
 #include "observability_prometheus_test.h"
 #include "observability_config_test.h"
+#include "observability_shutdown_test.h"
+#include "observability_link_kill_test.h"
 #include "observability_e2e_test.h"
 #include "test_framework.h"
 #include <algorithm>
@@ -225,6 +227,14 @@ void RunAllTest(){
     // ValidateHotReloadable splits, MakeMetricsHandler runtime gate.
     ObservabilityConfigTests::RunAllTests();
 
+    // Phase 1c shutdown — finalize CAS gate, KillOutstandingSnapshots
+    // counter drain, BeginShutdown idempotency.
+    ObservabilityShutdownTests::RunAllTests();
+
+    // Link/kill protocol — ProxyTransaction implements
+    // UpstreamTransactionLink; the kill loop reaches linked txs.
+    ObservabilityLinkKillTests::RunAllTests();
+
     // Observability end-to-end tests — boot a real HttpServer, install
     // the observability manager + middleware, send TCP-level HTTP
     // requests, assert spans are captured by the InMemorySpanProcessor.
@@ -299,6 +309,10 @@ void PrintUsage(const char* program_name) {
     std::cout << "                     counter / gauge / histogram exposition, OpenMetrics)" << std::endl;
     std::cout << "  obs_config         Observability config schema tests (JSON load," << std::endl;
     std::cout << "                     Validate, ValidateHotReloadable, MetricsHandler)" << std::endl;
+    std::cout << "  obs_shutdown       Phase 1c shutdown tests (CAS gate," << std::endl;
+    std::cout << "                     KillOutstandingSnapshots drain, BeginShutdown idempotency)" << std::endl;
+    std::cout << "  obs_linkkill       Observability link/kill protocol tests" << std::endl;
+    std::cout << "                     (ProxyTransaction link, KillOutstandingSnapshots wiring)" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -485,6 +499,12 @@ int main(int argc, char* argv[]) {
         // Run observability config schema + MakeMetricsHandler tests.
         }else if(mode == "obs_config"){
             ObservabilityConfigTests::RunAllTests();
+        // Run Phase 1c shutdown / kill loop tests.
+        }else if(mode == "obs_shutdown"){
+            ObservabilityShutdownTests::RunAllTests();
+        // Run observability link/kill protocol tests.
+        }else if(mode == "obs_linkkill"){
+            ObservabilityLinkKillTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

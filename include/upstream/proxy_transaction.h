@@ -11,6 +11,7 @@
 #include "circuit_breaker/retry_budget.h" // RetryBudget::InFlightGuard (member-by-value)
 #include "http/http_callbacks.h"
 #include "http/http_response.h"
+#include "observability/observability_snapshot.h"  // UpstreamTransactionLink
 #include <optional>
 // <string>, <map>, <unordered_map>, <memory>, <functional>, <chrono> provided by common.h
 
@@ -27,8 +28,10 @@ namespace AUTH_NAMESPACE {
 class AuthManager;
 }  // namespace AUTH_NAMESPACE
 
-class ProxyTransaction : public std::enable_shared_from_this<ProxyTransaction>,
-                         public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink {
+class ProxyTransaction
+    : public std::enable_shared_from_this<ProxyTransaction>,
+      public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink,
+      public OBSERVABILITY_NAMESPACE::UpstreamTransactionLink {
 public:
     // Result codes for internal state tracking
     static constexpr int RESULT_SUCCESS             = 0;
@@ -96,6 +99,26 @@ public:
     // Idempotent and dispatcher-thread-only (invoked via the connection
     // handler's abort hook, which always runs on the dispatcher).
     void Cancel();
+
+    // Observability link site (§13 r63/r65). Caller (ProxyHandler) hands
+    // in the per-request ObservabilitySnapshot; Start() establishes the
+    // bidirectional link under snapshot's link_mtx.
+    //
+    // Once linked, the Phase 1c kill loop can mark this transaction for
+    // shutdown via MarkKilledForShutdown(); terminal callbacks check
+    // IsKilledForShutdown() before issuing Span::End so shutdown wins
+    // every race against in-flight upstream I/O.
+    void AttachObservabilitySnapshot(
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap);
+
+    // UpstreamTransactionLink interface — invoked by ObservabilityManager
+    // ::KillOutstandingSnapshots under the snapshot's link_mtx.
+    void MarkKilledForShutdown() noexcept override {
+        kill_for_shutdown_.store(true, std::memory_order_release);
+    }
+    bool IsKilledForShutdown() const noexcept override {
+        return kill_for_shutdown_.load(std::memory_order_acquire);
+    }
 
     bool OnHeaders(
         const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) override;
@@ -230,6 +253,21 @@ private:
     // Cleanup. Dry-run rejects proceed but the flag stays false — no
     // token was consumed, so no ReleaseRetry is required.
     bool retry_token_held_ = false;
+
+    // Observability link/kill protocol (§13 r63/r65). The snapshot is
+    // captured by AttachObservabilitySnapshot and linked under its
+    // link_mtx in Start(). Phase 1c sets kill_for_shutdown_ via
+    // MarkKilledForShutdown() — terminal callbacks read it BEFORE
+    // emitting Span::End so shutdown's CASE A/B kill always wins
+    // even when the upstream response is mid-flight.
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot>
+        obs_snapshot_;
+    std::atomic<bool> kill_for_shutdown_{false};
+
+    // Counter publication latch — guarantees Start() bumps
+    // inflight_transactions_ exactly once (defensive against double-call)
+    // and the destructor decrements iff Start() bumped.
+    bool inflight_counter_held_ = false;
     enum class RelayMode {
         BUFFERED,
         STREAMING,

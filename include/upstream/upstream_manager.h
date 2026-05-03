@@ -72,6 +72,33 @@ public:
     // Non-blocking check: true if outstanding_conns_ == 0.
     bool AllDrained() const;
 
+    // ---- Phase 1c WaitForAllAsyncDrain counters (§13 r78/r80) ----
+    //
+    // active_leases — number of UpstreamConnection leases currently held
+    //   by callers (not yet returned). Today this maps onto
+    //   outstanding_conns_ (the manager's existing accounting) so adding
+    //   a separate counter would double-count without buying anything;
+    //   the accessor is exposed under the design's contract name so
+    //   future refactors can split the two without touching call sites.
+    //
+    // inflight_transactions — number of ProxyTransactions in flight
+    //   (entered Start() but not yet reached terminal completion). This
+    //   is independent of active_leases (a transaction can be queued or
+    //   awaiting a circuit-breaker decision before holding a lease) and
+    //   is incremented/decremented by ProxyTransaction directly.
+    int64_t active_leases() const noexcept {
+        return outstanding_conns_.load(std::memory_order_acquire);
+    }
+    int64_t inflight_transactions() const noexcept {
+        return inflight_transactions_.load(std::memory_order_acquire);
+    }
+    void IncInflightTransactions() noexcept {
+        inflight_transactions_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    void DecInflightTransactions() noexcept {
+        inflight_transactions_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
     // Force-close all remaining connections (enqueues to each dispatcher).
     void ForceCloseRemaining();
 
@@ -143,6 +170,11 @@ private:
 
     // Manager-owned atomic counter: total outstanding connections
     std::atomic<int64_t> outstanding_conns_{0};
+
+    // Phase 1c — proxy-transaction inflight counter (§13). Bumped from
+    // ProxyTransaction::Start, decremented at terminal completion. Read
+    // by HttpServer::WaitForAllAsyncDrain alongside active_leases.
+    std::atomic<int64_t> inflight_transactions_{0};
 
     std::mutex drain_mtx_;
     std::condition_variable drain_cv_;
