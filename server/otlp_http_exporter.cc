@@ -5,7 +5,7 @@
 #include "observability/instrumentation_scope.h"
 #include "observability/resource.h"
 
-#include <chrono>
+#include "common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

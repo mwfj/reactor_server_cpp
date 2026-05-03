@@ -1,5 +1,7 @@
 #include "observability/meter_provider.h"
 
+#include "common.h"
+
 namespace OBSERVABILITY_NAMESPACE {
 
 MeterProvider::MeterProvider(std::shared_ptr<const Resource> resource,

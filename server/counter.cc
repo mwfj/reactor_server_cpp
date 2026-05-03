@@ -3,7 +3,7 @@
 #include "log/logger.h"
 #include "observability/metric_writer_context.h"
 
-#include <cstring>
+#include "common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

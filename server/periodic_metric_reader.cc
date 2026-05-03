@@ -1,5 +1,6 @@
 #include "observability/periodic_metric_reader.h"
 
+#include "common.h"
 #include "log/logger.h"
 
 namespace OBSERVABILITY_NAMESPACE {

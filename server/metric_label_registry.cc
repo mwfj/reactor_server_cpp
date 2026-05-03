@@ -1,5 +1,7 @@
 #include "observability/metric_label_registry.h"
 
+#include "common.h"
+
 namespace OBSERVABILITY_NAMESPACE {
 
 MetricLabelRegistry::MetricLabelRegistry(Catalog catalog) {

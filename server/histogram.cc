@@ -2,8 +2,7 @@
 
 #include "observability/metric_writer_context.h"
 
-#include <algorithm>
-#include <cstring>
+#include "common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

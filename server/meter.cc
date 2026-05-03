@@ -1,5 +1,7 @@
 #include "observability/meter.h"
 
+#include "common.h"
+
 namespace OBSERVABILITY_NAMESPACE {
 
 Meter::Meter(std::shared_ptr<const InstrumentationScope> scope,

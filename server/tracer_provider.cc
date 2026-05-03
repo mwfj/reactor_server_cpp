@@ -1,5 +1,6 @@
 #include "observability/tracer_provider.h"
 
+#include "common.h"
 #include "observability/instrumentation_scope.h"
 
 namespace OBSERVABILITY_NAMESPACE {

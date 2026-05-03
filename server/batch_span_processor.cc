@@ -1,5 +1,6 @@
 #include "observability/batch_span_processor.h"
 
+#include "common.h"
 #include "log/logger.h"
 
 namespace OBSERVABILITY_NAMESPACE {

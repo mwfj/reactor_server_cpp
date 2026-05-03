@@ -5,6 +5,7 @@
 #include "observability/span.h"
 #include "observability/span_status.h"
 
+#include "common.h"
 #include "log/logger.h"
 
 namespace OBSERVABILITY_NAMESPACE {
