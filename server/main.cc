@@ -1007,12 +1007,12 @@ static int HandleStart(const CliOptions& options) {
         logging::Get()->info("  Stats:   /stats");
     }
 
-    // Observability bootstrap (§14.1) — only when the master switch is
-    // on. Resource attributes carry service.name/version/instance.id;
-    // span processor defaults to NoopSpanProcessor (replaced by
-    // BatchSpanProcessor when traces.exporter == "otlp_http" — wired in
-    // a follow-up slice). Manager is attached to HttpServer so the
-    // observability middleware fires on every request.
+    // Observability bootstrap — only when the master switch is on.
+    // Resource carries service.name/version/instance.id. Default
+    // processor is NoopSpanProcessor; production callers swap in
+    // BatchSpanProcessor when traces.exporter is configured. The
+    // manager is attached to HttpServer so the middleware fires on
+    // every request.
     std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>
         observability_manager;
     if (config.observability.enabled) {
@@ -1046,12 +1046,11 @@ static int HandleStart(const CliOptions& options) {
                               config.observability.resource.service_name);
     }
 
-    // Per §10.6: register /metrics ONLY when:
-    //   - master observability.enabled
-    //   - metrics.exporter == "prometheus_pull"
-    //   - metrics_endpoint AND health_endpoint CLI flags are on
-    // Runtime metrics.enabled toggles are handled inside the handler
-    // (returns 404 when off) so the route stays registered across reloads.
+    // Register /metrics only when the master switch is on, the
+    // exporter is prometheus_pull, and both /health and /metrics CLI
+    // flags are enabled. Runtime metrics.enabled toggles are handled
+    // by the handler (404 when off) so the route stays registered
+    // across reloads.
     if (config.observability.enabled
         && config.observability.metrics.exporter == "prometheus_pull"
         && options.metrics_endpoint

@@ -6,41 +6,22 @@
 // behavior on snapshots that survive the drain.
 
 #include "test_framework.h"
-#include "observability/observability_config.h"
 #include "observability/observability_manager.h"
 #include "observability/observability_snapshot.h"
-#include "observability/resource.h"
-#include "observability/span_processor.h"
-#include "observability/trace_id.h"
+#include "observability_test_helpers.h"
 
 #include <chrono>
 #include <memory>
 
 namespace ObservabilityShutdownTests {
 
-using OBSERVABILITY_NAMESPACE::AttrValue;
-using OBSERVABILITY_NAMESPACE::Attribute;
-using OBSERVABILITY_NAMESPACE::ObservabilityConfig;
 using OBSERVABILITY_NAMESPACE::ObservabilityManager;
 using OBSERVABILITY_NAMESPACE::ObservabilitySnapshot;
-using OBSERVABILITY_NAMESPACE::NoopSpanProcessor;
-using OBSERVABILITY_NAMESPACE::RandomSource;
-using OBSERVABILITY_NAMESPACE::Resource;
-using OBSERVABILITY_NAMESPACE::SpanProcessor;
 
 namespace {
-std::shared_ptr<ObservabilityManager> MakeManager() {
-    ObservabilityConfig cfg;
-    cfg.enabled = true;
-    cfg.metrics.enabled = true;
-    cfg.resource.service_name = "shutdown-test";
-    std::vector<Attribute> attrs;
-    attrs.emplace_back("service.name", AttrValue(std::string("shutdown-test")));
-    return ObservabilityManager::Create(
-        std::move(cfg),
-        std::make_shared<Resource>(std::move(attrs)),
-        std::shared_ptr<SpanProcessor>(std::make_shared<NoopSpanProcessor>()),
-        std::make_shared<RandomSource>(0xDEADBEEFULL));
+inline std::shared_ptr<ObservabilityManager> MakeManager() {
+    return ObservabilityTestHelpers::MakeManager(
+        "shutdown-test", 0xDEADBEEFULL);
 }
 }  // namespace
 

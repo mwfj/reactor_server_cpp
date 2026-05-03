@@ -497,19 +497,17 @@ private:
     void OnWsDrainComplete(ConnectionHandler* conn_ptr);
     void WaitForH2Drain();
 
-    // Phase 1c (§13 r78/r80) — block until every async-counter reaches
-    // zero or the deadline expires. Predicate gates each counter on
-    // null-manager: a deployment with no upstream_manager_ contributes
-    // zero to active_leases / inflight_transactions; a deployment with
-    // no observability_manager_ contributes zero to inflight_finalizations.
-    // Phase 1c MUST run unconditionally so future async counters (e.g.
-    // hypothetical AuthManager async-introspection counter) are picked
-    // up automatically when added to the predicate.
-    //
-    // Returns true if every predicate counter reached zero before the
-    // deadline; false on timeout. Caller (HttpServer::Stop) decides
-    // whether to fall through into the kill loop.
+    // Block until every async counter reaches zero or `timeout`
+    // expires. The predicate gates each counter on its owning manager
+    // being non-null — null managers contribute zero. Always called
+    // unconditionally so any future async counter added to the
+    // predicate is picked up automatically. Returns true on full drain.
     bool WaitForAllAsyncDrain(std::chrono::milliseconds timeout);
+
+    // Run the observability shutdown sweep within `budget`:
+    // WaitForAllAsyncDrain → on-timeout KillOutstandingSnapshots →
+    // BeginShutdown. No-op when observability is not configured.
+    void DrainObservabilityForShutdown(std::chrono::milliseconds budget);
 
     // Helper: set up request handler on an Http2ConnectionHandler
     void SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn);

@@ -35,19 +35,20 @@ ObservabilityManager::ObservabilityManager(
       resource_(std::move(resource)),
       random_(std::move(random)),
       span_processor_(std::move(span_processor)) {
-    traces_enabled_.store(config_.traces.enabled,
-                            std::memory_order_release);
-    metrics_enabled_.store(config_.metrics.enabled,
-                            std::memory_order_release);
-    include_target_info_.store(config_.metrics.prometheus.include_target_info,
-                                 std::memory_order_release);
+    PublishLiveFlags(config_);
 }
 
 ObservabilityManager::~ObservabilityManager() {
-    // Defensive: BeginShutdown is idempotent; if HttpServer::Stop
-    // never called it (e.g. test teardown without explicit shutdown),
-    // run it here so the processor / reader workers join cleanly.
+    // Idempotent safety net for tests / abnormal teardown paths.
     BeginShutdown(std::chrono::milliseconds{1000});
+}
+
+void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
+    traces_enabled_.store(c.traces.enabled, std::memory_order_release);
+    metrics_enabled_.store(c.metrics.enabled, std::memory_order_release);
+    include_target_info_.store(
+        c.metrics.prometheus.include_target_info,
+        std::memory_order_release);
 }
 
 void ObservabilityManager::Init() {
@@ -87,10 +88,8 @@ ObservabilityManager::BuildSamplerFromConfig() const {
 void ObservabilityManager::RegisterLiveSnapshot(
     const std::shared_ptr<ObservabilitySnapshot>& snap) {
     if (!snap) return;
-    // Atomic register-and-count (r45): both the registry insert AND
-    // the counter increment happen under the SAME mutex acquisition,
-    // so the Phase 1c kill loop can never observe a registered-but-
-    // uncounted OR counted-but-unregistered snapshot.
+    // Insert AND counter-bump under the SAME mutex so the kill loop
+    // can never observe a registered-but-uncounted snapshot (or vice versa).
     std::lock_guard<std::mutex> g(live_snapshots_mtx_);
     live_snapshots_[snap.get()] = snap;
     inflight_finalizations_.fetch_add(1, std::memory_order_acq_rel);
@@ -126,8 +125,7 @@ bool ObservabilityManager::FinalizeFromSnapshot(
         return false;
     }
 
-    // Bookkeeping: bump finalizers_in_progress so Phase 1c's
-    // wait predicate observes the in-progress finalize as load-bearing.
+    // Make the in-progress finalize visible to the shutdown wait predicate.
     finalizers_in_progress_.fetch_add(1, std::memory_order_acq_rel);
 
     try {
@@ -161,13 +159,10 @@ void ObservabilityManager::OnFinalizeWinner(
     snap.wire_body_size.store(wire_body_size, std::memory_order_release);
     snap.error_type = error_type;
 
-    // Attach response-side attributes to the inbound SERVER span before
-    // ending it (per OPENTELEMETRY_DESIGN.md §6.6 + §7.1):
-    //   - http.response.status_code (always when status > 0)
-    //   - http.server.response.body.size (wire-bytes; 0 for HEAD/1xx/204/304)
-    //   - error.type (when set; categorical string per OTel error semconv)
-    //   - SpanStatusCode: server 5xx → ERROR; 4xx → UNSET (client misuse,
-    //     not the gateway's fault); successful operations stay UNSET.
+    // Attach response-side attributes before ending:
+    //   http.response.status_code, http.server.response.body.size,
+    //   error.type. 5xx maps to SpanStatusCode::ERROR; 4xx stays UNSET
+    //   (client misuse is not a server-side error).
     if (snap.inbound_span) {
         if (status_code > 0) {
             snap.inbound_span->SetAttribute(
@@ -185,11 +180,8 @@ void ObservabilityManager::OnFinalizeWinner(
         } else if (status_code >= 500 && status_code < 600) {
             snap.inbound_span->SetStatus(SpanStatusCode::ERROR);
         }
-        // End is idempotent + dispatcher-thread-only — we're on the
-        // dispatcher thread because finalize is called from the response-
-        // completion path (sync handler / async-completion / streaming
-        // End/Abort / middleware-rejection). The Phase 1c kill path uses
-        // CASE A/B semantics in KillOutstandingSnapshots.
+        // Idempotent + dispatcher-thread-only. The shutdown kill path
+        // takes a different code route via KillOutstandingSnapshots.
         snap.inbound_span->End();
     }
 }
@@ -205,7 +197,6 @@ void ObservabilityManager::BeginShutdown(
         span_processor_->SignalShutdown();
         span_processor_->JoinWorkers(timeout);
     }
-    // PeriodicMetricReader shutdown lands in task #70.
 }
 
 void ObservabilityManager::KillOutstandingSnapshots(
@@ -225,10 +216,9 @@ void ObservabilityManager::KillOutstandingSnapshots(
     for (auto& snap_sp : to_kill) {
         ObservabilitySnapshot& snap = *snap_sp;
 
-        // Step 1 (r48): publish kill flag on linked transaction
-        // INLINE on the shutdown thread, BEFORE any marshal. Phase-3
-        // terminal callbacks acquire-load the flag BEFORE Span::End
-        // and skip End when set.
+        // Publish kill flag on the linked transaction first so its
+        // terminal callbacks observe the marker before they emit
+        // Span::End and skip the emit when set.
         std::shared_ptr<UpstreamTransactionLink> tx;
         {
             std::lock_guard<std::mutex> g(snap.link_mtx);
@@ -236,29 +226,18 @@ void ObservabilityManager::KillOutstandingSnapshots(
         }
         if (tx) tx->MarkKilledForShutdown();
 
-        // Step 2: idempotent CAS-from-false-to-true. Ties FinalizeFromSnapshot
-        // and the kill loop together — only one wins. If the user-side
-        // finalize already won, kill no-ops and we just deregister
-        // (deregister is idempotent — DeregisterAndDecrement no-ops
-        // when the entry is already gone).
+        // CAS arbitrates against any concurrent FinalizeFromSnapshot —
+        // exactly one path commits the terminal event.
         bool expected = false;
         if (!snap.finalized.compare_exchange_strong(expected, true,
                 std::memory_order_acq_rel)) {
             continue;
         }
 
-        // Drop the inbound SERVER span. Per r80: when the kill loop is
-        // running on the snapshot's owning dispatcher (CASE B),
-        // DropWithoutEnd is safe inline — it mutates Span members on
-        // the dispatcher thread. When OFF the owning dispatcher
-        // (CASE A), the design uses EnQueue with weak_from_this()
-        // capture; for now we INLINE both cases because the per-
-        // dispatcher kill marshal infrastructure is part of task #73
-        // (HttpServer::Stop wiring). The race window is bounded by
-        // BeginShutdown(t) above, which already drained the
-        // BatchSpanProcessor; DropWithoutEnd is safe because it's
-        // marked atomic-CAS-idempotent at the Span level and only
-        // mutates Span-local state.
+        // DropWithoutEnd is CAS-idempotent and only mutates Span-local
+        // state, so an inline call is safe regardless of which dispatcher
+        // owns the span. The processor was already drained by
+        // BeginShutdown above.
         if (snap.inbound_span) {
             snap.inbound_span->DropWithoutEnd();
         }
@@ -269,16 +248,11 @@ void ObservabilityManager::KillOutstandingSnapshots(
 }
 
 void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
-    // Master flag (`enabled`) and Resource fields are restart-required
-    // — caller (HttpServer::Reload) emits the WARN log. We ignore
-    // them here.
-    traces_enabled_.store(new_config.traces.enabled, std::memory_order_release);
-    metrics_enabled_.store(new_config.metrics.enabled, std::memory_order_release);
-    include_target_info_.store(
-        new_config.metrics.prometheus.include_target_info,
-        std::memory_order_release);
+    // Master `enabled` and Resource are restart-required; HttpServer::Reload
+    // emits the warn for those. Ignore them here.
+    PublishLiveFlags(new_config);
 
-    // Capture the new sampler config for any FUTURE GetTracer() calls.
+    // Capture the new sampler config for any future GetTracer() calls.
     config_.traces.sampler  = new_config.traces.sampler;
     config_.traces.enabled  = new_config.traces.enabled;
     config_.metrics         = new_config.metrics;
@@ -286,7 +260,7 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
     // Build new sampler + push to TracerProvider.
     auto new_sampler = BuildSamplerFromConfig();
     if (tracer_provider_) {
-        ProcessorOptions po;  // r79: processor knobs not in obs config yet.
+        ProcessorOptions po;
         tracer_provider_->Reload(new_sampler, po);
     }
 

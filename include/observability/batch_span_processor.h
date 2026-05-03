@@ -3,18 +3,16 @@
 // BatchSpanProcessor — bounded-queue worker that batches finished
 // SpanData and hands batches to a SpanExporter.
 //
-// Per OPENTELEMETRY_DESIGN.md §8 r79:
-//   - max_queue_size:        restart-only (allocated at construction;
-//                              live resize would drop or duplicate).
-//   - max_export_batch_size: live-reloadable (caps each export call).
-//   - schedule_delay:         live-reloadable (worker wakes every N ms
-//                              even when queue is below batch size).
-//   - export_timeout:         per-export deadline (passed to exporter).
+// Field classification:
+//   max_queue_size:        restart-only (allocated at construction;
+//                          live resize would drop or duplicate).
+//   max_export_batch_size: live-reloadable (caps each export call).
+//   schedule_delay:        live-reloadable (worker wakes every N ms
+//                          even when the queue is below batch size).
+//   export_timeout:        per-export deadline passed to the exporter.
 //
-// Drop-oldest semantics on queue full: the OnEnd path NEVER blocks
-// (would stall the dispatcher). Drops are counted in
-// `dropped_on_overflow_` for the §7.4 `reactor_otel_spans_dropped_total`
-// metric (wired in task #71/#72).
+// Drop-oldest on queue full: OnEnd never blocks (would stall the
+// dispatcher). Drops are counted via dropped_on_overflow_.
 
 #include "observability/span_exporter.h"
 #include "observability/span_processor.h"
@@ -51,16 +49,16 @@ public:
     void SignalShutdown() override;
     void JoinWorkers(std::chrono::milliseconds deadline) override;
 
-    // Live-reloadable knobs (r79).
+    // Live-reloadable knobs.
     void Reload(size_t new_max_export_batch_size,
                 std::chrono::milliseconds new_schedule_delay,
                 std::chrono::milliseconds new_export_timeout);
 
-    // Force a flush + return when the queue drains or `deadline`
-    // expires. Idempotent. Used by §13 BeginShutdown(t).
+    // Force a flush; returns when the queue drains or `deadline`
+    // expires. Idempotent.
     void ForceFlush(std::chrono::milliseconds deadline);
 
-    // Diagnostics — read by §7.4 self-metrics.
+    // Diagnostics counters surfaced via self-metrics.
     size_t  queue_depth() const noexcept;
     int64_t dropped_on_overflow() const noexcept {
         return dropped_on_overflow_.load(std::memory_order_acquire);

@@ -52,6 +52,8 @@
 #include "observability_config_test.h"
 #include "observability_shutdown_test.h"
 #include "observability_link_kill_test.h"
+#include "observability_issue_inject_test.h"
+#include "observability_stress_test.h"
 #include "observability_e2e_test.h"
 #include "test_framework.h"
 #include <algorithm>
@@ -235,6 +237,15 @@ void RunAllTest(){
     // UpstreamTransactionLink; the kill loop reaches linked txs.
     ObservabilityLinkKillTests::RunAllTests();
 
+    // IssueTraceContext outbound injection (JWKS / OIDC / introspection
+    // / OTLP) — strip-and-replace W3C contract.
+    ObservabilityIssueInjectTests::RunAllTests();
+
+    // Cross-cutting stress / lifecycle / race tests — concurrent
+    // finalize CAS, register/finalize churn, kill loop tolerance,
+    // concurrent counter add, reload + read race, manager cycle.
+    ObservabilityStressTests::RunAllTests();
+
     // Observability end-to-end tests — boot a real HttpServer, install
     // the observability manager + middleware, send TCP-level HTTP
     // requests, assert spans are captured by the InMemorySpanProcessor.
@@ -313,6 +324,10 @@ void PrintUsage(const char* program_name) {
     std::cout << "                     KillOutstandingSnapshots drain, BeginShutdown idempotency)" << std::endl;
     std::cout << "  obs_linkkill       Observability link/kill protocol tests" << std::endl;
     std::cout << "                     (ProxyTransaction link, KillOutstandingSnapshots wiring)" << std::endl;
+    std::cout << "  obs_issue          IssueTraceContext outbound injection tests" << std::endl;
+    std::cout << "                     (JWKS / OIDC / introspection / OTLP traceparent strip+inject)" << std::endl;
+    std::cout << "  obs_stress         Cross-cutting stress / race / lifecycle tests" << std::endl;
+    std::cout << "                     (concurrent finalize CAS, churn drain, reload+read)" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -505,6 +520,12 @@ int main(int argc, char* argv[]) {
         // Run observability link/kill protocol tests.
         }else if(mode == "obs_linkkill"){
             ObservabilityLinkKillTests::RunAllTests();
+        // Run IssueTraceContext outbound injection tests.
+        }else if(mode == "obs_issue"){
+            ObservabilityIssueInjectTests::RunAllTests();
+        // Run observability cross-cutting stress / race tests.
+        }else if(mode == "obs_stress"){
+            ObservabilityStressTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

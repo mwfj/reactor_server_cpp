@@ -1,23 +1,24 @@
 #pragma once
 
-// SpanExporter — the wire-format export interface.
+// SpanExporter — wire-format export interface.
 //
-// Per OPENTELEMETRY_DESIGN.md §8.2 r84: the exporter owns NO worker
-// thread (BatchSpanProcessor / PeriodicMetricReader own worker
-// shutdown). The exporter's lifecycle is the trio:
+// The exporter owns NO worker thread; BatchSpanProcessor and
+// PeriodicMetricReader own their own workers. The exporter's lifecycle
+// is the trio:
 //
 //   SignalShutdown()           — refuse new Export() calls; subsequent
-//                                  Export() returns kFailedNotRetryable.
-//                                  Idempotent.
-//   CancelAllActiveExports()   — ONLY called from §13's self-dispatcher /
-//                                  single-dispatcher branch; force-cancels
-//                                  in-flight exports so the processor's
-//                                  drain loop can exit without blocking
-//                                  on a queued dispatcher hop. Idempotent.
+//                                Export() returns kFailedNotRetryable.
+//                                Idempotent.
+//   CancelAllActiveExports()   — force-cancel in-flight exports so the
+//                                processor's drain loop can exit
+//                                without blocking on a queued
+//                                dispatcher hop. Idempotent. Called
+//                                only from the self-dispatcher /
+//                                single-dispatcher shutdown branch.
 //   RebindDispatcher(d)        — re-home in-flight export hops onto a
-//                                  surviving dispatcher when the original
-//                                  pinned dispatcher is being torn down.
-//                                  Optional; default no-op.
+//                                surviving dispatcher when the
+//                                original pinned dispatcher is being
+//                                torn down. Optional; default no-op.
 
 #include "observability/span_data.h"
 
@@ -45,7 +46,6 @@ public:
                                  std::chrono::steady_clock::time_point deadline =
                                      std::chrono::steady_clock::time_point::max()) = 0;
 
-    // r84 shutdown trio.
     virtual void SignalShutdown() = 0;
     virtual void CancelAllActiveExports() = 0;
     virtual void RebindDispatcher(Dispatcher* /*new_export_dispatcher*/) {}

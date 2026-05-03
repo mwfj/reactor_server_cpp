@@ -391,7 +391,9 @@ void TestMetricsHandlerContentTypeFromAccept() {
         auto m = BuildManager(true, true);
         auto h = MakeMetricsHandler(std::weak_ptr<ObservabilityManager>(m));
         HttpRequest req;
-        req.headers["Accept"] = "application/openmetrics-text; version=1.0.0";
+        // The HTTP parser lowercases inbound header keys; mirror that
+        // here so HttpRequest::GetHeader's case-insensitive lookup hits.
+        req.headers["accept"] = "application/openmetrics-text; version=1.0.0";
         HttpResponse resp;
         h(req, resp);
         bool found_om = false;

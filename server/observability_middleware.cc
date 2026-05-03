@@ -18,22 +18,14 @@ namespace OBSERVABILITY_NAMESPACE {
 
 namespace {
 
-// Tracer name used by the observability middleware for inbound
-// SERVER spans. Backends group spans by (Resource,
-// InstrumentationScope); using a stable name lets operators filter
-// "all gateway-emitted server spans" by scope name.
+// Backends group spans by (Resource, InstrumentationScope); a stable
+// scope name lets operators filter "all gateway-emitted server spans".
 constexpr const char* kInboundTracerName = "reactor.http.server";
 
-// Capture inbound trace context from the request via the W3C
-// propagator (per OPENTELEMETRY_DESIGN.md §4.5.1). When the inbound
-// `traceparent` header is present + valid, `remote_parent` carries
-// the extracted parent SpanContext (is_remote=true). When absent or
-// malformed, remote_parent is left invalid → the SERVER span becomes
-// a root span. `current_local` is filled by the caller AFTER
-// StartSpan returns, so this helper just sets up the parent.
-RequestTraceContext BuildRequestTraceContext(
-    const HttpRequest& request,
-    Tracer* /*tracer*/) {
+// Extract the inbound W3C traceparent. Missing or malformed → invalid
+// remote_parent (the SERVER span becomes a root). current_local is
+// filled by the caller after StartSpan returns.
+RequestTraceContext BuildRequestTraceContext(const HttpRequest& request) {
     RequestTraceContext rtx;
     auto parent = W3CPropagator::Extract(request.headers);
     if (parent.has_value()) {
@@ -47,43 +39,31 @@ RequestTraceContext BuildRequestTraceContext(
 HttpRouter::Middleware MakeObservabilityMiddleware(
     std::shared_ptr<ObservabilityManager> manager) {
     if (!manager) {
-        // Defensive: caller (HttpServer::MarkServerReady) should NOT
-        // install this middleware when observability is disabled.
-        // If it does, fall through every request as a true no-op.
         return [](HttpRequest& /*request*/, HttpResponse& /*response*/) {
             return true;
         };
     }
 
-    // Capture by value: the middleware closure outlives the call site
-    // (HttpRouter holds it in `middlewares_`). The shared_ptr keeps
-    // the manager alive at least as long as the router, which is the
-    // contract HttpServer enforces (manager is constructed before
-    // MarkServerReady installs this middleware, and is owned by
-    // HttpServer for the server's lifetime).
+    // The shared_ptr keeps the manager alive for the lifetime of the
+    // closure, which the router holds for the server's lifetime.
     auto mgr_sp = std::move(manager);
 
     return [mgr_sp](HttpRequest& request, HttpResponse& /*response*/) -> bool {
-        // 1. Ensure route_match is populated. The router's
-        //    ResolveRouteMatch is idempotent (short-circuits when
-        //    kind != None) so calling it both from middleware AND
-        //    from the dispatch site is safe. We can't call it directly
-        //    here because the middleware doesn't hold a router pointer;
-        //    instead, the dispatch site calls PopulateRouteParams
-        //    BEFORE running the middleware chain, so by the time we
-        //    arrive route_match.kind is already set. (See
-        //    HttpRouter::DispatchHandler in server/http_router.cc.)
+        // PopulateRouteParams runs before the middleware chain so
+        // request.route_match is already set.
 
-        // 2. Snapshot the live trace flags. Disabled traces → still
-        //    build the snapshot (metrics + middleware-rejection paths
-        //    rely on it) but skip Span allocation.
         const bool traces_enabled = mgr_sp->TracesEnabled();
-
-        // 3. Build trace context.
         Tracer* tracer = mgr_sp->GetTracer(kInboundTracerName);
-        RequestTraceContext rtx = BuildRequestTraceContext(request, tracer);
 
-        // 4. Allocate the SERVER Span (only when traces are enabled).
+        // Skip parent extraction entirely when traces are off — the
+        // snapshot is still built so metrics + middleware-rejection
+        // paths can finalize, but no header lookup or context copy
+        // needs to happen.
+        RequestTraceContext rtx;
+        if (traces_enabled) {
+            rtx = BuildRequestTraceContext(request);
+        }
+
         std::shared_ptr<Span> server_span;
         if (traces_enabled) {
             StartSpanOptions opts;
@@ -92,10 +72,9 @@ HttpRouter::Middleware MakeObservabilityMiddleware(
             opts.parent                  = rtx.remote_parent;
             opts.has_explicit_start_time = false;
 
-            // Initial server-span attributes per OTel HTTP semconv.
-            // Only http.request.method + http.route + url.scheme +
-            // network.protocol.version; status_code lands at
-            // FinalizeFromSnapshot.
+            // OTel HTTP semconv initial server-span attributes.
+            // status_code is filled at FinalizeFromSnapshot.
+            opts.attributes.reserve(4);
             if (!request.method.empty()) {
                 opts.attributes.emplace_back(
                     std::string(sem::kHttpRequestMethod),
@@ -123,17 +102,12 @@ HttpRouter::Middleware MakeObservabilityMiddleware(
                     : (request.method.empty() ? std::string("HTTP")
                                                 : request.method);
             server_span = tracer->StartSpan(span_name, opts);
-            // Mirror the freshly-created SpanContext back into rtx so
-            // downstream outbound-propagation paths read a populated
-            // current_local.
+            // Outbound propagation reads current_local; mirror the
+            // freshly-created SpanContext back into rtx.
             rtx.current_local = server_span->Context();
             rtx.is_recording = server_span->IsRecording();
         }
 
-        // 5. Build the snapshot + register-and-count under
-        //    live_snapshots_mtx_. PopulateSnapshot is the field-fill;
-        //    RegisterLiveSnapshot is the SINGLE atomic register-and-
-        //    count site (r45).
         auto snap = std::make_shared<ObservabilitySnapshot>();
         snap->trace_context             = rtx.current_local;
         snap->route_pattern             = request.route_match.pattern;
@@ -148,14 +122,12 @@ HttpRouter::Middleware MakeObservabilityMiddleware(
 
         mgr_sp->RegisterLiveSnapshot(snap);
 
-        // 6. Hand back to the request. Trace ctx + span are also
-        //    written so downstream code (proxy, auth-path outbound
-        //    HTTP, finalize wiring) can read them off the request.
+        // Republish to the request so downstream code (proxy, auth
+        // outbound, finalize wiring) can read trace ctx + span + snap.
         request.trace_ctx = rtx;
         request.observability_span = server_span;
         request.obs_snapshot = std::move(snap);
 
-        // Always-pass — observability is non-blocking.
         return true;
     };
 }

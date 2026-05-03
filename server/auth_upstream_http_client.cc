@@ -1,4 +1,6 @@
 #include "auth/upstream_http_client.h"
+#include "observability/propagator.h"
+#include "observability/span_context.h"
 
 #include "upstream/upstream_manager.h"
 #include "upstream/upstream_http_codec.h"
@@ -235,6 +237,19 @@ UpstreamHttpClient::UpstreamHttpClient(
 
 UpstreamHttpClient::~UpstreamHttpClient() = default;
 
+void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
+    // Strip first so an unsanitized inbound header can never leak
+    // across gateway-internal hops, then inject from issue_ctx when
+    // the caller has populated it with a valid local SpanContext.
+    req.headers.erase("traceparent");
+    req.headers.erase("tracestate");
+    if (req.issue_ctx.has_value()
+        && req.issue_ctx->local.IsValid()) {
+        OBSERVABILITY_NAMESPACE::W3CPropagator::Inject(
+            req.issue_ctx->local, req.headers);
+    }
+}
+
 void UpstreamHttpClient::Issue(const std::string& upstream_pool_name,
                                 size_t dispatcher_index,
                                 Request req,
@@ -266,6 +281,8 @@ void UpstreamHttpClient::Issue(const std::string& upstream_pool_name,
         deliver_error(cb, "dispatcher_out_of_range");
         return;
     }
+
+    ApplyOutboundTraceContext(req);
 
     auto txn = std::make_shared<Transaction>();
     txn->req = std::move(req);

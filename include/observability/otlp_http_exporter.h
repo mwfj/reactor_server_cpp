@@ -1,21 +1,21 @@
 #pragma once
 
 // OtlpHttpExporter — serializes SpanData / MetricsSnapshot to OTLP/JSON
-// per the v1.10 OpenTelemetry protocol spec, then hands the payload to
-// a caller-supplied transport callback.
+// (v1.10) and hands the payload to a caller-supplied transport
+// callback.
 //
-// Per OPENTELEMETRY_DESIGN.md §8.1 r84:
-//   - Implements SpanExporter + MetricExporter (one exporter handles
-//     both signal types; per-signal Options carry trace vs metric
-//     routing — Tempo for traces, Prometheus-OTLP / Mimir for metrics).
-//   - r84 trio: SignalShutdown / CancelAllActiveExports / RebindDispatcher.
-//   - Owns NO worker thread (BatchSpanProcessor / PeriodicMetricReader
-//     own worker shutdown).
+// Implements SpanExporter + MetricExporter — one exporter handles both
+// signal types so operators can route traces and metrics to different
+// collectors via per-signal SignalOptions.
 //
-// Transport pluggability: the exporter accepts an `OnSerializedExport`
-// callback that receives the (path, headers, body) tuple. Production
-// wiring (task #74/#75) installs a callback that POSTs through
-// `UpstreamHttpClient::Issue`. Tests install a capture callback that
+// Owns no worker thread (BatchSpanProcessor and PeriodicMetricReader
+// own their own workers); exposes the SignalShutdown /
+// CancelAllActiveExports / RebindDispatcher trio for the lifecycle
+// hooks the processors need.
+//
+// The exporter accepts an OnSerializedExport callback that receives
+// (path, headers, body); production callers POST it through
+// UpstreamHttpClient::Issue, tests install a capture callback that
 // retains the payload for inspection.
 
 #include "observability/metric_exporter.h"
@@ -38,9 +38,8 @@ class OtlpHttpExporter
       public std::enable_shared_from_this<OtlpHttpExporter> {
 public:
     // Per-signal options — operators commonly route trace and metric
-    // OTLP to separate collectors. Per §8.1 r79: live-reloadable subset
-    // is `headers` + `timeout_ms` ONLY (controlled merge under r79;
-    // upstream_pool_name + path are restart-only).
+    // OTLP to separate collectors. Live-reloadable subset is `headers`
+    // + `timeout` only; `upstream_pool_name` + `path` are restart-only.
     struct SignalOptions {
         std::string upstream_pool_name;  // e.g. "otel_traces_collector"
         std::string path;                 // "/v1/traces" or "/v1/metrics"
@@ -86,15 +85,14 @@ public:
                          std::chrono::steady_clock::time_point deadline =
                              std::chrono::steady_clock::time_point::max()) override;
 
-    // r84 trio (overrides both base interfaces).
+    // Lifecycle hooks (override both base interfaces).
     void SignalShutdown() override;
     void CancelAllActiveExports() override;
     void RebindDispatcher(Dispatcher* /*new_export_dispatcher*/) override {}
 
-    // Live-reloadable: controlled merge per r79. Replaces ONLY
-    // `headers` + `timeout` on the matching signal (traces or
-    // metrics). Restart-only fields (upstream_pool_name, path) are
-    // preserved.
+    // Controlled merge: replaces only `headers` + `timeout` on the
+    // matching signal. Restart-only fields (upstream_pool_name, path)
+    // are preserved.
     void ReloadHeaders(const std::map<std::string, std::string>& trace_headers,
                         const std::map<std::string, std::string>& metric_headers,
                         std::chrono::milliseconds trace_timeout,

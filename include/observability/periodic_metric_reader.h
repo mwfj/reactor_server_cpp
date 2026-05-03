@@ -1,12 +1,12 @@
 #pragma once
 
 // PeriodicMetricReader — worker thread that calls
-// `MeterProvider::Snapshot()` on a fixed interval and hands the
-// resulting MetricsSnapshot to a MetricExporter.
+// MeterProvider::Snapshot on a fixed interval and hands the result
+// to a MetricExporter.
 //
-// Per OPENTELEMETRY_DESIGN.md §8.4 r79: reader-side knobs are
-// `export_interval_ms` AND `export_timeout_ms` only. Trace-only knobs
-// (max_export_batch_size, schedule_delay) live on BatchSpanProcessor.
+// Reader-side knobs are export_interval and export_timeout only.
+// Trace-only knobs (max_export_batch_size, schedule_delay) live on
+// BatchSpanProcessor.
 
 #include "observability/metric_exporter.h"
 #include "observability/meter_provider.h"
@@ -30,14 +30,13 @@ public:
     PeriodicMetricReader& operator=(const PeriodicMetricReader&) = delete;
     ~PeriodicMetricReader();
 
-    // r84 trio mirror — same lifecycle shape as the SpanExporter trio.
+    // Lifecycle hooks — same shape as the SpanExporter trio.
     void SignalShutdown();
     void JoinWorkers(std::chrono::milliseconds deadline);
 
-    // Live-reloadable knobs (r79). MeterProvider::reader_options()
-    // remains the source of truth; this method updates the reader's
-    // local atomic snapshot so the worker observes the new values
-    // promptly without a Snapshot() round-trip.
+    // Update the reader's atomic interval/timeout snapshot so the
+    // worker observes new values without a Snapshot() round-trip.
+    // MeterProvider::reader_options() remains the source of truth.
     void Reload(MeterReaderOptions new_options);
 
     // Force a single export now, bounded by `deadline`. Idempotent

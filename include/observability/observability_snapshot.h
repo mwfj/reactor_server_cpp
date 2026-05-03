@@ -65,6 +65,14 @@ public:
 };
 
 struct ObservabilitySnapshot {
+    // Publish the transaction weak_ptr under link_mtx so the kill loop
+    // can find and mark it. Either ordering with the kill loop converges
+    // — there is no "linked but not yet marked" window.
+    void AttachTransaction(std::weak_ptr<UpstreamTransactionLink> tx) {
+        std::lock_guard<std::mutex> g(link_mtx);
+        tx_weak = std::move(tx);
+    }
+
     // ---- Identity (immutable post-construction) ----
     SpanContext   trace_context;     // server-hop SpanContext (current_local).
     std::string   route_pattern;     // http.route — copy-from-RouteMatch.pattern.

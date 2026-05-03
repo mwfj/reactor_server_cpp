@@ -1,40 +1,26 @@
 #pragma once
 
-// ObservabilityManager — the top-level owner of TracerProvider +
+// ObservabilityManager — top-level owner of TracerProvider +
 // MeterProvider + the live-snapshot registry. Inherits
-// `enable_shared_from_this` so per-snapshot weak_ptr captures can
-// safely upgrade-or-no-op when the manager outlives a kill marshal.
+// enable_shared_from_this so kill marshals can safely upgrade-or-no-op
+// when the manager outlives them.
 //
-// Per OPENTELEMETRY_DESIGN.md §6.1.2 + §13:
+// Counter lifecycle for the shutdown drain predicate:
 //
-//   live_snapshots_ + live_snapshots_mtx_:
-//     RegisterLiveSnapshot is the SINGLE atomic register-and-count
-//     site (per r45). PopulateSnapshot is a pure field-fill helper
-//     that does NOT touch inflight_finalizations_.
+//   inflight_finalizations_  — bumped under live_snapshots_mtx_ in
+//                              RegisterLiveSnapshot; decremented under
+//                              the same mutex by FinalizeFromSnapshot
+//                              (CAS-winner) AND the kill loop.
+//   finalizers_in_progress_  — bumped at FinalizeFromSnapshot entry,
+//                              decremented before return; signaled on
+//                              finalizers_done_cv_.
+//   kill_marshals_in_flight_ — bumped by off-dispatcher kill marshals
+//                              before EnQueue; decremented + cv-notified
+//                              when the closure runs. Inline self-
+//                              dispatcher kills do not touch it.
 //
-//   inflight_finalizations_:
-//     Incremented INSIDE RegisterLiveSnapshot under live_snapshots_mtx_.
-//     Decremented inside FinalizeFromSnapshot's CAS-from-false-to-true
-//     success path (matched with live_snapshots_ deregister under the
-//     same mutex). Phase 1c kill loop also performs the
-//     decrement-and-deregister pair on every CAS-won snapshot.
-//     Phase 1c's WaitForAllAsyncDrain reads this counter.
-//
-//   finalizers_in_progress_ + finalizers_done_cv_:
-//     Incremented at FinalizeFromSnapshot entry (after CAS); decremented
-//     before return. The Phase 1c kill loop's wait predicate requires
-//     finalizers_in_progress_ == 0 AND kill_marshals_in_flight_ == 0
-//     before Phase 2 begins.
-//
-//   kill_marshals_in_flight_:
-//     CASE A (off-dispatcher kill marshal) increments before EnQueue;
-//     the closure decrements + cv-notifies on completion. CASE B
-//     (self-dispatcher inline) does NOT touch this counter — no marshal
-//     is pending. Per r80.
-//
-//   BeginShutdown(t):
-//     Phase 2 entry. Tells the BatchSpanProcessor + PeriodicMetricReader
-//     to drain bounded by `t`. Idempotent — repeat calls no-op.
+// BeginShutdown(t) drains the BatchSpanProcessor + PeriodicMetricReader
+// bounded by t. Idempotent.
 
 #include "observability/common.h"
 #include "observability/meter_provider.h"
@@ -57,9 +43,9 @@ namespace OBSERVABILITY_NAMESPACE {
 class ObservabilityManager
     : public std::enable_shared_from_this<ObservabilityManager> {
 public:
-    // Factory — must be used (NOT direct constructor) so
-    // enable_shared_from_this seeds the internal weak reference. Per
-    // §17.1 r37 lifecycle.
+    // Factory — must be used (NOT the direct constructor) so
+    // enable_shared_from_this seeds the internal weak reference before
+    // any caller can capture a weak_ptr.
     static std::shared_ptr<ObservabilityManager> Create(
         ObservabilityConfig config,
         std::shared_ptr<const Resource> resource,
@@ -90,56 +76,45 @@ public:
     }
     // Live read of metrics.prometheus.include_target_info — flipped by
     // SIGHUP through Reload(). The /metrics handler consults this on
-    // every scrape so operators see flips immediately.
+    // every scrape.
     bool IncludeTargetInfo() const noexcept {
         return include_target_info_.load(std::memory_order_acquire);
     }
 
     // ---- Snapshot lifecycle ----
     //
-    // RegisterLiveSnapshot — atomic register-and-count site. Inserts
-    // weak_ptr into live_snapshots_ AND increments inflight_finalizations_
-    // under live_snapshots_mtx_ in ONE critical section. Returns the
-    // input shared_ptr unchanged (chainable).
+    // Atomic register-and-count site: inserts the weak_ptr AND bumps
+    // inflight_finalizations_ under one critical section.
     void RegisterLiveSnapshot(const std::shared_ptr<ObservabilitySnapshot>& snap);
 
-    // FinalizeFromSnapshot — the single terminal-event entry point.
-    // Idempotent: only the CAS-from-false-to-true winner runs the
-    // span End + metric Record + counter decrement. Late callers
-    // no-op cleanly. Returns true on win, false on no-op.
+    // Single terminal-event entry. Idempotent CAS-from-false-to-true:
+    // exactly one caller wins; late callers no-op. Returns the win flag.
     bool FinalizeFromSnapshot(ObservabilitySnapshot& snap,
                                 int      status_code,
                                 uint64_t wire_body_size,
                                 std::string error_type);
 
-    // ---- Phase 2 shutdown entry (§13) ----
-    // Idempotent. Drains processor + reader bounded by `t`.
+    // Idempotent. Drains processor + reader bounded by `timeout`.
     void BeginShutdown(std::chrono::milliseconds timeout);
 
-    // ---- Phase 1c kill loop (§13 r80) ----
-    // Iterates live_snapshots_ and CAS-wins finalize on every snapshot
-    // that survived the drain. CASE A (off-dispatcher) marshals via
-    // EnQueue with weak_from_this() capture per r80; CASE B
-    // (self-dispatcher) runs inline + falls through to common
-    // bookkeeping. The kill flag (kill_for_shutdown on each linked
-    // ProxyTransaction) is published INLINE before the EnQueue per
-    // r48 — Phase-3 terminal callbacks acquire-load it BEFORE
-    // Span::End and skip End when set.
+    // Iterates live_snapshots_ and CAS-wins a terminal event on every
+    // snapshot that survived the drain. Off-dispatcher marshals via
+    // EnQueue with weak_from_this() capture; self-dispatcher kills run
+    // inline. The kill flag on the linked ProxyTransaction is published
+    // before the EnQueue so terminal callbacks can short-circuit
+    // Span::End on shutdown.
     void KillOutstandingSnapshots(std::chrono::milliseconds grace);
 
-    // ---- Reload (§11.1 r77/r79) ----
-    //
-    // Apply the live-reloadable subset of `new_config` to the running
-    // pipeline. Master flag (`enabled`) and Resource fields are
-    // restart-required and IGNORED here (a separate WARN log fires at
-    // the call site when those change). Live subset:
+    // Apply the live-reloadable subset of `new_config`. Master `enabled`
+    // and Resource are restart-required and ignored here; the call site
+    // emits the warn for those. Live subset:
     //   - traces.enabled / metrics.enabled (atomic stores)
     //   - traces.sampler.* (TracerProvider::Reload swaps sampler)
     //   - metrics.export_interval / export_timeout
     //     (MeterProvider::Reload stores reader options)
     void Reload(const ObservabilityConfig& new_config);
 
-    // ---- Counters (read-only; used by Phase 1c WaitForAllAsyncDrain) ----
+    // Read-only accessors consumed by the shutdown drain predicate.
     int64_t inflight_finalizations() const noexcept {
         return inflight_finalizations_.load(std::memory_order_acquire);
     }
@@ -150,10 +125,8 @@ public:
         return finalizers_in_progress_.load(std::memory_order_acquire);
     }
 
-    // CV used by Phase 1c WaitForAllAsyncDrain to block until counters
-    // reach zero. Public so the call-site can wait on it. r78 contract:
-    // null-manager guards live INSIDE WaitForAllAsyncDrain at HttpServer,
-    // not on the cv itself.
+    // Signaled by every finalize / kill decrement; the call site uses it
+    // to wake from the drain wait.
     std::condition_variable& finalizers_done_cv() noexcept {
         return finalizers_done_cv_;
     }
@@ -171,8 +144,12 @@ private:
 
     std::shared_ptr<const Sampler> BuildSamplerFromConfig() const;
 
-    // Configuration snapshot — `enabled` is preserved verbatim (LIVE
-    // truth per r78); other live-reloadable fields update on Reload.
+    // Republish the live-flag atomics from the supplied config. Called
+    // by both the ctor and Reload so the publication path is single-sourced.
+    void PublishLiveFlags(const ObservabilityConfig& c);
+
+    // Live truth: master `enabled` is preserved verbatim across Reload;
+    // other live-reloadable fields are updated by Reload.
     ObservabilityConfig                       config_;
     std::shared_ptr<const Resource>           resource_;
     std::shared_ptr<RandomSource>             random_;
@@ -186,15 +163,11 @@ private:
     std::atomic<bool> metrics_enabled_{true};
     std::atomic<bool> include_target_info_{true};
 
-    // ---- Snapshot registry + counter (r45 atomic register-and-count) ----
-    //
-    // Keyed on the snapshot's raw address (heap-allocated by
-    // make_shared, never moves during the snapshot's lifetime).
-    // Touched ONLY under live_snapshots_mtx_ so no per-entry
-    // synchronization is needed. Expired weak_ptr entries are erased
-    // on Finalize / kill — they cannot accumulate because every
-    // RegisterLiveSnapshot is paired with exactly one
-    // DeregisterAndDecrement.
+    // Snapshot registry. Keyed on the snapshot's raw address (stable
+    // for its lifetime — make_shared never moves). Touched only under
+    // live_snapshots_mtx_; the matching counter increment+decrement
+    // also lives inside that critical section so a registered-but-
+    // uncounted snapshot cannot exist.
     mutable std::mutex                          live_snapshots_mtx_;
     std::unordered_map<ObservabilitySnapshot*,
                         std::weak_ptr<ObservabilitySnapshot>>
@@ -206,10 +179,10 @@ private:
     std::mutex                                  finalizers_done_mtx_;
     std::condition_variable                     finalizers_done_cv_;
 
-    // Shutdown latch — set true by BeginShutdown. Idempotent.
+    // Idempotent BeginShutdown latch.
     std::atomic<bool>                           shutdown_started_{false};
 
-    // ---- Snapshot-killed counter (diagnostics; bumped on every kill) ----
+    // Diagnostic — bumped on every kill-loop CAS-win.
     std::atomic<int64_t> snapshots_killed_on_timeout_{0};
 
     // -- Internal helpers --

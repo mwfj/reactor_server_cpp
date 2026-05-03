@@ -10,9 +10,9 @@ namespace OBSERVABILITY_NAMESPACE {
 
 namespace {
 
-// Per design §8.3: replace every char outside [a-zA-Z0-9_] with '_'; if
-// the resulting first char is a digit, prepend '_'. Empty input stays
-// empty (caller's problem; the registry should reject empty names).
+// Replace every char outside [a-zA-Z0-9_] with '_'; if the result
+// starts with a digit, prepend '_'. Empty input stays empty (the
+// registry rejects empty names earlier).
 inline bool IsLegalChar(char c) noexcept {
     return (c >= 'a' && c <= 'z')
         || (c >= 'A' && c <= 'Z')
@@ -226,8 +226,8 @@ std::string PrometheusExporter::SanitizeName(std::string_view name) {
 
 PrometheusExporter::Format PrometheusExporter::ChooseFormat(
         std::string_view accept_header) noexcept {
-    // OpenMetrics media type takes precedence per OpenMetrics spec §6
-    // when present anywhere in the Accept header.
+    // OpenMetrics media type takes precedence when present anywhere in
+    // the Accept header.
     static constexpr std::string_view kOpenMetrics =
         "application/openmetrics-text";
     if (accept_header.find(kOpenMetrics) != std::string_view::npos) {
@@ -251,10 +251,9 @@ std::string PrometheusExporter::Render(const MetricsSnapshot& snap,
     std::string out;
     out.reserve(2048);
 
-    // target_info gauge — operators pivot on resource attributes via this
-    // pseudo-metric in Prometheus / OpenMetrics. Caller decides whether
-    // to include it (live-reloadable per §11.2); the exporter renders
-    // unconditionally and lets the handler omit on the off-toggle.
+    // target_info — emitted from Resource attrs whenever the snapshot
+    // carries a Resource. The handler clears snap.resource to suppress
+    // it when include_target_info is off.
     RenderTargetInfo(out, snap.resource.get());
 
     for (const auto& inst : snap.instruments) {

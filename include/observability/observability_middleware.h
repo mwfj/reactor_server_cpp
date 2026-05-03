@@ -1,17 +1,14 @@
 #pragma once
 
-// HttpRouter middleware factory that wires the observability pipeline
-// into every request. Runs as the FIRST middleware in the chain (per
-// OPENTELEMETRY_DESIGN.md §6.1.1: PrependMiddleware order means
-// last-prepend-runs-first — observability must be the LAST prepend
-// so it executes before auth + rate-limit, and middleware-rejection
-// paths can finalize through the populated snapshot).
+// HttpRouter middleware factory that installs the observability
+// pipeline. Must be the LAST PrependMiddleware caller so it runs FIRST
+// in the chain (PrependMiddleware pushes to the front), executing
+// before auth + rate-limit so middleware-rejection paths can still
+// finalize through the populated snapshot.
 //
-// Constraint surfaced by the live-code survey: HttpRouter allows
-// exactly ONE async middleware (auth introspection holds it).
-// Observability MUST be sync — it cannot defer or suspend the chain.
-// Span finalization happens AT response-completion time via the
-// FinalizeFromSnapshot CAS gate, NOT inline in the middleware.
+// HttpRouter only allows one async middleware (auth introspection),
+// so this middleware is sync. Span finalization happens at response-
+// completion time via the FinalizeFromSnapshot CAS gate, not inline.
 
 #include "http/http_router.h"
 #include "observability/common.h"
@@ -22,26 +19,16 @@ namespace OBSERVABILITY_NAMESPACE {
 
 class ObservabilityManager;
 
-// Build a sync middleware that:
-//   1. Calls HttpRouter::ResolveRouteMatch via PopulateRouteParams so
-//      `request.route_match` is populated before sampling decisions.
-//   2. Allocates a SERVER Span via the manager's TracerProvider with
-//      kind=SERVER and parent extracted from inbound `traceparent`
-//      (parent extraction lands in task #69 — Propagator).
-//   3. Builds an ObservabilitySnapshot, calls
-//      ObservabilityManager::RegisterLiveSnapshot, assigns
-//      `request.obs_snapshot`.
-//   4. Returns true (observability never rejects a request).
+// Build the sync middleware. The closure:
+//   1. Resolves the route match so sampling sees the route pattern.
+//   2. Allocates a SERVER Span (parent extracted from inbound traceparent).
+//   3. Registers the snapshot on the manager and assigns it to the request.
+//   4. Returns true; this middleware never rejects.
 //
-// On `manager == nullptr`: middleware is a no-op (matches the disabled
-// fast-path contract in §14 — the manager is null in the default
-// `observability.enabled=false` deployment, so this middleware should
-// never be installed in that case; the no-op branch is defensive).
-//
-// On `manager->TracesEnabled() == false`: snapshot is still built (so
-// metrics still record per-route + middleware-rejection paths still
-// finalize), but the SpanContext is zero-valued and no Span is
-// allocated. Toggle is live-reloadable per §11.2.
+// Manager null   → no-op (defensive; the middleware is normally only
+//                  installed when observability.enabled is true).
+// Traces off live → snapshot is still built so metrics still record;
+//                  the SpanContext is zero-valued and no Span is allocated.
 HttpRouter::Middleware MakeObservabilityMiddleware(
     std::shared_ptr<ObservabilityManager> manager);
 

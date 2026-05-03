@@ -1,6 +1,8 @@
 #pragma once
 
 #include "common.h"
+#include "observability/trace_context.h"
+#include <optional>
 // <string>, <map>, <memory>, <functional>, <vector>, <chrono>, <atomic> via common.h
 
 class UpstreamManager;
@@ -40,6 +42,12 @@ class UpstreamHttpClient {
         std::string body;                                  // For POST
         int timeout_sec = 5;
         size_t max_response_body = 256 * 1024;             // 256 KB default
+        // Optional outbound trace context. Populated by JWKS / OIDC /
+        // introspection / OTLP callers when observability is on and an
+        // upstream span exists. Absent (or with an invalid `local`)
+        // means inject nothing — but Issue() still strips any client-
+        // supplied traceparent / tracestate so they can't leak through.
+        std::optional<OBSERVABILITY_NAMESPACE::IssueTraceContext> issue_ctx;
     };
 
     struct Response {
@@ -78,6 +86,12 @@ class UpstreamHttpClient {
                 Request req,
                 DoneCallback cb,
                 std::shared_ptr<std::atomic<bool>> cancel_token = nullptr);
+
+    // Strip pre-existing `traceparent` / `tracestate` and (when
+    // `req.issue_ctx->local` is set + valid) inject a fresh pair.
+    // Exposed so tests can exercise the strip+inject contract without
+    // standing up an UpstreamManager pool.
+    static void ApplyOutboundTraceContext(Request& req);
 
     UpstreamManager* upstream_manager() const noexcept {
         return upstream_manager_;
