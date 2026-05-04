@@ -6,6 +6,8 @@
 #include "http/streaming_response_sender_utils.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
+#include "observability/observability_manager.h"
+#include "observability/observability_snapshot.h"
 #include <cstdio>
 #include <sstream>
 #include <unordered_set>
@@ -404,11 +406,19 @@ public:
                 trailers, declared_trailer_names_);
             conn_->SendRaw(final_chunk.data(), final_chunk.size());
         }
-        if (finalize_response_) {
-            finalize_response_(should_close_);
-        }
+        // finalize_request_ MUST run before finalize_response_:
+        // finalize_response_ clears the deferred state and can
+        // synchronously replay deferred_pending_buf_ back through
+        // OnRawData, which begins parsing the next pipelined request
+        // and (for keep-alive) starts request B's snapshot. Reversing
+        // the order means request A's metric / span finalize lands
+        // AFTER request B's middleware has registered, briefly
+        // overlapping the two snapshots.
         if (finalize_request_) {
             finalize_request_(last_status_code_, bytes_sent_, std::string{});
+        }
+        if (finalize_response_) {
+            finalize_response_(should_close_);
         }
         return SendResult::ACCEPTED_BELOW_WATER;
     }
@@ -1081,9 +1091,10 @@ inline uint64_t ComputeWireBodySize(const HttpResponse& response,
                                       bool was_head_request) noexcept {
     if (was_head_request) return 0;
     const int status = response.GetStatusCode();
-    // 1xx / 204 / 304 — bodyless per HTTP semantics.
+    // 1xx / 204 / 205 / 304 — bodyless per HTTP semantics.
+    // The wire serialiser strips the body for these statuses.
     if (status >= 100 && status < 200) return 0;
-    if (status == 204 || status == 304) return 0;
+    if (status == 204 || status == 205 || status == 304) return 0;
     return static_cast<uint64_t>(response.GetBody().size());
 }
 
@@ -1449,8 +1460,23 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
 
                 self->BeginAsyncResponse(*req_copy);
 
-                self->SetAsyncAbortHook([state]() {
+                // Same finalize-on-abort contract as the H1/H2 sync-route
+                // suspends — without this, a WS upgrade whose async
+                // middleware is mid-IdP-introspection when the client
+                // disconnects leaves the snapshot registered until the
+                // shutdown kill loop runs.
+                auto suspend_obs_snap = req_copy->obs_snapshot;
+                self->SetAsyncAbortHook([state, suspend_obs_snap]() {
                     state->TripCancel();
+                    if (suspend_obs_snap) {
+                        if (auto mgr = suspend_obs_snap->manager.lock()) {
+                            mgr->FinalizeFromSnapshot(
+                                *suspend_obs_snap,
+                                /*status_code=*/0,
+                                /*wire_body_size=*/0,
+                                /*error_type=*/"client_disconnect");
+                        }
+                    }
                 });
 
                 auto resume_cb =
@@ -1700,15 +1726,30 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                             "aborting and sending 504",
                             cap_sec,
                             self->conn_ ? self->conn_->fd() : -1);
-                        // Fire the abort hook FIRST. It short-circuits
-                        // the stored complete() closure (flipping its
-                        // one-shot completed/cancelled atomics) and
-                        // decrements active_requests exactly once,
-                        // regardless of whether the real handler
-                        // eventually calls complete(). Without this
-                        // the /stats.requests.active counter stays
-                        // permanently elevated after a stuck handler.
-                        //
+                        // Build the synthetic 504 response.
+                        // Forcing Connection: close ensures
+                        // NormalizeOutgoingResponse returns should_close=true
+                        // so the socket is torn down (the handler may
+                        // still be running in the background and must not
+                        // see a reusable connection).
+                        HttpResponse timeout_resp =
+                            HttpResponse::GatewayTimeout();
+                        timeout_resp.Header("Connection", "close");
+                        // Pre-finalize the snapshot with the actual 504
+                        // BEFORE firing the abort hook. The hook also
+                        // calls FinalizeFromSnapshot (with a synthetic
+                        // client_disconnect placeholder), but the CAS
+                        // gate inside FinalizeFromSnapshot makes this
+                        // first call the winner — the hook's later
+                        // attempt becomes a no-op. Without this
+                        // pre-finalize, the abort hook would record
+                        // server-side timeouts as client_disconnect.
+                        HttpServer::FinalizeIfSnapshot(
+                            self->parser_.GetRequest(),
+                            timeout_resp, "server_timeout");
+                        // Fire the abort hook for its bookkeeping
+                        // (active_requests--, cancel_slot, etc.). Its
+                        // FinalizeFromSnapshot is now a CAS no-op.
                         // Move to a local first so CompleteAsyncResponse
                         // (which clears async_abort_hook_) cannot
                         // destroy the std::function while we're
@@ -1722,15 +1763,6 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                         // call CancelAsyncResponse first — that wipes
                         // deferred_was_head_, which CompleteAsyncResponse
                         // needs to know whether to strip the body.
-                        // Forcing Connection: close on the synthetic 504
-                        // ensures NormalizeOutgoingResponse returns
-                        // should_close=true so the socket is torn down
-                        // (the handler may still be running in the
-                        // background and must not see a reusable
-                        // connection).
-                        HttpResponse timeout_resp =
-                            HttpResponse::GatewayTimeout();
-                        timeout_resp.Header("Connection", "close");
                         self->CompleteAsyncResponse(std::move(timeout_resp));
                         return false;
                     }

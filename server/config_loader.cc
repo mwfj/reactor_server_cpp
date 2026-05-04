@@ -1050,6 +1050,8 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                         auto t = it.value("sampler", std::string("always_off"));
                         if (t == "always_on")
                             o.sampler = OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOn;
+                        else if (t == "always_off")
+                            o.sampler = OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOff;
                         else if (t == "trace_id_ratio")
                             o.sampler =
                                 OBSERVABILITY_NAMESPACE::SamplerType::TraceIdRatio;
@@ -1057,7 +1059,15 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                             o.sampler =
                                 OBSERVABILITY_NAMESPACE::SamplerType::ParentBased;
                         else
-                            o.sampler = OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOff;
+                            // Match the top-level sampler parser: a typo
+                            // (e.g. "always-of") must fail config load
+                            // rather than silently coerce to AlwaysOff
+                            // and disable telemetry for the prefix.
+                            throw std::runtime_error(
+                                "observability.traces.sampler.routes[].sampler "
+                                "must be one of: always_on, always_off, "
+                                "trace_id_ratio, parent_based (got '" +
+                                t + "')");
                         o.ratio = it.value("ratio", 1.0);
                         oc.traces.sampler.routes.push_back(std::move(o));
                     }

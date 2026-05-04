@@ -41,7 +41,12 @@ static uint64_t ObsWireBodySize(const HttpResponse& response,
     if (was_head_request) return 0;
     const int status = response.GetStatusCode();
     if (status >= 100 && status < 200) return 0;
-    if (status == 204 || status == 304) return 0;
+    // 204 No Content / 205 Reset Content / 304 Not Modified all
+    // forbid a body — HttpResponse::Serialize + the H2 submit path
+    // suppress the body bytes on the wire, so observability must
+    // record 0 even if a handler accidentally left a body on the
+    // response object.
+    if (status == 204 || status == 205 || status == 304) return 0;
     return static_cast<uint64_t>(response.GetBody().size());
 }
 
@@ -3854,9 +3859,26 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 auto resp_copy = std::make_shared<HttpResponse>(std::move(response));
                 std::weak_ptr<HttpConnectionHandler> h1_weak = self;
                 auto active_counter_local = active_requests_;
+                // Snapshot from the request_copy so the abort hook can
+                // finalize the SERVER span if the suspend window is
+                // torn down before the resume callback runs (client
+                // disconnect, async safety cap, etc.). Without this,
+                // the registered snapshot leaks inflight_finalizations_
+                // until shutdown kill / timeout.
+                auto suspend_obs_snap = req_copy->obs_snapshot;
 
-                self->SetAsyncAbortHook([state]() {
+                self->SetAsyncAbortHook(
+                    [state, suspend_obs_snap]() {
                     state->TripCancel();
+                    if (suspend_obs_snap) {
+                        if (auto mgr = suspend_obs_snap->manager.lock()) {
+                            mgr->FinalizeFromSnapshot(
+                                *suspend_obs_snap,
+                                /*status_code=*/0,
+                                /*wire_body_size=*/0,
+                                /*error_type=*/"client_disconnect");
+                        }
+                    }
                 });
 
                 // Capture state by VALUE — RunOnDispatcher enqueues for
@@ -4641,9 +4663,22 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                              bookkeeping_done, cancelled,
                              obs_snap_local, was_head_local]() {
                             if (cancelled->load(std::memory_order_acquire)) return;
-                            s->SubmitStreamResponse(stream_id, *shared_resp);
-                            // Observability finalize for the H2 async
-                            // completion path. Idempotent CAS gate.
+                            // Erase the per-stream abort hook BEFORE
+                            // SubmitStreamResponse: that call goes on
+                            // to SendPendingFrames(), and nghttp2 can
+                            // synchronously close the stream and fire
+                            // the close callback inline, which would
+                            // call FireAndEraseStreamAbortHook() and
+                            // run the abort hook BEFORE we get to
+                            // FinalizeFromSnapshot below. Without this
+                            // erase, the hook's CAS-wins finalize
+                            // records status=0/client_disconnect for a
+                            // perfectly normal completion.
+                            s->EraseStreamAbortHook(stream_id);
+                            // Finalize BEFORE submit: SubmitStreamResponse
+                            // can synchronously close the stream + start
+                            // the next stream on multiplexed connections,
+                            // mirroring the H1 ordering fix.
                             if (obs_snap_local) {
                                 auto mgr = obs_snap_local->manager.lock();
                                 if (mgr) {
@@ -4656,6 +4691,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                                         /*error_type=*/std::string{});
                                 }
                             }
+                            s->SubmitStreamResponse(stream_id, *shared_resp);
                             if (!bookkeeping_done->exchange(
                                     true, std::memory_order_acq_rel)) {
                                 active_counter->fetch_sub(
@@ -4931,8 +4967,22 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 std::weak_ptr<Http2ConnectionHandler> h2_weak = self;
                 auto active_counter_local = active_requests_;
 
-                self->SetStreamAbortHook(stream_id, [state]() {
+                // See H1 suspend hook above — finalize the snapshot
+                // on suspend-time aborts so it doesn't leak into the
+                // shutdown kill loop.
+                auto suspend_obs_snap = req_copy->obs_snapshot;
+                self->SetStreamAbortHook(stream_id,
+                    [state, suspend_obs_snap]() {
                     state->TripCancel();
+                    if (suspend_obs_snap) {
+                        if (auto mgr = suspend_obs_snap->manager.lock()) {
+                            mgr->FinalizeFromSnapshot(
+                                *suspend_obs_snap,
+                                /*status_code=*/0,
+                                /*wire_body_size=*/0,
+                                /*error_type=*/"client_disconnect");
+                        }
+                    }
                 });
 
                 // Protocol-specific bits go into the three callables below;

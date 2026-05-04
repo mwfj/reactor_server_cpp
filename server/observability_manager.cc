@@ -242,12 +242,14 @@ void ObservabilityManager::OnFinalizeWinner(
     snap.error_type = error_type;
 
     // Record the OTel HTTP server request duration metric.
-    // Gated on metrics_enabled so a runtime SIGHUP toggle stops the
-    // record path immediately (the snapshot pipeline still finalizes
-    // for span correctness). Histogram is null when traces+metrics
-    // are both off or when Init() didn't run; defensive null check.
-    if (http_server_request_duration_ != nullptr
-        && metrics_enabled_.load(std::memory_order_acquire)) {
+    // Always record when the instrument exists — `metrics.enabled`
+    // gates the EXPORT surface (Prometheus 404, OTLP push skip), not
+    // in-memory writes. Stopping writes during a temporary toggle
+    // would silently lose history from cumulative histograms; flipping
+    // export back on must resume the full series with the in-flight
+    // counts intact. The instrument pointer is null only when Init()
+    // didn't run (master `enabled=false`).
+    if (http_server_request_duration_ != nullptr) {
         const auto duration_ns =
             std::chrono::steady_clock::now() - snap.start_steady;
         const double duration_s =

@@ -367,6 +367,12 @@ public:
             return SendResult::CLOSED;
         }
         terminal_ = true;
+        // Erase the abort hook + fire finalize_request_ BEFORE flushing
+        // EOF: data_source_->Finish() + SendPendingFrames may close
+        // the stream synchronously and fire the stream-close callback,
+        // which runs the abort hook. Without this ordering, a normal
+        // streaming completion gets recorded as status=0/client_disconnect.
+        self->EraseStreamAbortHook(stream_id_);
         if (body_suppressed_) {
             data_source_.reset();
             if (finalize_request_) {
@@ -375,6 +381,9 @@ public:
             }
             return SendResult::ACCEPTED_BELOW_WATER;
         }
+        if (finalize_request_) {
+            finalize_request_(last_status_code_, bytes_sent_, std::string{});
+        }
         data_source_->Finish();
         if (!session->InReceiveData()) {
             int rv = session->ResumeStreamData(stream_id_);
@@ -382,14 +391,13 @@ public:
                 logging::Get()->warn(
                     "H2 streaming End resume failed stream={} rv={}",
                     stream_id_, rv);
+                // finalize_request_ already fired; AbortInternal's
+                // additional finalize is CAS-blocked.
                 AbortInternal(false, AbortReason::CLIENT_DISCONNECT);
                 return SendResult::CLOSED;
             }
             session->SendPendingFrames();
             self->RecheckShutdownDrainAfterFlush();
-        }
-        if (finalize_request_) {
-            finalize_request_(last_status_code_, bytes_sent_, std::string{});
         }
         return SendResult::ACCEPTED_BELOW_WATER;
     }
