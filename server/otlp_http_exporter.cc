@@ -411,8 +411,13 @@ void OtlpHttpExporter::ReloadHeaders(
     std::chrono::milliseconds metric_timeout) {
     // Controlled merge: clone the LIVE Options, overwrite ONLY the
     // live-reloadable subset (headers + timeout), atomic-store.
+    // The mutex serialises Reload-vs-Reload; the atomic_load on
+    // options_ pairs with Snapshot()'s atomic_load — without it, a
+    // worker mid-Snapshot reading the same shared_ptr object races on
+    // the control block / pointer fields.
     std::lock_guard<std::mutex> g(options_mtx_);
-    auto live = options_;
+    auto live = std::atomic_load_explicit(&options_,
+                                            std::memory_order_acquire);
     auto next = std::make_shared<Options>(*live);
     next->traces.headers  = trace_headers;
     next->traces.timeout  = trace_timeout;

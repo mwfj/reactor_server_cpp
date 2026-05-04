@@ -14,6 +14,8 @@
 #include "http/http_status.h"
 #include "http/trailer_policy.h"
 #include "log/logger.h"
+#include "observability/observability_snapshot.h"
+#include "observability/propagator.h"
 #include <unordered_set>
 
 namespace {
@@ -332,6 +334,40 @@ void ProxyTransaction::Start() {
         upstream_host_, upstream_port_, sni_hostname_,
         fwd_snap ? fwd_snap.get() : nullptr,
         &auth_ctx_);
+
+    // Outbound trace context: ALWAYS strip the client's traceparent /
+    // tracestate (case-insensitive) so an unsanitised inbound header
+    // never leaks across the gateway hop. When observability is on
+    // for this request, inject the SERVER span's context as the
+    // upstream's parent so the gateway is visible in the resulting
+    // trace tree. The strip is unconditional — even with observability
+    // disabled, leaking the caller's context to the upstream is a
+    // privacy / consistency issue. Per-attempt CLIENT-span emission
+    // (so retries produce distinct child spans) is a Phase-2 follow-up;
+    // today every attempt carries the same outbound traceparent.
+    {
+        auto strip_lc = [](std::map<std::string, std::string>& h,
+                            const char* needle) {
+            for (auto it = h.begin(); it != h.end(); ) {
+                std::string k = it->first;
+                std::transform(k.begin(), k.end(), k.begin(),
+                               [](unsigned char c) {
+                                   return std::tolower(c);
+                               });
+                if (k == needle) {
+                    it = h.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        };
+        strip_lc(rewritten_headers_, "traceparent");
+        strip_lc(rewritten_headers_, "tracestate");
+        if (obs_snapshot_ && obs_snapshot_->trace_context.IsValid()) {
+            OBSERVABILITY_NAMESPACE::W3CPropagator::Inject(
+                obs_snapshot_->trace_context, rewritten_headers_);
+        }
+    }
 
     // Compute upstream path with strip_prefix support.
     // Prefer upstream_path_override_ (extracted from catch-all route param by

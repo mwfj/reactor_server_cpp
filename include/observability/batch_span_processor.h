@@ -33,6 +33,14 @@ struct BatchSpanProcessorOptions {
     size_t                    max_export_batch_size = 512;    // live-reloadable
     std::chrono::milliseconds schedule_delay        = std::chrono::milliseconds{5000};
     std::chrono::milliseconds export_timeout        = std::chrono::milliseconds{10000};
+    // Retry policy for kFailedRetryable Export results. The worker
+    // retries with exponential backoff capped at `max_backoff`,
+    // bounded by `max_attempts` total tries (initial + retries).
+    // max_attempts<=1 disables retries — Export is called once and
+    // any failure drops the batch (matches the original behaviour).
+    int                       retries_max_attempts   = 3;
+    std::chrono::milliseconds retries_initial_backoff = std::chrono::milliseconds{1000};
+    std::chrono::milliseconds retries_max_backoff    = std::chrono::milliseconds{10000};
 };
 
 class BatchSpanProcessor final : public SpanProcessor {
@@ -60,6 +68,18 @@ public:
     // omits export_timeout because it isn't surfaced as a config field.
     void Reload(size_t new_max_export_batch_size,
                 std::chrono::milliseconds new_schedule_delay);
+
+    // Disable the worker-loop exporter SignalShutdown call. Used by
+    // ObservabilityManager when this processor shares an OtlpHttpExporter
+    // with a PeriodicMetricReader: signalling unilaterally from the
+    // first drainer would kFail the still-active peer's final export.
+    // The manager then fires SignalShutdown on the shared exporter
+    // once after BOTH workers have joined. Default (not called):
+    // the worker signals its own exporter — preserves the standalone
+    // ownership contract every test and non-shared deployment relies on.
+    void DisableExporterShutdownOnDrain() noexcept {
+        exporter_shutdown_disabled_.store(true, std::memory_order_release);
+    }
 
     // Force a flush; returns when the queue drains or `deadline`
     // expires. Idempotent.
@@ -106,6 +126,12 @@ private:
     std::mutex                     join_mtx_;
     std::condition_variable        join_cv_;
     bool                           worker_done_ = false;
+
+    // When true (set by ObservabilityManager via
+    // DisableExporterShutdownOnDrain), the worker loop skips the
+    // post-drain exporter SignalShutdown so the manager can coordinate
+    // it once across BSP + PMR sharing one exporter.
+    std::atomic<bool>              exporter_shutdown_disabled_{false};
 };
 
 }  // namespace OBSERVABILITY_NAMESPACE

@@ -1412,13 +1412,18 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
         req.client_ip = conn_->ip_addr();
         req.client_tls = conn_->HasTls();
         req.client_fd = conn_->fd();
-        // Observability fields needed by the inbound middleware. The
-        // :scheme pseudo-header (req.url_scheme already populated by
-        // the headers callback) takes precedence; if it was empty
-        // (defensive fallback for malformed HEADERS that nghttp2 still
-        // accepted), derive from TLS state. H2 is always "2" on the
+        // Observability fields needed by the inbound middleware.
+        // The :scheme pseudo-header is captured on Http2Stream::scheme_
+        // by the headers callback; copy it onto the HttpRequest first
+        // so a non-default :scheme (e.g. "https" over a non-TLS
+        // back-channel, or "http" over TLS for cleartext-via-HTTPS
+        // testing) is preserved. Fall back to the TLS-derived scheme
+        // only when :scheme was missing (defensive — nghttp2 normally
+        // rejects HEADERS without :scheme). H2 is always "2" on the
         // wire.
-        if (req.url_scheme.empty()) {
+        if (stream->HasScheme() && !stream->Scheme().empty()) {
+            req.url_scheme = stream->Scheme();
+        } else if (req.url_scheme.empty()) {
             req.url_scheme = conn_->HasTls() ? "https" : "http";
         }
         req.network_protocol_version = "2";

@@ -2055,6 +2055,28 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
             "observability.metrics.exporter must be empty, 'otlp_http' or "
             "'prometheus_pull'");
 
+    // The OTLP push pipeline (BatchSpanProcessor + PeriodicMetricReader
+    // + OtlpHttpExporter wired through UpstreamHttpClient) is built
+    // but not yet bootstrapped in main.cc. Until that wiring lands,
+    // reject `otlp_http` here at validate time — the alternative
+    // (accept here, throw at startup) lets `validate` / `config`
+    // commands return success on a config that the running server
+    // would refuse, which is exactly the inconsistency the reviewer
+    // flagged. When the bootstrap wiring lands, both this gate and
+    // the symmetric main.cc throw should be removed in the same
+    // change.
+    if (oc.traces.exporter == "otlp_http") {
+        throw std::invalid_argument(
+            "observability.traces.exporter='otlp_http' is not yet wired "
+            "in this build; remove the exporter or wait for the OTLP "
+            "push pipeline to land");
+    }
+    if (oc.metrics.exporter == "otlp_http") {
+        throw std::invalid_argument(
+            "observability.metrics.exporter='otlp_http' is not yet wired "
+            "in this build; use 'prometheus_pull' or remove the exporter");
+    }
+
     if (oc.metrics.exporter == "prometheus_pull"
         && oc.metrics.prometheus.path.empty()) {
         throw std::invalid_argument(
@@ -3763,12 +3785,14 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             static_cast<int64_t>(oc.metrics.otlp.timeout_ms.count());
         mj["otlp"] = mojo;
 
-        nlohmann::json mrj;
-        mrj["export_interval_ms"] =
+        // Reader knobs sit at metrics-level in the parser (not under
+        // a "reader" sub-object). Serialize at the same path so a
+        // Load → ToJson → Load round-trip preserves the operator's
+        // export cadence.
+        mj["export_interval_ms"] =
             static_cast<int64_t>(oc.metrics.reader.export_interval.count());
-        mrj["export_timeout_ms"]  =
+        mj["export_timeout_ms"]  =
             static_cast<int64_t>(oc.metrics.reader.export_timeout.count());
-        mj["reader"] = mrj;
 
         nlohmann::json pj;
         pj["path"]                = oc.metrics.prometheus.path;

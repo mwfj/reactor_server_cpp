@@ -93,17 +93,68 @@ void BatchSpanProcessor::WorkerLoop() {
         while (true) {
             auto batch = DrainBatch(batch_cap);
             if (batch.empty()) break;
-            const auto deadline = std::chrono::steady_clock::now() +
-                std::chrono::nanoseconds(export_timeout_ns_.load(std::memory_order_acquire));
-            try {
-                exporter_->Export(std::move(batch), deadline);
-                exported_batches_.fetch_add(1, std::memory_order_relaxed);
-            } catch (const std::exception& e) {
-                logging::Get()->error(
-                    "BatchSpanProcessor::Export threw: {}", e.what());
-            } catch (...) {
-                logging::Get()->error(
-                    "BatchSpanProcessor::Export threw unknown exception");
+            // Retry loop: on kFailedRetryable back off and try again
+            // up to retries_max_attempts. kSuccess stops; any other
+            // result (kFailedNotRetryable / kInvalidArgument) drops
+            // the batch — those are non-retryable per the exporter
+            // contract. Backoff doubles each attempt, capped at
+            // retries_max_backoff. The first exception path counts
+            // as a failure but isn't retried (preserves the original
+            // best-effort drop on programmer errors / bad payloads).
+            const int max_attempts =
+                std::max(1, options_.retries_max_attempts);
+            auto backoff = options_.retries_initial_backoff;
+            const auto max_backoff = options_.retries_max_backoff;
+            int attempt = 0;
+            for (; attempt < max_attempts; ++attempt) {
+                const auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::nanoseconds(export_timeout_ns_.load(
+                        std::memory_order_acquire));
+                ExportResult result = ExportResult::kFailedNotRetryable;
+                std::vector<SpanData> attempt_batch;
+                if (attempt + 1 < max_attempts) {
+                    // Keep a copy so a kFailedRetryable can re-export
+                    // the SAME batch; only the last attempt moves.
+                    attempt_batch = batch;
+                } else {
+                    attempt_batch = std::move(batch);
+                }
+                try {
+                    result = exporter_->Export(std::move(attempt_batch),
+                                                  deadline);
+                } catch (const std::exception& e) {
+                    logging::Get()->error(
+                        "BatchSpanProcessor::Export threw: {}", e.what());
+                    break;
+                } catch (...) {
+                    logging::Get()->error(
+                        "BatchSpanProcessor::Export threw unknown exception");
+                    break;
+                }
+                if (result == ExportResult::kSuccess) {
+                    exported_batches_.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
+                if (result != ExportResult::kFailedRetryable) {
+                    break;  // non-retryable — drop and move on.
+                }
+                if (attempt + 1 >= max_attempts) {
+                    logging::Get()->warn(
+                        "BatchSpanProcessor: retryable export failed after "
+                        "{} attempts; dropping batch", max_attempts);
+                    break;
+                }
+                // Exponential backoff with cap. cv_-aware sleep so a
+                // mid-backoff shutdown wakes immediately and the
+                // subsequent attempt still happens (best-effort
+                // delivery before the worker exits).
+                std::unique_lock<std::mutex> blk(mtx_);
+                cv_.wait_for(blk, backoff, [&] {
+                    return shutting_down_.load(std::memory_order_acquire);
+                });
+                blk.unlock();
+                backoff *= 2;
+                if (backoff > max_backoff) backoff = max_backoff;
             }
             if (!drain_all) break;
         }
@@ -119,12 +170,13 @@ void BatchSpanProcessor::WorkerLoop() {
         }
     }
     // Worker has fully drained the queue. Signal the exporter to
-    // refuse any subsequent exports BEFORE publishing worker_done_:
-    // this guarantees exporter shutdown happens regardless of when
-    // (or whether) JoinWorkers is called, while keeping the queue-
-    // drain → exporter-signal ordering intact (Export() during the
-    // drain still succeeds).
-    if (exporter_) exporter_->SignalShutdown();
+    // refuse subsequent exports — UNLESS the manager has flagged the
+    // exporter as shared (in which case the manager handles the
+    // signal once across all processors after BOTH have joined).
+    if (exporter_
+        && !exporter_shutdown_disabled_.load(std::memory_order_acquire)) {
+        exporter_->SignalShutdown();
+    }
     {
         std::lock_guard<std::mutex> g(join_mtx_);
         worker_done_ = true;

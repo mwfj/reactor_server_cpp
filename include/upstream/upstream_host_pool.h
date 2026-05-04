@@ -18,6 +18,7 @@ public:
                      const std::vector<std::shared_ptr<Dispatcher>>& dispatchers,
                      std::shared_ptr<TlsClientContext> tls_ctx,
                      std::atomic<int64_t>& outstanding_conns,
+                     std::atomic<int64_t>& inflight_leases,
                      std::atomic<bool>& manager_shutting_down,
                      std::mutex& drain_mtx,
                      std::condition_variable& drain_cv);

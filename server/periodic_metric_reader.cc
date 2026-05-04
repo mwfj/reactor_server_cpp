@@ -64,10 +64,13 @@ void PeriodicMetricReader::WorkerLoop() {
         (void)flush;  // forced flush already handled by the loop iteration above.
     }
     // Final-flush already happened above (the last iteration with
-    // shutdown=true exported once); now signal the exporter so any
-    // shared peer (BatchSpanProcessor) gets the same shutdown contract,
-    // BEFORE publishing worker_done_.
-    if (exporter_) exporter_->SignalShutdown();
+    // shutdown=true exported once). Signal the exporter unless the
+    // manager has flagged it as shared with a BatchSpanProcessor —
+    // see DisableExporterShutdownOnDrain for the rationale.
+    if (exporter_
+        && !exporter_shutdown_disabled_.load(std::memory_order_acquire)) {
+        exporter_->SignalShutdown();
+    }
     {
         std::lock_guard<std::mutex> g(join_mtx_);
         worker_done_ = true;

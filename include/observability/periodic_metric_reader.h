@@ -48,6 +48,13 @@ public:
         return exported_cycles_.load(std::memory_order_acquire);
     }
 
+    // Skip the worker-loop exporter SignalShutdown when the exporter
+    // is shared with a BatchSpanProcessor — see the matching method
+    // on BatchSpanProcessor for the rationale.
+    void DisableExporterShutdownOnDrain() noexcept {
+        exporter_shutdown_disabled_.store(true, std::memory_order_release);
+    }
+
 private:
     void WorkerLoop();
 
@@ -72,6 +79,7 @@ private:
     std::mutex                      join_mtx_;
     std::condition_variable         join_cv_;
     bool                            worker_done_ = false;
+    std::atomic<bool>               exporter_shutdown_disabled_{false};
 };
 
 }  // namespace OBSERVABILITY_NAMESPACE

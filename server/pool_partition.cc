@@ -42,6 +42,7 @@ PoolPartition::PoolPartition(
     const UpstreamPoolConfig& config,
     std::shared_ptr<TlsClientContext> tls_ctx,
     std::atomic<int64_t>& outstanding_conns,
+    std::atomic<int64_t>& inflight_leases,
     std::atomic<bool>& manager_shutting_down,
     std::mutex& drain_mtx,
     std::condition_variable& drain_cv)
@@ -53,6 +54,7 @@ PoolPartition::PoolPartition(
     , tls_ctx_(std::move(tls_ctx))
     , resolved_endpoint_(std::move(resolved_endpoint))
     , outstanding_conns_(outstanding_conns)
+    , inflight_leases_(inflight_leases)
     , manager_shutting_down_(manager_shutting_down)
     , drain_mtx_(drain_mtx)
     , drain_cv_(drain_cv)
@@ -246,6 +248,9 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
             std::chrono::steady_clock::now() + FAR_FUTURE_CHECKOUT);
         UpstreamConnection* raw = conn.get();
         active_conns_.push_back(std::move(conn));
+        // Bump inflight_leases_ BEFORE handing the lease to the caller.
+        // ReturnConnection (called from ~UpstreamLease) decrements.
+        inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
         ready_cb(UpstreamLease(raw, this, alive_));
         return;
     }
@@ -312,6 +317,12 @@ size_t PoolPartition::PurgeCancelledWaitEntries() {
 
 void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     if (!conn) return;
+
+    // The lease that owned `conn` is being released — decrement
+    // inflight_leases_ once per call regardless of where the connection
+    // ends up (idle pool / destroyed / zombie cleanup). Pairs with the
+    // increment at every ready_cb(UpstreamLease(...)) site above.
+    inflight_leases_.fetch_sub(1, std::memory_order_acq_rel);
 
     // Hoist alive_ onto the stack — the waiter retry loops below call
     // CreateNewConnection, which can synchronously invoke a user error_cb
@@ -1036,6 +1047,8 @@ void PoolPartition::OnConnectComplete(UpstreamConnection* conn,
     logging::Get()->debug("Upstream connection ready fd={} {}:{}",
                           raw->fd(), upstream_host_, upstream_port_);
 
+    // See the matching site above — bump before handing the lease out.
+    inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
     ready_cb(UpstreamLease(raw, this, alive_));
 }
 

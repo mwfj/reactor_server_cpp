@@ -181,7 +181,8 @@ UpstreamManager::UpstreamManager(
             effective_sni,
             resolved_endpoint,
             upstream.pool, dispatchers, tls_ctx,
-            outstanding_conns_, shutting_down_, drain_mtx_, drain_cv_);
+            outstanding_conns_, inflight_leases_,
+            shutting_down_, drain_mtx_, drain_cv_);
     }
 
     // Adjust dispatcher timer intervals for upstream timeout enforcement.
