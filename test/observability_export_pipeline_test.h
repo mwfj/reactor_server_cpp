@@ -218,7 +218,13 @@ void TestBatchSpanProcessorShutdownPropagates() {
         auto exporter = std::make_shared<CaptureSpanExporter>();
         BatchSpanProcessor proc(exporter, BatchSpanProcessorOptions{});
         proc.SignalShutdown();
-        proc.JoinWorkers(std::chrono::milliseconds{500});
+        // Use deadline=0 (unbounded) so the worker is guaranteed to
+        // finish its post-loop exporter SignalShutdown call before
+        // the test reads signal_count. Bounded JoinWorkers can return
+        // before the worker reaches the SignalShutdown forwarding under
+        // TSan/heavy CPU contention, producing a spurious failure.
+        // The bounded contract is exercised by other tests.
+        proc.JoinWorkers(std::chrono::milliseconds{0});
         bool pass = exporter->signal_count() == 1;
         TestFramework::RecordTest(
             "ObsExport: BatchSpanProcessor SignalShutdown forwards to exporter",
