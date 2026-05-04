@@ -1,5 +1,6 @@
 #include "http/http_connection_handler.h"
 #include "http/http_router.h"   // AsyncPendingState / AsyncMiddlewarePayload
+#include "http/http_server.h"   // HttpServer::FinalizeIfSnapshot
 #include "http/http_status.h"
 #include "http/trailer_policy.h"
 #include "http/streaming_response_sender_utils.h"
@@ -1391,6 +1392,8 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                 logging::Get()->debug("WebSocket upgrade rejected by middleware fd={} path={}",
                                       conn_->fd(), req.path);
                 mw_response.Header("Connection", "close");
+                HttpServer::FinalizeIfSnapshot(req, mw_response,
+                                                "rejected_by_middleware");
                 SendResponse(mw_response);
                 CloseConnection();
                 return false;
@@ -1448,6 +1451,9 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                         if (shared_payload->result ==
                                 HttpRouter::AsyncMiddlewareResult::DENY) {
                             resp_copy->Header("Connection", "close");
+                            HttpServer::FinalizeIfSnapshot(
+                                *req_copy, *resp_copy,
+                                "rejected_by_async_middleware");
                             resp_copy->ClearDeferred();
                             self->CompleteAsyncResponse(std::move(*resp_copy));
                             self->CloseConnection();
@@ -1500,6 +1506,8 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                     "WebSocket upgrade rejected by async middleware fd={} path={}",
                     conn_->fd(), req.path);
                 mw_response.Header("Connection", "close");
+                HttpServer::FinalizeIfSnapshot(req, mw_response,
+                                                "rejected_by_async_middleware");
                 SendResponse(mw_response);
                 CloseConnection();
                 return false;
@@ -1527,11 +1535,13 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                 // Pre-101: send HTTP 500, close via HTTP path
                 HttpResponse err = HttpResponse::InternalError();
                 err.Header("Connection", "close");
+                HttpServer::FinalizeIfSnapshot(req, err, "ws_upgrade_handler_threw");
                 SendResponse(err);
                 CloseConnection();
             } else if (ws_conn_) {
                 // Post-101 with WS connection: send close 1011.
                 // SendClose now includes CloseAfterWrite for proper drain.
+                // Snapshot was already finalized at 101 success.
                 ws_conn_->SendClose(1011, "Internal error");
             } else {
                 // Post-101 but ws_conn_ is null — make_unique threw (OOM).
@@ -1832,6 +1842,11 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
             reject.Header("Sec-WebSocket-Version", "13");
         }
         reject.Header("Connection", "close");
+        // Finalize BEFORE the response leaves: CompleteAsyncResponse
+        // can synchronously start the next pipelined request, and
+        // SendResponse may also trigger pipeline replay on keep-alive.
+        // FinalizeIfSnapshot is a no-op when obs is disabled.
+        HttpServer::FinalizeIfSnapshot(req, reject, "ws_handshake_invalid");
         if (from_async_resume) {
             reject.ClearDeferred();
             CompleteAsyncResponse(std::move(reject));
@@ -1853,6 +1868,7 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
                               conn_->fd(), logging::SanitizePath(req.path));
         auto not_found = HttpResponse::NotFound();
         not_found.Header("Connection", "close");
+        HttpServer::FinalizeIfSnapshot(req, not_found, "ws_route_not_found");
         if (from_async_resume) {
             not_found.ClearDeferred();
             CompleteAsyncResponse(std::move(not_found));
@@ -1901,6 +1917,7 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
         HttpResponse shutdown_resp;
         shutdown_resp.Status(HttpStatus::SERVICE_UNAVAILABLE).Text("Service Unavailable");
         shutdown_resp.Header("Connection", "close");
+        HttpServer::FinalizeIfSnapshot(req, shutdown_resp, "shutting_down");
         if (from_async_resume) {
             shutdown_resp.ClearDeferred();
             CompleteAsyncResponse(std::move(shutdown_resp));
@@ -1957,10 +1974,15 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
             ws_conn_.reset();
             HttpResponse err = HttpResponse::InternalError();
             err.Header("Connection", "close");
+            HttpServer::FinalizeIfSnapshot(req, err, "ws_upgrade_handler_threw");
             err.ClearDeferred();
             CompleteAsyncResponse(std::move(err));
             return false;
         }
+        // 101 success — finalize the SERVER span. The HTTP request is
+        // terminal at the upgrade; subsequent WS frames are out of
+        // scope for this span.
+        HttpServer::FinalizeIfSnapshot(req, upgrade_resp, std::string{});
         upgrade_resp.ClearDeferred();
         CompleteAsyncResponse(std::move(upgrade_resp));
         if (conn_->IsClosing()) {
@@ -1981,6 +2003,9 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
     }
 
     // ---- Sync path ----
+    // Finalize BEFORE the 101 leaves the wire so the SERVER span is
+    // closed in lock-step with the upgrade completion.
+    HttpServer::FinalizeIfSnapshot(req, upgrade_resp, std::string{});
     SendResponse(upgrade_resp);
 
     if (conn_->IsClosing()) {

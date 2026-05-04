@@ -13,8 +13,9 @@ PeriodicMetricReader::PeriodicMetricReader(
       exporter_(std::move(exporter)),
       interval_ns_(options.export_interval.count() * 1'000'000),
       timeout_ns_(options.export_timeout.count() * 1'000'000) {
-    worker_ = std::thread([this] { WorkerLoop(); });
+    // See BatchSpanProcessor for the rationale on publish-before-launch.
     worker_started_.store(true, std::memory_order_release);
+    worker_ = std::thread([this] { WorkerLoop(); });
 }
 
 PeriodicMetricReader::~PeriodicMetricReader() {
@@ -41,7 +42,8 @@ void PeriodicMetricReader::WorkerLoop() {
         }
 
         // Snapshot the provider's current series state and hand to
-        // exporter. Per §8.4: snapshot is consistent point-in-time view.
+        // exporter. The snapshot is a consistent point-in-time view
+        // produced under the provider's series-map lock.
         try {
             MetricsSnapshot snap = provider_->Snapshot();
             const auto deadline = std::chrono::steady_clock::now() +
@@ -67,13 +69,16 @@ void PeriodicMetricReader::SignalShutdown() {
             std::memory_order_acq_rel)) {
         return;
     }
-    if (exporter_) exporter_->SignalShutdown();
+    // Wake the worker so it can run one final export pass before
+    // exiting. Defer exporter signal until JoinWorkers — see
+    // BatchSpanProcessor for the rationale.
     cv_.notify_all();
 }
 
 void PeriodicMetricReader::JoinWorkers(std::chrono::milliseconds /*deadline*/) {
     if (!worker_started_.load(std::memory_order_acquire)) return;
     if (worker_.joinable()) worker_.join();
+    if (exporter_) exporter_->SignalShutdown();
 }
 
 void PeriodicMetricReader::Reload(MeterReaderOptions new_options) {

@@ -275,6 +275,20 @@ MakeAsyncResumeCallback(
                 *resp = HttpResponse::InternalError();
             }
             tweak_response(*resp, threw);
+            // Finalize the snapshot BEFORE submit: H1 submit consumes
+            // the response by move AND can synchronously start the
+            // next pipelined request, both of which would corrupt or
+            // race the finalize read. The CAS gate inside
+            // FinalizeFromSnapshot makes this safe to call even if a
+            // future error path also invokes finalize.
+            std::string error_type;
+            if (threw) {
+                error_type = "handler_threw";
+            } else if (shared_payload->result ==
+                           HttpRouter::AsyncMiddlewareResult::DENY) {
+                error_type = "rejected_by_async_middleware";
+            }
+            HttpServer::FinalizeIfSnapshot(*req, *resp, std::move(error_type));
             try {
                 submit(*handle, *resp);
             } catch (const std::exception& e) {
@@ -2486,10 +2500,10 @@ void HttpServer::Start() {
         return;
     }
 
-    // DNS resolution (off the reactor; no threads running) ──
-    // §5.4a. Batch contains one entry per configured upstream plus a
-    // `bind` entry for bind_host. For literal hosts (IP addresses)
-    // DnsResolver short-circuits without spawning worker threads, so
+    // DNS resolution (off the reactor; no threads running). Batch
+    // contains one entry per configured upstream plus a `bind` entry
+    // for bind_host. For literal hosts (IP addresses) DnsResolver
+    // short-circuits without spawning worker threads, so
     // literal-only deployments pay zero DNS cost here.
     //
     // The `tag` field distinguishes bind from upstream in the result
@@ -3217,13 +3231,32 @@ bool HttpServer::WaitForAllAsyncDrain(std::chrono::milliseconds timeout) {
     // Predicate gates each counter on its owning manager being non-
     // null. Null managers contribute zero, so the predicate short-
     // circuits true when nothing is in flight.
+    //
+    // The observability check covers THREE counters because they can
+    // be non-zero independently:
+    //   - inflight_finalizations_  : registered, not-yet-finalized.
+    //   - finalizers_in_progress_  : a finalize won the CAS and is
+    //                                still inside OnFinalizeWinner.
+    //                                Decremented AFTER inflight is
+    //                                decremented, so the window where
+    //                                inflight==0 but finalizer hasn't
+    //                                returned must also be drained.
+    //   - kill_marshals_in_flight_ : per-dispatcher kill EnQueue
+    //                                closures the marshal path bumps
+    //                                before EnQueue and decrements
+    //                                when the closure runs.
+    // Skipping any of the three creates a use-after-free window
+    // during ObservabilityManager teardown.
     auto* upm = upstream_manager_.get();
     auto* obs = observability_manager_.get();
     auto predicate = [upm, obs]() {
         return (upm == nullptr
                 || (upm->active_leases() == 0
                     && upm->inflight_transactions() == 0))
-            && (obs == nullptr || obs->inflight_finalizations() == 0);
+            && (obs == nullptr
+                || (obs->inflight_finalizations() == 0
+                    && obs->finalizers_in_progress() == 0
+                    && obs->kill_marshals_in_flight() == 0));
     };
 
     if (predicate()) return true;
@@ -3253,10 +3286,13 @@ bool HttpServer::WaitForAllAsyncDrain(std::chrono::milliseconds timeout) {
         logging::Get()->warn(
             "WaitForAllAsyncDrain timeout — "
             "active_leases={} inflight_transactions={} "
-            "inflight_finalizations={}",
+            "inflight_finalizations={} finalizers_in_progress={} "
+            "kill_marshals_in_flight={}",
             upm ? upm->active_leases() : 0,
             upm ? upm->inflight_transactions() : 0,
-            obs ? obs->inflight_finalizations() : 0);
+            obs ? obs->inflight_finalizations() : 0,
+            obs ? obs->finalizers_in_progress() : 0,
+            obs ? obs->kill_marshals_in_flight() : 0);
     }
     return drained;
 }
@@ -3479,12 +3515,14 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                              bookkeeping_done, cancelled,
                              obs_snap_local, was_head_local]() {
                             if (cancelled->load(std::memory_order_acquire)) return;
-                            s->CompleteAsyncResponse(std::move(*shared_resp));
-                            // Observability finalize for the H1 async
-                            // completion path. Idempotent CAS gate on
-                            // the snapshot itself; we capture method
-                            // (for HEAD detection) + snap by value at
-                            // dispatch time, before request Reset().
+                            // Finalize the snapshot BEFORE handing the
+                            // response to CompleteAsyncResponse: that
+                            // call (a) move-consumes the response, so a
+                            // post-call read returns moved-from data
+                            // (body size 0, etc.), and (b) synchronously
+                            // replays deferred_pending_buf_, which can
+                            // start the next pipelined request before
+                            // the finalizer would otherwise run.
                             if (obs_snap_local) {
                                 auto mgr = obs_snap_local->manager.lock();
                                 if (mgr) {
@@ -3497,6 +3535,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                                         /*error_type=*/std::string{});
                                 }
                             }
+                            s->CompleteAsyncResponse(std::move(*shared_resp));
                             if (!bookkeeping_done->exchange(
                                     true, std::memory_order_acq_rel)) {
                                 active_counter->fetch_sub(
@@ -5694,6 +5733,19 @@ bool HttpServer::Reload(ServerConfig new_config) {
             new_config.auth.forward,
             new_config.auth.enabled,
             new_config.auth.debug_response_headers);
+    }
+
+    // Observability live-reloadable subset (sampler, batch sizing,
+    // export interval/timeout, traces.enabled / metrics.enabled,
+    // include_target_info). Master `enabled` and Resource (service.*)
+    // are restart-required and ignored by Manager::Reload — operators
+    // editing those see them surface only on the next restart. The
+    // ObservabilityConfig::operator== gate excludes the live-reloadable
+    // fields, so the "topology change" warn upstream of this call still
+    // fires when restart-required fields differ.
+    if (observability_manager_) {
+        observability_manager_->Reload(new_config.observability);
+        live_config_.observability = new_config.observability;
     }
 
     return true;

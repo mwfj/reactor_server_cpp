@@ -3079,8 +3079,8 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
         }
     }
 
-    // Observability schema (full §10). Both live + restart subsets run
-    // at startup; the reload path runs only the live subset.
+    // Observability schema. Both live + restart subsets run at startup;
+    // the reload path runs only the live subset (ValidateObservabilityLive).
     ValidateObservabilityLive(config);
     ValidateObservabilityRestart(config, reload_copy);
 }

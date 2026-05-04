@@ -14,8 +14,13 @@ BatchSpanProcessor::BatchSpanProcessor(
       schedule_delay_ns_(options.schedule_delay.count() * 1'000'000),
       export_timeout_ns_(options.export_timeout.count() * 1'000'000) {
     if (options_.max_queue_size == 0) options_.max_queue_size = 1;
-    worker_ = std::thread([this] { WorkerLoop(); });
+    // Publish the started flag BEFORE constructing the thread so a
+    // racing JoinWorkers() (e.g. from ~BatchSpanProcessor on a partial-
+    // construction unwind path) reads true and falls through to the
+    // joinable() check rather than skipping the join and leaving a
+    // joinable std::thread behind (which would terminate from ~thread).
     worker_started_.store(true, std::memory_order_release);
+    worker_ = std::thread([this] { WorkerLoop(); });
 }
 
 BatchSpanProcessor::~BatchSpanProcessor() {
@@ -116,16 +121,22 @@ void BatchSpanProcessor::SignalShutdown() {
             std::memory_order_acq_rel)) {
         return;  // idempotent
     }
-    // Tell the exporter to refuse new exports. The processor worker
-    // continues draining the queue under the shutdown flag until
-    // empty; subsequent OnEnd calls land in dropped_on_overflow_.
-    if (exporter_) exporter_->SignalShutdown();
+    // Wake the worker so it sees shutting_down_=true and runs its
+    // drain_all loop. Do NOT signal the exporter here: that would
+    // cause Export() inside the drain to return kFailedNotRetryable
+    // and silently drop every queued span. The exporter is signaled
+    // AFTER the worker has finished draining, in JoinWorkers().
+    // Subsequent OnEnd calls already land in dropped_on_overflow_.
     cv_.notify_all();
 }
 
 void BatchSpanProcessor::JoinWorkers(std::chrono::milliseconds /*deadline*/) {
     if (!worker_started_.load(std::memory_order_acquire)) return;
     if (worker_.joinable()) worker_.join();
+    // Worker has fully drained. Now safe to refuse any further
+    // exports (e.g. a metric reader sharing the same exporter that
+    // is still active). Idempotent on the exporter side.
+    if (exporter_) exporter_->SignalShutdown();
 }
 
 void BatchSpanProcessor::Reload(size_t new_max_export_batch_size,

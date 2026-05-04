@@ -54,8 +54,9 @@ std::shared_ptr<Span> Tracer::StartSpan(std::string name,
     auto processor = AtomicLoad(processor_);
 
     // Build the SpanContext for the new span. Three sources, in order:
-    //   1. precomputed_context (proxy / auth callers wanting wire-format
-    //      span_id alignment per §6.1).
+    //   1. precomputed_context (caller-supplied wire-format SpanContext
+    //      so outbound traceparent encodes the same span_id the upstream
+    //      will see in the request).
     //   2. Inherited from parent — same trace_id, freshly-generated span_id.
     //   3. Root span — freshly-generated trace_id AND span_id.
     SpanContext own_context;
@@ -84,7 +85,8 @@ std::shared_ptr<Span> Tracer::StartSpan(std::string name,
         if (result.has_trace_state_override) {
             // Inject the sampler's trace_state mutation. We round-trip
             // through Parse() to validate the W3C list-member shape;
-            // an invalid override is silently dropped per §3.3.
+            // an invalid override is silently dropped per W3C Trace
+            // Context Level 1 §3.3.
             auto parsed = TraceState::Parse(result.trace_state_override);
             if (parsed.has_value()) {
                 own_context.mutable_state() = std::move(*parsed);

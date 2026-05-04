@@ -25,12 +25,11 @@ Span::Span(SpanContext context,
 
 Span::~Span() {
     // Defensive: if a Span is destroyed without End() / Drop, treat it
-    // as End-with-now to avoid silently losing the snapshot. This is a
-    // safety net for code paths that drop the shared_ptr without
-    // explicit lifecycle management; the §13 kill path calls
-    // DropWithoutEnd explicitly so this branch only hits in genuine
-    // bugs (e.g. an exception thrown across the request handler that
-    // bypasses the WithFinalize hook).
+    // as End-with-now to avoid silently losing the snapshot. The
+    // shutdown kill path calls DropWithoutEnd explicitly, so this
+    // branch only hits when a code path drops the shared_ptr without
+    // explicit lifecycle management (e.g. an exception thrown across
+    // the request handler that bypasses the finalize hook).
     if (!ended_.load(std::memory_order_acquire) &&
         !dropped_.load(std::memory_order_acquire)) {
         try {
@@ -162,20 +161,14 @@ void Span::DropWithoutEnd() {
                                             std::memory_order_acq_rel)) {
         return;  // already dropped.
     }
-    // Release Span members so memory is reclaimed even if some other
-    // shared_ptr is still pinning the Span object alive (e.g. an in-
-    // flight ProxyTransaction's `current_attempt_.upstream_span`).
-    name_.clear();
-    status_description_.clear();
-    attributes_.clear();
-    events_.clear();
-    links_.clear();
-    // Drop the processor reference — the §13 kill path invokes this
-    // BECAUSE the processor is being torn down, so we can't call OnEnd
-    // and we don't want to keep the processor alive via this Span.
-    processor_.reset();
-    resource_.reset();
-    scope_.reset();
+    // Mutating the vectors / shared_ptrs here would race with a
+    // dispatcher thread mid-SetAttribute / AddEvent / End — IsRecording()
+    // is necessarily a TOCTOU read against dropped_, so a mutator can
+    // be past its IsRecording() check and inside emplace_back() when
+    // this CAS publishes. Just mark the span dropped (later mutators
+    // bail) and let the destructor reclaim memory when the last
+    // shared_ptr is released — bounded by dispatcher stop, which runs
+    // after KillOutstandingSnapshots returns.
 }
 
 }  // namespace OBSERVABILITY_NAMESPACE

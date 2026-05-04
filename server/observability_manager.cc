@@ -235,10 +235,12 @@ void ObservabilityManager::KillOutstandingSnapshots(
             continue;
         }
 
-        // DropWithoutEnd is CAS-idempotent and only mutates Span-local
-        // state, so an inline call is safe regardless of which dispatcher
-        // owns the span. The processor was already drained by
-        // BeginShutdown above.
+        // DropWithoutEnd only flips the dropped_ atomic; it never
+        // touches the Span's non-atomic state. Safe to invoke from
+        // the stopper thread even if the owning dispatcher is mid-
+        // SetAttribute. The processor was already drained by
+        // BeginShutdown above, and the destructor will reclaim
+        // memory naturally on the last shared_ptr release.
         if (snap.inbound_span) {
             snap.inbound_span->DropWithoutEnd();
         }

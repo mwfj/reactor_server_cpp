@@ -7,9 +7,10 @@ namespace OBSERVABILITY_NAMESPACE {
 namespace {
 
 // Read the upper 64 bits of a trace_id as a host-byte-order uint64.
-// Spec §6.5 doesn't pin endianness for the sampling key; the only
-// requirement is determinism per trace_id. We pick "treat the first
-// 8 bytes as a big-endian u64" which matches the W3C wire format.
+// The sampling key only needs determinism per trace_id, not a fixed
+// endianness. "Treat the first 8 bytes as a big-endian u64" matches
+// the W3C wire format and gives identical sampling decisions for the
+// same trace_id across different hosts.
 uint64_t TraceIdUpper64(const TraceId& id) noexcept {
     uint64_t v = 0;
     for (int i = 0; i < 8; ++i) {
