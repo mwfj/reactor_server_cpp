@@ -176,6 +176,16 @@ void BatchSpanProcessor::JoinWorkers(std::chrono::milliseconds deadline) {
 }
 
 void BatchSpanProcessor::Reload(size_t new_max_export_batch_size,
+                                 std::chrono::milliseconds new_schedule_delay) {
+    // Preserve the current export_timeout (read back from the live
+    // atomic, not the construction-time value, so consecutive 2-arg
+    // reloads compose).
+    auto current_timeout_ns = export_timeout_ns_.load(std::memory_order_acquire);
+    Reload(new_max_export_batch_size, new_schedule_delay,
+           std::chrono::milliseconds(current_timeout_ns / 1'000'000));
+}
+
+void BatchSpanProcessor::Reload(size_t new_max_export_batch_size,
                                  std::chrono::milliseconds new_schedule_delay,
                                  std::chrono::milliseconds new_export_timeout) {
     if (new_max_export_batch_size == 0) new_max_export_batch_size = 1;

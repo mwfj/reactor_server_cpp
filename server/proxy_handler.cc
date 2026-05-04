@@ -194,6 +194,17 @@ void ProxyHandler::Handle(
         request.async_cap_sec_override = 0;
     }
 
+    // Wire the observability snapshot into the transaction BEFORE Start()
+    // so KillOutstandingSnapshots() can call MarkKilledForShutdown()
+    // through the link/kill protocol on real proxy traffic. Without this,
+    // ObservabilitySnapshot::tx_weak stays empty and the shutdown kill
+    // path bypasses every in-flight proxy request — the link protocol
+    // would only fire in tests. No-op when obs_snapshot is null
+    // (observability disabled or middleware skipped this request).
+    if (request.obs_snapshot) {
+        txn->AttachObservabilitySnapshot(request.obs_snapshot);
+    }
+
     txn->Start();
     // txn stays alive via shared_ptr captured in async callbacks
 }

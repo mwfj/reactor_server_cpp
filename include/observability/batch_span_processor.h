@@ -54,6 +54,13 @@ public:
                 std::chrono::milliseconds new_schedule_delay,
                 std::chrono::milliseconds new_export_timeout);
 
+    // Convenience overload — reloads only the two batch-shape knobs,
+    // preserving the construction-time export_timeout. Used by
+    // TracerProvider::Reload, where ProcessorOptions intentionally
+    // omits export_timeout because it isn't surfaced as a config field.
+    void Reload(size_t new_max_export_batch_size,
+                std::chrono::milliseconds new_schedule_delay);
+
     // Force a flush; returns when the queue drains or `deadline`
     // expires. Idempotent.
     void ForceFlush(std::chrono::milliseconds deadline);

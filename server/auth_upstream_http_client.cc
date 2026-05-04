@@ -241,8 +241,31 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
     // Strip first so an unsanitized inbound header can never leak
     // across gateway-internal hops, then inject from issue_ctx when
     // the caller has populated it with a valid local SpanContext.
-    req.headers.erase("traceparent");
-    req.headers.erase("tracestate");
+    //
+    // Header keys are documented as "lowercase preferred" — not
+    // required. A caller passing a mixed-case key like "TraceParent"
+    // would otherwise survive an exact-key erase and be serialized
+    // alongside the freshly injected lowercase header, leaking the
+    // caller's context. Walk the map and remove every key that
+    // case-insensitively matches "traceparent" or "tracestate".
+    auto ieq = [](const std::string& a, const char* b) {
+        size_t n = std::strlen(b);
+        if (a.size() != n) return false;
+        for (size_t i = 0; i < n; ++i) {
+            unsigned char ca = static_cast<unsigned char>(a[i]);
+            unsigned char cb = static_cast<unsigned char>(b[i]);
+            if (std::tolower(ca) != std::tolower(cb)) return false;
+        }
+        return true;
+    };
+    for (auto it = req.headers.begin(); it != req.headers.end(); ) {
+        if (ieq(it->first, "traceparent") ||
+            ieq(it->first, "tracestate")) {
+            it = req.headers.erase(it);
+        } else {
+            ++it;
+        }
+    }
     if (req.issue_ctx.has_value()
         && req.issue_ctx->local.IsValid()) {
         OBSERVABILITY_NAMESPACE::W3CPropagator::Inject(

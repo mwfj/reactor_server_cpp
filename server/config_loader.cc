@@ -3675,5 +3675,117 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
         j["auth"] = aj;
     }
 
+    // Observability — round-trip support. Without this block,
+    // ConfigLoader::ToJson(LoadFromString(...)) would silently strip
+    // every operator-set observability field (exporters, sampler
+    // routes, /metrics path, OTLP upstream, batch sizing, etc.).
+    {
+        auto sampler_name = [](OBSERVABILITY_NAMESPACE::SamplerType t) {
+            switch (t) {
+                case OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOn:
+                    return "always_on";
+                case OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOff:
+                    return "always_off";
+                case OBSERVABILITY_NAMESPACE::SamplerType::TraceIdRatio:
+                    return "trace_id_ratio";
+                case OBSERVABILITY_NAMESPACE::SamplerType::ParentBased:
+                default:
+                    return "parent_based";
+            }
+        };
+        const auto& oc = config.observability;
+        nlohmann::json oj;
+        oj["enabled"] = oc.enabled;
+
+        nlohmann::json rj;
+        rj["service_name"] = oc.resource.service_name;
+        if (!oc.resource.service_version.empty())
+            rj["service_version"] = oc.resource.service_version;
+        if (!oc.resource.service_instance_id.empty())
+            rj["service_instance_id"] = oc.resource.service_instance_id;
+        oj["resource"] = rj;
+
+        nlohmann::json tj;
+        tj["enabled"]  = oc.traces.enabled;
+        if (!oc.traces.exporter.empty())
+            tj["exporter"] = oc.traces.exporter;
+
+        nlohmann::json sj;
+        sj["type"]  = sampler_name(oc.traces.sampler.type);
+        sj["ratio"] = oc.traces.sampler.ratio;
+        if (!oc.traces.sampler.routes.empty()) {
+            nlohmann::json routes = nlohmann::json::array();
+            for (const auto& r : oc.traces.sampler.routes) {
+                nlohmann::json rj2;
+                rj2["path"]    = r.path;
+                rj2["sampler"] = sampler_name(r.sampler);
+                rj2["ratio"]   = r.ratio;
+                routes.push_back(std::move(rj2));
+            }
+            sj["routes"] = std::move(routes);
+        }
+        tj["sampler"] = sj;
+
+        nlohmann::json otj;
+        if (!oc.traces.otlp.upstream.empty())
+            otj["upstream"] = oc.traces.otlp.upstream;
+        if (!oc.traces.otlp.headers.empty())
+            otj["headers"] = oc.traces.otlp.headers;
+        otj["timeout_ms"] =
+            static_cast<int64_t>(oc.traces.otlp.timeout_ms.count());
+        tj["otlp"] = otj;
+
+        nlohmann::json bj;
+        bj["max_queue_size"]        = oc.traces.batch.max_queue_size;
+        bj["max_export_batch_size"] = oc.traces.batch.max_export_batch_size;
+        bj["schedule_delay_ms"]     =
+            static_cast<int64_t>(oc.traces.batch.schedule_delay.count());
+        nlohmann::json brj;
+        brj["max_attempts"]    = oc.traces.batch.retries.max_attempts;
+        brj["initial_backoff_ms"] =
+            static_cast<int64_t>(oc.traces.batch.retries.initial_backoff.count());
+        brj["max_backoff_ms"]  =
+            static_cast<int64_t>(oc.traces.batch.retries.max_backoff.count());
+        bj["retries"] = brj;
+        tj["batch"] = bj;
+        oj["traces"] = tj;
+
+        nlohmann::json mj;
+        mj["enabled"] = oc.metrics.enabled;
+        if (!oc.metrics.exporter.empty())
+            mj["exporter"] = oc.metrics.exporter;
+        nlohmann::json mojo;
+        if (!oc.metrics.otlp.upstream.empty())
+            mojo["upstream"] = oc.metrics.otlp.upstream;
+        if (!oc.metrics.otlp.headers.empty())
+            mojo["headers"] = oc.metrics.otlp.headers;
+        mojo["timeout_ms"] =
+            static_cast<int64_t>(oc.metrics.otlp.timeout_ms.count());
+        mj["otlp"] = mojo;
+
+        nlohmann::json mrj;
+        mrj["export_interval_ms"] =
+            static_cast<int64_t>(oc.metrics.reader.export_interval.count());
+        mrj["export_timeout_ms"]  =
+            static_cast<int64_t>(oc.metrics.reader.export_timeout.count());
+        mj["reader"] = mrj;
+
+        nlohmann::json pj;
+        pj["path"]                = oc.metrics.prometheus.path;
+        pj["include_target_info"] = oc.metrics.prometheus.include_target_info;
+        mj["prometheus"] = pj;
+
+        if (!oc.metrics.histogram_buckets.empty()) {
+            nlohmann::json hj = nlohmann::json::object();
+            for (const auto& [name, buckets] : oc.metrics.histogram_buckets) {
+                hj[name] = buckets;
+            }
+            mj["histogram_buckets"] = hj;
+        }
+        oj["metrics"] = mj;
+
+        j["observability"] = oj;
+    }
+
     return j.dump(4);
 }

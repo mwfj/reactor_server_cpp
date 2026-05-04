@@ -385,12 +385,21 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
     // Capture the new sampler config for any future GetTracer() calls.
     config_.traces.sampler  = new_config.traces.sampler;
     config_.traces.enabled  = new_config.traces.enabled;
+    config_.traces.batch    = new_config.traces.batch;
     config_.metrics         = new_config.metrics;
 
-    // Build new sampler + push to TracerProvider.
+    // Build new sampler + push to TracerProvider, including the
+    // updated batch-shape knobs so a SIGHUP that edits
+    // traces.batch.{max_export_batch_size,schedule_delay} actually
+    // takes effect on the running BatchSpanProcessor (the previous
+    // default-constructed ProcessorOptions made the reload a silent
+    // no-op).
     auto new_sampler = BuildSamplerFromConfig();
     if (tracer_provider_) {
         ProcessorOptions po;
+        po.max_export_batch_size =
+            static_cast<size_t>(new_config.traces.batch.max_export_batch_size);
+        po.schedule_delay = new_config.traces.batch.schedule_delay;
         tracer_provider_->Reload(new_sampler, po);
     }
 
