@@ -7,12 +7,13 @@
 //   - trace-flags: 8 bits; bit 0 = sampled.
 //
 // These are POD-like value types — copyable, comparable, hex-serializable.
-// The RandomSource produces non-cryptographic-quality 64-bit / 128-bit
-// random words for ID generation; it is dispatcher-thread-local so no
-// synchronization is needed (each dispatcher seeds its own state at
-// construction time).
+// RandomSource produces non-cryptographic-quality 64-bit / 128-bit random
+// words for ID generation; it serialises access internally so a single
+// instance may be safely shared across dispatchers (production wiring
+// passes one RandomSource through the manager to all Tracers).
 
 #include <array>
+#include <mutex>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -91,9 +92,15 @@ struct TraceFlags {
     bool operator!=(TraceFlags o) const noexcept { return value != o.value; }
 };
 
-// Per-dispatcher random source for ID generation. Non-cryptographic.
-// Each dispatcher constructs its own instance; no synchronization needed
-// because the same RandomSource is never touched cross-thread.
+// Random source for trace/span ID generation. Non-cryptographic.
+//
+// Production wires a single RandomSource through the manager →
+// TracerProvider → all per-dispatcher Tracers, so a StartSpan() call
+// from one dispatcher can race with another dispatcher's call against
+// the same xoroshiro128+ state. The class therefore guards Next64()
+// with a small mutex; ID generation is one-call-per-span and well
+// outside the hot byte-shuffling path so the contention is negligible
+// in practice.
 class RandomSource {
 public:
     RandomSource();
@@ -103,9 +110,10 @@ public:
     SpanId  NewSpanId() noexcept;
 
 private:
+    std::mutex state_mtx_;
     uint64_t state_lo_ = 0;
     uint64_t state_hi_ = 0;
-    uint64_t Next64() noexcept;
+    uint64_t Next64() noexcept;  // takes state_mtx_
 };
 
 }  // namespace OBSERVABILITY_NAMESPACE

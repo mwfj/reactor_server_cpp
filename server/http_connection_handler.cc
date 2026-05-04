@@ -1324,6 +1324,19 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
     req.client_tls = conn_->HasTls();
     req.client_fd = conn_->fd();
 
+    // Populate observability fields BEFORE dispatch / middleware so the
+    // observability middleware sees non-empty url.scheme,
+    // network.protocol.version, and the owning dispatcher pointer
+    // needed by the kill-marshal target.
+    req.url_scheme = conn_->HasTls() ? "https" : "http";
+    {
+        char ver[8];
+        std::snprintf(ver, sizeof(ver), "%d.%d",
+                      req.http_major, req.http_minor);
+        req.network_protocol_version = ver;
+    }
+    req.owning_dispatcher = conn_->GetDispatcher();
+
     // Count every completed request parse — dispatched, rejected, or upgraded.
     if (callbacks_.request_count_callback) {
         callbacks_.request_count_callback();
@@ -1579,6 +1592,11 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             logging::Get()->error("Exception in request handler: {}", e.what());
             response = HttpResponse::InternalError();
             response.Header("Connection", "close");
+            // Finalize the snapshot here too: the sync-handler exception
+            // path bypasses the FinalizeIfSnapshot calls in
+            // request_callback's normal return paths, leaving
+            // inflight_finalizations_ elevated and the SERVER span open.
+            HttpServer::FinalizeIfSnapshot(req, response, "handler_threw");
             SendResponse(response);
             CloseConnection();
             return false;

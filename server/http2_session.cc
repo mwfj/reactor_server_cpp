@@ -1,6 +1,7 @@
 #include "http2/http2_session.h"
 #include "http2/http2_connection_handler.h"
 #include "http/http_response.h"
+#include "http/http_server.h"  // HttpServer::FinalizeIfSnapshot
 #include "http/http_status.h"
 #include "log/logger.h"
 
@@ -1411,6 +1412,17 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
         req.client_ip = conn_->ip_addr();
         req.client_tls = conn_->HasTls();
         req.client_fd = conn_->fd();
+        // Observability fields needed by the inbound middleware. The
+        // :scheme pseudo-header (req.url_scheme already populated by
+        // the headers callback) takes precedence; if it was empty
+        // (defensive fallback for malformed HEADERS that nghttp2 still
+        // accepted), derive from TLS state. H2 is always "2" on the
+        // wire.
+        if (req.url_scheme.empty()) {
+            req.url_scheme = conn_->HasTls() ? "https" : "http";
+        }
+        req.network_protocol_version = "2";
+        req.owning_dispatcher = conn_->GetDispatcher();
     }
 
     // RFC 9110 Section 8.6: If content-length is declared, the actual body
@@ -1438,11 +1450,18 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
     }
 
     HttpResponse response;
+    bool handler_threw = false;
     try {
         callbacks_.request_callback(Owner(), stream_id, req, response);
     } catch (const std::exception& e) {
         logging::Get()->error("Exception in HTTP/2 request handler: {}", e.what());
         response = HttpResponse::InternalError();
+        handler_threw = true;
+    }
+    // Mirror H1: a sync handler exception bypasses FinalizeIfSnapshot
+    // in the normal return paths, so the snapshot stays registered.
+    if (handler_threw) {
+        HttpServer::FinalizeIfSnapshot(req, response, "handler_threw");
     }
     // Async handler path: the framework has dispatched an async route and
     // will submit the real response on this stream later via

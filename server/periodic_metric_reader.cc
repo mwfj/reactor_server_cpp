@@ -63,6 +63,11 @@ void PeriodicMetricReader::WorkerLoop() {
         if (shutdown) break;
         (void)flush;  // forced flush already handled by the loop iteration above.
     }
+    // Final-flush already happened above (the last iteration with
+    // shutdown=true exported once); now signal the exporter so any
+    // shared peer (BatchSpanProcessor) gets the same shutdown contract,
+    // BEFORE publishing worker_done_.
+    if (exporter_) exporter_->SignalShutdown();
     {
         std::lock_guard<std::mutex> g(join_mtx_);
         worker_done_ = true;
@@ -84,27 +89,23 @@ void PeriodicMetricReader::SignalShutdown() {
 
 void PeriodicMetricReader::JoinWorkers(std::chrono::milliseconds deadline) {
     if (!worker_started_.load(std::memory_order_acquire)) return;
-    bool joined_now = false;
     if (deadline.count() <= 0) {
         if (worker_.joinable()) worker_.join();
-        joined_now = true;
-    } else {
-        std::unique_lock<std::mutex> lk(join_mtx_);
-        bool done = join_cv_.wait_for(lk, deadline,
-                                          [this]{ return worker_done_; });
-        lk.unlock();
-        if (!done) {
-            logging::Get()->warn(
-                "PeriodicMetricReader::JoinWorkers timeout after {}ms — "
-                "worker still in flight (exporter likely stalled); final "
-                "join deferred to destructor",
-                deadline.count());
-            return;
-        }
-        if (worker_.joinable()) worker_.join();
-        joined_now = true;
+        return;
     }
-    if (joined_now && exporter_) exporter_->SignalShutdown();
+    std::unique_lock<std::mutex> lk(join_mtx_);
+    bool done = join_cv_.wait_for(lk, deadline,
+                                      [this]{ return worker_done_; });
+    lk.unlock();
+    if (!done) {
+        logging::Get()->warn(
+            "PeriodicMetricReader::JoinWorkers timeout after {}ms — "
+            "worker still in flight (exporter likely stalled); final "
+            "join deferred to destructor",
+            deadline.count());
+        return;
+    }
+    if (worker_.joinable()) worker_.join();
 }
 
 void PeriodicMetricReader::Reload(MeterReaderOptions new_options) {

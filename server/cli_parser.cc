@@ -258,7 +258,8 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
         if (options.config_path_explicit || options.port >= 0 ||
             !options.host.empty() || !options.log_level.empty() ||
             options.workers >= 0 || !options.health_endpoint ||
-            !options.stats_endpoint || options.daemonize) {
+            !options.stats_endpoint || !options.metrics_endpoint ||
+            options.daemonize) {
             throw std::runtime_error(
                 std::string("'") + argv[1] + "' only accepts -P/--pid-file");
         }
@@ -266,11 +267,15 @@ CliOptions CliParser::Parse(int argc, char* argv[]) {
 
     // validate accepts -c, -p, -H, -l, -w, -d, -P (for daemon pre-validation)
     // config accepts -c, -p, -H, -l, -w but NOT -d or -P
-    // Neither accepts --no-health-endpoint
+    // Neither accepts --no-health-endpoint / --no-stats-endpoint /
+    // --no-metrics-endpoint (those are start-only flags, like -d).
     if (cmd == CliCommand::VALIDATE || cmd == CliCommand::CONFIG) {
-        if (!options.health_endpoint || !options.stats_endpoint) {
+        if (!options.health_endpoint || !options.stats_endpoint ||
+            !options.metrics_endpoint) {
             throw std::runtime_error(
-                std::string("'") + argv[1] + "' does not accept --no-health-endpoint/--no-stats-endpoint");
+                std::string("'") + argv[1] +
+                "' does not accept --no-health-endpoint/"
+                "--no-stats-endpoint/--no-metrics-endpoint");
         }
         if (cmd == CliCommand::CONFIG) {
             if (options.daemonize) {

@@ -66,6 +66,38 @@ void ObservabilityManager::Init() {
     ro.export_interval = config_.metrics.reader.export_interval;
     ro.export_timeout  = config_.metrics.reader.export_timeout;
     meter_provider_->Reload(ro);
+
+    // Register the OTel HTTP-semconv server-request duration histogram
+    // up front so OnFinalizeWinner can Record() without any per-request
+    // get-or-create cost. Buckets: configured `metrics.histogram_buckets`
+    // for "http.server.request.duration" if present, otherwise the
+    // OTel-recommended default exponential-ish ladder (seconds).
+    Meter* http_server_meter =
+        meter_provider_->GetMeter("reactor.http.server");
+    std::vector<double> duration_buckets;
+    auto bucket_it = config_.metrics.histogram_buckets.find(
+        "http.server.request.duration");
+    if (bucket_it != config_.metrics.histogram_buckets.end()
+        && !bucket_it->second.empty()) {
+        duration_buckets = bucket_it->second;
+    } else {
+        duration_buckets = {0.005, 0.01, 0.025, 0.05, 0.075, 0.1,
+                             0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0};
+    }
+    MetricLabelRegistry::Catalog duration_catalog;
+    duration_catalog.allowed_keys = {
+        "http.request.method",
+        "http.response.status_code",
+        "http.route",
+        "network.protocol.version",
+        "error.type",
+    };
+    http_server_request_duration_ = http_server_meter->GetHistogram(
+        "http.server.request.duration",
+        "Duration of HTTP server requests",
+        "s",
+        std::move(duration_buckets),
+        std::move(duration_catalog));
 }
 
 std::shared_ptr<const Sampler>
@@ -208,6 +240,50 @@ void ObservabilityManager::OnFinalizeWinner(
     snap.status_code.store(status_code, std::memory_order_release);
     snap.wire_body_size.store(wire_body_size, std::memory_order_release);
     snap.error_type = error_type;
+
+    // Record the OTel HTTP server request duration metric.
+    // Gated on metrics_enabled so a runtime SIGHUP toggle stops the
+    // record path immediately (the snapshot pipeline still finalizes
+    // for span correctness). Histogram is null when traces+metrics
+    // are both off or when Init() didn't run; defensive null check.
+    if (http_server_request_duration_ != nullptr
+        && metrics_enabled_.load(std::memory_order_acquire)) {
+        const auto duration_ns =
+            std::chrono::steady_clock::now() - snap.start_steady;
+        const double duration_s =
+            std::chrono::duration<double>(duration_ns).count();
+        std::vector<std::pair<std::string, std::string>> labels;
+        labels.reserve(5);
+        if (!snap.method.empty()) {
+            labels.emplace_back("http.request.method", snap.method);
+        }
+        if (status_code > 0) {
+            labels.emplace_back("http.response.status_code",
+                                std::to_string(status_code));
+        }
+        if (!snap.route_pattern.empty()) {
+            labels.emplace_back("http.route", snap.route_pattern);
+        }
+        if (!snap.network_protocol_version.empty()) {
+            labels.emplace_back("network.protocol.version",
+                                snap.network_protocol_version);
+        }
+        // OTel HTTP semconv: error.type is required for 5xx and
+        // optional for everything else. The finalizer's error_type
+        // covers transport aborts and middleware rejections; for
+        // bare 5xx the reviewer's prior round derived a stringified
+        // status — match that here so span↔histogram correlation is
+        // consistent.
+        std::string effective_error = error_type;
+        if (effective_error.empty() && status_code >= 500
+            && status_code < 600) {
+            effective_error = std::to_string(status_code);
+        }
+        if (!effective_error.empty()) {
+            labels.emplace_back("error.type", std::move(effective_error));
+        }
+        http_server_request_duration_->Record(duration_s, labels);
+    }
 
     // Attach response-side attributes before ending:
     //   http.response.status_code, http.server.response.body.size,

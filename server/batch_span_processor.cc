@@ -118,8 +118,13 @@ void BatchSpanProcessor::WorkerLoop() {
             if (queue_.empty()) break;
         }
     }
-    // Publish loop exit so a bounded JoinWorkers wakes promptly
-    // instead of polling an unbounded worker_.join().
+    // Worker has fully drained the queue. Signal the exporter to
+    // refuse any subsequent exports BEFORE publishing worker_done_:
+    // this guarantees exporter shutdown happens regardless of when
+    // (or whether) JoinWorkers is called, while keeping the queue-
+    // drain → exporter-signal ordering intact (Export() during the
+    // drain still succeeds).
+    if (exporter_) exporter_->SignalShutdown();
     {
         std::lock_guard<std::mutex> g(join_mtx_);
         worker_done_ = true;
@@ -144,35 +149,30 @@ void BatchSpanProcessor::SignalShutdown() {
 
 void BatchSpanProcessor::JoinWorkers(std::chrono::milliseconds deadline) {
     if (!worker_started_.load(std::memory_order_acquire)) return;
-    bool joined_now = false;
     if (deadline.count() <= 0) {
         // Caller asked for unbounded wait — block on join directly.
         if (worker_.joinable()) worker_.join();
-        joined_now = true;
-    } else {
-        // Bounded wait. If the worker doesn't publish worker_done_ in
-        // time (e.g. exporter Export() is stalled), return without
-        // joining; the destructor's unconditional fallback join will
-        // catch a thread that finishes later.
-        std::unique_lock<std::mutex> lk(join_mtx_);
-        bool done = join_cv_.wait_for(lk, deadline,
-                                          [this]{ return worker_done_; });
-        lk.unlock();
-        if (!done) {
-            logging::Get()->warn(
-                "BatchSpanProcessor::JoinWorkers timeout after {}ms — "
-                "worker still in flight (exporter likely stalled); final "
-                "join deferred to destructor",
-                deadline.count());
-            return;
-        }
-        if (worker_.joinable()) worker_.join();
-        joined_now = true;
+        return;
     }
-    // Worker has fully drained. Refuse any further exports through this
-    // exporter (e.g. a metric reader sharing the same exporter still
-    // active). Idempotent on the exporter side.
-    if (joined_now && exporter_) exporter_->SignalShutdown();
+    // Bounded wait. The worker publishes worker_done_ AFTER signaling
+    // the exporter and finishing the queue drain, so a successful
+    // wait_for guarantees exporter shutdown has already fired. If the
+    // wait times out (e.g. exporter Export() is stalled), return
+    // without joining; the destructor's unconditional fallback join
+    // catches a thread that finishes later.
+    std::unique_lock<std::mutex> lk(join_mtx_);
+    bool done = join_cv_.wait_for(lk, deadline,
+                                      [this]{ return worker_done_; });
+    lk.unlock();
+    if (!done) {
+        logging::Get()->warn(
+            "BatchSpanProcessor::JoinWorkers timeout after {}ms — "
+            "worker still in flight (exporter likely stalled); final "
+            "join deferred to destructor",
+            deadline.count());
+        return;
+    }
+    if (worker_.joinable()) worker_.join();
 }
 
 void BatchSpanProcessor::Reload(size_t new_max_export_batch_size,

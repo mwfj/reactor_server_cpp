@@ -1008,11 +1008,29 @@ static int HandleStart(const CliOptions& options) {
     }
 
     // Observability bootstrap — only when the master switch is on.
-    // Resource carries service.name/version/instance.id. Default
-    // processor is NoopSpanProcessor; production callers swap in
-    // BatchSpanProcessor when traces.exporter is configured. The
-    // manager is attached to HttpServer so the middleware fires on
-    // every request.
+    // Resource carries service.name/version/instance.id.
+    //
+    // Refuse otlp_http exporters until the production push pipeline is
+    // wired through this bootstrap. Without this guard, the manager
+    // builds with a NoopSpanProcessor while ConfigLoader::Validate has
+    // already cross-checked the upstream — the operator's exporter
+    // setting would be silently ignored and traces would be lost. Fail
+    // closed at startup instead so misconfigurations surface
+    // immediately.
+    if (config.observability.enabled) {
+        if (config.observability.traces.exporter == "otlp_http") {
+            throw std::runtime_error(
+                "observability.traces.exporter='otlp_http' is not yet "
+                "wired in this bootstrap; remove the exporter or rebuild "
+                "after the OTLP push pipeline lands");
+        }
+        if (config.observability.metrics.exporter == "otlp_http") {
+            throw std::runtime_error(
+                "observability.metrics.exporter='otlp_http' is not yet "
+                "wired in this bootstrap; use 'prometheus_pull' or remove "
+                "the exporter until the OTLP push pipeline lands");
+        }
+    }
     std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>
         observability_manager;
     if (config.observability.enabled) {

@@ -23,6 +23,7 @@
 // bounded by t. Idempotent.
 
 #include "observability/common.h"
+#include "observability/histogram.h"
 #include "observability/meter_provider.h"
 #include "observability/observability_config.h"
 #include "observability/observability_snapshot.h"
@@ -173,6 +174,13 @@ private:
 
     std::unique_ptr<TracerProvider>           tracer_provider_;
     std::unique_ptr<MeterProvider>            meter_provider_;
+    // Built at Init() time, registered into meter_provider_'s
+    // "reactor.http.server" Meter. Not owned by this manager — Meter
+    // owns the Histogram. Recorded once per request from
+    // OnFinalizeWinner so /metrics + OTLP exports surface real traffic
+    // (only the duration histogram is wired today; the rest of the
+    // §7.1 catalog is deferred to Phase 2).
+    Histogram*                                http_server_request_duration_ = nullptr;
 
     // Live-flag snapshots (atomic; updated on Reload).
     std::atomic<bool> traces_enabled_{true};

@@ -3780,7 +3780,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 // completion against a disconnected client.
                 self->SetAsyncAbortHook(
                     [bookkeeping_done, cancelled, active_counter,
-                     cancel_slot]() {
+                     cancel_slot, obs_snap_local]() {
                         if (!bookkeeping_done->exchange(
                                 true, std::memory_order_acq_rel)) {
                             cancelled->store(true, std::memory_order_release);
@@ -3798,6 +3798,24 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                                     logging::Get()->error(
                                         "Async cancel hook threw: {}",
                                         e.what());
+                                }
+                            }
+                            // Finalize the observability snapshot so
+                            // inflight_finalizations_ drains and the
+                            // SERVER span lands with error.type set.
+                            // No status code is on the wire (complete()
+                            // never fired); 0 indicates "no response".
+                            // The CAS gate inside FinalizeFromSnapshot
+                            // makes this safe even if a late complete()
+                            // path also tries to finalize.
+                            if (obs_snap_local) {
+                                if (auto mgr =
+                                        obs_snap_local->manager.lock()) {
+                                    mgr->FinalizeFromSnapshot(
+                                        *obs_snap_local,
+                                        /*status_code=*/0,
+                                        /*wire_body_size=*/0,
+                                        /*error_type=*/"client_disconnect");
                                 }
                             }
                         }
@@ -4838,7 +4856,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 self->SetStreamAbortHook(
                     stream_id,
                     [bookkeeping_done, cancelled, active_counter,
-                     cancel_slot]() {
+                     cancel_slot, obs_snap_local]() {
                         if (!bookkeeping_done->exchange(
                                 true, std::memory_order_acq_rel)) {
                             cancelled->store(true, std::memory_order_release);
@@ -4852,6 +4870,19 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                                     logging::Get()->error(
                                         "Async cancel hook threw: {}",
                                         e.what());
+                                }
+                            }
+                            // Mirror the H1 abort-hook fix — drain the
+                            // snapshot so inflight_finalizations_ stays
+                            // accurate and the SERVER span lands.
+                            if (obs_snap_local) {
+                                if (auto mgr =
+                                        obs_snap_local->manager.lock()) {
+                                    mgr->FinalizeFromSnapshot(
+                                        *obs_snap_local,
+                                        /*status_code=*/0,
+                                        /*wire_body_size=*/0,
+                                        /*error_type=*/"client_disconnect");
                                 }
                             }
                         }
@@ -5801,7 +5832,27 @@ bool HttpServer::Reload(ServerConfig new_config) {
     // fires when restart-required fields differ.
     if (observability_manager_) {
         observability_manager_->Reload(new_config.observability);
-        live_config_.observability = new_config.observability;
+        // Preserve restart-only fields in the live snapshot so that
+        // /config and any subsequent in-process Reload read the values
+        // actually in use at runtime, not the staged-but-not-applied
+        // values. Restart-only fields (mirroring Manager::Reload's
+        // intentional skip set):
+        //   - master `enabled`
+        //   - service.{name,version,instance_id} (Resource)
+        //   - traces.exporter, metrics.exporter
+        //   - traces.otlp.upstream, metrics.otlp.upstream
+        //   - metrics.prometheus.path
+        // Live-reloadable fields are taken from the staged config.
+        OBSERVABILITY_NAMESPACE::ObservabilityConfig merged =
+            new_config.observability;
+        merged.enabled                 = live_config_.observability.enabled;
+        merged.resource                = live_config_.observability.resource;
+        merged.traces.exporter         = live_config_.observability.traces.exporter;
+        merged.metrics.exporter        = live_config_.observability.metrics.exporter;
+        merged.traces.otlp.upstream    = live_config_.observability.traces.otlp.upstream;
+        merged.metrics.otlp.upstream   = live_config_.observability.metrics.otlp.upstream;
+        merged.metrics.prometheus.path = live_config_.observability.metrics.prometheus.path;
+        live_config_.observability = std::move(merged);
     }
 
     return true;

@@ -105,7 +105,10 @@ RandomSource::RandomSource(uint64_t seed) {
 }
 
 uint64_t RandomSource::Next64() noexcept {
-    // xoroshiro128+ (Vigna 2018).
+    // xoroshiro128+ (Vigna 2018). Wrapped in state_mtx_ so concurrent
+    // calls from different dispatchers (production wiring shares one
+    // RandomSource across all Tracers) don't corrupt the state vector.
+    std::lock_guard<std::mutex> lock(state_mtx_);
     const uint64_t s0 = state_lo_;
     uint64_t s1 = state_hi_;
     const uint64_t result = s0 + s1;

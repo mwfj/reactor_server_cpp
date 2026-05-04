@@ -2060,10 +2060,18 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
 
     // Cross-references into upstreams[] — only at startup (reload_copy
     // strips upstreams to skip topology checks; the reload path warns
-    // separately on staged otlp.upstream renames).
+    // separately on staged otlp.upstream renames). An empty `upstream`
+    // when the exporter is otlp_http is a configuration error: the
+    // pipeline has no collector to route to, so requests would be
+    // silently discarded post-startup.
     if (!reload_copy) {
         auto cross_ref = [&](const std::string& name, const char* field) {
-            if (name.empty()) return;
+            if (name.empty()) {
+                throw std::invalid_argument(
+                    std::string(field) +
+                    " must reference an upstreams[].name when the "
+                    "matching exporter is set to 'otlp_http'");
+            }
             for (const auto& u : config.upstreams) {
                 if (u.name == name) return;
             }
