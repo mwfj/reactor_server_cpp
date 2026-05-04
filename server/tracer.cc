@@ -50,7 +50,12 @@ std::shared_ptr<Span> Tracer::StartSpan(std::string name,
                                           const StartSpanOptions& opts) {
     // Snapshot the sampler + processor BEFORE building the span so
     // mid-flight Reload swaps don't tear down the processor under us.
-    auto sampler   = AtomicLoad(sampler_);
+    // Per-call `sampler_override` (used by the inbound-server middleware
+    // to honour `traces.sampler.routes` overrides) takes precedence
+    // over the provider-installed sampler.
+    auto sampler   = opts.sampler_override
+                       ? opts.sampler_override
+                       : AtomicLoad(sampler_);
     auto processor = AtomicLoad(processor_);
 
     // Build the SpanContext for the new span. Three sources, in order:

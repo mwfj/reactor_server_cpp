@@ -65,6 +65,13 @@ private:
 
     std::thread                     worker_;
     std::atomic<bool>               worker_started_{false};
+    // See BatchSpanProcessor for the same handshake — JoinWorkers
+    // returns when worker_done_ is published, instead of blocking on
+    // worker_.join() through a stalled exporter Export(). Destructor
+    // does an unconditional fallback join.
+    std::mutex                      join_mtx_;
+    std::condition_variable         join_cv_;
+    bool                            worker_done_ = false;
 };
 
 }  // namespace OBSERVABILITY_NAMESPACE

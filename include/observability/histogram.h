@@ -65,12 +65,21 @@ private:
     // Counts are uint64; sum/min/max are doubles encoded as uint64
     // bits via memcpy (matching Counter's atomic update pattern).
     struct Series {
+        // IEEE 754 double bit patterns for ±infinity. min_bits is
+        // initialized to +inf and max_bits to -inf so the FIRST call
+        // to AtomicMin/AtomicMax always replaces the sentinel — no
+        // separate init-CAS gate needed, and concurrent first-writers
+        // can't observe a half-initialized state where one writer
+        // published `has_min_max=true` before storing the actual bits.
+        static constexpr uint64_t kPosInfBits = 0x7FF0000000000000ULL;
+        static constexpr uint64_t kNegInfBits = 0xFFF0000000000000ULL;
+
         LabelSet                       labels;
         std::vector<std::atomic<uint64_t>> bucket_counts;  // size = boundaries+1
         std::atomic<uint64_t>          count{0};
         std::atomic<uint64_t>          sum_bits{0};
-        std::atomic<uint64_t>          min_bits{0};
-        std::atomic<uint64_t>          max_bits{0};
+        std::atomic<uint64_t>          min_bits{kPosInfBits};
+        std::atomic<uint64_t>          max_bits{kNegInfBits};
         std::atomic<bool>              has_min_max{false};
 
         explicit Series(size_t bucket_n) : bucket_counts(bucket_n) {

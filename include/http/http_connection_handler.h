@@ -85,9 +85,23 @@ public:
     // Create a streaming final-response sender for the current deferred async
     // request. Used by the proxy relay path to stream bytes without going
     // through CompleteAsyncResponse(HttpResponse).
+    //
+    // `finalize_request` fires exactly once on End() OR Abort() with the
+    // observed final state of the stream:
+    //   status_code     — the status passed to SendHeaders, or 0 if Abort
+    //                     fired before SendHeaders.
+    //   bytes_sent      — cumulative bytes accepted by SendData (the
+    //                     wire body size, modulo HEAD-strip).
+    //   error_type      — empty for End(); a stable label
+    //                     ("upstream_truncated", "client_disconnect", etc.)
+    //                     mapped from AbortReason on Abort. The OTel
+    //                     observability finalize uses this verbatim as
+    //                     the `error.type` attribute on the SERVER span.
     HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender CreateStreamingResponseSender(
         std::function<bool()> claim_response,
-        std::function<void()> finalize_request);
+        std::function<void(int status_code,
+                            uint64_t bytes_sent,
+                            std::string error_type)> finalize_request);
 
     // Send a non-final 1xx response (103 Early Hints, 102 Processing, etc.).
     // Thread-safe: off-dispatcher callers are internally hopped to the

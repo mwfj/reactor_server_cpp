@@ -15,11 +15,18 @@ public:
     static constexpr int CONNECT_ERROR       = -1;  // SO_ERROR != 0 or getsockopt failure
 
 private:
-    int fd_;
+    // fd_ is read by NetServer::HandleNewConnection on the conn-dispatcher
+    // thread for diagnostic logging while the owning-dispatcher's
+    // CallCloseCb path may concurrently write -1 via ReleaseFd(). The
+    // value is racy but bounded (an int) so a relaxed atomic gives TSan
+    // happiness without cross-thread fences. The pitfalls file calls
+    // out the same pattern: any FD or pointer field shared across
+    // threads MUST be std::atomic<T>.
+    std::atomic<int> fd_{-1};
     std::string ip_addr_;
     int port_;
-    sa_family_t family_ = AF_UNSPEC;   // §5.3 dual-family — set by CreateSocket / accept-ctor
-    static void SetNonBlocking(int fd);   // static per v0.45 step 4 — CreateSocket is static
+    sa_family_t family_ = AF_UNSPEC;   // dual-family — set by CreateSocket / accept-ctor
+    static void SetNonBlocking(int fd);
 
 public:
     SocketHandler();
@@ -38,33 +45,35 @@ public:
     
     // Move operations
     SocketHandler(SocketHandler&& other) noexcept
-        : fd_(other.fd_), ip_addr_(std::move(other.ip_addr_)),
+        : fd_(other.fd_.load(std::memory_order_relaxed)),
+          ip_addr_(std::move(other.ip_addr_)),
           port_(other.port_), family_(other.family_) {
-        other.fd_ = -1;
+        other.fd_.store(-1, std::memory_order_relaxed);
         other.port_ = 0;
         other.family_ = AF_UNSPEC;
     }
     SocketHandler& operator=(SocketHandler&& other) noexcept {
         if (this != &other) {
             Close();
-            fd_ = other.fd_;
+            fd_.store(other.fd_.load(std::memory_order_relaxed),
+                      std::memory_order_relaxed);
             ip_addr_ = std::move(other.ip_addr_);
             port_ = other.port_;
             family_ = other.family_;
-            other.fd_ = -1;
+            other.fd_.store(-1, std::memory_order_relaxed);
             other.port_ = 0;
             other.family_ = AF_UNSPEC;
         }
         return *this;
     }
 
-    int fd() const { return fd_; }
+    int fd() const { return fd_.load(std::memory_order_relaxed); }
     const std::string& ip_addr() const {return ip_addr_;}
     int port() const {return port_;}
-    
+
 
     // Release ownership of the fd without closing it (used when Channel takes over)
-    void ReleaseFd() { fd_ = -1; }
+    void ReleaseFd() { fd_.store(-1, std::memory_order_relaxed); }
     
     bool SetTcpNoDelay(bool);
     bool SetReuseAddr(bool);

@@ -239,7 +239,7 @@ public:
     H1StreamingResponseSenderImpl(
         std::shared_ptr<ConnectionHandler> conn,
         std::function<bool()> claim_response,
-        std::function<void()> finalize_request,
+        std::function<void(int, uint64_t, std::string)> finalize_request,
         PrepareHeadCallback prepare_head,
         FinalizeResponseCallback finalize_response,
         AbortResponseCallback abort_response,
@@ -306,6 +306,7 @@ public:
         declared_trailer_names_ =
             CollectAllowedTrailerNames(headers_only_response.GetHeaders());
         headers_sent_ = true;
+        last_status_code_ = headers_only_response.GetStatusCode();
         if (mark_response_committed_) {
             mark_response_committed_();
         }
@@ -336,8 +337,11 @@ public:
             return SendResult::CLOSED;
         }
         if (body_suppressed_) {
+            // Wire body is empty (HEAD / 1xx / 204 / 304); accept the
+            // chunk semantically but don't count it toward bytes_sent_.
             return SendResult::ACCEPTED_BELOW_WATER;
         }
+        bytes_sent_ += len;
         if (use_chunked_) {
             if (len == 0) {
                 return EvaluateOccupancy();
@@ -404,7 +408,7 @@ public:
             finalize_response_(should_close_);
         }
         if (finalize_request_) {
-            finalize_request_();
+            finalize_request_(last_status_code_, bytes_sent_, std::string{});
         }
         return SendResult::ACCEPTED_BELOW_WATER;
     }
@@ -506,7 +510,13 @@ private:
             abort_response_();
         }
         if (finalize_request_) {
-            finalize_request_();
+            // last_status_code_ may be 0 if Abort fired before
+            // SendHeaders — that's deliberately propagated so the
+            // observability finalize knows the wire never carried a
+            // status. bytes_sent_ is whatever was accepted before
+            // the abort.
+            finalize_request_(last_status_code_, bytes_sent_,
+                                StreamingAbortReasonToString(reason));
         }
     }
 
@@ -548,11 +558,16 @@ private:
 
     std::shared_ptr<ConnectionHandler> conn_;
     std::function<bool()> claim_response_;
-    std::function<void()> finalize_request_;
+    std::function<void(int, uint64_t, std::string)> finalize_request_;
     PrepareHeadCallback prepare_head_;
     FinalizeResponseCallback finalize_response_;
     AbortResponseCallback abort_response_;
     std::function<void()> mark_response_committed_;
+    // State observed by SendHeaders/SendData/Abort and replayed to
+    // finalize_request_ on End/Abort. Dispatcher-thread-only writes
+    // and reads — no synchronization needed.
+    int last_status_code_ = 0;
+    uint64_t bytes_sent_ = 0;
     DrainListener drain_listener_;
     bool claimed_response_ = false;
     bool headers_sent_ = false;
@@ -598,7 +613,7 @@ void HttpConnectionHandler::SetUpgradeCallback(UpgradeCallback callback) {
 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender
 HttpConnectionHandler::CreateStreamingResponseSender(
     std::function<bool()> claim_response,
-    std::function<void()> finalize_request) {
+    std::function<void(int, uint64_t, std::string)> finalize_request) {
     auto weak_self = weak_from_this();
     auto prepare_head =
         [weak_self](const HttpResponse& input)
@@ -1115,9 +1130,9 @@ void HttpConnectionHandler::CompleteAsyncResponseWithFinalize(
     // Fire the WithFinalize hook AFTER CompleteAsyncResponse returns:
     // the wire bytes are buffered, the deferred state is cleared, and
     // any pipelined-input replay has already fed back into OnRawData.
-    // Per §6.1.2: the hook lands BEFORE the next pipelined request's
-    // span starts (single-threaded dispatcher), so finalize ordering
-    // is preserved on keep-alive connections.
+    // Single-threaded dispatcher ordering guarantees the hook lands
+    // BEFORE the next pipelined request's span starts, so finalize
+    // ordering on keep-alive connections is preserved.
     if (hook) hook(wire_body_size);
 }
 
@@ -1356,7 +1371,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         if (expect != "100-continue") {
             logging::Get()->debug("Unsupported Expect value fd={}", conn_->fd());
             HttpResponse err;
-            err.Status(417, "Expectation Failed");
+            err.Status(HttpStatus::EXPECTATION_FAILED, "Expectation Failed");
             err.Header("Connection", "close");
             SendResponse(err);
             CloseConnection();
@@ -2128,7 +2143,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
                     return;
                 }
                 HttpResponse cont;
-                cont.Status(100, "Continue");
+                cont.Status(HttpStatus::CONTINUE, "Continue");
                 SendResponse(cont);
                 sent_100_continue_ = true;
                 logging::Get()->debug("Sent 100 Continue fd={}", conn_->fd());
@@ -2137,7 +2152,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
                 logging::Get()->debug("Early reject: unsupported Expect fd={}", conn_->fd());
                 count_request();
                 HttpResponse err;
-                err.Status(417, "Expectation Failed");
+                err.Status(HttpStatus::EXPECTATION_FAILED, "Expectation Failed");
                 err.Header("Connection", "close");
                 SendResponse(err);
                 CloseConnection();

@@ -71,6 +71,13 @@ HttpRouter::Middleware MakeObservabilityMiddleware(
             opts.has_parent              = rtx.remote_parent.IsValid();
             opts.parent                  = rtx.remote_parent;
             opts.has_explicit_start_time = false;
+            // Resolve the per-route sampler override (if any) using the
+            // raw request path BEFORE pattern resolution, per the
+            // documented `traces.sampler.routes.path` semantic. The
+            // override flows through to Tracer::StartSpan via opts;
+            // null means "use the global sampler".
+            opts.sampler_override =
+                mgr_sp->EffectiveSamplerForPath(request.path);
 
             // OTel HTTP semconv initial server-span attributes.
             // status_code is filled at FinalizeFromSnapshot.

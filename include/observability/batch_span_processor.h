@@ -90,6 +90,15 @@ private:
 
     std::thread                    worker_;
     std::atomic<bool>              worker_started_{false};
+    // Worker-exit handshake. Set under join_mtx_ + cv-notify at the
+    // end of WorkerLoop so JoinWorkers can return when the worker has
+    // actually finished, rather than blocking on worker_.join()
+    // through a stalled exporter Export(). The destructor falls back
+    // to an unconditional join after the bounded wait so a still-
+    // joinable thread cannot escape into ~thread → terminate.
+    std::mutex                     join_mtx_;
+    std::condition_variable        join_cv_;
+    bool                           worker_done_ = false;
 };
 
 }  // namespace OBSERVABILITY_NAMESPACE

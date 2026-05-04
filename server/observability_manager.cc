@@ -55,6 +55,7 @@ void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
 void ObservabilityManager::Init() {
     // Build the sampler from config now that shared_from_this is seeded.
     auto sampler = BuildSamplerFromConfig();
+    route_overrides_snapshot_ = BuildRouteOverridesFromConfig();
 
     tracer_provider_ = std::make_unique<TracerProvider>(
         resource_, span_processor_, std::move(sampler), random_);
@@ -84,6 +85,54 @@ ObservabilityManager::BuildSamplerFromConfig() const {
             return std::make_shared<ParentBasedSampler>(std::move(root));
         }
     }
+}
+
+std::shared_ptr<const std::vector<ObservabilityManager::RouteOverride>>
+ObservabilityManager::BuildRouteOverridesFromConfig() const {
+    auto out = std::make_shared<std::vector<RouteOverride>>();
+    out->reserve(config_.traces.sampler.routes.size());
+    for (const auto& r : config_.traces.sampler.routes) {
+        if (r.path.empty()) continue;
+        RouteOverride ov;
+        ov.path_prefix = r.path;
+        switch (r.sampler) {
+            case SamplerType::AlwaysOn:
+                ov.sampler = std::make_shared<AlwaysOnSampler>();
+                break;
+            case SamplerType::AlwaysOff:
+                ov.sampler = std::make_shared<AlwaysOffSampler>();
+                break;
+            case SamplerType::TraceIdRatio:
+                ov.sampler = std::make_shared<TraceIdRatioSampler>(r.ratio);
+                break;
+            case SamplerType::ParentBased:
+            default: {
+                auto root = std::make_shared<TraceIdRatioSampler>(r.ratio);
+                ov.sampler = std::make_shared<ParentBasedSampler>(std::move(root));
+                break;
+            }
+        }
+        out->push_back(std::move(ov));
+    }
+    return out;
+}
+
+std::shared_ptr<const Sampler>
+ObservabilityManager::EffectiveSamplerForPath(
+        const std::string& path) const noexcept {
+    auto snap = std::atomic_load_explicit(&route_overrides_snapshot_,
+                                            std::memory_order_acquire);
+    if (!snap || snap->empty() || path.empty()) return nullptr;
+    for (const auto& r : *snap) {
+        if (r.path_prefix.empty()) continue;
+        // Literal byte-prefix match against the request path.
+        if (path.size() < r.path_prefix.size()) continue;
+        if (std::memcmp(path.data(), r.path_prefix.data(),
+                         r.path_prefix.size()) == 0) {
+            return r.sampler;
+        }
+    }
+    return nullptr;
 }
 
 void ObservabilityManager::RegisterLiveSnapshot(
@@ -266,6 +315,15 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
         ProcessorOptions po;
         tracer_provider_->Reload(new_sampler, po);
     }
+
+    // Republish per-route overrides. Atomic-store so the middleware's
+    // EffectiveSamplerForPath load picks up the new vector without a
+    // mutex; in-flight requests that already captured the old snapshot
+    // continue with the previous policy until they complete.
+    auto new_routes = BuildRouteOverridesFromConfig();
+    std::atomic_store_explicit(&route_overrides_snapshot_,
+                                std::move(new_routes),
+                                std::memory_order_release);
 
     if (meter_provider_) {
         MeterReaderOptions ro;

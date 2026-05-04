@@ -53,6 +53,11 @@ struct StartSpanOptions {
     std::chrono::system_clock::time_point start_time{};
     bool                                  has_explicit_start_time = false;
     std::vector<Attribute>                attributes;
+    // Per-call sampler override. Used by route-aware sampling so the
+    // server-span middleware can apply `traces.sampler.routes` overrides
+    // without rebuilding the global Tracer/MeterProvider chain. When
+    // null, Tracer falls back to the provider-installed sampler.
+    std::shared_ptr<const Sampler>        sampler_override;
 };
 
 class Tracer {

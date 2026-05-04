@@ -114,6 +114,13 @@ public:
     //     (MeterProvider::Reload stores reader options)
     void Reload(const ObservabilityConfig& new_config);
 
+    // Match `path` against the configured `traces.sampler.routes`
+    // overrides (literal byte-prefix). Returns the per-route sampler
+    // when an override matches, or null when the global sampler should
+    // be used. Callers pass the result into `StartSpanOptions::sampler_override`.
+    std::shared_ptr<const Sampler> EffectiveSamplerForPath(
+        const std::string& path) const noexcept;
+
     // Read-only accessors consumed by the shutdown drain predicate.
     int64_t inflight_finalizations() const noexcept {
         return inflight_finalizations_.load(std::memory_order_acquire);
@@ -143,6 +150,15 @@ private:
     void Init();
 
     std::shared_ptr<const Sampler> BuildSamplerFromConfig() const;
+
+    // Build per-route sampler overrides from `config_.traces.sampler.routes`.
+    // Stored in `route_overrides_snapshot_` and atomic-swapped on Reload.
+    struct RouteOverride {
+        std::string path_prefix;
+        std::shared_ptr<const Sampler> sampler;
+    };
+    std::shared_ptr<const std::vector<RouteOverride>>
+    BuildRouteOverridesFromConfig() const;
 
     // Republish the live-flag atomics from the supplied config. Called
     // by both the ctor and Reload so the publication path is single-sourced.
@@ -184,6 +200,13 @@ private:
 
     // Diagnostic — bumped on every kill-loop CAS-win.
     std::atomic<int64_t> snapshots_killed_on_timeout_{0};
+
+    // Compiled `traces.sampler.routes` overrides. shared_ptr so reads
+    // can capture the snapshot lock-free while a Reload swaps in a new
+    // vector. Iteration is O(N) over typically <10 entries; no lock
+    // needed because the vector is immutable post-construction.
+    std::shared_ptr<const std::vector<RouteOverride>>
+        route_overrides_snapshot_;
 
     // -- Internal helpers --
     void OnFinalizeWinner(ObservabilitySnapshot& snap,

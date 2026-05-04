@@ -85,16 +85,13 @@ void Histogram::Record(double value,
     series->count.fetch_add(1, std::memory_order_release);
     AtomicAddDouble(series->sum_bits, value);
 
-    // First record() for this series initializes min/max. Subsequent
-    // records do CAS-based min/max updates.
-    bool has = series->has_min_max.exchange(true, std::memory_order_acq_rel);
-    if (!has) {
-        series->min_bits.store(DoubleToBits(value), std::memory_order_release);
-        series->max_bits.store(DoubleToBits(value), std::memory_order_release);
-    } else {
-        AtomicMin(series->min_bits, value);
-        AtomicMax(series->max_bits, value);
-    }
+    // min/max are pre-initialised to +inf/-inf so the first observation
+    // always wins the CAS and overwrites the sentinel — no init-vs-update
+    // race. Set has_min_max AFTER the value lands so a snapshot reader
+    // never sees has_min_max=true with sentinel values.
+    AtomicMin(series->min_bits, value);
+    AtomicMax(series->max_bits, value);
+    series->has_min_max.store(true, std::memory_order_release);
 }
 
 void Histogram::AtomicAddDouble(std::atomic<uint64_t>& bits,

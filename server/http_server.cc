@@ -3355,6 +3355,11 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     if (!server_ready_.load(std::memory_order_acquire)) {
                         response.Header("Connection", "close");
                     }
+                    // Finalize before returning to the auto-send path —
+                    // otherwise the snapshot's strong ref drops below
+                    // and inflight_finalizations_ stays elevated.
+                    FinalizeIfSnapshot(request, response,
+                                        /*error_type=*/"rejected_by_middleware");
                     return;  // Sync send path below runs auto-send
                 }
 
@@ -3393,7 +3398,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         // finalizer is a non-issue because the finalizer
                         // never runs.
                         response = HttpResponse();
-                        response.Status(503)
+                        response.Status(HttpStatus::SERVICE_UNAVAILABLE)
                                 .Header("Retry-After", "1")
                                 .Header("Cache-Control", "no-store")
                                 .Text("authentication unavailable on async route — retry");
@@ -3428,6 +3433,8 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         if (!server_ready_.load(std::memory_order_acquire)) {
                             response.Header("Connection", "close");
                         }
+                        FinalizeIfSnapshot(request, response,
+                                            /*error_type=*/"async_route_warmup_unavailable");
                         return;
                     }
                     if (mw_state &&
@@ -3438,6 +3445,8 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         if (!server_ready_.load(std::memory_order_acquire)) {
                             response.Header("Connection", "close");
                         }
+                        FinalizeIfSnapshot(request, response,
+                                            /*error_type=*/"rejected_by_async_middleware");
                         return;
                     }
                 }
@@ -3545,7 +3554,25 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     };
 
                 auto finalize_request =
-                    [active_counter, bookkeeping_done]() {
+                    [active_counter, bookkeeping_done,
+                     obs_snap_local, was_head_local](
+                        int status_code, uint64_t bytes_sent,
+                        std::string error_type) {
+                    // Observability finalize for the H1 streaming path.
+                    // End() reports (status, total_bytes, "") and Abort()
+                    // reports (status_or_0, bytes_so_far, reason). HEAD
+                    // requests strip the body on the wire, so wire body
+                    // size is 0 regardless of bytes_sent.
+                    if (obs_snap_local) {
+                        auto mgr = obs_snap_local->manager.lock();
+                        if (mgr) {
+                            const uint64_t wire_body =
+                                was_head_local ? 0u : bytes_sent;
+                            mgr->FinalizeFromSnapshot(
+                                *obs_snap_local, status_code, wire_body,
+                                std::move(error_type));
+                        }
+                    }
                     if (!bookkeeping_done->exchange(
                             true, std::memory_order_acq_rel)) {
                         active_counter->fetch_sub(
@@ -3701,7 +3728,14 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         }
                         stream_sender.Abort(
                             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
-                        finalize_request();
+                        // Fallback finalize: Abort fires the inner
+                        // finalize_request_ in the normal case (claim
+                        // succeeded), but if claim_response was already
+                        // false the inner path early-returns without
+                        // finalizing. The CAS + bookkeeping_done guard
+                        // keep this path idempotent when Abort already
+                        // finalized.
+                        finalize_request(0, 0, "handler_threw");
                         guard.release();
                         return;
                     }
@@ -4479,6 +4513,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
             if (async_handler) {
                 if (!router_.RunMiddleware(request, response)) {
                     HttpRouter::FillDefaultRejectionResponse(response);
+                    FinalizeIfSnapshot(request, response,
+                                        /*error_type=*/"rejected_by_middleware");
                     return;
                 }
 
@@ -4498,7 +4534,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         request, response, mw_state);
                     if (!mw_sync_complete) {
                         response = HttpResponse();
-                        response.Status(503)
+                        response.Status(HttpStatus::SERVICE_UNAVAILABLE)
                                 .Header("Retry-After", "1")
                                 .Header("Cache-Control", "no-store")
                                 .Text("authentication unavailable on async route — retry");
@@ -4515,11 +4551,15 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                                 /*policy=*/std::string{},
                                 AUTH_NAMESPACE::AuthCache::None);
                         }
+                        FinalizeIfSnapshot(request, response,
+                                            /*error_type=*/"async_route_warmup_unavailable");
                         return;
                     }
                     if (mw_state &&
                         mw_state->sync_result() ==
                             HttpRouter::AsyncMiddlewareResult::DENY) {
+                        FinalizeIfSnapshot(request, response,
+                                            /*error_type=*/"rejected_by_async_middleware");
                         return;
                     }
                 }
@@ -4607,7 +4647,22 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     };
 
                 auto finalize_request =
-                    [active_counter, bookkeeping_done]() {
+                    [active_counter, bookkeeping_done,
+                     obs_snap_local, was_head_local](
+                        int status_code, uint64_t bytes_sent,
+                        std::string error_type) {
+                    // Same observability finalize as the H1 streaming
+                    // path — see that lambda for the full contract.
+                    if (obs_snap_local) {
+                        auto mgr = obs_snap_local->manager.lock();
+                        if (mgr) {
+                            const uint64_t wire_body =
+                                was_head_local ? 0u : bytes_sent;
+                            mgr->FinalizeFromSnapshot(
+                                *obs_snap_local, status_code, wire_body,
+                                std::move(error_type));
+                        }
+                    }
                     if (!bookkeeping_done->exchange(
                             true, std::memory_order_acq_rel)) {
                         active_counter->fetch_sub(
@@ -4740,7 +4795,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         }
                         stream_sender.Abort(
                             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
-                        finalize_request();
+                        // Fallback finalize — see H1 site for rationale.
+                        finalize_request(0, 0, "handler_threw");
                         guard.release();
                         return;
                     }

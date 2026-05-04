@@ -206,7 +206,7 @@ public:
         int32_t stream_id,
         std::function<bool()> claim_response,
         std::function<void()> release_response_claim,
-        std::function<void()> finalize_request)
+        std::function<void(int, uint64_t, std::string)> finalize_request)
         : handler_(std::move(handler)),
           stream_id_(stream_id),
           claim_response_(std::move(claim_response)),
@@ -270,6 +270,7 @@ public:
             return -1;
         }
         headers_sent_ = true;
+        last_status_code_ = headers_only_response.GetStatusCode();
         if (!session->InReceiveData()) {
             session->SendPendingFrames();
             self->RecheckShutdownDrainAfterFlush();
@@ -303,8 +304,12 @@ public:
             return SendResult::CLOSED;
         }
         if (body_suppressed_) {
+            // Status doesn't allow a body — accept the chunk without
+            // counting it; bytes_sent_ stays at 0 so the finalize sees
+            // wire body == 0.
             return SendResult::ACCEPTED_BELOW_WATER;
         }
+        bytes_sent_ += len;
         if (data_source_->Append(data, len) == SendResult::CLOSED) {
             logging::Get()->warn(
                 "H2 streaming SendData failed to append stream={} len={}",
@@ -365,7 +370,8 @@ public:
         if (body_suppressed_) {
             data_source_.reset();
             if (finalize_request_) {
-                finalize_request_();
+                finalize_request_(last_status_code_, bytes_sent_,
+                                    std::string{});
             }
             return SendResult::ACCEPTED_BELOW_WATER;
         }
@@ -383,7 +389,7 @@ public:
             self->RecheckShutdownDrainAfterFlush();
         }
         if (finalize_request_) {
-            finalize_request_();
+            finalize_request_(last_status_code_, bytes_sent_, std::string{});
         }
         return SendResult::ACCEPTED_BELOW_WATER;
     }
@@ -500,7 +506,8 @@ private:
                 stream_id_, HTTP2_CONSTANTS::ERROR_INTERNAL_ERROR);
         }
         if (finalize_request_) {
-            finalize_request_();
+            finalize_request_(last_status_code_, bytes_sent_,
+                                StreamingAbortReasonToString(reason));
         }
     }
 
@@ -565,7 +572,12 @@ private:
     int32_t stream_id_;
     std::function<bool()> claim_response_;
     std::function<void()> release_response_claim_;
-    std::function<void()> finalize_request_;
+    std::function<void(int, uint64_t, std::string)> finalize_request_;
+    // State observed by SendHeaders/SendData/Abort and replayed to
+    // finalize_request_ on End/Abort. Dispatcher-thread-only writes
+    // and reads — no synchronization needed.
+    int last_status_code_ = 0;
+    uint64_t bytes_sent_ = 0;
     std::shared_ptr<StreamingH2DataSource> data_source_;
     DrainListener drain_listener_;
     bool claimed_response_ = false;
@@ -1110,15 +1122,17 @@ Http2ConnectionHandler::CreateStreamingResponseSender(
     int32_t stream_id,
     std::function<bool()> claim_response,
     std::function<void()> release_response_claim,
-    std::function<void()> finalize_request) {
+    std::function<void(int, uint64_t, std::string)> finalize_request) {
     std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
     auto finalize_with_unregister =
-        [weak_self, stream_id, finalize_request = std::move(finalize_request)]() {
+        [weak_self, stream_id, finalize_request = std::move(finalize_request)]
+            (int status_code, uint64_t bytes_sent, std::string error_type) {
             if (auto self = weak_self.lock()) {
                 self->active_stream_sender_impls_.erase(stream_id);
             }
             if (finalize_request) {
-                finalize_request();
+                finalize_request(status_code, bytes_sent,
+                                  std::move(error_type));
             }
         };
     auto impl = std::make_shared<H2StreamingResponseSenderImpl>(

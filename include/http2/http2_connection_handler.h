@@ -100,11 +100,16 @@ public:
     // tracking should be refreshed.
     void RecheckShutdownDrainAfterFlush();
 
+    // See HttpConnectionHandler::CreateStreamingResponseSender for the
+    // contract on `finalize_request`'s signature (status_code, bytes_sent,
+    // error_type).
     HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender CreateStreamingResponseSender(
         int32_t stream_id,
         std::function<bool()> claim_response,
         std::function<void()> release_response_claim,
-        std::function<void()> finalize_request);
+        std::function<void(int status_code,
+                            uint64_t bytes_sent,
+                            std::string error_type)> finalize_request);
 
     // Submit a non-final 1xx informational response (e.g. 103 Early Hints)
     // on a specific stream and flush nghttp2 output.

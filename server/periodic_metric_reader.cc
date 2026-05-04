@@ -21,6 +21,8 @@ PeriodicMetricReader::PeriodicMetricReader(
 PeriodicMetricReader::~PeriodicMetricReader() {
     SignalShutdown();
     JoinWorkers(std::chrono::milliseconds{2000});
+    // Final unconditional join — see BatchSpanProcessor for rationale.
+    if (worker_.joinable()) worker_.join();
 }
 
 void PeriodicMetricReader::WorkerLoop() {
@@ -61,6 +63,11 @@ void PeriodicMetricReader::WorkerLoop() {
         if (shutdown) break;
         (void)flush;  // forced flush already handled by the loop iteration above.
     }
+    {
+        std::lock_guard<std::mutex> g(join_mtx_);
+        worker_done_ = true;
+    }
+    join_cv_.notify_all();
 }
 
 void PeriodicMetricReader::SignalShutdown() {
@@ -75,10 +82,29 @@ void PeriodicMetricReader::SignalShutdown() {
     cv_.notify_all();
 }
 
-void PeriodicMetricReader::JoinWorkers(std::chrono::milliseconds /*deadline*/) {
+void PeriodicMetricReader::JoinWorkers(std::chrono::milliseconds deadline) {
     if (!worker_started_.load(std::memory_order_acquire)) return;
-    if (worker_.joinable()) worker_.join();
-    if (exporter_) exporter_->SignalShutdown();
+    bool joined_now = false;
+    if (deadline.count() <= 0) {
+        if (worker_.joinable()) worker_.join();
+        joined_now = true;
+    } else {
+        std::unique_lock<std::mutex> lk(join_mtx_);
+        bool done = join_cv_.wait_for(lk, deadline,
+                                          [this]{ return worker_done_; });
+        lk.unlock();
+        if (!done) {
+            logging::Get()->warn(
+                "PeriodicMetricReader::JoinWorkers timeout after {}ms — "
+                "worker still in flight (exporter likely stalled); final "
+                "join deferred to destructor",
+                deadline.count());
+            return;
+        }
+        if (worker_.joinable()) worker_.join();
+        joined_now = true;
+    }
+    if (joined_now && exporter_) exporter_->SignalShutdown();
 }
 
 void PeriodicMetricReader::Reload(MeterReaderOptions new_options) {
