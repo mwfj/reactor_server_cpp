@@ -122,7 +122,10 @@ ObservabilityManager::BuildSamplerFromConfig() const {
 std::shared_ptr<const std::vector<ObservabilityManager::RouteOverride>>
 ObservabilityManager::BuildRouteOverridesFromConfig() const {
     auto out = std::make_shared<std::vector<RouteOverride>>();
-    out->reserve(config_.traces.sampler.routes.size());
+    out->reserve(config_.traces.sampler.routes.size() + 1);
+    bool metrics_path_overridden = false;
+    const std::string& metrics_path =
+        config_.metrics.prometheus.path;
     for (const auto& r : config_.traces.sampler.routes) {
         if (r.path.empty()) continue;
         RouteOverride ov;
@@ -144,7 +147,26 @@ ObservabilityManager::BuildRouteOverridesFromConfig() const {
                 break;
             }
         }
+        if (!metrics_path.empty() && ov.path_prefix == metrics_path) {
+            metrics_path_overridden = true;
+        }
         out->push_back(std::move(ov));
+    }
+    // Auto-suppress trace sampling for the live Prometheus scrape
+    // path. Without this, every /metrics scrape (typically once per
+    // 15s per Prometheus) emits a SERVER span, polluting the trace
+    // export with self-noise. The override is appended ONLY when the
+    // operator hasn't already provided one for the same path so an
+    // explicit always_on / trace_id_ratio override still wins.
+    // Route registration is restart-only — we use the live path so a
+    // reload that stages a different prometheus.path doesn't move
+    // the auto-suppress to a path that isn't actually scraped.
+    if (!metrics_path.empty() && !metrics_path_overridden
+        && config_.metrics.exporter == "prometheus_pull") {
+        RouteOverride auto_off;
+        auto_off.path_prefix = metrics_path;
+        auto_off.sampler = std::make_shared<AlwaysOffSampler>();
+        out->push_back(std::move(auto_off));
     }
     return out;
 }
@@ -383,10 +405,34 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
     PublishLiveFlags(new_config);
 
     // Capture the new sampler config for any future GetTracer() calls.
+    // Preserve restart-only fields explicitly: max_queue_size (queue
+    // allocated at ctor), traces.exporter / metrics.exporter,
+    // otlp.upstream pair, prometheus.path (route registered once at
+    // ctor), and histogram_buckets (instruments built at ctor). The
+    // BuildRouteOverridesFromConfig() call below uses prometheus.path
+    // to auto-suppress scrape sampling — pinning it to the live path
+    // keeps the auto-suppress on the actually-registered route after
+    // a SIGHUP that stages a different path.
+    auto saved_traces_exporter   = config_.traces.exporter;
+    auto saved_traces_otlp_up    = config_.traces.otlp.upstream;
+    auto saved_traces_max_queue  = config_.traces.batch.max_queue_size;
+    auto saved_metrics_exporter  = config_.metrics.exporter;
+    auto saved_metrics_otlp_up   = config_.metrics.otlp.upstream;
+    auto saved_metrics_prom_path = config_.metrics.prometheus.path;
+    auto saved_metrics_buckets   = config_.metrics.histogram_buckets;
+
     config_.traces.sampler  = new_config.traces.sampler;
     config_.traces.enabled  = new_config.traces.enabled;
     config_.traces.batch    = new_config.traces.batch;
     config_.metrics         = new_config.metrics;
+
+    config_.traces.exporter         = std::move(saved_traces_exporter);
+    config_.traces.otlp.upstream    = std::move(saved_traces_otlp_up);
+    config_.traces.batch.max_queue_size = saved_traces_max_queue;
+    config_.metrics.exporter        = std::move(saved_metrics_exporter);
+    config_.metrics.otlp.upstream   = std::move(saved_metrics_otlp_up);
+    config_.metrics.prometheus.path = std::move(saved_metrics_prom_path);
+    config_.metrics.histogram_buckets = std::move(saved_metrics_buckets);
 
     // Build new sampler + push to TracerProvider, including the
     // updated batch-shape knobs so a SIGHUP that edits

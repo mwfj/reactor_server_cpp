@@ -337,54 +337,38 @@ void ProxyTransaction::Start() {
         fwd_snap ? fwd_snap.get() : nullptr,
         &auth_ctx_);
 
-    // Outbound trace context. Strip+inject ONLY when we will replace
-    // the client's traceparent with a gateway-issued context — when
-    // observability is off (no snapshot, or snapshot has no valid
-    // SERVER context), W3C transparent propagation requires us to
-    // forward the client's headers unchanged. Stripping without
-    // replacement breaks distributed traces through the gateway.
-    //
-    // Build a CLIENT context with the same trace_id as the SERVER
-    // span but a FRESH span_id, so downstream services parent to the
-    // gateway's outbound hop instead of the inbound SERVER span.
-    // The fresh span_id is generated once per transaction (not per
-    // attempt) because serialized_request_ is cached and reused
-    // across retries; per-attempt distinct CLIENT spans require
-    // re-serialising the wire and emitting an explicit CLIENT span
-    // with End() — Phase 2 follow-up.
+    // Outbound trace context. Until per-attempt CLIENT span emission
+    // is wired, propagating ANY gateway-minted span_id leaves
+    // downstream services parenting to a span the gateway never
+    // exports — a phantom-parent footgun. Two safe modes today:
+    //   1. Observability OFF for this request → leave the client's
+    //      headers untouched (transparent W3C propagation).
+    //   2. Observability ON → strip-only: drop client traceparent /
+    //      tracestate so the gateway doesn't relay an inbound parent
+    //      that has no relationship to the outbound hop, and inject
+    //      nothing. Downstream services will treat the upstream call
+    //      as a root span.
+    // Phase 2 (when ProxyTransaction allocates a CLIENT span per
+    // attempt and ends it on response/timeout): replace the strip
+    // with strip+inject of the per-attempt context.
     if (obs_snapshot_ && obs_snapshot_->trace_context.IsValid()) {
-        auto mgr_strong = obs_snapshot_->manager.lock();
-        auto random_src = mgr_strong ? mgr_strong->random()
-                                       : std::shared_ptr<OBSERVABILITY_NAMESPACE::RandomSource>{};
-        if (random_src) {
-            OBSERVABILITY_NAMESPACE::SpanContext attempt_ctx;
-            attempt_ctx.SetTraceId(
-                obs_snapshot_->trace_context.trace_id());
-            attempt_ctx.SetSpanId(random_src->NewSpanId());
-            attempt_ctx.SetFlags(obs_snapshot_->trace_context.flags());
-            attempt_ctx.mutable_state() =
-                obs_snapshot_->trace_context.state();
-
-            auto strip_lc = [](std::map<std::string, std::string>& h,
-                                const char* needle) {
-                for (auto it = h.begin(); it != h.end(); ) {
-                    std::string k = it->first;
-                    std::transform(k.begin(), k.end(), k.begin(),
-                                   [](unsigned char c) {
-                                       return std::tolower(c);
-                                   });
-                    if (k == needle) {
-                        it = h.erase(it);
-                    } else {
-                        ++it;
-                    }
+        auto strip_lc = [](std::map<std::string, std::string>& h,
+                            const char* needle) {
+            for (auto it = h.begin(); it != h.end(); ) {
+                std::string k = it->first;
+                std::transform(k.begin(), k.end(), k.begin(),
+                               [](unsigned char c) {
+                                   return std::tolower(c);
+                               });
+                if (k == needle) {
+                    it = h.erase(it);
+                } else {
+                    ++it;
                 }
-            };
-            strip_lc(rewritten_headers_, "traceparent");
-            strip_lc(rewritten_headers_, "tracestate");
-            OBSERVABILITY_NAMESPACE::W3CPropagator::Inject(
-                attempt_ctx, rewritten_headers_);
-        }
+            }
+        };
+        strip_lc(rewritten_headers_, "traceparent");
+        strip_lc(rewritten_headers_, "tracestate");
     }
 
     // Compute upstream path with strip_prefix support.

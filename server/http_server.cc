@@ -2943,19 +2943,25 @@ void HttpServer::Stop() {
                     WaitForH2Drain();
                 }
             }
-            // Drain observability with half the configured budget so
-            // the kill loop + the upstream WaitForDrain still have
-            // time to run within the operator-configured total.
             const auto drain_budget = std::chrono::seconds(
                 shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
-            DrainObservabilityForShutdown(
-                std::chrono::milliseconds(drain_budget) / 2);
             // Initiate upstream shutdown AFTER protocol drain so proxy
             // handlers dispatched during the drain can still check out.
             if (upstream_manager_) {
                 upstream_manager_->InitiateShutdown();
                 upstream_manager_->WaitForDrain(drain_budget);
             }
+            // Drain observability AFTER upstream completes. An in-flight
+            // proxy request that finishes during the upstream drain
+            // window emits its snapshot finalize via the normal
+            // completion path; running obs drain (and worse, the kill
+            // loop) before the upstream drain meant those finalizes
+            // landed on snapshots already CAS-killed and the spans
+            // were lost. Half-budget here matches the previous total
+            // — the upstream drain has already had the full budget,
+            // and most snapshots are finalized by now.
+            DrainObservabilityForShutdown(
+                std::chrono::milliseconds(drain_budget) / 2);
             // Post-upstream H1 flush window: an async (exempt) HTTP/1 handler
             // whose completion fires during the upstream drain (or that takes
             // longer than the first H1 drain loop) only starts writing its
@@ -3095,17 +3101,11 @@ void HttpServer::Stop() {
                     }
                 }
             }
-            // Same observability sweep as the off-thread path.
             const auto drain_budget_sec = std::chrono::seconds(
                 shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
-            DrainObservabilityForShutdown(
-                std::chrono::milliseconds(drain_budget_sec) / 2);
             // Upstream drain — initiate AFTER protocol drains so late
             // proxy handlers can still check out. Then poll with task
             // pump until leases return, and force-close stragglers.
-            // A second H1 flush window follows so async proxy responses
-            // arriving during the upstream drain still get their client
-            // bytes out before the event loop stops.
             if (upstream_manager_) {
                 upstream_manager_->InitiateShutdown();
                 static constexpr int UP_PUMP_MS = 200;
@@ -3120,6 +3120,12 @@ void HttpServer::Stop() {
                 }
                 upstream_manager_->ForceCloseRemaining();
             }
+            // Drain observability AFTER upstream completes — see the
+            // off-thread path above for the rationale (proxy in-flight
+            // requests that finalize during the upstream drain
+            // mustn't find their snapshots already CAS-killed).
+            DrainObservabilityForShutdown(
+                std::chrono::milliseconds(drain_budget_sec) / 2);
             // Post-upstream H1 flush window: use the configured drain budget
             // so async H1 routes that take longer than 2s aren't cut off.
             {
@@ -5279,8 +5285,22 @@ bool HttpServer::Reload(ServerConfig new_config) {
             // ADDED/RENAMED issuer (rejected as restart-required anyway
             // by AuthManager::Reload) doesn't abort unrelated live-safe
             // edits.
+            //
+            // Substitute the LIVE max_queue_size before validating —
+            // the queue is restart-only, so the staged value would
+            // never take effect, and the validator's batch_size <=
+            // queue_size cross-check must reflect what the live worker
+            // actually runs against. Without this swap a reload that
+            // only stages a smaller queue would falsely reject an
+            // otherwise-valid batch_size edit. We restore the staged
+            // value afterwards so HttpServer::Reload's restart-required
+            // warn (which compares operator==) still fires on the
+            // operator's actual edit.
+            ServerConfig validation_target = new_config;
+            validation_target.observability.traces.batch.max_queue_size =
+                live_config_.observability.traces.batch.max_queue_size;
             ConfigLoader::ValidateHotReloadable(
-                new_config, live_names, live_issuer_names);
+                validation_target, live_names, live_issuer_names);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Reload() rejected invalid config: {}",
                                   e.what());
@@ -5891,7 +5911,10 @@ bool HttpServer::Reload(ServerConfig new_config) {
         //   - service.{name,version,instance_id} (Resource)
         //   - traces.exporter, metrics.exporter
         //   - traces.otlp.upstream, metrics.otlp.upstream
+        //   - traces.batch.max_queue_size (queue allocated at ctor)
         //   - metrics.prometheus.path
+        //   - metrics.histogram_buckets (instruments built at ctor;
+        //     bucket layout cannot change once Series are populated)
         // Live-reloadable fields are taken from the staged config.
         OBSERVABILITY_NAMESPACE::ObservabilityConfig merged =
             new_config.observability;
@@ -5901,7 +5924,11 @@ bool HttpServer::Reload(ServerConfig new_config) {
         merged.metrics.exporter        = live_config_.observability.metrics.exporter;
         merged.traces.otlp.upstream    = live_config_.observability.traces.otlp.upstream;
         merged.metrics.otlp.upstream   = live_config_.observability.metrics.otlp.upstream;
+        merged.traces.batch.max_queue_size =
+            live_config_.observability.traces.batch.max_queue_size;
         merged.metrics.prometheus.path = live_config_.observability.metrics.prometheus.path;
+        merged.metrics.histogram_buckets =
+            live_config_.observability.metrics.histogram_buckets;
         live_config_.observability = std::move(merged);
     }
 

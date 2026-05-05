@@ -13,6 +13,7 @@
 #include <fstream>
 #include <sstream>
 #include <arpa/inet.h>
+#include <cmath>
 #include <cstdlib>
 #include <stdexcept>
 #include <algorithm>
@@ -1506,7 +1507,8 @@ void ConfigLoader::Normalize(ServerConfig& config) {
 // Forward decls for the observability validators (defined further
 // below). Surfaced here so ValidateHotReloadable / Validate can call
 // them regardless of source ordering.
-static void ValidateObservabilityLive(const ServerConfig& config);
+static void ValidateObservabilityLive(const ServerConfig& config,
+                                        bool force_validate);
 static void ValidateObservabilityRestart(const ServerConfig& config,
                                            bool reload_copy);
 
@@ -1977,16 +1979,39 @@ void ConfigLoader::ValidateHotReloadable(
     // histogram bucket layout) are deliberately NOT validated here —
     // SIGHUP edits to those fields are surfaced as the outer "restart
     // required" warn by HttpServer::Reload's operator!= check.
-    ValidateObservabilityLive(config);
+    //
+    // force_validate=true: even when the staged file sets
+    // observability.enabled=false (a restart-only field that won't
+    // take effect mid-process), the live manager may still be
+    // running with enabled=true. HttpServer::Reload applies the
+    // staged live subfields to the running pipeline regardless, so
+    // invalid live knobs (schedule_delay_ms=0, negative
+    // max_export_batch_size, etc.) must reject here even with
+    // staged enabled=false.
+    ValidateObservabilityLive(config, /*force_validate=*/true);
 }
 
 // Validate the observability schema. Splits into a "live-reloadable"
 // subset (called from ValidateHotReloadable) and a "restart-required"
 // subset (called only from Validate at startup). The split mirrors
 // the field classification in `ObservabilityConfig`.
-static void ValidateObservabilityLive(const ServerConfig& config) {
+static void ValidateObservabilityLive(const ServerConfig& config,
+                                        bool force_validate) {
     const auto& oc = config.observability;
-    if (!oc.enabled) return;  // master switch off — nothing to live-validate.
+    // Skip the live-field range checks when the master switch is OFF
+    // and the caller hasn't asked us to force validation. Startup with
+    // `enabled=false` is the canonical "no observability" deployment
+    // and we don't want to reject configs that happen to carry stale
+    // (possibly invalid) reader / batch values they never apply.
+    //
+    // ValidateHotReloadable passes force_validate=true because in a
+    // SIGHUP reload the LIVE manager may be enabled even when the
+    // staged config sets enabled=false (which is restart-only —
+    // disabling never takes effect mid-process). HttpServer::Reload
+    // hands the staged config straight to ObservabilityManager::Reload
+    // and applies the live subfields, so invalid live knobs in the
+    // staged file would otherwise reach a running manager unchecked.
+    if (!oc.enabled && !force_validate) return;
 
     if (oc.metrics.reader.export_interval.count() < 1)
         throw std::invalid_argument(
@@ -2005,10 +2030,18 @@ static void ValidateObservabilityLive(const ServerConfig& config) {
     if (oc.traces.batch.max_export_batch_size < 1)
         throw std::invalid_argument(
             "observability.traces.batch.max_export_batch_size must be >= 1");
-    if (oc.traces.batch.max_export_batch_size > oc.traces.batch.max_queue_size)
+    // batch_size must not exceed queue_size. max_queue_size is
+    // restart-only — for the SIGHUP reload path, HttpServer::Reload
+    // overwrites the staged max_queue_size with the live value
+    // BEFORE calling ValidateHotReloadable, so this comparison sees
+    // the live queue capacity that staged batch_size will actually
+    // run against. At startup both values are the operator's
+    // construction-time choices.
+    if (oc.traces.batch.max_export_batch_size > oc.traces.batch.max_queue_size) {
         throw std::invalid_argument(
             "observability.traces.batch.max_export_batch_size must not "
             "exceed max_queue_size");
+    }
     if (oc.traces.batch.schedule_delay.count() < 1)
         throw std::invalid_argument(
             "observability.traces.batch.schedule_delay_ms must be >= 1");
@@ -2119,12 +2152,21 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
                       "observability.metrics.otlp.upstream");
     }
 
-    // Histogram bucket layout — must be strictly increasing, no NaN.
+    // Histogram bucket layout — every boundary must be finite (NaN
+    // and ±Inf are rejected so the Prometheus formatter and OTLP
+    // serialiser never see them) AND strictly increasing.
     for (const auto& kv : oc.metrics.histogram_buckets) {
         if (kv.second.empty())
             throw std::invalid_argument(
                 "observability.metrics.histogram_buckets[" + kv.first +
                 "] must be non-empty");
+        for (size_t i = 0; i < kv.second.size(); ++i) {
+            if (!std::isfinite(kv.second[i])) {
+                throw std::invalid_argument(
+                    "observability.metrics.histogram_buckets[" + kv.first +
+                    "] contains a non-finite boundary (NaN/Inf forbidden)");
+            }
+        }
         for (size_t i = 1; i < kv.second.size(); ++i) {
             if (!(kv.second[i] > kv.second[i-1]))
                 throw std::invalid_argument(
@@ -3121,7 +3163,11 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
 
     // Observability schema. Both live + restart subsets run at startup;
     // the reload path runs only the live subset (ValidateObservabilityLive).
-    ValidateObservabilityLive(config);
+    // Startup honours `enabled=false` and skips the live-field range
+    // checks (force_validate=false); the reload caller above forces
+    // them on so a SIGHUP can't smuggle invalid live values through
+    // staged enabled=false.
+    ValidateObservabilityLive(config, /*force_validate=*/false);
     ValidateObservabilityRestart(config, reload_copy);
 }
 

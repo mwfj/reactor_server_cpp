@@ -384,12 +384,14 @@ test_auth_observability: $(TARGET)
 	./$(TARGET) auth_observability
 
 # Per-suite OTel observability targets — each maps onto a flag the
-# test runner already understands. `test_obs` runs the umbrella set
-# (matches the runner's family flag), individual `test_obs_*` targets
-# run one suite.
-test_obs: $(TARGET)
-	@echo "Running all observability tests..."
-	./$(TARGET) observability
+# test runner already understands. `test_obs` chains every per-suite
+# target (the runner doesn't ship an umbrella flag — unknown flags
+# exit through the unknown-option path).
+test_obs: test_obs_foundation test_obs_tracer test_obs_metrics \
+          test_obs_mgr test_obs_propagator test_obs_export \
+          test_obs_prom test_obs_config test_obs_shutdown \
+          test_obs_linkkill test_obs_issue test_obs_stress test_obs_e2e
+	@echo "All observability suites passed."
 
 test_obs_foundation: $(TARGET)
 	@echo "Running observability foundation tests..."
