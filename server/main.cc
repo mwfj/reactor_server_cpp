@@ -667,8 +667,22 @@ static bool ReloadConfig(const std::string& config_path,
         std::unordered_set<std::string> live_issuer_names =
             server.LiveAuthIssuerNames();
         try {
+            // Substitute the LIVE max_queue_size into the validation
+            // copy. The traces.batch.max_queue_size field is restart-
+            // only (BatchSpanProcessor allocates its bounded queue at
+            // ctor time and Reload() never resizes), so the validator's
+            // batch_size <= queue_size cross-check must measure
+            // staged batch_size against the LIVE queue capacity, not
+            // the staged one. Without this substitution, a SIGHUP
+            // that lowers max_queue_size below the live batch_size
+            // (e.g. live queue 2048, staged queue 100, batch 512)
+            // falsely rejects an otherwise-safe reload — the running
+            // processor keeps using the live capacity until restart.
+            ServerConfig validation_copy = new_config;
+            validation_copy.observability.traces.batch.max_queue_size =
+                current_config.observability.traces.batch.max_queue_size;
             ConfigLoader::ValidateHotReloadable(
-                new_config, live_names, live_issuer_names);
+                validation_copy, live_names, live_issuer_names);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Config reload rejected: {}", e.what());
             reopen_existing_logs();

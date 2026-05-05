@@ -12,7 +12,8 @@ Span::Span(SpanContext context,
            std::chrono::system_clock::time_point start_system,
            std::shared_ptr<const Resource>             resource,
            std::shared_ptr<const InstrumentationScope> scope,
-           std::shared_ptr<SpanProcessor>              processor)
+           std::shared_ptr<SpanProcessor>              processor,
+           bool                                         record_locally)
     : context_(std::move(context)),
       parent_context_(std::move(parent)),
       has_parent_(has_parent),
@@ -21,7 +22,8 @@ Span::Span(SpanContext context,
       start_system_(start_system),
       resource_(std::move(resource)),
       scope_(std::move(scope)),
-      processor_(std::move(processor)) {}
+      processor_(std::move(processor)),
+      record_locally_(record_locally) {}
 
 Span::~Span() {
     // Defensive: if a Span is destroyed without End() / Drop, treat it

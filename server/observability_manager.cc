@@ -45,7 +45,21 @@ ObservabilityManager::~ObservabilityManager() {
 }
 
 void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
-    traces_enabled_.store(c.traces.enabled, std::memory_order_release);
+    // Gate the live "traces enabled" flag on whether a real span
+    // pipeline exists. main.cc installs a null SpanProcessor when
+    // traces.exporter is empty (Prometheus-only / metrics-only
+    // deployments), and a null processor produces non-recording
+    // spans regardless of c.traces.enabled. Publishing
+    // traces_enabled_=true in that mode would have the inbound
+    // middleware allocate a SpanContext + ObservabilitySnapshot per
+    // request and the proxy strip transparent W3C propagation —
+    // pure overhead with no telemetry to show for it. The
+    // span_processor_ pointer is set once at construction and never
+    // swapped, so this static gate is sufficient.
+    const bool traces_pipeline_present =
+        c.traces.enabled && span_processor_ != nullptr;
+    traces_enabled_.store(traces_pipeline_present,
+                            std::memory_order_release);
     metrics_enabled_.store(c.metrics.enabled, std::memory_order_release);
     include_target_info_.store(
         c.metrics.prometheus.include_target_info,

@@ -109,6 +109,16 @@ std::shared_ptr<Span> Tracer::StartSpan(std::string name,
         ? opts.start_time
         : std::chrono::system_clock::now();
 
+    // Sampler decision drives two independent gates on the Span:
+    //   - record_locally: RECORD_AND_SAMPLE OR RECORD_ONLY → mutators
+    //     populate the local SpanData. DROP → mutators no-op.
+    //   - processor: RECORD_AND_SAMPLE only → End() pushes to the
+    //     exporter pipeline. RECORD_ONLY keeps the local data in
+    //     memory but doesn't enqueue (the OTel public contract for
+    //     RECORD_ONLY).
+    const bool record_locally =
+        decision == SamplingDecision::RECORD_AND_SAMPLE ||
+        decision == SamplingDecision::RECORD_ONLY;
     auto span = std::make_shared<Span>(
         std::move(own_context),
         opts.parent,
@@ -118,13 +128,8 @@ std::shared_ptr<Span> Tracer::StartSpan(std::string name,
         start_time,
         resource_,
         scope_,
-        // DROP / RECORD_ONLY spans receive a null processor — End()
-        // therefore no-ops and the SpanData snapshot is never built.
-        // RECORD_ONLY is treated identically to DROP for export
-        // purposes here; if a future use case wants to record-but-not-
-        // export, it would attach a separate in-process metrics
-        // processor.
-        decision == SamplingDecision::RECORD_AND_SAMPLE ? processor : nullptr);
+        decision == SamplingDecision::RECORD_AND_SAMPLE ? processor : nullptr,
+        record_locally);
 
     // Seed initial attributes.
     for (const auto& a : opts.attributes) {

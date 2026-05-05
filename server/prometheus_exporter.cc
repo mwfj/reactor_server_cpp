@@ -38,12 +38,21 @@ std::string EscapeLabelValue(const std::string& v) {
 
 // Render a double in a Prometheus-friendly form. NaN → "NaN"; +Inf →
 // "+Inf"; -Inf → "-Inf"; integers print without trailing ".0".
+//
+// The magnitude check (`< kIntFormatLimit`) MUST run before the
+// double→int64 conversion. C++ converts a finite double whose
+// truncated value is outside the int64 range with undefined
+// behaviour; checking magnitude first avoids the UB regardless of
+// which compiler-defined trap a platform exhibits. 1e15 is well
+// inside int64 range (~9.2e18) so anything within the gate is
+// safely representable.
+static constexpr double kIntFormatLimit = 1e15;
 std::string FormatValue(double v) {
     if (std::isnan(v)) return "NaN";
     if (std::isinf(v)) return v > 0 ? "+Inf" : "-Inf";
     char buf[64];
-    if (v == static_cast<double>(static_cast<int64_t>(v))
-        && std::abs(v) < 1e15) {
+    if (std::abs(v) < kIntFormatLimit
+        && v == static_cast<double>(static_cast<int64_t>(v))) {
         std::snprintf(buf, sizeof(buf), "%lld",
                       static_cast<long long>(v));
     } else {
@@ -55,8 +64,8 @@ std::string FormatValue(double v) {
 std::string FormatBoundary(double v) {
     if (std::isinf(v)) return "+Inf";
     char buf[64];
-    if (v == static_cast<double>(static_cast<int64_t>(v))
-        && std::abs(v) < 1e15) {
+    if (std::abs(v) < kIntFormatLimit
+        && v == static_cast<double>(static_cast<int64_t>(v))) {
         std::snprintf(buf, sizeof(buf), "%lld",
                       static_cast<long long>(v));
     } else {
@@ -69,6 +78,14 @@ void AppendLabels(std::string& out,
                    const std::vector<std::pair<std::string, std::string>>& kv,
                    const std::string* extra_key = nullptr,
                    const std::string* extra_value = nullptr) {
+    // Prometheus / OpenMetrics text format omits the label block
+    // entirely for label-less samples: `active 11`, not `active{} 11`.
+    // Some scrapers reject the empty-brace form. Skip the braces when
+    // both the user labels and any extra_key (used for histogram
+    // `le="..."`) are absent.
+    if (kv.empty() && extra_key == nullptr) {
+        return;
+    }
     bool first = true;
     out += '{';
     for (const auto& [k, v] : kv) {

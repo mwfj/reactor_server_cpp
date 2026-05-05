@@ -58,7 +58,8 @@ public:
          std::chrono::system_clock::time_point start_system,
          std::shared_ptr<const Resource>             resource,
          std::shared_ptr<const InstrumentationScope> scope,
-         std::shared_ptr<SpanProcessor>              processor);
+         std::shared_ptr<SpanProcessor>              processor,
+         bool                                         record_locally = true);
 
     // Non-copyable, non-movable — Spans are pinned to their owning
     // dispatcher and tracked via shared_ptr. The shared_ptr handle is
@@ -91,18 +92,16 @@ public:
     // attributes mirroring OTel exception semconv.
     void RecordException(const std::exception& e);
 
-    // True iff the Span will be exported (RECORD_AND_SAMPLE) — used by
-    // hot-path call sites to skip building expensive attributes when
-    // the span isn't going to be exported.
+    // True iff the Span is locally recording — RECORD_AND_SAMPLE OR
+    // RECORD_ONLY, both gate SetAttribute / AddEvent / AddLink so the
+    // local SpanData stays populated. DROP spans bypass this with
+    // record_locally_=false. Hot paths can read this to skip building
+    // expensive attribute payloads.
     //
-    // DROP-sampled spans receive a null `processor_` at construction
-    // (Tracer::StartSpan branches on the sampler decision); the null
-    // processor is the load-bearing signal for "this span won't be
-    // recorded". `processor_` is set once at construction and never
-    // mutated post-construction (Tracer::SwapProcessor only affects
-    // FUTURE StartSpan calls), so a plain pointer compare is safe.
+    // record_locally_ is set once at construction and never mutated;
+    // ended_ / dropped_ are atomics used as terminal gates.
     bool IsRecording() const noexcept {
-        return processor_ != nullptr &&
+        return record_locally_ &&
                !ended_.load(std::memory_order_acquire) &&
                !dropped_.load(std::memory_order_acquire);
     }
@@ -154,6 +153,13 @@ private:
     // End(), the kill-marshal closure captures `weak_from_this()` on
     // the manager (NOT raw `this`) so the closure no-ops cleanly.
     std::shared_ptr<SpanProcessor> processor_;
+
+    // Mirrors the Sampler decision: true for RECORD_AND_SAMPLE and
+    // RECORD_ONLY (local mutators land), false for DROP (mutators
+    // are no-ops). Distinct from `processor_ != nullptr` because
+    // RECORD_ONLY needs IsRecording()=true while keeping a null
+    // export sink so End() doesn't push to a processor.
+    bool record_locally_;
 
     // Atomic flags so IsRecording() can be queried from any thread
     // (read-only) for early-out optimization. Mutation still happens
