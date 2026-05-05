@@ -3313,6 +3313,24 @@ void HttpServer::DrainObservabilityForShutdown(
     bool drained = WaitForAllAsyncDrain(budget);
     if (!drained && observability_manager_) {
         observability_manager_->KillOutstandingSnapshots(budget);
+        // After the kill sweep, snapshots whose CAS was already won
+        // by an in-progress finalizer are skipped — but those
+        // finalizers may still be inside OnFinalizeWinner, racing
+        // toward Span::End. If BeginShutdown signals the processor
+        // before they reach End, the OnEnd dispatch sees
+        // shutting_down_ and the completed span is dropped as
+        // post-shutdown overflow. Wait once more (bounded by the
+        // remaining slice of the drain budget) for
+        // finalizers_in_progress_ to drain so those spans land
+        // through the still-live exporter pipeline before
+        // BeginShutdown signals shutdown.
+        auto* obs = observability_manager_.get();
+        const auto deadline =
+            std::chrono::steady_clock::now() + budget;
+        std::unique_lock<std::mutex> lck(obs->finalizers_done_mtx());
+        obs->finalizers_done_cv().wait_until(lck, deadline, [obs]() {
+            return obs->finalizers_in_progress() == 0;
+        });
     }
     if (observability_manager_) {
         observability_manager_->BeginShutdown(budget);

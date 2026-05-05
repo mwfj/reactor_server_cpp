@@ -277,6 +277,19 @@ void ObservabilityManager::OnFinalizeWinner(
     snap.wire_body_size.store(wire_body_size, std::memory_order_release);
     snap.error_type = error_type;
 
+    // Derive the effective error.type ONCE so the span attribute,
+    // span status description, and histogram label all carry the
+    // same value — span/metric correlations break otherwise. OTel
+    // HTTP semconv requires error.type on 5xx; the finalizer's
+    // error_type carries transport aborts / middleware rejections,
+    // and for bare 5xx with no caller-supplied reason we stringify
+    // the status code (e.g. "500", "502").
+    std::string effective_error = error_type;
+    if (effective_error.empty() && status_code >= 500
+        && status_code < 600) {
+        effective_error = std::to_string(status_code);
+    }
+
     // Record the OTel HTTP server request duration metric.
     // Always record when the instrument exists — `metrics.enabled`
     // gates the EXPORT surface (Prometheus 404, OTLP push skip), not
@@ -306,19 +319,8 @@ void ObservabilityManager::OnFinalizeWinner(
             labels.emplace_back("network.protocol.version",
                                 snap.network_protocol_version);
         }
-        // OTel HTTP semconv: error.type is required for 5xx and
-        // optional for everything else. The finalizer's error_type
-        // covers transport aborts and middleware rejections; for
-        // bare 5xx the reviewer's prior round derived a stringified
-        // status — match that here so span↔histogram correlation is
-        // consistent.
-        std::string effective_error = error_type;
-        if (effective_error.empty() && status_code >= 500
-            && status_code < 600) {
-            effective_error = std::to_string(status_code);
-        }
         if (!effective_error.empty()) {
-            labels.emplace_back("error.type", std::move(effective_error));
+            labels.emplace_back("error.type", effective_error);
         }
         http_server_request_duration_->Record(duration_s, labels);
     }
@@ -326,7 +328,10 @@ void ObservabilityManager::OnFinalizeWinner(
     // Attach response-side attributes before ending:
     //   http.response.status_code, http.server.response.body.size,
     //   error.type. 5xx maps to SpanStatusCode::ERROR; 4xx stays UNSET
-    //   (client misuse is not a server-side error).
+    //   (client misuse is not a server-side error). The same
+    //   effective_error is applied as the span attribute and the
+    //   ERROR status description so span ↔ histogram correlations
+    //   carry the identical value.
     if (snap.inbound_span) {
         if (status_code > 0) {
             snap.inbound_span->SetAttribute(
@@ -336,13 +341,12 @@ void ObservabilityManager::OnFinalizeWinner(
         snap.inbound_span->SetAttribute(
             std::string(sem::kHttpServerResponseBodySize),
             AttrValue(static_cast<int64_t>(wire_body_size)));
-        if (!error_type.empty()) {
+        if (!effective_error.empty()) {
             snap.inbound_span->SetAttribute(
                 std::string(sem::kErrorType),
-                AttrValue(error_type));
-            snap.inbound_span->SetStatus(SpanStatusCode::ERROR, error_type);
-        } else if (status_code >= 500 && status_code < 600) {
-            snap.inbound_span->SetStatus(SpanStatusCode::ERROR);
+                AttrValue(effective_error));
+            snap.inbound_span->SetStatus(SpanStatusCode::ERROR,
+                                          effective_error);
         }
         // Idempotent + dispatcher-thread-only. The shutdown kill path
         // takes a different code route via KillOutstandingSnapshots.
@@ -380,22 +384,31 @@ void ObservabilityManager::KillOutstandingSnapshots(
     for (auto& snap_sp : to_kill) {
         ObservabilitySnapshot& snap = *snap_sp;
 
-        // Publish kill flag on the linked transaction first so its
-        // terminal callbacks observe the marker before they emit
-        // Span::End and skip the emit when set.
+        // The link/kill protocol must be atomic against
+        // ProxyTransaction::Start. Without holding link_mtx across
+        // the finalized CAS:
+        //   1. Kill takes link_mtx, sees tx_weak empty, releases.
+        //   2. Start (under link_mtx) sees finalized=false, publishes
+        //      tx_weak, releases.
+        //   3. Kill CAS-flips finalized=true.
+        //   4. Nobody ever calls MarkKilledForShutdown — the proxy
+        //      runs against a snapshot already removed from
+        //      drain counters.
+        // Holding link_mtx across the CAS makes Start's locked check
+        // either observe finalized=true (and self-mark) OR run
+        // entirely before/after kill's whole locked region.
         std::shared_ptr<UpstreamTransactionLink> tx;
+        bool finalize_won = false;
         {
             std::lock_guard<std::mutex> g(snap.link_mtx);
             tx = snap.tx_weak.lock();
+            bool expected = false;
+            finalize_won = snap.finalized.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel);
         }
         if (tx) tx->MarkKilledForShutdown();
-
-        // CAS arbitrates against any concurrent FinalizeFromSnapshot —
-        // exactly one path commits the terminal event.
-        bool expected = false;
-        if (!snap.finalized.compare_exchange_strong(expected, true,
-                std::memory_order_acq_rel)) {
-            continue;
+        if (!finalize_won) {
+            continue;  // a finalizer already won; let it run.
         }
 
         // DropWithoutEnd only flips the dropped_ atomic; it never

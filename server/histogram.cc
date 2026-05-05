@@ -3,6 +3,7 @@
 #include "observability/metric_writer_context.h"
 
 #include "common.h"
+#include <cmath>
 
 namespace OBSERVABILITY_NAMESPACE {
 
@@ -43,6 +44,16 @@ Histogram::Histogram(std::string name,
 
 void Histogram::Record(double value,
                         const std::vector<std::pair<std::string, std::string>>& kvs) {
+    // Reject non-finite samples up front. NaN would fall through to
+    // the +Inf bucket, taint sum_bits via AtomicAddDouble (NaN
+    // contagion), and could publish has_min_max=true while min/max
+    // remain at the +inf/-inf sentinels — corrupting the series for
+    // every subsequent observer. ±Inf has the same Prometheus-format
+    // and OTLP-output hazard as the histogram_buckets validator
+    // already rejects at config load. The HTTP duration recorder
+    // never produces these, but custom callers can.
+    if (!std::isfinite(value)) return;
+
     LabelSet labels = registry_->BuildLabelSet(kvs);
     const size_t shard_id = MetricWriterContext::GetShardId(shards_.size());
     Shard& shard = shards_[shard_id];

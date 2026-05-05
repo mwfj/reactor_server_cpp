@@ -18,10 +18,15 @@ inline std::string ToLower(std::string_view s) {
     return out;
 }
 
-inline bool IsHexChar(char c) noexcept {
+// W3C Trace Context Level 1 §3.2 mandates LOWERCASE hex for the
+// trace-id, parent-id, and trace-flags fields of version 00. An
+// inbound traceparent with uppercase hex is malformed and must be
+// treated as absent (no remote parent), per the spec — accepting it
+// would let the gateway propagate an invalid trace context to
+// downstream services.
+inline bool IsHexCharLower(char c) noexcept {
     return (c >= '0' && c <= '9') ||
-           (c >= 'a' && c <= 'f') ||
-           (c >= 'A' && c <= 'F');
+           (c >= 'a' && c <= 'f');
 }
 
 // Find a header value by lower-cased key. Returns nullptr when absent.
@@ -54,10 +59,11 @@ std::optional<SpanContext> W3CPropagator::ParseTraceparent(
     // Version must be "00".
     if (header[0] != '0' || header[1] != '0') return std::nullopt;
 
-    // All other characters must be hex.
+    // All other characters must be lowercase hex (per W3C §3.2.2.1
+    // — an uppercase hex digit makes the header malformed).
     for (size_t i = 3; i < kTraceparentLen; ++i) {
         if (i == 35 || i == 52) continue;
-        if (!IsHexChar(header[i])) return std::nullopt;
+        if (!IsHexCharLower(header[i])) return std::nullopt;
     }
 
     auto trace_id = TraceId::FromHex(header.substr(3, 32));
@@ -65,11 +71,12 @@ std::optional<SpanContext> W3CPropagator::ParseTraceparent(
     auto span_id = SpanId::FromHex(header.substr(36, 16));
     if (!span_id.IsValid()) return std::nullopt;
 
-    // Parse trace-flags as 2 hex chars → uint8_t.
+    // Parse trace-flags as 2 lowercase hex chars → uint8_t. The
+    // earlier IsHexCharLower scan already rejected uppercase, so
+    // this lambda is just the digit→nibble conversion.
     auto from_hex = [](char c) -> int {
         if (c >= '0' && c <= '9') return c - '0';
         if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-        if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
         return -1;
     };
     int hi = from_hex(header[53]);
