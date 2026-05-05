@@ -792,6 +792,32 @@ static bool ReloadConfig(const std::string& config_path,
     // becomes hot-reloadable); at that point this save becomes a
     // partial-field save excluding circuit_breaker.
     auto saved_upstreams = current_config.upstreams;
+    // Same rationale for observability — `enabled`, `resource.*`,
+    // `traces.exporter`, `metrics.exporter`, the `otlp.upstream`
+    // pair, and `metrics.prometheus.path` are all restart-required
+    // (see ObservabilityConfig::operator==). Without preserving
+    // them, a SIGHUP that stages new restart-only obs values would
+    // record them in current_config as if live, and subsequent
+    // reloads / `--config` dumps would compare against phantom
+    // state. ObservabilityManager::Reload only applies the live-
+    // reloadable subset; the others stay at their startup values
+    // until restart.
+    auto saved_obs_enabled  = current_config.observability.enabled;
+    auto saved_obs_resource = current_config.observability.resource;
+    auto saved_obs_traces_exporter =
+        current_config.observability.traces.exporter;
+    auto saved_obs_traces_otlp_upstream =
+        current_config.observability.traces.otlp.upstream;
+    auto saved_obs_traces_max_queue =
+        current_config.observability.traces.batch.max_queue_size;
+    auto saved_obs_metrics_exporter =
+        current_config.observability.metrics.exporter;
+    auto saved_obs_metrics_otlp_upstream =
+        current_config.observability.metrics.otlp.upstream;
+    auto saved_obs_metrics_prom_path =
+        current_config.observability.metrics.prometheus.path;
+    auto saved_obs_histogram_buckets =
+        current_config.observability.metrics.histogram_buckets;
 
     current_config = new_config;
 
@@ -801,6 +827,23 @@ static bool ReloadConfig(const std::string& config_path,
     current_config.worker_threads = saved_workers;
     current_config.http2.enabled = saved_h2_enabled;
     current_config.upstreams = std::move(saved_upstreams);
+
+    current_config.observability.enabled = saved_obs_enabled;
+    current_config.observability.resource = std::move(saved_obs_resource);
+    current_config.observability.traces.exporter =
+        std::move(saved_obs_traces_exporter);
+    current_config.observability.traces.otlp.upstream =
+        std::move(saved_obs_traces_otlp_upstream);
+    current_config.observability.traces.batch.max_queue_size =
+        saved_obs_traces_max_queue;
+    current_config.observability.metrics.exporter =
+        std::move(saved_obs_metrics_exporter);
+    current_config.observability.metrics.otlp.upstream =
+        std::move(saved_obs_metrics_otlp_upstream);
+    current_config.observability.metrics.prometheus.path =
+        std::move(saved_obs_metrics_prom_path);
+    current_config.observability.metrics.histogram_buckets =
+        std::move(saved_obs_histogram_buckets);
 
     // Commit file-backed state only after full success — a failed reload
     // must not flip this flag or future reloads lose the defaults+env fallback.
@@ -1053,8 +1096,19 @@ static int HandleStart(const CliOptions& options) {
         }
         auto resource = std::make_shared<OBSERVABILITY_NAMESPACE::Resource>(
             std::move(resource_attrs));
-        std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor> processor =
-            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>();
+        // Install a span processor only when a traces exporter is
+        // configured. Without this gate, a Prometheus-only deployment
+        // (traces.exporter empty, metrics.exporter="prometheus_pull")
+        // would still allocate sampled SERVER spans and propagate
+        // sampled trace_flags to upstreams — even though the operator
+        // explicitly disabled trace export. Tracer::StartSpan with a
+        // null processor returns non-recording spans.
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor> processor;
+        if (!config.observability.traces.exporter.empty()
+            && config.observability.traces.enabled) {
+            processor =
+                std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>();
+        }
         auto random = std::make_shared<OBSERVABILITY_NAMESPACE::RandomSource>();
         observability_manager =
             OBSERVABILITY_NAMESPACE::ObservabilityManager::Create(

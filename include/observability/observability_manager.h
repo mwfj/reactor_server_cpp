@@ -122,6 +122,15 @@ public:
     std::shared_ptr<const Sampler> EffectiveSamplerForPath(
         const std::string& path) const noexcept;
 
+    // Shared RandomSource used by Tracer / outbound-context callers
+    // (proxy attempt CLIENT contexts, auth IdP issue contexts) that
+    // need fresh span_ids without going through Tracer::StartSpan.
+    // The source is internally synchronised so concurrent calls from
+    // multiple dispatchers are safe.
+    std::shared_ptr<RandomSource> random() const noexcept {
+        return random_;
+    }
+
     // Read-only accessors consumed by the shutdown drain predicate.
     int64_t inflight_finalizations() const noexcept {
         return inflight_finalizations_.load(std::memory_order_acquire);

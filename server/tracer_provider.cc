@@ -67,6 +67,10 @@ void TracerProvider::Reload(std::shared_ptr<const Sampler> new_sampler,
                 processor_for_reload.get())) {
             bsp->Reload(new_processor_options.max_export_batch_size,
                         new_processor_options.schedule_delay);
+            bsp->ReloadRetries(
+                new_processor_options.retries_max_attempts,
+                new_processor_options.retries_initial_backoff,
+                new_processor_options.retries_max_backoff);
         }
     }
 }

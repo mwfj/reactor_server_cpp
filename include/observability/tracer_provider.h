@@ -30,6 +30,13 @@ namespace OBSERVABILITY_NAMESPACE {
 struct ProcessorOptions {
     size_t max_export_batch_size = 512;
     std::chrono::milliseconds schedule_delay = std::chrono::milliseconds{5000};
+    // Retry policy — live-reloadable, applied to subsequent batch
+    // exports. Defaults match BatchSpanProcessorOptions.
+    int retries_max_attempts                  = 3;
+    std::chrono::milliseconds retries_initial_backoff =
+        std::chrono::milliseconds{1000};
+    std::chrono::milliseconds retries_max_backoff =
+        std::chrono::milliseconds{10000};
 };
 
 class TracerProvider {

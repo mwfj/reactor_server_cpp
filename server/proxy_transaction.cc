@@ -14,8 +14,10 @@
 #include "http/http_status.h"
 #include "http/trailer_policy.h"
 #include "log/logger.h"
+#include "observability/observability_manager.h"
 #include "observability/observability_snapshot.h"
 #include "observability/propagator.h"
+#include "observability/trace_id.h"
 #include <unordered_set>
 
 namespace {
@@ -335,37 +337,53 @@ void ProxyTransaction::Start() {
         fwd_snap ? fwd_snap.get() : nullptr,
         &auth_ctx_);
 
-    // Outbound trace context: ALWAYS strip the client's traceparent /
-    // tracestate (case-insensitive) so an unsanitised inbound header
-    // never leaks across the gateway hop. When observability is on
-    // for this request, inject the SERVER span's context as the
-    // upstream's parent so the gateway is visible in the resulting
-    // trace tree. The strip is unconditional — even with observability
-    // disabled, leaking the caller's context to the upstream is a
-    // privacy / consistency issue. Per-attempt CLIENT-span emission
-    // (so retries produce distinct child spans) is a Phase-2 follow-up;
-    // today every attempt carries the same outbound traceparent.
-    {
-        auto strip_lc = [](std::map<std::string, std::string>& h,
-                            const char* needle) {
-            for (auto it = h.begin(); it != h.end(); ) {
-                std::string k = it->first;
-                std::transform(k.begin(), k.end(), k.begin(),
-                               [](unsigned char c) {
-                                   return std::tolower(c);
-                               });
-                if (k == needle) {
-                    it = h.erase(it);
-                } else {
-                    ++it;
+    // Outbound trace context. Strip+inject ONLY when we will replace
+    // the client's traceparent with a gateway-issued context — when
+    // observability is off (no snapshot, or snapshot has no valid
+    // SERVER context), W3C transparent propagation requires us to
+    // forward the client's headers unchanged. Stripping without
+    // replacement breaks distributed traces through the gateway.
+    //
+    // Build a CLIENT context with the same trace_id as the SERVER
+    // span but a FRESH span_id, so downstream services parent to the
+    // gateway's outbound hop instead of the inbound SERVER span.
+    // The fresh span_id is generated once per transaction (not per
+    // attempt) because serialized_request_ is cached and reused
+    // across retries; per-attempt distinct CLIENT spans require
+    // re-serialising the wire and emitting an explicit CLIENT span
+    // with End() — Phase 2 follow-up.
+    if (obs_snapshot_ && obs_snapshot_->trace_context.IsValid()) {
+        auto mgr_strong = obs_snapshot_->manager.lock();
+        auto random_src = mgr_strong ? mgr_strong->random()
+                                       : std::shared_ptr<OBSERVABILITY_NAMESPACE::RandomSource>{};
+        if (random_src) {
+            OBSERVABILITY_NAMESPACE::SpanContext attempt_ctx;
+            attempt_ctx.SetTraceId(
+                obs_snapshot_->trace_context.trace_id());
+            attempt_ctx.SetSpanId(random_src->NewSpanId());
+            attempt_ctx.SetFlags(obs_snapshot_->trace_context.flags());
+            attempt_ctx.mutable_state() =
+                obs_snapshot_->trace_context.state();
+
+            auto strip_lc = [](std::map<std::string, std::string>& h,
+                                const char* needle) {
+                for (auto it = h.begin(); it != h.end(); ) {
+                    std::string k = it->first;
+                    std::transform(k.begin(), k.end(), k.begin(),
+                                   [](unsigned char c) {
+                                       return std::tolower(c);
+                                   });
+                    if (k == needle) {
+                        it = h.erase(it);
+                    } else {
+                        ++it;
+                    }
                 }
-            }
-        };
-        strip_lc(rewritten_headers_, "traceparent");
-        strip_lc(rewritten_headers_, "tracestate");
-        if (obs_snapshot_ && obs_snapshot_->trace_context.IsValid()) {
+            };
+            strip_lc(rewritten_headers_, "traceparent");
+            strip_lc(rewritten_headers_, "tracestate");
             OBSERVABILITY_NAMESPACE::W3CPropagator::Inject(
-                obs_snapshot_->trace_context, rewritten_headers_);
+                attempt_ctx, rewritten_headers_);
         }
     }
 

@@ -125,6 +125,10 @@ struct ObservabilityConfig {
             && resource.service_instance_id == o.resource.service_instance_id
             && traces.exporter == o.traces.exporter
             && traces.otlp.upstream == o.traces.otlp.upstream
+            // BatchSpanProcessor allocates queue capacity at
+            // construction; Reload() never resizes. Edits would
+            // silently no-op until restart, so this is restart-only.
+            && traces.batch.max_queue_size == o.traces.batch.max_queue_size
             && metrics.exporter == o.metrics.exporter
             && metrics.otlp.upstream == o.metrics.otlp.upstream
             && metrics.prometheus.path == o.metrics.prometheus.path

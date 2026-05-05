@@ -400,6 +400,12 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
         po.max_export_batch_size =
             static_cast<size_t>(new_config.traces.batch.max_export_batch_size);
         po.schedule_delay = new_config.traces.batch.schedule_delay;
+        po.retries_max_attempts =
+            new_config.traces.batch.retries.max_attempts;
+        po.retries_initial_backoff =
+            new_config.traces.batch.retries.initial_backoff;
+        po.retries_max_backoff =
+            new_config.traces.batch.retries.max_backoff;
         tracer_provider_->Reload(new_sampler, po);
     }
 

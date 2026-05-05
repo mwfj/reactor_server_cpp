@@ -12,7 +12,12 @@ BatchSpanProcessor::BatchSpanProcessor(
       options_(options),
       max_export_batch_size_(options.max_export_batch_size),
       schedule_delay_ns_(options.schedule_delay.count() * 1'000'000),
-      export_timeout_ns_(options.export_timeout.count() * 1'000'000) {
+      export_timeout_ns_(options.export_timeout.count() * 1'000'000),
+      retries_max_attempts_(options.retries_max_attempts),
+      retries_initial_backoff_ns_(
+          options.retries_initial_backoff.count() * 1'000'000),
+      retries_max_backoff_ns_(
+          options.retries_max_backoff.count() * 1'000'000) {
     if (options_.max_queue_size == 0) options_.max_queue_size = 1;
     // Publish the started flag BEFORE constructing the thread so a
     // racing JoinWorkers() (e.g. from ~BatchSpanProcessor on a partial-
@@ -101,10 +106,18 @@ void BatchSpanProcessor::WorkerLoop() {
             // retries_max_backoff. The first exception path counts
             // as a failure but isn't retried (preserves the original
             // best-effort drop on programmer errors / bad payloads).
-            const int max_attempts =
-                std::max(1, options_.retries_max_attempts);
-            auto backoff = options_.retries_initial_backoff;
-            const auto max_backoff = options_.retries_max_backoff;
+            //
+            // Read the live atomics (set by ReloadRetries) once per
+            // batch so a SIGHUP affects subsequent attempts without
+            // disturbing the in-progress batch's accounting.
+            const int max_attempts = std::max(
+                1, retries_max_attempts_.load(std::memory_order_acquire));
+            auto backoff = std::chrono::milliseconds(
+                retries_initial_backoff_ns_.load(
+                    std::memory_order_acquire) / 1'000'000);
+            const auto max_backoff = std::chrono::milliseconds(
+                retries_max_backoff_ns_.load(
+                    std::memory_order_acquire) / 1'000'000);
             int attempt = 0;
             for (; attempt < max_attempts; ++attempt) {
                 const auto deadline = std::chrono::steady_clock::now() +
@@ -248,6 +261,23 @@ void BatchSpanProcessor::Reload(size_t new_max_export_batch_size,
     export_timeout_ns_.store(new_export_timeout.count() * 1'000'000,
                               std::memory_order_release);
     cv_.notify_all();  // wake worker so the new schedule_delay applies promptly.
+}
+
+void BatchSpanProcessor::ReloadRetries(int new_max_attempts,
+        std::chrono::milliseconds new_initial_backoff,
+        std::chrono::milliseconds new_max_backoff) {
+    if (new_max_attempts < 1) new_max_attempts = 1;
+    if (new_max_backoff < new_initial_backoff) {
+        new_max_backoff = new_initial_backoff;
+    }
+    retries_max_attempts_.store(new_max_attempts,
+                                  std::memory_order_release);
+    retries_initial_backoff_ns_.store(
+        new_initial_backoff.count() * 1'000'000,
+        std::memory_order_release);
+    retries_max_backoff_ns_.store(
+        new_max_backoff.count() * 1'000'000,
+        std::memory_order_release);
 }
 
 void BatchSpanProcessor::ForceFlush(std::chrono::milliseconds deadline) {

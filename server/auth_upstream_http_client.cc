@@ -266,8 +266,19 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
             ++it;
         }
     }
+    // Only inject when the caller has bound a Tracer in issue_ctx.
+    // The Tracer field is the contract signal that the caller is
+    // emitting (StartSpan + End) a CLIENT span with the SAME
+    // precomputed_context as `issue_ctx.local`. Injecting without
+    // that emission produces a downstream parent span_id the gateway
+    // never reports, leaving the upstream's parent reference dangling
+    // in the trace tree. Today no production caller populates
+    // issue_ctx — leaving this gate in place documents the contract
+    // for future wiring without leaking phantom span_ids in the
+    // meantime.
     if (req.issue_ctx.has_value()
-        && req.issue_ctx->local.IsValid()) {
+        && req.issue_ctx->local.IsValid()
+        && req.issue_ctx->tracer != nullptr) {
         OBSERVABILITY_NAMESPACE::W3CPropagator::Inject(
             req.issue_ctx->local, req.headers);
     }

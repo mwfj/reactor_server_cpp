@@ -7,10 +7,14 @@
 
 #include "test_framework.h"
 #include "auth/upstream_http_client.h"
+#include "observability/observability_manager.h"
 #include "observability/propagator.h"
 #include "observability/span_context.h"
 #include "observability/trace_context.h"
 #include "observability/trace_id.h"
+#include "observability/tracer.h"
+#include "observability/tracer_provider.h"
+#include "observability_test_helpers.h"
 
 #include <cstdint>
 #include <string>
@@ -24,6 +28,7 @@ using OBSERVABILITY_NAMESPACE::SpanContext;
 using OBSERVABILITY_NAMESPACE::SpanId;
 using OBSERVABILITY_NAMESPACE::TraceFlags;
 using OBSERVABILITY_NAMESPACE::TraceId;
+using OBSERVABILITY_NAMESPACE::Tracer;
 using OBSERVABILITY_NAMESPACE::TraceState;
 using OBSERVABILITY_NAMESPACE::W3CPropagator;
 
@@ -75,8 +80,15 @@ void TestInjectFromIssueContext() {
         req.headers["traceparent"] =
             "00-deadbeefdeadbeefdeadbeefdeadbeef-aabbccddeeff0011-01";
 
+        // Spin up a Tracer so the issue_ctx satisfies the
+        // ApplyOutboundTraceContext contract (only inject when a
+        // tracer is bound — tracer presence signals the caller is
+        // emitting a CLIENT span around the outbound call).
+        auto mgr = ObservabilityTestHelpers::MakeManager("issue-inject-test");
+        Tracer* tracer = mgr->GetTracer("test.issue");
         IssueTraceContext ictx;
         ictx.local = MakeRecordingContext(0x12345);
+        ictx.tracer = tracer;
         req.issue_ctx = ictx;
 
         UpstreamHttpClient::ApplyOutboundTraceContext(req);
@@ -149,6 +161,10 @@ void TestTracestateRoundTrip() {
         ictx.local = SpanContext(tid, sid,
                                  TraceFlags(TraceFlags::kSampled),
                                  ts, false);
+        // Bind a Tracer so the inject path fires under the new
+        // contract — see TestInjectFromIssueContext above.
+        auto mgr = ObservabilityTestHelpers::MakeManager("tracestate-test");
+        ictx.tracer = mgr->GetTracer("test.issue");
         req.issue_ctx = ictx;
 
         UpstreamHttpClient::ApplyOutboundTraceContext(req);

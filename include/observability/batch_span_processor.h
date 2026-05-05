@@ -69,6 +69,13 @@ public:
     void Reload(size_t new_max_export_batch_size,
                 std::chrono::milliseconds new_schedule_delay);
 
+    // Reload retry policy in lockstep with batch shape. SIGHUP edits
+    // to traces.batch.retries.* take effect on the next attempt
+    // (already-scheduled backoffs are not preempted).
+    void ReloadRetries(int new_max_attempts,
+                       std::chrono::milliseconds new_initial_backoff,
+                       std::chrono::milliseconds new_max_backoff);
+
     // Disable the worker-loop exporter SignalShutdown call. Used by
     // ObservabilityManager when this processor shares an OtlpHttpExporter
     // with a PeriodicMetricReader: signalling unilaterally from the
@@ -105,6 +112,11 @@ private:
     std::atomic<size_t>            max_export_batch_size_;
     std::atomic<int64_t>           schedule_delay_ns_;
     std::atomic<int64_t>           export_timeout_ns_;
+    // Retry knobs — live-reloadable. Read at the top of each retry
+    // loop in WorkerLoop so a SIGHUP edits subsequent attempts.
+    std::atomic<int>               retries_max_attempts_;
+    std::atomic<int64_t>           retries_initial_backoff_ns_;
+    std::atomic<int64_t>           retries_max_backoff_ns_;
 
     mutable std::mutex             mtx_;
     std::condition_variable        cv_;
