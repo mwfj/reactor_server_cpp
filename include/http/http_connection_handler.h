@@ -186,6 +186,18 @@ public:
     // any pipelined bytes that arrived during the deferred window.
     void CompleteAsyncResponse(HttpResponse response);
 
+    // Variant that fires `before_replay` AFTER the wire bytes have been
+    // queued via SendRaw and AFTER the deferred state has been cleared,
+    // but BEFORE the deferred-pipeline replay loop resumes parsing.
+    // The wrapper exists so CompleteAsyncResponseWithFinalize can land
+    // its observability finalize call between the request-A response
+    // and any synchronous request-B middleware/registration triggered
+    // by the replay; without this ordering, request B's snapshot
+    // registers before request A's snapshot finalizes.
+    void CompleteAsyncResponseBeforeReplay(
+        HttpResponse response,
+        std::function<void()> before_replay);
+
     // Cancel a deferred async-response cycle that was started by
     // BeginAsyncResponse but whose handler threw before handing off the
     // completion callback. Resets deferred state + shutdown exemption so
@@ -344,6 +356,22 @@ private:
     bool deferred_was_head_ = false;
     bool deferred_keep_alive_ = true;
     std::string deferred_pending_buf_;
+    // Snapshot of `req.obs_snapshot` captured at BeginAsyncResponse time.
+    // The parser request slot is Reset() after the handler returns (the
+    // sync send path at HandleCompleteRequest's tail clears it before
+    // returning false), so the cap-fire safety-cap path running later
+    // can no longer read obs_snapshot from parser_.GetRequest(). The
+    // captured shared_ptr keeps the snapshot alive for the deferred
+    // window — cleared by Complete/CancelAsyncResponse along with the
+    // other deferred fields.
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot>
+        deferred_obs_snapshot_;
+    // Mirror of req.method == "HEAD" for the deferred snapshot's
+    // wire-body-size accounting in the cap-fire path. Already
+    // captured as deferred_was_head_ above; the cap-fire path passes
+    // a synthetic req copy so the FinalizeIfSnapshot static helper
+    // can compute wire size correctly without needing the
+    // (now-reset) parser request.
 
     // Tracks whether the final (>=200) response has been written for the
     // CURRENT request. Set by SendResponse (status >= 200) and

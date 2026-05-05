@@ -1058,23 +1058,37 @@ inline uint64_t ComputeH2WireBodySize(const HttpResponse& response,
                                        bool was_head_request) noexcept {
     if (was_head_request) return 0;
     const int status = response.GetStatusCode();
+    // 1xx / 204 / 205 / 304 are bodyless per HTTP semantics; the H2
+    // submit path strips DATA frames for these statuses, so the
+    // observability hook must report 0 wire body bytes regardless of
+    // whatever the handler left in response.GetBody().
     if (status >= 100 && status < 200) return 0;
-    if (status == 204 || status == 304) return 0;
+    if (status == HttpStatus::NO_CONTENT ||
+        status == HttpStatus::RESET_CONTENT ||
+        status == HttpStatus::NOT_MODIFIED) {
+        return 0;
+    }
     return static_cast<uint64_t>(response.GetBody().size());
 }
 }  // namespace
 
 void Http2ConnectionHandler::SubmitStreamResponseWithFinalize(
     int32_t stream_id, const HttpResponse& response, FinalizeHook hook) {
-    // Compute the wire body size BEFORE handing to nghttp2 so the hook
-    // fires with the right value even on the destroyed-session path.
-    // We can't read the request method directly (it's owned by
-    // Http2Stream, not the handler), but H2 streams are independent
-    // and HEAD-stripping is internal to nghttp2 framing — so for H2
-    // the simpler "report the response body's bodyless-status-aware
-    // size" matches the wire output.
+    // Match Http2Session::SubmitResponse's body-suppression rules:
+    // HEAD requests have their bodies stripped at the framing layer,
+    // and 1xx / 204 / 205 / 304 are bodyless. Read the request method
+    // from the live stream (Http2Stream owns it) so the hook reports
+    // 0 wire body bytes for HEAD instead of the forbidden body the
+    // handler may have left on the response.
+    bool was_head = false;
+    if (session_) {
+        auto* stream = session_->FindStream(stream_id);
+        if (stream && stream->GetRequest().method == "HEAD") {
+            was_head = true;
+        }
+    }
     const uint64_t wire_body_size =
-        ComputeH2WireBodySize(response, /*was_head_request=*/false);
+        ComputeH2WireBodySize(response, was_head);
     SubmitStreamResponse(stream_id, response);
     if (hook) hook(wire_body_size);
 }

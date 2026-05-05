@@ -692,6 +692,7 @@ HttpConnectionHandler::CreateStreamingResponseSender(
         self->deferred_was_head_ = false;
         self->deferred_keep_alive_ = true;
         self->deferred_start_ = std::chrono::steady_clock::time_point{};
+        self->deferred_obs_snapshot_.reset();
         self->async_abort_hook_ = nullptr;
 
         if (self->conn_->IsClosing()) {
@@ -727,6 +728,7 @@ HttpConnectionHandler::CreateStreamingResponseSender(
         self->deferred_keep_alive_ = true;
         self->deferred_pending_buf_.clear();
         self->deferred_start_ = std::chrono::steady_clock::time_point{};
+        self->deferred_obs_snapshot_.reset();
         self->async_abort_hook_ = nullptr;
         self->conn_->SetShutdownExempt(false);
         self->conn_->ClearDeadline();
@@ -885,6 +887,11 @@ void HttpConnectionHandler::BeginAsyncResponse(const HttpRequest& req) {
     deferred_response_committed_ = false;
     deferred_was_head_ = (req.method == "HEAD");
     deferred_keep_alive_ = req.keep_alive;
+    // Capture obs_snapshot before the parser request slot gets Reset()
+    // so the cap-fire safety-cap path can finalize against the
+    // ORIGINAL deferred request, not whatever (empty) request slot
+    // the parser owns by the time the deadline callback runs.
+    deferred_obs_snapshot_ = req.obs_snapshot;
     // Reset so interim responses can be emitted before the final response
     // on this new async cycle. Without this, back-to-back requests on a
     // keep-alive connection would inherit the previous request's
@@ -906,6 +913,7 @@ void HttpConnectionHandler::CancelAsyncResponse() {
     deferred_keep_alive_ = true;
     deferred_pending_buf_.clear();
     deferred_start_ = std::chrono::steady_clock::time_point{};
+    deferred_obs_snapshot_.reset();
     // Release the abort hook's captured shared_ptrs so the request's
     // atomic flags and active_counter handle can be freed. The throw
     // path that calls CancelAsyncResponse already has its own
@@ -960,10 +968,16 @@ void HttpConnectionHandler::StashDeferredBytes(const std::string& data) {
 }
 
 void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
+    CompleteAsyncResponseBeforeReplay(std::move(response), nullptr);
+}
+
+void HttpConnectionHandler::CompleteAsyncResponseBeforeReplay(
+        HttpResponse response, std::function<void()> before_replay) {
     if (!deferred_response_pending_) {
         logging::Get()->warn(
             "CompleteAsyncResponse called without a pending deferred response "
             "(fd={})", conn_ ? conn_->fd() : -1);
+        if (before_replay) before_replay();
         return;
     }
 
@@ -1012,6 +1026,7 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     deferred_was_head_ = false;
     deferred_keep_alive_ = true;
     deferred_start_ = std::chrono::steady_clock::time_point{};
+    deferred_obs_snapshot_.reset();
     // Release the abort hook's captures — by the time CompleteAsyncResponse
     // runs on the normal path, the complete closure already owns the
     // bookkeeping and the safety cap no longer needs to fire.
@@ -1020,6 +1035,11 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     if (conn_->IsClosing()) {
         if (conn_) conn_->SetShutdownExempt(false);
         deferred_pending_buf_.clear();
+        // Fire before_replay (no replay will happen on this branch);
+        // the hook documents itself as "after wire bytes queued and
+        // deferred state cleared, before parsing resumes" — both
+        // hold here.
+        if (before_replay) before_replay();
         return;
     }
     if (should_close) {
@@ -1028,6 +1048,7 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
         // so HasPendingH1Output always sees at least one flag true.
         CloseConnection();
         if (conn_) conn_->SetShutdownExempt(false);
+        if (before_replay) before_replay();
         return;
     }
 
@@ -1044,6 +1065,14 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     // when the response was marked deferred).
     conn_->ClearDeadline();
     conn_->SetDeadlineTimeoutCb(nullptr);
+
+    // Fire `before_replay` AFTER state-clear / deadline-clear but
+    // BEFORE the deferred-pipeline replay loop. The replay calls
+    // OnRawData() which can synchronously parse the next pipelined
+    // request and register its observability snapshot — firing the
+    // request-A finalize hook here keeps the "A finalize before B
+    // register" ordering the wrapper contract requires.
+    if (before_replay) before_replay();
 
     // Resume parsing any pipelined bytes that arrived during the deferred
     // window. Move out of the member first so a nested BeginAsyncResponse
@@ -1102,15 +1131,17 @@ inline uint64_t ComputeWireBodySize(const HttpResponse& response,
 
 void HttpConnectionHandler::SendResponseWithFinalize(HttpResponse response,
                                                        FinalizeHook hook) {
-    // Compute wire-body-size BEFORE SendRaw. The H1 sync send path
-    // does NOT HEAD-strip (HEAD-stripping is the deferred-async path's
-    // CompleteAsyncResponse responsibility); sync handlers are
-    // responsible for emitting empty bodies on HEAD requests. The
-    // observability hook reports what's on the wire — for sync
-    // responses that's exactly response.body.size() minus the
-    // bodyless-status suppressions (1xx / 204 / 304).
+    // Compute wire-body-size BEFORE SendRaw. SendResponse() routes
+    // through the same code path as HandleCompleteRequest's sync
+    // send: HEAD requests have their bodies stripped from the wire
+    // by StripResponseBodyForHead before SendRaw runs (see
+    // HandleCompleteRequest's HEAD branch). Mirror that here so the
+    // observability hook reports 0 bytes on HEAD instead of the
+    // forbidden body the handler may have left on the response.
+    const bool was_head =
+        (parser_.GetRequest().method == "HEAD");
     const uint64_t wire_body_size =
-        ComputeWireBodySize(response, /*was_head_request=*/false);
+        ComputeWireBodySize(response, was_head);
     SendResponse(response);
     if (hook) hook(wire_body_size);
 }
@@ -1131,20 +1162,18 @@ void HttpConnectionHandler::CompleteAsyncResponseWithFinalize(
     const uint64_t wire_body_size =
         ComputeWireBodySize(response, was_head);
 
-    // CompleteAsyncResponse handles normalize → SendRaw → state-clear
-    // → resume pipelined input. The post_write_notify_ flag (when set)
-    // is fired inside CompleteAsyncResponse's normal path, so the
-    // shutdown-route pump and the WithFinalize hook see the same
-    // post-wire-write instant.
-    CompleteAsyncResponse(std::move(response));
-
-    // Fire the WithFinalize hook AFTER CompleteAsyncResponse returns:
-    // the wire bytes are buffered, the deferred state is cleared, and
-    // any pipelined-input replay has already fed back into OnRawData.
-    // Single-threaded dispatcher ordering guarantees the hook lands
-    // BEFORE the next pipelined request's span starts, so finalize
-    // ordering on keep-alive connections is preserved.
-    if (hook) hook(wire_body_size);
+    // Use the BeforeReplay variant so the finalize hook lands AFTER
+    // SendRaw + deferred-state clear but BEFORE the deferred-pipeline
+    // replay starts parsing the next request. Without this ordering
+    // a keep-alive client whose pipelined bytes arrived during the
+    // suspend window would have request B's snapshot register before
+    // request A's finalize fires — violating the wrapper contract
+    // and misordering cumulative spans/metrics.
+    CompleteAsyncResponseBeforeReplay(
+        std::move(response),
+        [hook, wire_body_size]() {
+            if (hook) hook(wire_body_size);
+        });
 }
 
 void HttpConnectionHandler::SetPostWriteNotifyOnce(
@@ -1744,9 +1773,31 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                         // attempt becomes a no-op. Without this
                         // pre-finalize, the abort hook would record
                         // server-side timeouts as client_disconnect.
-                        HttpServer::FinalizeIfSnapshot(
-                            self->parser_.GetRequest(),
-                            timeout_resp, "server_timeout");
+                        //
+                        // Use the snapshot captured at BeginAsyncResponse
+                        // time, NOT parser_.GetRequest() — the parser
+                        // request slot was Reset() right after the
+                        // handler returned, so a parser-based finalize
+                        // would no-op (obs_snapshot is null) and the
+                        // abort hook's client_disconnect placeholder
+                        // would land instead.
+                        if (self->deferred_obs_snapshot_) {
+                            auto mgr =
+                                self->deferred_obs_snapshot_->manager.lock();
+                            if (mgr) {
+                                const uint64_t wire_size =
+                                    self->deferred_was_head_
+                                        ? 0u
+                                        : ComputeWireBodySize(
+                                              timeout_resp,
+                                              self->deferred_was_head_);
+                                mgr->FinalizeFromSnapshot(
+                                    *self->deferred_obs_snapshot_,
+                                    timeout_resp.GetStatusCode(),
+                                    wire_size,
+                                    "server_timeout");
+                            }
+                        }
                         // Fire the abort hook for its bookkeeping
                         // (active_requests--, cancel_slot, etc.). Its
                         // FinalizeFromSnapshot is now a CAS no-op.

@@ -894,22 +894,44 @@ bool HttpRouter::HasWebSocketRoute(const std::string& path) const {
     return ws_trie_.HasMatch(path);
 }
 
-// Case-insensitive substring check for header tokens. RFC 7230 §3.2.6
-// allows the Connection header to be a comma-separated token list, and
-// individual tokens are case-insensitive. We use a containment check
-// rather than equality so requests with `Connection: keep-alive, Upgrade`
-// (a common shape) trip step (0a) correctly.
+// RFC 7230 §3.2.6 token-list match. The Connection / Upgrade headers
+// are comma-separated token lists; an individual token compares
+// case-insensitively. A naive substring match misclassifies values
+// like `Connection: notupgrade` or `Upgrade: xwebsocketx`, which on
+// short-circuit would mark a normal GET as a WebSocket candidate
+// and deprive routing/middleware of the real match. Tokenise on
+// commas, trim OWS, and compare each token case-insensitively.
 namespace {
-bool HeaderContainsTokenCI(const std::string& header_value,
-                            const std::string& needle_lower) {
+bool HeaderHasTokenCI(const std::string& header_value,
+                       const std::string& needle_lower) {
     if (header_value.empty()) return false;
-    std::string lower;
-    lower.reserve(header_value.size());
-    for (char c : header_value) {
-        lower.push_back(static_cast<char>(
-            std::tolower(static_cast<unsigned char>(c))));
+    auto is_ows = [](char c) { return c == ' ' || c == '\t'; };
+    size_t n = header_value.size();
+    size_t i = 0;
+    while (i < n) {
+        // Skip leading OWS.
+        while (i < n && is_ows(header_value[i])) ++i;
+        size_t start = i;
+        while (i < n && header_value[i] != ',') ++i;
+        size_t end = i;
+        // Trim trailing OWS within this token.
+        while (end > start && is_ows(header_value[end - 1])) --end;
+        if (end > start) {
+            const size_t tok_len = end - start;
+            if (tok_len == needle_lower.size()) {
+                bool match = true;
+                for (size_t k = 0; k < tok_len; ++k) {
+                    char c = header_value[start + k];
+                    char lc = static_cast<char>(
+                        std::tolower(static_cast<unsigned char>(c)));
+                    if (lc != needle_lower[k]) { match = false; break; }
+                }
+                if (match) return true;
+            }
+        }
+        if (i < n && header_value[i] == ',') ++i;
     }
-    return lower.find(needle_lower) != std::string::npos;
+    return false;
 }
 
 // Cheap WebSocket-upgrade-candidate detection: method == "GET" AND a
@@ -917,13 +939,14 @@ bool HeaderContainsTokenCI(const std::string& header_value,
 // "Upgrade: websocket". Structural intent only, NOT full RFC 6455
 // validation. Once this returns true, the resolver short-circuits;
 // later precedence-chain steps are unreachable regardless of the
-// follow-up validation outcome.
+// follow-up validation outcome — so the match must be exact (token
+// equality), not substring.
 bool IsWebSocketUpgradeCandidate(const HttpRequest& request) {
     if (request.method != "GET") return false;
-    if (!HeaderContainsTokenCI(request.GetHeader("Connection"), "upgrade")) {
+    if (!HeaderHasTokenCI(request.GetHeader("Connection"), "upgrade")) {
         return false;
     }
-    if (!HeaderContainsTokenCI(request.GetHeader("Upgrade"), "websocket")) {
+    if (!HeaderHasTokenCI(request.GetHeader("Upgrade"), "websocket")) {
         return false;
     }
     return true;
