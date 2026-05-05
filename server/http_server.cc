@@ -5202,6 +5202,38 @@ bool HttpServer::Reload(ServerConfig new_config) {
         // immediately via rate_limit_manager_->Reload(), so bad values
         // (rate<=0, invalid key_type, duplicate zone names) must be caught.
         validation_copy.rate_limit = new_config.rate_limit;
+        // Substitute LIVE values for restart-only observability
+        // fields. Validate() applies the full schema (including
+        // restart-only cross-checks: otlp_http rejection, exporter
+        // allowlist, prometheus.path leading-`/`, histogram bucket
+        // layout). Without this substitution a direct in-process
+        // HttpServer::Reload that staged `traces.exporter="otlp_http"`
+        // or a smaller `traces.batch.max_queue_size` would reject the
+        // entire reload — even though those fields are later preserved
+        // from live_config_ in the merged commit, never actually
+        // applied to the running server. The SIGHUP path in
+        // main.cc::ReloadConfig already downgrades restart-only
+        // failures to warnings; the in-process path now mirrors that
+        // by validating against the live values for restart-only
+        // fields and the staged values for everything else.
+        validation_copy.observability.enabled =
+            live_config_.observability.enabled;
+        validation_copy.observability.resource =
+            live_config_.observability.resource;
+        validation_copy.observability.traces.exporter =
+            live_config_.observability.traces.exporter;
+        validation_copy.observability.traces.otlp.upstream =
+            live_config_.observability.traces.otlp.upstream;
+        validation_copy.observability.traces.batch.max_queue_size =
+            live_config_.observability.traces.batch.max_queue_size;
+        validation_copy.observability.metrics.exporter =
+            live_config_.observability.metrics.exporter;
+        validation_copy.observability.metrics.otlp.upstream =
+            live_config_.observability.metrics.otlp.upstream;
+        validation_copy.observability.metrics.prometheus.path =
+            live_config_.observability.metrics.prometheus.path;
+        validation_copy.observability.metrics.histogram_buckets =
+            live_config_.observability.metrics.histogram_buckets;
         try {
             // reload_copy=true — signals the validator that upstreams[]
             // has been deliberately stripped above, so topology cross-

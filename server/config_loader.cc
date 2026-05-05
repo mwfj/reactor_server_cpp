@@ -1045,7 +1045,17 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                             "observability.traces.sampler.routes must be an array");
                     oc.traces.sampler.routes.clear();
                     for (const auto& it : sj["routes"]) {
-                        if (!it.is_object()) continue;
+                        if (!it.is_object()) {
+                            // Silently dropping non-object entries
+                            // (`routes: ["/health"]`, `routes: [null]`)
+                            // would let an operator typo disable
+                            // per-route sampling without any error.
+                            // Treat the whole reload as malformed.
+                            throw std::runtime_error(
+                                "observability.traces.sampler.routes[] "
+                                "entries must be objects with "
+                                "{path, sampler, ratio?}");
+                        }
                         OBSERVABILITY_NAMESPACE::SamplerRouteOverride o;
                         o.path = it.value("path", std::string{});
                         auto t = it.value("sampler", std::string("always_off"));
@@ -1116,7 +1126,17 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                             static_cast<int>(
                                 oc.traces.batch.schedule_delay.count()),
                             "observability.traces.batch")};
-                if (bj.contains("retries") && bj["retries"].is_object()) {
+                if (bj.contains("retries")) {
+                    if (!bj["retries"].is_object()) {
+                        // `retries: []` or `retries: "off"` previously
+                        // fell through this gate and silently kept
+                        // defaults — the operator's intent was lost.
+                        // Reject malformed values explicitly.
+                        throw std::runtime_error(
+                            "observability.traces.batch.retries must be "
+                            "an object with {max_attempts, "
+                            "initial_backoff_ms, max_backoff_ms}");
+                    }
                     auto& rj = bj["retries"];
                     oc.traces.batch.retries.max_attempts = ParseStrictInt(
                         rj, "max_attempts",
@@ -2048,6 +2068,24 @@ static void ValidateObservabilityLive(const ServerConfig& config,
     if (oc.traces.batch.retries.max_attempts < 0)
         throw std::invalid_argument(
             "observability.traces.batch.retries.max_attempts must be >= 0");
+    // Non-positive backoffs would collapse exponential retry into
+    // immediate retries (cv::wait_for with a non-positive duration
+    // returns instantly per the spec), hammering a struggling
+    // exporter. Both knobs are live-reloadable, so reject before
+    // they reach the running BatchSpanProcessor.
+    if (oc.traces.batch.retries.initial_backoff.count() < 1)
+        throw std::invalid_argument(
+            "observability.traces.batch.retries.initial_backoff_ms "
+            "must be >= 1");
+    if (oc.traces.batch.retries.max_backoff.count() < 1)
+        throw std::invalid_argument(
+            "observability.traces.batch.retries.max_backoff_ms "
+            "must be >= 1");
+    if (oc.traces.batch.retries.max_backoff
+            < oc.traces.batch.retries.initial_backoff)
+        throw std::invalid_argument(
+            "observability.traces.batch.retries.max_backoff_ms must "
+            "not be less than initial_backoff_ms");
 
     if (oc.traces.sampler.ratio < 0.0 || oc.traces.sampler.ratio > 1.0)
         throw std::invalid_argument(
