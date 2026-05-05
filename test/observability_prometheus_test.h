@@ -413,7 +413,9 @@ void TestMultiSeriesAndMultiInstrument() {
         std::string body = PrometheusExporter::Render(snap);
         bool e1 = ContainsLine(body, "errors_total{code=\"500\"} 4");
         bool e2 = ContainsLine(body, "errors_total{code=\"503\"} 2");
-        bool a  = ContainsLine(body, "active{} 11");
+        // Label-less samples render WITHOUT empty braces per the
+        // Prometheus exposition format — `active 11`, not `active{} 11`.
+        bool a  = ContainsLine(body, "active 11");
         bool single_help = body.find("# HELP errors_total")
                             == body.rfind("# HELP errors_total");
         bool single_type = body.find("# TYPE errors_total")
