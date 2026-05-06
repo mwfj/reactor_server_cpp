@@ -2,8 +2,12 @@
 
 #include "observability/resource.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <variant>
 
 namespace OBSERVABILITY_NAMESPACE {
@@ -243,11 +247,88 @@ std::string PrometheusExporter::SanitizeName(std::string_view name) {
 
 PrometheusExporter::Format PrometheusExporter::ChooseFormat(
         std::string_view accept_header) noexcept {
-    // OpenMetrics media type takes precedence when present anywhere in
-    // the Accept header.
+    // RFC 7231 §5.3.2: media types are case-insensitive and may carry
+    // q-values. A naive substring scan misses `Application/OpenMetrics-Text`
+    // (legal casing) and ignores `q=0` (explicit rejection). We parse the
+    // header into media-range/q pairs and pick OpenMetrics only when its
+    // q-value is positive AND ≥ the q-value of any other range that would
+    // otherwise win (text/plain or */*).
     static constexpr std::string_view kOpenMetrics =
         "application/openmetrics-text";
-    if (accept_header.find(kOpenMetrics) != std::string_view::npos) {
+
+    auto trim = [](std::string_view s) {
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
+        while (!s.empty() && (s.back()  == ' ' || s.back()  == '\t')) s.remove_suffix(1);
+        return s;
+    };
+    auto iequals = [](std::string_view a, std::string_view b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            unsigned char ca = static_cast<unsigned char>(a[i]);
+            unsigned char cb = static_cast<unsigned char>(b[i]);
+            if (std::tolower(ca) != std::tolower(cb)) return false;
+        }
+        return true;
+    };
+    // Best q-values seen so far. Default to "absent" via -1.
+    double q_openmetrics = -1.0;
+    double q_default     = -1.0;  // text/plain or */* — would win without OM
+
+    size_t i = 0;
+    while (i < accept_header.size()) {
+        size_t comma = accept_header.find(',', i);
+        std::string_view item = accept_header.substr(
+            i, comma == std::string_view::npos ? std::string_view::npos : comma - i);
+        i = (comma == std::string_view::npos) ? accept_header.size() : comma + 1;
+
+        item = trim(item);
+        if (item.empty()) continue;
+
+        // Split media-range from parameters on the first ';'.
+        size_t semi = item.find(';');
+        std::string_view media = trim(item.substr(0, semi));
+        double q = 1.0;
+        if (semi != std::string_view::npos) {
+            std::string_view params = item.substr(semi + 1);
+            while (!params.empty()) {
+                size_t s = params.find(';');
+                std::string_view p = trim(
+                    s == std::string_view::npos ? params : params.substr(0, s));
+                params = (s == std::string_view::npos)
+                    ? std::string_view{} : params.substr(s + 1);
+                size_t eq = p.find('=');
+                if (eq == std::string_view::npos) continue;
+                std::string_view pname  = trim(p.substr(0, eq));
+                std::string_view pvalue = trim(p.substr(eq + 1));
+                if (iequals(pname, "q")) {
+                    // Lenient parse — invalid → leave q at 1.0 (default).
+                    char buf[32];
+                    size_t n = std::min(pvalue.size(), sizeof(buf) - 1);
+                    std::memcpy(buf, pvalue.data(), n);
+                    buf[n] = '\0';
+                    char* end = nullptr;
+                    double parsed = std::strtod(buf, &end);
+                    if (end != buf && parsed >= 0.0 && parsed <= 1.0) q = parsed;
+                }
+            }
+        }
+
+        if (iequals(media, kOpenMetrics)) {
+            if (q > q_openmetrics) q_openmetrics = q;
+        } else if (iequals(media, "text/plain") ||
+                   iequals(media, "*/*") ||
+                   iequals(media, "text/*") ||
+                   iequals(media, "application/*")) {
+            if (q > q_default) q_default = q;
+        }
+    }
+
+    // Pick OpenMetrics only when explicitly accepted (q>0) and at least
+    // as preferred as the default. Equal q ties break in OpenMetrics'
+    // favor — preserves the historical behavior for the standard scraper
+    // header `application/openmetrics-text;version=...,text/plain;...`
+    // where both are present at q=1.
+    if (q_openmetrics > 0.0 && q_openmetrics >= q_default) {
         return Format::OpenMetrics;
     }
     return Format::PrometheusExposition;

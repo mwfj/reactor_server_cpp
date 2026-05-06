@@ -1022,7 +1022,13 @@ void HttpRouter::ResolveRouteMatch(HttpRequest& request) const {
     bool head_fb = false;
     auto async = GetAsyncHandler(request, &head_fb, &async_pattern);
     if (async) {
-        if (IsProxyAsyncPattern(request.method, async_pattern)) {
+        // On HEAD→GET fallback the matched pattern + handler come from
+        // the GET trie, and proxy ownership is recorded in
+        // proxy_async_patterns_["GET"]. Looking up under "HEAD" would
+        // miss a GET-owned proxy and misclassify the route as Async even
+        // though Dispatch invokes the proxy handler.
+        const std::string& lookup_method = head_fb ? "GET" : request.method;
+        if (IsProxyAsyncPattern(lookup_method, async_pattern)) {
             request.route_match.kind     = RouteKind::Proxy;
             request.route_match.is_proxy = true;
         } else {

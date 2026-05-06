@@ -142,6 +142,79 @@ void TestChooseFormatDefault() {
     }
 }
 
+// RFC 7231 §5.3.2: media types are case-insensitive. A scraper that
+// sends mixed-case `Application/OpenMetrics-Text` must still pick the
+// OpenMetrics format.
+void TestChooseFormatCaseInsensitive() {
+    try {
+        auto fmt = PrometheusExporter::ChooseFormat(
+            "Application/OpenMetrics-Text; version=1.0.0");
+        bool pass = fmt == PrometheusExporter::Format::OpenMetrics;
+        TestFramework::RecordTest(
+            "ObsProm: ChooseFormat is case-insensitive on media type",
+            pass, pass ? "" : "mixed-case header not recognized",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsProm: ChooseFormat is case-insensitive on media type",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// q=0 explicitly rejects a media type per RFC 7231 §5.3.1. A scraper
+// listing OpenMetrics with q=0 alongside text/plain wants the
+// Prometheus exposition, not OpenMetrics.
+void TestChooseFormatRespectsQZero() {
+    try {
+        auto fmt = PrometheusExporter::ChooseFormat(
+            "application/openmetrics-text;q=0,text/plain;q=1");
+        bool pass = fmt == PrometheusExporter::Format::PrometheusExposition;
+        TestFramework::RecordTest(
+            "ObsProm: ChooseFormat honors q=0 on OpenMetrics",
+            pass, pass ? "" : "did not honor q=0",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsProm: ChooseFormat honors q=0 on OpenMetrics",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Standard scraper Accept header — both formats present at q=1. Tie
+// breaks in OpenMetrics' favor (richer format).
+void TestChooseFormatTieBreaksToOpenMetrics() {
+    try {
+        auto fmt = PrometheusExporter::ChooseFormat(
+            "application/openmetrics-text;version=1.0.0;q=1,text/plain;version=0.0.4;q=1,*/*;q=0.1");
+        bool pass = fmt == PrometheusExporter::Format::OpenMetrics;
+        TestFramework::RecordTest(
+            "ObsProm: ChooseFormat tie-breaks to OpenMetrics",
+            pass, pass ? "" : "tied q-values not resolved to OpenMetrics",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsProm: ChooseFormat tie-breaks to OpenMetrics",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Lower q on OpenMetrics than on text/plain → prefer text/plain.
+void TestChooseFormatPrefersHigherQ() {
+    try {
+        auto fmt = PrometheusExporter::ChooseFormat(
+            "application/openmetrics-text;q=0.3,text/plain;q=0.9");
+        bool pass = fmt == PrometheusExporter::Format::PrometheusExposition;
+        TestFramework::RecordTest(
+            "ObsProm: ChooseFormat picks higher q-value",
+            pass, pass ? "" : "ignored q-value preference",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsProm: ChooseFormat picks higher q-value",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestContentTypeStrings() {
     try {
         std::string p = PrometheusExporter::ContentType(
@@ -442,6 +515,10 @@ void RunAllTests() {
     TestSanitizeEmptyInput();
     TestChooseFormatOpenMetrics();
     TestChooseFormatDefault();
+    TestChooseFormatCaseInsensitive();
+    TestChooseFormatRespectsQZero();
+    TestChooseFormatTieBreaksToOpenMetrics();
+    TestChooseFormatPrefersHigherQ();
     TestContentTypeStrings();
     TestRenderCounterTotalSuffix();
     TestRenderUpDownCounterAsGauge();

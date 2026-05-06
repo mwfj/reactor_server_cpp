@@ -2085,6 +2085,47 @@ void TestResolveRouteMatchSyncKindAndHeadFallback() {
     }
 }
 
+// Test: HEAD→GET fallback on a proxy route classifies as Proxy, not Async.
+// Regression guard for the IsProxyAsyncPattern lookup-by-method bug:
+// proxy ownership is keyed under "GET" but a HEAD request that falls
+// back to GET should still be tagged RouteKind::Proxy / is_proxy=true.
+void TestResolveRouteMatchHeadFallbackOnProxyRoute() {
+    try {
+        HttpRouter router;
+        router.RouteProxyAsync("GET", "/api/v1/*rest", MakeNoopAsync());
+        // No explicit HEAD registration — HEAD on /api/v1/foo must
+        // fall back to the GET handler (proxy).
+
+        auto head_req = MakeRequest("HEAD", "/api/v1/users/42");
+        router.ResolveRouteMatch(head_req);
+
+        bool pass = head_req.route_match.kind == RouteKind::Proxy &&
+                    head_req.route_match.is_proxy &&
+                    head_req.route_match.head_fallback &&
+                    head_req.route_match.method_for_dispatch == "GET" &&
+                    head_req.route_match.pattern == "/api/v1/*rest";
+        std::string err;
+        if (!pass) {
+            err = "kind=" + std::to_string(
+                      static_cast<int>(head_req.route_match.kind)) +
+                  ", is_proxy=" +
+                      (head_req.route_match.is_proxy ? "true" : "false") +
+                  ", head_fallback=" +
+                      (head_req.route_match.head_fallback ? "true" : "false") +
+                  ", method_for_dispatch='" +
+                      head_req.route_match.method_for_dispatch +
+                  "', pattern='" + head_req.route_match.pattern + "'";
+        }
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: HEAD→GET fallback on proxy route tagged Proxy",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: HEAD→GET fallback on proxy route tagged Proxy",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
 // Test: ResolveRouteMatch is idempotent. A second call must not clobber
 // or re-resolve. The H1/H2 dispatch frames may invoke the resolver
 // twice (pre-middleware AND at dispatch); the design contract is "first
@@ -2192,6 +2233,7 @@ void RunAllTests() {
     TestResolveRouteMatchMalformedWsUpgradeForbidsFallthrough();
     TestResolveRouteMatchProxyKindIsProxy();
     TestResolveRouteMatchSyncKindAndHeadFallback();
+    TestResolveRouteMatchHeadFallbackOnProxyRoute();
     TestResolveRouteMatchIdempotency();
 }
 

@@ -265,6 +265,44 @@ void TestInjectStripsExistingHeaderInVector() {
     }
 }
 
+// Inject into a vector with EMPTY tracestate must still strip a pre-
+// existing tracestate. The contract is strip-then-inject; leaving stale
+// vendor state paired with a fresh traceparent corrupts the trace
+// context for downstream services.
+void TestInjectStripsTracestateOnEmptyState() {
+    try {
+        SpanContext ctx;
+        ctx.SetTraceId(TraceId::FromHex("0af7651916cd43dd8448eb211c80319c"));
+        ctx.SetSpanId(SpanId::FromHex("00f067aa0ba902b7"));
+        ctx.SetFlags(TraceFlags{0x01});
+        // Default-constructed TraceState ⇒ Empty() == true.
+
+        std::vector<std::pair<std::string, std::string>> headers;
+        headers.emplace_back("traceparent", "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-00");
+        headers.emplace_back("TraceState", "vendorA=stale,vendorB=alsostale");
+        headers.emplace_back("host", "example.com");
+
+        bool ok = W3CPropagator::Inject(ctx, headers);
+        size_t ts_count = 0;
+        for (const auto& [k, v] : headers) {
+            (void)v;
+            std::string lk;
+            for (char c : k) lk.push_back(
+                static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            if (lk == "tracestate") ++ts_count;
+        }
+        bool pass = ok && ts_count == 0;
+        TestFramework::RecordTest(
+            "ObsProp: Inject strips stale tracestate even when new state is empty",
+            pass, pass ? "" : "stale tracestate left in headers",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsProp: Inject strips stale tracestate even when new state is empty",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Inject with invalid context returns false + does not mutate headers.
 void TestInjectInvalidContextNoOp() {
     try {
@@ -298,6 +336,7 @@ void RunAllTests() {
     TestExtractAbsentTraceparent();
     TestInjectIntoMap();
     TestInjectStripsExistingHeaderInVector();
+    TestInjectStripsTracestateOnEmptyState();
     TestInjectInvalidContextNoOp();
 }
 

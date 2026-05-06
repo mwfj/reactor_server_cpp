@@ -172,8 +172,12 @@ bool W3CPropagator::Inject(const SpanContext& ctx,
     };
     erase_if_match("traceparent");
     headers.emplace_back("traceparent", std::move(*tp));
+    // Always strip stale tracestate — the vector overload's contract
+    // is strip-then-inject, so a new context with empty state must NOT
+    // leave a previous vendor's tracestate paired with the fresh
+    // traceparent. Append only when the new state is non-empty.
+    erase_if_match("tracestate");
     if (!ctx.state().Empty()) {
-        erase_if_match("tracestate");
         headers.emplace_back("tracestate", ctx.state().Serialize());
     }
     return true;
