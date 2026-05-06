@@ -2126,21 +2126,24 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
             "observability.metrics.exporter must be empty, 'otlp_http' or "
             "'prometheus_pull'");
 
-    // The OTLP push pipeline (BatchSpanProcessor + PeriodicMetricReader
-    // + OtlpHttpExporter wired through UpstreamHttpClient) is built
-    // but not yet bootstrapped in main.cc. Until that wiring lands,
-    // reject `otlp_http` here at validate time — the alternative
-    // (accept here, throw at startup) lets `validate` / `config`
-    // commands return success on a config that the running server
-    // would refuse, which is exactly the inconsistency the reviewer
-    // flagged. When the bootstrap wiring lands, both this gate and
-    // the symmetric main.cc throw should be removed in the same
-    // change.
+    // OTLP push pipeline acceptance is gated on the bootstrap path
+    // in main.cc actually wiring an OtlpHttpExporter through
+    // UpstreamHttpClient. That wiring is non-trivial because the
+    // UpstreamHttpClient needs HttpServer's live dispatchers (built
+    // during Start()) while the ObservabilityManager must be
+    // attached BEFORE Start() so the middleware fires — i.e. the
+    // processor swap has to go through a post-Start re-bind, which
+    // is a focused follow-up not yet in this PR. Until that lands,
+    // reject `otlp_http` here at validate time so `validate` /
+    // `config` / `start` give consistent answers (the alternative —
+    // accept at validate, install NoopSpanProcessor at start —
+    // silently drops every span/metric the operator configured for
+    // export).
     if (oc.traces.exporter == "otlp_http") {
         throw std::invalid_argument(
             "observability.traces.exporter='otlp_http' is not yet wired "
             "in this build; remove the exporter or wait for the OTLP "
-            "push pipeline to land");
+            "push pipeline bootstrap to land");
     }
     if (oc.metrics.exporter == "otlp_http") {
         throw std::invalid_argument(

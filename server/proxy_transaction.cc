@@ -358,39 +358,16 @@ void ProxyTransaction::Start() {
         fwd_snap ? fwd_snap.get() : nullptr,
         &auth_ctx_);
 
-    // Outbound trace context. Until per-attempt CLIENT span emission
-    // is wired, propagating ANY gateway-minted span_id leaves
-    // downstream services parenting to a span the gateway never
-    // exports — a phantom-parent footgun. Two safe modes today:
-    //   1. Observability OFF for this request → leave the client's
-    //      headers untouched (transparent W3C propagation).
-    //   2. Observability ON → strip-only: drop client traceparent /
-    //      tracestate so the gateway doesn't relay an inbound parent
-    //      that has no relationship to the outbound hop, and inject
-    //      nothing. Downstream services will treat the upstream call
-    //      as a root span.
-    // Phase 2 (when ProxyTransaction allocates a CLIENT span per
-    // attempt and ends it on response/timeout): replace the strip
-    // with strip+inject of the per-attempt context.
-    if (obs_snapshot_ && obs_snapshot_->trace_context.IsValid()) {
-        auto strip_lc = [](std::map<std::string, std::string>& h,
-                            const char* needle) {
-            for (auto it = h.begin(); it != h.end(); ) {
-                std::string k = it->first;
-                std::transform(k.begin(), k.end(), k.begin(),
-                               [](unsigned char c) {
-                                   return std::tolower(c);
-                               });
-                if (k == needle) {
-                    it = h.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        };
-        strip_lc(rewritten_headers_, "traceparent");
-        strip_lc(rewritten_headers_, "tracestate");
-    }
+    // Outbound trace context: PRESERVE the client's traceparent /
+    // tracestate verbatim. Until per-attempt CLIENT span emission
+    // is wired (Phase 2: allocate a CLIENT span per attempt, end it
+    // on response/timeout, inject the matching span_id), the gateway
+    // can't issue a fresh outbound context that downstream services
+    // can correlate back to a real exported span — and stripping
+    // without replacement breaks transparent W3C propagation through
+    // the gateway. Forwarding the inbound parent unchanged is the
+    // standard reverse-proxy behaviour and keeps the client's trace
+    // tree intact across the gateway hop.
 
     // Compute upstream path with strip_prefix support.
     // Prefer upstream_path_override_ (extracted from catch-all route param by

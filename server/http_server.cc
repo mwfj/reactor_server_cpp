@@ -2945,23 +2945,33 @@ void HttpServer::Stop() {
             }
             const auto drain_budget = std::chrono::seconds(
                 shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
-            // Initiate upstream shutdown AFTER protocol drain so proxy
-            // handlers dispatched during the drain can still check out.
+            // Phase A — observability flush BEFORE upstream pool
+            // shutdown. The BatchSpanProcessor's final flush (when
+            // the OTLP push pipeline is wired) routes through
+            // UpstreamHttpClient against the same pools that
+            // InitiateShutdown is about to take down; running flush
+            // first keeps those checkouts valid. Today's NoopSpanProcessor
+            // wiring makes the flush a no-op, but we wait for natural
+            // finalize drain here so proxy in-flight that completes
+            // during the upcoming upstream drain doesn't have to
+            // race the kill loop.
+            const bool flushed = FlushObservabilityForShutdown(
+                std::chrono::milliseconds(drain_budget) / 2);
+            // Phase B — upstream shutdown. Initiate AFTER protocol
+            // drain so proxy handlers dispatched during the drain
+            // can still check out. In-flight proxy requests that
+            // complete during this window finalize via the normal
+            // path against still-live snapshots.
             if (upstream_manager_) {
                 upstream_manager_->InitiateShutdown();
                 upstream_manager_->WaitForDrain(drain_budget);
             }
-            // Drain observability AFTER upstream completes. An in-flight
-            // proxy request that finishes during the upstream drain
-            // window emits its snapshot finalize via the normal
-            // completion path; running obs drain (and worse, the kill
-            // loop) before the upstream drain meant those finalizes
-            // landed on snapshots already CAS-killed and the spans
-            // were lost. Half-budget here matches the previous total
-            // — the upstream drain has already had the full budget,
-            // and most snapshots are finalized by now.
-            DrainObservabilityForShutdown(
-                std::chrono::milliseconds(drain_budget) / 2);
+            // Phase C — kill survivors + BeginShutdown AFTER upstream
+            // drain so any proxy in-flight that finalized during
+            // Phase B reached Span::End before the kill sweep.
+            KillAndShutdownObservability(
+                std::chrono::milliseconds(drain_budget) / 2,
+                flushed);
             // Post-upstream H1 flush window: an async (exempt) HTTP/1 handler
             // whose completion fires during the upstream drain (or that takes
             // longer than the first H1 drain loop) only starts writing its
@@ -3103,9 +3113,14 @@ void HttpServer::Stop() {
             }
             const auto drain_budget_sec = std::chrono::seconds(
                 shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
-            // Upstream drain — initiate AFTER protocol drains so late
-            // proxy handlers can still check out. Then poll with task
-            // pump until leases return, and force-close stragglers.
+            // Phase A — observability flush BEFORE upstream pool
+            // shutdown — see the off-thread path above for rationale.
+            const bool flushed = FlushObservabilityForShutdown(
+                std::chrono::milliseconds(drain_budget_sec) / 2);
+            // Phase B — upstream drain — initiate AFTER protocol drains
+            // so late proxy handlers can still check out. Then poll
+            // with task pump until leases return, and force-close
+            // stragglers.
             if (upstream_manager_) {
                 upstream_manager_->InitiateShutdown();
                 static constexpr int UP_PUMP_MS = 200;
@@ -3120,12 +3135,12 @@ void HttpServer::Stop() {
                 }
                 upstream_manager_->ForceCloseRemaining();
             }
-            // Drain observability AFTER upstream completes — see the
-            // off-thread path above for the rationale (proxy in-flight
-            // requests that finalize during the upstream drain
-            // mustn't find their snapshots already CAS-killed).
-            DrainObservabilityForShutdown(
-                std::chrono::milliseconds(drain_budget_sec) / 2);
+            // Phase C — kill survivors + BeginShutdown AFTER upstream
+            // drain so any proxy in-flight that finalized during
+            // Phase B reached Span::End before the kill sweep.
+            KillAndShutdownObservability(
+                std::chrono::milliseconds(drain_budget_sec) / 2,
+                flushed);
             // Post-upstream H1 flush window: use the configured drain budget
             // so async H1 routes that take longer than 2s aren't cut off.
             {
@@ -3310,8 +3325,34 @@ bool HttpServer::WaitForAllAsyncDrain(std::chrono::milliseconds timeout) {
 
 void HttpServer::DrainObservabilityForShutdown(
         std::chrono::milliseconds budget) {
+    // Single-phase facade preserved for callers that don't need the
+    // upstream-pool-alive ordering (e.g. ~HttpServer / abnormal
+    // teardown). Splits the budget evenly between the two phases.
+    const auto half = budget / 2;
+    bool drained = FlushObservabilityForShutdown(half);
+    KillAndShutdownObservability(budget - half, drained);
+}
+
+bool HttpServer::FlushObservabilityForShutdown(
+        std::chrono::milliseconds budget) {
     bool drained = WaitForAllAsyncDrain(budget);
-    if (!drained && observability_manager_) {
+    // ForceFlush hook: when the OTLP push pipeline is wired, the
+    // BatchSpanProcessor's flush triggers an export through
+    // UpstreamHttpClient. The pre-upstream-shutdown placement here
+    // ensures those checkouts succeed against live pools. The
+    // current NoopSpanProcessor wiring makes this a no-op; the call
+    // is retained so the eventual OTLP wiring just needs to plug
+    // its processor in without re-ordering Stop().
+    // BatchSpanProcessor::ForceFlush is not on the SpanProcessor base
+    // — when wiring lands, dynamic_cast or expand the base interface.
+    return drained;
+}
+
+void HttpServer::KillAndShutdownObservability(
+        std::chrono::milliseconds budget,
+        bool drained_in_flush_phase) {
+    if (!observability_manager_) return;
+    if (!drained_in_flush_phase) {
         observability_manager_->KillOutstandingSnapshots(budget);
         // After the kill sweep, snapshots whose CAS was already won
         // by an in-progress finalizer are skipped — but those
@@ -3332,9 +3373,7 @@ void HttpServer::DrainObservabilityForShutdown(
             return obs->finalizers_in_progress() == 0;
         });
     }
-    if (observability_manager_) {
-        observability_manager_->BeginShutdown(budget);
-    }
+    observability_manager_->BeginShutdown(budget);
 }
 
 void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn) {

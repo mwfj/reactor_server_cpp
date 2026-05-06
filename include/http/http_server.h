@@ -508,6 +508,22 @@ private:
     // BeginShutdown. No-op when observability is not configured.
     void DrainObservabilityForShutdown(std::chrono::milliseconds budget);
 
+    // Two-phase split used by Stop()'s shutdown sequence so the
+    // natural-finalize wait + (future) BatchSpanProcessor ForceFlush
+    // can run BEFORE upstream pool shutdown — when the OTLP push
+    // pipeline is wired through UpstreamHttpClient, the final flush
+    // MUST go through pools that still accept checkouts. The kill +
+    // BeginShutdown phase runs AFTER upstream drain so proxy
+    // in-flight finalizes complete naturally during the upstream
+    // drain window without hitting CAS-killed snapshots.
+    //
+    // FlushObservability returns true when the natural wait observed
+    // a fully-drained state; the kill phase passes that hint so an
+    // already-drained pipeline skips the kill sweep entirely.
+    bool FlushObservabilityForShutdown(std::chrono::milliseconds budget);
+    void KillAndShutdownObservability(std::chrono::milliseconds budget,
+                                       bool drained_in_flush_phase);
+
     // Helper: set up request handler on an Http2ConnectionHandler
     void SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn);
 
