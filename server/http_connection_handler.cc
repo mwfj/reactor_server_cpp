@@ -1694,26 +1694,23 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         // `finalize_response_`, which clears `deferred_response_pending_`,
         // delivers any earlier-stashed pipelined bytes, and — when the
         // response asked to close — calls CloseConnection. We must
-        // NOT take the deferred-stash branch below: bytes after
+        // NOT take the deferred-stash branch below (bytes after
         // `consumed` belong to the next pipelined request and must be
         // parsed normally, not re-stashed into a buffer nothing will
-        // ever replay. We must also NOT call SendResponse(response)
-        // (it would write a stale empty response on top of the wire
-        // bytes already flushed by the streaming sender). Fall through
-        // to the post-response cleanup that resets the parser, advances
-        // `buf`, and continues the pipelining loop.
+        // ever replay) and we must NOT call SendResponse(response) (it
+        // would write a stale empty response on top of the wire bytes
+        // already flushed by the streaming sender). We DO want to fall
+        // through to the post-response cleanup at the bottom of this
+        // function so the request-timeout deadline is re-armed when
+        // `remaining > 0` — finalize_response_ already cleared the
+        // previous deadline, so without that re-arm a partial pipelined
+        // request following a body-suppressed streaming response has
+        // no slowloris protection until the (much longer) idle timeout
+        // fires.
         const bool streaming_finalised_sync =
             response.IsDeferred() && !deferred_response_pending_;
-        if (streaming_finalised_sync) {
-            if (conn_->IsClosing()) return false;
-            // Leave request_in_progress_ as the post-handler cleanup
-            // sets it; jump straight to the pipelining loop.
-            request_in_progress_ = false;
-            buf += consumed;
-            remaining -= consumed;
-            parser_.Reset();
-            sent_100_continue_ = false;
-            return true;
+        if (streaming_finalised_sync && conn_->IsClosing()) {
+            return false;
         }
 
         // Async handler path: the framework marked the response as deferred
@@ -1724,7 +1721,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         // Route them through StashDeferredBytes so the same size cap and
         // force-close-on-overflow logic as OnRawData's top-level stash
         // applies.
-        if (response.IsDeferred()) {
+        if (response.IsDeferred() && !streaming_finalised_sync) {
             request_in_progress_ = false;
             // Arm a ROLLING heartbeat deadline that re-arms itself on
             // fire to suppress idle_timeout while the async handler
@@ -1909,31 +1906,36 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             return false;
         }
 
-        const bool should_close = NormalizeOutgoingResponse(
-            response, req.keep_alive, req.http_minor);
+        // Sync-response path. Skipped when the streaming sender already
+        // finalised inline (the response is on the wire and CloseConnection
+        // / keep-alive accounting were handled by `finalize_response_`).
+        if (!streaming_finalised_sync) {
+            const bool should_close = NormalizeOutgoingResponse(
+                response, req.keep_alive, req.http_minor);
 
-        // RFC 7231 §4.3.2: HEAD responses carry the GET headers (including
-        // Content-Length) but MUST NOT include a body. Serialize first so
-        // the framework's auto-computed Content-Length is preserved, then
-        // strip the body from the wire.
-        if (req.method == "HEAD") {
-            response.Version(1, current_http_minor_.load(std::memory_order_acquire));
-            std::string wire = response.Serialize();
-            StripResponseBodyForHead(wire);
-            conn_->SendRaw(wire.data(), wire.size());
-        } else {
-            SendResponse(response);
-        }
+            // RFC 7231 §4.3.2: HEAD responses carry the GET headers (including
+            // Content-Length) but MUST NOT include a body. Serialize first so
+            // the framework's auto-computed Content-Length is preserved, then
+            // strip the body from the wire.
+            if (req.method == "HEAD") {
+                response.Version(1, current_http_minor_.load(std::memory_order_acquire));
+                std::string wire = response.Serialize();
+                StripResponseBodyForHead(wire);
+                conn_->SendRaw(wire.data(), wire.size());
+            } else {
+                SendResponse(response);
+            }
 
-        // If SendResponse triggered a connection close (e.g., EPIPE),
-        // stop processing pipelined requests.
-        if (conn_->IsClosing()) {
-            return false;
-        }
+            // If SendResponse triggered a connection close (e.g., EPIPE),
+            // stop processing pipelined requests.
+            if (conn_->IsClosing()) {
+                return false;
+            }
 
-        if (should_close) {
-            CloseConnection();
-            return false;
+            if (should_close) {
+                CloseConnection();
+                return false;
+            }
         }
     }
 

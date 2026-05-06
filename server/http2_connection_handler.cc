@@ -305,22 +305,6 @@ public:
         if (!headers_sent_) {
             return HandleProgrammerError("SendData");
         }
-        // Body-suppressed (HEAD / 204 / 205 / 304) silently drops body
-        // bytes — there is no body on the wire. This branch must run
-        // BEFORE the terminal_/data_source_ guard because SendHeaders
-        // for body-suppressed responses now sets terminal_=true and
-        // resets data_source_; a handler that follows SendHeaders with
-        // SendData (a benign no-op for body-suppressed status) would
-        // otherwise observe CLOSED instead of ACCEPTED.
-        if (body_suppressed_) {
-            return SendResult::ACCEPTED_BELOW_WATER;
-        }
-        if (terminal_ || programmer_error_ || !data_source_) {
-            logging::Get()->debug(
-                "H2 streaming SendData rejected stream={} terminal={} programmer_error={} has_data_source={} len={}",
-                stream_id_, terminal_, programmer_error_, data_source_ != nullptr, len);
-            return SendResult::CLOSED;
-        }
         auto self = handler_.lock();
         auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
         auto conn = self ? self->GetConnection() : nullptr;
@@ -334,6 +318,27 @@ public:
             logging::Get()->error(
                 "H2 streaming SendData called off dispatcher stream={}",
                 stream_id_);
+            return SendResult::CLOSED;
+        }
+        // Body-suppressed (HEAD / 204 / 205 / 304) silently drops body
+        // bytes — there is no body on the wire. Must run BEFORE the
+        // terminal_/data_source_ guard because SendHeaders for body-
+        // suppressed responses sets terminal_=true and resets
+        // data_source_, and a handler that follows SendHeaders with
+        // SendData (a benign no-op for body-suppressed status) must
+        // see ACCEPTED rather than CLOSED. Must run AFTER the
+        // dispatcher-thread guard so the documented H2 contract
+        // ("SendData is dispatcher-thread-only") is enforced for
+        // body-suppressed streams too — otherwise an off-thread caller
+        // would silently observe ACCEPTED while reading sender state
+        // off-loop.
+        if (body_suppressed_) {
+            return SendResult::ACCEPTED_BELOW_WATER;
+        }
+        if (terminal_ || programmer_error_ || !data_source_) {
+            logging::Get()->debug(
+                "H2 streaming SendData rejected stream={} terminal={} programmer_error={} has_data_source={} len={}",
+                stream_id_, terminal_, programmer_error_, data_source_ != nullptr, len);
             return SendResult::CLOSED;
         }
         bytes_sent_ += len;
@@ -394,11 +399,13 @@ public:
             return SendResult::CLOSED;
         }
         terminal_ = true;
-        // Erase the abort hook + fire finalize_request_ BEFORE flushing
-        // EOF: data_source_->Finish() + SendPendingFrames may close
-        // the stream synchronously and fire the stream-close callback,
-        // which runs the abort hook. Without this ordering, a normal
-        // streaming completion gets recorded as status=0/client_disconnect.
+        // Erase the abort hook BEFORE flushing EOF. data_source_->Finish()
+        // + SendPendingFrames may close the stream synchronously and fire
+        // the stream-close callback (which would otherwise call
+        // FireAndEraseStreamAbortHook → run a stale hook → record
+        // status=0/client_disconnect on a normal completion). Erasing
+        // makes the close-callback's hook lookup a no-op regardless of
+        // when the close actually lands.
         self->EraseStreamAbortHook(stream_id_);
         if (body_suppressed_) {
             data_source_.reset();
@@ -408,9 +415,20 @@ public:
             }
             return SendResult::ACCEPTED_BELOW_WATER;
         }
-        if (finalize_request_) {
-            finalize_request_(last_status_code_, bytes_sent_, std::string{});
-        }
+        // For body-bearing streams the success finalize must NOT fire
+        // until ResumeStreamData succeeds. If Resume fails (stream no
+        // longer resumable / RST_STREAM observed / nghttp2 lost the
+        // stream), the response never emitted a successful END_STREAM
+        // and observability must record an error. Firing the success
+        // finalize first then trying to overwrite via AbortInternal
+        // doesn't work: AbortInternal early-returns on
+        // `terminal_ && !from_programmer_error`, AND finalize_request_
+        // is gated by a one-shot bookkeeping_done CAS plus
+        // FinalizeFromSnapshot's own snap.finalized CAS, so a second
+        // call is silently dropped. Instead, fire the error finalize
+        // explicitly on the Resume-failure branch and the success
+        // finalize only after a clean Resume (or after Finish() on the
+        // in-receive path where the post-receive flush handles EOF).
         data_source_->Finish();
         if (!session->InReceiveData()) {
             int rv = session->ResumeStreamData(stream_id_);
@@ -418,13 +436,18 @@ public:
                 logging::Get()->warn(
                     "H2 streaming End resume failed stream={} rv={}",
                     stream_id_, rv);
-                // finalize_request_ already fired; AbortInternal's
-                // additional finalize is CAS-blocked.
+                if (finalize_request_) {
+                    finalize_request_(/*status_code=*/0, /*bytes_sent=*/0,
+                                        /*error_type=*/"client_disconnect");
+                }
                 AbortInternal(false, AbortReason::CLIENT_DISCONNECT);
                 return SendResult::CLOSED;
             }
             session->SendPendingFrames();
             self->RecheckShutdownDrainAfterFlush();
+        }
+        if (finalize_request_) {
+            finalize_request_(last_status_code_, bytes_sent_, std::string{});
         }
         return SendResult::ACCEPTED_BELOW_WATER;
     }
