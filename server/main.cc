@@ -681,8 +681,14 @@ static bool ReloadConfig(const std::string& config_path,
             ServerConfig validation_copy = new_config;
             validation_copy.observability.traces.batch.max_queue_size =
                 current_config.observability.traces.batch.max_queue_size;
+            // observability_live mirrors the startup decision: the
+            // master `enabled` field is restart-only and preserved
+            // across reloads (saved_obs_enabled below), so the live
+            // value here is the boot-time setting that determined
+            // whether HttpServer instantiated an ObservabilityManager.
             ConfigLoader::ValidateHotReloadable(
-                validation_copy, live_names, live_issuer_names);
+                validation_copy, live_names, live_issuer_names,
+                /*observability_live=*/current_config.observability.enabled);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Config reload rejected: {}", e.what());
             reopen_existing_logs();

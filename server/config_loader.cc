@@ -1775,7 +1775,8 @@ static void ValidateIntrospectionFields(
 void ConfigLoader::ValidateHotReloadable(
         const ServerConfig& config,
         const std::unordered_set<std::string>& live_upstream_names,
-        const std::unordered_set<std::string>& live_issuer_names) {
+        const std::unordered_set<std::string>& live_issuer_names,
+        bool observability_live) {
     // Mirrors the circuit_breaker validation block in Validate().
     // Kept in lock-step with that block — any rule added there for a
     // hot-reloadable field must be added here too, or the SIGHUP
@@ -1998,17 +1999,22 @@ void ConfigLoader::ValidateHotReloadable(
     // (exporter selection, otlp.upstream cross-refs, prometheus path,
     // histogram bucket layout) are deliberately NOT validated here —
     // SIGHUP edits to those fields are surfaced as the outer "restart
-    // required" warn by HttpServer::Reload's operator!= check.
+    // required" warn by HttpServer::Reload.
     //
-    // force_validate=true: even when the staged file sets
-    // observability.enabled=false (a restart-only field that won't
-    // take effect mid-process), the live manager may still be
-    // running with enabled=true. HttpServer::Reload applies the
-    // staged live subfields to the running pipeline regardless, so
-    // invalid live knobs (schedule_delay_ms=0, negative
-    // max_export_batch_size, etc.) must reject here even with
-    // staged enabled=false.
-    ValidateObservabilityLive(config, /*force_validate=*/true);
+    // force_validate is set ONLY when a live ObservabilityManager
+    // actually consumes the staged live knobs. When the server started
+    // with observability.enabled=false, no manager exists and stale
+    // invalid live values in the file (e.g. schedule_delay_ms=0
+    // carried over from a prior config) would never be applied —
+    // rejecting them here would block unrelated live-safe edits in
+    // the same SIGHUP. When the manager IS live, force_validate=true
+    // because disabling observability is itself restart-only and the
+    // live pipeline keeps consuming the live subset (rejecting the
+    // stale value protects the running exporter / batch processor).
+    // Same scoping rationale as `live_upstream_names` /
+    // `live_issuer_names`: validate only what the apply path will
+    // actually touch.
+    ValidateObservabilityLive(config, /*force_validate=*/observability_live);
 }
 
 // Validate the observability schema. Splits into a "live-reloadable"

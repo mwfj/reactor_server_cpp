@@ -5388,8 +5388,15 @@ bool HttpServer::Reload(ServerConfig new_config) {
             ServerConfig validation_target = new_config;
             validation_target.observability.traces.batch.max_queue_size =
                 live_config_.observability.traces.batch.max_queue_size;
+            // observability_live=true iff the running server actually
+            // built an ObservabilityManager at construction. When
+            // observability was disabled at startup, no live runtime
+            // consumes the staged knobs — rejecting stale invalid live
+            // values here would block unrelated live-safe edits in the
+            // same SIGHUP.
             ConfigLoader::ValidateHotReloadable(
-                validation_target, live_names, live_issuer_names);
+                validation_target, live_names, live_issuer_names,
+                /*observability_live=*/observability_manager_ != nullptr);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Reload() rejected invalid config: {}",
                                   e.what());
@@ -5985,10 +5992,26 @@ bool HttpServer::Reload(ServerConfig new_config) {
     // export interval/timeout, traces.enabled / metrics.enabled,
     // include_target_info). Master `enabled` and Resource (service.*)
     // are restart-required and ignored by Manager::Reload — operators
-    // editing those see them surface only on the next restart. The
-    // ObservabilityConfig::operator== gate excludes the live-reloadable
-    // fields, so the "topology change" warn upstream of this call still
-    // fires when restart-required fields differ.
+    // editing those see them surface as a warn here. The merged-commit
+    // block below preserves the live values silently, so without this
+    // diff/warn an operator could SIGHUP a new exporter, prometheus
+    // path, or `enabled=true` and see "reload OK" with no indication
+    // that the change was ignored.
+    //
+    // ObservabilityConfig::operator== covers exactly the restart-only
+    // fields (enabled, resource.*, exporters, otlp.upstream pair,
+    // max_queue_size, prometheus.path, histogram_buckets). Live-only
+    // edits never trigger this warn.
+    if (live_config_.observability != new_config.observability) {
+        logging::Get()->warn(
+            "Reload: observability restart-only fields changed "
+            "(enabled / resource.* / exporters / otlp.upstream / "
+            "max_queue_size / prometheus.path / histogram_buckets) — "
+            "restart required for those fields to take effect; "
+            "live-reloadable knobs (sampler, batch tuning, "
+            "include_target_info, traces.enabled, metrics.enabled) "
+            "applied normally");
+    }
     if (observability_manager_) {
         observability_manager_->Reload(new_config.observability);
         // Preserve restart-only fields in the live snapshot so that

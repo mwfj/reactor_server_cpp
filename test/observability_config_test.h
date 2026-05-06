@@ -233,6 +233,68 @@ void TestHotReloadableRejectsBadLiveValue() {
     }
 }
 
+// observability_live=false (server started with enabled=false) MUST
+// NOT reject stale invalid live values in the staged file. There is no
+// running ObservabilityManager to consume those fields, so failing here
+// would block unrelated live-safe edits in the same SIGHUP. When the
+// staged file flips enabled=true the validator runs because the
+// operator is opting in (the !oc.enabled short-circuit no longer fires).
+void TestHotReloadableSkipsBadLiveValueWhenNotLive() {
+    try {
+        // Stale live-knob value (schedule_delay_ms=0) carried over in
+        // a config whose master switch is disabled. observability_live
+        // is false → validator must skip the live-knob range checks.
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {"enabled": false,
+                "traces": {"batch": {"schedule_delay_ms": 0}}
+            }
+        })");
+        bool threw = false;
+        try {
+            ConfigLoader::ValidateHotReloadable(cfg, {}, {},
+                /*observability_live=*/false);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TestFramework::RecordTest(
+            "ObsCfg: ValidateHotReloadable skips bad live value when not live",
+            !threw, threw ? "rejected stale live value with no live runtime" : "",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: ValidateHotReloadable skips bad live value when not live",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// observability_live=true (running manager exists, even when staged
+// enabled=false) MUST reject bad live values: the live pipeline keeps
+// consuming them until restart because disabling is restart-only.
+void TestHotReloadableForcesLiveValidationWhenLive() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {"enabled": false,
+                "traces": {"batch": {"schedule_delay_ms": 0}}
+            }
+        })");
+        bool threw = false;
+        try {
+            ConfigLoader::ValidateHotReloadable(cfg, {}, {},
+                /*observability_live=*/true);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TestFramework::RecordTest(
+            "ObsCfg: ValidateHotReloadable forces live validation when live",
+            threw, threw ? "" : "didn't throw on bad live value",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: ValidateHotReloadable forces live validation when live",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // HotReloadable should NOT reject restart-required-only fields (those
 // are surfaced by HttpServer::Reload's outer warn).
 void TestHotReloadableSkipsRestartFields() {
@@ -427,6 +489,8 @@ void RunAllTests() {
     TestValidatePromPathMustStartWithSlash();
     TestValidateRejectsHistogramBucketsOutOfOrder();
     TestHotReloadableRejectsBadLiveValue();
+    TestHotReloadableSkipsBadLiveValueWhenNotLive();
+    TestHotReloadableForcesLiveValidationWhenLive();
     TestHotReloadableSkipsRestartFields();
     TestOperatorEqIgnoresLiveFields();
     TestOperatorEqDetectsRestartChange();

@@ -157,7 +157,18 @@ std::vector<HistogramPoint> Histogram::SnapshotPoints() const {
                 for (const auto& bc : s->bucket_counts) {
                     p.bucket_counts.push_back(bc.load(std::memory_order_acquire));
                 }
-                p.count = s->count.load(std::memory_order_acquire);
+                // Derive count from the captured bucket counts so the
+                // Prometheus invariant `cumulative_buckets <= _count`
+                // holds even when Record() races with this snapshot:
+                // Record() increments bucket_counts BEFORE count, so an
+                // independent count.load() can observe fewer samples
+                // than the bucket loop above and produce a `_bucket{le="+Inf"}`
+                // higher than `_count` — which conforming parsers reject.
+                // Sum-of-buckets is the consistent total for the captured
+                // distribution and matches OTLP's count == sum(buckets).
+                uint64_t derived_count = 0;
+                for (uint64_t bc : p.bucket_counts) derived_count += bc;
+                p.count = derived_count;
                 p.sum   = BitsToDouble(s->sum_bits.load(std::memory_order_acquire));
                 p.has_min_max = s->has_min_max.load(std::memory_order_acquire);
                 if (p.has_min_max) {

@@ -109,10 +109,21 @@ public:
     // AuthManager::Reload as restart-required anyway, so failing the whole
     // hot-reload on it would block unrelated live-safe edits. Empty set is
     // safe: "no live issuers" skips the per-issuer loop entirely.
+    //
+    // `observability_live` indicates whether the running process actually
+    // has an ObservabilityManager consuming live-reloadable knobs. When
+    // false (server started with observability.enabled=false), stale
+    // invalid live values (e.g. schedule_delay_ms=0 sitting in the file
+    // since startup) are NOT rejected — there is no live runtime to feed
+    // them to, so failing here would block unrelated live-safe edits. When
+    // true, validation runs regardless of the staged enabled flag because
+    // disabling observability is itself restart-only and the running
+    // pipeline keeps consuming the live subset until restart.
     static void ValidateHotReloadable(
         const ServerConfig& config,
         const std::unordered_set<std::string>& live_upstream_names,
-        const std::unordered_set<std::string>& live_issuer_names = {});
+        const std::unordered_set<std::string>& live_issuer_names = {},
+        bool observability_live = false);
 
     // Validate inline per-proxy auth blocks (structural checks +
     // enforcement-not-yet-wired gate). Runs the SAME per-upstream auth
