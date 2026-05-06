@@ -1875,6 +1875,92 @@ namespace HttpTests {
         }
     }
 
+    // Regression: an H1 streaming handler that sends a body-suppressed
+    // response (HEAD / 204 / 205 / 304) and returns WITHOUT calling
+    // End() must still finalise the request: clear
+    // deferred_response_pending_ so a subsequent pipelined request on
+    // the same keep-alive connection is parsed instead of being stashed
+    // in deferred_pending_buf_, and decrement active_requests_. The
+    // wire response was already complete after the head bytes; End()
+    // would be redundant. Pre-fix the connection would wedge — the
+    // first response went out fine, but the second request never got
+    // dispatched because the deferred state was never released.
+    void TestH1_StreamingBodyless204NoEndKeepsKeepalive() {
+        std::cout << "\n[TEST] H1 streaming: bodyless 204 without End() "
+                  << "keeps keep-alive parsing the next request..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/no-end",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(204);
+                    (void)stream_sender.SendHeaders(head);
+                    // Intentionally NO End() — exercises the SendHeaders
+                    // body-suppressed finalize path.
+                });
+            server.Get("/after", [](const HttpRequest&, HttpResponse& res) {
+                res.Status(200).Text("AFTER-BODY");
+            });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+            int64_t before = server.GetStats().active_requests;
+
+            // Pipeline both requests in a single send. The second
+            // request reaches the dispatcher only when the first
+            // request's deferred async state is properly cleared.
+            std::string payload =
+                "GET /no-end HTTP/1.1\r\nHost: x\r\n\r\n"
+                "GET /after HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+            std::string resp = SendRawAndDrain(port, payload, 3000);
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("http/1.1 204") == std::string::npos) {
+                pass = false; err += "missing 204 response; ";
+            }
+            if (resp.find("AFTER-BODY") == std::string::npos) {
+                pass = false;
+                err += "second pipelined request never produced a response — "
+                       "deferred_response_pending_ leak; ";
+            }
+
+            // Bookkeeping must drop back to baseline before the
+            // connection closes. Pre-fix the decrement happened only at
+            // socket close, well after this poll window.
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(2);
+            int64_t after = server.GetStats().active_requests;
+            while (after != before &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                after = server.GetStats().active_requests;
+            }
+            if (after != before) {
+                pass = false;
+                err += "active_requests stuck at " + std::to_string(after) +
+                       " (expected " + std::to_string(before) + "); ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: bodyless 204 without End() keeps keepalive",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: bodyless 204 without End() keeps keepalive",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     void TestH1_Streaming205CanonicalizesContentLength() {
         std::cout << "\n[TEST] H1 streaming: 205 canonicalizes Content-Length..." << std::endl;
         try {
@@ -2902,6 +2988,7 @@ namespace HttpTests {
         TestH1_StreamingTrailers_DeclarationFiltersForbiddenNames();
         TestH1_StreamingTrailers_SuppressedWhenNotChunked();
         TestH1_StreamingTrailers_DropsUndeclaredFields();
+        TestH1_StreamingBodyless204NoEndKeepsKeepalive();
         TestH1_Streaming205CanonicalizesContentLength();
         TestH1_StreamingDeduplicatesContentLength();
         TestH1_StreamingHttp10UnknownLengthOmitsContentLength();

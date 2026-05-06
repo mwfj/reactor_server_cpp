@@ -313,6 +313,32 @@ public:
             mark_response_committed_();
         }
         conn_->SendRaw(prepared->wire.data(), prepared->wire.size());
+        if (body_suppressed_) {
+            // Mirrors the H2 SendHeaders fix: body-suppressed responses
+            // (HEAD / 204 / 205 / 304 / 1xx) are fully on the wire after
+            // the head bytes are flushed — there's no body, no chunked
+            // terminator, and no trailers (PrepareHead disables chunked
+            // for these). If the handler returns without End(), the
+            // async-dispatch finalizers never run: active_requests_
+            // stays elevated, observability records never close, and
+            // crucially `finalize_response_` never clears
+            // `deferred_response_pending_`, so on a keep-alive socket
+            // the next pipelined bytes are stashed in
+            // deferred_pending_buf_ and never parsed — the connection
+            // wedges until the client gives up. End()'s body-suppressed
+            // path runs the SAME two finalisers in the SAME order; we
+            // run them here so handlers that omit End() still complete
+            // cleanly. End() called afterward early-returns on
+            // `terminal_` (no-op) so it remains safe to call.
+            terminal_ = true;
+            if (finalize_request_) {
+                finalize_request_(last_status_code_, bytes_sent_,
+                                    std::string{});
+            }
+            if (finalize_response_) {
+                finalize_response_(should_close_);
+            }
+        }
         return 0;
     }
 
@@ -332,16 +358,21 @@ public:
         if (!headers_sent_) {
             return HandleProgrammerError("SendData");
         }
+        // Body-suppressed (HEAD / 1xx / 204 / 205 / 304) silently drops
+        // body bytes — there's no body on the wire. Must run BEFORE the
+        // terminal_ guard because SendHeaders for body-suppressed
+        // responses now sets terminal_=true (see SendHeaders body-
+        // suppressed finalize path); a handler that follows SendHeaders
+        // with SendData would otherwise observe CLOSED instead of the
+        // ACCEPTED contract this branch documents.
+        if (body_suppressed_) {
+            return SendResult::ACCEPTED_BELOW_WATER;
+        }
         if (terminal_ || programmer_error_) {
             logging::Get()->debug(
                 "H1 streaming SendData rejected fd={} terminal={} programmer_error={} len={}",
                 conn_->fd(), terminal_, programmer_error_, len);
             return SendResult::CLOSED;
-        }
-        if (body_suppressed_) {
-            // Wire body is empty (HEAD / 1xx / 204 / 304); accept the
-            // chunk semantically but don't count it toward bytes_sent_.
-            return SendResult::ACCEPTED_BELOW_WATER;
         }
         bytes_sent_ += len;
         if (use_chunked_) {
@@ -1655,6 +1686,34 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             SendResponse(response);
             CloseConnection();
             return false;
+        }
+
+        // Streaming sender that finalised synchronously inside the
+        // handler (e.g. SendHeaders for HEAD/204/205/304, or
+        // SendHeaders+End on the dispatcher) has already called
+        // `finalize_response_`, which clears `deferred_response_pending_`,
+        // delivers any earlier-stashed pipelined bytes, and — when the
+        // response asked to close — calls CloseConnection. We must
+        // NOT take the deferred-stash branch below: bytes after
+        // `consumed` belong to the next pipelined request and must be
+        // parsed normally, not re-stashed into a buffer nothing will
+        // ever replay. We must also NOT call SendResponse(response)
+        // (it would write a stale empty response on top of the wire
+        // bytes already flushed by the streaming sender). Fall through
+        // to the post-response cleanup that resets the parser, advances
+        // `buf`, and continues the pipelining loop.
+        const bool streaming_finalised_sync =
+            response.IsDeferred() && !deferred_response_pending_;
+        if (streaming_finalised_sync) {
+            if (conn_->IsClosing()) return false;
+            // Leave request_in_progress_ as the post-handler cleanup
+            // sets it; jump straight to the pipelining loop.
+            request_in_progress_ = false;
+            buf += consumed;
+            remaining -= consumed;
+            parser_.Reset();
+            sent_100_continue_ = false;
+            return true;
         }
 
         // Async handler path: the framework marked the response as deferred
