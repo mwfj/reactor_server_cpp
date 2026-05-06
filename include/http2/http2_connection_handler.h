@@ -68,7 +68,15 @@ public:
     // async operation completes. Safe to call with a stream_id that has
     // already closed (e.g. due to client RST_STREAM or connection drop) —
     // Http2Session handles the missing-stream case internally.
-    void SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
+    // Submits a response and flushes pending frames. Returns 0 on
+    // submit success, -1 if Http2Session::SubmitResponse rejected the
+    // call (stream not found / closed / 1xx misuse). The flush still
+    // runs on -1 so any prior queued frames drain. Callers that record
+    // observability on success must check the return value AND call
+    // WasStreamClosedSuccessfully(stream_id) after the flush, because
+    // submit-then-RST in the same recv batch will return 0 here but
+    // discard the response frames during the post-receive flush.
+    int SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
 
     // ============================================================
     // Observability finalize hooks
@@ -234,6 +242,17 @@ public:
             if (slot) slot->store(true, std::memory_order_release);
         }
         stream_post_write_notify_.clear();
+        // Drain any deferred post-receive finalisers. Streaming senders
+        // that fired SendHeaders/End from inside ReceiveData and
+        // queued their finalize through EnqueuePostReceiveTask would
+        // otherwise leak observability + active_requests bookkeeping
+        // when the connection is torn down before OnRawData's tail
+        // flush could run. The deferred closure's
+        // WasStreamClosedSuccessfully check correctly returns false for
+        // streams whose on_stream_close did not record (teardown skips
+        // OnStreamCloseCallback's user-callback path), so the
+        // finalisers record client_disconnect.
+        DrainPostReceiveTasks();
     }
 
 private:
@@ -307,4 +326,44 @@ private:
     // signal. Consumed by the shutdown-route pump.
     std::unordered_map<int32_t, std::shared_ptr<std::atomic<bool>>>
         stream_post_write_notify_;
+
+    // Per-stream nghttp2 close error code, recorded in
+    // WrapStreamCloseCallback before the user callback runs. Lets a
+    // deferred response finalize (the streaming sender or the async
+    // complete path) discriminate "stream cleanly closed" (NO_ERROR)
+    // from "stream reset by peer" (CANCEL / REFUSED_STREAM / ...) so
+    // observability records the actual outcome instead of overwriting
+    // a clean status onto a discarded response. Dispatcher-thread-only.
+    std::unordered_map<int32_t, uint32_t> stream_close_error_codes_;
+
+    // Tasks deferred from inside Http2Session::ReceiveData
+    // (e.g. streaming-sender finalisers) until AFTER OnRawData's
+    // post-receive SendPendingFrames flushes. By that point any
+    // late RST_STREAM the peer included in the same recv batch has
+    // closed the stream, so the deferred task can read the actual
+    // outcome via WasStreamClosedSuccessfully. Dispatcher-thread-only.
+    std::vector<std::function<void()>> pending_post_receive_tasks_;
+
+public:
+    // Outcome predicate for deferred finalisers. Returns true when the
+    // stream is still alive in nghttp2 (response in flight) OR closed
+    // with NGHTTP2_NO_ERROR (clean END_STREAM both directions). Returns
+    // false only when the stream closed with a non-zero error code
+    // (peer RST or local protocol abort) — which means the response
+    // never reached the wire as a clean END_STREAM. Erases the close-
+    // code entry on consume so the map stays bounded. Dispatcher-
+    // thread-only.
+    bool WasStreamClosedSuccessfully(int32_t stream_id);
+
+    // Enqueue a closure to run AFTER OnRawData's tail SendPendingFrames
+    // (and after any in-flight on_stream_close callbacks that flush
+    // would drive). Used by streaming senders that finalise observability
+    // from inside a receive callback — the success/error decision must
+    // wait until the rest of the recv batch has been processed.
+    void EnqueuePostReceiveTask(std::function<void()> task);
+
+private:
+    // Drain pending_post_receive_tasks_. Called from OnRawData after
+    // the post-receive flush; callers outside that path must not invoke.
+    void DrainPostReceiveTasks();
 };

@@ -4727,34 +4727,54 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                              obs_snap_local, was_head_local]() {
                             if (cancelled->load(std::memory_order_acquire)) return;
                             // Erase the per-stream abort hook BEFORE
-                            // SubmitStreamResponse: that call goes on
-                            // to SendPendingFrames(), and nghttp2 can
+                            // SubmitStreamResponse: that call drives
+                            // SendPendingFrames(), and nghttp2 can
                             // synchronously close the stream and fire
-                            // the close callback inline, which would
-                            // call FireAndEraseStreamAbortHook() and
-                            // run the abort hook BEFORE we get to
-                            // FinalizeFromSnapshot below. Without this
-                            // erase, the hook's CAS-wins finalize
-                            // records status=0/client_disconnect for a
-                            // perfectly normal completion.
+                            // the close callback inline. Without this
+                            // erase, the close-callback path would run
+                            // a stale abort hook AFTER our finalize and
+                            // re-record bookkeeping/observability.
                             s->EraseStreamAbortHook(stream_id);
-                            // Finalize BEFORE submit: SubmitStreamResponse
-                            // can synchronously close the stream + start
-                            // the next stream on multiplexed connections,
-                            // mirroring the H1 ordering fix.
+                            // Finalize AFTER submit + flush so we know
+                            // the response actually reached the wire.
+                            // SubmitStreamResponse returns -1 if
+                            // Http2Session rejected the call (stream
+                            // already closed / 1xx misuse), and even on
+                            // a 0 return the post-submit flush can
+                            // discard frames if the peer batched
+                            // RST_STREAM behind the request:
+                            //   * submit_rv != 0 ⇒ definitely failed
+                            //   * submit_rv == 0 + WasStreamClosedSuccessfully
+                            //     ⇒ delivered (in flight or clean close)
+                            //   * submit_rv == 0 + !WasStreamClosedSuccessfully
+                            //     ⇒ frames were discarded (peer-RST during
+                            //     same recv batch). Record client_disconnect.
+                            const int submit_rv =
+                                s->SubmitStreamResponse(stream_id, *shared_resp);
+                            const bool delivered =
+                                submit_rv == 0 &&
+                                s->WasStreamClosedSuccessfully(stream_id);
                             if (obs_snap_local) {
                                 auto mgr = obs_snap_local->manager.lock();
                                 if (mgr) {
-                                    const uint64_t wire_size =
-                                        ObsWireBodySize(*shared_resp, was_head_local);
-                                    mgr->FinalizeFromSnapshot(
-                                        *obs_snap_local,
-                                        shared_resp->GetStatusCode(),
-                                        wire_size,
-                                        /*error_type=*/std::string{});
+                                    if (delivered) {
+                                        const uint64_t wire_size =
+                                            ObsWireBodySize(*shared_resp,
+                                                              was_head_local);
+                                        mgr->FinalizeFromSnapshot(
+                                            *obs_snap_local,
+                                            shared_resp->GetStatusCode(),
+                                            wire_size,
+                                            /*error_type=*/std::string{});
+                                    } else {
+                                        mgr->FinalizeFromSnapshot(
+                                            *obs_snap_local,
+                                            /*status_code=*/0,
+                                            /*wire_body_size=*/0,
+                                            /*error_type=*/"client_disconnect");
+                                    }
                                 }
                             }
-                            s->SubmitStreamResponse(stream_id, *shared_resp);
                             if (!bookkeeping_done->exchange(
                                     true, std::memory_order_acq_rel)) {
                                 active_counter->fetch_sub(
