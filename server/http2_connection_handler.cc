@@ -271,6 +271,29 @@ public:
         }
         headers_sent_ = true;
         last_status_code_ = headers_only_response.GetStatusCode();
+        if (body_suppressed_) {
+            // Body-suppressed responses (HEAD / 204 / 205 / 304) are
+            // submitted as a headers-only frame with END_STREAM already
+            // set. The next flush — either inline below, or the
+            // OnRawData tail flush when called from inside a receive
+            // callback — can drive nghttp2's on_stream_close synchronously
+            // and tear the stream down before the handler ever calls
+            // End(). The dispatch site installs a per-stream abort hook
+            // AFTER the streaming handler returns; that hook would then
+            // fire on connection teardown and overwrite a clean status
+            // with status=0/client_disconnect, plus skew active_requests_
+            // (the streaming sender's finalize_request_ never ran). We
+            // mirror End()'s body-suppressed branch here so the response
+            // is observability-finalised and bookkeeping-decremented
+            // before any flush can race the close callback.
+            terminal_ = true;
+            data_source_.reset();
+            self->EraseStreamAbortHook(stream_id_);
+            if (finalize_request_) {
+                finalize_request_(last_status_code_, bytes_sent_,
+                                    std::string{});
+            }
+        }
         if (!session->InReceiveData()) {
             session->SendPendingFrames();
             self->RecheckShutdownDrainAfterFlush();
@@ -281,6 +304,16 @@ public:
     SendResult SendData(const char* data, size_t len) override {
         if (!headers_sent_) {
             return HandleProgrammerError("SendData");
+        }
+        // Body-suppressed (HEAD / 204 / 205 / 304) silently drops body
+        // bytes — there is no body on the wire. This branch must run
+        // BEFORE the terminal_/data_source_ guard because SendHeaders
+        // for body-suppressed responses now sets terminal_=true and
+        // resets data_source_; a handler that follows SendHeaders with
+        // SendData (a benign no-op for body-suppressed status) would
+        // otherwise observe CLOSED instead of ACCEPTED.
+        if (body_suppressed_) {
+            return SendResult::ACCEPTED_BELOW_WATER;
         }
         if (terminal_ || programmer_error_ || !data_source_) {
             logging::Get()->debug(
@@ -302,12 +335,6 @@ public:
                 "H2 streaming SendData called off dispatcher stream={}",
                 stream_id_);
             return SendResult::CLOSED;
-        }
-        if (body_suppressed_) {
-            // Status doesn't allow a body — accept the chunk without
-            // counting it; bytes_sent_ stays at 0 so the finalize sees
-            // wire body == 0.
-            return SendResult::ACCEPTED_BELOW_WATER;
         }
         bytes_sent_ += len;
         if (data_source_->Append(data, len) == SendResult::CLOSED) {

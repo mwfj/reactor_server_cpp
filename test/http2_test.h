@@ -4263,6 +4263,90 @@ void TestH2_StreamingAbortBeforeHeadersResetsStream() {
     }
 }
 
+// Regression: a streaming handler that sends a body-suppressed status
+// (HEAD / 204 / 205 / 304) and returns WITHOUT calling End() must still
+// finalize bookkeeping (active_requests + observability). The streaming
+// SendHeaders submits an END_STREAM headers-only frame; the dispatch
+// site installs the per-stream abort hook AFTER the handler returns,
+// so a flush race could leave the hook to fire as client_disconnect on
+// connection teardown — corrupting observability and inflating
+// active_requests for the lifetime of the connection. The fix
+// finalises the snapshot + decrements bookkeeping inside SendHeaders
+// for body-suppressed streams.
+void TestH2_StreamingBodyless204NoEndFinalizesPromptly() {
+    std::cout << "\n[TEST] H2 streaming: bodyless 204 without End() finalizes..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        server.GetAsync(
+            "/stream-204-no-end",
+            [](const HttpRequest&,
+               HttpRouter::InterimResponseSender /*send_interim*/,
+               HttpRouter::ResourcePusher /*push_resource*/,
+               HttpRouter::StreamingResponseSender stream_sender,
+               HttpRouter::AsyncCompletionCallback /*complete*/) {
+                HttpResponse head;
+                head.Status(204);
+                (void)stream_sender.SendHeaders(head);
+                // Intentionally NO End() — exercises the SendHeaders
+                // body-suppressed finalize path.
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+        int64_t before = server.GetStats().active_requests;
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.Get("/stream-204-no-end");
+            if (resp.status != 204) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) + "; ";
+            }
+            if (resp.rst) {
+                pass = false;
+                err += "unexpected RST_STREAM; ";
+            }
+            if (!resp.body.empty()) {
+                pass = false;
+                err += "body should be empty; ";
+            }
+
+            // Critical regression check: active_requests must return to
+            // baseline WHILE the connection is still open. Pre-fix, the
+            // decrement was deferred until connection close (when
+            // FireAllStreamAbortHooks ran the lingering hook).
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(2);
+            int64_t after = server.GetStats().active_requests;
+            while (after != before &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                after = server.GetStats().active_requests;
+            }
+            if (after != before) {
+                pass = false;
+                err += "active_requests stuck at " + std::to_string(after) +
+                       " (expected " + std::to_string(before) +
+                       ") while connection still open — abort hook leak; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: bodyless 204 without End() finalizes promptly",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: bodyless 204 without End() finalizes promptly",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestH2_StreamingNoBodyEndDoesNotResetStream() {
     std::cout << "\n[TEST] H2 streaming: bodyless End does not reset stream..."
               << std::endl;
@@ -5645,6 +5729,7 @@ void RunAllTests() {
     TestH2_Async_HandlerThrowFiresCancelSlot();
     TestH2_StreamingHandlerThrowAfterHeadersFinalizesRequest();
     TestH2_StreamingAbortBeforeHeadersResetsStream();
+    TestH2_StreamingBodyless204NoEndFinalizesPromptly();
     TestH2_StreamingNoBodyEndDoesNotResetStream();
     TestH2_StreamingBodylessSendDataDropsAndFinalizes();
     TestH2_StreamingUnknownLengthOmitsContentLength();
