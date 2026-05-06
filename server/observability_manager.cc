@@ -236,15 +236,26 @@ bool ObservabilityManager::FinalizeFromSnapshot(
     int      status_code,
     uint64_t wire_body_size,
     std::string error_type) {
+    // Reserve the in-progress slot BEFORE the CAS. Otherwise a
+    // thread that wins the CAS but is preempted before incrementing
+    // would let DrainObservabilityForShutdown observe
+    // finalizers_in_progress_ == 0 and call BeginShutdown, which
+    // would then race the still-pending Span::End and drop the
+    // completed span as a post-shutdown OnEnd. Decrement on CAS
+    // failure so the loser path doesn't leak the reservation.
+    finalizers_in_progress_.fetch_add(1, std::memory_order_acq_rel);
+
     // Idempotent CAS gate — exactly one caller wins.
     bool expected = false;
     if (!snap.finalized.compare_exchange_strong(expected, true,
             std::memory_order_acq_rel)) {
+        finalizers_in_progress_.fetch_sub(1, std::memory_order_acq_rel);
+        // Notify so a drain wait that latched on this loser-bump
+        // wakes once the counter returns to its real value.
+        std::lock_guard<std::mutex> g(finalizers_done_mtx_);
+        finalizers_done_cv_.notify_all();
         return false;
     }
-
-    // Make the in-progress finalize visible to the shutdown wait predicate.
-    finalizers_in_progress_.fetch_add(1, std::memory_order_acq_rel);
 
     try {
         OnFinalizeWinner(snap, status_code, wire_body_size, error_type);
@@ -345,8 +356,23 @@ void ObservabilityManager::OnFinalizeWinner(
             snap.inbound_span->SetAttribute(
                 std::string(sem::kErrorType),
                 AttrValue(effective_error));
-            snap.inbound_span->SetStatus(SpanStatusCode::ERROR,
-                                          effective_error);
+            // OTel HTTP semconv: server-side 4xx maps to Status=UNSET
+            // (client misuse, not a server fault). ERROR is reserved
+            // for 5xx and transport-level aborts (status_code <= 0
+            // means the response never reached the wire — covers
+            // client_disconnect / server_timeout / handler_threw /
+            // ws_upgrade_handler_threw / async_route_warmup_unavailable
+            // / rejected_by_*_middleware-on-disconnect). Without this
+            // gate, 4xx auth/validation rejections would inflate
+            // server-error span telemetry even though the metric
+            // already correctly carries error.type=…
+            const bool is_server_error =
+                (status_code >= 500 && status_code < 600) ||
+                status_code <= 0;
+            if (is_server_error) {
+                snap.inbound_span->SetStatus(SpanStatusCode::ERROR,
+                                              effective_error);
+            }
         }
         // Idempotent + dispatcher-thread-only. The shutdown kill path
         // takes a different code route via KillOutstandingSnapshots.

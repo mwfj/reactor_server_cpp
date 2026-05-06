@@ -1057,17 +1057,53 @@ void HttpRouter::ResolveRouteMatch(HttpRequest& request) const {
         }
     }
     if (request.method == "HEAD") {
-        auto get_it = method_tries_.find("GET");
-        if (get_it != method_tries_.end()) {
-            std::unordered_map<std::string, std::string> params;
-            auto result = get_it->second.Search(request.path, params);
-            if (result.handler) {
-                request.params                          = std::move(params);
-                request.route_match.kind                = RouteKind::Sync;
-                request.route_match.pattern             = std::move(result.matched_pattern);
-                request.route_match.method_for_dispatch = "GET";
-                request.route_match.head_fallback       = true;
-                return;
+        // Mirror DispatchHandler's head_blocked_by_async gate: if an
+        // async/proxy GET pattern at this path opted out of HEAD
+        // fallback (DisableHeadFallback registered the pattern in
+        // head_fallback_blocked_), the dispatch path returns 405
+        // even when a sync GET is registered. Resolving to
+        // RouteKind::Sync with head_fallback=true would tell the
+        // observability middleware that the sync route handled the
+        // request — when DispatchHandler later rejects it. Apply
+        // the same proxy-companion yield rule (a sync GET on the
+        // exact path overrides a companion-blocked async pattern).
+        bool head_blocked_by_async = false;
+        auto async_get_it = async_method_tries_.find("GET");
+        if (async_get_it != async_method_tries_.end()) {
+            std::unordered_map<std::string, std::string> tmp;
+            auto async_result =
+                async_get_it->second.Search(request.path, tmp);
+            if (async_result.handler &&
+                head_fallback_blocked_.count(async_result.matched_pattern)) {
+                bool companion_yields_to_sync = false;
+                auto comp_get_it = proxy_companion_patterns_.find("GET");
+                if (comp_get_it != proxy_companion_patterns_.end() &&
+                    comp_get_it->second.count(
+                        async_result.matched_pattern) > 0) {
+                    auto sync_get_it = method_tries_.find("GET");
+                    if (sync_get_it != method_tries_.end() &&
+                        sync_get_it->second.HasMatch(request.path)) {
+                        companion_yields_to_sync = true;
+                    }
+                }
+                if (!companion_yields_to_sync) {
+                    head_blocked_by_async = true;
+                }
+            }
+        }
+        if (!head_blocked_by_async) {
+            auto get_it = method_tries_.find("GET");
+            if (get_it != method_tries_.end()) {
+                std::unordered_map<std::string, std::string> params;
+                auto result = get_it->second.Search(request.path, params);
+                if (result.handler) {
+                    request.params                          = std::move(params);
+                    request.route_match.kind                = RouteKind::Sync;
+                    request.route_match.pattern             = std::move(result.matched_pattern);
+                    request.route_match.method_for_dispatch = "GET";
+                    request.route_match.head_fallback       = true;
+                    return;
+                }
             }
         }
     }

@@ -55,9 +55,50 @@ json AttrValueToJson(const AttrValue& v) {
     }, v.value);
 }
 
+// Sensitive-attribute denylist. Span / event / resource attribute
+// keys matching any entry (case-insensitive, after lowercasing) are
+// exported with their value replaced by "[REDACTED]" so tokens,
+// cookies, and api keys never leave the process. The match is
+// EXACT — partial matches like `myauthorization` are not redacted.
+// Operators with additional keys to scrub should land them via a
+// follow-up that surfaces the list as configuration; this minimal
+// fixed set covers the headers the OTel HTTP semconv calls out.
+bool IsSensitiveAttributeKey(const std::string& key) {
+    static const char* const kDenylist[] = {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "http.request.header.authorization",
+        "http.request.header.proxy-authorization",
+        "http.request.header.cookie",
+        "http.request.header.x-api-key",
+        "http.response.header.set-cookie",
+    };
+    if (key.empty()) return false;
+    std::string lower;
+    lower.reserve(key.size());
+    for (char c : key) {
+        lower.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c))));
+    }
+    for (const char* d : kDenylist) {
+        if (lower == d) return true;
+    }
+    return false;
+}
+
 json AttributesToJson(const std::vector<Attribute>& attrs) {
     json arr = json::array();
     for (const auto& a : attrs) {
+        if (IsSensitiveAttributeKey(a.key)) {
+            arr.push_back({
+                {"key", a.key},
+                {"value", json{{"stringValue", "[REDACTED]"}}}
+            });
+            continue;
+        }
         arr.push_back({
             {"key", a.key},
             {"value", AttrValueToJson(a.value)}

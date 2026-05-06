@@ -4,6 +4,7 @@
 #include "observability/metric_writer_context.h"
 
 #include "common.h"
+#include <cmath>
 
 namespace OBSERVABILITY_NAMESPACE {
 
@@ -21,6 +22,16 @@ Counter::Counter(std::string name,
 
 void Counter::Add(double value,
                    const std::vector<std::pair<std::string, std::string>>& kvs) {
+    // NaN < 0 is false, so a NaN delta would slip past the negative
+    // gate and contaminate the atomic sum (NaN contagion → all
+    // subsequent reads return NaN). Reject non-finite values up
+    // front, matching Histogram::Record.
+    if (!std::isfinite(value)) {
+        logging::Get()->warn(
+            "Counter::Add rejected non-finite value for instrument '{}'",
+            name_);
+        return;
+    }
     if (value < 0) {
         logging::Get()->warn(
             "Counter::Add rejected negative value {} for instrument '{}'",
@@ -32,6 +43,16 @@ void Counter::Add(double value,
 
 void Counter::AddInternal(double value,
                             const std::vector<std::pair<std::string, std::string>>& kvs) {
+    // UpDownCounter::Add bypasses the public Counter::Add gate, so
+    // mirror the non-finite reject here too — otherwise a NaN/Inf
+    // delta from the UpDownCounter path would taint the same atomic
+    // sum and corrupt the gauge series.
+    if (!std::isfinite(value)) {
+        logging::Get()->warn(
+            "Counter::AddInternal rejected non-finite value for instrument '{}'",
+            name_);
+        return;
+    }
     LabelSet labels = registry_->BuildLabelSet(kvs);
     const size_t shard_id = MetricWriterContext::GetShardId(shards_.size());
     Shard& shard = shards_[shard_id];

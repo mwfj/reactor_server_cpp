@@ -112,13 +112,18 @@ public:
                  std::chrono::system_clock::now());
 
     // Drop without firing OnEnd. Used by the shutdown kill path to
-    // release Span members WITHOUT enqueueing to the processor (which
-    // may already be torn down). Idempotent. After DropWithoutEnd,
-    // subsequent End() / mutator calls are no-ops.
+    // mark the span dropped WITHOUT enqueueing to the processor (the
+    // processor may already be torn down). Idempotent. After
+    // DropWithoutEnd, subsequent End() / mutator calls are no-ops.
     //
-    // Must be called on the owning dispatcher per the dispatcher-
-    // thread-only mutation contract. Inline kills run it directly;
-    // cross-dispatcher kills marshal via EnQueue.
+    // Off-thread-safe by construction — the implementation only
+    // flips the `dropped_` atomic, so the kill loop in
+    // ObservabilityManager::KillOutstandingSnapshots may invoke this
+    // directly from the stopper thread without marshalling to the
+    // owning dispatcher. Vector / shared_ptr cleanup happens in the
+    // destructor when the last shared_ptr to the Span releases —
+    // bounded by Phase 4 dispatcher stop, which runs after the kill
+    // loop returns.
     void DropWithoutEnd();
 
 private:

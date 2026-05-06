@@ -14,10 +14,21 @@
 //   finalizers_in_progress_  — bumped at FinalizeFromSnapshot entry,
 //                              decremented before return; signaled on
 //                              finalizers_done_cv_.
-//   kill_marshals_in_flight_ — bumped by off-dispatcher kill marshals
-//                              before EnQueue; decremented + cv-notified
-//                              when the closure runs. Inline self-
-//                              dispatcher kills do not touch it.
+//   kill_marshals_in_flight_ — RESERVED for a future per-dispatcher
+//                              kill-marshal path. Today
+//                              KillOutstandingSnapshots invokes
+//                              Span::DropWithoutEnd inline from the
+//                              stopper thread (DropWithoutEnd is
+//                              off-thread-safe — flips an atomic flag
+//                              only; vector/shared_ptr cleanup runs in
+//                              the destructor when the last shared_ptr
+//                              releases, bounded by Phase 4 dispatcher
+//                              stop). The counter stays at 0 today and
+//                              is consulted by WaitForAllAsyncDrain so
+//                              the predicate is forward-compatible
+//                              with any future marshal step that bumps
+//                              it before EnQueue + decrements when the
+//                              closure runs.
 //
 // BeginShutdown(t) drains the BatchSpanProcessor + PeriodicMetricReader
 // bounded by t. Idempotent.
