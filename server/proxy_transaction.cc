@@ -1394,6 +1394,56 @@ void ProxyTransaction::DeliverResponse(HttpResponse response) {
     }
 }
 
+void ProxyTransaction::MarkKilledForShutdown() noexcept {
+    // Set the flag first so a subsequent dispatcher-thread caller
+    // observing it (any future site that gates on IsKilledForShutdown)
+    // sees the shutdown intent. The flag is also load-bearing for
+    // Start()'s "snapshot already finalized" branch, which calls this
+    // BEFORE publishing tx_weak (i.e., we're not yet wired up to the
+    // kill loop) — that path is a noop on Cancel because dispatcher_
+    // operations are still safe.
+    kill_for_shutdown_.store(true, std::memory_order_release);
+    // Cancel() touches dispatcher-thread-only state (cancelled_,
+    // complete_cb_, retry timers, lease release). The kill loop runs
+    // from the stopper thread, so we must hop. dispatcher_ is non-
+    // owning and outlives the transaction (per the field comment), so
+    // the EnQueue is safe even though MarkKilledForShutdown can fire
+    // very late in shutdown.
+    //
+    // Pre-fix the kill flag was set but never read by production code,
+    // so the proxy kept consuming pool resources / firing upstream
+    // callbacks after its snapshot was removed from the drain counters,
+    // and the kill sweep didn't actually bound the survivor.
+    if (!dispatcher_) return;
+    // If we're already on the owning dispatcher (e.g. Start() called
+    // us synchronously after observing snap.finalized), Cancel inline:
+    // letting Start go on to AttemptCheckout / write the upstream
+    // request just to undo it on the next event-loop tick wastes pool
+    // capacity and IO. Off-thread (the common kill-loop path) we hop.
+    if (dispatcher_->is_on_loop_thread()) {
+        try {
+            Cancel();
+        } catch (...) {
+            // Cancel is noexcept-shaped in practice but defend against
+            // future changes — dropping here keeps MarkKilledForShutdown
+            // noexcept-safe.
+        }
+        return;
+    }
+    std::weak_ptr<ProxyTransaction> weak = weak_from_this();
+    try {
+        dispatcher_->EnQueue([weak]() {
+            if (auto self = weak.lock()) {
+                self->Cancel();
+            }
+        });
+    } catch (...) {
+        // Dispatcher may be tearing down (loop already stopped). The
+        // transaction will be destroyed with the connection; the kill
+        // flag we just set is enough for any post-mortem introspection.
+    }
+}
+
 void ProxyTransaction::Cancel() {
     if (cancelled_ || complete_cb_invoked_) {
         return;

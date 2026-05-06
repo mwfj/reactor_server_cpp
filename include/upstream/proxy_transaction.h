@@ -109,9 +109,14 @@ public:
         std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap);
 
     // Invoked under the snapshot's link_mtx by the shutdown kill loop.
-    void MarkKilledForShutdown() noexcept override {
-        kill_for_shutdown_.store(true, std::memory_order_release);
-    }
+    // Sets the shutdown-kill flag AND enqueues a dispatcher hop to
+    // Cancel() — the flag alone is not load-bearing (no production
+    // gate reads IsKilledForShutdown), so without the Cancel hop the
+    // proxy would keep using pool resources after its snapshot was
+    // removed from drain counters. Out-of-line definition lets us
+    // depend on Dispatcher's full type in the .cc rather than dragging
+    // it into this header.
+    void MarkKilledForShutdown() noexcept override;
     bool IsKilledForShutdown() const noexcept override {
         return kill_for_shutdown_.load(std::memory_order_acquire);
     }

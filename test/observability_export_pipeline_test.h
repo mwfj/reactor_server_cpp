@@ -213,6 +213,54 @@ void TestBatchSpanProcessorDropsOnOverflow() {
 }
 
 // SignalShutdown propagates to the exporter.
+// Regression: a direct caller that constructs BatchSpanProcessorOptions
+// with `max_export_batch_size == 0` must not wedge the worker. The
+// worker predicate `queue_.size() >= batch_cap` would be permanently
+// true and DrainBatch(0) would pop nothing, so spans would never
+// export and the worker would spin. Reload() already clamps to 1; the
+// constructor must do the same before publishing the cached value.
+void TestBatchSpanProcessorClampsZeroBatchSize() {
+    try {
+        auto exporter = std::make_shared<CaptureSpanExporter>();
+        BatchSpanProcessorOptions opts;
+        opts.max_export_batch_size = 0;  // hazardous — must be clamped
+        opts.schedule_delay        = std::chrono::milliseconds{20};
+        BatchSpanProcessor proc(exporter, opts);
+
+        for (int i = 0; i < 4; ++i) {
+            SpanData sd;
+            sd.name = "x";
+            proc.OnEnd(std::move(sd));
+        }
+
+        // Wait up to 1s for the worker to drain. Pre-fix the worker
+        // would spin without ever exporting because batch_cap=0.
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds{1};
+        size_t exported = 0;
+        while (std::chrono::steady_clock::now() < deadline) {
+            exported = exporter->Size();
+            if (exported >= 4) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+
+        proc.SignalShutdown();
+        proc.JoinWorkers(std::chrono::milliseconds{500});
+
+        bool pass = exported == 4;
+        TestFramework::RecordTest(
+            "ObsExport: BatchSpanProcessor constructor clamps zero batch size",
+            pass,
+            pass ? "" : "exported=" + std::to_string(exported) +
+                        " (expected 4) — worker likely wedged",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: BatchSpanProcessor constructor clamps zero batch size",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestBatchSpanProcessorShutdownPropagates() {
     try {
         auto exporter = std::make_shared<CaptureSpanExporter>();
@@ -452,6 +500,7 @@ void RunAllTests() {
 
     TestBatchSpanProcessorBatchesAndExports();
     TestBatchSpanProcessorDropsOnOverflow();
+    TestBatchSpanProcessorClampsZeroBatchSize();
     TestBatchSpanProcessorShutdownPropagates();
     TestPeriodicMetricReaderExportsCycles();
     TestOtlpExporterSerializesSpansToJson();

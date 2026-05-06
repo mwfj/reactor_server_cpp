@@ -212,10 +212,22 @@ namespace {
 //     stamp Connection: close (H1) or no-op (H2) based on shutdown
 //     state and whether the user handler threw.
 //
-//   submit(handle, resp)
-//     Sends the final response.
-//       H1: ClearDeferred + CompleteAsyncResponse (close handled inside).
-//       H2: SubmitStreamResponse(stream_id, resp).
+//   submit(handle, req, resp, error_type)
+//     Sends the final response AND owns the FinalizeIfSnapshot call.
+//     Each protocol's submit decides the finalize ordering:
+//       H1: FinalizeIfSnapshot BEFORE CompleteAsyncResponse — that
+//           call replays deferred_pending_buf_ which can synchronously
+//           start the next pipelined request, so the finalize must
+//           land first to avoid racing with request B's snapshot.
+//       H2: FinalizeIfSnapshot AFTER SubmitStreamResponse — submit
+//           returns the nghttp2 result, and even on success the post-
+//           submit flush can discard frames if the peer batched
+//           RST_STREAM. The H2 submit checks the actual wire outcome
+//           via WasStreamClosedSuccessfully and finalizes accordingly.
+//     `error_type` is computed by MakeAsyncResumeCallback (handler_threw
+//     / rejected_by_async_middleware / "" on success-shaped) and passed
+//     through verbatim so each path can decide whether to override on
+//     wire-level failure.
 //
 // Lifetime: state, req, resp are shared_ptrs captured by value; HandlerT
 // is held weakly and re-locked at each invocation so a torn-down
@@ -280,12 +292,11 @@ MakeAsyncResumeCallback(
                 *resp = HttpResponse::InternalError();
             }
             tweak_response(*resp, threw);
-            // Finalize the snapshot BEFORE submit: H1 submit consumes
-            // the response by move AND can synchronously start the
-            // next pipelined request, both of which would corrupt or
-            // race the finalize read. The CAS gate inside
-            // FinalizeFromSnapshot makes this safe to call even if a
-            // future error path also invokes finalize.
+            // Compute error_type but DO NOT finalize here — each
+            // protocol's submit owns the finalize call (see the
+            // SubmitFn contract docstring above for why H1 wants
+            // finalize-before-submit and H2 wants finalize-after-
+            // submit).
             std::string error_type;
             if (threw) {
                 error_type = "handler_threw";
@@ -293,9 +304,8 @@ MakeAsyncResumeCallback(
                            HttpRouter::AsyncMiddlewareResult::DENY) {
                 error_type = "rejected_by_async_middleware";
             }
-            HttpServer::FinalizeIfSnapshot(*req, *resp, std::move(error_type));
             try {
-                submit(*handle, *resp);
+                submit(*handle, *req, *resp, std::move(error_type));
             } catch (const std::exception& e) {
                 logging::Get()->error(
                     "Exception sending resumed response: {}", e.what());
@@ -3965,7 +3975,17 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     }
                 };
                 auto submit =
-                    [](HttpConnectionHandler& h, HttpResponse& r) {
+                    [](HttpConnectionHandler& h, HttpRequest& req,
+                       HttpResponse& r, std::string error_type) {
+                    // H1 ordering: FinalizeIfSnapshot BEFORE
+                    // CompleteAsyncResponse. CompleteAsyncResponse
+                    // move-consumes the response AND replays
+                    // deferred_pending_buf_, which can synchronously
+                    // start the next pipelined request — so request A's
+                    // finalize must land before request B's snapshot is
+                    // installed by BeginAsyncResponse.
+                    HttpServer::FinalizeIfSnapshot(req, r,
+                                                    std::move(error_type));
                     r.ClearDeferred();
                     h.CompleteAsyncResponse(std::move(r));
                 };
@@ -5086,8 +5106,36 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     // handles GOAWAY/RST_STREAM separately.
                 };
                 auto submit =
-                    [stream_id](Http2ConnectionHandler& h, HttpResponse& r) {
-                    h.SubmitStreamResponse(stream_id, r);
+                    [stream_id](Http2ConnectionHandler& h, HttpRequest& req,
+                                HttpResponse& r, std::string error_type) {
+                    // H2 ordering: defer FinalizeIfSnapshot until AFTER
+                    // submit + flush so the recorded outcome reflects
+                    // whether nghttp2 actually accepted the response.
+                    // Mirrors the H2 async-completion fix: pre_dispatch
+                    // already erased the abort hook, so without this
+                    // outcome check a stream RST'd between the resume
+                    // hop and the post-submit flush would lock a clean
+                    // status onto a dropped response.
+                    if (!error_type.empty()) {
+                        // Handler-error path (handler_threw /
+                        // rejected_by_async_middleware) — record the
+                        // semantic error regardless of wire outcome and
+                        // still attempt to submit so the client gets a
+                        // 500 / 4xx response.
+                        HttpServer::FinalizeIfSnapshot(req, r,
+                                                        std::move(error_type));
+                        h.SubmitStreamResponse(stream_id, r);
+                        return;
+                    }
+                    const int submit_rv =
+                        h.SubmitStreamResponse(stream_id, r);
+                    const bool delivered =
+                        submit_rv == 0 &&
+                        h.WasStreamClosedSuccessfully(stream_id);
+                    HttpServer::FinalizeIfSnapshot(
+                        req, r,
+                        delivered ? std::string{}
+                                  : std::string{"client_disconnect"});
                 };
                 auto resume_cb = MakeAsyncResumeCallback(
                     router_, h2_weak, req_copy, resp_copy, state,
@@ -5118,9 +5166,47 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
             RestoreDebugAuthHeaders(response, auth_hdrs);
-            // H2 sync-path observability finalize. CAS gate ensures
-            // exactly-once dispatch.
-            FinalizeIfSnapshot(request, response, /*error_type=*/std::string{});
+            // H2 sync-path observability finalize MUST defer until
+            // AFTER OnRawData's post-receive flush. This callback runs
+            // INSIDE Http2Session::DispatchStreamRequest, BEFORE that
+            // function calls SubmitResponse and BEFORE the tail
+            // SendPendingFrames. If the peer batched
+            // [HEADERS+END_STREAM] [RST_STREAM] in the same recv buffer,
+            // nghttp2 processes the RST during the rest of ReceiveData
+            // and the post-receive flush silently discards the queued
+            // response — observability would otherwise lock a clean
+            // status onto a dropped response. Snapshot the values now,
+            // then queue an outcome-checked finalize on the H2 handler
+            // (drained by OnRawData after the tail flush; also drained
+            // by FireAllStreamAbortHooks on connection teardown). The
+            // snap.finalized CAS makes a future call idempotent if any
+            // error path also tries to finalize.
+            if (request.obs_snapshot) {
+                auto snap = request.obs_snapshot;
+                const bool was_head_local = (request.method == "HEAD");
+                const uint64_t wire_body_size =
+                    ObsWireBodySize(response, was_head_local);
+                const int status = response.GetStatusCode();
+                std::weak_ptr<Http2ConnectionHandler> h2_weak = self;
+                self->EnqueuePostReceiveTask(
+                    [h2_weak, stream_id, snap = std::move(snap),
+                     status, wire_body_size]() {
+                    auto mgr = snap->manager.lock();
+                    if (!mgr) return;
+                    auto h2 = h2_weak.lock();
+                    const bool delivered =
+                        h2 && h2->WasStreamClosedSuccessfully(stream_id);
+                    if (delivered) {
+                        mgr->FinalizeFromSnapshot(*snap, status,
+                                                    wire_body_size,
+                                                    std::string{});
+                    } else {
+                        mgr->FinalizeFromSnapshot(*snap, /*status=*/0,
+                                                    /*wire_body_size=*/0,
+                                                    "client_disconnect");
+                    }
+                });
+            }
         }
     );
 

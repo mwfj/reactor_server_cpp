@@ -10,7 +10,15 @@ BatchSpanProcessor::BatchSpanProcessor(
     BatchSpanProcessorOptions    options)
     : exporter_(std::move(exporter)),
       options_(options),
-      max_export_batch_size_(options.max_export_batch_size),
+      // Match Reload()'s clamp: a zero batch cap wedges WorkerLoop —
+      // its predicate `queue_.size() >= batch_cap` is permanently true,
+      // and `DrainBatch(0)` would pop nothing, so the worker never
+      // exports and spins reading the empty queue. Clamp to 1 BEFORE
+      // publishing to max_export_batch_size_ so the worker thread we
+      // spawn below never observes the hazardous value.
+      max_export_batch_size_(options.max_export_batch_size == 0
+                                ? size_t{1}
+                                : options.max_export_batch_size),
       schedule_delay_ns_(options.schedule_delay.count() * 1'000'000),
       export_timeout_ns_(options.export_timeout.count() * 1'000'000),
       retries_max_attempts_(options.retries_max_attempts),
@@ -19,6 +27,10 @@ BatchSpanProcessor::BatchSpanProcessor(
       retries_max_backoff_ns_(
           options.retries_max_backoff.count() * 1'000'000) {
     if (options_.max_queue_size == 0) options_.max_queue_size = 1;
+    // Mirror the clamp into the cached options_ struct so /stats and
+    // /config reflect the value the worker actually uses, not the
+    // hazardous zero the operator typed.
+    if (options_.max_export_batch_size == 0) options_.max_export_batch_size = 1;
     // Publish the started flag BEFORE constructing the thread so a
     // racing JoinWorkers() (e.g. from ~BatchSpanProcessor on a partial-
     // construction unwind path) reads true and falls through to the
