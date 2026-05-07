@@ -530,10 +530,9 @@ void TestLookupStagedH2Found() {
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
-        DispatcherThreadGuard dtg{disp, t};
-
         UpstreamConfig live_cfg = MakeH2UpstreamConfig("backend", "127.0.0.1", 9999);
         UpstreamManager mgr({live_cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
 
         // Staged set contains "backend" with H2 enabled
         UpstreamConfig staged = live_cfg;
@@ -555,10 +554,9 @@ void TestLookupStagedH2MissingFromStaged() {
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
-        DispatcherThreadGuard dtg{disp, t};
-
         UpstreamConfig live_cfg = MakeH2UpstreamConfig("backend", "127.0.0.1", 9999);
         UpstreamManager mgr({live_cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
 
         // Staged set does NOT contain "backend"
         auto result = mgr.LookupStagedH2ForLivePartition("backend", {});
@@ -577,10 +575,9 @@ void TestLookupStagedH2UnknownLivePartition() {
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
-        DispatcherThreadGuard dtg{disp, t};
-
         UpstreamConfig live_cfg = MakeH2UpstreamConfig("backend", "127.0.0.1", 9999);
         UpstreamManager mgr({live_cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
 
         // Query a name that is not in the live pools
         UpstreamConfig staged = MakeH2UpstreamConfig("other", "127.0.0.1", 9998);
@@ -601,11 +598,10 @@ void TestCommitH2SnapshotsBootstrap() {
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
-        DispatcherThreadGuard dtg{disp, t};
-
         UpstreamConfig cfg = MakeH2UpstreamConfig("backend", "127.0.0.1", 9999);
         cfg.http2.ping_idle_sec = 77;
         UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
 
         // Before commit, snapshot may be null
         mgr.CommitHttp2Snapshots({cfg});
@@ -636,11 +632,10 @@ void TestCommitH2SnapshotsMissingPartitionRetainsPrevious() {
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
-        DispatcherThreadGuard dtg{disp, t};
-
         UpstreamConfig cfg = MakeH2UpstreamConfig("backend", "127.0.0.1", 9999);
         cfg.http2.ping_idle_sec = 55;
         UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
 
         // First commit establishes snapshot
         mgr.CommitHttp2Snapshots({cfg});
@@ -715,10 +710,9 @@ void TestApplyAndLoadH2Snapshot() {
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
-        DispatcherThreadGuard dtg{disp, t};
-
         UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
         UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
 
         // Get the partition for dispatcher 0
         auto* part = mgr.GetPoolPartition("svc", 0);
@@ -748,10 +742,9 @@ void TestApplyNullClearsSnapshot() {
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
-        DispatcherThreadGuard dtg{disp, t};
-
         UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
         UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
 
         auto* part = mgr.GetPoolPartition("svc", 0);
         if (!part) {
@@ -1562,10 +1555,9 @@ void TestC5AcquireReleaseNoTornRead() {
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
-        DispatcherThreadGuard dtg{disp, t};
-
         UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
         UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
 
         auto* part = mgr.GetPoolPartition("svc", 0);
         if (!part) {
@@ -1777,11 +1769,10 @@ void TestLivePartitionsNonEmpty() {
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
-        DispatcherThreadGuard dtg{disp, t};
-
         UpstreamConfig cfgA = MakeH2UpstreamConfig("svc-a", "127.0.0.1", 9991);
         UpstreamConfig cfgB = MakeH2UpstreamConfig("svc-b", "127.0.0.1", 9992);
         UpstreamManager mgr({cfgA, cfgB}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
 
         auto parts = mgr.LivePartitions();
         bool pass = true;
@@ -1806,11 +1797,10 @@ void TestCommitH2SnapshotsH2Disabled() {
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
-        DispatcherThreadGuard dtg{disp, t};
-
         UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
         cfg.http2.enabled = false;
         UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
 
         // Commit with h2.enabled=false — the snapshot should reflect disabled state
         mgr.CommitHttp2Snapshots({cfg});
@@ -1973,10 +1963,9 @@ void TestHasUpstream() {
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
-        DispatcherThreadGuard dtg{disp, t};
-
         UpstreamConfig cfg = MakeH2UpstreamConfig("known-svc", "127.0.0.1", 9999);
         UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
 
         bool pass = mgr.HasUpstream("known-svc") && !mgr.HasUpstream("unknown-svc");
         TestFramework::RecordTest("H2Upstream HasUpstream: known vs unknown",

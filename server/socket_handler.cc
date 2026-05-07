@@ -13,19 +13,19 @@ SocketHandler::~SocketHandler() { Close(); }
 
 bool SocketHandler::SetTcpNoDelay(bool _flag){
     int optVal = _flag ? 1 : 0;
-    return ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &optVal, sizeof(optVal)) == 0;
+    return ::setsockopt(fd_.load(std::memory_order_relaxed), IPPROTO_TCP, TCP_NODELAY, &optVal, sizeof(optVal)) == 0;
 }
 bool SocketHandler::SetReuseAddr(bool _flag){
     int optVal = _flag ? 1 : 0;
-    return ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &optVal, sizeof(optVal)) == 0;
+    return ::setsockopt(fd_.load(std::memory_order_relaxed), SOL_SOCKET, SO_REUSEADDR, &optVal, sizeof(optVal)) == 0;
 }
 bool SocketHandler::SetReusePort(bool _flag){
     int optVal = _flag ? 1 : 0;
-    return ::setsockopt(fd_, SOL_SOCKET, SO_REUSEPORT, &optVal, sizeof(optVal)) == 0;
+    return ::setsockopt(fd_.load(std::memory_order_relaxed), SOL_SOCKET, SO_REUSEPORT, &optVal, sizeof(optVal)) == 0;
 }
 bool SocketHandler::SetKeepAlive(bool _flag){
     int optVal = _flag ? 1 : 0;
-    return ::setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &optVal, sizeof(optVal)) == 0;
+    return ::setsockopt(fd_.load(std::memory_order_relaxed), SOL_SOCKET, SO_KEEPALIVE, &optVal, sizeof(optVal)) == 0;
 }
 
 int SocketHandler::CreateSocket(sa_family_t family) {
@@ -99,7 +99,7 @@ int SocketHandler::CreateClientSocket(sa_family_t family) {
 }
 
 void SocketHandler::Bind(const InetAddr& _servAddr){
-    if(::bind(fd_, _servAddr.Addr(), _servAddr.Len()) < 0){
+    if(::bind(fd_.load(std::memory_order_relaxed), _servAddr.Addr(), _servAddr.Len()) < 0){
         int saved_errno = errno;  // Save errno before any other calls
         Close();
         logging::Get()->error("Bind failed: {} (errno={})", logging::SafeStrerror(saved_errno), saved_errno);
@@ -108,7 +108,7 @@ void SocketHandler::Bind(const InetAddr& _servAddr){
 }
 
 void SocketHandler::Listen(int _maxLen){
-    if(::listen(fd_, _maxLen) != 0){
+    if(::listen(fd_.load(std::memory_order_relaxed), _maxLen) != 0){
         Close();
         logging::Get()->error("Listen failed");
         throw std::runtime_error("Error occurred when listening ...");
@@ -121,12 +121,13 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
     // the real family.
     sockaddr_storage acceptAddr;
     socklen_t len = sizeof(acceptAddr);
+    int listen_fd = fd_.load(std::memory_order_relaxed);
 #if defined(__linux__)
     // Linux: use accept4 with SOCK_NONBLOCK|SOCK_CLOEXEC for atomic setup
-    int clientfd = accept4(fd_, reinterpret_cast<sockaddr*>(&acceptAddr), &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    int clientfd = accept4(listen_fd, reinterpret_cast<sockaddr*>(&acceptAddr), &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
 #elif defined(__APPLE__) || defined(__MACH__)
     // macOS: use regular accept and set non-blocking separately
-    int clientfd = accept(fd_, reinterpret_cast<sockaddr*>(&acceptAddr), &len);
+    int clientfd = accept(listen_fd, reinterpret_cast<sockaddr*>(&acceptAddr), &len);
 #endif
     if(clientfd == -1){
         int saved_errno = errno;
@@ -180,9 +181,10 @@ int SocketHandler::Accept(InetAddr& _clientAddr){
 }
 
 void SocketHandler::Close() {
-    if (fd_ != -1) {
-        ::close(fd_);
-        fd_ = -1;
+    int cur = fd_.load(std::memory_order_relaxed);
+    if (cur != -1) {
+        ::close(cur);
+        fd_.store(-1, std::memory_order_relaxed);
     }
 }
 
@@ -254,14 +256,15 @@ void SocketHandler::SetNonBlocking(int fd) {
 }
 
 int SocketHandler::GetBoundPort() const {
-    if (fd_ == -1) return 0;
+    int cur = fd_.load(std::memory_order_relaxed);
+    if (cur == -1) return 0;
     // Dual-family per §5.3: use sockaddr_storage so an AF_INET6 listener
     // returns the real sin6_port rather than truncating into
     // sockaddr_in's 16 bytes. Branch on ss_family to read the correct
     // port field.
     struct sockaddr_storage addr;
     socklen_t len = sizeof(addr);
-    if (getsockname(fd_, reinterpret_cast<struct sockaddr*>(&addr), &len) < 0) {
+    if (getsockname(cur, reinterpret_cast<struct sockaddr*>(&addr), &len) < 0) {
         int saved_errno = errno;
         logging::Get()->warn("getsockname failed: {}", logging::SafeStrerror(saved_errno));
         return 0;
