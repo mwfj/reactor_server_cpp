@@ -3311,6 +3311,11 @@ bool HttpServer::WaitForAllAsyncDrain(std::chrono::milliseconds timeout) {
         }
     } else {
         // No observability manager — poll just the upstream half.
+        // TODO: thread an UpstreamManager drain_cv_ accessor through
+        // here so we can wake on the actual drain signal instead of
+        // the 50ms polling timer; today the cv is private and a stub
+        // mutex would be required to bind to it. The wasted-wakeup
+        // window is bounded at one poll interval per shutdown.
         while (!predicate()) {
             if (std::chrono::steady_clock::now() >= deadline) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));

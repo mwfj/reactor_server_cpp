@@ -78,30 +78,13 @@ public:
     // discard the response frames during the post-receive flush.
     int SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
 
-    // ============================================================
-    // Observability finalize hooks
-    // ============================================================
-    using FinalizeHook = std::function<void(uint64_t wire_body_size)>;
-
-    // Stream-targeted async-completion + post-wire finalize. Equivalent
-    // to SubmitStreamResponse + finalize hook. The hook receives the
-    // WIRE body size — bytes ACTUALLY emitted as DATA frames after H2
-    // bodyless-status normalization (1xx / 204 / 304 always pass 0).
-    // Fires AFTER nghttp2's output buffer accepts the response and the
-    // session's pending-frames flush completes.
-    void SubmitStreamResponseWithFinalize(int32_t stream_id,
-                                            const HttpResponse& response,
-                                            FinalizeHook hook);
-
-    // Per-stream orthogonal post-wire-write notification slot. Same
-    // contract as the H1 SetPostWriteNotifyOnce — but H2 multiplexes
+    // Per-stream post-wire-write notification slot. H2 multiplexes
     // streams, so the slot is keyed on stream_id. Used by
     // ShutdownContext's H2 CASE B path: arms `notify_sent` BEFORE
     // SubmitStreamResponse, observes the flip after nghttp2 commits
     // the response frames.
     void SetPostWriteNotifyOnce(int32_t stream_id,
                                   std::shared_ptr<std::atomic<bool>> notify_sent);
-    // ============================================================
 
     // Internal: after an explicit SendPendingFrames() flush, re-check whether
     // graceful shutdown can now complete or whether the normal deadline

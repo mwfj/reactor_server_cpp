@@ -312,7 +312,15 @@ struct ServerConfig {
     size_t max_body_size = 1048576;      // 1 MB
     size_t max_ws_message_size = 16777216; // 16 MB
     int request_timeout_sec = 30;
-    int shutdown_drain_timeout_sec = 30; // Max seconds to wait for in-flight H2 streams during shutdown. 0 = immediate.
+    // Per-phase drain budget during graceful shutdown. NOT a wall-clock
+    // ceiling on total shutdown — the protocol-drain phases (H2/WS/H1)
+    // each consume up to this budget separately, and Phase A
+    // (observability flush) + Phase C (kill + observability shutdown)
+    // each get budget/2. Worst-case observed wall time is therefore
+    // ~3x this value: protocol-drain (T) + obs-flush (T/2) + upstream-
+    // drain (T) + kill (T/2) + post-upstream H1 flush (T). Set with
+    // multi-stage worst-case in mind. 0 = immediate; -1 invalid.
+    int shutdown_drain_timeout_sec = 30;
     Http2Config http2;
     std::vector<UpstreamConfig> upstreams;
     RateLimitConfig rate_limit;

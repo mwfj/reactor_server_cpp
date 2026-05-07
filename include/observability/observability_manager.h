@@ -201,9 +201,9 @@ private:
     // Built at Init() time, registered into meter_provider_'s
     // "reactor.http.server" Meter. Not owned by this manager — Meter
     // owns the Histogram. Recorded once per request from
-    // OnFinalizeWinner so /metrics + OTLP exports surface real traffic
-    // (only the duration histogram is wired today; the rest of the
-    // §7.1 catalog is deferred to Phase 2).
+    // OnFinalizeWinner so /metrics + OTLP exports surface real traffic.
+    // TODO: extend the registered-instrument set beyond duration once
+    // the full HTTP server semconv catalog is wired.
     Histogram*                                http_server_request_duration_ = nullptr;
 
     // Live-flag snapshots (atomic; updated on Reload).

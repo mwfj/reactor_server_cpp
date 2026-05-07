@@ -63,14 +63,32 @@ public:
 
 struct ObservabilitySnapshot {
     // Publish the transaction weak_ptr under link_mtx, performing the
-    // safe link/kill protocol. If the snapshot was already finalized
-    // (KillOutstandingSnapshots ran first), capture the link strong
-    // ptr while still under the lock and call MarkKilledForShutdown
-    // OUTSIDE the lock — matches the kill loop's lock-then-mark
-    // pattern and avoids holding link_mtx across a dispatcher
-    // EnQueue. Returns true when the snapshot was already finalized
-    // (caller may short-circuit further work; the link's terminal
-    // gate has been notified).
+    // safe link/kill protocol.
+    //
+    // INVARIANT (load-bearing — DO NOT replace with a lock-free CAS):
+    //   The link_mtx critical section MUST encompass both the
+    //   `finalized` read and the `tx_weak` publish. The kill sweep
+    //   in ObservabilityManager::KillOutstandingSnapshots takes the
+    //   same lock and CAS-flips `finalized` inside it, so either:
+    //     (a) AttachTransaction observes finalized==false, publishes
+    //         tx_weak; the kill sweep then takes the lock, locks
+    //         tx_weak, CAS-finalizes, calls MarkKilledForShutdown
+    //         outside the lock, OR
+    //     (b) AttachTransaction observes finalized==true; the kill
+    //         sweep already finalized and removed the snapshot from
+    //         live_snapshots_ — so this attach captures the strong
+    //         ptr and calls MarkKilledForShutdown directly.
+    //   Reordering the lock to a mutex-free finalized-load loses
+    //   case (b) — a "linked but not yet marked" snapshot would
+    //   exist and Start() could run upstream work for a
+    //   conceptually-killed transaction.
+    //
+    // MarkKilledForShutdown fires OUTSIDE link_mtx (via the strong
+    // ptr captured under the lock) — matches the kill loop's
+    // lock-then-mark pattern and avoids holding link_mtx across a
+    // dispatcher EnQueue. Returns true when the snapshot was already
+    // finalized; callers should short-circuit further work because
+    // the link's terminal gate has been notified.
     bool AttachTransaction(std::weak_ptr<UpstreamTransactionLink> tx) {
         std::shared_ptr<UpstreamTransactionLink> already_killed_link;
         {

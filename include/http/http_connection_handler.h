@@ -38,37 +38,9 @@ public:
     // ============================================================
     // Observability finalize hooks
     // ============================================================
-    // Hook signature receives the WIRE body size — the byte count
-    // ACTUALLY written to the socket post-normalization. HEAD-stripped
-    // responses + 1xx / 204 / 304 always pass 0 here, so
-    // `http.server.response.body.size` is correct regardless of
-    // normalization. The hook fires AFTER the bytes are buffered for
-    // send (conn_->SendRaw has returned) and BEFORE pipelined-input
-    // resume, so the snapshot's CAS gate races are correctly ordered.
-    using FinalizeHook = std::function<void(uint64_t wire_body_size)>;
-
-    // Sync-path send + post-wire finalize. Equivalent to SendResponse
-    // followed by `hook(wire_body_size)` — but exposed as one call so
-    // the wire-size computation matches the post-normalization bytes
-    // actually written. Used by sync handler paths +
-    // middleware-rejection paths.
-    void SendResponseWithFinalize(HttpResponse response, FinalizeHook hook);
-
-    // Async-path completion + post-wire finalize. Equivalent to
-    // CompleteAsyncResponse + finalize hook. Splits the existing
-    // CompleteAsyncResponse into normalize → write+compute size →
-    // invoke hook → resume pipelined input. The hook fires BEFORE
-    // the OnRawData replay so the snapshot's End() lands on the
-    // request that produced it, not the next pipelined request.
-    void CompleteAsyncResponseWithFinalize(HttpResponse response,
-                                            FinalizeHook hook);
-
-    // Per-request orthogonal post-wire-write notification slot.
-    // Independent of `WithFinalize` (which carries the observability
-    // finalize hook). Both signals fire at the same wire-write
-    // completion instant. The shutdown-route pump arms this slot when
-    // no observability snapshot exists so it knows when the response
-    // has been buffered.
+    // Per-request post-wire-write notification slot. The shutdown-route
+    // pump arms this when no observability snapshot exists so it knows
+    // when the response has been buffered.
     //
     // The framework signals it by calling `notify_sent->store(true,
     // std::memory_order_release);` immediately AFTER the post-wire-
@@ -189,11 +161,9 @@ public:
     // Variant that fires `before_replay` AFTER the wire bytes have been
     // queued via SendRaw and AFTER the deferred state has been cleared,
     // but BEFORE the deferred-pipeline replay loop resumes parsing.
-    // The wrapper exists so CompleteAsyncResponseWithFinalize can land
-    // its observability finalize call between the request-A response
-    // and any synchronous request-B middleware/registration triggered
-    // by the replay; without this ordering, request B's snapshot
-    // registers before request A's snapshot finalizes.
+    // Lets a caller land observability or pipeline-ordered work
+    // between the request-A response and any synchronous request-B
+    // middleware/registration triggered by replay.
     void CompleteAsyncResponseBeforeReplay(
         HttpResponse response,
         std::function<void()> before_replay);

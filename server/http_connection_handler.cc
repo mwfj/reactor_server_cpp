@@ -1160,53 +1160,6 @@ inline uint64_t ComputeWireBodySize(const HttpResponse& response,
 
 }  // namespace
 
-void HttpConnectionHandler::SendResponseWithFinalize(HttpResponse response,
-                                                       FinalizeHook hook) {
-    // Compute wire-body-size BEFORE SendRaw. SendResponse() routes
-    // through the same code path as HandleCompleteRequest's sync
-    // send: HEAD requests have their bodies stripped from the wire
-    // by StripResponseBodyForHead before SendRaw runs (see
-    // HandleCompleteRequest's HEAD branch). Mirror that here so the
-    // observability hook reports 0 bytes on HEAD instead of the
-    // forbidden body the handler may have left on the response.
-    const bool was_head =
-        (parser_.GetRequest().method == "HEAD");
-    const uint64_t wire_body_size =
-        ComputeWireBodySize(response, was_head);
-    SendResponse(response);
-    if (hook) hook(wire_body_size);
-}
-
-void HttpConnectionHandler::CompleteAsyncResponseWithFinalize(
-    HttpResponse response, FinalizeHook hook) {
-    if (!deferred_response_pending_) {
-        logging::Get()->warn(
-            "CompleteAsyncResponseWithFinalize called without a pending "
-            "deferred response (fd={})", conn_ ? conn_->fd() : -1);
-        if (hook) hook(0);
-        return;
-    }
-
-    // Save was_head BEFORE CompleteAsyncResponse clears the deferred
-    // state (which also clears deferred_was_head_).
-    const bool was_head = deferred_was_head_;
-    const uint64_t wire_body_size =
-        ComputeWireBodySize(response, was_head);
-
-    // Use the BeforeReplay variant so the finalize hook lands AFTER
-    // SendRaw + deferred-state clear but BEFORE the deferred-pipeline
-    // replay starts parsing the next request. Without this ordering
-    // a keep-alive client whose pipelined bytes arrived during the
-    // suspend window would have request B's snapshot register before
-    // request A's finalize fires — violating the wrapper contract
-    // and misordering cumulative spans/metrics.
-    CompleteAsyncResponseBeforeReplay(
-        std::move(response),
-        [hook, wire_body_size]() {
-            if (hook) hook(wire_body_size);
-        });
-}
-
 void HttpConnectionHandler::SetPostWriteNotifyOnce(
     std::shared_ptr<std::atomic<bool>> notify_sent) {
     post_write_notify_ = std::move(notify_sent);

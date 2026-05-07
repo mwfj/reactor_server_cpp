@@ -226,8 +226,18 @@ void BatchSpanProcessor::SignalShutdown() {
 
 void BatchSpanProcessor::JoinWorkers(std::chrono::milliseconds deadline) {
     if (!worker_started_.load(std::memory_order_acquire)) return;
-    if (deadline.count() <= 0) {
-        // Caller asked for unbounded wait — block on join directly.
+    if (deadline.count() == 0) {
+        // Operator-configured "immediate" — return without joining.
+        // The destructor's unconditional fallback join still blocks on
+        // the worker before the object is destroyed, so the thread is
+        // never abandoned. Mapping 0 to unbounded would silently
+        // wedge shutdown on a stalled exporter, contradicting the
+        // documented "0 = immediate" contract for shutdown_drain_timeout_sec.
+        return;
+    }
+    if (deadline.count() < 0) {
+        // Negative deadline — caller explicitly asked for unbounded wait.
+        // Block on join directly (no timeout).
         if (worker_.joinable()) worker_.join();
         return;
     }

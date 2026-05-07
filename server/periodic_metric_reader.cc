@@ -92,7 +92,14 @@ void PeriodicMetricReader::SignalShutdown() {
 
 void PeriodicMetricReader::JoinWorkers(std::chrono::milliseconds deadline) {
     if (!worker_started_.load(std::memory_order_acquire)) return;
-    if (deadline.count() <= 0) {
+    if (deadline.count() == 0) {
+        // Operator-configured "immediate" — return without joining.
+        // Mirrors BatchSpanProcessor::JoinWorkers contract; the
+        // destructor's unconditional fallback join still pairs with
+        // ~PeriodicMetricReader so the thread is never abandoned.
+        return;
+    }
+    if (deadline.count() < 0) {
         if (worker_.joinable()) worker_.join();
         return;
     }

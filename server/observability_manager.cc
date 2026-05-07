@@ -53,9 +53,15 @@ void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
     // traces_enabled_=true in that mode would have the inbound
     // middleware allocate a SpanContext + ObservabilitySnapshot per
     // request and the proxy strip transparent W3C propagation —
-    // pure overhead with no telemetry to show for it. The
-    // span_processor_ pointer is set once at construction and never
-    // swapped, so this static gate is sufficient.
+    // pure overhead with no telemetry to show for it.
+    //
+    // PRECONDITION: span_processor_ is set once at Init() and never
+    // hot-swapped. A future caller that swaps the processor at
+    // runtime (e.g. exporter pipeline rebuild on SIGHUP) MUST call
+    // PublishLiveFlags(config_) explicitly post-swap — otherwise
+    // traces_enabled_ stays cached against the stale processor and
+    // either overcommits work to a now-null pipeline or silently
+    // disables tracing on a pipeline that just came online.
     const bool traces_pipeline_present =
         c.traces.enabled && span_processor_ != nullptr;
     traces_enabled_.store(traces_pipeline_present,
@@ -387,6 +393,11 @@ void ObservabilityManager::OnFinalizeWinner(
 
 void ObservabilityManager::BeginShutdown(
     std::chrono::milliseconds timeout) {
+    // The shutdown_started_ latch is one-shot — never reset. Production
+    // callers shut the manager down once; tests construct a fresh
+    // manager per cycle (see obs_stress's per-iteration MakeManager).
+    // A future "restart in place" would need the latch to reset
+    // before re-arming the worker drain.
     bool expected = false;
     if (!shutdown_started_.compare_exchange_strong(expected, true,
             std::memory_order_acq_rel)) {
@@ -399,7 +410,7 @@ void ObservabilityManager::BeginShutdown(
 }
 
 void ObservabilityManager::KillOutstandingSnapshots(
-    std::chrono::milliseconds /*grace*/) {
+    [[maybe_unused]] std::chrono::milliseconds /*grace*/) {
     // Snapshot the registry under the mutex, then run the per-snapshot
     // kill outside it (each snapshot's CAS gate is independent).
     std::vector<std::shared_ptr<ObservabilitySnapshot>> to_kill;
@@ -462,35 +473,36 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
     // emits the warn for those. Ignore them here.
     PublishLiveFlags(new_config);
 
-    // Capture the new sampler config for any future GetTracer() calls.
-    // Preserve restart-only fields explicitly: max_queue_size (queue
-    // allocated at ctor), traces.exporter / metrics.exporter,
-    // otlp.upstream pair, prometheus.path (route registered once at
-    // ctor), and histogram_buckets (instruments built at ctor). The
-    // BuildRouteOverridesFromConfig() call below uses prometheus.path
-    // to auto-suppress scrape sampling — pinning it to the live path
-    // keeps the auto-suppress on the actually-registered route after
-    // a SIGHUP that stages a different path.
-    auto saved_traces_exporter   = config_.traces.exporter;
-    auto saved_traces_otlp_up    = config_.traces.otlp.upstream;
-    auto saved_traces_max_queue  = config_.traces.batch.max_queue_size;
-    auto saved_metrics_exporter  = config_.metrics.exporter;
-    auto saved_metrics_otlp_up   = config_.metrics.otlp.upstream;
-    auto saved_metrics_prom_path = config_.metrics.prometheus.path;
-    auto saved_metrics_buckets   = config_.metrics.histogram_buckets;
+    // Live-reloadable fields ONLY — copy field-by-field rather than
+    // wholesale-assign-then-restore. Adding a new field to
+    // ObservabilityConfig MUST classify it here: omit and it stays
+    // restart-only (live behaviour pinned at ctor); add and it picks
+    // up the staged value. The save/overwrite/restore pattern made
+    // it possible for a field added to MetricsConfig to silently
+    // take the staged value while restart-only fields kept restoring;
+    // explicit assignment makes the classification visible at the
+    // call site. The field-by-field grouping below mirrors the
+    // restart-vs-live header in observability_config.h.
+    //
+    // Restart-only fields NOT touched here:
+    //   traces.exporter, traces.otlp.upstream, traces.batch.max_queue_size,
+    //   metrics.exporter, metrics.otlp.upstream, metrics.prometheus.path,
+    //   metrics.histogram_buckets.
+    config_.traces.enabled               = new_config.traces.enabled;
+    config_.traces.sampler               = new_config.traces.sampler;
+    config_.traces.otlp.headers          = new_config.traces.otlp.headers;
+    config_.traces.otlp.timeout_ms       = new_config.traces.otlp.timeout_ms;
+    config_.traces.batch.max_export_batch_size =
+        new_config.traces.batch.max_export_batch_size;
+    config_.traces.batch.schedule_delay  = new_config.traces.batch.schedule_delay;
+    config_.traces.batch.retries         = new_config.traces.batch.retries;
 
-    config_.traces.sampler  = new_config.traces.sampler;
-    config_.traces.enabled  = new_config.traces.enabled;
-    config_.traces.batch    = new_config.traces.batch;
-    config_.metrics         = new_config.metrics;
-
-    config_.traces.exporter         = std::move(saved_traces_exporter);
-    config_.traces.otlp.upstream    = std::move(saved_traces_otlp_up);
-    config_.traces.batch.max_queue_size = saved_traces_max_queue;
-    config_.metrics.exporter        = std::move(saved_metrics_exporter);
-    config_.metrics.otlp.upstream   = std::move(saved_metrics_otlp_up);
-    config_.metrics.prometheus.path = std::move(saved_metrics_prom_path);
-    config_.metrics.histogram_buckets = std::move(saved_metrics_buckets);
+    config_.metrics.enabled              = new_config.metrics.enabled;
+    config_.metrics.otlp.headers         = new_config.metrics.otlp.headers;
+    config_.metrics.otlp.timeout_ms      = new_config.metrics.otlp.timeout_ms;
+    config_.metrics.reader               = new_config.metrics.reader;
+    config_.metrics.prometheus.include_target_info =
+        new_config.metrics.prometheus.include_target_info;
 
     // Build new sampler + push to TracerProvider, including the
     // updated batch-shape knobs so a SIGHUP that edits

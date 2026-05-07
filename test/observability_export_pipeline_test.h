@@ -266,13 +266,12 @@ void TestBatchSpanProcessorShutdownPropagates() {
         auto exporter = std::make_shared<CaptureSpanExporter>();
         BatchSpanProcessor proc(exporter, BatchSpanProcessorOptions{});
         proc.SignalShutdown();
-        // Use deadline=0 (unbounded) so the worker is guaranteed to
-        // finish its post-loop exporter SignalShutdown call before
-        // the test reads signal_count. Bounded JoinWorkers can return
-        // before the worker reaches the SignalShutdown forwarding under
-        // TSan/heavy CPU contention, producing a spurious failure.
-        // The bounded contract is exercised by other tests.
-        proc.JoinWorkers(std::chrono::milliseconds{0});
+        // Negative deadline = unbounded join. Bounded JoinWorkers can
+        // return before the worker reaches the SignalShutdown forwarding
+        // under TSan/heavy CPU contention, producing a spurious failure.
+        // The bounded contract is exercised by other tests; this one
+        // specifically asserts the propagation occurs.
+        proc.JoinWorkers(std::chrono::milliseconds{-1});
         bool pass = exporter->signal_count() == 1;
         TestFramework::RecordTest(
             "ObsExport: BatchSpanProcessor SignalShutdown forwards to exporter",
@@ -281,6 +280,57 @@ void TestBatchSpanProcessorShutdownPropagates() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "ObsExport: BatchSpanProcessor SignalShutdown forwards to exporter",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Locks the new JoinWorkers(0) = "no-wait" contract. shutdown_drain_timeout_sec=0
+// is documented as "immediate"; under the OLD contract `deadline.count() <= 0`
+// meant unbounded join, which silently wedged shutdown on a stalled exporter.
+// The fix maps 0 to no-wait (return without joining) and reserves negative
+// for unbounded. The destructor's fallback join still blocks on the worker
+// before the object is destroyed, so the thread is never abandoned.
+void TestBatchSpanProcessorJoinWorkersZeroIsNoWait() {
+    try {
+        // Stalled exporter: blocks SignalShutdown for ~2s — a real
+        // operator stall would block the post-loop exporter signal
+        // and lock JoinWorkers under the old contract.
+        class StalledExporter : public SpanExporter {
+        public:
+            ExportResult Export(std::vector<SpanData>,
+                                 std::chrono::steady_clock::time_point) override {
+                return ExportResult::kSuccess;
+            }
+            void SignalShutdown() override {
+                // Stall the worker thread's post-loop signal forwarding
+                // for long enough to demonstrate the no-wait contract.
+                std::this_thread::sleep_for(std::chrono::seconds{2});
+            }
+            void CancelAllActiveExports() override {}
+        };
+        auto exporter = std::make_shared<StalledExporter>();
+        BatchSpanProcessor proc(exporter, BatchSpanProcessorOptions{});
+        proc.SignalShutdown();
+
+        auto t0 = std::chrono::steady_clock::now();
+        proc.JoinWorkers(std::chrono::milliseconds{0});
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0);
+
+        // The contract is "return immediately" — give it 200ms of
+        // slack for scheduler noise. If we wait the full ~2s the
+        // stall imposes, the no-wait semantic is broken.
+        bool pass = elapsed < std::chrono::milliseconds{200};
+        TestFramework::RecordTest(
+            "ObsExport: JoinWorkers(0) returns immediately (no-wait contract)",
+            pass,
+            pass ? "" :
+                ("elapsed=" + std::to_string(elapsed.count()) +
+                 "ms (expected < 200ms — JoinWorkers(0) blocked on stalled exporter)"),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: JoinWorkers(0) returns immediately (no-wait contract)",
             false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
@@ -502,6 +552,7 @@ void RunAllTests() {
     TestBatchSpanProcessorDropsOnOverflow();
     TestBatchSpanProcessorClampsZeroBatchSize();
     TestBatchSpanProcessorShutdownPropagates();
+    TestBatchSpanProcessorJoinWorkersZeroIsNoWait();
     TestPeriodicMetricReaderExportsCycles();
     TestOtlpExporterSerializesSpansToJson();
     TestOtlpExporterShutdownRefusesExport();
