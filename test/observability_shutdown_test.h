@@ -118,6 +118,49 @@ void TestFinalizeIsIdempotent() {
     }
 }
 
+// Snapshot dropped without FinalizeIfSnapshot — the dtor backstop
+// must finalize it as "unfinalized_drop" so inflight_finalizations_
+// drains. Without the backstop, a missed FinalizeIfSnapshot at any
+// of the 40+ exit paths leaks the counter forever and stalls
+// WaitForAllAsyncDrain on every shutdown.
+void TestUnfinalizedDropTriggersBackstop() {
+    try {
+        auto m = MakeManager();
+        std::weak_ptr<ObservabilityManager> mgr_weak = m;
+        {
+            auto snap = std::make_shared<ObservabilitySnapshot>();
+            // Production path sets manager via ObservabilityMiddleware;
+            // tests must do it explicitly so the dtor backstop
+            // condition fires.
+            snap->manager = mgr_weak;
+            m->RegisterLiveSnapshot(snap);
+            // Confirm the registration bumped the counter.
+            bool registered = m->inflight_finalizations() == 1;
+            if (!registered) {
+                TestFramework::RecordTest(
+                    "ObsShutdown: snapshot dropped without finalize "
+                    "triggers dtor backstop",
+                    false, "register did not bump counter",
+                    TestFramework::TestCategory::OTHER);
+                return;
+            }
+            // Drop snap WITHOUT calling FinalizeFromSnapshot — exits
+            // this scope, dtor runs.
+        }
+        // Dtor backstop must have finalized via "unfinalized_drop".
+        bool drained = m->inflight_finalizations() == 0;
+        TestFramework::RecordTest(
+            "ObsShutdown: snapshot dropped without finalize triggers dtor backstop",
+            drained,
+            drained ? "" : "dtor backstop did not drain inflight",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsShutdown: snapshot dropped without finalize triggers dtor backstop",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // BeginShutdown is idempotent and must not crash on a manager with no
 // processor / reader workers.
 void TestBeginShutdownIdempotent() {
@@ -145,6 +188,7 @@ void RunAllTests() {
     TestRegisterFinalizeRoundTrip();
     TestKillDrainsSurvivors();
     TestFinalizeIsIdempotent();
+    TestUnfinalizedDropTriggersBackstop();
     TestBeginShutdownIdempotent();
 }
 

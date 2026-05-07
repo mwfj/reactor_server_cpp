@@ -3368,16 +3368,6 @@ bool HttpServer::WaitForAllAsyncDrain(
     return drained;
 }
 
-void HttpServer::DrainObservabilityForShutdown(
-        std::chrono::milliseconds budget) {
-    // Single-phase facade preserved for callers that don't need the
-    // upstream-pool-alive ordering (e.g. ~HttpServer / abnormal
-    // teardown). Splits the budget evenly between the two phases.
-    const auto half = budget / 2;
-    bool drained = FlushObservabilityForShutdown(half);
-    KillAndShutdownObservability(budget - half, drained);
-}
-
 bool HttpServer::FlushObservabilityForShutdown(
         std::chrono::milliseconds budget) {
     bool drained = WaitForAllAsyncDrain(budget);

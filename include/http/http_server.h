@@ -503,11 +503,6 @@ private:
     // predicate is picked up automatically. Returns true on full drain.
     bool WaitForAllAsyncDrain(std::chrono::milliseconds timeout);
 
-    // Run the observability shutdown sweep within `budget`:
-    // WaitForAllAsyncDrain → on-timeout KillOutstandingSnapshots →
-    // BeginShutdown. No-op when observability is not configured.
-    void DrainObservabilityForShutdown(std::chrono::milliseconds budget);
-
     // Two-phase split used by Stop()'s shutdown sequence so the
     // natural-finalize wait + (future) BatchSpanProcessor ForceFlush
     // can run BEFORE upstream pool shutdown — when the OTLP push

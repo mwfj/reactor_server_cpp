@@ -39,6 +39,15 @@ ObservabilityManager::ObservabilityManager(
     PublishLiveFlags(config_);
 }
 
+// Bounded budget for the dtor's safety-net BeginShutdown. Production
+// shuts down through HttpServer::Stop with the operator-configured
+// shutdown_drain_timeout_sec and never reaches this branch with live
+// work. The dtor budget covers tests / abnormal teardown only — long
+// enough to drain a typical processor flush, short enough that an
+// unwinding test doesn't hang.
+static constexpr auto kDtorShutdownBudget =
+    std::chrono::milliseconds{1000};
+
 ObservabilityManager::~ObservabilityManager() {
     // Idempotent safety net for tests / abnormal teardown paths.
     // Production goes through HttpServer::Stop's coordinated kill +
@@ -50,7 +59,7 @@ ObservabilityManager::~ObservabilityManager() {
     // manager.lock()==nullptr no-op once the dtor begins and inbound
     // SERVER spans silently leak (never End()-ed).
     KillOutstandingSnapshots(std::chrono::milliseconds{0});
-    BeginShutdown(std::chrono::milliseconds{1000});
+    BeginShutdown(kDtorShutdownBudget);
 }
 
 void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
@@ -80,8 +89,8 @@ void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
         c.metrics.prometheus.include_target_info,
         std::memory_order_release);
     // Operator visibility — traces.enabled is documented as live-
-    // reloadable, but with no SpanProcessor (boot-time exporter empty
-    // / Phase 2 not wired) the flip is silently no-op. Warn the
+    // reloadable, but with no SpanProcessor attached (e.g. boot-time
+    // exporter empty) the flip is silently no-op. Warn the
     // operator instead of failing closed; metrics-only deployments are
     // valid and shouldn't fail to reload, but the operator should know
     // their staged change didn't take effect. Restart is required to
@@ -241,6 +250,23 @@ ObservabilityManager::EffectiveSamplerForPath(
     return nullptr;
 }
 
+// Backstop for missed FinalizeIfSnapshot at any production call site.
+// Defined here (not in the header) so the dtor body sees the full
+// ObservabilityManager type for FinalizeFromSnapshot. The CAS gate
+// inside FinalizeFromSnapshot makes this idempotent against a late
+// finalizer that wins the race; manager.lock() failure means the
+// kill path already finalized us through the registry.
+ObservabilitySnapshot::~ObservabilitySnapshot() {
+    if (finalized.load(std::memory_order_acquire)) return;
+    auto mgr = manager.lock();
+    if (!mgr) return;  // manager torn down — kill loop ran or test path.
+    // Exception-safe: FinalizeFromSnapshot wraps OnFinalizeWinner in
+    // try/catch and never throws. The mgr shared_ptr keeps the
+    // manager alive for the duration of the call.
+    mgr->FinalizeFromSnapshot(*this, /*status=*/0, /*wire_body=*/0,
+                                /*error_type=*/"unfinalized_drop");
+}
+
 void ObservabilityManager::RegisterLiveSnapshot(
     const std::shared_ptr<ObservabilitySnapshot>& snap) {
     if (!snap) return;
@@ -275,7 +301,8 @@ bool ObservabilityManager::FinalizeFromSnapshot(
     uint64_t wire_body_size,
     std::string error_type) {
     // Reserve the in-progress slot BEFORE the CAS. A winner preempted
-    // before incrementing would let DrainObservabilityForShutdown
+    // before incrementing would let HttpServer::Stop's drain
+    // (FlushObservabilityForShutdown + KillAndShutdownObservability)
     // observe finalizers_in_progress_ == 0, call BeginShutdown, and
     // drop the still-pending Span::End. Decrement on CAS failure so
     // the loser path doesn't leak the reservation.
@@ -473,10 +500,14 @@ void ObservabilityManager::KillOutstandingSnapshots(
             finalize_won = snap.finalized.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel);
         }
-        if (tx) tx->MarkKilledForShutdown();
         if (!finalize_won) {
             continue;  // a finalizer already won; let it run.
         }
+        // Only mark survivors as killed for shutdown — transactions
+        // that finalized normally (CAS lost above) are already past
+        // their terminal callback and don't need a redundant
+        // EnQueue + Cancel.
+        if (tx) tx->MarkKilledForShutdown();
 
         // DropWithoutEnd only flips the dropped_ atomic; it never
         // touches the Span's non-atomic state. Safe to invoke from

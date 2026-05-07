@@ -62,6 +62,21 @@ public:
 };
 
 struct ObservabilitySnapshot {
+    // Backstop dtor — when the last shared_ptr drops on a snapshot
+    // that was registered with the manager but never finalized, this
+    // calls FinalizeFromSnapshot with error_type="unfinalized_drop".
+    // Without it, a missed FinalizeIfSnapshot at any of the 40+ exit
+    // paths (sync return / async resume / streaming abort / WS reject
+    // / etc.) leaks inflight_finalizations_ forever — the kill loop's
+    // weak.lock() returns null after the strong refs drop and
+    // WaitForAllAsyncDrain then waits the full configured budget on
+    // every shutdown. The dtor only fires its backstop when the
+    // manager weak_ptr is set (production path) AND finalized==false;
+    // test snapshots that don't set the manager field stay no-op.
+    // Defined out-of-line in observability_manager.cc where
+    // ObservabilityManager is complete.
+    ~ObservabilitySnapshot();
+
     // Publish the transaction weak_ptr under link_mtx, performing the
     // safe link/kill protocol.
     //
