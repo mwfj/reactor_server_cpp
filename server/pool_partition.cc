@@ -553,6 +553,11 @@ std::shared_ptr<UpstreamH2Connection> PoolPartition::AcquireH2Connection(
             if (!h) return;
             ssize_t rv = h->HandleBytes(data.data(), data.size());
             if (rv < 0) {
+                // MarkDead BEFORE the fail-fan-out so a concurrent
+                // FindUsable can't pick this conn between the in-flight
+                // streams being failed and the table eviction. See the
+                // UPSTREAM_PROXY.md pitfall on dead_ vs goaway_seen_.
+                h->MarkDead();
                 h->FailAllStreams(
                     ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
                     "h2 session fatal error");
@@ -563,15 +568,15 @@ std::shared_ptr<UpstreamH2Connection> PoolPartition::AcquireH2Connection(
         [wk](std::shared_ptr<ConnectionHandler>) {
             auto h = wk.lock();
             if (!h) return;
+            // MarkDead BEFORE FailAllStreams (mirrors PING-timeout and
+            // session-fatal-error sites). A FindUsable racing the
+            // fan-out would otherwise see streams_.empty() with
+            // dead_=false and return this conn, whose transport is
+            // already gone.
+            h->MarkDead();
             h->FailAllStreams(
                 ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
                 "transport closed");
-            // Mark this connection dead so IsUsable() returns false and
-            // the next FindUsable / TickAll pass evicts it. Without this,
-            // the H2 conn stays in the table with an empty stream list
-            // but a closed transport, and FindUsable would return it for
-            // a subsequent request — which would then fail at SubmitRequest.
-            h->MarkDead();
         });
 
     h2->AdoptLease(std::move(lease));

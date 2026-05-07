@@ -79,6 +79,15 @@ void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
             int idle = cfg ? cfg->ping_idle_sec : 0;
             int timeout = cfg ? cfg->ping_timeout_sec : 0;
             if (!c->Tick(now, idle, timeout)) {
+                // MarkDead BEFORE FailAllStreams: between the failure
+                // fan-out and the table erase below, FindUsable could be
+                // called from another path and would return this conn
+                // with dead_=false / streams_.empty() / IsUsable()=true.
+                // The next SubmitRequest then fails on a poisoned session
+                // and burns retry budget. Pitfall doc: UPSTREAM_PROXY.md
+                // "After any FailAllStreams call site, the connection
+                // MUST be marked dead".
+                c->MarkDead();
                 c->FailAllStreams(-1, "h2 PING timeout");
                 it = conns.erase(it);
             } else if (c->goaway_seen() && c->active_stream_count() == 0) {

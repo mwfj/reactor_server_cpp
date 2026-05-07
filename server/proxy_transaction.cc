@@ -332,9 +332,10 @@ void ProxyTransaction::Start() {
     // Cache for retry and for the H2 dispatch path's :path pseudo-header.
     upstream_path_ = upstream_path;
 
-    // Serialize the upstream request (cached for retry)
-    serialized_request_ = HttpRequestSerializer::Serialize(
-        method_, upstream_path, query_, rewritten_headers_, request_body_);
+    // Note: serialized_request_ is built lazily on the first H1 send so
+    // the H2 dispatch path doesn't pay the cost of a second copy of the
+    // request body (which is also held in request_body_ for retry replay
+    // and in the H2 stream's body_source).
 
     logging::Get()->debug("ProxyTransaction::Start client_fd={} service={} "
                           "upstream={}:{} {} {}",
@@ -860,6 +861,15 @@ void ProxyTransaction::SendUpstreamRequest() {
     holding_retryable_5xx_response_ = false;
     held_retryable_5xx_saw_eof_ = false;
     state_ = State::SENDING_REQUEST;
+
+    // Lazy-serialize on first H1 send. Cached on subsequent retries that
+    // also land on H1 (rewritten_headers_ / method_ / upstream_path_ /
+    // request_body_ are immutable across retries). H2 dispatches never
+    // reach this path, avoiding a second large copy of the body.
+    if (serialized_request_.empty()) {
+        serialized_request_ = HttpRequestSerializer::Serialize(
+            method_, upstream_path_, query_, rewritten_headers_, request_body_);
+    }
 
     logging::Get()->debug("ProxyTransaction sending request client_fd={} "
                           "service={} upstream_fd={} bytes={}",

@@ -1,6 +1,7 @@
 #include "upstream/upstream_h2_connection.h"
 #include "upstream/h2_settings.h"
 #include "upstream/upstream_connection.h"
+#include "upstream/upstream_http_codec.h"
 #include "upstream/header_rewriter.h"
 #include "connection_handler.h"
 #include "log/logger.h"
@@ -8,17 +9,10 @@
 
 namespace {
 
-ssize_t SendCallback(nghttp2_session* /*session*/, const uint8_t* data,
-                     size_t length, int /*flags*/, void* user_data)
-{
-    auto* self = static_cast<UpstreamH2Connection*>(user_data);
-    UpstreamConnection* up = self->transport();
-    if (!up) return NGHTTP2_ERR_CALLBACK_FAILURE;
-    auto transport = up->GetTransport();
-    if (!transport) return NGHTTP2_ERR_CALLBACK_FAILURE;
-    transport->SendRaw(reinterpret_cast<const char*>(data), length);
-    return static_cast<ssize_t>(length);
-}
+// FlushSend uses nghttp2_session_mem_send2 which returns bytes directly
+// to the caller — the send callback is not invoked. We deliberately do
+// not register one to keep readers from assuming there's a wired send
+// path.
 
 int OnFrameRecvCallback(nghttp2_session* /*session*/,
                         const nghttp2_frame* frame, void* user_data)
@@ -182,6 +176,12 @@ ssize_t H2BodyReadCallback(nghttp2_session* /*session*/, int32_t /*stream_id*/,
 {
     auto* src = static_cast<UpstreamH2BodySource*>(source->ptr);
     if (!src) {
+        // SubmitRequest always sets source.ptr before passing the
+        // provider to nghttp2; reaching here means a regression.
+        // Log loudly so it surfaces in CI / production rather than
+        // silently truncating the request body.
+        logging::Get()->error(
+            "BUG: H2BodyReadCallback invoked with null source->ptr");
         *data_flags |= NGHTTP2_DATA_FLAG_EOF;
         return 0;
     }
@@ -260,7 +260,9 @@ bool UpstreamH2Connection::Init() {
         logging::Get()->error("UpstreamH2Connection: callbacks_new failed");
         return false;
     }
-    nghttp2_session_callbacks_set_send_callback2(cbs, &SendCallback);
+    // No send_callback registered: FlushSend uses nghttp2_session_mem_send2
+    // which returns the bytes directly. Registering one would make a
+    // future maintainer assume the path is wired.
     nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, &OnFrameRecvCallback);
     nghttp2_session_callbacks_set_on_stream_close_callback(cbs, &OnStreamCloseCallback);
     nghttp2_session_callbacks_set_on_header_callback(cbs, &OnHeaderCallback);
@@ -428,11 +430,30 @@ void UpstreamH2Connection::OnHeadersComplete(int32_t stream_id,
     if (end_stream) {
         stream->response_head.framing = Framing::NO_BODY;
     } else {
-        // Scan accumulated headers for content-length.
+        // Scan accumulated headers for content-length. Cap at the H1
+        // codec's MAX_RESPONSE_BODY_SIZE to defend against malicious or
+        // buggy upstreams advertising absurd values (e.g. 1e18 bytes)
+        // that would propagate through expected_length into snapshot
+        // truncation arithmetic. RFC 9113 lets us treat the header as
+        // informational, so on an over-cap value we fall through to
+        // CHUNKED-equivalent framing and rely on END_STREAM as the
+        // authoritative end-of-body signal.
         int64_t cl = -1;
         for (const auto& [nm, val] : stream->response_head.headers) {
             if (nm == "content-length") {
-                try { cl = std::stoll(val); } catch (...) { cl = -1; }
+                size_t consumed = 0;
+                try { cl = std::stoll(val, &consumed); } catch (...) { cl = -1; }
+                if (consumed != val.size()) cl = -1;
+                if (cl > static_cast<int64_t>(
+                        UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE)) {
+                    logging::Get()->warn(
+                        "UpstreamH2Connection: content-length {} exceeds cap "
+                        "{} on stream {}; treating as chunked",
+                        val,
+                        UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE,
+                        stream_id);
+                    cl = -1;
+                }
                 break;
             }
         }
@@ -519,8 +540,14 @@ namespace {
 // proxy-authorization). Also strips Host because the H2 wire conveys
 // it via :authority.
 bool IsForbiddenH2RequestHeader(const std::string& lower_name) {
+    // HeaderRewriter::IsHopByHopHeader covers the RFC 7230 §6.1 set;
+    // host is conveyed via :authority on the H2 wire; expect is illegal
+    // on H2 per RFC 9113 §8.2.2 and HeaderRewriter strips it upstream,
+    // but list it explicitly as defense-in-depth so this gate stays
+    // self-contained.
     return HeaderRewriter::IsHopByHopHeader(lower_name) ||
-           lower_name == "host";
+           lower_name == "host" ||
+           lower_name == "expect";
 }
 
 }  // namespace
@@ -605,7 +632,22 @@ int32_t UpstreamH2Connection::SubmitRequest(
     last_activity_at_ = std::chrono::steady_clock::now();
 
     if (!in_receive_data_) {
-        if (!FlushSend()) return -1;
+        if (!FlushSend()) {
+            // Session is in a bad state — detach the sink and erase the
+            // stream so the eventual session-teardown OnStreamClose
+            // can't fire OnError on a transaction that already moved on
+            // to a fresh attempt with a new stream_id (the caller treats
+            // -1 as CONNECT_FAILURE and retries). Mark the connection
+            // dead so FindUsable evicts it instead of handing it to
+            // another caller for SubmitRequest, which would also fail.
+            auto it = streams_.find(stream_id);
+            if (it != streams_.end()) {
+                if (it->second) it->second->sink = nullptr;
+                streams_.erase(it);
+            }
+            MarkDead();
+            return -1;
+        }
     }
     return stream_id;
 }

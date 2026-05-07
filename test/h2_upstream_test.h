@@ -1406,8 +1406,8 @@ void TestB1SingleRequestCompletes() {
 }
 
 // B5 — PING timeout — Tick returns false
-void TestB5PingTimeout() {
-    std::cout << "\n[TEST] H2Upstream B5: Tick returns false on PING timeout..." << std::endl;
+void TestB5TickReturnsFalseWithNullSession() {
+    std::cout << "\n[TEST] H2Upstream B5: Tick returns false when session is null..." << std::endl;
     try {
         auto cfg = std::make_shared<Http2UpstreamConfig>();
         cfg->enabled               = true;
@@ -1416,17 +1416,17 @@ void TestB5PingTimeout() {
         cfg->max_concurrent_streams_pref = 10;
         cfg->goaway_drain_timeout_sec = 30;
 
-        // With transport_=nullptr, Init() will fail (session_=nullptr), Tick() returns false
+        // With transport_=nullptr, Init() is never called, session_=nullptr,
+        // and Tick() returns false at the null-session early-out.
         UpstreamH2Connection conn(nullptr, cfg);
         auto now = std::chrono::steady_clock::now();
         bool tick_result = conn.Tick(now, 1, 1);
-        // session_ is nullptr → Tick returns false
         bool pass = !tick_result;
-        TestFramework::RecordTest("H2Upstream B5: Tick returns false on PING timeout",
+        TestFramework::RecordTest("H2Upstream B5: Tick returns false when session is null",
                                    pass,
                                    pass ? "" : "Tick should return false with no session");
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("H2Upstream B5: Tick returns false on PING timeout",
+        TestFramework::RecordTest("H2Upstream B5: Tick returns false when session is null",
                                    false, e.what());
     }
 }
@@ -1604,6 +1604,39 @@ void TestC4GoawayMarksNotUsable() {
     }
 }
 
+// C4b — MarkDead is the lifecycle flag that closes the FailAllStreams race
+// window. After a fatal session error or PING timeout, the call sites in
+// pool_partition.cc and h2_connection_table.cc must MarkDead BEFORE
+// FailAllStreams so a concurrent FindUsable does not pick the conn between
+// the stream fan-out and the table erase. Verifies IsDead() / IsUsable()
+// transitions match that contract.
+void TestC4bMarkDeadDisablesUsable() {
+    std::cout << "\n[TEST] H2Upstream C4b: MarkDead -> IsDead and !IsUsable..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        cfg->ping_idle_sec = 0;
+        cfg->ping_timeout_sec = 0;
+        cfg->goaway_drain_timeout_sec = 0;
+
+        UpstreamH2Connection conn(nullptr, cfg);
+        bool was_dead_before = conn.IsDead();
+        conn.MarkDead();
+        bool pass =
+            !was_dead_before &&
+            conn.IsDead() &&
+            !conn.IsUsable() &&
+            !conn.goaway_seen();  // dead and goaway are independent flags
+        TestFramework::RecordTest("H2Upstream C4b: MarkDead -> IsDead and !IsUsable",
+                                   pass,
+                                   pass ? "" : "MarkDead did not transition flags correctly");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2Upstream C4b: MarkDead -> IsDead and !IsUsable",
+                                   false, e.what());
+    }
+}
+
 // C5 — acquire/release: ApplyHttp2ConfigCommit on one thread, LoadHttp2ConfigSnapshot
 //      on another thread, no torn read.
 void TestC5AcquireReleaseNoTornRead() {
@@ -1710,6 +1743,48 @@ void TestConfigParseH2Block() {
         TestFramework::RecordTest("H2Upstream Config: parse http2 upstream block", pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("H2Upstream Config: parse http2 upstream block", false, e.what());
+    }
+}
+
+// Hot-reload validation must reject http2.enabled=true on a non-TLS
+// upstream — same rule the startup Validate() applies. Without symmetry,
+// a SIGHUP that toggles enabled without enabling TLS passes hot-reload,
+// prints "restart required" warning, and the server fails to start at
+// the next restart.
+void TestConfigH2EnabledRequiresTlsHotReload() {
+    std::cout << "\n[TEST] H2Upstream Config: hot-reload rejects h2.enabled=true && !tls.enabled..." << std::endl;
+    try {
+        const std::string json = R"({
+            "upstreams": [{
+                "name": "svc",
+                "host": "127.0.0.1",
+                "port": 9000,
+                "tls": {"enabled": false},
+                "http2": {"enabled": true}
+            }]
+        })";
+        ServerConfig cfg = ConfigLoader::LoadFromString(json);
+
+        std::unordered_set<std::string> live_upstreams = {"svc"};
+        bool threw = false;
+        std::string what;
+        try {
+            ConfigLoader::ValidateHotReloadable(cfg, live_upstreams);
+        } catch (const std::invalid_argument& e) {
+            threw = true;
+            what = e.what();
+        }
+
+        bool pass = threw &&
+                    what.find("h2c not supported") != std::string::npos;
+        TestFramework::RecordTest("H2Upstream Config: hot-reload rejects h2.enabled=true && !tls.enabled",
+                                   pass,
+                                   pass ? "" :
+                                   ("expected h2c rejection; threw=" +
+                                    std::to_string(threw) + " what='" + what + "'"));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2Upstream Config: hot-reload rejects h2.enabled=true && !tls.enabled",
+                                   false, e.what());
     }
 }
 
@@ -2171,9 +2246,10 @@ void RunAllH2UpstreamTests() {
     // Config parsing
     TestConfigParseH2Block();
     TestConfigH2Defaults();
+    TestConfigH2EnabledRequiresTlsHotReload();
 
     // Tier B (wire-level — session-only)
-    TestB5PingTimeout();
+    TestB5TickReturnsFalseWithNullSession();
     TestB6RstStreamRemovesEntry();
     TestB7OnTrailersCompleteNoStream();
     TestB8RecordingSinkTrailers();
@@ -2184,6 +2260,7 @@ void RunAllH2UpstreamTests() {
     TestC2LeaseAdoption();
     TestC3StreamsEmptyAfterFailAll();
     TestC4GoawayMarksNotUsable();
+    TestC4bMarkDeadDisablesUsable();
     TestC5AcquireReleaseNoTornRead();
 }
 

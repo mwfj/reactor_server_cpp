@@ -1630,6 +1630,16 @@ void ConfigLoader::ValidateHotReloadable(
         // causing every H2 dispatch to fail at the wire.
         {
             const auto& h2 = u.http2;
+            // Mirror the startup rule: H2 outbound requires TLS (no h2c).
+            // Without this, a SIGHUP that toggles enabled→true on a
+            // non-TLS upstream passes hot-reload validation, prints
+            // "restart required" warning, and the server fails to start
+            // at the next restart — operator hits a delayed surprise.
+            if (h2.enabled && !u.tls.enabled) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.enabled=true requires tls.enabled=true (h2c not supported)");
+            }
             if (h2.prefer == "always" && !u.tls.enabled) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name +
