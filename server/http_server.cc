@@ -2953,12 +2953,13 @@ void HttpServer::Stop() {
             }
             const auto drain_budget = std::chrono::seconds(
                 shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
-            // Single shutdown deadline anchors every downstream wait.
-            // Each phase consumes from the same budget via budget_left()
-            // so the operator-configured shutdown_drain_timeout_sec is a
-            // hard cap on total drain wall-clock — not a per-phase hint
-            // that compounds. Pod terminationGracePeriodSeconds sized
-            // against this knob behaves as documented.
+            // Single shutdown deadline anchors steps 1/2/3 (observability
+            // flush, upstream drain, kill+shutdown) and the post-upstream
+            // H1 flush below. The earlier H1/H2/WS protocol drains have
+            // their own independent timeouts (H1_DRAIN_TIMEOUT_SEC, H2
+            // GOAWAY drain, WS close) and are NOT folded into this
+            // budget — operator-configured shutdown_drain_timeout_sec
+            // is the cap for this section, not for total Stop() wall.
             const auto shutdown_deadline =
                 std::chrono::steady_clock::now() + drain_budget;
             auto budget_left = [shutdown_deadline]() {
@@ -2988,8 +2989,7 @@ void HttpServer::Stop() {
             // live snapshots.
             if (upstream_manager_) {
                 upstream_manager_->InitiateShutdown();
-                upstream_manager_->WaitForDrain(
-                    std::chrono::ceil<std::chrono::seconds>(budget_left()));
+                upstream_manager_->WaitForDrain(budget_left());
             }
             // Step 3 — kill survivors + BeginShutdown AFTER upstream
             // drain so any proxy in-flight that finalized during step 2
@@ -3288,8 +3288,7 @@ bool HttpServer::WaitForAllAsyncDrain(
     // null. Null managers contribute zero, so the predicate short-
     // circuits true when nothing is in flight.
     //
-    // The observability check covers THREE counters because they can
-    // be non-zero independently:
+    // The observability check covers THREE counters:
     //   - inflight_finalizations_  : registered, not-yet-finalized.
     //   - finalizers_in_progress_  : a finalize won the CAS and is
     //                                still inside OnFinalizeWinner.
@@ -3297,12 +3296,15 @@ bool HttpServer::WaitForAllAsyncDrain(
     //                                decremented, so the window where
     //                                inflight==0 but finalizer hasn't
     //                                returned must also be drained.
-    //   - kill_marshals_in_flight_ : per-dispatcher kill EnQueue
-    //                                closures the marshal path bumps
-    //                                before EnQueue and decrements
-    //                                when the closure runs.
-    // Skipping any of the three creates a use-after-free window
-    // during ObservabilityManager teardown.
+    //   - kill_marshals_in_flight_ : RESERVED for a future per-
+    //                                dispatcher kill-marshal step
+    //                                (today the kill loop runs inline
+    //                                from the stopper thread; no
+    //                                incrementer/decrementer exists).
+    //                                The clause is permanently zero
+    //                                today and is kept here so the
+    //                                predicate is forward-compatible
+    //                                with that wiring.
     auto* upm = upstream_manager_.get();
     auto* obs = observability_manager_.get();
     auto predicate = [upm, obs]() {
@@ -3330,14 +3332,15 @@ bool HttpServer::WaitForAllAsyncDrain(
                 lck, std::chrono::milliseconds(50));
         }
     } else if (upm) {
-        // No observability manager — wait on the upstream drain cv
-        // instead of polling. drain_cv_ is signaled by PoolPartition
-        // every time a connection count changes (lease release / conn
-        // close), which paired with DecInflightTransactions on the
-        // same release path makes the cv a sufficient wake signal
-        // for the predicate. The 50ms timeout is a safety net: a
-        // pure DecInflightTransactions decrement that doesn't touch
-        // pool state still gets noticed within one tick.
+        // No observability manager — periodically re-check the
+        // predicate, with a wakeup hook on the upstream drain cv as
+        // an opportunistic short-circuit. PoolPartition's
+        // MaybeSignalDrain only fires on the LAST decrement to zero
+        // (gated on shutting_down_ && outstanding_conns <= 0), and
+        // DecInflightTransactions is a silent atomic — so the cv is
+        // not a reliable per-event wake. The 50 ms timer is what
+        // actually drives progress; the cv occasionally lets us
+        // short-circuit on the final zero-crossing.
         std::unique_lock<std::mutex> lck(upm->drain_mtx());
         while (!predicate()) {
             if (std::chrono::steady_clock::now() >= deadline) break;
@@ -3378,15 +3381,11 @@ void HttpServer::DrainObservabilityForShutdown(
 bool HttpServer::FlushObservabilityForShutdown(
         std::chrono::milliseconds budget) {
     bool drained = WaitForAllAsyncDrain(budget);
-    // ForceFlush hook: when the OTLP push pipeline is wired, the
-    // BatchSpanProcessor's flush triggers an export through
-    // UpstreamHttpClient. The pre-upstream-shutdown placement here
-    // ensures those checkouts succeed against live pools. The
-    // current NoopSpanProcessor wiring makes this a no-op; the call
-    // is retained so the eventual OTLP wiring just needs to plug
-    // its processor in without re-ordering Stop().
-    // BatchSpanProcessor::ForceFlush is not on the SpanProcessor base
-    // — when wiring lands, dynamic_cast or expand the base interface.
+    // TODO: when the OTLP push pipeline is wired, call
+    // BatchSpanProcessor::ForceFlush here. The pre-upstream-shutdown
+    // placement keeps those exporter checkouts against live pools.
+    // ForceFlush is not on the SpanProcessor base interface today —
+    // either dynamic_cast or expand the base when wiring lands.
     return drained;
 }
 
@@ -3408,19 +3407,23 @@ void HttpServer::KillAndShutdownObservability(
     };
     if (!drained_in_flush_phase) {
         // KillOutstandingSnapshots is synchronous CAS work; the grace
-        // parameter is currently unused (see method docstring).
+        // parameter is currently unused (see method docstring). Skip
+        // when step 1 already drained — the registry is empty.
         observability_manager_->KillOutstandingSnapshots(remaining());
-        // After the kill sweep, snapshots whose CAS was already won by
-        // an in-progress finalizer are skipped — but those finalizers
-        // may still be inside OnFinalizeWinner, racing toward
-        // Span::End. If BeginShutdown signals the processor before
-        // they reach End, the OnEnd dispatch sees shutting_down_ and
-        // the completed span is dropped as post-shutdown overflow.
-        // Wait once more (bounded by remaining budget) for
-        // finalizers_in_progress_ to drain so those spans land through
-        // the still-live exporter pipeline before BeginShutdown
-        // signals shutdown.
-        auto* obs = observability_manager_.get();
+    }
+    // Always wait for finalizers_in_progress_ to drain before
+    // BeginShutdown, even when step 1 returned drained=true. Step 2's
+    // upstream-pool drain runs between step 1 and here, and proxy
+    // transactions that complete during step 2 trigger fresh
+    // FinalizeFromSnapshot calls. Those finalizers may be mid-
+    // OnFinalizeWinner when this function is entered; if BeginShutdown
+    // signals the processor before they reach Span::End, OnEnd sees
+    // shutting_down_ and drops the completed span as post-shutdown
+    // overflow. Today's NoopSpanProcessor masks the loss; the moment
+    // BatchSpanProcessor wires in, this becomes user-visible data
+    // loss.
+    auto* obs = observability_manager_.get();
+    {
         std::unique_lock<std::mutex> lck(obs->finalizers_done_mtx());
         obs->finalizers_done_cv().wait_until(lck, deadline, [obs]() {
             return obs->finalizers_in_progress() == 0;

@@ -13,10 +13,14 @@
 // cumulative `_bucket{le="..."}` lines plus `_sum` and `_count`.
 //
 // Sanitization collisions across distinct OTel names are detected on
-// every Render() call; each distinct collision pair is logged at most
-// once per process via an internal warned-set. The framework HTTP-
+// every Render() call. The first instrument with a given emit name
+// (sanitized + the Counter "_total" suffix) wins; subsequent
+// instruments that map to the same emit name are SUPPRESSED so the
+// output never contains conflicting `# TYPE` blocks for the same
+// family. Each distinct collision pair is logged at most once per
+// process (warned-set bounded at 1024 entries). The framework HTTP-
 // semconv catalog is collision-free, so this fires only on operator-
-// added custom names that sanitize to the same Prometheus family.
+// added custom names that map to the same Prometheus family.
 
 #include "observability/metrics_snapshot.h"
 

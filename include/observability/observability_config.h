@@ -27,7 +27,8 @@
 //                    retries.*}  — max_queue_size is RESTART (queue
 //                                  capacity is allocated at ctor and
 //                                  Reload never resizes).
-//   - metrics.otlp.{headers, timeout_ms, export_interval_ms}
+//   - metrics.otlp.{headers, timeout_ms}
+//   - metrics.reader.{export_interval_ms, export_timeout_ms}
 //   - metrics.prometheus.include_target_info
 
 #include <chrono>
@@ -115,6 +116,14 @@ struct PeriodicReaderConfig {
 };
 
 struct MetricsConfig {
+    // Hard cap on per-instrument histogram boundary count. Each
+    // (instrument, label combination) allocates one cumulative
+    // counter per boundary, so an unbounded boundary list scales
+    // memory linearly with cardinality and is a denial-of-service
+    // surface. Shared by config validation and any future
+    // construction-time validators.
+    static constexpr size_t kMaxBucketsPerInstrument = 256;
+
     bool        enabled  = true;       // live-reloadable
     std::string exporter;              // "otlp_http" | "prometheus_pull" | "". RESTART
     OtlpTransportConfig otlp;          // upstream RESTART; headers/timeout/interval live
@@ -139,6 +148,19 @@ struct ResourceConfig {
     std::string service_name        = "reactor-server";
     std::string service_version;     // empty → omit.
     std::string service_instance_id; // empty → omit.
+    // Restart-required equality. Same field-classification contract as
+    // TracesConfig::operator== — every existing field is restart-only
+    // (Resource attributes are baked into spans + the Prometheus
+    // target_info series at construction; runtime mutation would
+    // re-key all in-flight series). Adding a future field (e.g. OTel
+    // service.namespace) MUST update this comparator AND classify in
+    // ObservabilityManager::Reload's per-field block.
+    bool operator==(const ResourceConfig& o) const {
+        return service_name == o.service_name
+            && service_version == o.service_version
+            && service_instance_id == o.service_instance_id;
+    }
+    bool operator!=(const ResourceConfig& o) const { return !(*this == o); }
 };
 
 struct ObservabilityConfig {
@@ -150,14 +172,13 @@ struct ObservabilityConfig {
     // Restart-required equality — only fields that cannot be hot-reloaded
     // contribute. The HttpServer::Reload outer "restart required" warn
     // fires when this differs between live and staged configs.
-    // Composition is delegated to TracesConfig / MetricsConfig
-    // operator== so adding a field to one of those structs forces the
-    // author to revisit the field-classification contract there.
+    // Composition is delegated to ResourceConfig / TracesConfig /
+    // MetricsConfig operator== so adding a field to one of those
+    // structs forces the author to revisit the field-classification
+    // contract there.
     bool operator==(const ObservabilityConfig& o) const {
         return enabled == o.enabled
-            && resource.service_name == o.resource.service_name
-            && resource.service_version == o.resource.service_version
-            && resource.service_instance_id == o.resource.service_instance_id
+            && resource == o.resource
             && traces == o.traces
             && metrics == o.metrics;
     }

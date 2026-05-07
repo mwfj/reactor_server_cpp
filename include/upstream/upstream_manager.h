@@ -67,7 +67,12 @@ public:
     // them (leases may still hold raw pointers). The manager must NOT be
     // destroyed until all dispatcher threads are joined — HttpServer::Stop()
     // ensures this by calling upstream_manager_.reset() after net_server_.Stop().
-    void WaitForDrain(std::chrono::seconds timeout);
+    // milliseconds resolution so HttpServer::Stop's single-deadline
+    // budget can pass sub-second residuals without rounding-up to the
+    // next full second (which would defeat the hard-cap contract).
+    // Callers passing chrono::seconds get implicit conversion (no API
+    // break for the test suites).
+    void WaitForDrain(std::chrono::milliseconds timeout);
 
     // Non-blocking check: true if outstanding_conns_ == 0.
     bool AllDrained() const;
@@ -95,10 +100,13 @@ public:
         return inflight_transactions_.load(std::memory_order_acquire);
     }
     // Drain mutex/cv accessors for HttpServer::WaitForAllAsyncDrain.
-    // The cv is signaled on every transaction/lease decrement so a
-    // single waiter can sleep until shutdown actually drains. Without
-    // these, the no-observability path would fall back to a 50ms
-    // polling loop.
+    // NOTE: drain_cv_ is signaled by PoolPartition::MaybeSignalDrain
+    // ONLY when shutting_down_ is set AND outstanding_conns_ has
+    // dropped to zero (the final transition). DecInflightTransactions
+    // is a silent atomic with no notify. Callers waiting on this cv
+    // MUST pair it with a periodic re-check timer; the cv alone is
+    // an opportunistic short-circuit for the final zero-crossing,
+    // not a per-event wake.
     std::mutex& drain_mtx() noexcept { return drain_mtx_; }
     std::condition_variable& drain_cv() noexcept { return drain_cv_; }
     void IncInflightTransactions() noexcept {

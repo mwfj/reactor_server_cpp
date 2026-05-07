@@ -85,12 +85,15 @@ void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
     // operator instead of failing closed; metrics-only deployments are
     // valid and shouldn't fail to reload, but the operator should know
     // their staged change didn't take effect. Restart is required to
-    // attach a processor.
-    if (c.traces.enabled && span_processor_ == nullptr) {
+    // attach a processor. Warn ONCE per process so SIGHUP reloads of a
+    // stable misconfig don't spam the log.
+    if (c.traces.enabled && span_processor_ == nullptr
+        && !traces_processor_misconfig_warned_) {
         logging::Get()->warn(
             "observability.traces.enabled=true but no SpanProcessor "
             "is attached (traces.exporter was empty at boot). "
             "Restart with traces.exporter set to enable tracing.");
+        traces_processor_misconfig_warned_ = true;
     }
 }
 
@@ -432,7 +435,7 @@ void ObservabilityManager::BeginShutdown(
 }
 
 void ObservabilityManager::KillOutstandingSnapshots(
-    [[maybe_unused]] std::chrono::milliseconds /*grace*/) {
+    [[maybe_unused]] std::chrono::milliseconds grace) {
     // Snapshot the registry under the mutex, then run the per-snapshot
     // kill outside it (each snapshot's CAS gate is independent).
     std::vector<std::shared_ptr<ObservabilitySnapshot>> to_kill;

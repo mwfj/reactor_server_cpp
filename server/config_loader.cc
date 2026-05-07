@@ -1028,6 +1028,9 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                         "observability.traces.sampler must be an object");
                 auto& sj = tj["sampler"];
                 if (sj.contains("type")) {
+                    if (!sj["type"].is_string())
+                        throw std::runtime_error(
+                            "observability.traces.sampler.type must be a string");
                     auto t = sj["type"].get<std::string>();
                     if (t == "always_on")
                         oc.traces.sampler.type =
@@ -1069,7 +1072,15 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                                 "{path, sampler, ratio?}");
                         }
                         OBSERVABILITY_NAMESPACE::SamplerRouteOverride o;
+                        if (it.contains("path") && !it["path"].is_string())
+                            throw std::runtime_error(
+                                "observability.traces.sampler.routes[].path "
+                                "must be a string");
                         o.path = it.value("path", std::string{});
+                        if (it.contains("sampler") && !it["sampler"].is_string())
+                            throw std::runtime_error(
+                                "observability.traces.sampler.routes[].sampler "
+                                "must be a string");
                         auto t = it.value("sampler", std::string("always_off"));
                         if (t == "always_on")
                             o.sampler = OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOn;
@@ -1091,6 +1102,10 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                                 "must be one of: always_on, always_off, "
                                 "trace_id_ratio, parent_based (got '" +
                                 t + "')");
+                        if (it.contains("ratio") && !it["ratio"].is_number())
+                            throw std::runtime_error(
+                                "observability.traces.sampler.routes[].ratio "
+                                "must be a number");
                         o.ratio = it.value("ratio", 1.0);
                         oc.traces.sampler.routes.push_back(std::move(o));
                     }
@@ -1119,6 +1134,10 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     oc.traces.otlp.headers.clear();
                     for (auto it = oj["headers"].begin();
                          it != oj["headers"].end(); ++it) {
+                        if (!it.value().is_string())
+                            throw std::runtime_error(
+                                "observability.traces.otlp.headers[" +
+                                it.key() + "] must be a string");
                         oc.traces.otlp.headers[it.key()] =
                             it.value().get<std::string>();
                     }
@@ -1215,6 +1234,10 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     oc.metrics.otlp.headers.clear();
                     for (auto it = oj["headers"].begin();
                          it != oj["headers"].end(); ++it) {
+                        if (!it.value().is_string())
+                            throw std::runtime_error(
+                                "observability.metrics.otlp.headers[" +
+                                it.key() + "] must be a string");
                         oc.metrics.otlp.headers[it.key()] =
                             it.value().get<std::string>();
                     }
@@ -2229,21 +2252,22 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
 
     // Histogram bucket layout — every boundary must be finite (NaN
     // and ±Inf are rejected so the Prometheus formatter and OTLP
-    // serialiser never see them) AND strictly increasing. Per-
-    // instrument bucket count is capped: each label combination
-    // allocates one counter per boundary, so a 100k-boundary typo
-    // would otherwise be a per-series memory bomb.
-    static constexpr size_t kMaxBucketsPerInstrument = 256;
+    // serialiser never see them) AND strictly increasing. The cap
+    // lives on MetricsConfig so non-config histogram constructors
+    // can share it.
     for (const auto& kv : oc.metrics.histogram_buckets) {
         if (kv.second.empty())
             throw std::invalid_argument(
                 "observability.metrics.histogram_buckets[" + kv.first +
                 "] must be non-empty");
-        if (kv.second.size() > kMaxBucketsPerInstrument)
+        if (kv.second.size() >
+            OBSERVABILITY_NAMESPACE::MetricsConfig::kMaxBucketsPerInstrument)
             throw std::invalid_argument(
                 "observability.metrics.histogram_buckets[" + kv.first +
                 "] exceeds the per-instrument boundary cap (" +
-                std::to_string(kMaxBucketsPerInstrument) + ")");
+                std::to_string(OBSERVABILITY_NAMESPACE::MetricsConfig::
+                                 kMaxBucketsPerInstrument) +
+                ")");
         for (size_t i = 0; i < kv.second.size(); ++i) {
             if (!std::isfinite(kv.second[i])) {
                 throw std::invalid_argument(

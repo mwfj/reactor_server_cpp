@@ -348,35 +348,43 @@ const char* PrometheusExporter::ContentType(Format fmt) noexcept {
     }
 }
 
-// Detect sanitization collisions within a snapshot and log each
-// distinct collision pair at most once for the process lifetime. Two
-// distinct OTel instrument names that sanitize to the same Prometheus
-// family produce duplicate `# TYPE` lines, which strict OpenMetrics
-// validators reject. The framework HTTP-semconv catalog is collision-
-// free; this fires only on operator-added custom names.
-void DetectCollisionsAndWarn(
-    const std::vector<InstrumentSnapshot>& instruments) {
-    std::unordered_map<std::string, std::string> sanitized_to_original;
-    sanitized_to_original.reserve(instruments.size());
-    for (const auto& inst : instruments) {
-        std::string sanitized = PrometheusExporter::SanitizeName(inst.name);
-        if (sanitized.empty()) continue;
-        auto [it, inserted] =
-            sanitized_to_original.try_emplace(sanitized, inst.name);
-        if (inserted || it->second == inst.name) continue;
-        // Distinct originals → same sanitized name.
-        static std::mutex warned_mtx;
-        static std::unordered_set<std::string> warned;
-        std::string key = sanitized + "|" + it->second + "|" + inst.name;
-        std::lock_guard<std::mutex> g(warned_mtx);
-        if (warned.insert(std::move(key)).second) {
-            logging::Get()->warn(
-                "prometheus: name collision — '{}' and '{}' both "
-                "sanitize to '{}'; output will contain duplicate "
-                "TYPE blocks. Rename one of the OTel instruments.",
-                it->second, inst.name, sanitized);
-        }
-    }
+// Compute the wire-level emit name for an instrument: SanitizeName,
+// plus the "_total" suffix that Counter renders use. Keep in lockstep
+// with RenderInstrument's emit_name computation — collision dedup
+// MUST key on this, not on SanitizeName alone, because Counter "foo"
+// and Gauge "foo_total" both end up writing `# TYPE foo_total` and
+// only an emit-name keyed map detects the collision.
+std::string ComputeEmitName(const InstrumentSnapshot& inst) {
+    std::string base = PrometheusExporter::SanitizeName(inst.name);
+    if (base.empty()) return base;
+    if (inst.kind == InstrumentKind::Counter) base += "_total";
+    return base;
+}
+
+// Process-lifetime warned set, capped to bound memory growth from
+// dynamic instrument registration (Phase 2+).
+std::mutex& CollisionWarnedMtx() {
+    static std::mutex m;
+    return m;
+}
+std::unordered_set<std::string>& CollisionWarnedSet() {
+    static std::unordered_set<std::string> s;
+    return s;
+}
+void WarnCollisionOnce(const std::string& key,
+                        const std::string& a_name,
+                        const std::string& b_name,
+                        const std::string& emit_name) {
+    static constexpr size_t kMaxWarnedCollisions = 1024;
+    std::lock_guard<std::mutex> g(CollisionWarnedMtx());
+    auto& warned = CollisionWarnedSet();
+    if (warned.size() >= kMaxWarnedCollisions) return;
+    if (!warned.insert(key).second) return;
+    logging::Get()->warn(
+        "prometheus: name collision — '{}' and '{}' both render as "
+        "'{}'; the second instrument will be SUPPRESSED to keep "
+        "output OpenMetrics-valid. Rename one of the OTel instruments.",
+        a_name, b_name, emit_name);
 }
 
 std::string PrometheusExporter::Render(const MetricsSnapshot& snap,
@@ -384,14 +392,28 @@ std::string PrometheusExporter::Render(const MetricsSnapshot& snap,
     std::string out;
     out.reserve(2048);
 
-    DetectCollisionsAndWarn(snap.instruments);
-
     // target_info — emitted from Resource attrs whenever the snapshot
     // carries a Resource. The handler clears snap.resource to suppress
     // it when include_target_info is off.
     RenderTargetInfo(out, snap.resource.get());
 
+    // Dedup duplicates by emit_name within this scrape. The first
+    // instrument with a given emit_name wins; subsequent ones are
+    // skipped (and a once-per-process warn is emitted) so output
+    // never contains conflicting `# TYPE` blocks for the same family.
+    std::unordered_map<std::string, std::string> emitted_to_original;
+    emitted_to_original.reserve(snap.instruments.size());
     for (const auto& inst : snap.instruments) {
+        std::string emit = ComputeEmitName(inst);
+        if (emit.empty()) continue;
+        auto [it, inserted] =
+            emitted_to_original.try_emplace(emit, inst.name);
+        if (!inserted) {
+            if (it->second == inst.name) continue;  // same instrument repeated
+            WarnCollisionOnce(emit + "|" + it->second + "|" + inst.name,
+                              it->second, inst.name, emit);
+            continue;  // suppress conflicting render
+        }
         RenderInstrument(out, inst, fmt);
     }
 

@@ -211,6 +211,15 @@ private:
     std::atomic<bool> metrics_enabled_{true};
     std::atomic<bool> include_target_info_{true};
 
+    // Tracks whether PublishLiveFlags has already warned about the
+    // "traces.enabled=true but no SpanProcessor" misconfig in this
+    // process. Operator gets one warning per process — Reload() flips
+    // (e.g. config reload that changes nothing else) don't re-spam.
+    // PublishLiveFlags is called only on the construction thread and
+    // on the Reload caller thread, never concurrently, so a plain bool
+    // suffices.
+    bool traces_processor_misconfig_warned_ = false;
+
     // Snapshot registry. Keyed on the snapshot's raw address (stable
     // for its lifetime — make_shared never moves). Touched only under
     // live_snapshots_mtx_; the matching counter increment+decrement
