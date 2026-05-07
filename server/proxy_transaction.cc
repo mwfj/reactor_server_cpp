@@ -1319,6 +1319,22 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             pending_retryable_5xx_head_ = response_head_;
             pending_retryable_5xx_body_ = std::move(snapshot.body);
             pending_retryable_5xx_body_complete_ = snapshot.complete;
+            // The keep_held branch below relies on H1's transport-level pause
+            // (codec_->PauseParsing + IncReadDisable on the transport) to
+            // hold the original 5xx body in case the retry is later rejected.
+            // H2 has no equivalent: the multiplexed transport must keep
+            // serving sibling streams, lease_ is empty post-DispatchH2 so
+            // IncReadDisable is a no-op, and UpstreamH2Codec::PauseParsing
+            // only flips a flag nothing reads. Force-clearing the holding
+            // flag steers MaybeRetry into the Cleanup-driven path: ResetStream
+            // cleanly cancels the in-flight body and the retry attempt
+            // actually contacts the upstream. The trade-off is that an H2
+            // retry-rejection delivers the headers-only snapshot rather than
+            // the full upstream 5xx body — same trade-off the H2 OnHeaders
+            // synchronous-decision path already accepts.
+            if (h2_path_) {
+                pending_retryable_5xx_body_complete_ = true;
+            }
             holding_retryable_5xx_response_ =
                 !pending_retryable_5xx_body_complete_;
             held_retryable_5xx_saw_eof_ = false;
@@ -1462,7 +1478,7 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                                      "client_fd={} service={} status={} "
                                      "attempt={} duration={}ms",
                                      client_fd_, service_name_,
-                                     codec_->GetResponse().status_code,
+                                     response_head_.status_code,
                                      attempt_, duration.count());
                 state_ = State::COMPLETE;
                 HttpResponse client_response = BuildClientResponse();

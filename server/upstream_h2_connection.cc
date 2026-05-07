@@ -46,10 +46,18 @@ int OnFrameRecvCallback(nghttp2_session* /*session*/,
             }
         } else if (cat == NGHTTP2_HCAT_HEADERS) {
             // HCAT_HEADERS after the first HEADERS frame: either the
-            // final response (when the first was 1xx) or trailers.
+            // final response (when the first was 1xx), another 1xx
+            // interim (chained interims like 100 Continue → 103 Early
+            // Hints → final), or trailers.
             auto* stream = self->GetStream(frame->hd.stream_id);
             if (stream && !stream->head_dispatched) {
-                self->OnHeadersComplete(frame->hd.stream_id, end_stream);
+                if (stream->response_head.status_code >= 100 &&
+                    stream->response_head.status_code < 200) {
+                    // Another interim — keep waiting for the final.
+                    stream->saw_1xx_interim = true;
+                } else {
+                    self->OnHeadersComplete(frame->hd.stream_id, end_stream);
+                }
             } else if (stream && stream->head_dispatched) {
                 self->OnTrailersComplete(frame->hd.stream_id);
             }
@@ -142,7 +150,12 @@ int OnHeaderCallback(nghttp2_session* /*session*/, const nghttp2_frame* frame,
                 logging::Get()->warn(
                     "UpstreamH2Connection: invalid :status '{}' on stream {}",
                     val, frame->hd.stream_id);
-                self->ResetStream(frame->hd.stream_id);
+                // nghttp2 RSTs the stream with INTERNAL_ERROR on
+                // NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE; the eventual
+                // OnStreamClose then fires sink->OnError so the proxy
+                // transaction can fail/retry. Calling ResetStream
+                // ourselves would detach the sink and silently swallow
+                // that signal.
                 return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
             }
             stream->response_head.status_code = s;

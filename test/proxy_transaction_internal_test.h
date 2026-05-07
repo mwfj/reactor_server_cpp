@@ -607,6 +607,116 @@ void TestRetryable5xxIncompleteSnapshotKeepsLeaseDuringBackoff() {
     }
 }
 
+// Fix #1 verification: on the H2 path, MaybeRetry must NOT take the
+// keep_held branch even when the snapshot is incomplete — H2 has no
+// transport-level pause analog (lease is empty post-DispatchH2,
+// UpstreamH2Codec::PauseParsing is a no-op), so keep-held would let
+// body chunks flow through to the client and the retry timer would
+// fire after the original 5xx was already delivered. The fix in
+// MaybeRetry forces pending_retryable_5xx_body_complete_=true for
+// h2_path_ so Cleanup runs and the actual retry attempt fires.
+void TestRetryable5xxH2PathClearsHoldingDespiteIncompleteSnapshot() {
+    std::cout << "\n[TEST] ProxyTransaction internal: H2 retryable 5xx clears holding even with incomplete snapshot..."
+              << std::endl;
+    try {
+        int fds[2] = {-1, -1};
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+            throw std::runtime_error("socketpair failed");
+        }
+
+        auto dispatcher = std::make_shared<Dispatcher>();
+        auto transport = std::shared_ptr<ConnectionHandler>(new ConnectionHandler(
+            dispatcher,
+            std::unique_ptr<SocketHandler>(
+                new SocketHandler(fds[0], "127.0.0.1", 8080))));
+        // The H2 fast path detaches the lease at DispatchH2, so the test
+        // mirrors that by leaving tx->lease_ empty.
+        auto upstream_conn =
+            std::make_unique<UpstreamConnection>(transport, "127.0.0.1", 8080);
+
+        HttpRequest request;
+        request.method = "GET";
+        request.url = "/h2-retry-5xx";
+        request.path = "/h2-retry-5xx";
+        request.headers["host"] = "example.test";
+        request.client_fd = 42;
+
+        ProxyConfig proxy_config;
+        HeaderRewriter::Config rewriter_config;
+        HeaderRewriter header_rewriter(rewriter_config);
+        RetryPolicy::Config retry_config;
+        retry_config.max_retries = 1;
+        retry_config.retry_on_5xx = true;
+        retry_config.retry_on_connect_failure = false;
+        RetryPolicy retry_policy(retry_config);
+
+        auto tx = std::make_shared<ProxyTransaction>(
+            "svc",
+            request,
+            HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender(),
+            [](HttpResponse) {},
+            nullptr,
+            proxy_config,
+            header_rewriter,
+            retry_policy,
+            false,
+            "127.0.0.1",
+            8080,
+            "",
+            "",
+            "");
+
+        tx->dispatcher_ = dispatcher.get();
+        tx->state_ = ProxyTransaction::State::RECEIVING_BODY;
+        // H2 dispatch path: lease is donated to the H2 connection, so
+        // tx->lease_ is empty (the empty default-constructed UpstreamLease
+        // is fine) but h2_path_ is set to mark the H2 dispatch.
+        tx->h2_path_ = true;
+        tx->h2_stream_id_ = 1;
+        tx->response_headers_seen_ = true;
+        tx->response_head_.status_code = HttpStatus::SERVICE_UNAVAILABLE;
+        tx->response_head_.status_reason = "Service Unavailable";
+        // Force the snapshot.complete=false branch by configuring an
+        // expected_length that exceeds the (empty) accumulated body.
+        tx->response_head_.framing =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH;
+        tx->response_head_.expected_length = 100;
+        tx->response_body_.clear();
+
+        tx->MaybeRetry(RetryPolicy::RetryCondition::RESPONSE_5XX);
+
+        bool pass =
+            !tx->holding_retryable_5xx_response_ &&  // <-- the fix
+            tx->pending_retryable_5xx_body_complete_ &&  // <-- forced
+            tx->attempt_ == 1 &&
+            tx->pending_retryable_5xx_response_;
+        std::string err;
+        if (tx->holding_retryable_5xx_response_) {
+            err += "h2_path_ must clear holding_retryable_5xx_response_; ";
+        }
+        if (!tx->pending_retryable_5xx_body_complete_) {
+            err += "h2_path_ must force pending_retryable_5xx_body_complete_=true; ";
+        }
+        if (tx->attempt_ != 1) err += "attempt should be incremented to 1; ";
+        if (!tx->pending_retryable_5xx_response_) err += "stored 5xx missing; ";
+
+        tx->complete_cb_invoked_ = true;
+        tx->complete_cb_ = nullptr;
+        tx->Cancel();
+        if (fds[1] >= 0) {
+            ::close(fds[1]);
+        }
+
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: H2 retryable 5xx clears holding even with incomplete snapshot",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: H2 retryable 5xx clears holding even with incomplete snapshot",
+            false, e.what());
+    }
+}
+
 void TestHeldRetryable5xxIncompleteSnapshotResumesInsteadOfRetrying() {
     std::cout << "\n[TEST] ProxyTransaction internal: held 5xx incomplete snapshot resumes instead of retrying..."
               << std::endl;
@@ -957,6 +1067,7 @@ void RunAllTests() {
     TestCheckoutCapsAndCleanupRestoresIdleUpstreamTransportInputCap();
     TestRetryable5xxRetryReleasesLeaseBeforeBackoff();
     TestRetryable5xxIncompleteSnapshotKeepsLeaseDuringBackoff();
+    TestRetryable5xxH2PathClearsHoldingDespiteIncompleteSnapshot();
     TestHeldRetryable5xxIncompleteSnapshotResumesInsteadOfRetrying();
     TestCheckoutLocalFailureRelaysStoredRetryable5xx();
     TestCheckoutCircuitOpenRelaysStoredRetryable5xx();
