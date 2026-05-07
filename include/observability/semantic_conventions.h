@@ -13,7 +13,7 @@
 #include <string_view>
 
 namespace OBSERVABILITY_NAMESPACE {
-namespace sem {
+namespace SEMCONV_NAMESPACE {
 
 // ---- HTTP server semconv (RFC 9112 + OTel HTTP semconv 1.27) ----
 inline constexpr std::string_view kHttpRequestMethod      = "http.request.method";
@@ -88,5 +88,5 @@ inline constexpr std::string_view kReactorUpstreamRetryReason = "reactor.upstrea
 inline constexpr std::string_view kReactorOtelInstrument  = "reactor.otel.instrument";
 inline constexpr std::string_view kReactorOtelDropReason  = "reactor.otel.drop_reason";
 
-}  // namespace sem
+}  // namespace SEMCONV_NAMESPACE
 }  // namespace OBSERVABILITY_NAMESPACE

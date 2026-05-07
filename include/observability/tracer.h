@@ -32,7 +32,8 @@
 #include "observability/span_kind.h"
 #include "observability/trace_id.h"
 
-#include "../common.h" 
+#include "../common.h"
+// <chrono>, <memory>, <string>, <vector> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 

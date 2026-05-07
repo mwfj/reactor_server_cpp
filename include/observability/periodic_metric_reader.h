@@ -12,6 +12,8 @@
 #include "observability/meter_provider.h"
 
 #include "../common.h"
+#include <condition_variable>
+// <atomic>, <chrono>, <memory>, <mutex>, <thread> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 

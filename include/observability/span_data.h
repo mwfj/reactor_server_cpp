@@ -12,6 +12,7 @@
 #include "observability/span_status.h"
 
 #include "../common.h"
+// <chrono>, <memory>, <string>, <vector> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 

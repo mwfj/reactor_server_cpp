@@ -49,6 +49,8 @@
 #include "observability/tracer_provider.h"
 
 #include "../common.h"
+#include <condition_variable>
+// <atomic>, <chrono>, <memory>, <mutex>, <string>, <unordered_map> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 

@@ -417,15 +417,15 @@ void ObservabilityManager::OnFinalizeWinner(
     if (snap.inbound_span) {
         if (status_code > 0) {
             snap.inbound_span->SetAttribute(
-                std::string(sem::kHttpResponseStatusCode),
+                std::string(SEMCONV_NAMESPACE::kHttpResponseStatusCode),
                 AttrValue(static_cast<int64_t>(status_code)));
         }
         snap.inbound_span->SetAttribute(
-            std::string(sem::kHttpServerResponseBodySize),
+            std::string(SEMCONV_NAMESPACE::kHttpServerResponseBodySize),
             AttrValue(static_cast<int64_t>(wire_body_size)));
         if (!effective_error.empty()) {
             snap.inbound_span->SetAttribute(
-                std::string(sem::kErrorType),
+                std::string(SEMCONV_NAMESPACE::kErrorType),
                 AttrValue(effective_error));
             // OTel HTTP semconv: server-side 4xx maps to Status=UNSET
             // (client misuse, not a server fault). ERROR is reserved

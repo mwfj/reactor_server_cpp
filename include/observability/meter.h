@@ -15,6 +15,7 @@
 #include "observability/metrics_snapshot.h"
 
 #include "../common.h"
+// <memory>, <mutex>, <string>, <unordered_map>, <vector> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 

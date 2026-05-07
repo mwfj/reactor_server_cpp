@@ -15,11 +15,8 @@
 #include "observability/instrumentation_scope.h"
 #include "observability/resource.h"
 
-#include <chrono>
-#include <cstdint>
-#include <memory>
-#include <string>
-#include <vector>
+#include "../common.h"
+// <chrono>, <memory>, <string>, <vector> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 

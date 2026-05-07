@@ -19,6 +19,7 @@
 #include "observability/span_kind.h"
 
 #include "../common.h"
+// <cstdint>, <memory>, <string> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 

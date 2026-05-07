@@ -84,22 +84,22 @@ HttpRouter::Middleware MakeObservabilityMiddleware(
             opts.attributes.reserve(4);
             if (!request.method.empty()) {
                 opts.attributes.emplace_back(
-                    std::string(sem::kHttpRequestMethod),
+                    std::string(SEMCONV_NAMESPACE::kHttpRequestMethod),
                     AttrValue(request.method));
             }
             if (!request.route_match.pattern.empty()) {
                 opts.attributes.emplace_back(
-                    std::string(sem::kHttpRoute),
+                    std::string(SEMCONV_NAMESPACE::kHttpRoute),
                     AttrValue(request.route_match.pattern));
             }
             if (!request.url_scheme.empty()) {
                 opts.attributes.emplace_back(
-                    std::string(sem::kUrlScheme),
+                    std::string(SEMCONV_NAMESPACE::kUrlScheme),
                     AttrValue(request.url_scheme));
             }
             if (!request.network_protocol_version.empty()) {
                 opts.attributes.emplace_back(
-                    std::string(sem::kNetworkProtocolVersion),
+                    std::string(SEMCONV_NAMESPACE::kNetworkProtocolVersion),
                     AttrValue(request.network_protocol_version));
             }
 

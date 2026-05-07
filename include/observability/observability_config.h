@@ -32,6 +32,7 @@
 //   - metrics.prometheus.include_target_info
 
 #include "../common.h"
+// <chrono>, <map>, <string>, <vector> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 

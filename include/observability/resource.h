@@ -11,6 +11,7 @@
 #include "observability/attr_value.h"
 
 #include "../common.h"
+// <string>, <utility>, <vector> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 

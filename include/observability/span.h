@@ -34,6 +34,7 @@
 #include "observability/span_status.h"
 
 #include "../common.h"
+// <atomic>, <chrono>, <memory>, <stdexcept>, <string>, <vector> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 

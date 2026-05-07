@@ -22,6 +22,7 @@
 #include "observability/span_exporter.h"
 
 #include "../common.h"
+// <atomic>, <chrono>, <functional>, <map>, <memory>, <mutex>, <string>, <vector> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 

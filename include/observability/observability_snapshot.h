@@ -35,6 +35,7 @@
 #include "observability/span_context.h"
 
 #include "../common.h"
+// <atomic>, <chrono>, <memory>, <mutex>, <string> via common.h
 
 class Dispatcher;  // include/dispatcher.h forward — pointer member only.
 

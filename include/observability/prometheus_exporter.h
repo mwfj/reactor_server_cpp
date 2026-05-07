@@ -24,8 +24,8 @@
 
 #include "observability/metrics_snapshot.h"
 
-#include <string>
-#include <string_view>
+#include "../common.h"
+// <string>, <string_view> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 
