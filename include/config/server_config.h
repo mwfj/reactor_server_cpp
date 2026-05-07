@@ -312,18 +312,27 @@ struct ServerConfig {
     size_t max_body_size = 1048576;      // 1 MB
     size_t max_ws_message_size = 16777216; // 16 MB
     int request_timeout_sec = 30;
-    // Wall-clock cap (in seconds) for the post-protocol-drain shutdown
-    // sequence. HttpServer::Stop anchors a single shutdown_deadline =
-    // now + T at the start of this section and runs each sub-phase
-    // (observability flush → upstream pool drain → snapshot kill +
-    // processor stop → post-upstream H1 flush) via budget_left()
-    // against that one window. Worst-case wall-clock for this section
-    // is therefore T, not a multiple of T.
+    // Drain budget (in seconds) used by HttpServer::Stop. Reused as a
+    // deadline at multiple points in the shutdown sequence — sizing
+    // pod terminationGracePeriodSeconds against this knob requires
+    // accounting for every reuse, not just one application.
     //
-    // Total Stop() wall = (H2/WS/H1 protocol drains, each with their
-    // own independent timeouts BEFORE this section) + T. Pod
-    // terminationGracePeriodSeconds should be sized as protocol-drain
-    // budget + T + a small margin.
+    // Wall-clock worst case across the off-thread Stop() path:
+    //   1. WaitForH2Drain                    — up to T  (H2 GOAWAY drain)
+    //   2. WS close handshake                — up to 6s (fixed)
+    //   3. HTTP/1 output flush               — up to 2s (H1_DRAIN_TIMEOUT_SEC)
+    //   4. Late-H2 re-check (WaitForH2Drain) — up to T  (slow h2c classify)
+    //   5. Post-protocol drain section       — up to T  (single deadline:
+    //                                                    obs-flush +
+    //                                                    upstream-drain +
+    //                                                    kill+obs-stop +
+    //                                                    post-upstream H1)
+    // Sum: 3 × T + 8s. Step 5 itself is a single shutdown_deadline =
+    // now + T anchor (steps 5a-5d each consume from the same budget
+    // via budget_left()), but T is also the per-call deadline for
+    // steps 1 and 4.
+    //
+    // Pod terminationGracePeriodSeconds: size as 3 × T + 8s + margin.
     //
     // 0 = immediate (skip waits, force-close); negative rejected by Validate.
     int shutdown_drain_timeout_sec = 30;

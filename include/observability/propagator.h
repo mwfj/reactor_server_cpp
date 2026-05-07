@@ -20,11 +20,7 @@
 #include "observability/span_context.h"
 #include "observability/trace_state.h"
 
-#include <map>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <vector>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

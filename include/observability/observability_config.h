@@ -31,10 +31,7 @@
 //   - metrics.reader.{export_interval_ms, export_timeout_ms}
 //   - metrics.prometheus.include_target_info
 
-#include <chrono>
-#include <map>
-#include <string>
-#include <vector>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

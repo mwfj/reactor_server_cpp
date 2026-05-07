@@ -14,11 +14,7 @@
 #include "observability/metric_label_registry.h"
 #include "observability/metrics_snapshot.h"
 
-#include <memory>
-#include <mutex>
-#include <string>
-#include <unordered_map>
-#include <vector>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

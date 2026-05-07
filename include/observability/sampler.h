@@ -18,8 +18,7 @@
 #include "observability/span_context.h"
 #include "observability/span_kind.h"
 
-#include <memory>
-#include <string>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

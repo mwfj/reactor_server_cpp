@@ -11,10 +11,7 @@
 #include "observability/span_kind.h"
 #include "observability/span_status.h"
 
-#include <chrono>
-#include <memory>
-#include <string>
-#include <vector>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 
@@ -39,8 +36,8 @@ struct SpanData {
     bool        has_parent = false;
 
     std::string  name;
-    SpanKind     kind        = SpanKind::INTERNAL;
-    SpanStatusCode status_code = SpanStatusCode::UNSET;
+    SpanKind     kind          =          SpanKind::INTERNAL;
+    SpanStatusCode status_code =          SpanStatusCode::UNSET;
     std::string  status_description;
 
     std::chrono::system_clock::time_point start_time_system{};

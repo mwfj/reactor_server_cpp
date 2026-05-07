@@ -15,11 +15,7 @@
 #include "observability/metrics_snapshot.h"
 #include "observability/resource.h"
 
-#include <chrono>
-#include <memory>
-#include <mutex>
-#include <string>
-#include <unordered_map>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

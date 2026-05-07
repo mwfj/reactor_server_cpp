@@ -11,12 +11,7 @@
 #include "observability/metric_exporter.h"
 #include "observability/meter_provider.h"
 
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <memory>
-#include <mutex>
-#include <thread>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

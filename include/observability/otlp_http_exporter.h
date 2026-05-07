@@ -21,14 +21,7 @@
 #include "observability/metric_exporter.h"
 #include "observability/span_exporter.h"
 
-#include <atomic>
-#include <chrono>
-#include <functional>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <string>
-#include <vector>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

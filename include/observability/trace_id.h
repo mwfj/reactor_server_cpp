@@ -12,12 +12,7 @@
 // instance may be safely shared across dispatchers (production wiring
 // passes one RandomSource through the manager to all Tracers).
 
-#include <array>
-#include <mutex>
-#include <cstdint>
-#include <cstring>
-#include <string>
-#include <string_view>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

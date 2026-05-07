@@ -10,8 +10,7 @@
 
 #include "observability/attr_value.h"
 
-#include <string>
-#include <vector>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

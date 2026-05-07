@@ -13,9 +13,8 @@
 //   - `precomputed_context` — when set, the new Span uses this context
 //                              verbatim instead of generating a fresh
 //                              span_id. Proxy / auth callers want the
-//                              exported CLIENT span's
-//                              `Context().span_id` to match the wire-
-//                              format span_id they already injected via
+//                              exported CLIENT span's `Context().span_id` 
+//                              to match the wire-format span_id they already injected via
 //                              `AttemptTraceContext.attempt_local` /
 //                              `IssueTraceContext.local`. Without this,
 //                              outbound traceparent (which uses the
@@ -33,10 +32,7 @@
 #include "observability/span_kind.h"
 #include "observability/trace_id.h"
 
-#include <chrono>
-#include <memory>
-#include <string>
-#include <vector>
+#include "../common.h" 
 
 namespace OBSERVABILITY_NAMESPACE {
 

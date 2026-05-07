@@ -201,7 +201,14 @@ private:
 
     // Completion callback
     HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete_cb_;
-    bool complete_cb_invoked_ = false;
+    // Atomic latch — writes happen on dispatcher-thread terminal
+    // callbacks (DeliverResponse / Cancel / various stream-error
+    // paths), but the destructor reads it on whatever thread releases
+    // the last shared_ptr (retry-timer lambda / upstream callback /
+    // shutdown kill sweep). Same TSan-flaggable cross-thread shape as
+    // kill_for_shutdown_ and inflight_counter_held_; use store(release)
+    // / load(acquire) so the dtor sees a published value.
+    std::atomic<bool> complete_cb_invoked_{false};
 
     // Upstream connection state (per attempt)
     UpstreamLease lease_;

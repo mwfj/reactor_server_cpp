@@ -17,10 +17,7 @@
 #include "observability/trace_id.h"
 #include "observability/tracer.h"
 
-#include <memory>
-#include <mutex>
-#include <string>
-#include <unordered_map>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

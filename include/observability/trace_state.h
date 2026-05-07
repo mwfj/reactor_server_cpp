@@ -16,12 +16,7 @@
 // the gateway. Oversized list-members or >32 entries → drop tracestate
 // entirely.
 
-#include <cstddef>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

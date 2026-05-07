@@ -48,13 +48,7 @@
 #include "observability/span_processor.h"
 #include "observability/tracer_provider.h"
 
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <memory>
-#include <mutex>
-#include <string>
-#include <unordered_map>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

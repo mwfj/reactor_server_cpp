@@ -33,11 +33,7 @@
 #include "observability/span_kind.h"
 #include "observability/span_status.h"
 
-#include <atomic>
-#include <chrono>
-#include <memory>
-#include <string>
-#include <vector>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 
@@ -133,9 +129,9 @@ private:
     // snapshot. Called by End().
     SpanData MakeSnapshot(std::chrono::system_clock::time_point end_system);
 
-    SpanContext context_;
-    SpanContext parent_context_;
-    bool        has_parent_;
+    SpanContext                context_;
+    SpanContext                parent_context_;
+    bool                       has_parent_;
 
     std::string                name_;
     SpanKind                   kind_;

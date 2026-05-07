@@ -264,7 +264,7 @@ ProxyTransaction::~ProxyTransaction() {
         upstream_manager_->DecInflightTransactions();
     }
 
-    if (!complete_cb_invoked_ && complete_cb_) {
+    if (!complete_cb_invoked_.load(std::memory_order_acquire) && complete_cb_) {
         logging::Get()->warn("ProxyTransaction destroyed without delivering "
                              "response client_fd={} service={} state={}",
                              client_fd_, service_name_,
@@ -1030,7 +1030,7 @@ bool ProxyTransaction::OnHeaders(
             state_ = State::FAILED;
             stream_sender_.Abort(
                 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
-            complete_cb_invoked_ = true;
+            complete_cb_invoked_.store(true, std::memory_order_release);
             complete_cb_ = nullptr;
             Cleanup();
             return false;
@@ -1068,7 +1068,7 @@ bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
         stream_sender_.Abort(
             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::CLIENT_DISCONNECT);
         state_ = State::FAILED;
-        complete_cb_invoked_ = true;
+        complete_cb_invoked_.store(true, std::memory_order_release);
         complete_cb_ = nullptr;
         Cleanup();
         return false;
@@ -1177,7 +1177,7 @@ void ProxyTransaction::OnResponseComplete() {
             stream_sender_.Abort(
                 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::CLIENT_DISCONNECT);
         }
-        complete_cb_invoked_ = true;
+        complete_cb_invoked_.store(true, std::memory_order_release);
         complete_cb_ = nullptr;
         Cleanup();
         return;
@@ -1218,7 +1218,7 @@ void ProxyTransaction::OnError(int result_code,
             reason = AbortReason::UPSTREAM_TIMEOUT;
         }
         stream_sender_.Abort(reason);
-        complete_cb_invoked_ = true;
+        complete_cb_invoked_.store(true, std::memory_order_release);
         complete_cb_ = nullptr;
         Cleanup();
         return;
@@ -1398,13 +1398,13 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
 }
 
 void ProxyTransaction::DeliverResponse(HttpResponse response) {
-    if (complete_cb_invoked_) {
+    if (complete_cb_invoked_.load(std::memory_order_acquire)) {
         logging::Get()->warn("ProxyTransaction double-deliver prevented "
                              "client_fd={} service={}",
                              client_fd_, service_name_);
         return;
     }
-    complete_cb_invoked_ = true;
+    complete_cb_invoked_.store(true, std::memory_order_release);
     ClearPendingRetryable5xxResponse();
 
     // Cleanup BEFORE invoking the completion callback to ensure transport
@@ -1496,7 +1496,7 @@ void ProxyTransaction::MarkKilledForShutdown() noexcept {
 }
 
 void ProxyTransaction::Cancel() {
-    if (cancelled_ || complete_cb_invoked_) {
+    if (cancelled_ || complete_cb_invoked_.load(std::memory_order_acquire)) {
         return;
     }
     logging::Get()->debug("ProxyTransaction::Cancel client_fd={} service={} "
@@ -1518,7 +1518,7 @@ void ProxyTransaction::Cancel() {
     // the client-side bookkeeping; delivering a response to a
     // disconnected client would be pointless and confuses the complete-
     // closure's one-shot completed/cancelled contract.
-    complete_cb_invoked_ = true;
+    complete_cb_invoked_.store(true, std::memory_order_release);
     complete_cb_ = nullptr;
     // POISON the upstream connection before releasing the lease IF we
     // have already started (or finished) writing the upstream request.
@@ -1749,7 +1749,7 @@ bool ProxyTransaction::ResumeHeldRetryable5xxResponse(
             state_ = State::FAILED;
             stream_sender_.Abort(
                 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
-            complete_cb_invoked_ = true;
+            complete_cb_invoked_.store(true, std::memory_order_release);
             complete_cb_ = nullptr;
             Cleanup();
             return true;
