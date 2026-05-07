@@ -1075,12 +1075,13 @@ static int HandleStart(const CliOptions& options) {
     // Resource carries service.name/version/instance.id.
     //
     // Refuse otlp_http exporters until the production push pipeline is
-    // wired through this bootstrap. Without this guard, the manager
-    // builds with a NoopSpanProcessor while ConfigLoader::Validate has
-    // already cross-checked the upstream — the operator's exporter
-    // setting would be silently ignored and traces would be lost. Fail
-    // closed at startup instead so misconfigurations surface
-    // immediately.
+    // wired through this bootstrap. Defense-in-depth — ConfigLoader::
+    // Validate already rejects otlp_http via ValidateObservabilityRestart
+    // for the normal startup path, but a code path that bypasses
+    // Validate (test fixtures, future programmatic config) would
+    // otherwise silently build the manager with a NoopSpanProcessor and
+    // lose all traces. Fail closed at startup so misconfigurations
+    // surface immediately regardless of how config arrived here.
     if (config.observability.enabled) {
         if (config.observability.traces.exporter == "otlp_http") {
             throw std::runtime_error(
@@ -1117,16 +1118,20 @@ static int HandleStart(const CliOptions& options) {
         }
         auto resource = std::make_shared<OBSERVABILITY_NAMESPACE::Resource>(
             std::move(resource_attrs));
-        // Install a span processor only when a traces exporter is
-        // configured. Without this gate, a Prometheus-only deployment
-        // (traces.exporter empty, metrics.exporter="prometheus_pull")
-        // would still allocate sampled SERVER spans and propagate
-        // sampled trace_flags to upstreams — even though the operator
-        // explicitly disabled trace export. Tracer::StartSpan with a
-        // null processor returns non-recording spans.
+        // Install a span processor whenever a traces exporter is
+        // configured — independent of traces.enabled. This keeps
+        // traces.enabled truly live-reloadable: an operator can boot
+        // with traces.enabled=false, then SIGHUP to true and have
+        // spans flow without restart. Without this, gating on
+        // traces.enabled at boot would make the false→true flip a
+        // permanent no-op (the warn in PublishLiveFlags would fire).
+        // A Prometheus-only deployment (traces.exporter empty) still
+        // gets no processor, so Tracer::StartSpan returns non-
+        // recording spans and the propagator doesn't inject sampled
+        // trace_flags. The traces.enabled live flag governs whether
+        // PublishLiveFlags lets spans record once a processor exists.
         std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor> processor;
-        if (!config.observability.traces.exporter.empty()
-            && config.observability.traces.enabled) {
+        if (!config.observability.traces.exporter.empty()) {
             processor =
                 std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>();
         }

@@ -307,6 +307,15 @@ MakeAsyncResumeCallback(
             } catch (const std::exception& e) {
                 logging::Get()->error(
                     "Exception sending resumed response: {}", e.what());
+                // submit() owns the FinalizeIfSnapshot call; pre_dispatch
+                // already erased the H2 abort hook, so a throw here
+                // would leave neither success-finalize nor
+                // client_disconnect-finalize landing — the snapshot
+                // would stay registered until the shutdown kill loop.
+                // Defensively finalize as "submit_failed"; the CAS gate
+                // makes this idempotent against any partial finalize
+                // submit may have done before the throw.
+                HttpServer::FinalizeIfSnapshot(*req, *resp, "submit_failed");
             }
             do_bookkeeping();
         });

@@ -374,7 +374,6 @@ public:
                 conn_->fd(), terminal_, programmer_error_, len);
             return SendResult::CLOSED;
         }
-        bytes_sent_ += len;
         if (use_chunked_) {
             if (len == 0) {
                 return EvaluateOccupancy();
@@ -399,6 +398,11 @@ public:
         } else {
             conn_->SendRaw(data, len);
         }
+        // Account bytes only after the SendRaw calls succeeded — the
+        // chunk-encode-failure branch above aborts the stream BEFORE
+        // any bytes hit the wire and must not contribute to
+        // http.server.response.body.size.
+        bytes_sent_ += len;
         return EvaluateOccupancy();
     }
 
@@ -859,9 +863,10 @@ void HttpConnectionHandler::SetRequestTimeout(int seconds) {
                     // Finalize any observability snapshot middleware
                     // attached to the in-flight request before the 408
                     // hits the wire — otherwise inflight_finalizations_
-                    // leaks and Phase 1c drain stalls. parser_.GetRequest()
-                    // is the live request slot on the dispatcher thread
-                    // that owns this callback; FinalizeIfSnapshot no-ops
+                    // leaks and the shutdown drain stalls.
+                    // parser_.GetRequest() is the live request slot on
+                    // the dispatcher thread that owns this callback;
+                    // FinalizeIfSnapshot no-ops
                     // when no snapshot is attached (early-arrival case).
                     HttpServer::FinalizeIfSnapshot(
                         self->parser_.GetRequest(), timeout_resp,

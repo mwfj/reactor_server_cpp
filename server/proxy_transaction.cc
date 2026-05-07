@@ -360,9 +360,15 @@ void ProxyTransaction::Start() {
     // that keeps the client's trace tree intact across the gateway
     // hop. Stripping without replacement would break transparent
     // W3C propagation; injecting a fresh context without emitting
-    // a CLIENT span (TODO: per-attempt CLIENT span allocation) would
-    // leave downstream services with a parent span_id the gateway
-    // never reports.
+    // a CLIENT span would leave downstream services with a parent
+    // span_id the gateway never reports.
+    //
+    // TODO: once the per-attempt CLIENT span lands (deferred), switch
+    // to strip-and-replace here so SERVER and upstream see the SAME
+    // trace_id (the SERVER span's trace_id, with the CLIENT span as
+    // parent) instead of the diverging tree the verbatim forward
+    // produces. Until then, propagator_test.h's outbound-strip cases
+    // exercise the auth path; the proxy path stays verbatim by design.
     //
     // Threat note for operators: a malicious client can populate
     // arbitrary trace_id / span_id / trace-flags in traceparent and

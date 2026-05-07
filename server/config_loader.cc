@@ -1977,7 +1977,7 @@ void ConfigLoader::ValidateHotReloadable(
                 throw std::invalid_argument(
                     ctx + ".algorithms contains unsupported value '" + a +
                     "' (v1 supports only RS256/RS384/RS512/ES256/ES384; "
-                    "HS*/none/PS*/auto are deferred )");
+                    "HS*/none/PS*/auto are deferred)");
             }
         }
         // Introspection-block input validation runs for ALL staged issuers
@@ -2870,7 +2870,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     throw std::invalid_argument(
                         ctx + ".algorithms contains unsupported value '" + a +
                         "' (v1 supports only RS256/RS384/RS512/ES256/ES384; "
-                        "HS*/none/PS*/auto are deferred )");
+                        "HS*/none/PS*/auto are deferred)");
                 }
             }
             // Referenced upstream is mandatory — JWKS refresh, OIDC
@@ -3055,10 +3055,10 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 }
             }
 
-            // Mode/endpoint mismatch — warn Not a
-            // hard-reject because operators sometimes template both blocks
-            // and select mode dynamically; emitting a warn ensures the
-            // unused field is noticed without blocking deployment.
+            // Mode/endpoint mismatch — warn, not a hard-reject because
+            // operators sometimes template both blocks and select mode
+            // dynamically; emitting a warn ensures the unused field is
+            // noticed without blocking deployment.
             if (ic.mode == "jwt" &&
                 !ic.introspection.endpoint.empty()) {
                 logging::Get()->warn(

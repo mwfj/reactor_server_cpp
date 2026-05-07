@@ -941,6 +941,15 @@ bool HeaderHasTokenCI(const std::string& header_value,
 // later precedence-chain steps are unreachable regardless of the
 // follow-up validation outcome — so the match must be exact (token
 // equality), not substring.
+//
+// PRECONDITION: HttpParser comma-folds repeated header lines per
+// RFC 7230 §3.2.2 (see http_parser.cc on_header_field — duplicate
+// non-singleton headers are concatenated with ", " before being
+// stored in HttpRequest::headers). HeaderHasTokenCI therefore sees
+// the FULL combined token list in a single string and correctly
+// matches a `Connection: Upgrade` token even when the client sent
+// `Connection: keep-alive\r\nConnection: Upgrade`. Iterating
+// per-header is unnecessary as long as that parser invariant holds.
 bool IsWebSocketUpgradeCandidate(const HttpRequest& request) {
     if (request.method != "GET") return false;
     if (!HeaderHasTokenCI(request.GetHeader("Connection"), "upgrade")) {

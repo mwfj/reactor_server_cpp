@@ -22,16 +22,22 @@
 //                              off-thread-safe — flips an atomic flag
 //                              only; vector/shared_ptr cleanup runs in
 //                              the destructor when the last shared_ptr
-//                              releases, bounded by Phase 4 dispatcher
-//                              stop). The counter stays at 0 today and
+//                              releases, bounded by dispatcher stop).
+//                              The counter stays at 0 today and
 //                              is consulted by WaitForAllAsyncDrain so
 //                              the predicate is forward-compatible
 //                              with any future marshal step that bumps
 //                              it before EnQueue + decrements when the
 //                              closure runs.
 //
-// BeginShutdown(t) drains the BatchSpanProcessor + PeriodicMetricReader
-// bounded by t. Idempotent.
+// BeginShutdown(t) signals shutdown to the SpanProcessor and joins
+// its workers, bounded by t. Idempotent.
+//
+// TODO: when the PeriodicMetricReader is wired into the manager (it
+// is constructed/owned externally today and only used in tests),
+// extend BeginShutdown to drain it too — otherwise the final metrics
+// flush is silently dropped on every Stop(). Until that wiring lands,
+// the manager has no PMR to drain.
 
 #include "observability/common.h"
 #include "observability/histogram.h"
@@ -156,6 +162,12 @@ public:
     int64_t finalizers_in_progress() const noexcept {
         return finalizers_in_progress_.load(std::memory_order_acquire);
     }
+    // Diagnostic accessor — see snapshots_finalized_via_dtor_. CI may
+    // assert this is zero after every drain to catch missed
+    // FinalizeIfSnapshot call sites.
+    int64_t snapshots_finalized_via_dtor() const noexcept {
+        return snapshots_finalized_via_dtor_.load(std::memory_order_acquire);
+    }
 
     // Signaled by every finalize / kill decrement; the call site uses it
     // to wake from the drain wait.
@@ -248,6 +260,18 @@ private:
 
     // Diagnostic — bumped on every kill-loop CAS-win.
     std::atomic<int64_t> snapshots_killed_on_timeout_{0};
+
+    // Diagnostic — bumped each time ObservabilitySnapshot::~dtor's
+    // backstop fires (i.e. the request lifecycle dropped its last
+    // shared_ptr without anyone calling FinalizeIfSnapshot). Production
+    // code paths should never trigger this; CI / load tests can read
+    // the counter and assert it stays at 0 after every drain.
+    std::atomic<int64_t> snapshots_finalized_via_dtor_{0};
+
+    // Friended so the snapshot dtor (defined in
+    // observability_manager.cc) can bump the diagnostic counter
+    // above without exposing it to general callers.
+    friend struct ObservabilitySnapshot;
 
     // Compiled `traces.sampler.routes` overrides. shared_ptr so reads
     // can capture the snapshot lock-free while a Reload swaps in a new

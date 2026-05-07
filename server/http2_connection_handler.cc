@@ -378,13 +378,16 @@ public:
                 stream_id_, terminal_, programmer_error_, data_source_ != nullptr, len);
             return SendResult::CLOSED;
         }
-        bytes_sent_ += len;
         if (data_source_->Append(data, len) == SendResult::CLOSED) {
             logging::Get()->warn(
                 "H2 streaming SendData failed to append stream={} len={}",
                 stream_id_, len);
             return SendResult::CLOSED;
         }
+        // Account bytes only after Append succeeded — a CLOSED return
+        // means the bytes never entered the data source's queue and
+        // must not contribute to http.server.response.body.size.
+        bytes_sent_ += len;
         // While we're still inside nghttp2_session_mem_recv2, the stream has
         // not yet had a chance to return NGHTTP2_ERR_DEFERRED from the data
         // provider. Resuming before that point returns INVALID_ARGUMENT and
@@ -756,6 +759,28 @@ Http2ConnectionHandler::WrapStreamCloseCallback(StreamCloseCallback callback) {
         // the upcoming post-receive task drain) can read the actual
         // error_code rather than guessing from FindStream alone.
         self->stream_close_error_codes_[stream_id] = error_code;
+        // Bound the map to prevent unbounded growth on long-lived H2
+        // connections where a stream closes without an outcome
+        // consumer reading back (e.g. sync H2 dispatch with
+        // observability disabled — neither the streaming-finalize
+        // path, the abort hook, nor the obs post-receive task is
+        // installed). Stream IDs are monotonic per RFC 9113 §5.1.1,
+        // so the smallest key is the oldest entry — safe to evict
+        // because any consumer for it would have read it within the
+        // same OnRawData call.
+        constexpr size_t kMaxStreamCloseEntries = 256;
+        if (self->stream_close_error_codes_.size() >
+            kMaxStreamCloseEntries) {
+            auto min_it = std::min_element(
+                self->stream_close_error_codes_.begin(),
+                self->stream_close_error_codes_.end(),
+                [](const auto& a, const auto& b) {
+                    return a.first < b.first;
+                });
+            if (min_it != self->stream_close_error_codes_.end()) {
+                self->stream_close_error_codes_.erase(min_it);
+            }
+        }
         if (callback) {
             callback(std::move(self), stream_id, error_code);
         }
@@ -1207,10 +1232,14 @@ int Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
             stream_id);
         // Defensive: still fire the per-stream post-write notifier (if
         // any) so a shutdown-route pump waiting on this stream's slot
-        // observes "framework gave up" rather than hanging.
+        // observes "framework gave up" rather than hanging. Match
+        // FireStreamPostWriteNotify's symmetric `if (slot)` null
+        // check so a stream registered with a null slot doesn't UB.
         auto it = stream_post_write_notify_.find(stream_id);
         if (it != stream_post_write_notify_.end()) {
-            it->second->store(true, std::memory_order_release);
+            if (it->second) {
+                it->second->store(true, std::memory_order_release);
+            }
             stream_post_write_notify_.erase(it);
         }
         return -1;
@@ -1231,7 +1260,9 @@ int Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
     // the operation idempotent across stream-id reuse.
     auto it = stream_post_write_notify_.find(stream_id);
     if (it != stream_post_write_notify_.end()) {
-        it->second->store(true, std::memory_order_release);
+        if (it->second) {
+            it->second->store(true, std::memory_order_release);
+        }
         stream_post_write_notify_.erase(it);
     }
     return submit_rv;

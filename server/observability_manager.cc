@@ -263,6 +263,8 @@ ObservabilitySnapshot::~ObservabilitySnapshot() {
     // Exception-safe: FinalizeFromSnapshot wraps OnFinalizeWinner in
     // try/catch and never throws. The mgr shared_ptr keeps the
     // manager alive for the duration of the call.
+    mgr->snapshots_finalized_via_dtor_.fetch_add(
+        1, std::memory_order_relaxed);
     mgr->FinalizeFromSnapshot(*this, /*status=*/0, /*wire_body=*/0,
                                 /*error_type=*/"unfinalized_drop");
 }

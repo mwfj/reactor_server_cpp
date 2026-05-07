@@ -124,8 +124,8 @@ public:
     // directly from the stopper thread without marshalling to the
     // owning dispatcher. Vector / shared_ptr cleanup happens in the
     // destructor when the last shared_ptr to the Span releases —
-    // bounded by Phase 4 dispatcher stop, which runs after the kill
-    // loop returns.
+    // bounded by dispatcher stop, which runs after the kill loop
+    // returns.
     void DropWithoutEnd();
 
 private:

@@ -32,18 +32,27 @@ LabelSet MetricLabelRegistry::BuildLabelSet(
         if (state_it == per_key_.end()) continue;
         PerKeyState& s = *state_it->second;
 
-        // Fast path: shared_lock + lookup.
+        // Fast path: shared_lock + lookup. Track resolution with an
+        // explicit bool — using `emitted.empty()` as a "not yet
+        // resolved" sentinel collides with legitimate empty-string
+        // label values, forcing them onto the slow path on every
+        // call (correctness preserved by the slow path's repeat
+        // lookup, but performance regresses for empty-string-valued
+        // custom labels).
         std::string emitted;
+        bool resolved = false;
         {
             std::shared_lock<std::shared_mutex> g(s.mtx);
             if (s.seen_values.find(value) != s.seen_values.end()) {
                 emitted = value;
+                resolved = true;
             } else if (s.cap_full.load(std::memory_order_acquire)) {
                 // Cap latched and value not seen → overflow.
                 emitted = std::string(kOverflowSentinel);
+                resolved = true;
             }
         }
-        if (emitted.empty()) {
+        if (!resolved) {
             // Slow path: maybe-insert under unique_lock.
             std::unique_lock<std::shared_mutex> g(s.mtx);
             if (s.seen_values.find(value) != s.seen_values.end()) {
