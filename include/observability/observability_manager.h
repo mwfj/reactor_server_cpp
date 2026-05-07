@@ -127,9 +127,13 @@ public:
     void Reload(const ObservabilityConfig& new_config);
 
     // Match `path` against the configured `traces.sampler.routes`
-    // overrides (literal byte-prefix). Returns the per-route sampler
-    // when an override matches, or null when the global sampler should
-    // be used. Callers pass the result into `StartSpanOptions::sampler_override`.
+    // overrides using path-or-subtree semantics: a configured `path`
+    // matches when the request path equals it exactly, when the next
+    // byte after the prefix is `/` (subtree), or when the configured
+    // path itself ends with `/`. `/api` does NOT match `/apifoo`.
+    // Returns the per-route sampler when an override matches, or null
+    // when the global sampler should be used. Callers pass the result
+    // into `StartSpanOptions::sampler_override`.
     std::shared_ptr<const Sampler> EffectiveSamplerForPath(
         const std::string& path) const noexcept;
 

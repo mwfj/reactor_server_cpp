@@ -137,14 +137,16 @@ std::optional<std::string> W3CPropagator::SerializeTraceparent(
 
 bool W3CPropagator::Inject(const SpanContext& ctx,
                              std::map<std::string, std::string>& headers) {
+    // Strip-then-inject contract — symmetric with the vector overload.
+    // A new context with empty state must NOT leave a previous
+    // vendor's tracestate paired with the fresh traceparent.
     auto tp = SerializeTraceparent(ctx);
     if (!tp) return false;
     headers["traceparent"] = std::move(*tp);
     if (!ctx.state().Empty()) {
         headers["tracestate"] = ctx.state().Serialize();
     } else {
-        // If a previous tracestate was in the map, leave it alone —
-        // strip-then-inject is the caller's responsibility.
+        headers.erase("tracestate");
     }
     return true;
 }

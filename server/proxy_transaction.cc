@@ -288,30 +288,18 @@ void ProxyTransaction::Start() {
     // Publish ourselves to the snapshot so the shutdown kill loop can
     // mark us via MarkKilledForShutdown on its terminal sweep.
     //
-    // Race: KillOutstandingSnapshots may have CAS-finalized this
-    // snapshot (and decremented inflight_finalizations_) before Start
-    // ran. AttachTransaction alone takes link_mtx but doesn't check
-    // snap.finalized — without the explicit check below the kill
-    // loop's locked tx_weak read sees empty, exits the lock, and
-    // never calls MarkKilledForShutdown on us. Start would then run
-    // the upstream request unaware that the snapshot is already
-    // dropped from the drain counters, and the eventual completion
-    // would emit a span the manager has stopped tracking.
-    //
-    // Mirror the kill loop's locked-and-check protocol: lock
-    // link_mtx, read snap.finalized, and if it's already true mark
-    // ourselves killed-for-shutdown immediately so terminal-callback
-    // gates short-circuit. Either way publish tx_weak — when not
-    // finalized so the kill loop can find us, and when finalized for
-    // diagnostic introspection (the kill marshal already finished).
+    // Delegate to ObservabilitySnapshot::AttachTransaction — it owns
+    // the canonical link/kill protocol: lock link_mtx, read finalized
+    // under the lock, capture the strong ptr if already finalized,
+    // publish tx_weak, release the lock, then call
+    // MarkKilledForShutdown OUTSIDE the lock. If the kill sweep ran
+    // first, the helper kills us inline; AttemptCheckout below will
+    // observe cancelled_ (set by Cancel via MarkKilledForShutdown)
+    // and short-circuit before allocating an upstream lease.
     if (obs_snapshot_) {
-        std::lock_guard<std::mutex> g(obs_snapshot_->link_mtx);
-        if (obs_snapshot_->finalized.load(std::memory_order_acquire)) {
-            MarkKilledForShutdown();
-        }
-        obs_snapshot_->tx_weak =
+        obs_snapshot_->AttachTransaction(
             std::weak_ptr<OBSERVABILITY_NAMESPACE::UpstreamTransactionLink>(
-                shared_from_this());
+                shared_from_this()));
     }
 
     // Tell the codec the request method so it handles HEAD correctly

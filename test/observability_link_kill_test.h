@@ -127,6 +127,102 @@ void TestKillTolerantOfMissingLink() {
     }
 }
 
+// ---- Start-vs-Kill race: Kill swept FIRST, then AttachTransaction ----
+// Closes the gap flagged in PR review: "no targeted test for the
+// Start-vs-KillOutstandingSnapshots race." Exercises the safe helper
+// directly: KillOutstandingSnapshots finalizes the snapshot before
+// the link is published; AttachTransaction must observe the
+// finalized state under link_mtx and immediately mark the link
+// killed-for-shutdown so the caller's terminal gates short-circuit.
+
+void TestAttachAfterKillFlipsLinkImmediately() {
+    try {
+        auto m = MakeManager();
+        auto snap = std::make_shared<ObservabilitySnapshot>();
+        m->RegisterLiveSnapshot(snap);
+
+        // Kill loop runs first — finalizes the snapshot, drains the
+        // counter, leaves tx_weak empty (no link was attached).
+        m->KillOutstandingSnapshots(std::chrono::milliseconds{50});
+        bool kill_observed_finalize =
+            snap->finalized.load(std::memory_order_acquire);
+        bool counter_drained = m->inflight_finalizations() == 0;
+
+        // Late attach mirroring ProxyTransaction::Start after the
+        // kill sweep. The safe helper must:
+        //   1. Observe finalized==true under link_mtx
+        //   2. Lock the weak ptr, call MarkKilledForShutdown OUTSIDE
+        //      the lock
+        //   3. Return true so callers can short-circuit
+        auto fake = std::make_shared<FakeTxLink>();
+        bool was_already_finalized = snap->AttachTransaction(
+            std::weak_ptr<UpstreamTransactionLink>(fake));
+
+        bool fake_killed = fake->IsKilledForShutdown();
+        bool tx_weak_published = !snap->tx_weak.expired();
+
+        bool pass = kill_observed_finalize && counter_drained
+                 && was_already_finalized && fake_killed
+                 && tx_weak_published;
+        TestFramework::RecordTest(
+            "ObsLink: AttachTransaction after Kill flips link immediately",
+            pass,
+            pass ? "" :
+                ("kill_observed_finalize=" +
+                 std::to_string(kill_observed_finalize) +
+                 " counter_drained=" + std::to_string(counter_drained) +
+                 " was_already_finalized=" +
+                 std::to_string(was_already_finalized) +
+                 " fake_killed=" + std::to_string(fake_killed) +
+                 " tx_weak_published=" +
+                 std::to_string(tx_weak_published)),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsLink: AttachTransaction after Kill flips link immediately",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---- AttachTransaction before any Kill — happy path: returns false ----
+//
+// Pairs with the post-kill test above to lock down the helper's
+// return value semantics. Without a kill sweep, the snapshot stays
+// finalize=false; AttachTransaction must publish tx_weak, return
+// false, and leave the link's kill flag untouched. The kill loop
+// (or any future finalizer) is still in charge of marking the link.
+
+void TestAttachBeforeKillIsBenign() {
+    try {
+        auto m = MakeManager();
+        auto snap = std::make_shared<ObservabilitySnapshot>();
+        m->RegisterLiveSnapshot(snap);
+
+        auto fake = std::make_shared<FakeTxLink>();
+        bool was_already_finalized = snap->AttachTransaction(
+            std::weak_ptr<UpstreamTransactionLink>(fake));
+
+        bool helper_reports_fresh = !was_already_finalized;
+        bool fake_alive = !fake->IsKilledForShutdown();
+        bool tx_weak_published = !snap->tx_weak.expired();
+
+        // Now run the kill sweep — must find tx_weak and mark fake.
+        m->KillOutstandingSnapshots(std::chrono::milliseconds{50});
+        bool fake_killed_by_loop = fake->IsKilledForShutdown();
+
+        bool pass = helper_reports_fresh && fake_alive
+                 && tx_weak_published && fake_killed_by_loop;
+        TestFramework::RecordTest(
+            "ObsLink: AttachTransaction before Kill is benign + kill loop reaches link",
+            pass, pass ? "" : "helper or kill-loop contract violated",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsLink: AttachTransaction before Kill is benign + kill loop reaches link",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ---- AttachObservabilitySnapshot stores the snapshot for the link site ----
 
 void TestAttachSnapshotStoresHandle() {
@@ -157,6 +253,8 @@ void RunAllTests() {
     TestProxyTxIsLink();
     TestKillFlipsLinkedTransaction();
     TestKillTolerantOfMissingLink();
+    TestAttachAfterKillFlipsLinkImmediately();
+    TestAttachBeforeKillIsBenign();
     TestAttachSnapshotStoresHandle();
 }
 

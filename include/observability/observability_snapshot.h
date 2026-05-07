@@ -62,12 +62,29 @@ public:
 };
 
 struct ObservabilitySnapshot {
-    // Publish the transaction weak_ptr under link_mtx so the kill loop
-    // can find and mark it. Either ordering with the kill loop converges
-    // — there is no "linked but not yet marked" window.
-    void AttachTransaction(std::weak_ptr<UpstreamTransactionLink> tx) {
-        std::lock_guard<std::mutex> g(link_mtx);
-        tx_weak = std::move(tx);
+    // Publish the transaction weak_ptr under link_mtx, performing the
+    // safe link/kill protocol. If the snapshot was already finalized
+    // (KillOutstandingSnapshots ran first), capture the link strong
+    // ptr while still under the lock and call MarkKilledForShutdown
+    // OUTSIDE the lock — matches the kill loop's lock-then-mark
+    // pattern and avoids holding link_mtx across a dispatcher
+    // EnQueue. Returns true when the snapshot was already finalized
+    // (caller may short-circuit further work; the link's terminal
+    // gate has been notified).
+    bool AttachTransaction(std::weak_ptr<UpstreamTransactionLink> tx) {
+        std::shared_ptr<UpstreamTransactionLink> already_killed_link;
+        {
+            std::lock_guard<std::mutex> g(link_mtx);
+            if (finalized.load(std::memory_order_acquire)) {
+                already_killed_link = tx.lock();
+            }
+            tx_weak = std::move(tx);
+        }
+        if (already_killed_link) {
+            already_killed_link->MarkKilledForShutdown();
+            return true;
+        }
+        return false;
     }
 
     // ---- Identity (immutable post-construction) ----

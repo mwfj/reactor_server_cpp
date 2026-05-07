@@ -193,12 +193,19 @@ ObservabilityManager::EffectiveSamplerForPath(
     if (!snap || snap->empty() || path.empty()) return nullptr;
     for (const auto& r : *snap) {
         if (r.path_prefix.empty()) continue;
-        // Literal byte-prefix match against the request path.
         if (path.size() < r.path_prefix.size()) continue;
         if (std::memcmp(path.data(), r.path_prefix.data(),
-                         r.path_prefix.size()) == 0) {
-            return r.sampler;
+                         r.path_prefix.size()) != 0) {
+            continue;
         }
+        // Path-or-subtree match: configured `path` matches request
+        // path exactly, OR the request path's next byte is `/`
+        // (subtree), OR the configured path itself ends with `/`
+        // (operator-encoded subtree, including bare `/` for root).
+        // Rejects partial-segment matches like `/api` vs `/apifoo`.
+        if (path.size() == r.path_prefix.size()) return r.sampler;
+        if (path[r.path_prefix.size()] == '/') return r.sampler;
+        if (r.path_prefix.back() == '/') return r.sampler;
     }
     return nullptr;
 }
@@ -236,13 +243,11 @@ bool ObservabilityManager::FinalizeFromSnapshot(
     int      status_code,
     uint64_t wire_body_size,
     std::string error_type) {
-    // Reserve the in-progress slot BEFORE the CAS. Otherwise a
-    // thread that wins the CAS but is preempted before incrementing
-    // would let DrainObservabilityForShutdown observe
-    // finalizers_in_progress_ == 0 and call BeginShutdown, which
-    // would then race the still-pending Span::End and drop the
-    // completed span as a post-shutdown OnEnd. Decrement on CAS
-    // failure so the loser path doesn't leak the reservation.
+    // Reserve the in-progress slot BEFORE the CAS. A winner preempted
+    // before incrementing would let DrainObservabilityForShutdown
+    // observe finalizers_in_progress_ == 0, call BeginShutdown, and
+    // drop the still-pending Span::End. Decrement on CAS failure so
+    // the loser path doesn't leak the reservation.
     finalizers_in_progress_.fetch_add(1, std::memory_order_acq_rel);
 
     // Idempotent CAS gate — exactly one caller wins.
