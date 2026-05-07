@@ -12,8 +12,7 @@
 // documented — a 1100ms deadline rounded to 2s cadence would be
 // checked only every 2s, firing up to ~0.9s late. Promotes to int64_t
 // to avoid signed overflow on INT_MAX-range operator typos. Saturates
-// to INT_MAX and returns at least 1. Mirrors the helper in
-// http_server.cc — keep them in sync.
+// to INT_MAX and returns at least 1.
 static int CadenceSecFromMs(int ms) {
     if (ms <= 0) return 1;
     if (ms < 2000) return 1;
@@ -142,7 +141,7 @@ UpstreamManager::UpstreamManager(
         std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>
             resolved_endpoint = it->second;
 
-        // Effective SNI (§5.10). The rule has three tiers:
+        // Effective SNI selection rule. Three tiers:
         //   1. Explicit `tls.sni_hostname` wins (operator intent).
         //   2. Hostname `upstream.host` falls back — it is a verifiable
         //      identity and matches cert CN/SAN for the common
@@ -186,28 +185,9 @@ UpstreamManager::UpstreamManager(
 
     // Adjust dispatcher timer intervals for upstream timeout enforcement.
     // Without this, standalone dispatchers use their default interval (often
-    // 60s), making connect_timeout_ms / idle_timeout_sec / proxy
-    // response_timeout_ms fire tens of seconds late.
-    // HttpServer::MarkServerReady does this for production; this covers
-    // standalone UpstreamManager usage (see HttpServer::MarkServerReady
-    // for the mirrored logic).
-    int min_upstream_sec = std::numeric_limits<int>::max();
-    for (const auto& u : upstreams) {
-        int connect_sec = CadenceSecFromMs(u.pool.connect_timeout_ms);
-        min_upstream_sec = std::min(min_upstream_sec, connect_sec);
-        if (u.pool.idle_timeout_sec > 0) {
-            min_upstream_sec = std::min(min_upstream_sec, u.pool.idle_timeout_sec);
-        }
-        // Proxy response timeout: also drives timer scan cadence when
-        // ProxyTransaction::ArmResponseTimeout sets a deadline on the
-        // transport. Without folding this in, a configured
-        // proxy.response_timeout_ms can still fire at the default ~60s
-        // cadence instead of its configured budget.
-        if (u.proxy.response_timeout_ms > 0) {
-            int response_sec = CadenceSecFromMs(u.proxy.response_timeout_ms);
-            min_upstream_sec = std::min(min_upstream_sec, response_sec);
-        }
-    }
+    // 60s), making upstream-side timeouts fire tens of seconds late.
+    // HttpServer::MarkServerReady mirrors this for production.
+    int min_upstream_sec = ComputeMinUpstreamCadenceSec(upstreams);
     if (min_upstream_sec < std::numeric_limits<int>::max()) {
         for (auto& disp : dispatchers_) {
             // Only narrow the interval, never widen. The dispatcher may
@@ -409,5 +389,71 @@ void UpstreamManager::UpdateResolvedEndpoints(
         if (it == pools_.end()) continue;
         if (!new_ep) continue;
         it->second->UpdateResolvedEndpoint(new_ep);
+    }
+}
+
+std::optional<Http2UpstreamConfig>
+UpstreamManager::LookupStagedH2ForLivePartition(
+    const std::string& upstream_name,
+    const std::vector<UpstreamConfig>& staged_upstreams) const
+{
+    if (pools_.find(upstream_name) == pools_.end()) {
+        return std::nullopt;
+    }
+    for (const auto& staged : staged_upstreams) {
+        if (staged.name == upstream_name) {
+            return staged.http2;
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<UpstreamManager::LivePartitionRef>
+UpstreamManager::LivePartitions() const
+{
+    std::vector<LivePartitionRef> out;
+    for (const auto& [name, pool] : pools_) {
+        if (!pool) continue;
+        for (size_t i = 0; i < pool->partition_count(); ++i) {
+            PoolPartition* p = pool->GetPartition(i);
+            if (p) out.push_back({name, p});
+        }
+    }
+    return out;
+}
+
+int UpstreamManager::ComputeMinUpstreamCadenceSec(
+    const std::vector<UpstreamConfig>& upstreams)
+{
+    int m = std::numeric_limits<int>::max();
+    for (const auto& u : upstreams) {
+        m = std::min(m, CadenceSecFromMs(u.pool.connect_timeout_ms));
+        if (u.pool.idle_timeout_sec > 0) {
+            m = std::min(m, u.pool.idle_timeout_sec);
+        }
+        if (u.proxy.response_timeout_ms > 0) {
+            m = std::min(m, CadenceSecFromMs(u.proxy.response_timeout_ms));
+        }
+        m = std::min(m, u.http2.MinCadenceSec());
+    }
+    return m;
+}
+
+void UpstreamManager::CommitHttp2Snapshots(
+    const std::vector<UpstreamConfig>& upstreams)
+{
+    // Build staged map once (O(N)). LivePartitions can grow as K * P (K
+    // upstreams, P partitions) — a per-partition linear scan would make
+    // this O(K * P * N).
+    std::unordered_map<std::string, const Http2UpstreamConfig*> staged;
+    staged.reserve(upstreams.size());
+    for (const auto& u : upstreams) {
+        staged.emplace(u.name, &u.http2);
+    }
+    for (const auto& live : LivePartitions()) {
+        auto it = staged.find(live.upstream_name);
+        if (it == staged.end()) continue;  // missing → keep live snapshot
+        live.partition->ApplyHttp2ConfigCommit(
+            std::make_shared<const Http2UpstreamConfig>(*it->second));
     }
 }

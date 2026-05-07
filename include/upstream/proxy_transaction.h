@@ -1,7 +1,9 @@
 #pragma once
 
 #include "common.h"
+#include "upstream/upstream_codec.h"
 #include "upstream/upstream_http_codec.h"
+#include "upstream/upstream_h2_codec.h"
 #include "upstream/upstream_response_sink.h"
 #include "upstream/upstream_lease.h"
 #include "upstream/header_rewriter.h"
@@ -18,6 +20,7 @@
 class UpstreamManager;
 class ConnectionHandler;
 class Dispatcher;
+class UpstreamH2Connection;
 
 namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerSlice;
@@ -154,6 +157,10 @@ private:
     // Rewritten headers and serialized request (cached for retry)
     std::map<std::string, std::string> rewritten_headers_;
     std::string serialized_request_;
+    // Computed upstream path (after strip_prefix / catch-all override).
+    // Cached so DispatchH2 builds the H2 :path pseudo-header without
+    // recomputing the prefix logic that lives in Start().
+    std::string upstream_path_;
 
     // Captured by value at construction from client_request.auth so the
     // overlay snapshot outlives any retry cycle. HttpRequest is invalidated
@@ -175,7 +182,14 @@ private:
 
     // Upstream connection state (per attempt)
     UpstreamLease lease_;
-    UpstreamHttpCodec codec_;
+    // Codec interface — H1 path always constructs UpstreamHttpCodec; H2
+    // path (Phase 1+ once UpstreamH2Codec lands) constructs the H2 codec.
+    // Single field through the abstract base lets ProxyTransaction
+    // dispatch parsing without protocol-specific downcasts. Protocol-
+    // specific extensions (e.g., UpstreamH2Codec::SubmitH2Request) reach
+    // through static_cast at the OnCheckoutReady branch that constructed
+    // the matching concrete type.
+    std::unique_ptr<UpstreamCodec> codec_;
 
     // Connection poisoning flag: set when the upstream connection must NOT be
     // returned to the idle pool. Reasons include:
@@ -230,6 +244,15 @@ private:
     // Cleanup. Dry-run rejects proceed but the flag stays false — no
     // token was consumed, so no ReleaseRetry is required.
     bool retry_token_held_ = false;
+
+    // H2 dispatch state. `h2_path_` flips true once DispatchH2 has
+    // successfully submitted a stream; cleanup paths gate H1-specific
+    // teardown on `!h2_path_`. The weak_ptr lets a mid-flight Cleanup
+    // / Cancel issue RST_STREAM if the H2 session is still alive.
+    std::weak_ptr<UpstreamH2Connection> h2_conn_weak_;
+    int32_t h2_stream_id_ = -1;
+    bool h2_path_ = false;
+
     enum class RelayMode {
         BUFFERED,
         STREAMING,
@@ -266,6 +289,19 @@ private:
     void StartCheckoutAsync();
     void OnCheckoutReady(UpstreamLease lease);
     void OnCheckoutError(int error_code);
+
+    // H1 dispatch: wires transport callbacks on the lease's transport
+    // and serializes the request. Reads `lease_` (already moved in by
+    // OnCheckoutReady) and assumes the transport is ready to write.
+    void DispatchH1();
+
+    // H2 dispatch: routes the request through the partition's
+    // multiplexed H2 session. Reads `lease_`; on a fresh checkout the
+    // lease is donated to the H2 connection (transport stays out of
+    // the idle pool until every stream exits). On reuse of an existing
+    // session, the lease is released back to the pool immediately.
+    void DispatchH2(std::shared_ptr<const Http2UpstreamConfig> cfg);
+
     void SendUpstreamRequest();
     void OnUpstreamData(std::shared_ptr<ConnectionHandler> conn, std::string& data);
     void OnUpstreamWriteComplete(std::shared_ptr<ConnectionHandler> conn);

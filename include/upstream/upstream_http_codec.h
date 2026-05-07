@@ -1,11 +1,12 @@
 #pragma once
 
+#include "upstream/upstream_codec.h"
 #include "upstream/upstream_response.h"
 #include "upstream/upstream_response_head.h"
 #include "upstream/upstream_response_sink.h"
 // <string>, <memory>, <cstddef> provided by common.h (via upstream_response.h)
 
-class UpstreamHttpCodec {
+class UpstreamHttpCodec : public UpstreamCodec {
 public:
     enum class ParseError { NONE, PARSE_ERROR };
 
@@ -14,7 +15,7 @@ public:
     static constexpr size_t MAX_RESPONSE_BODY_SIZE = 67108864;
 
     UpstreamHttpCodec();
-    ~UpstreamHttpCodec();
+    ~UpstreamHttpCodec() override;
 
     // Non-copyable (owns pimpl)
     UpstreamHttpCodec(const UpstreamHttpCodec&) = delete;
@@ -22,36 +23,37 @@ public:
 
     // Set the request method that produced this response. Must be called
     // before Parse() so llhttp knows HEAD responses have no body.
-    void SetRequestMethod(const std::string& method);
+    void SetRequestMethod(const std::string& method) override;
 
-    void SetSink(UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink);
-    void PauseParsing();
-    void ResumeParsing();
+    void SetSink(
+        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink) override;
+    void PauseParsing() override;
+    void ResumeParsing() override;
     UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing FramingHint() const {
         return framing_hint_;
     }
     int64_t ExpectedLength() const { return expected_length_; }
-    bool IsPaused() const { return paused_; }
+    bool IsPaused() const override { return paused_; }
 
     // Feed raw bytes from upstream. Returns bytes consumed.
     // After this call, check GetResponse().complete.
-    size_t Parse(const char* data, size_t len);
+    size_t Parse(const char* data, size_t len) override;
 
     // Signal EOF from the transport. For connection-close framing (no
     // Content-Length / Transfer-Encoding), llhttp needs this to finalize
     // the response. Returns true if the response was completed by EOF.
-    bool Finish();
+    bool Finish() override;
 
     // Access the parsed response
-    const UpstreamResponse& GetResponse() const { return response_; }
-    UpstreamResponse& GetResponse() { return response_; }
+    const UpstreamResponse& GetResponse() const override { return response_; }
+    UpstreamResponse& GetResponse() override { return response_; }
 
     // Reset parser state for the next response (connection reuse).
-    void Reset();
+    void Reset() override;
 
     // Error state
-    bool HasError() const { return has_error_; }
-    std::string GetError() const { return error_message_; }
+    bool HasError() const override { return has_error_; }
+    std::string GetError() const override { return error_message_; }
     ParseError GetErrorType() const { return error_type_; }
 
     // Public fields for llhttp callbacks (same pattern as HttpParser).

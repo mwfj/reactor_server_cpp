@@ -146,3 +146,9 @@ jobs:
         # Linux full-sweep ./test_runner runs both suites via the `dns`
         # umbrella; macOS only carries the OS-sensitive integration half.
         run: ./test_runner dual_stack
+      - name: Test - h2_upstream (H2 codec + nghttp2 session via socketpair)
+        # OS-sensitive: uses socketpair, threads, nghttp2 session framing,
+        # and UpstreamH2Connection lifecycle tests. These exercise BSD socket
+        # semantics and Apple-specific threading scheduling that can mask
+        # races not caught by Linux alone.
+        run: ./test_runner h2_upstream

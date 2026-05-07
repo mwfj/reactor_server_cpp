@@ -95,6 +95,10 @@ public:
         return std::this_thread::get_id() == tid;
     }
     bool is_dispatcher_thread() const { return is_on_loop_thread(); }
+    // PascalCase alias used by H2 reload-contract call sites that need
+    // to gate "self-dispatcher inline-apply vs cross-thread enqueue".
+    // Equivalent to is_on_loop_thread() / is_dispatcher_thread().
+    bool IsOnDispatcherThread() const noexcept { return is_on_loop_thread(); }
     bool is_sock_dispatcher() const { return is_sock_dispatcher_.load(); }
 
     void SetDispatcherIndex(int idx) { dispatcher_index_.store(idx, std::memory_order_release); }

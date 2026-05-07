@@ -120,7 +120,7 @@ void TestHeldRetryable5xxResumeCompletesBodylessResponse() {
         tx->response_head_.framing =
             UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::CONTENT_LENGTH;
         tx->response_head_.expected_length = 0;
-        tx->codec_.PauseParsing();
+        tx->codec_->PauseParsing();
 
         bool resumed = tx->ResumeHeldRetryable5xxResponse("unit_test");
 
@@ -181,7 +181,7 @@ void TestHeldRetryable5xxResumeCompletesNoBodyHeadResponse() {
         tx->response_head_.status_reason = "Service Unavailable";
         tx->response_head_.framing =
             UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::NO_BODY;
-        tx->codec_.PauseParsing();
+        tx->codec_->PauseParsing();
 
         bool resumed = tx->ResumeHeldRetryable5xxResponse("unit_test_head");
 

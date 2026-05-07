@@ -4,6 +4,8 @@
 #include <vector>
 #include <chrono>
 #include <cstdint>
+#include <algorithm>
+#include <limits>
 
 #include "auth/auth_config.h"
 #include "net/dns_resolver.h"
@@ -35,6 +37,66 @@ struct Http2Config {
     // in its preface; when true the entry is OMITTED so nghttp2's local
     // default of 1 applies internally for our PUSH_PROMISE emission.
     bool enable_push = false;
+};
+
+// Per-upstream HTTP/2 client configuration. Distinct from `Http2Config`
+// (which governs INBOUND HTTP/2 server settings) — this struct configures
+// the OUTBOUND H2 client used by the upstream connection pool. Each upstream
+// in `ServerConfig::upstreams` carries its own `Http2UpstreamConfig`.
+//
+// Field classification (see operator==/LiveEqual + ConfigLoader::ValidateHotReloadable):
+//   Restart-only: enabled, prefer  (topology — affects ALPN list / pool layout)
+//   Live:         max_concurrent_streams_pref, initial_window_size,
+//                 max_frame_size, header_table_size, ping_idle_sec,
+//                 ping_timeout_sec, goaway_drain_timeout_sec,
+//                 saturation_open_pct
+struct Http2UpstreamConfig {
+    bool enabled = false;
+    std::string prefer = "auto";                 // "auto" | "always" | "never"
+    uint32_t max_concurrent_streams_pref = 100;  // local cap on per-connection stream count
+    uint32_t initial_window_size = 1048576;      // per-stream initial window (1 MB)
+    uint32_t max_frame_size = 16384;             // RFC 9113 default
+    uint32_t header_table_size = 4096;           // HPACK dynamic table
+    int ping_idle_sec = 60;                      // emit PING after this idle window
+    int ping_timeout_sec = 10;                   // close conn if no PONG within this
+    int goaway_drain_timeout_sec = 30;           // bound on graceful drain
+    int saturation_open_pct = 0;                 // 0 disables saturation routing
+
+    // Full equality: every field. Used by tests + serialization round-trips.
+    bool operator==(const Http2UpstreamConfig& o) const {
+        return enabled == o.enabled && prefer == o.prefer &&
+               max_concurrent_streams_pref == o.max_concurrent_streams_pref &&
+               initial_window_size == o.initial_window_size &&
+               max_frame_size == o.max_frame_size &&
+               header_table_size == o.header_table_size &&
+               ping_idle_sec == o.ping_idle_sec &&
+               ping_timeout_sec == o.ping_timeout_sec &&
+               goaway_drain_timeout_sec == o.goaway_drain_timeout_sec &&
+               saturation_open_pct == o.saturation_open_pct;
+    }
+    bool operator!=(const Http2UpstreamConfig& o) const { return !(*this == o); }
+
+    // Restart-only equality: compares ONLY topology fields. Used by
+    // `UpstreamConfig::operator==` once the live-H2 reload propagation path
+    // lands so a SIGHUP touching only live H2 fields doesn't trip the
+    // outer "restart required" warning.
+    bool LiveEqual(const Http2UpstreamConfig& o) const {
+        return enabled == o.enabled && prefer == o.prefer;
+    }
+
+    // Smallest cadence-relevant H2 timer in seconds, or INT_MAX when
+    // disabled. The INT_MAX sentinel lets callers fold this into a
+    // running std::min without a per-site `if (enabled)` guard.
+    int MinCadenceSec() const {
+        if (!enabled) return std::numeric_limits<int>::max();
+        int m = ping_idle_sec > 0 ? ping_idle_sec
+                                  : std::numeric_limits<int>::max();
+        if (ping_timeout_sec > 0) m = std::min(m, ping_timeout_sec);
+        if (goaway_drain_timeout_sec > 0) {
+            m = std::min(m, goaway_drain_timeout_sec);
+        }
+        return m;
+    }
 };
 
 struct UpstreamTlsConfig {
@@ -247,6 +309,7 @@ struct UpstreamConfig {
     UpstreamPoolConfig pool;
     ProxyConfig proxy;
     CircuitBreakerConfig circuit_breaker;
+    Http2UpstreamConfig http2;
 
     // Excludes `circuit_breaker` — breaker fields are live-reloadable via
     // `CircuitBreakerManager::Reload`, which `HttpServer::Reload` invokes on
@@ -254,13 +317,15 @@ struct UpstreamConfig {
     // proxy) remain restart-only; a mismatch here triggers the
     // "restart required" warning in the outer reload.
     //
-    // Contract: a config pair that differs ONLY in circuit_breaker fields
-    // must compare EQUAL so the outer reload doesn't fire a spurious warn.
-    // Any future field whose propagation path is wired into a live
-    // `*Manager::Reload` should be removed from this operator symmetrically.
+    // H2 live fields (ping timers, window sizes, etc.) are propagated via
+    // CommitHttp2Snapshots (wired into both MarkServerReady and Reload).
+    // LiveEqual compares only the restart-only H2 fields (enabled, prefer),
+    // so a SIGHUP that changes only ping_idle_sec no longer fires a
+    // spurious "restart required" warning.
     bool operator==(const UpstreamConfig& o) const {
         return name == o.name && host == o.host && port == o.port &&
-               tls == o.tls && pool == o.pool && proxy == o.proxy;
+               tls == o.tls && pool == o.pool && proxy == o.proxy &&
+               http2.LiveEqual(o.http2);
     }
     bool operator!=(const UpstreamConfig& o) const { return !(*this == o); }
 };
@@ -312,6 +377,14 @@ struct ServerConfig {
     size_t max_ws_message_size = 16777216; // 16 MB
     int request_timeout_sec = 30;
     int shutdown_drain_timeout_sec = 30; // Max seconds to wait for in-flight H2 streams during shutdown. 0 = immediate.
+    // Bound on the per-partition H2 apply futures-barrier in
+    // HttpServer::Reload. After enqueueing per-partition H2-config apply
+    // tasks, the reload thread waits this long for them to complete before
+    // setting the cancel-token, aborting the cadence recompute, and
+    // returning. Restart-only — changing it during a reload is meta (which
+    // timeout would apply, the old or the new?). Validated to [1, 60] at
+    // load time.
+    int http2_reload_barrier_timeout_sec = 5;
     Http2Config http2;
     std::vector<UpstreamConfig> upstreams;
     RateLimitConfig rate_limit;
