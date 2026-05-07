@@ -1139,14 +1139,14 @@ static int HandleStart(const CliOptions& options) {
     }
 
     // Register /metrics only when the master switch is on, the
-    // exporter is prometheus_pull, and both /health and /metrics CLI
-    // flags are enabled. Runtime metrics.enabled toggles are handled
-    // by the handler (404 when off) so the route stays registered
-    // across reloads.
+    // exporter is prometheus_pull, and the /metrics CLI flag is
+    // enabled. /health and /metrics are independent — disabling
+    // health must not silently disable metrics scrape. Runtime
+    // metrics.enabled toggles are handled by the handler (404 when
+    // off) so the route stays registered across reloads.
     if (config.observability.enabled
         && config.observability.metrics.exporter == "prometheus_pull"
         && options.metrics_endpoint
-        && options.health_endpoint
         && observability_manager) {
         const std::string& mp = config.observability.metrics.prometheus.path;
         server->Get(mp,

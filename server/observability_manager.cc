@@ -41,6 +41,15 @@ ObservabilityManager::ObservabilityManager(
 
 ObservabilityManager::~ObservabilityManager() {
     // Idempotent safety net for tests / abnormal teardown paths.
+    // Production goes through HttpServer::Stop's coordinated kill +
+    // shutdown sequence and never reaches the dtor with live
+    // snapshots. Tests and abnormal teardown (panic, exception during
+    // construction-then-drop) skip that sequence — kill outstanding
+    // snapshots first so survivors' weak manager refs don't outlive
+    // the registry. Without this, FinalizeIfSnapshot becomes a
+    // manager.lock()==nullptr no-op once the dtor begins and inbound
+    // SERVER spans silently leak (never End()-ed).
+    KillOutstandingSnapshots(std::chrono::milliseconds{0});
     BeginShutdown(std::chrono::milliseconds{1000});
 }
 
@@ -70,6 +79,19 @@ void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
     include_target_info_.store(
         c.metrics.prometheus.include_target_info,
         std::memory_order_release);
+    // Operator visibility — traces.enabled is documented as live-
+    // reloadable, but with no SpanProcessor (boot-time exporter empty
+    // / Phase 2 not wired) the flip is silently no-op. Warn the
+    // operator instead of failing closed; metrics-only deployments are
+    // valid and shouldn't fail to reload, but the operator should know
+    // their staged change didn't take effect. Restart is required to
+    // attach a processor.
+    if (c.traces.enabled && span_processor_ == nullptr) {
+        logging::Get()->warn(
+            "observability.traces.enabled=true but no SpanProcessor "
+            "is attached (traces.exporter was empty at boot). "
+            "Restart with traces.exporter set to enable tracing.");
+    }
 }
 
 void ObservabilityManager::Init() {

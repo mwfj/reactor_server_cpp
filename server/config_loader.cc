@@ -986,13 +986,25 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
             if (!obs["resource"].is_object())
                 throw std::runtime_error("observability.resource must be an object");
             auto& r = obs["resource"];
-            if (r.contains("service_name"))
+            if (r.contains("service_name")) {
+                if (!r["service_name"].is_string())
+                    throw std::runtime_error(
+                        "observability.resource.service_name must be a string");
                 oc.resource.service_name = r["service_name"].get<std::string>();
-            if (r.contains("service_version"))
+            }
+            if (r.contains("service_version")) {
+                if (!r["service_version"].is_string())
+                    throw std::runtime_error(
+                        "observability.resource.service_version must be a string");
                 oc.resource.service_version = r["service_version"].get<std::string>();
-            if (r.contains("service_instance_id"))
+            }
+            if (r.contains("service_instance_id")) {
+                if (!r["service_instance_id"].is_string())
+                    throw std::runtime_error(
+                        "observability.resource.service_instance_id must be a string");
                 oc.resource.service_instance_id =
                     r["service_instance_id"].get<std::string>();
+            }
         }
         if (obs.contains("traces")) {
             if (!obs["traces"].is_object())
@@ -1089,8 +1101,12 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     throw std::runtime_error(
                         "observability.traces.otlp must be an object");
                 auto& oj = tj["otlp"];
-                if (oj.contains("upstream"))
+                if (oj.contains("upstream")) {
+                    if (!oj["upstream"].is_string())
+                        throw std::runtime_error(
+                            "observability.traces.otlp.upstream must be a string");
                     oc.traces.otlp.upstream = oj["upstream"].get<std::string>();
+                }
                 if (oj.contains("timeout_ms"))
                     oc.traces.otlp.timeout_ms = std::chrono::milliseconds{
                         ParseStrictInt(oj, "timeout_ms",
@@ -1170,15 +1186,23 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                         "observability.metrics.enabled must be boolean");
                 oc.metrics.enabled = mj["enabled"].get<bool>();
             }
-            if (mj.contains("exporter"))
+            if (mj.contains("exporter")) {
+                if (!mj["exporter"].is_string())
+                    throw std::runtime_error(
+                        "observability.metrics.exporter must be a string");
                 oc.metrics.exporter = mj["exporter"].get<std::string>();
+            }
             if (mj.contains("otlp")) {
                 if (!mj["otlp"].is_object())
                     throw std::runtime_error(
                         "observability.metrics.otlp must be an object");
                 auto& oj = mj["otlp"];
-                if (oj.contains("upstream"))
+                if (oj.contains("upstream")) {
+                    if (!oj["upstream"].is_string())
+                        throw std::runtime_error(
+                            "observability.metrics.otlp.upstream must be a string");
                     oc.metrics.otlp.upstream = oj["upstream"].get<std::string>();
+                }
                 if (oj.contains("timeout_ms"))
                     oc.metrics.otlp.timeout_ms = std::chrono::milliseconds{
                         ParseStrictInt(oj, "timeout_ms",
@@ -1213,8 +1237,12 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     throw std::runtime_error(
                         "observability.metrics.prometheus must be an object");
                 auto& pj = mj["prometheus"];
-                if (pj.contains("path"))
+                if (pj.contains("path")) {
+                    if (!pj["path"].is_string())
+                        throw std::runtime_error(
+                            "observability.metrics.prometheus.path must be a string");
                     oc.metrics.prometheus.path = pj["path"].get<std::string>();
+                }
                 if (pj.contains("include_target_info")) {
                     if (!pj["include_target_info"].is_boolean())
                         throw std::runtime_error(
@@ -2201,12 +2229,21 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
 
     // Histogram bucket layout — every boundary must be finite (NaN
     // and ±Inf are rejected so the Prometheus formatter and OTLP
-    // serialiser never see them) AND strictly increasing.
+    // serialiser never see them) AND strictly increasing. Per-
+    // instrument bucket count is capped: each label combination
+    // allocates one counter per boundary, so a 100k-boundary typo
+    // would otherwise be a per-series memory bomb.
+    static constexpr size_t kMaxBucketsPerInstrument = 256;
     for (const auto& kv : oc.metrics.histogram_buckets) {
         if (kv.second.empty())
             throw std::invalid_argument(
                 "observability.metrics.histogram_buckets[" + kv.first +
                 "] must be non-empty");
+        if (kv.second.size() > kMaxBucketsPerInstrument)
+            throw std::invalid_argument(
+                "observability.metrics.histogram_buckets[" + kv.first +
+                "] exceeds the per-instrument boundary cap (" +
+                std::to_string(kMaxBucketsPerInstrument) + ")");
         for (size_t i = 0; i < kv.second.size(); ++i) {
             if (!std::isfinite(kv.second[i])) {
                 throw std::invalid_argument(

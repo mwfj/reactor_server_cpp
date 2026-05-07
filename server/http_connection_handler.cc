@@ -6,7 +6,7 @@
 #include "http/streaming_response_sender_utils.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
-#include "observability/observability_manager.h"
+#include "observability/observability_manager.h"  // ->FinalizeFromSnapshot mgr-method calls
 #include "observability/observability_snapshot.h"
 #include <cstdio>
 #include <sstream>
@@ -856,6 +856,16 @@ void HttpConnectionHandler::SetRequestTimeout(int seconds) {
                 if (auto self = weak_self.lock()) {
                     HttpResponse timeout_resp = HttpResponse::RequestTimeout();
                     timeout_resp.Header("Connection", "close");
+                    // Finalize any observability snapshot middleware
+                    // attached to the in-flight request before the 408
+                    // hits the wire — otherwise inflight_finalizations_
+                    // leaks and Phase 1c drain stalls. parser_.GetRequest()
+                    // is the live request slot on the dispatcher thread
+                    // that owns this callback; FinalizeIfSnapshot no-ops
+                    // when no snapshot is attached (early-arrival case).
+                    HttpServer::FinalizeIfSnapshot(
+                        self->parser_.GetRequest(), timeout_resp,
+                        "request_timeout");
                     self->SendResponse(timeout_resp);
                 }
                 return false;
@@ -1916,6 +1926,9 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             if (auto self = weak_self.lock()) {
                 HttpResponse timeout_resp = HttpResponse::RequestTimeout();
                 timeout_resp.Header("Connection", "close");
+                HttpServer::FinalizeIfSnapshot(
+                    self->parser_.GetRequest(), timeout_resp,
+                    "request_timeout");
                 self->SendResponse(timeout_resp);
             }
             return false;  // Proceed with connection close
@@ -2334,6 +2347,9 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 if (auto self = weak_self.lock()) {
                     HttpResponse timeout_resp = HttpResponse::RequestTimeout();
                     timeout_resp.Header("Connection", "close");
+                    HttpServer::FinalizeIfSnapshot(
+                        self->parser_.GetRequest(), timeout_resp,
+                        "request_timeout");
                     self->SendResponse(timeout_resp);
                 }
                 return false;  // Proceed with connection close
@@ -2345,6 +2361,8 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 logging::Get()->warn("Request timeout fd={}", conn_->fd());
                 HttpResponse timeout_resp = HttpResponse::RequestTimeout();
                 timeout_resp.Header("Connection", "close");
+                HttpServer::FinalizeIfSnapshot(
+                    parser_.GetRequest(), timeout_resp, "request_timeout");
                 SendResponse(timeout_resp);
                 CloseConnection();
                 return;

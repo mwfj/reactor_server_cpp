@@ -12,10 +12,11 @@
 // the `_total` suffix per Prometheus convention. Histogram renders as
 // cumulative `_bucket{le="..."}` lines plus `_sum` and `_count`.
 //
-// Sanitization collisions across distinct OTel names are detected at
-// first render and logged once at startup; the OTel HTTP semconv
-// catalog is collision-free, so this fires only on operator-added
-// custom names.
+// Sanitization collisions across distinct OTel names are detected on
+// every Render() call; each distinct collision pair is logged at most
+// once per process via an internal warned-set. The framework HTTP-
+// semconv catalog is collision-free, so this fires only on operator-
+// added custom names that sanitize to the same Prometheus family.
 
 #include "observability/metrics_snapshot.h"
 

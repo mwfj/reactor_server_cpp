@@ -15,11 +15,18 @@
 //   - metrics.histogram_buckets.<name>
 //
 // Live-reloadable (apply on next request / next scrape / next export):
-//   - traces.enabled, metrics.enabled
+//   - metrics.enabled
+//   - traces.enabled  — restart-required when traces.exporter was empty
+//                       at boot (no SpanProcessor was ever installed,
+//                       so the live flag stays gated to false until a
+//                       restart attaches one). PublishLiveFlags warns
+//                       on a stage-time flip that can't take effect.
 //   - traces.sampler.{type, ratio, routes}
 //   - traces.otlp.{headers, timeout_ms}
-//   - traces.batch.{max_queue_size, max_export_batch_size,
-//                    schedule_delay_ms, retries.*}
+//   - traces.batch.{max_export_batch_size, schedule_delay_ms,
+//                    retries.*}  — max_queue_size is RESTART (queue
+//                                  capacity is allocated at ctor and
+//                                  Reload never resizes).
 //   - metrics.otlp.{headers, timeout_ms, export_interval_ms}
 //   - metrics.prometheus.include_target_info
 
@@ -78,7 +85,23 @@ struct TracesConfig {
     std::string   exporter;            // "otlp_http" | "" (off). RESTART.
     SamplerConfig sampler;             // live-reloadable
     OtlpTransportConfig otlp;          // upstream RESTART; headers/timeout live
-    BatchSpanConfig batch;             // live-reloadable
+    BatchSpanConfig batch;             // live-reloadable except max_queue_size
+    // Restart-required equality. ADDING A FIELD:
+    //   - restart-only ⇒ include here AND classify in the field-by-
+    //     field assignment in ObservabilityManager::Reload (omit it
+    //     so the live struct keeps the boot value).
+    //   - live-reloadable ⇒ omit here AND copy it through in
+    //     ObservabilityManager::Reload's per-field block.
+    // Skipping either leg makes the reload silently take effect on
+    // restart-only fields or silently no-op on live ones.
+    bool operator==(const TracesConfig& o) const {
+        return exporter == o.exporter
+            && otlp.upstream == o.otlp.upstream
+            // BatchSpanProcessor allocates queue capacity at construction;
+            // Reload never resizes, so the field is restart-only.
+            && batch.max_queue_size == o.batch.max_queue_size;
+    }
+    bool operator!=(const TracesConfig& o) const { return !(*this == o); }
 };
 
 struct PrometheusConfig {
@@ -101,6 +124,15 @@ struct MetricsConfig {
     // RESTART-only — bucket layout cannot change once Series are
     // populated without losing histogram coherency.
     std::map<std::string, std::vector<double>> histogram_buckets;
+    // Restart-required equality. Same field-classification contract
+    // as TracesConfig::operator== above.
+    bool operator==(const MetricsConfig& o) const {
+        return exporter == o.exporter
+            && otlp.upstream == o.otlp.upstream
+            && prometheus.path == o.prometheus.path
+            && histogram_buckets == o.histogram_buckets;
+    }
+    bool operator!=(const MetricsConfig& o) const { return !(*this == o); }
 };
 
 struct ResourceConfig {
@@ -118,21 +150,16 @@ struct ObservabilityConfig {
     // Restart-required equality — only fields that cannot be hot-reloaded
     // contribute. The HttpServer::Reload outer "restart required" warn
     // fires when this differs between live and staged configs.
+    // Composition is delegated to TracesConfig / MetricsConfig
+    // operator== so adding a field to one of those structs forces the
+    // author to revisit the field-classification contract there.
     bool operator==(const ObservabilityConfig& o) const {
         return enabled == o.enabled
             && resource.service_name == o.resource.service_name
             && resource.service_version == o.resource.service_version
             && resource.service_instance_id == o.resource.service_instance_id
-            && traces.exporter == o.traces.exporter
-            && traces.otlp.upstream == o.traces.otlp.upstream
-            // BatchSpanProcessor allocates queue capacity at
-            // construction; Reload() never resizes. Edits would
-            // silently no-op until restart, so this is restart-only.
-            && traces.batch.max_queue_size == o.traces.batch.max_queue_size
-            && metrics.exporter == o.metrics.exporter
-            && metrics.otlp.upstream == o.metrics.otlp.upstream
-            && metrics.prometheus.path == o.metrics.prometheus.path
-            && metrics.histogram_buckets == o.metrics.histogram_buckets;
+            && traces == o.traces
+            && metrics == o.metrics;
     }
     bool operator!=(const ObservabilityConfig& o) const { return !(*this == o); }
 };

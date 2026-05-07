@@ -13,9 +13,11 @@
 // forbidden — the processor receives a fully-detached SpanData snapshot
 // and never touches the Span object. The shutdown kill loop respects
 // this contract via the synchronized link/kill protocol on
-// ObservabilitySnapshot plus DropWithoutEnd(), which mutates Span
-// members on the OWNING DISPATCHER (inline when the kill loop is on-
-// thread, or marshaled via EnQueue otherwise).
+// ObservabilitySnapshot plus DropWithoutEnd(), which is off-thread-safe
+// by construction: it only flips the `dropped_` atomic. Vector /
+// shared_ptr cleanup runs in the destructor when the last shared_ptr
+// to the Span releases — bounded by dispatcher stop after the kill
+// loop returns. See observability_manager.h for the drain ordering.
 //
 // Idempotent guarantees:
 //   - End() may be called at most once. Repeat calls are silently

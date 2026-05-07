@@ -14,10 +14,7 @@
 #include "http/http_status.h"
 #include "http/trailer_policy.h"
 #include "log/logger.h"
-#include "observability/observability_manager.h"
 #include "observability/observability_snapshot.h"
-#include "observability/propagator.h"
-#include "observability/trace_id.h"
 #include <unordered_set>
 
 namespace {
@@ -1468,19 +1465,19 @@ void ProxyTransaction::MarkKilledForShutdown() noexcept {
         // etc.) so any callbacks that fire on a still-live transport
         // short-circuit. The transaction is destroyed with its
         // connection; the lease, retry token, and breaker admission
-        // are released by the destructor's tear-down. Surface the
-        // EnQueue failure so operators investigating a wedged shutdown
-        // see WHY a kill never finalized inline.
+        // are released by the destructor's tear-down. Demoted to
+        // debug so a drain-timed-out shutdown doesn't spam the log
+        // with one warn per surviving transaction.
         try {
-            logging::Get()->warn(
-                "ProxyTransaction kill EnQueue failed (dispatcher stopped) "
+            logging::Get()->debug(
+                "ProxyTransaction kill EnQueue skipped (dispatcher stopped) "
                 "client_fd={} service={}: {}",
                 client_fd_, service_name_, e.what());
         } catch (...) {}
     } catch (...) {
         try {
-            logging::Get()->warn(
-                "ProxyTransaction kill EnQueue failed (unknown exception) "
+            logging::Get()->debug(
+                "ProxyTransaction kill EnQueue skipped (unknown exception) "
                 "client_fd={} service={}",
                 client_fd_, service_name_);
         } catch (...) {}

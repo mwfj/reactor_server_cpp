@@ -94,6 +94,13 @@ public:
     int64_t inflight_transactions() const noexcept {
         return inflight_transactions_.load(std::memory_order_acquire);
     }
+    // Drain mutex/cv accessors for HttpServer::WaitForAllAsyncDrain.
+    // The cv is signaled on every transaction/lease decrement so a
+    // single waiter can sleep until shutdown actually drains. Without
+    // these, the no-observability path would fall back to a 50ms
+    // polling loop.
+    std::mutex& drain_mtx() noexcept { return drain_mtx_; }
+    std::condition_variable& drain_cv() noexcept { return drain_cv_; }
     void IncInflightTransactions() noexcept {
         inflight_transactions_.fetch_add(1, std::memory_order_acq_rel);
     }

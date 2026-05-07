@@ -1,5 +1,6 @@
 #include "observability/prometheus_exporter.h"
 
+#include "log/logger.h"
 #include "observability/resource.h"
 
 #include <algorithm>
@@ -8,6 +9,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <variant>
 
 namespace OBSERVABILITY_NAMESPACE {
@@ -344,10 +348,43 @@ const char* PrometheusExporter::ContentType(Format fmt) noexcept {
     }
 }
 
+// Detect sanitization collisions within a snapshot and log each
+// distinct collision pair at most once for the process lifetime. Two
+// distinct OTel instrument names that sanitize to the same Prometheus
+// family produce duplicate `# TYPE` lines, which strict OpenMetrics
+// validators reject. The framework HTTP-semconv catalog is collision-
+// free; this fires only on operator-added custom names.
+void DetectCollisionsAndWarn(
+    const std::vector<InstrumentSnapshot>& instruments) {
+    std::unordered_map<std::string, std::string> sanitized_to_original;
+    sanitized_to_original.reserve(instruments.size());
+    for (const auto& inst : instruments) {
+        std::string sanitized = PrometheusExporter::SanitizeName(inst.name);
+        if (sanitized.empty()) continue;
+        auto [it, inserted] =
+            sanitized_to_original.try_emplace(sanitized, inst.name);
+        if (inserted || it->second == inst.name) continue;
+        // Distinct originals → same sanitized name.
+        static std::mutex warned_mtx;
+        static std::unordered_set<std::string> warned;
+        std::string key = sanitized + "|" + it->second + "|" + inst.name;
+        std::lock_guard<std::mutex> g(warned_mtx);
+        if (warned.insert(std::move(key)).second) {
+            logging::Get()->warn(
+                "prometheus: name collision — '{}' and '{}' both "
+                "sanitize to '{}'; output will contain duplicate "
+                "TYPE blocks. Rename one of the OTel instruments.",
+                it->second, inst.name, sanitized);
+        }
+    }
+}
+
 std::string PrometheusExporter::Render(const MetricsSnapshot& snap,
                                          Format fmt) {
     std::string out;
     out.reserve(2048);
+
+    DetectCollisionsAndWarn(snap.instruments);
 
     // target_info — emitted from Resource attrs whenever the snapshot
     // carries a Resource. The handler clears snap.resource to suppress

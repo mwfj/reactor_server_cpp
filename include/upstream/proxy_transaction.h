@@ -109,13 +109,19 @@ public:
         std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap);
 
     // Invoked under the snapshot's link_mtx by the shutdown kill loop.
-    // Sets the shutdown-kill flag AND enqueues a dispatcher hop to
-    // Cancel() — the flag alone is not load-bearing (no production
-    // gate reads IsKilledForShutdown), so without the Cancel hop the
-    // proxy would keep using pool resources after its snapshot was
-    // removed from drain counters. Out-of-line definition lets us
-    // depend on Dispatcher's full type in the .cc rather than dragging
-    // it into this header.
+    // Two-part contract:
+    //   - kill_for_shutdown_ is the inline gate read by terminal
+    //     upstream callbacks (OnHeaders / OnBodyChunk / OnComplete /
+    //     OnError / OnUpstreamWriteComplete / OnUpstreamData /
+    //     OnStreamIdleTimeout / OnStreamBudgetTimeout / DeliverResponse)
+    //     so any callback firing on a still-live transport short-
+    //     circuits without writing to the client.
+    //   - the dispatcher EnQueue + Cancel() is the cleanup hop — it
+    //     releases the upstream lease, retry token, breaker admission,
+    //     and async hooks. Without it the proxy would keep using pool
+    //     resources after its snapshot was removed from drain counters.
+    // Out-of-line definition lets us depend on Dispatcher's full type
+    // in the .cc rather than dragging it into this header.
     void MarkKilledForShutdown() noexcept override;
     bool IsKilledForShutdown() const noexcept override {
         return kill_for_shutdown_.load(std::memory_order_acquire);

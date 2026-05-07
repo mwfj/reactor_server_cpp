@@ -3,8 +3,6 @@
 #include "http/push_helper.h"
 #include "config/config_loader.h"
 #include "net/dns_resolver.h"            // IsValidHostOrIpLiteral grammar
-#include "ws/websocket_frame.h"
-#include "http2/http2_constants.h"
 #include "upstream/upstream_manager.h"
 #include "upstream/proxy_handler.h"
 #include "auth/auth_manager.h"
@@ -1523,9 +1521,9 @@ HttpServer::HttpServer(ServerConfig config)
                   config.worker_threads)
 {
     // Ctor body is pure configuration wiring — no listen socket, no
-    // DNS, no dispatchers. `Start()` owns Phase A (DNS batch), Phase B
-    // (StartListening on the resolved address), and Phase C (dispatcher
-    // bootstrap) per §5.4a. This lets a SIGTERM arriving between ctor
+    // DNS, no dispatchers. `Start()` owns the DNS batch, StartListening
+    // on the resolved address, and dispatcher bootstrap. This lets a
+    // SIGTERM arriving between ctor
     // completion and Start() produce a clean shutdown with no listener
     // open, and allows hostname bind to flow through the async
     // DnsResolver instead of synchronous getaddrinfo at ctor time.
@@ -2955,46 +2953,57 @@ void HttpServer::Stop() {
             }
             const auto drain_budget = std::chrono::seconds(
                 shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
-            // Phase A — observability flush BEFORE upstream pool
-            // shutdown. The BatchSpanProcessor's final flush (when
-            // the OTLP push pipeline is wired) routes through
+            // Single shutdown deadline anchors every downstream wait.
+            // Each phase consumes from the same budget via budget_left()
+            // so the operator-configured shutdown_drain_timeout_sec is a
+            // hard cap on total drain wall-clock — not a per-phase hint
+            // that compounds. Pod terminationGracePeriodSeconds sized
+            // against this knob behaves as documented.
+            const auto shutdown_deadline =
+                std::chrono::steady_clock::now() + drain_budget;
+            auto budget_left = [shutdown_deadline]() {
+                auto now = std::chrono::steady_clock::now();
+                if (now >= shutdown_deadline) {
+                    return std::chrono::milliseconds{0};
+                }
+                return std::chrono::duration_cast<std::chrono::milliseconds>(
+                    shutdown_deadline - now);
+            };
+
+            // Step 1 — observability flush BEFORE upstream pool
+            // shutdown. The BatchSpanProcessor's final flush (when the
+            // OTLP push pipeline is wired) routes through
             // UpstreamHttpClient against the same pools that
             // InitiateShutdown is about to take down; running flush
-            // first keeps those checkouts valid. Today's NoopSpanProcessor
-            // wiring makes the flush a no-op, but we wait for natural
-            // finalize drain here so proxy in-flight that completes
-            // during the upcoming upstream drain doesn't have to
+            // first keeps those checkouts valid. Today's
+            // NoopSpanProcessor wiring makes flush a no-op, but we wait
+            // for natural finalize drain so proxy in-flight that
+            // completes during the upcoming upstream drain doesn't
             // race the kill loop.
-            const bool flushed = FlushObservabilityForShutdown(
-                std::chrono::milliseconds(drain_budget) / 2);
-            // Phase B — upstream shutdown. Initiate AFTER protocol
-            // drain so proxy handlers dispatched during the drain
-            // can still check out. In-flight proxy requests that
-            // complete during this window finalize via the normal
-            // path against still-live snapshots.
+            const bool flushed = FlushObservabilityForShutdown(budget_left());
+            // Step 2 — upstream shutdown. Initiate AFTER protocol drain
+            // so proxy handlers dispatched during the drain can still
+            // check out. In-flight proxy requests that complete during
+            // this window finalize via the normal path against still-
+            // live snapshots.
             if (upstream_manager_) {
                 upstream_manager_->InitiateShutdown();
-                upstream_manager_->WaitForDrain(drain_budget);
+                upstream_manager_->WaitForDrain(
+                    std::chrono::ceil<std::chrono::seconds>(budget_left()));
             }
-            // Phase C — kill survivors + BeginShutdown AFTER upstream
-            // drain so any proxy in-flight that finalized during
-            // Phase B reached Span::End before the kill sweep.
-            KillAndShutdownObservability(
-                std::chrono::milliseconds(drain_budget) / 2,
-                flushed);
-            // Post-upstream H1 flush window: an async (exempt) HTTP/1 handler
-            // whose completion fires during the upstream drain (or that takes
-            // longer than the first H1 drain loop) only starts writing its
-            // client response after the earlier H1 drain has finished. Use
-            // the operator-configured shutdown_drain_timeout_sec_ instead of
-            // the hard-coded H1_DRAIN_TIMEOUT_SEC: any async H1 route that
-            // doesn't go through UpstreamManager (or simply takes longer than
-            // 2s before it starts writing) would otherwise be cut off when
-            // StopEventLoop runs.
+            // Step 3 — kill survivors + BeginShutdown AFTER upstream
+            // drain so any proxy in-flight that finalized during step 2
+            // reached Span::End before the kill sweep.
+            KillAndShutdownObservability(budget_left(), flushed);
+            // Post-upstream H1 flush window: an async (exempt) HTTP/1
+            // handler whose completion fires during the upstream drain
+            // (or that takes longer than the first H1 drain loop) only
+            // starts writing its client response after the earlier H1
+            // drain has finished. Bounded by the same shutdown deadline
+            // as everything else.
             {
-                auto h1_deadline = std::chrono::steady_clock::now() +
-                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
-                        std::memory_order_relaxed));
+                auto h1_deadline =
+                    std::chrono::steady_clock::now() + budget_left();
                 while (std::chrono::steady_clock::now() < h1_deadline) {
                     if (!HasPendingH1Output()) break;
                     std::this_thread::sleep_for(
@@ -3123,20 +3132,31 @@ void HttpServer::Stop() {
             }
             const auto drain_budget_sec = std::chrono::seconds(
                 shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
-            // Phase A — observability flush BEFORE upstream pool
+            // Single shutdown deadline — same hard-cap contract as the
+            // off-thread path above.
+            const auto dt_shutdown_deadline =
+                std::chrono::steady_clock::now() + drain_budget_sec;
+            auto dt_budget_left = [dt_shutdown_deadline]() {
+                auto now = std::chrono::steady_clock::now();
+                if (now >= dt_shutdown_deadline) {
+                    return std::chrono::milliseconds{0};
+                }
+                return std::chrono::duration_cast<std::chrono::milliseconds>(
+                    dt_shutdown_deadline - now);
+            };
+            // Step 1 — observability flush BEFORE upstream pool
             // shutdown — see the off-thread path above for rationale.
             const bool flushed = FlushObservabilityForShutdown(
-                std::chrono::milliseconds(drain_budget_sec) / 2);
-            // Phase B — upstream drain — initiate AFTER protocol drains
+                dt_budget_left());
+            // Step 2 — upstream drain — initiate AFTER protocol drains
             // so late proxy handlers can still check out. Then poll
             // with task pump until leases return, and force-close
             // stragglers.
             if (upstream_manager_) {
                 upstream_manager_->InitiateShutdown();
                 static constexpr int UP_PUMP_MS = 200;
-                auto up_deadline = std::chrono::steady_clock::now() +
-                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
-                        std::memory_order_relaxed));
+                auto up_deadline =
+                    std::chrono::steady_clock::now() + dt_budget_left();
                 while (std::chrono::steady_clock::now() < up_deadline) {
                     net_server_.ProcessSelfDispatcherTasks();
                     if (upstream_manager_->AllDrained()) break;
@@ -3145,18 +3165,15 @@ void HttpServer::Stop() {
                 }
                 upstream_manager_->ForceCloseRemaining();
             }
-            // Phase C — kill survivors + BeginShutdown AFTER upstream
-            // drain so any proxy in-flight that finalized during
-            // Phase B reached Span::End before the kill sweep.
-            KillAndShutdownObservability(
-                std::chrono::milliseconds(drain_budget_sec) / 2,
-                flushed);
-            // Post-upstream H1 flush window: use the configured drain budget
-            // so async H1 routes that take longer than 2s aren't cut off.
+            // Step 3 — kill survivors + BeginShutdown AFTER upstream
+            // drain so any proxy in-flight that finalized during step 2
+            // reached Span::End before the kill sweep.
+            KillAndShutdownObservability(dt_budget_left(), flushed);
+            // Post-upstream H1 flush window — bounded by the same
+            // shutdown deadline as everything else.
             {
-                auto h1_deadline = std::chrono::steady_clock::now() +
-                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
-                        std::memory_order_relaxed));
+                auto h1_deadline =
+                    std::chrono::steady_clock::now() + dt_budget_left();
                 while (std::chrono::steady_clock::now() < h1_deadline) {
                     net_server_.ProcessSelfDispatcherTasks();
                     if (!HasPendingH1Output()) break;
@@ -3263,7 +3280,10 @@ void HttpServer::WaitForH2Drain() {
     }
 }
 
-bool HttpServer::WaitForAllAsyncDrain(std::chrono::milliseconds timeout) {
+bool HttpServer::WaitForAllAsyncDrain(
+        std::chrono::milliseconds timeout) {
+    const auto drain_started_at = std::chrono::steady_clock::now();
+    const auto budget_ms = timeout;
     // Predicate gates each counter on its owning manager being non-
     // null. Null managers contribute zero, so the predicate short-
     // circuits true when nothing is in flight.
@@ -3309,26 +3329,33 @@ bool HttpServer::WaitForAllAsyncDrain(std::chrono::milliseconds timeout) {
             obs->finalizers_done_cv().wait_for(
                 lck, std::chrono::milliseconds(50));
         }
-    } else {
-        // No observability manager — poll just the upstream half.
-        // TODO: thread an UpstreamManager drain_cv_ accessor through
-        // here so we can wake on the actual drain signal instead of
-        // the 50ms polling timer; today the cv is private and a stub
-        // mutex would be required to bind to it. The wasted-wakeup
-        // window is bounded at one poll interval per shutdown.
+    } else if (upm) {
+        // No observability manager — wait on the upstream drain cv
+        // instead of polling. drain_cv_ is signaled by PoolPartition
+        // every time a connection count changes (lease release / conn
+        // close), which paired with DecInflightTransactions on the
+        // same release path makes the cv a sufficient wake signal
+        // for the predicate. The 50ms timeout is a safety net: a
+        // pure DecInflightTransactions decrement that doesn't touch
+        // pool state still gets noticed within one tick.
+        std::unique_lock<std::mutex> lck(upm->drain_mtx());
         while (!predicate()) {
             if (std::chrono::steady_clock::now() >= deadline) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            upm->drain_cv().wait_for(lck, std::chrono::milliseconds(50));
         }
     }
 
     bool drained = predicate();
     if (!drained) {
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - drain_started_at);
         logging::Get()->warn(
             "WaitForAllAsyncDrain timeout — "
-            "active_leases={} inflight_transactions={} "
-            "inflight_finalizations={} finalizers_in_progress={} "
-            "kill_marshals_in_flight={}",
+            "budget_ms={} elapsed_ms={} active_leases={} "
+            "inflight_transactions={} inflight_finalizations={} "
+            "finalizers_in_progress={} kill_marshals_in_flight={}",
+            budget_ms.count(), elapsed_ms.count(),
             upm ? upm->active_leases() : 0,
             upm ? upm->inflight_transactions() : 0,
             obs ? obs->inflight_finalizations() : 0,
@@ -3367,28 +3394,39 @@ void HttpServer::KillAndShutdownObservability(
         std::chrono::milliseconds budget,
         bool drained_in_flush_phase) {
     if (!observability_manager_) return;
+    // Anchor on a single deadline so the function's total wall <= budget.
+    // The original split passed `budget` to BOTH the finalizer-drain
+    // wait_until AND BeginShutdown's JoinWorkers, allowing 2x budget
+    // worst case. Compute remaining-after-each-step instead.
+    const auto deadline =
+        std::chrono::steady_clock::now() + budget;
+    auto remaining = [deadline]() {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return std::chrono::milliseconds{0};
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now);
+    };
     if (!drained_in_flush_phase) {
-        observability_manager_->KillOutstandingSnapshots(budget);
-        // After the kill sweep, snapshots whose CAS was already won
-        // by an in-progress finalizer are skipped — but those
-        // finalizers may still be inside OnFinalizeWinner, racing
-        // toward Span::End. If BeginShutdown signals the processor
-        // before they reach End, the OnEnd dispatch sees
-        // shutting_down_ and the completed span is dropped as
-        // post-shutdown overflow. Wait once more (bounded by the
-        // remaining slice of the drain budget) for
-        // finalizers_in_progress_ to drain so those spans land
-        // through the still-live exporter pipeline before
-        // BeginShutdown signals shutdown.
+        // KillOutstandingSnapshots is synchronous CAS work; the grace
+        // parameter is currently unused (see method docstring).
+        observability_manager_->KillOutstandingSnapshots(remaining());
+        // After the kill sweep, snapshots whose CAS was already won by
+        // an in-progress finalizer are skipped — but those finalizers
+        // may still be inside OnFinalizeWinner, racing toward
+        // Span::End. If BeginShutdown signals the processor before
+        // they reach End, the OnEnd dispatch sees shutting_down_ and
+        // the completed span is dropped as post-shutdown overflow.
+        // Wait once more (bounded by remaining budget) for
+        // finalizers_in_progress_ to drain so those spans land through
+        // the still-live exporter pipeline before BeginShutdown
+        // signals shutdown.
         auto* obs = observability_manager_.get();
-        const auto deadline =
-            std::chrono::steady_clock::now() + budget;
         std::unique_lock<std::mutex> lck(obs->finalizers_done_mtx());
         obs->finalizers_done_cv().wait_until(lck, deadline, [obs]() {
             return obs->finalizers_in_progress() == 0;
         });
     }
-    observability_manager_->BeginShutdown(budget);
+    observability_manager_->BeginShutdown(remaining());
 }
 
 void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn) {
@@ -5777,11 +5815,11 @@ bool HttpServer::Reload(ServerConfig new_config) {
         }
         size_t final_cap = (ws > 0) ? (http_cap == 0 ? ws : std::min(http_cap, ws))
                                     : http_cap;
-        // Three-phase update ensures the cap is never larger than what the
+        // Three-step update ensures the cap is never larger than what the
         // limits enforce at any point during the transition:
-        //   Phase 1: set cap to min(old, new) — tightest constraint
-        //   Phase 2: update limit atomics (SetupHandlers reads these)
-        //   Phase 3: set final cap (may be larger if limits grew)
+        //   1. Set cap to min(old, new) — tightest constraint
+        //   2. Update limit atomics (SetupHandlers reads these)
+        //   3. Set final cap (may be larger if limits grew)
         // 0 means unlimited — never use it as the transitional cap.
         size_t old_cap = ComputeInputCap();  // from current atomics
         size_t transition_cap;
