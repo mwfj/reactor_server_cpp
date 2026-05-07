@@ -659,10 +659,11 @@ void ProxyTransaction::DispatchH1() {
 void ProxyTransaction::DispatchH2(
     std::shared_ptr<const Http2UpstreamConfig> /*cfg*/)
 {
-    auto* partition = upstream_manager_
-        ? upstream_manager_->GetPoolPartition(
-            service_name_, static_cast<size_t>(dispatcher_index_))
-        : nullptr;
+    PoolPartition* partition = nullptr;
+    if (upstream_manager_ && dispatcher_index_ >= 0) {
+        partition = upstream_manager_->GetPoolPartition(
+            service_name_, static_cast<size_t>(dispatcher_index_));
+    }
     if (!partition) {
         MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
         return;
@@ -1067,6 +1068,17 @@ bool ProxyTransaction::OnHeaders(
                 // this response. Pausing llhttp alone would keep appending raw
                 // bytes into paused_parse_bytes_ without the relay cap.
                 upstream_conn->IncReadDisable();
+            }
+            // H2: there is no parser-loop driver to dispatch the retry
+            // decision later, and we cannot pause the multiplexed
+            // transport without stalling sibling streams. Make the retry
+            // decision synchronously so subsequent body chunks land on a
+            // detached sink (Cleanup nulls stream->sink via ResetStream)
+            // and never reach the client. Empty-body fallback if the
+            // retry is rejected — H1's body-replay logic doesn't carry
+            // over because nothing has been buffered yet on this path.
+            if (h2_path_) {
+                ProcessHeadersRetryDecision();
             }
             return true;
         } else if (ShouldRetryResponse5xx()) {
@@ -1597,6 +1609,11 @@ void ProxyTransaction::Cleanup() {
         }
         h2_stream_id_ = -1;
         h2_conn_weak_.reset();
+        // Reset h2_path_ so a subsequent retry attempt that lands on H1
+        // (e.g. ALPN renegotiated, or the H2 connection died and prefer=auto's
+        // next probe selects http/1.1) goes through the H1 lease-release
+        // branch on its own Cleanup. Without this reset the H1 lease leaks.
+        h2_path_ = false;
         ClearResponseTimeout();
         // Cancelled mid-stream H2 requests are neutral from the breaker's
         // perspective — RST_STREAM is a client-initiated abort, not an

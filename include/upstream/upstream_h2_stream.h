@@ -37,6 +37,15 @@ struct UpstreamH2Stream {
     // OnHeaders. Subsequent HEADERS frames (e.g. trailers) take a
     // different code path, so guard against re-dispatching the head.
     bool head_dispatched = false;
+    // Set when the first HEADERS frame carried an informational status
+    // (1xx). The next HEADERS frame is then expected to be the final
+    // response (or another 1xx); response_head accumulators are cleared
+    // at the boundary so the final headers overlay cleanly.
+    bool saw_1xx_interim = false;
+    // Trailing HEADERS frame contents accumulated when HCAT_HEADERS
+    // arrives after head_dispatched. Dispatched via sink->OnTrailers
+    // when the trailing block ends.
+    std::vector<std::pair<std::string, std::string>> trailers;
     // Holds the request-body buffer used by the nghttp2 data provider
     // read_callback. Empty for bodyless requests.
     std::unique_ptr<UpstreamH2BodySource> body_source;

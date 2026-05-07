@@ -151,14 +151,23 @@ struct RecordingSink : public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink
     int body_bytes      = 0;
     int complete_calls  = 0;
     int error_calls     = 0;
+    int trailers_calls  = 0;
+    int last_status     = 0;
     int last_error_code = 0;
     std::string last_error_msg;
+    std::vector<std::pair<std::string, std::string>> last_trailers;
 
-    bool OnHeaders(const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead&) override {
-        ++headers_calls; return true;
+    bool OnHeaders(const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) override {
+        ++headers_calls;
+        last_status = head.status_code;
+        return true;
     }
     bool OnBodyChunk(const char*, size_t len) override {
         body_bytes += static_cast<int>(len); return true;
+    }
+    void OnTrailers(const std::vector<std::pair<std::string, std::string>>& t) override {
+        ++trailers_calls;
+        last_trailers = t;
     }
     void OnComplete() override { ++complete_calls; }
     void OnError(int code, const std::string& msg) override {
@@ -1446,6 +1455,53 @@ void TestB6RstStreamRemovesEntry() {
     }
 }
 
+// B7 — OnTrailersComplete on a non-existent stream is a no-op
+void TestB7OnTrailersCompleteNoStream() {
+    std::cout << "\n[TEST] H2Upstream B7: OnTrailersComplete on missing stream is no-op..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        cfg->ping_idle_sec   = 0;
+        cfg->ping_timeout_sec = 0;
+        cfg->goaway_drain_timeout_sec = 0;
+
+        UpstreamH2Connection conn(nullptr, cfg);
+        conn.OnTrailersComplete(1);
+        bool pass = (conn.active_stream_count() == 0);
+        TestFramework::RecordTest("H2Upstream B7: OnTrailersComplete on missing stream is no-op",
+                                   pass, pass ? "" : "expected no state change");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2Upstream B7: OnTrailersComplete on missing stream is no-op",
+                                   false, e.what());
+    }
+}
+
+// B8 — RecordingSink: OnTrailers is wired and tracks payload
+void TestB8RecordingSinkTrailers() {
+    std::cout << "\n[TEST] H2Upstream B8: RecordingSink.OnTrailers tracks payload..." << std::endl;
+    try {
+        RecordingSink sink;
+        std::vector<std::pair<std::string, std::string>> t = {
+            {"grpc-status", "0"},
+            {"grpc-message", "ok"},
+        };
+        sink.OnTrailers(t);
+
+        bool pass =
+            (sink.trailers_calls == 1) &&
+            (sink.last_trailers.size() == 2) &&
+            (sink.last_trailers[0].first == "grpc-status") &&
+            (sink.last_trailers[0].second == "0") &&
+            (sink.last_trailers[1].first == "grpc-message");
+        TestFramework::RecordTest("H2Upstream B8: RecordingSink.OnTrailers tracks payload",
+                                   pass, pass ? "" : "trailer accounting mismatch");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2Upstream B8: RecordingSink.OnTrailers tracks payload",
+                                   false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tier C — Race / lifetime / memory
 // ---------------------------------------------------------------------------
@@ -2119,6 +2175,8 @@ void RunAllH2UpstreamTests() {
     // Tier B (wire-level — session-only)
     TestB5PingTimeout();
     TestB6RstStreamRemovesEntry();
+    TestB7OnTrailersCompleteNoStream();
+    TestB8RecordingSinkTrailers();
     TestB1SingleRequestCompletes();
 
     // Tier C — race / lifetime / memory

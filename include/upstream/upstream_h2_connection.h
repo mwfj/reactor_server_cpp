@@ -123,6 +123,9 @@ public:
     void OnGoawayReceived(int32_t last_stream_id);
     void OnStreamClose(int32_t stream_id, uint32_t error_code);
     void OnHeadersComplete(int32_t stream_id, bool end_stream);
+    // Trailing HEADERS block complete (HCAT_HEADERS after the response
+    // head). Dispatches accumulated stream->trailers via sink->OnTrailers.
+    void OnTrailersComplete(int32_t stream_id);
     UpstreamH2Stream* GetStream(int32_t stream_id);
 
     // Mark this connection permanently unusable (e.g. transport closed).

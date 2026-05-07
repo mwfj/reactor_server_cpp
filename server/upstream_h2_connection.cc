@@ -25,15 +25,37 @@ int OnFrameRecvCallback(nghttp2_session* /*session*/,
 {
     auto* self = static_cast<UpstreamH2Connection*>(user_data);
     switch (frame->hd.type) {
-    case NGHTTP2_HEADERS:
-        if ((frame->hd.flags & NGHTTP2_FLAG_END_HEADERS) &&
-            (frame->headers.cat == NGHTTP2_HCAT_RESPONSE ||
-             frame->headers.cat == NGHTTP2_HCAT_PUSH_RESPONSE)) {
-            bool end_stream =
-                (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
-            self->OnHeadersComplete(frame->hd.stream_id, end_stream);
+    case NGHTTP2_HEADERS: {
+        if (!(frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) break;
+        bool end_stream =
+            (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
+        auto cat = frame->headers.cat;
+        if (cat == NGHTTP2_HCAT_RESPONSE ||
+            cat == NGHTTP2_HCAT_PUSH_RESPONSE) {
+            // First HEADERS for this stream. Status < 200 is an
+            // informational interim (e.g. 103 Early Hints) — capture but
+            // don't dispatch as the final response head; the next
+            // HEADERS frame (HCAT_HEADERS) will carry either another
+            // interim or the final response.
+            auto* stream = self->GetStream(frame->hd.stream_id);
+            if (stream && stream->response_head.status_code >= 100 &&
+                stream->response_head.status_code < 200) {
+                stream->saw_1xx_interim = true;
+            } else {
+                self->OnHeadersComplete(frame->hd.stream_id, end_stream);
+            }
+        } else if (cat == NGHTTP2_HCAT_HEADERS) {
+            // HCAT_HEADERS after the first HEADERS frame: either the
+            // final response (when the first was 1xx) or trailers.
+            auto* stream = self->GetStream(frame->hd.stream_id);
+            if (stream && !stream->head_dispatched) {
+                self->OnHeadersComplete(frame->hd.stream_id, end_stream);
+            } else if (stream && stream->head_dispatched) {
+                self->OnTrailersComplete(frame->hd.stream_id);
+            }
         }
         break;
+    }
     case NGHTTP2_GOAWAY:
         self->OnGoawayReceived(frame->goaway.last_stream_id);
         break;
@@ -48,6 +70,26 @@ int OnFrameRecvCallback(nghttp2_session* /*session*/,
     return 0;
 }
 
+int OnBeginHeadersCallback(nghttp2_session* /*session*/,
+                           const nghttp2_frame* frame, void* user_data)
+{
+    if (frame->hd.type != NGHTTP2_HEADERS) return 0;
+    auto* self = static_cast<UpstreamH2Connection*>(user_data);
+    auto* stream = self->GetStream(frame->hd.stream_id);
+    if (!stream) return 0;
+    // Transitioning from 1xx interim to the final response: clear the
+    // accumulated interim values so OnHeaderCallback overlays cleanly
+    // for the final HEADERS block.
+    if (frame->headers.cat == NGHTTP2_HCAT_HEADERS &&
+        !stream->head_dispatched && stream->saw_1xx_interim) {
+        stream->response_head.headers.clear();
+        stream->response_head.status_code = 0;
+        stream->response.headers.clear();
+        stream->response.status_code = 0;
+    }
+    return 0;
+}
+
 int OnStreamCloseCallback(nghttp2_session* /*session*/, int32_t stream_id,
                           uint32_t error_code, void* user_data)
 {
@@ -56,20 +98,18 @@ int OnStreamCloseCallback(nghttp2_session* /*session*/, int32_t stream_id,
     return 0;
 }
 
-int OnHeaderCallback(nghttp2_session* session, const nghttp2_frame* frame,
+int OnHeaderCallback(nghttp2_session* /*session*/, const nghttp2_frame* frame,
                      const uint8_t* name, size_t namelen,
                      const uint8_t* value, size_t valuelen,
                      uint8_t /*flags*/, void* user_data)
 {
     if (frame->hd.type != NGHTTP2_HEADERS) return 0;
-    if (frame->headers.cat != NGHTTP2_HCAT_RESPONSE &&
-        frame->headers.cat != NGHTTP2_HCAT_PUSH_RESPONSE) {
-        // Trailers / promised request headers — not the response head.
+    auto cat = frame->headers.cat;
+    if (cat == NGHTTP2_HCAT_REQUEST) {
+        // Promised request header on a server-pushed stream — server
+        // push is disabled (SETTINGS_ENABLE_PUSH=0), but defensively skip.
         return 0;
     }
-    // Look up via the connection's own stream table rather than casting
-    // nghttp2's raw user_data pointer directly. The raw pointer could be
-    // dangling if the stream was erased between nghttp2 callback invocations.
     auto* self = static_cast<UpstreamH2Connection*>(user_data);
     auto* stream = self->GetStream(frame->hd.stream_id);
     if (!stream) return 0;
@@ -77,21 +117,48 @@ int OnHeaderCallback(nghttp2_session* session, const nghttp2_frame* frame,
     std::string nm(reinterpret_cast<const char*>(name), namelen);
     std::string val(reinterpret_cast<const char*>(value), valuelen);
 
+    // Route by HEADERS-block kind:
+    //   HCAT_RESPONSE / HCAT_PUSH_RESPONSE → the first response HEADERS
+    //   (interim 1xx or final). Accumulate into response_head.
+    //   HCAT_HEADERS && !head_dispatched   → post-1xx final HEADERS.
+    //   Accumulate into response_head (cleared by on_begin_headers when
+    //   transitioning from 1xx interim).
+    //   HCAT_HEADERS && head_dispatched    → trailers. Accumulate into
+    //   stream->trailers.
+    bool to_trailers = (cat == NGHTTP2_HCAT_HEADERS && stream->head_dispatched);
+
     if (!nm.empty() && nm[0] == ':') {
-        if (nm == ":status") {
+        if (!to_trailers && nm == ":status") {
+            int s = 0;
+            bool ok = false;
             try {
-                stream->response_head.status_code = std::stoi(val);
-                stream->response.status_code = stream->response_head.status_code;
+                size_t consumed = 0;
+                s = std::stoi(val, &consumed);
+                ok = (consumed == val.size()) && s >= 100 && s < 600;
             } catch (...) {
-                stream->response_head.status_code = 0;
+                ok = false;
             }
+            if (!ok) {
+                logging::Get()->warn(
+                    "UpstreamH2Connection: invalid :status '{}' on stream {}",
+                    val, frame->hd.stream_id);
+                self->ResetStream(frame->hd.stream_id);
+                return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+            }
+            stream->response_head.status_code = s;
+            stream->response.status_code = s;
         }
-        // Other pseudo-headers ignored on the response side.
+        // Other pseudo-headers (request pseudos in trailers are illegal,
+        // unknown response pseudos are reserved) — drop silently.
         return 0;
     }
 
-    stream->response_head.headers.emplace_back(nm, val);
-    stream->response.headers.emplace_back(nm, val);
+    if (to_trailers) {
+        stream->trailers.emplace_back(std::move(nm), std::move(val));
+    } else {
+        stream->response_head.headers.emplace_back(nm, val);
+        stream->response.headers.emplace_back(std::move(nm), std::move(val));
+    }
     return 0;
 }
 
@@ -184,6 +251,7 @@ bool UpstreamH2Connection::Init() {
     nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, &OnFrameRecvCallback);
     nghttp2_session_callbacks_set_on_stream_close_callback(cbs, &OnStreamCloseCallback);
     nghttp2_session_callbacks_set_on_header_callback(cbs, &OnHeaderCallback);
+    nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, &OnBeginHeadersCallback);
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(
         cbs, &OnDataChunkRecvCallback);
 
@@ -369,6 +437,15 @@ void UpstreamH2Connection::OnHeadersComplete(int32_t stream_id,
         // false from the headers_complete callback.
         ResetStream(stream_id);
     }
+}
+
+void UpstreamH2Connection::OnTrailersComplete(int32_t stream_id) {
+    auto it = streams_.find(stream_id);
+    if (it == streams_.end()) return;
+    auto& stream = it->second;
+    if (!stream || !stream->sink) return;
+    if (stream->trailers.empty()) return;
+    stream->sink->OnTrailers(stream->trailers);
 }
 
 UpstreamH2Stream* UpstreamH2Connection::GetStream(int32_t stream_id) {
