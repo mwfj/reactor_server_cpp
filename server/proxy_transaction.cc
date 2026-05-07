@@ -1070,6 +1070,7 @@ bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
 
 void ProxyTransaction::OnTrailers(
     const std::vector<std::pair<std::string, std::string>>& trailers) {
+    if (cancelled_ || IsKilledForShutdown()) return;
     if (config_.forward_trailers) {
         auto allowed = CollectDeclaredTrailerNames(response_head_.headers);
         response_trailers_.clear();
@@ -1133,6 +1134,7 @@ void ProxyTransaction::OnUpstreamWriteComplete(
 }
 
 void ProxyTransaction::OnResponseComplete() {
+    if (cancelled_ || IsKilledForShutdown()) return;
     ClearResponseTimeout();
     InvalidateStreamTimers();
 
@@ -1436,11 +1438,6 @@ void ProxyTransaction::MarkKilledForShutdown() noexcept {
     // owning and outlives the transaction (per the field comment), so
     // the EnQueue is safe even though MarkKilledForShutdown can fire
     // very late in shutdown.
-    //
-    // Pre-fix the kill flag was set but never read by production code,
-    // so the proxy kept consuming pool resources / firing upstream
-    // callbacks after its snapshot was removed from the drain counters,
-    // and the kill sweep didn't actually bound the survivor.
     if (!dispatcher_) return;
     // If we're already on the owning dispatcher (e.g. Start() called
     // us synchronously after observing snap.finalized), Cancel inline:
