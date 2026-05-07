@@ -384,10 +384,6 @@ public:
                 stream_id_, len);
             return SendResult::CLOSED;
         }
-        // Account bytes only after Append succeeded — a CLOSED return
-        // means the bytes never entered the data source's queue and
-        // must not contribute to http.server.response.body.size.
-        bytes_sent_ += len;
         // While we're still inside nghttp2_session_mem_recv2, the stream has
         // not yet had a chance to return NGHTTP2_ERR_DEFERRED from the data
         // provider. Resuming before that point returns INVALID_ARGUMENT and
@@ -403,6 +399,11 @@ public:
             }
             session->SendPendingFrames();
         }
+        // Account bytes only after BOTH Append AND (when applicable)
+        // ResumeStreamData have succeeded. Either failure path tears
+        // the stream down before any bytes reach the wire, so they
+        // must not contribute to http.server.response.body.size.
+        bytes_sent_ += len;
         return EvaluateCombinedOccupancy();
     }
 
@@ -765,9 +766,13 @@ Http2ConnectionHandler::WrapStreamCloseCallback(StreamCloseCallback callback) {
         // observability disabled — neither the streaming-finalize
         // path, the abort hook, nor the obs post-receive task is
         // installed). Stream IDs are monotonic per RFC 9113 §5.1.1,
-        // so the smallest key is the oldest entry — safe to evict
-        // because any consumer for it would have read it within the
-        // same OnRawData call.
+        // so the smallest key is the oldest entry. The cap protects
+        // against a misconfigured max_concurrent_streams >= 256;
+        // default 100 never triggers it. If an operator pushes that
+        // ceiling above 256, post-receive consumers (which run after
+        // mem_recv2 returns) could lose entries and observability
+        // records `client_disconnect` instead of the actual outcome
+        // — graceful degradation, not data loss.
         constexpr size_t kMaxStreamCloseEntries = 256;
         if (self->stream_close_error_codes_.size() >
             kMaxStreamCloseEntries) {

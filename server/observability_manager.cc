@@ -262,7 +262,13 @@ ObservabilitySnapshot::~ObservabilitySnapshot() {
     if (!mgr) return;  // manager torn down — kill loop ran or test path.
     // Exception-safe: FinalizeFromSnapshot wraps OnFinalizeWinner in
     // try/catch and never throws. The mgr shared_ptr keeps the
-    // manager alive for the duration of the call.
+    // manager alive for the duration of the call. The counter bump
+    // is precise (not best-effort): the registry holds only a
+    // weak_ptr, so the dtor running implies the last shared_ptr
+    // dropped — meaning no concurrent thread can be inside
+    // FinalizeFromSnapshot for this snapshot. The CAS below is
+    // therefore guaranteed to win, so every counter increment
+    // corresponds to a real backstop fire.
     mgr->snapshots_finalized_via_dtor_.fetch_add(
         1, std::memory_order_relaxed);
     mgr->FinalizeFromSnapshot(*this, /*status=*/0, /*wire_body=*/0,
