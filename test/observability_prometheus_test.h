@@ -252,8 +252,10 @@ void TestRenderCounterTotalSuffix() {
         snap.instruments.push_back(std::move(inst));
 
         std::string body = PrometheusExporter::Render(snap);
-        bool has_help = ContainsLine(body, "# HELP http_server_requests_total Server-side HTTP request count");
-        bool has_type = ContainsLine(body, "# TYPE http_server_requests_total counter");
+        // Per OpenMetrics 1.0 §5.1, # HELP / # TYPE carry the bare
+        // family name; only samples carry the `_total` suffix.
+        bool has_help = ContainsLine(body, "# HELP http_server_requests Server-side HTTP request count");
+        bool has_type = ContainsLine(body, "# TYPE http_server_requests counter");
         bool has_sample = ContainsLine(body,
             "http_server_requests_total{http_request_method=\"GET\",http_response_status_code=\"200\"} 7");
         bool pass = has_help && has_type && has_sample;
@@ -489,10 +491,14 @@ void TestMultiSeriesAndMultiInstrument() {
         // Label-less samples render WITHOUT empty braces per the
         // Prometheus exposition format — `active 11`, not `active{} 11`.
         bool a  = ContainsLine(body, "active 11");
-        bool single_help = body.find("# HELP errors_total")
-                            == body.rfind("# HELP errors_total");
-        bool single_type = body.find("# TYPE errors_total")
-                            == body.rfind("# TYPE errors_total");
+        // # HELP / # TYPE for the Counter family use the bare name
+        // `errors`, not `errors_total` (OpenMetrics 1.0 §5.1).
+        // Multi-series under one instrument must still share the
+        // single header pair.
+        bool single_help = body.find("# HELP errors ")
+                            == body.rfind("# HELP errors ");
+        bool single_type = body.find("# TYPE errors counter")
+                            == body.rfind("# TYPE errors counter");
         bool pass = e1 && e2 && a && single_help && single_type;
         TestFramework::RecordTest("ObsProm: multi-series under one instrument shares HELP/TYPE",
             pass, pass ? "" : "header dedup wrong:\n" + body,

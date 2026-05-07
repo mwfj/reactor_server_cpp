@@ -267,11 +267,14 @@ void TestConcurrentCounterAddTotalsConsistent() {
 
 // ---- Race: concurrent Reload + GetTracer must not crash ----
 //
-// SIGHUP-style: one thread keeps calling Reload while many threads
-// fetch tracers / record metrics. Tests the live-flag atomic
-// publication and the MeterProvider's reload synchronization.
+// SIGHUP-style: ONE writer thread keeps calling Reload while four
+// reader threads fetch tracers / record metrics. Tests the live-flag
+// atomic publication and the MeterProvider's reload synchronization
+// against concurrent reads. NOT a multi-writer Reload race — Reload
+// is documented as serialised by HttpServer::reload_mtx_; that
+// invariant is not exercised here.
 
-void TestConcurrentReloadDoesNotCrash() {
+void TestSingleReloaderVsConcurrentReadersDoesNotCrash() {
     try {
         auto m = MakeManager();
         std::atomic<bool> stop{false};
@@ -351,7 +354,7 @@ void RunAllTests() {
     TestRegisterFinalizeChurnDrains();
     TestKillDrainsSurvivingSnapshots();
     TestConcurrentCounterAddTotalsConsistent();
-    TestConcurrentReloadDoesNotCrash();
+    TestSingleReloaderVsConcurrentReadersDoesNotCrash();
     TestManyManagerCreateDestroyCycles();
 }
 

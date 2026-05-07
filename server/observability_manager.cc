@@ -525,6 +525,14 @@ void ObservabilityManager::KillOutstandingSnapshots(
 }
 
 void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
+    // PRECONDITION: callers serialise Reload via HttpServer::reload_mtx_.
+    // The field-by-field mutation of config_ below is single-writer
+    // safe ONLY under that lock; concurrent Reload calls would race
+    // on the non-atomic config_ assignments. Reads of the live
+    // atomic flags (TracesEnabled / MetricsEnabled / IncludeTargetInfo)
+    // are unaffected — they go through PublishLiveFlags's release
+    // stores and stay coherent across the writer's mutation window.
+    //
     // Master `enabled` and Resource are restart-required; HttpServer::Reload
     // emits the warn for those. Ignore them here.
     PublishLiveFlags(new_config);

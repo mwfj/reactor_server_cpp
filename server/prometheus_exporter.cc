@@ -133,9 +133,15 @@ void RenderInstrument(std::string& out,
     const std::string emit_name =
         (inst.kind == InstrumentKind::Counter) ? base + "_total" : base;
 
+    // Per OpenMetrics 1.0 §5.1, the `# HELP` / `# TYPE` lines carry
+    // the bare family name; only individual samples carry the
+    // Counter `_total` suffix. Strict validators (`promtool check
+    // metrics --strict`) reject `# TYPE foo_total counter`. Use
+    // `base` for the metadata lines and `emit_name` for the samples
+    // below.
     if (!inst.description.empty()) {
         out += "# HELP ";
-        out += emit_name;
+        out += base;
         out += ' ';
         for (char c : inst.description) {
             if (c == '\\')      out += "\\\\";
@@ -145,7 +151,7 @@ void RenderInstrument(std::string& out,
         out += '\n';
     }
     out += "# TYPE ";
-    out += emit_name;
+    out += base;
     out += ' ';
     out += TypeLine(inst.kind);
     out += '\n';
@@ -176,10 +182,9 @@ void RenderInstrument(std::string& out,
             out += std::to_string(cumulative);
             out += '\n';
         }
-        // +Inf bucket = total count (last bucket overflow).
-        if (!p.bucket_counts.empty()) {
-            cumulative += p.bucket_counts.back();
-        }
+        // +Inf bucket = total count. Emitted from p.count directly
+        // (the cumulative running total above is used only for the
+        // finite-boundary lines).
         const std::string inf_boundary = "+Inf";
         out += base;
         out += "_bucket";

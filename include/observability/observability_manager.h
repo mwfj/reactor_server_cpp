@@ -218,6 +218,13 @@ private:
     // PublishLiveFlags is called only on the construction thread and
     // on the Reload caller thread, never concurrently, so a plain bool
     // suffices.
+    //
+    // TODO: when a future SpanProcessor hot-swap path lands (e.g. the
+    // OTLP exporter pipeline rebuild), reset this latch immediately
+    // post-swap so a subsequent SIGHUP that flips traces.enabled with
+    // a now-attached processor (or vice-versa) re-arms the warning.
+    // Operators who missed the boot warn currently get no SIGHUP
+    // signal until process restart.
     bool traces_processor_misconfig_warned_ = false;
 
     // Snapshot registry. Keyed on the snapshot's raw address (stable
