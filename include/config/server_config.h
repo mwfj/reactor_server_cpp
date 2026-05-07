@@ -312,16 +312,19 @@ struct ServerConfig {
     size_t max_body_size = 1048576;      // 1 MB
     size_t max_ws_message_size = 16777216; // 16 MB
     int request_timeout_sec = 30;
-    // Per-phase drain budget during graceful shutdown. NOT a wall-clock
-    // ceiling on total shutdown — each phase consumes up to its own
-    // share of this budget. Wall-clock worst case is the sum of all
-    // phase shares for the path the server takes:
-    //   protocol-drain (T)             — H2/WS/H1 graceful close
-    //   Phase A: obs-flush (T/2)       — drain async snapshots
-    //   Phase B: upstream-drain (T)    — pool quiesce
-    //   Phase C: kill + obs-stop (T/2) — survivor kill + processor join
-    //   post-upstream H1 flush (T)     — final response delivery
-    // Sum: 4 × T. Set the value with that multiplier in mind.
+    // Wall-clock cap (in seconds) for the post-protocol-drain shutdown
+    // sequence. HttpServer::Stop anchors a single shutdown_deadline =
+    // now + T at the start of this section and runs each sub-phase
+    // (observability flush → upstream pool drain → snapshot kill +
+    // processor stop → post-upstream H1 flush) via budget_left()
+    // against that one window. Worst-case wall-clock for this section
+    // is therefore T, not a multiple of T.
+    //
+    // Total Stop() wall = (H2/WS/H1 protocol drains, each with their
+    // own independent timeouts BEFORE this section) + T. Pod
+    // terminationGracePeriodSeconds should be sized as protocol-drain
+    // budget + T + a small margin.
+    //
     // 0 = immediate (skip waits, force-close); negative rejected by Validate.
     int shutdown_drain_timeout_sec = 30;
     Http2Config http2;

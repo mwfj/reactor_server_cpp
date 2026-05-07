@@ -256,9 +256,12 @@ ProxyTransaction::~ProxyTransaction() {
 
     // Pair the Start()-time IncInflightTransactions; the latch covers
     // the case where the transaction was constructed but never Start()ed.
-    if (inflight_counter_held_ && upstream_manager_) {
+    // Atomic exchange handles the cross-thread case (dtor may run on a
+    // retry-timer / upstream-callback / shutdown-sweep thread) and
+    // returns the previous value so we Dec exactly once.
+    if (upstream_manager_ &&
+        inflight_counter_held_.exchange(false, std::memory_order_acq_rel)) {
         upstream_manager_->DecInflightTransactions();
-        inflight_counter_held_ = false;
     }
 
     if (!complete_cb_invoked_ && complete_cb_) {
@@ -276,10 +279,12 @@ void ProxyTransaction::AttachObservabilitySnapshot(
 
 void ProxyTransaction::Start() {
     // Bump exactly once per transaction; the destructor's matching
-    // decrement is gated on the same latch.
-    if (!inflight_counter_held_ && upstream_manager_) {
+    // decrement is gated on the same latch. exchange returns the
+    // PREVIOUS value, so the !old-value branch fires exactly once
+    // even under repeat Start() calls.
+    if (upstream_manager_ &&
+        !inflight_counter_held_.exchange(true, std::memory_order_acq_rel)) {
         upstream_manager_->IncInflightTransactions();
-        inflight_counter_held_ = true;
     }
 
     // Publish ourselves to the snapshot so the shutdown kill loop can

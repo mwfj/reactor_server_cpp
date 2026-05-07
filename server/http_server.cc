@@ -44,7 +44,11 @@ static uint64_t ObsWireBodySize(const HttpResponse& response,
     // suppress the body bytes on the wire, so observability must
     // record 0 even if a handler accidentally left a body on the
     // response object.
-    if (status == 204 || status == 205 || status == 304) return 0;
+    if (status == HttpStatus::NO_CONTENT
+        || status == HttpStatus::RESET_CONTENT
+        || status == HttpStatus::NOT_MODIFIED) {
+        return 0;
+    }
     return static_cast<uint64_t>(response.GetBody().size());
 }
 

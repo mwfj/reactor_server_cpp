@@ -270,8 +270,14 @@ private:
     std::atomic<bool> kill_for_shutdown_{false};
 
     // Latch — Start() bumps inflight_transactions_ exactly once and
-    // the destructor decrements iff this is set.
-    bool inflight_counter_held_ = false;
+    // the destructor decrements iff this is set. Atomic because Start
+    // runs on the owning dispatcher thread while ~ProxyTransaction
+    // can run on whatever thread releases the last shared_ptr (a
+    // retry-timer lambda, an upstream `std::function` callback, or
+    // the shutdown kill sweep). Acq_rel exchange establishes a
+    // happens-before edge between the Start-thread bump and the
+    // dtor-thread decrement.
+    std::atomic<bool> inflight_counter_held_{false};
     enum class RelayMode {
         BUFFERED,
         STREAMING,
