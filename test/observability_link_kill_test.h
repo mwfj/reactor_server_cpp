@@ -223,6 +223,47 @@ void TestAttachBeforeKillIsBenign() {
     }
 }
 
+// ---- Start() short-circuits when AttachTransaction reports finalized ----
+//
+// Shows that ProxyTransaction::Start() actually consumes the bool
+// returned by AttachTransaction. If the kill sweep ran before
+// Start(), the helper returns true and Start() must bail before
+// header rewrite / request serialization / breaker resolution /
+// AttemptCheckout. Without the early return the test fixture would
+// reach `serialized_request_ = HttpRequestSerializer::Serialize(...)`
+// and produce a non-empty wire image — the assertion catches that.
+
+void TestStartShortCircuitsOnFinalizedSnapshot() {
+    try {
+        auto m = MakeManager();
+        auto snap = std::make_shared<ObservabilitySnapshot>();
+        m->RegisterLiveSnapshot(snap);
+        m->KillOutstandingSnapshots(std::chrono::milliseconds{50});
+
+        HttpRequest req;
+        auto tx = ProxyTransactionInternalTests::MakeInternalProxyTransaction(req);
+        tx->AttachObservabilitySnapshot(snap);
+        tx->Start();
+
+        bool tx_killed = tx->IsKilledForShutdown();
+        // Non-empty serialized_request_ proves Start fell through to
+        // HttpRequestSerializer::Serialize — short-circuit broken.
+        bool serialize_skipped = tx->serialized_request_.empty();
+
+        bool pass = tx_killed && serialize_skipped;
+        TestFramework::RecordTest(
+            "ObsLink: Start() short-circuits when snapshot already finalized",
+            pass, pass ? "" :
+                ("tx_killed=" + std::to_string(tx_killed) +
+                 " serialize_skipped=" + std::to_string(serialize_skipped)),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsLink: Start() short-circuits when snapshot already finalized",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ---- AttachObservabilitySnapshot stores the snapshot for the link site ----
 
 void TestAttachSnapshotStoresHandle() {
@@ -255,6 +296,7 @@ void RunAllTests() {
     TestKillTolerantOfMissingLink();
     TestAttachAfterKillFlipsLinkImmediately();
     TestAttachBeforeKillIsBenign();
+    TestStartShortCircuitsOnFinalizedSnapshot();
     TestAttachSnapshotStoresHandle();
 }
 

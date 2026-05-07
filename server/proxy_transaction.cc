@@ -292,14 +292,26 @@ void ProxyTransaction::Start() {
     // the canonical link/kill protocol: lock link_mtx, read finalized
     // under the lock, capture the strong ptr if already finalized,
     // publish tx_weak, release the lock, then call
-    // MarkKilledForShutdown OUTSIDE the lock. If the kill sweep ran
-    // first, the helper kills us inline; AttemptCheckout below will
-    // observe cancelled_ (set by Cancel via MarkKilledForShutdown)
-    // and short-circuit before allocating an upstream lease.
+    // MarkKilledForShutdown OUTSIDE the lock.
+    //
+    // Returns true when the snapshot had already been finalized (kill
+    // sweep ran first). In that case the helper has already called
+    // MarkKilledForShutdown — which Cancelled us inline because
+    // Start() runs on the owning dispatcher — so the rest of Start()
+    // would only allocate header-rewrite / request-serialize / slice
+    // resolution work that AttemptCheckout's cancelled_ check would
+    // immediately discard. Returning here makes the kill barrier
+    // explicit so future code added between attach and checkout
+    // doesn't silently bypass it. The IncInflightTransactions above
+    // is paired by the destructor's gated decrement on
+    // inflight_counter_held_, so the early return preserves the
+    // counter contract.
     if (obs_snapshot_) {
-        obs_snapshot_->AttachTransaction(
-            std::weak_ptr<OBSERVABILITY_NAMESPACE::UpstreamTransactionLink>(
-                shared_from_this()));
+        if (obs_snapshot_->AttachTransaction(
+                std::weak_ptr<OBSERVABILITY_NAMESPACE::UpstreamTransactionLink>(
+                    shared_from_this()))) {
+            return;
+        }
     }
 
     // Tell the codec the request method so it handles HEAD correctly
