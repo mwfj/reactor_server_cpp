@@ -5899,12 +5899,29 @@ bool HttpServer::Reload(ServerConfig new_config) {
     {
         int new_interval = ComputeTimerInterval(new_config.idle_timeout_sec,
                                                  new_config.request_timeout_sec);
-        // Preserve the upstream cadence narrow — topology is restart-only
-        // so upstream_configs_ still reflects the live values at this
-        // point. Folding INT_MAX is a std::min no-op when no upstream
-        // contributes.
+        // Topology fields (pool.connect_timeout_ms, idle_timeout_sec,
+        // proxy.response_timeout_ms) are restart-only, so upstream_configs_
+        // is correct for them. But the H2 timer block (ping_idle_sec,
+        // ping_timeout_sec, goaway_drain_timeout_sec) is LIVE-reloadable;
+        // CommitHttp2Snapshots below will publish the staged values to
+        // live partitions when LiveEqual (restart-only fields) matches.
+        // Build a cadence-view that mirrors that decision so an H2-only
+        // SIGHUP recomputes the timer interval from the JUST-APPLIED
+        // timeouts, not the pre-reload ones.
+        std::vector<UpstreamConfig> cadence_view = upstream_configs_;
+        std::unordered_map<std::string, const Http2UpstreamConfig*> staged_h2;
+        staged_h2.reserve(new_config.upstreams.size());
+        for (const auto& u : new_config.upstreams) {
+            staged_h2.emplace(u.name, &u.http2);
+        }
+        for (auto& u : cadence_view) {
+            auto it = staged_h2.find(u.name);
+            if (it != staged_h2.end() && u.http2.LiveEqual(*it->second)) {
+                u.http2 = *it->second;
+            }
+        }
         int upstream_min =
-            UpstreamManager::ComputeMinUpstreamCadenceSec(upstream_configs_);
+            UpstreamManager::ComputeMinUpstreamCadenceSec(cadence_view);
         new_interval = std::min(new_interval, upstream_min);
         net_server_.SetTimerInterval(new_interval);
     }

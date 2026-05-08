@@ -1,10 +1,12 @@
 #include "upstream/upstream_h2_connection.h"
 #include "upstream/h2_settings.h"
+#include "upstream/proxy_transaction.h"  // for RESULT_UPSTREAM_DISCONNECT
 #include "upstream/upstream_connection.h"
 #include "upstream/upstream_http_codec.h"
 #include "upstream/header_rewriter.h"
 #include "connection_handler.h"
 #include "log/logger.h"
+#include <charconv>
 #include <cstring>
 
 namespace {
@@ -131,15 +133,15 @@ int OnHeaderCallback(nghttp2_session* /*session*/, const nghttp2_frame* frame,
 
     if (!nm.empty() && nm[0] == ':') {
         if (!to_trailers && nm == ":status") {
+            // from_chars: no leading-whitespace skip, no exceptions, and
+            // the (ptr == end) check enforces strict full-string consume.
+            // std::stoi would silently accept " 200" (skipped whitespace
+            // counts toward `consumed`).
             int s = 0;
-            bool ok = false;
-            try {
-                size_t consumed = 0;
-                s = std::stoi(val, &consumed);
-                ok = (consumed == val.size()) && s >= 100 && s < 600;
-            } catch (...) {
-                ok = false;
-            }
+            const char* end = val.data() + val.size();
+            auto [ptr, ec] = std::from_chars(val.data(), end, s);
+            bool ok = (ec == std::errc()) && (ptr == end)
+                      && s >= 100 && s < 600;
             if (!ok) {
                 logging::Get()->warn(
                     "UpstreamH2Connection: invalid :status '{}' on stream {}",
@@ -231,6 +233,18 @@ UpstreamH2Connection::UpstreamH2Connection(
 }
 
 UpstreamH2Connection::~UpstreamH2Connection() {
+    // Null H2-session-bound transport callbacks FIRST so incoming bytes
+    // arriving mid-dtor cannot reenter HandleBytes and trigger a
+    // FlushSend on a session that's about to be torn down. This also
+    // closes the door on the pool re-wire path (WirePoolCallbacks)
+    // observing closures that capture a now-expired weak_ptr to *this.
+    if (transport_) {
+        if (auto t = transport_->GetTransport()) {
+            t->SetOnMessageCb(nullptr);
+            t->SetCloseCb(nullptr);
+            t->SetErrorCb(nullptr);
+        }
+    }
     if (session_) {
         // Best-effort polite shutdown. Failure is non-fatal — the
         // transport will be torn down regardless when the lease ends.
@@ -238,16 +252,6 @@ UpstreamH2Connection::~UpstreamH2Connection() {
         FlushSend();
         nghttp2_session_del(session_);
         session_ = nullptr;
-    }
-    // Clear H2-session-bound transport callbacks before the lease
-    // destructor returns the transport to the pool. Without this, the
-    // pool's re-wire path (WirePoolCallbacks) would see closures that
-    // capture a now-expired weak_ptr to *this.
-    if (transport_) {
-        if (auto t = transport_->GetTransport()) {
-            t->SetOnMessageCb(nullptr);
-            t->SetCloseCb(nullptr);
-        }
     }
     // Lease destructor returns the underlying transport to the pool.
 }
@@ -407,6 +411,30 @@ void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
     goaway_last_stream_id_ = last_stream_id;
     goaway_seen_at_ = now;
     last_activity_at_ = now;
+
+    // RFC 9113 §6.8: streams whose id > last_stream_id were not processed
+    // by the peer and MUST be safe to retry on a fresh connection. Fail
+    // them now with a retryable error so the proxy retry policy kicks
+    // in immediately instead of waiting for transport close or the
+    // per-attempt response timeout. Streams with id <= last_stream_id
+    // continue draining naturally.
+    if (streams_.empty()) return;
+    std::vector<int32_t> to_fail;
+    to_fail.reserve(streams_.size());
+    for (auto& kv : streams_) {
+        if (kv.first > last_stream_id) to_fail.push_back(kv.first);
+    }
+    for (int32_t sid : to_fail) {
+        auto it = streams_.find(sid);
+        if (it == streams_.end()) continue;
+        auto stream = it->second;
+        streams_.erase(it);
+        if (stream && stream->sink) {
+            stream->sink->OnError(
+                ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
+                "h2 stream above GOAWAY last_stream_id — peer did not process");
+        }
+    }
 }
 
 void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
@@ -422,9 +450,20 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
             if (error_code == NGHTTP2_NO_ERROR) {
                 stream->sink->OnComplete();
             } else {
+                // Translate the H2 stream error to a proxy RESULT_* code.
+                // Without this translation the raw nghttp2 code (positive
+                // int) falls through ProxyTransaction::MakeErrorResponse's
+                // RESULT_* allowlist to InternalError() — surfacing a 500
+                // for what is fundamentally an upstream/transport failure.
+                // RESULT_UPSTREAM_DISCONNECT maps to 502 BadGateway and is
+                // retryable: covers REFUSED_STREAM (peer didn't process,
+                // safe to retry), CANCEL (peer aborted), PROTOCOL_ERROR /
+                // INTERNAL_ERROR (upstream-side malformed response —
+                // distinct from a local PARSE_ERROR which is also 502).
                 stream->sink->OnError(
-                    static_cast<int>(error_code),
-                    "h2 stream closed with error");
+                    ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
+                    "h2 stream closed with error code=" +
+                        std::to_string(error_code));
             }
         }
     }
@@ -463,9 +502,15 @@ void UpstreamH2Connection::OnHeadersComplete(int32_t stream_id,
         int64_t cl = -1;
         for (const auto& [nm, val] : stream->response_head.headers) {
             if (nm == "content-length") {
-                size_t consumed = 0;
-                try { cl = std::stoll(val, &consumed); } catch (...) { cl = -1; }
-                if (consumed != val.size()) cl = -1;
+                // from_chars: strict full-string consume; std::stoll
+                // skips leading whitespace and would accept "  42".
+                cl = -1;
+                const char* end = val.data() + val.size();
+                int64_t parsed = 0;
+                auto [ptr, ec] = std::from_chars(val.data(), end, parsed);
+                if (ec == std::errc() && ptr == end && parsed >= 0) {
+                    cl = parsed;
+                }
                 if (cl > static_cast<int64_t>(
                         UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE)) {
                     logging::Get()->warn(

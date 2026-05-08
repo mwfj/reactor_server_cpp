@@ -369,7 +369,11 @@ private:
     // lease is donated to the H2 connection (transport stays out of
     // the idle pool until every stream exits). On reuse of an existing
     // session, the lease is released back to the pool immediately.
-    void DispatchH2(std::shared_ptr<const Http2UpstreamConfig> cfg);
+    // No cfg parameter — AcquireH2Connection re-reads the partition's
+    // live snapshot via LoadHttp2ConfigSnapshot(), which is always the
+    // freshest published value (a SIGHUP between the handshake-defer
+    // capture site and the actual dispatch can publish a new snapshot).
+    void DispatchH2();
 
     void SendUpstreamRequest();
     void OnUpstreamData(std::shared_ptr<ConnectionHandler> conn, std::string& data);

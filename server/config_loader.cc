@@ -2488,10 +2488,11 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             " (must be 0-300)");
     }
 
-    // http2_reload_barrier_timeout_sec bounds the futures-barrier wait
-    // during reload. Must allow at least 1s for any in-flight dispatcher
-    // task to complete; values above 60 are accepted but warned (a long
-    // wait blocks the reload thread excessively).
+    // http2_reload_barrier_timeout_sec — RESERVED for a future per-
+    // partition H2 apply futures-barrier; CURRENTLY UNUSED at runtime
+    // (CommitHttp2Snapshots is synchronous). Validated here so config
+    // files keep validating once the barrier path lands. Must allow at
+    // least 1s; values above 60 are accepted but warned.
     if (config.http2_reload_barrier_timeout_sec < 1) {
         throw std::invalid_argument(
             "Invalid http2_reload_barrier_timeout_sec: " +

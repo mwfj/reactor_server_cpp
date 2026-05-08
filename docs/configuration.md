@@ -320,7 +320,7 @@ The proxy engine can dispatch outbound requests over multiplexed HTTP/2 instead 
 
 **Reload semantics:** The non-restart fields above can be edited via SIGHUP and take effect on **new** H2 connections. Existing multiplexed sessions keep the snapshot they were constructed with — RFC 9113 doesn't cleanly support mid-session SETTINGS renegotiation. Operator changes propagate within a few seconds depending on connection turnover.
 
-**`http2_reload_barrier_timeout_sec`** (top-level config, default 5): bounds how long the reload thread waits for in-flight H2 dispatcher tasks to drain before continuing the live-config commit. Range: 1–60.
+**`http2_reload_barrier_timeout_sec`** (top-level config, default 5): RESERVED for a future per-partition H2 apply futures-barrier. The current `CommitHttp2Snapshots` reload path is synchronous (atomic-store of the staged snapshot per live partition), so this value is **not consulted at runtime today** — operators tuning it get a silent no-op until the barrier path lands. Validated in 1–60 so existing config files keep validating once the field is wired.
 
 For the operator runbook (failure modes, troubleshooting, monitoring), see [docs/http2_upstream.md](http2_upstream.md).
 

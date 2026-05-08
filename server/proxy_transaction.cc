@@ -665,19 +665,19 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
         std::weak_ptr<ProxyTransaction> wk_self = weak_from_this();
         std::weak_ptr<ConnectionHandler> wk_t = transport;
         transport->SetHandshakeCompleteCallback(
-            [wk_self, wk_t, cfg]() {
+            [wk_self, wk_t]() {
                 auto self = wk_self.lock();
                 if (!self || self->cancelled_) return;
                 auto t = wk_t.lock();
                 bool h2 = t && (t->GetAlpnProtocol() == "h2");
-                if (h2) self->DispatchH2(cfg);
+                if (h2) self->DispatchH2();
                 else    self->DispatchH1();
             });
         return;
     }
 
     if (want_h2) {
-        DispatchH2(cfg);
+        DispatchH2();
     } else {
         DispatchH1();
     }
@@ -740,9 +740,7 @@ void ProxyTransaction::DispatchH1() {
     SendUpstreamRequest();
 }
 
-void ProxyTransaction::DispatchH2(
-    std::shared_ptr<const Http2UpstreamConfig> /*cfg*/)
-{
+void ProxyTransaction::DispatchH2() {
     PoolPartition* partition = nullptr;
     if (upstream_manager_ && dispatcher_index_ >= 0) {
         partition = upstream_manager_->GetPoolPartition(

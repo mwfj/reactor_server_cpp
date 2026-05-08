@@ -401,13 +401,15 @@ struct ServerConfig {
     //
     // 0 = immediate (skip waits, force-close); negative rejected by Validate.
     int shutdown_drain_timeout_sec = 30;
-    // Bound on the per-partition H2 apply futures-barrier in
-    // HttpServer::Reload. After enqueueing per-partition H2-config apply
-    // tasks, the reload thread waits this long for them to complete before
-    // setting the cancel-token, aborting the cadence recompute, and
-    // returning. Restart-only — changing it during a reload is meta (which
-    // timeout would apply, the old or the new?). Validated to [1, 60] at
-    // load time.
+    // RESERVED for a future per-partition H2 apply futures-barrier in
+    // HttpServer::Reload. The current `CommitHttp2Snapshots` path is
+    // synchronous (atomic-store of the staged snapshot per live
+    // partition) and does NOT consume this knob — operators tuning it
+    // today get silent no-op. Field is parsed / validated / serialized /
+    // documented so a future barrier-based commit can adopt it without
+    // breaking existing config files. TODO: wire into the per-partition
+    // EnQueue + std::future barrier path once that lands.
+    // Validated to [1, 60] at load time.
     int http2_reload_barrier_timeout_sec = 5;
     Http2Config http2;
     std::vector<UpstreamConfig> upstreams;

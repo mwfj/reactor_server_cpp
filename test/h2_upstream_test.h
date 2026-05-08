@@ -1753,8 +1753,13 @@ void TestB12TickGoawayDrainTimeout() {
                                           /*ping_idle*/0, /*ping_timeout*/0,
                                           /*goaway_drain*/2);
 
-        // Now mark GOAWAY as received. Stream is still in-flight.
-        conn.OnGoawayReceived(/*last_stream_id=*/0);
+        // Mark GOAWAY received with last_stream_id=1 — the peer says it
+        // processed our stream (id=1) and will not process newer ones.
+        // Streams above last_stream_id are failed immediately by
+        // OnGoawayReceived (RFC 9113 §6.8 retry-safe), so we keep the
+        // in-flight stream INSIDE the processed range to actually
+        // exercise the drain-timeout path.
+        conn.OnGoawayReceived(/*last_stream_id=*/1);
 
         // Tick within the drain window — still alive.
         bool tick_within_window = conn.Tick(

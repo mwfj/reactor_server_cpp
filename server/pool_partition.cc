@@ -118,14 +118,12 @@ PoolPartition::~PoolPartition() {
         // run before the underlying transports get their callbacks
         // nulled (the H2 connection's lease destructor returns the
         // transport to the pool and the pool walk below frees them).
-        // TODO: when the dispatcher may already be stopped at this point,
-        // ~UpstreamH2Connection's nghttp2_session_terminate_session +
-        // FlushSend calls write to the transport. FlushSend currently
-        // calls SendRaw which checks was_stopped() and drops the write,
-        // so this is benign — but a more principled fix would null the
-        // H2 transport callbacks before Clear() so no send is attempted.
-        // See pitfalls/UPSTREAM_PROXY.md "ForceClose() in PoolPartition
-        // destructor" for the general principle.
+        // ~UpstreamH2Connection nulls its transport callbacks BEFORE
+        // running terminate_session + FlushSend, so a stray incoming-
+        // bytes event during the destruction window cannot reenter
+        // HandleBytes on a session about to be torn down. This is
+        // independent of SendRaw's was_stopped() drop — closes the
+        // door on a future SendRaw refactor that removes that check.
         h2_table_.Clear();
         auto clear = [](auto& container) {
             for (auto& c : container) {
@@ -536,11 +534,19 @@ std::shared_ptr<void> PoolPartition::MakeInflightGuard() {
 std::shared_ptr<UpstreamH2Connection> PoolPartition::AcquireH2Connection(
     const std::string& upstream_name, UpstreamLease& lease)
 {
-    // Reuse a multiplexed session if one is still healthy. The lease
-    // the caller passed in is left untouched — caller is responsible
-    // for releasing it back to the pool when reuse wins.
+    // Reuse a multiplexed session if one is still healthy AND its
+    // transport matches the partition's currently-published
+    // resolved_endpoint_. After a hostname re-resolution, an existing
+    // session pinned to the old IP must NOT serve fresh requests; mark
+    // it dead so future FindUsable() skips it and the table walker
+    // reaps it on the next Tick. In-flight streams continue on the
+    // stale endpoint (mirrors the H1 keepalive reuse contract).
     if (auto existing = h2_table_.FindUsable(upstream_name)) {
-        return existing;
+        UpstreamConnection* t = existing->transport();
+        if (t && ConnectionEndpointMatches(*t)) {
+            return existing;
+        }
+        existing->MarkDead();
     }
 
     auto cfg = LoadHttp2ConfigSnapshot();
