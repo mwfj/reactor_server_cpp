@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run the full sweep (1021 tests across 35+ suites at HEAD)
+make test               # Build and run all suites (1021 tests across 35+ suites at HEAD)
 ./test_runner                   # Run all tests directly (after building)
 ./test_runner help              # Print every supported flag
 
@@ -350,7 +350,7 @@ CI workflows live in `.github/workflows/` and run in three cadences. Stress and 
 
 ### Per-PR (`.github/workflows/ci.yml`)
 
-Six parallel jobs gate every PR. Cheap dimensions run the full sweep; the slow dimension (TSan) is sharded by hand-curated buckets so the critical path stays under ~13 minutes.
+Six parallel jobs gate every PR. Cheap dimensions run all suites; the slow dimension (TSan) is sharded by hand-curated buckets so the critical path stays under ~13 minutes.
 
 | Job | Runner | What it runs |
 |-----|--------|--------------|
@@ -378,7 +378,7 @@ Runs Sundays at 09:00 UTC. Valgrind catches reads-of-uninitialized-memory and po
 
 When adding a suite to `test/run_test.cc::RunAllTest()`:
 
-1. The Linux gcc / clang / ASan jobs auto-pick it up (full sweep).
+1. The Linux gcc / clang / ASan jobs auto-pick it up (all suites).
 2. **Add the new flag to the loop in `build-linux-tsan-rest`** — TSan does not auto-pick-up. If the new suite is heavy (>30s base runtime) or is itself a multi-suite umbrella, add it to `build-linux-tsan-heavy` instead.
 3. If the suite touches OS-level primitives (sockets, signals, FDs, kqueue, TLS, DNS) add it to the macOS subset in `build-macos`.
 4. If it's stress-shaped, add it to `nightly-stress.yml`, not `ci.yml`.

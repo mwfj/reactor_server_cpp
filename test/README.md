@@ -6,7 +6,7 @@ Comprehensive test coverage across the reactor core, HTTP/1.1, HTTP/2, WebSocket
 
 ```bash
 make clean && make -j4    # Build test_runner and server_runner
-./test_runner             # Run all tests (no-arg full sweep)
+./test_runner             # Run every suite (no-arg = all suites)
 ./test_runner <suite>     # Run a specific suite (see table below)
 ./test_runner help        # List every supported flag
 ```
@@ -34,7 +34,7 @@ All tests use ephemeral ports (port 0) to avoid conflicts. The test runner autom
 
 ### Feature-family umbrellas
 
-A single CLI flag runs every sub-suite in the family. Sub-suites stay accessible via the no-arg full sweep and (for auth) via individual flags.
+A single CLI flag runs every sub-suite in the family. Sub-suites stay accessible via the no-arg all-suites run and (for auth) via individual flags.
 
 | Family | Command | Short | Sub-suites covered |
 |--------|---------|-------|---------------------|
@@ -70,7 +70,7 @@ Every auth sub-suite has its own flag. Use these when you only want to exercise 
 ### Make Targets
 
 ```bash
-make test                    # Build and run the full sweep
+make test                    # Build and run all suites
 make test_basic              # Single-suite targets — one per CLI flag above
 make test_stress
 make test_race
