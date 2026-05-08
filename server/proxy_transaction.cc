@@ -1386,6 +1386,29 @@ void ProxyTransaction::OnResponseComplete() {
 void ProxyTransaction::OnError(int result_code,
                                 const std::string& log_message) {
     if (cancelled_ || IsKilledForShutdown()) return;
+
+    // H2 transport-level failures arrive here through sink->OnError —
+    // unlike H1, which detects transport failure inside OnUpstreamData
+    // and calls MaybeRetry(UPSTREAM_DISCONNECT) directly before the sink
+    // ever sees an error. Bring H2 to feature parity: when the result is
+    // a retryable disconnect AND no response has been committed, route
+    // through MaybeRetry so the retry policy fires (idempotent method,
+    // attempt budget, retry budget all honored). Cleanup() inside
+    // MaybeRetry's success branch tears down the H2 stream state; its
+    // retry-not-allowed branch falls through to DeliverTerminalError.
+    if (h2_path_ && !response_committed_ &&
+        result_code == RESULT_UPSTREAM_DISCONNECT) {
+        ReportBreakerOutcome(result_code);
+        MaybeRetry(RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT);
+        return;
+    }
+
+    DeliverTerminalError(result_code, log_message);
+}
+
+void ProxyTransaction::DeliverTerminalError(int result_code,
+                                              const std::string& log_message) {
+    if (cancelled_ || IsKilledForShutdown()) return;
     InvalidateStreamTimers();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time_);
@@ -1396,12 +1419,11 @@ void ProxyTransaction::OnError(int result_code,
                          attempt_, duration.count(), log_message);
 
     // Report the outcome if an admission is still held. Most error paths
-    // call ReportBreakerOutcome themselves BEFORE reaching OnError (so a
+    // call ReportBreakerOutcome themselves BEFORE reaching here (so a
     // retry's ConsultBreaker sees the fresh signal) — this is a safety
-    // net for error paths that skipped reporting, e.g., RESULT_SEND_FAILED
-    // and RESULT_RESPONSE_TIMEOUT from the on-upstream-data paths.
-    // ReportBreakerOutcome is idempotent: it clears admission_generation_
-    // on the first call so a double-call drops harmlessly.
+    // net for paths that skipped reporting (RESULT_SEND_FAILED,
+    // RESULT_RESPONSE_TIMEOUT from on-upstream-data paths, MaybeRetry's
+    // retry-not-allowed fallback). ReportBreakerOutcome is idempotent.
     ReportBreakerOutcome(result_code);
 
     state_ = State::FAILED;
@@ -1605,7 +1627,12 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             }
     }
 
-    OnError(result_code, "Retry exhausted or not allowed for condition=" +
+    // Use DeliverTerminalError instead of OnError so we don't bounce
+    // back through OnError's H2 retry escape hatch — that would loop
+    // when the retry was just denied here.
+    DeliverTerminalError(
+        result_code,
+        "Retry exhausted or not allowed for condition=" +
             std::to_string(static_cast<int>(condition)));
 }
 

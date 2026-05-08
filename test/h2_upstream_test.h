@@ -45,6 +45,7 @@
 #include "upstream/h2_settings.h"
 #include "upstream/upstream_manager.h"
 #include "upstream/pool_partition.h"
+#include "upstream/proxy_transaction.h"  // for RESULT_UPSTREAM_DISCONNECT
 #include "upstream/upstream_connection.h"
 #include "upstream/upstream_lease.h"
 #include "upstream/upstream_response_sink.h"
@@ -1784,6 +1785,72 @@ void TestB12TickGoawayDrainTimeout() {
     }
 }
 
+// B12b — RFC 9113 §6.8: streams above GOAWAY's last_stream_id were not
+// processed by the peer and MUST be failed immediately with a retryable
+// error so the proxy retry policy fires. Submit two streams, then send
+// GOAWAY with last_stream_id naming only the first; the second's sink
+// should observe exactly one OnError call carrying RESULT_UPSTREAM_DISCONNECT.
+// Streams inside the processed range continue draining (no extra error
+// fire on stream 1).
+void TestB12bGoawayFailsStreamsAbovePeerLastId() {
+    std::cout << "\n[TEST] H2Upstream B12b: GOAWAY fails streams above peer last_stream_id..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream B12b: GOAWAY fails streams above peer last_stream_id",
+                false, "Init failed");
+            return;
+        }
+
+        UpstreamH2Codec codec_a, codec_b;
+        RecordingSink sink_a, sink_b;
+        int32_t sid_a = conn.SubmitRequest(
+            "GET", "http", "example.com", "/a", {}, "", &codec_a, &sink_a);
+        int32_t sid_b = conn.SubmitRequest(
+            "GET", "http", "example.com", "/b", {}, "", &codec_b, &sink_b);
+        // nghttp2 assigns client-initiated stream ids 1, 3, 5, ...
+        if (sid_a != 1 || sid_b != 3) {
+            TestFramework::RecordTest(
+                "H2Upstream B12b: GOAWAY fails streams above peer last_stream_id",
+                false, "Unexpected stream ids: a=" + std::to_string(sid_a) +
+                       " b=" + std::to_string(sid_b));
+            return;
+        }
+
+        // Peer says: I processed up through stream 1; everything above
+        // is unprocessed and safe to retry.
+        conn.OnGoawayReceived(/*last_stream_id=*/1);
+
+        bool a_untouched = (sink_a.error_calls == 0 &&
+                            sink_a.complete_calls == 0);
+        bool b_failed_once = (sink_b.error_calls == 1 &&
+                              sink_b.complete_calls == 0);
+        bool b_code_correct =
+            (sink_b.last_error_code == ProxyTransaction::RESULT_UPSTREAM_DISCONNECT);
+
+        bool pass = a_untouched && b_failed_once && b_code_correct;
+        TestFramework::RecordTest(
+            "H2Upstream B12b: GOAWAY fails streams above peer last_stream_id",
+            pass,
+            pass ? ""
+                 : ("expected a:err=0+complete=0, b:err=1+code=" +
+                    std::to_string(ProxyTransaction::RESULT_UPSTREAM_DISCONNECT) +
+                    "; got a:err=" + std::to_string(sink_a.error_calls) +
+                    "/complete=" + std::to_string(sink_a.complete_calls) +
+                    ", b:err=" + std::to_string(sink_b.error_calls) +
+                    "/code=" + std::to_string(sink_b.last_error_code)));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream B12b: GOAWAY fails streams above peer last_stream_id",
+            false, e.what());
+    }
+}
+
 // B13 — UpstreamManager advertises ALPN gated on per-upstream H2 prefer
 // mode. prefer="auto" (default) → ["h2", "http/1.1"]; prefer="never" →
 // ["http/1.1"] only. The wire format is length-prefixed concatenation.
@@ -2666,6 +2733,7 @@ void RunAllH2UpstreamTests() {
     TestB10HandleBytesDispatchesValidStatus();
     TestB11HandleBytesRejectsInvalidStatus();
     TestB12TickGoawayDrainTimeout();
+    TestB12bGoawayFailsStreamsAbovePeerLastId();
     TestB13AlpnGatedByPreferMode();
     TestB14AuthorityDerivationCases();
 

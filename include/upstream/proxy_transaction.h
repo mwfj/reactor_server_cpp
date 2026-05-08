@@ -380,6 +380,12 @@ private:
     void OnUpstreamWriteComplete(std::shared_ptr<ConnectionHandler> conn);
     void OnResponseComplete();
     void MaybeRetry(RetryPolicy::RetryCondition condition);
+    // Terminal-failure delivery extracted from OnError so MaybeRetry's
+    // retry-not-allowed fallback can avoid bouncing through OnError's
+    // H2 retry escape hatch (would otherwise loop). Caller-owned
+    // ReportBreakerOutcome inside; idempotent.
+    void DeliverTerminalError(int result_code,
+                              const std::string& log_message);
     void DeliverResponse(HttpResponse response);
     void Cleanup();
     void ReleaseAttemptAccounting();

@@ -104,6 +104,15 @@ void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
                 // destruction.
                 c->MarkDead();
                 it = conns.erase(it);
+            } else if (c->IsDead() && c->active_stream_count() == 0) {
+                // Connections marked dead via paths other than Tick or
+                // goaway-drain (e.g., the endpoint-mismatch reuse gate
+                // in PoolPartition::AcquireH2Connection) accumulate here
+                // until a fresh AcquireH2Connection call inline-reaps
+                // them via FindUsable. Reap them on the timer too so a
+                // sustained pattern of reuse-gate misses on an upstream
+                // that no longer receives traffic doesn't leak entries.
+                it = conns.erase(it);
             } else {
                 ++it;
             }
