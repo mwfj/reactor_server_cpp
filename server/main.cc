@@ -1130,6 +1130,14 @@ static int HandleStart(const CliOptions& options) {
         // recording spans and the propagator doesn't inject sampled
         // trace_flags. The traces.enabled live flag governs whether
         // PublishLiveFlags lets spans record once a processor exists.
+        //
+        // FIXME (Phase 2): NoopSpanProcessor is free, but the same
+        // allocation site will pick up BatchSpanProcessor when the OTLP
+        // push pipeline lands — at which point `traces.enabled=false
+        // exporter="otlp_http"` will spin up a worker thread + bounded
+        // queue at boot. Either gate this on a separate
+        // `traces.reload_ready` knob or accept the worker cost as the
+        // price of live-reloadable traces.enabled.
         std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor> processor;
         if (!config.observability.traces.exporter.empty()) {
             processor =

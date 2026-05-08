@@ -245,6 +245,11 @@ private:
                         std::weak_ptr<ObservabilitySnapshot>>
                                                  live_snapshots_;
     std::atomic<int64_t> inflight_finalizations_{0};
+    // RESERVED — no incrementer/decrementer exists today. Permanently
+    // zero; consulted by HttpServer::WaitForAllAsyncDrain so the
+    // predicate is forward-compatible with a future per-dispatcher kill
+    // marshal that bumps it before EnQueue and decrements when the
+    // closure runs. See class header docstring for the full rationale.
     std::atomic<int64_t> kill_marshals_in_flight_{0};
     std::atomic<int64_t> finalizers_in_progress_{0};
 

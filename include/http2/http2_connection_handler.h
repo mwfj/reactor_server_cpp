@@ -248,9 +248,7 @@ private:
         }
         stream_post_write_notify_.erase(it);
     }
-public:
 
-private:
     StreamCloseCallback WrapStreamCloseCallback(StreamCloseCallback callback);
 
     // Dispatcher-thread-only weak refs to active per-stream streaming senders.
