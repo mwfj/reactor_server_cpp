@@ -4,8 +4,7 @@ name: Weekly Valgrind
 # overhead, single-threaded interpretation of every memory access). It
 # catches reads-of-uninitialized-memory and pointer-validity bugs that
 # AddressSanitizer cannot — but the wall-clock makes it unsuitable for
-# PR-blocking CI. We run it weekly on cron, mirroring the pattern used
-# by RocksDB (`build-linux-valgrind` weekly).
+# PR-blocking CI. We run it weekly on cron.
 #
 # A failure here does NOT red-X a PR — the workflow is independent of
 # ci.yml — but it IS allowed to red-X this scheduled run. We do NOT set

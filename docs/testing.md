@@ -367,6 +367,8 @@ Six parallel jobs gate every PR. Cheap dimensions run all suites; the slow dimen
 
 The PR matrix uses GitHub Actions `concurrency: cancel-in-progress: true`, so a follow-up commit on the same branch automatically cancels the in-flight run.
 
+**Compile-time caching.** Every Linux job and the macOS job wraps the build step in [`hendrikmuhs/ccache-action`](https://github.com/hendrikmuhs/ccache-action). `create-symlink: true` puts ccache symlinks ahead of `gcc` / `g++` / `clang` / `clang++` on `PATH` so the Makefile picks them up transparently — no Makefile edit needed. Cache keys are per matrix dimension (`ccache-linux-gcc`, `ccache-linux-clang`, `ccache-linux-asan`, `ccache-linux-tsan`, `ccache-macos-arm64`); `tsan-heavy` and `tsan-rest` share `ccache-linux-tsan` since they compile identical TSan binaries. `max-size` is 300M for non-sanitizer dims and 500M for sanitizer dims (sanitizer instrumentation roughly doubles object size). Total per-PR cache footprint ~1.9 GB across 5 unique keys, well under GitHub's 10 GB per-repo cap. Expected warm-cache build wall-clock: ~30–60s vs ~7–13 min cold.
+
 ### Nightly cron (`.github/workflows/nightly-stress.yml`)
 
 Runs at 07:00 UTC (= 00:00 PT). Stress suites are noisy on shared CI runners (200 concurrent clients with an 85% success-rate threshold under `CI=true`; 1000 clients with 95% threshold locally) — a failure here means "investigate flake," not "investigate code". The workflow uses `continue-on-error: true` and does not red-X the badge. Each job invokes `./test_runner stress` directly, which bypasses the `RunAllTest()` `GITHUB_ACTIONS` gate that excludes stress from the per-PR matrix.
