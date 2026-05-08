@@ -1,0 +1,91 @@
+name: Weekly Valgrind
+
+# Valgrind is the slowest sanitizer-equivalent we run (~10-50x runtime
+# overhead, single-threaded interpretation of every memory access). It
+# catches reads-of-uninitialized-memory and pointer-validity bugs that
+# AddressSanitizer cannot — but the wall-clock makes it unsuitable for
+# PR-blocking CI. We run it weekly on cron, mirroring the pattern used
+# by RocksDB (`build-linux-valgrind` weekly).
+#
+# A failure here is signal worth investigating but does NOT red-X a PR
+# (the workflow is independent of ci.yml). The high-value outputs are:
+#   1. Conditional-jump-on-uninitialized — bug class invisible to ASan.
+#   2. Pointer-validity violations on edge-case allocators.
+#   3. Definite leaks confirmed across multiple runs (ASan disables
+#      LSan in CI to tolerate test-harness teardown gaps; valgrind
+#      runs without that compromise on a curated subset of suites).
+#
+# Scope limitation: stress and timeout suites are EXCLUDED — under
+# valgrind the 10-50x slowdown collapses their timing assertions. The
+# protocol / lifecycle suites carry the high-value memory-safety signal.
+on:
+  schedule:
+    # 09:00 UTC every Sunday — matches RocksDB cadence; off-peak for
+    # GitHub-hosted runners.
+    - cron: '0 9 * * 0'
+  workflow_dispatch:  # allow manual runs from the Actions UI
+
+concurrency:
+  group: weekly-valgrind
+  cancel-in-progress: false
+
+jobs:
+  valgrind-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6h cap — refuse to consume runner-minutes
+                          # past this even if a suite hangs under valgrind
+    continue-on-error: true  # flake or interpreter-amplified timing
+                             # should not red-X the workflow
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev valgrind
+      - name: Build (debug + frame pointers — valgrind needs accurate stacks)
+        run: |
+          make -j$(nproc) \
+            CXXFLAGS_EXTRA="-O1 -g -fno-omit-frame-pointer" \
+            CFLAGS_EXTRA="-O1 -g -fno-omit-frame-pointer" \
+            NGHTTP2_CFLAGS_EXTRA="-O1 -g -fno-omit-frame-pointer"
+      - name: Valgrind sweep (memory-safety subset)
+        run: |
+          set -e
+          # Suites chosen for memory-safety signal-per-minute. Excluded:
+          # `stress`, `timeout`, `race`, `kqueue` (Linux no-op anyway),
+          # and the obs_stress / obs_export suites (interpreter-amplified
+          # timing makes them flake under valgrind).
+          for suite in \
+            basic \
+            http \
+            http2 \
+            ws \
+            tls \
+            cli \
+            route \
+            upstream \
+            proxy \
+            rate_limit \
+            circuit_breaker \
+            dns \
+            auth \
+            obs_foundation \
+            obs_tracer \
+            obs_metrics \
+            obs_mgr \
+            obs_propagator \
+            obs_prom \
+            obs_config \
+            obs_shutdown \
+            obs_linkkill \
+            obs_issue \
+            obs_e2e ; do
+            echo "::group::valgrind test_runner $suite"
+            valgrind \
+              --error-exitcode=1 \
+              --leak-check=full \
+              --show-leak-kinds=definite,indirect \
+              --errors-for-leak-kinds=definite \
+              --track-origins=yes \
+              --num-callers=20 \
+              ./test_runner "$suite"
+            echo "::endgroup::"
+          done

@@ -76,11 +76,27 @@ jobs:
         run: ./test_runner
 
   # ----------------------------------------------------------------------
-  # ThreadSanitizer. Catches data races, deadlocks, and lock-order
-  # inversions. The race / auth_race / circuit_breaker / dual_stack suites
-  # are the primary signal source. ~5-10x runtime overhead.
+  # ThreadSanitizer — sharded into two parallel buckets to cap PR wall-
+  # clock. TSAN amplifies runtime ~5-10x, so a single full-sweep job took
+  # ~15-25 min on shared runners; splitting the heaviest umbrellas
+  # (race, auth) into their own job lets the rest finish in parallel.
+  #
+  # Bucket assignment policy (hand-curated, see DEVELOPMENT_RULES.md
+  # "CI workflow maintenance" — must be re-balanced when adding a new
+  # heavy suite):
+  #   * `tsan-heavy`  — `race` + `auth` (auth umbrella covers
+  #                     auth_foundation / jwt / jwks / oidc / hrauth /
+  #                     auth_mgr / auth_fail / auth_reload / auth_multi /
+  #                     auth_ws / auth_race / router_async /
+  #                     introspection_cache / intro_client / auth_intro /
+  #                     auth_observability).
+  #   * `tsan-rest`   — every other suite enumerated explicitly. New
+  #                     suites added to RunAllTest() MUST be added here
+  #                     too — silent CI drift if missed.
+  #
+  # `stress` is NOT in either bucket — it lives in nightly-stress.yml.
   # ----------------------------------------------------------------------
-  build-linux-tsan:
+  build-linux-tsan-heavy:
     runs-on: ubuntu-latest
     env:
       TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:history_size=7
@@ -95,8 +111,65 @@ jobs:
             CFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
             NGHTTP2_CFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
             LDFLAGS_EXTRA="-fsanitize=thread"
-      - name: Test (full sweep)
-        run: ./test_runner
+      - name: Test - race (threading + I/O multiplexing)
+        run: ./test_runner race
+      - name: Test - auth (umbrella — every auth-related sub-suite)
+        run: ./test_runner auth
+
+  build-linux-tsan-rest:
+    runs-on: ubuntu-latest
+    env:
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:history_size=7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Build (tsan)
+        run: |
+          make -j$(nproc) \
+            CXXFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
+            CFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
+            NGHTTP2_CFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
+            LDFLAGS_EXTRA="-fsanitize=thread"
+      - name: Test (rest — every suite NOT in tsan-heavy, excluding stress)
+        run: |
+          set -e
+          # NOTE: When adding a suite to test/run_test.cc::RunAllTest(),
+          # add the matching flag here unless it belongs in tsan-heavy
+          # or nightly-stress.yml. See DEVELOPMENT_RULES.md.
+          for suite in \
+            basic \
+            timeout \
+            config \
+            http \
+            ws \
+            tls \
+            cli \
+            http2 \
+            route \
+            kqueue \
+            upstream \
+            proxy \
+            rate_limit \
+            circuit_breaker \
+            dns \
+            obs_foundation \
+            obs_tracer \
+            obs_metrics \
+            obs_mgr \
+            obs_propagator \
+            obs_export \
+            obs_prom \
+            obs_config \
+            obs_shutdown \
+            obs_linkkill \
+            obs_issue \
+            obs_stress \
+            obs_e2e ; do
+            echo "::group::test_runner $suite"
+            ./test_runner "$suite"
+            echo "::endgroup::"
+          done
 
   # ----------------------------------------------------------------------
   # macOS — only the suites whose behavior is influenced by the OS layer
